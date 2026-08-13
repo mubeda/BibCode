@@ -8,7 +8,7 @@ import {
 } from "./activityPresentation";
 
 const baseSnapshot = {
-  protocolVersion: 1,
+  protocolVersion: 2,
   scopeId: "scope-1",
   scope: { _tag: "thread", threadId: "thread-1" },
   revision: 1,
@@ -20,6 +20,7 @@ const baseSnapshot = {
     backgroundWork: true,
     historyRecovery: "full",
     terminalObservation: false,
+    targetedActorCancellation: false,
   },
   observationState: "live",
   sections: {
@@ -34,6 +35,7 @@ const baseSnapshot = {
   workItems: [],
   actorsHasMore: false,
   workItemsHasMore: false,
+  control: { scopeId: "scope-1", revision: 0, actors: [], operations: [] },
   updatedAt: "2026-07-22T12:00:00Z",
 } as unknown as ActivitySnapshot;
 

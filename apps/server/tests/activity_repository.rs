@@ -1,12 +1,13 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{
     activity::{
-        ActivityActorSummary, ActivityCapabilities, ActivityChange, ActivityDelta, ActivityEntry,
-        ActivityEntryKind, ActivityEntryTone, ActivityHistoryRecovery, ActivityLifecycle,
-        ActivityObservationState, ActivityProjection, ActivityProjections, ActivityRecordKind,
-        ActivityRepository, ActivityRepositoryError, ActivityRosterBucket, ActivityScopeRef,
-        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivityWorkItemSummary,
-        AgentActivityController, AgentActivitySource, ProviderActivityMutation,
+        ActivityActorControlState, ActivityActorSummary, ActivityCapabilities, ActivityChange,
+        ActivityDelta, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
+        ActivityHistoryRecovery, ActivityLifecycle, ActivityObservationState, ActivityProjection,
+        ActivityProjections, ActivityRecordKind, ActivityRepository, ActivityRepositoryError,
+        ActivityRosterBucket, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
+        ActivitySectionHealth, ActivityWorkItemSummary, AgentActivityController,
+        AgentActivitySource, ProviderActivityMutation,
     },
     persistence::{Database, run_migrations},
 };
@@ -1210,6 +1211,7 @@ fn scope_constructors_reject_invalid_capability_combinations() {
         background_work: false,
         history_recovery: ActivityHistoryRecovery::None,
         terminal_observation: false,
+        targeted_actor_cancellation: false,
     };
 
     assert!(
@@ -2644,6 +2646,14 @@ async fn large_activity_projection_keeps_pages_and_published_deltas_bounded() {
         .expect("snapshot");
     assert_eq!(snapshot.actors.len(), 200);
     assert!(snapshot.actors_has_more);
+    assert_eq!(snapshot.control.actors.len(), 200);
+    assert!(
+        snapshot
+            .control
+            .actors
+            .iter()
+            .all(|control| control.state == ActivityActorControlState::Unsupported)
+    );
     assert_eq!(snapshot.work_items.len(), 200);
     assert!(snapshot.work_items_has_more);
 
@@ -2672,6 +2682,13 @@ async fn large_activity_projection_keeps_pages_and_published_deltas_bounded() {
         .await
         .expect("bounded detail");
     assert_eq!(detail.entries.len(), 200);
+    assert_eq!(
+        detail
+            .actor_control
+            .expect("historical actor control")
+            .state,
+        ActivityActorControlState::Unsupported
+    );
     assert!(detail.next_cursor.is_none());
 }
 

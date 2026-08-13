@@ -32,6 +32,7 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
             "raw": "https://hooks.example/activity?token=PRIVATE_HOOK_TOKEN"
         }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 
@@ -73,6 +74,7 @@ async fn provider_logs_reject_malformed_item_ids() {
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
+            activity_controls: Default::default(),
         }));
     }
     log.shutdown().await.expect("provider log shuts down");
@@ -139,6 +141,7 @@ async fn startup_removes_provider_log_files_that_exceed_the_configured_bound() {
         request_id: None,
         payload: json!({ "text": "must not be persisted" }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 

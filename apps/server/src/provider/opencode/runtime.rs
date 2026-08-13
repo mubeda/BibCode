@@ -2767,6 +2767,7 @@ fn reconciliation_capabilities(
             ActivityHistoryRecovery::Bounded
         },
         terminal_observation: false,
+        targeted_actor_cancellation: false,
     }
 }
 

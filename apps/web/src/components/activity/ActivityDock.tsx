@@ -23,7 +23,6 @@ import { cn } from "~/lib/utils";
 import { ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME } from "~/rightPanelLayout";
 import { activityElapsedLabel, selectActivityDockVisibility } from "./activityPresentation";
 
-const MAX_GLYPHS = 4;
 const LIVE_ANNOUNCEMENT_WINDOW_MS = 500;
 
 function safeCount(value: unknown): number {
@@ -291,13 +290,6 @@ export function ActivityDock({
   const backgroundDone = visibility.showBackgroundTasks ? viewModel.counts.backgroundTasks.done : 0;
   const active = addCounts(subagentActive, backgroundActive);
   const done = addCounts(subagentDone, backgroundDone);
-  const subagentTotal = addCounts(subagentActive, subagentDone);
-  const glyphActors = visibility.showSubagents
-    ? [...viewModel.actors]
-        .sort((left, right) => compareText(left.id, right.id))
-        .slice(0, Math.min(MAX_GLYPHS, subagentTotal))
-    : [];
-  const glyphOverflow = Math.max(0, subagentTotal - glyphActors.length);
   const ProviderIcon = resolveProviderIcon(viewModel.provider);
   const dataIsStale =
     viewModel.observationState === "reconnecting" || viewModel.observationState === "stale";
@@ -330,56 +322,47 @@ export function ActivityDock({
   const elapsedNow = now ?? viewModel.updatedAt;
   const activeSubagent = firstActiveRecord(viewModel.actors);
   const activeBackgroundTask = firstActiveRecord(viewModel.workItems);
+  const providerGlyph = (
+    <span
+      aria-hidden="true"
+      className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border bg-muted"
+      data-activity-provider-glyph={viewModel.provider}
+    >
+      <ProviderIcon className="size-3" />
+    </span>
+  );
 
   const toggleContent = expanded ? (
     <>
-      <BotIcon aria-hidden="true" className="size-4" />
+      {providerGlyph}
       {!compact ? <span className="truncate">Activity</span> : null}
       <ChevronDownIcon aria-hidden="true" className="ml-auto size-4" />
     </>
   ) : (
     <>
-      <span aria-hidden="true" className="flex items-center -space-x-1">
-        {glyphActors.length === 0 ? (
-          <span
-            className="flex size-5 items-center justify-center rounded-full border border-border bg-muted"
-            data-activity-provider-glyph={viewModel.provider}
-          >
-            <ProviderIcon className="size-3" />
-          </span>
-        ) : (
-          glyphActors.map((currentActor) => (
-            <span
-              className="flex size-5 items-center justify-center rounded-full border border-border bg-muted"
-              data-activity-glyph={currentActor.id}
-              key={currentActor.id}
-              title={currentActor.name}
-            >
-              <ProviderIcon className="size-3" />
-            </span>
-          ))
-        )}
-        {glyphOverflow > 0 ? (
-          <span className="ml-1 whitespace-nowrap text-[11px] tabular-nums">+{glyphOverflow}</span>
-        ) : null}
-      </span>
+      {providerGlyph}
       {compact ? (
         <>
           <span
             aria-hidden="true"
-            className="flex whitespace-nowrap text-xs tabular-nums"
+            className="whitespace-nowrap text-xs tabular-nums"
             data-activity-count="active"
           >
-            <LoaderCircleIcon className="mr-1 size-3" />
-            {active}
+            Active {active}
           </span>
           <span
             aria-hidden="true"
-            className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
+            className="text-base leading-none font-bold text-foreground"
+            data-activity-count-separator="true"
+          >
+            ·
+          </span>
+          <span
+            aria-hidden="true"
+            className="whitespace-nowrap text-xs text-muted-foreground tabular-nums"
             data-activity-count="done"
           >
-            <CheckCircle2Icon className="mr-1 size-3" />
-            {done}
+            Done {done}
           </span>
         </>
       ) : (
@@ -463,25 +446,32 @@ export function ActivityDock({
                     </span>
                   </>
                 ) : (
-                  <>
-                    <span className="min-w-0 flex-1 truncate">Subagents</span>
-                    <span className="whitespace-nowrap text-xs tabular-nums">
-                      Active {subagentActive}
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className="flex min-w-0 items-center gap-2"
+                      data-activity-section-primary="subagents"
+                    >
+                      <span className="min-w-0 flex-1 truncate">Subagents</span>
+                      <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
+                        Active {subagentActive}
+                      </span>
+                      <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
+                        Done {subagentDone}
+                      </span>
                     </span>
-                    <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                      Done {subagentDone}
-                    </span>
-                    {activeSubagent !== undefined ? (
+                    {activeSubagent === undefined ? null : (
                       <span
                         aria-hidden="true"
-                        className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
-                        data-activity-elapsed="subagents"
+                        className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
+                        data-activity-section-metadata="subagents"
                       >
-                        <Clock3Icon className="mr-1 size-3" />
-                        {activityElapsedLabel(activeSubagent.startedAt, elapsedNow)}
+                        <Clock3Icon className="mr-1 size-3 shrink-0" />
+                        <span className="truncate">
+                          {activityElapsedLabel(activeSubagent.startedAt, elapsedNow)}
+                        </span>
                       </span>
-                    ) : null}
-                  </>
+                    )}
+                  </span>
                 )}
               </Button>
             ) : null}
@@ -518,25 +508,32 @@ export function ActivityDock({
                     </span>
                   </>
                 ) : (
-                  <>
-                    <span className="min-w-0 flex-1 truncate">Background tasks</span>
-                    <span className="whitespace-nowrap text-xs tabular-nums">
-                      Active {backgroundActive}
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className="flex min-w-0 items-center gap-2"
+                      data-activity-section-primary="backgroundTasks"
+                    >
+                      <span className="min-w-0 flex-1 truncate">Background tasks</span>
+                      <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
+                        Active {backgroundActive}
+                      </span>
+                      <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
+                        Done {backgroundDone}
+                      </span>
                     </span>
-                    <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                      Done {backgroundDone}
-                    </span>
-                    {activeBackgroundTask !== undefined ? (
+                    {activeBackgroundTask === undefined ? null : (
                       <span
                         aria-hidden="true"
-                        className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
-                        data-activity-elapsed="backgroundTasks"
+                        className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
+                        data-activity-section-metadata="backgroundTasks"
                       >
-                        <Clock3Icon className="mr-1 size-3" />
-                        {activityElapsedLabel(activeBackgroundTask.startedAt, elapsedNow)}
+                        <Clock3Icon className="mr-1 size-3 shrink-0" />
+                        <span className="truncate">
+                          {activityElapsedLabel(activeBackgroundTask.startedAt, elapsedNow)}
+                        </span>
                       </span>
-                    ) : null}
-                  </>
+                    )}
+                  </span>
                 )}
               </Button>
             ) : null}

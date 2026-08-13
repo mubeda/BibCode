@@ -38,7 +38,7 @@ const actor = {
 };
 
 const snapshot = {
-  protocolVersion: 1 as const,
+  protocolVersion: 2 as const,
   scopeId: "thread:thread-1",
   scope: { _tag: "thread" as const, threadId: "thread-1" },
   revision: 3,
@@ -50,6 +50,7 @@ const snapshot = {
     backgroundWork: true,
     historyRecovery: "full" as const,
     terminalObservation: false,
+    targetedActorCancellation: true,
   },
   observationState: "live" as const,
   sections: {
@@ -64,6 +65,19 @@ const snapshot = {
   workItems: [],
   actorsHasMore: false,
   workItemsHasMore: false,
+  control: {
+    scopeId: "thread:thread-1",
+    revision: 8,
+    actors: [
+      {
+        actorId: "actor:child-1",
+        state: "available",
+        controlRevision: 3,
+        activeDescendantCount: 2,
+      },
+    ],
+    operations: [],
+  },
   updatedAt: "2026-07-22T12:00:01Z",
 };
 const delta = {
@@ -86,6 +100,28 @@ describe("activity contracts", () => {
     ).toBe("featureDisabled");
   });
 
+  it("decodes targeted cancellation failures without provider-native details", () => {
+    // Mutation caught: omitting a typed failure that clients need to present cancellation state safely.
+    for (const reason of [
+      "cancellationUnsupported",
+      "staleScope",
+      "staleActor",
+      "staleOperation",
+      "providerUnavailable",
+      "targetUnavailable",
+      "partialCancellation",
+      "dispatchTimeout",
+    ]) {
+      expect(
+        decodeActivityError({
+          _tag: "ActivityError",
+          reason,
+          message: "Cancellation state changed. Refresh activity and try again.",
+        }).reason,
+      ).toBe(reason);
+    }
+  });
+
   it("keeps activity timestamp bounds private", () => {
     expect(ActivityModule).not.toHaveProperty("ACTIVITY_TIMESTAMP_MAX_LENGTH");
     expect(ContractsPackage).not.toHaveProperty("ACTIVITY_TIMESTAMP_MAX_LENGTH");
@@ -102,6 +138,365 @@ describe("activity contracts", () => {
 
   it("round-trips an ordered actor delta", () => {
     expect(decodeActivityDelta(delta)).toEqual(delta);
+  });
+
+  it("requires protocol v2 activity snapshots to carry targeted cancellation capabilities", () => {
+    // Mutation caught: accepting the old v1 snapshot shape or defaulting a v2 capability.
+    expect(decodeActivitySnapshot(snapshot)).toEqual(snapshot);
+    expect(() =>
+      decodeActivitySnapshot({
+        ...snapshot,
+        protocolVersion: 1,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeActivitySnapshot({
+        ...snapshot,
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+        },
+      }),
+    ).toThrow();
+    expect(ActivityModule.NO_ACTIVITY_CAPABILITIES.targetedActorCancellation).toBe(false);
+  });
+
+  it("round-trips independent control snapshots and deltas", () => {
+    // Mutation caught: dropping control state or coupling its revisions to activity revisions.
+    const controlSnapshot = {
+      scopeId: snapshot.scopeId,
+      revision: 12,
+      actors: [
+        {
+          actorId: actor.id,
+          state: "unsupported",
+          controlRevision: 0,
+          activeDescendantCount: 0,
+        },
+        {
+          actorId: "actor:available",
+          state: "available",
+          controlRevision: 4,
+          activeDescendantCount: 3,
+        },
+        {
+          actorId: "actor:requested",
+          state: "requested",
+          controlRevision: 5,
+          activeDescendantCount: 1,
+        },
+      ],
+      operations: [
+        {
+          rootActorId: "actor:available",
+          state: "requested",
+          residualCount: 0,
+          message: null,
+          operationRevision: 2,
+        },
+        {
+          rootActorId: "actor:requested",
+          state: "partial",
+          residualCount: 1,
+          message: "One descendant could not be stopped.",
+          operationRevision: 3,
+        },
+      ],
+    } as const;
+    const controlDelta = {
+      scopeId: snapshot.scopeId,
+      previousRevision: 12,
+      revision: 13,
+      changes: [
+        {
+          kind: "actor-upserted",
+          actor: controlSnapshot.actors[1],
+        },
+        {
+          kind: "operation-upserted",
+          operation: controlSnapshot.operations[1],
+        },
+      ],
+    } as const;
+    const decodeControlSnapshot = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlSnapshot") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeControlDelta = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlDelta") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+
+    expect(Reflect.get(ActivityModule, "ActivityControlSnapshot")).toBeDefined();
+    expect(Reflect.get(ActivityModule, "ActivityControlDelta")).toBeDefined();
+    expect(decodeControlSnapshot(controlSnapshot)).toEqual(controlSnapshot);
+    expect(decodeControlDelta(controlDelta)).toEqual(controlDelta);
+    expect(
+      decodeActivityStreamItem({ kind: "control-snapshot", control: controlSnapshot }),
+    ).toEqual({ kind: "control-snapshot", control: controlSnapshot });
+    expect(decodeActivityStreamItem({ kind: "control-delta", delta: controlDelta })).toEqual({
+      kind: "control-delta",
+      delta: controlDelta,
+    });
+  });
+
+  it("returns actor controls with roster and detail pages", () => {
+    // Mutation caught: omitting server-authoritative actor control state from paged activity reads.
+    const actorControl = snapshot.control.actors[0];
+    expect(
+      decodeActivityListRosterInput({
+        scope: snapshot.scope,
+        scopeId: snapshot.scopeId,
+        section: "subagents",
+        bucket: "active",
+      }),
+    ).toMatchObject({ scopeId: snapshot.scopeId });
+    const decodeRosterPage = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityRosterPage") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    expect(
+      decodeRosterPage({ records: [actor], actorControls: [actorControl], nextCursor: null }),
+    ).toEqual({ records: [actor], actorControls: [actorControl], nextCursor: null });
+    expect(
+      decodeActivityDetailPage({
+        record: actor,
+        actorControl,
+        entries: [],
+        nextCursor: null,
+      }),
+    ).toEqual({ record: actor, actorControl, entries: [], nextCursor: null });
+  });
+
+  it("accepts client-only cancellation commands and every result disposition", () => {
+    // Mutation caught: exposing provider-native target data or omitting one server disposition.
+    const cancelInput = {
+      scope: snapshot.scope,
+      scopeId: snapshot.scopeId,
+      actorId: actor.id,
+      expectedControlRevision: 3,
+    } as const;
+    const retryInput = {
+      scope: snapshot.scope,
+      scopeId: snapshot.scopeId,
+      rootActorId: actor.id,
+      expectedOperationRevision: 4,
+    } as const;
+    const decodeCancelInput = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityCancelSubtreeInput") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeRetryInput = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityRetrySubtreeCancellationInput") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeResult = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivitySubtreeCancellationResult") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+
+    expect(Reflect.get(ActivityModule, "ActivityCancelSubtreeInput")).toBeDefined();
+    expect(Reflect.get(ActivityModule, "ActivityRetrySubtreeCancellationInput")).toBeDefined();
+    expect(Reflect.get(ActivityModule, "ActivitySubtreeCancellationResult")).toBeDefined();
+    expect(decodeCancelInput(cancelInput)).toEqual(cancelInput);
+    expect(decodeRetryInput(retryInput)).toEqual(retryInput);
+    for (const result of [
+      { disposition: "accepted", rootActorId: actor.id, operationRevision: 5 },
+      { disposition: "inProgress", rootActorId: actor.id, operationRevision: 5 },
+      { disposition: "alreadyTerminal", rootActorId: actor.id, operationRevision: null },
+    ] as const) {
+      expect(decodeResult(result)).toEqual(result);
+    }
+  });
+
+  it("rejects malformed control state and cancellation payloads", () => {
+    // Mutation caught: accepting stale/unsafe control revisions or provider-native cancellation targets.
+    const controlSnapshot = snapshot.control;
+    const decodeControlSnapshot = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlSnapshot") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeCancelInput = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityCancelSubtreeInput") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeRetryInput = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityRetrySubtreeCancellationInput") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+
+    expect(Reflect.get(ActivityModule, "ActivityControlSnapshot")).toBeDefined();
+    expect(Reflect.get(ActivityModule, "ActivityCancelSubtreeInput")).toBeDefined();
+    expect(Reflect.get(ActivityModule, "ActivityRetrySubtreeCancellationInput")).toBeDefined();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...controlSnapshot.actors[0], state: "cancelling" }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        revision: -1,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...controlSnapshot.actors[0], activeDescendantCount: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        operations: [
+          {
+            rootActorId: actor.id,
+            state: "partial",
+            residualCount: 1,
+            message: "x".repeat(2_049),
+            operationRevision: 1,
+          },
+        ],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeCancelInput({
+        scope: snapshot.scope,
+        scopeId: snapshot.scopeId,
+        actorId: actor.id,
+        expectedControlRevision: 3,
+        nativeThreadId: "provider-thread-1",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRetryInput({
+        scope: { _tag: "terminal", threadId: "thread-1", terminalId: "term-1" },
+        scopeId: snapshot.scopeId,
+        rootActorId: actor.id,
+        expectedOperationRevision: 4,
+        descendantIds: ["provider-child-1"],
+      }),
+    ).toThrow();
+  });
+
+  it("enforces every public control collection bound and non-negative revision/count", () => {
+    // Mutation caught: accepting an unbounded or negative server-authoritative control value.
+    const controlSnapshot = snapshot.control;
+    const actorControl = controlSnapshot.actors[0];
+    const operation = {
+      rootActorId: actor.id,
+      state: "partial" as const,
+      residualCount: 1,
+      message: "One descendant could not be stopped.",
+      operationRevision: 2,
+    };
+    const controlDelta = {
+      scopeId: snapshot.scopeId,
+      previousRevision: 6,
+      revision: 7,
+      changes: [{ kind: "actor-upserted" as const, actor: actorControl }],
+    };
+    const decodeControlSnapshot = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlSnapshot") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeControlDelta = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlDelta") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: Array.from({ length: 201 }, (_, index) => ({
+          actorId: `actor:bounded-${index}`,
+          state: "available",
+          controlRevision: index,
+          activeDescendantCount: 0,
+        })),
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlDelta({
+        ...controlDelta,
+        changes: Array.from({ length: 257 }, () => controlDelta.changes[0]),
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...actorControl, controlRevision: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...actorControl, activeDescendantCount: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        operations: [{ ...operation, residualCount: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        operations: [{ ...operation, operationRevision: -1 }],
+      }),
+    ).toThrow();
+    expect(() => decodeControlSnapshot({ ...controlSnapshot, revision: -1 })).toThrow();
+    expect(() => decodeControlDelta({ ...controlDelta, previousRevision: -1 })).toThrow();
+    expect(() => decodeControlDelta({ ...controlDelta, revision: -1 })).toThrow();
   });
 
   it("rejects invalid snapshot revisions", () => {

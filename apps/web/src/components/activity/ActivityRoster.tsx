@@ -1,5 +1,7 @@
 import {
   ACTIVITY_PAGE_MAX_LENGTH,
+  type ActivityActorControl,
+  type ActivityRecordId,
   type ActivityRecordSummary,
   type ActivitySection,
   type ActivitySnapshot,
@@ -11,6 +13,7 @@ import { PROVIDER_ICON_BY_PROVIDER } from "~/components/chat/providerIconUtils";
 import { Alert, AlertAction, AlertDescription } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { Spinner } from "~/components/ui/spinner";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import {
   activityElapsedLabel,
   activityStatusLabel,
@@ -20,6 +23,7 @@ import {
 import type { ActivityQueryResult, ActivityRosterPageData } from "./ActivityPanel";
 
 const WINDOW_GROUP_SIZE = 50;
+const MAX_ROSTER_INDENT_DEPTH = 4;
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -28,6 +32,120 @@ function compareText(left: string, right: string): number {
 export interface ReconciledActivityRoster {
   readonly active: ReadonlyArray<ActivityRecordSummary>;
   readonly done: ReadonlyArray<ActivityRecordSummary>;
+}
+
+export interface ActivityRosterPresentationRecord {
+  readonly record: ActivityRecordSummary;
+  readonly depth: number;
+  readonly connectedToVisibleParent: boolean;
+}
+
+function invalidParentIds(records: ReadonlyArray<ActivityRecordSummary>): ReadonlySet<string> {
+  const actorsById = new Map<string, Extract<ActivityRecordSummary, { readonly _tag: "actor" }>>();
+  for (const record of records) {
+    if (record._tag === "actor") {
+      actorsById.set(record.id, record);
+    }
+  }
+
+  const invalid = new Set<string>();
+  for (const record of records) {
+    if (record._tag !== "actor") {
+      continue;
+    }
+    const path: string[] = [];
+    const pathIndex = new Map<string, number>();
+    let current: Extract<ActivityRecordSummary, { readonly _tag: "actor" }> | undefined = record;
+    for (let hops = 0; current !== undefined && hops <= records.length; hops += 1) {
+      const cycleStart = pathIndex.get(current.id);
+      if (cycleStart !== undefined) {
+        for (let index = cycleStart; index < path.length; index += 1) {
+          invalid.add(path[index]!);
+        }
+        break;
+      }
+      pathIndex.set(current.id, path.length);
+      path.push(current.id);
+      current = current.parentActorId === null ? undefined : actorsById.get(current.parentActorId);
+    }
+  }
+  return invalid;
+}
+
+export function projectActivityRosterHierarchy(
+  records: ReadonlyArray<ActivityRecordSummary>,
+  section: ActivitySection,
+): ReadonlyArray<ActivityRosterPresentationRecord> {
+  if (section !== "subagents") {
+    return records.map((record) => ({
+      record,
+      depth: 0,
+      connectedToVisibleParent: false,
+    }));
+  }
+
+  const byId = new Map<string, ActivityRecordSummary>();
+  for (const record of records) {
+    byId.set(record.id, record);
+  }
+  const invalid = invalidParentIds(records);
+  const childrenByParentId = new Map<string, ActivityRecordSummary[]>();
+  const roots: ActivityRecordSummary[] = [];
+  for (const record of records) {
+    if (record._tag !== "actor" || record.parentActorId === null || invalid.has(record.id)) {
+      roots.push(record);
+      continue;
+    }
+    const parent = byId.get(record.parentActorId);
+    if (parent?._tag !== "actor") {
+      roots.push(record);
+      continue;
+    }
+    const children = childrenByParentId.get(parent.id);
+    if (children === undefined) {
+      childrenByParentId.set(parent.id, [record]);
+    } else {
+      children.push(record);
+    }
+  }
+
+  const projected: ActivityRosterPresentationRecord[] = [];
+  const visited = new Set<string>();
+  const appendTree = (root: ActivityRecordSummary) => {
+    const stack: Array<{
+      readonly record: ActivityRecordSummary;
+      readonly traversalDepth: number;
+      readonly connectedToVisibleParent: boolean;
+    }> = [{ record: root, traversalDepth: 0, connectedToVisibleParent: false }];
+    while (stack.length > 0) {
+      const item = stack.pop()!;
+      if (visited.has(item.record.id)) {
+        continue;
+      }
+      visited.add(item.record.id);
+      projected.push({
+        record: item.record,
+        depth: Math.min(item.traversalDepth, MAX_ROSTER_INDENT_DEPTH),
+        connectedToVisibleParent: item.connectedToVisibleParent,
+      });
+      const children = childrenByParentId.get(item.record.id) ?? [];
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        stack.push({
+          record: children[index]!,
+          traversalDepth: item.traversalDepth + 1,
+          connectedToVisibleParent: true,
+        });
+      }
+    }
+  };
+
+  for (const root of roots) {
+    appendTree(root);
+  }
+  for (const record of records) {
+    appendTree(record);
+  }
+  return projected;
 }
 
 export function reconcileActivityRosterRecords(
@@ -141,9 +259,9 @@ function RosterError({
 }
 
 function recordGroups(
-  records: ReadonlyArray<ActivityRecordSummary>,
-): ReadonlyArray<ReadonlyArray<ActivityRecordSummary>> {
-  const groups: ActivityRecordSummary[][] = [];
+  records: ReadonlyArray<ActivityRosterPresentationRecord>,
+): ReadonlyArray<ReadonlyArray<ActivityRosterPresentationRecord>> {
+  const groups: ActivityRosterPresentationRecord[][] = [];
   for (let index = 0; index < records.length; index += WINDOW_GROUP_SIZE) {
     groups.push(records.slice(index, index + WINDOW_GROUP_SIZE));
   }
@@ -175,67 +293,134 @@ function recordTime(record: ActivityRecordSummary, now: string): string {
 
 interface ActivityRecordRowProps {
   readonly record: ActivityRecordSummary;
+  readonly depth: number;
+  readonly connectedToVisibleParent: boolean;
+  readonly control: ActivityActorControl | null;
+  readonly controlUnavailable: boolean;
   readonly provider: string;
   readonly now: string;
   readonly onSelect: (record: ActivityRecordSummary) => void;
+  readonly onCancelActor?: (actorId: ActivityRecordId, controlRevision: number) => void;
   readonly registerRow: (recordId: string, element: HTMLButtonElement | null) => void;
 }
 
 function ActivityRecordRow({
   record,
+  depth,
+  connectedToVisibleParent,
+  control,
+  controlUnavailable,
   provider,
   now,
   onSelect,
+  onCancelActor,
   registerRow,
 }: ActivityRecordRowProps) {
   const recordProvider = providerForRecord(record, provider);
   const ProviderIcon = providerIcon(recordProvider);
-  const RecordIcon = record._tag === "actor" ? BotIcon : ListTodoIcon;
   const typeLabel = record._tag === "actor" ? (record.role ?? "Actor") : record.workKind;
+  const stopping = control?.state === "requested";
+  const activeDescendants = control?.activeDescendantCount ?? 0;
+  const stopImpactLabel =
+    control === null || record._tag !== "actor"
+      ? null
+      : activeDescendants === 0
+        ? `Stop ${record.name}`
+        : `Stop ${record.name} and ${activeDescendants} child ${activeDescendants === 1 ? "agent" : "agents"}`;
+  const actionText = stopping ? "Stopping" : activeDescendants > 0 ? "Stop subtree" : "Stop";
 
   return (
-    <Button
-      className="w-full items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
-      data-activity-row={record.id}
-      onClick={() => onSelect(record)}
-      ref={(element) => registerRow(record.id, element)}
-      size="content"
-      variant="ghost"
+    <div
+      className="relative flex min-w-0 w-full items-start gap-2"
+      data-activity-hierarchy-depth={depth}
+      data-activity-row-layout={record.id}
+      style={{ paddingInlineStart: `${Math.min(depth, MAX_ROSTER_INDENT_DEPTH) * 12}px` }}
     >
-      <span className="mt-0.5 flex shrink-0 items-center -space-x-1">
+      {connectedToVisibleParent ? (
         <span
-          className="flex size-6 items-center justify-center rounded-full border border-border bg-muted"
-          data-activity-provider-glyph={recordProvider}
-          title={recordProvider}
-        >
-          <ProviderIcon aria-hidden="true" className="size-3.5" />
-        </span>
-        <span
-          className="flex size-6 items-center justify-center rounded-full border border-border bg-background"
-          data-activity-record-glyph={record._tag}
-          title={typeLabel}
-        >
-          <RecordIcon aria-hidden="true" className="size-3.5" />
-        </span>
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="min-w-0 flex-1 truncate font-medium">{record.name}</span>
-          <span className="shrink-0 text-xs text-muted-foreground">
-            {activityStatusLabel(record.status)}
+          aria-hidden="true"
+          className="pointer-events-none absolute bottom-1 top-0 w-px bg-border"
+          data-activity-hierarchy-connector={record.id}
+          style={{ insetInlineStart: `${Math.max(0, depth - 1) * 12 + 6}px` }}
+        />
+      ) : null}
+      <Button
+        className="min-w-0 flex-1 items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
+        data-activity-row={record.id}
+        onClick={() => onSelect(record)}
+        ref={(element) => registerRow(record.id, element)}
+        size="content"
+        variant="ghost"
+      >
+        {record._tag === "actor" ? (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-muted"
+            data-activity-provider-glyph={recordProvider}
+            title={recordProvider}
+          >
+            <ProviderIcon aria-hidden="true" className="size-3.5" />
+          </span>
+        ) : (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-background"
+            data-activity-record-glyph="workItem"
+            title={typeLabel}
+          >
+            <ListTodoIcon aria-hidden="true" className="size-3.5" />
+          </span>
+        )}
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 flex-1 truncate font-medium">{record.name}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {stopping ? "Stopping" : activityStatusLabel(record.status)}
+            </span>
+          </span>
+          {record.summary !== null ? (
+            <span className="line-clamp-2 text-xs font-normal text-muted-foreground">
+              {record.summary}
+            </span>
+          ) : null}
+          <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
+            <span>{typeLabel}</span>
+            {record._tag === "actor" && record.parentActorId !== null ? (
+              <span>Child agent</span>
+            ) : null}
+            <span>{recordTime(record, now)}</span>
           </span>
         </span>
-        {record.summary !== null ? (
-          <span className="line-clamp-2 text-xs font-normal text-muted-foreground">
-            {record.summary}
-          </span>
-        ) : null}
-        <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
-          <span>{typeLabel}</span>
-          <span>{recordTime(record, now)}</span>
+      </Button>
+      {controlUnavailable ? (
+        <span
+          className="mt-2 shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+          data-activity-control-unavailable={record.id}
+        >
+          Stop unavailable
         </span>
-      </span>
-    </Button>
+      ) : stopImpactLabel === null || control === null || onCancelActor === undefined ? null : (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                aria-label={stopImpactLabel}
+                className="mt-1 min-h-8 min-w-14 shrink-0"
+                disabled={control.state === "requested"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onCancelActor(record.id, control.controlRevision);
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                size="sm"
+                variant="outline"
+              >
+                {actionText}
+              </Button>
+            }
+          />
+          <TooltipPopup>{stopImpactLabel}</TooltipPopup>
+        </Tooltip>
+      )}
+    </div>
   );
 }
 
@@ -251,6 +436,7 @@ export interface ActivityRosterProps {
   readonly onFocusRestored: () => void;
   readonly onSelect: (record: ActivityRecordSummary) => void;
   readonly onLoadMore: (bucket: "active" | "done") => void;
+  readonly onCancelActor?: (actorId: ActivityRecordId, controlRevision: number) => void;
 }
 
 export function ActivityRoster({
@@ -265,6 +451,7 @@ export function ActivityRoster({
   onFocusRestored,
   onSelect,
   onLoadMore,
+  onCancelActor,
 }: ActivityRosterProps) {
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
   const activeRecords = reconciled.active;
@@ -283,6 +470,35 @@ export function ActivityRoster({
     (active.loading || done.loading) &&
     snapshot.sections[section].state !== "unsupported";
   const hasRosterError = active.error !== null || done.error !== null;
+  const targetedActorMutationAvailable =
+    section === "subagents" &&
+    snapshot.scope._tag === "thread" &&
+    snapshot.capabilities.targetedActorCancellation &&
+    onCancelActor !== undefined;
+  const actorControls = new Map<string, ActivityActorControl>();
+  for (const query of [active, done]) {
+    for (const page of query.pages) {
+      for (const control of page.actorControls) {
+        actorControls.set(control.actorId, control);
+      }
+    }
+  }
+  for (const control of snapshot.control.actors) {
+    actorControls.set(control.actorId, control);
+  }
+  const controlForRecord = (record: ActivityRecordSummary): ActivityActorControl | null => {
+    if (
+      section !== "subagents" ||
+      snapshot.scope._tag !== "thread" ||
+      !snapshot.capabilities.targetedActorCancellation ||
+      record._tag !== "actor" ||
+      !isActivityLifecycleActive(record.status)
+    ) {
+      return null;
+    }
+    const control = actorControls.get(record.id);
+    return control?.state === "available" || control?.state === "requested" ? control : null;
+  };
 
   useEffect(() => {
     if (focusRecordId === null) {
@@ -302,8 +518,8 @@ export function ActivityRoster({
       rowRefs.current.set(recordId, element);
     }
   };
-  const activeGroups = recordGroups(activeRecords);
-  const doneGroups = recordGroups(doneRecords);
+  const activeGroups = recordGroups(projectActivityRosterHierarchy(activeRecords, section));
+  const doneGroups = recordGroups(projectActivityRosterHierarchy(doneRecords, section));
 
   return (
     <section aria-label={sectionName} className="flex min-h-0 flex-1 flex-col">
@@ -346,17 +562,33 @@ export function ActivityRoster({
               </h3>
               <div>
                 {activeGroups.map((group, groupIndex) => (
-                  <div data-activity-window-group={`active-${groupIndex}`} key={group[0]?.id}>
-                    {group.map((record) => (
-                      <ActivityRecordRow
-                        key={record.id}
-                        now={now}
-                        onSelect={onSelect}
-                        provider={snapshot.provider}
-                        record={record}
-                        registerRow={registerRow}
-                      />
-                    ))}
+                  <div
+                    data-activity-window-group={`active-${groupIndex}`}
+                    key={group[0]?.record.id}
+                  >
+                    {group.map(({ record, depth, connectedToVisibleParent }) => {
+                      const control = controlForRecord(record);
+                      return (
+                        <ActivityRecordRow
+                          connectedToVisibleParent={connectedToVisibleParent}
+                          control={control}
+                          controlUnavailable={
+                            targetedActorMutationAvailable &&
+                            record._tag === "actor" &&
+                            isActivityLifecycleActive(record.status) &&
+                            control === null
+                          }
+                          depth={depth}
+                          key={record.id}
+                          now={now}
+                          onSelect={onSelect}
+                          {...(onCancelActor === undefined ? {} : { onCancelActor })}
+                          provider={snapshot.provider}
+                          record={record}
+                          registerRow={registerRow}
+                        />
+                      );
+                    })}
                   </div>
                 ))}
               </div>
@@ -370,12 +602,17 @@ export function ActivityRoster({
               </h3>
               <div>
                 {doneGroups.map((group, groupIndex) => (
-                  <div data-activity-window-group={`done-${groupIndex}`} key={group[0]?.id}>
-                    {group.map((record) => (
+                  <div data-activity-window-group={`done-${groupIndex}`} key={group[0]?.record.id}>
+                    {group.map(({ record, depth, connectedToVisibleParent }) => (
                       <ActivityRecordRow
+                        connectedToVisibleParent={connectedToVisibleParent}
+                        control={controlForRecord(record)}
+                        controlUnavailable={false}
+                        depth={depth}
                         key={record.id}
                         now={now}
                         onSelect={onSelect}
+                        {...(onCancelActor === undefined ? {} : { onCancelActor })}
                         provider={snapshot.provider}
                         record={record}
                         registerRow={registerRow}

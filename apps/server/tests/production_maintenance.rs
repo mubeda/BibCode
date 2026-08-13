@@ -83,6 +83,14 @@ fn every_public_mutation_boundary_is_classified_centrally() {
     );
     assert_eq!(rpc_mutability("terminal.write"), RpcMutability::Mutation);
     assert_eq!(
+        rpc_mutability("activity.cancelSubtree"),
+        RpcMutability::Mutation
+    );
+    assert_eq!(
+        rpc_mutability("activity.retrySubtreeCancellation"),
+        RpcMutability::Mutation
+    );
+    assert_eq!(
         rpc_mutability("orchestration.subscribeShell"),
         RpcMutability::Read
     );
@@ -241,6 +249,40 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         rejected.pointer("/exit/cause/0/error/_tag"),
         Some(&json!("UpdateMaintenanceActiveError"))
     );
+
+    for (id, tag) in [
+        ("11", "activity.cancelSubtree"),
+        ("12", "activity.retrySubtreeCancellation"),
+    ] {
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": id,
+                    "tag": tag,
+                    "payload": {},
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("activity mutation RPC request");
+        let rejected = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("activity mutation response timeout")
+            .expect("socket remains open")
+            .expect("activity mutation response frame");
+        let rejected: Value =
+            serde_json::from_str(rejected.to_text().expect("activity mutation response text"))
+                .expect("activity mutation response JSON");
+        assert_eq!(rejected["requestId"], id);
+        assert_eq!(
+            rejected.pointer("/exit/cause/0/error/_tag"),
+            Some(&json!("UpdateMaintenanceActiveError")),
+            "maintenance admitted {tag}"
+        );
+    }
 
     socket
         .send(Message::Text(

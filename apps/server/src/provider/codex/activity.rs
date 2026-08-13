@@ -12,7 +12,7 @@ use crate::activity::{
     ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary, ActivityCapabilities, ActivityEntry,
     ActivityEntryKind, ActivityEntryTone, ActivityHistoryRecovery, ActivityLifecycle,
     ActivityObservationState, ActivityRecordKind, ActivityWorkItemSummary,
-    ProviderActivityMutation,
+    ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
 };
 
 use super::model::{
@@ -44,6 +44,7 @@ pub struct CodexActivityStateCounts {
 #[derive(Debug, Default)]
 pub struct CodexActivityOutput {
     pub mutations: Vec<ProviderActivityMutation>,
+    pub(crate) controls: Vec<ProviderActivityControlUpdate>,
     pub request_reconciliation: bool,
     pub hinted_descendant_ids: Vec<String>,
 }
@@ -91,6 +92,19 @@ impl CodexActivityOutput {
         }
     }
 
+    fn push_control(&mut self, control: ProviderActivityControlUpdate) {
+        if self.controls.len() < MAX_MUTATIONS_PER_OUTPUT {
+            self.controls.push(control);
+        }
+    }
+
+    fn push_actor_update(&mut self, update: ActivityActorUpdate) {
+        self.push(ProviderActivityMutation::UpsertActor(update.actor));
+        if let Some(control) = update.control {
+            self.push_control(control);
+        }
+    }
+
     #[allow(dead_code, reason = "used by the pending runtime hint integration")]
     fn merge(&mut self, other: Self) {
         for mutation in other.mutations {
@@ -98,6 +112,9 @@ impl CodexActivityOutput {
         }
         for native_thread_id in other.hinted_descendant_ids {
             self.push_hint(&native_thread_id);
+        }
+        for control in other.controls {
+            self.push_control(control);
         }
         self.request_reconciliation |= other.request_reconciliation;
     }
@@ -114,6 +131,12 @@ struct ActivityActorState {
     started_at: String,
     updated_at: String,
     terminal_at: Option<String>,
+    active_turn_id: Option<String>,
+}
+
+struct ActivityActorUpdate {
+    actor: ActivityActorSummary,
+    control: Option<ProviderActivityControlUpdate>,
 }
 
 impl ActivityActorState {
@@ -351,6 +374,7 @@ impl CodexActivityTracker {
                 started_at: unix_millis_to_timestamp(0),
                 updated_at: unix_millis_to_timestamp(0),
                 terminal_at: None,
+                active_turn_id: None,
             },
         );
         self.provisional_actor_keys.remove(&native_key);
@@ -383,6 +407,90 @@ impl CodexActivityTracker {
         let native_key = thread_key(native_thread_id);
         self.actors_by_thread.contains_key(&native_key)
             && !self.provisional_actor_keys.contains(&native_key)
+    }
+
+    pub(crate) fn actor_control_id(&self, native_thread_id: &str) -> Option<&str> {
+        let native_key = thread_key(native_thread_id);
+        (!self.provisional_actor_keys.contains(&native_key))
+            .then(|| self.actors_by_thread.get(&native_key))
+            .flatten()
+            .map(|actor| actor.canonical_id.as_str())
+    }
+
+    #[must_use]
+    pub(crate) fn is_current_target(&self, native_thread_id: &str, turn_id: &str) -> bool {
+        usable_native_id(native_thread_id)
+            && usable_native_id(turn_id)
+            && !self.is_root_thread(native_thread_id)
+            && self.is_verified_child(native_thread_id)
+            && self
+                .actors_by_thread
+                .get(&thread_key(native_thread_id))
+                .is_some_and(|actor| {
+                    !actor.status.is_terminal() && actor.active_turn_id.as_deref() == Some(turn_id)
+                })
+    }
+
+    fn update_active_turn_control(
+        &mut self,
+        native_thread_id: &str,
+        turn_id: Option<&str>,
+        active: bool,
+    ) -> Option<ProviderActivityControlUpdate> {
+        if !usable_native_id(native_thread_id)
+            || self.is_root_thread(native_thread_id)
+            || !self.is_verified_child(native_thread_id)
+        {
+            return None;
+        }
+        let native_key = thread_key(native_thread_id);
+        let actor = self.actors_by_thread.get_mut(&native_key)?;
+        if active {
+            let turn_id = turn_id.filter(|turn_id| usable_native_id(turn_id))?;
+            if actor.status.is_terminal() {
+                return None;
+            }
+            if actor.active_turn_id.as_deref() == Some(turn_id) {
+                return None;
+            }
+            if actor.active_turn_id.is_some() {
+                actor.active_turn_id = None;
+                return Some(ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: actor.canonical_id.clone(),
+                    target: None,
+                });
+            }
+            actor.active_turn_id = Some(turn_id.to_owned());
+            return Some(ProviderActivityControlUpdate::ActorTarget {
+                actor_id: actor.canonical_id.clone(),
+                target: Some(ProviderActivityNativeTarget::codex_turn(
+                    native_thread_id.to_owned(),
+                    turn_id.to_owned(),
+                )),
+            });
+        }
+        if actor.active_turn_id.as_deref() != turn_id {
+            return None;
+        }
+        actor.active_turn_id = None;
+        Some(ProviderActivityControlUpdate::ActorTarget {
+            actor_id: actor.canonical_id.clone(),
+            target: None,
+        })
+    }
+
+    fn clear_active_turn_control(
+        &mut self,
+        native_thread_id: &str,
+    ) -> Option<ProviderActivityControlUpdate> {
+        let actor = self
+            .actors_by_thread
+            .get_mut(&thread_key(native_thread_id))?;
+        actor.active_turn_id.take()?;
+        Some(ProviderActivityControlUpdate::ActorTarget {
+            actor_id: actor.canonical_id.clone(),
+            target: None,
+        })
     }
 
     #[must_use]
@@ -467,6 +575,8 @@ impl CodexActivityTracker {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::None,
                     terminal_observation: false,
+                    targeted_actor_cancellation: self.sub_agent_hint_projection
+                        == SubAgentHintProjection::StructuredChat,
                 },
                 observation_state: ActivityObservationState::Live,
             });
@@ -598,7 +708,7 @@ impl CodexActivityTracker {
                 ActorReopenAuthority::ProviderTimestamp,
             )
         };
-        let Some(actor) = self.upsert_actor_state(
+        let Some(actor_update) = self.upsert_actor_state(
             hint.native_thread_id,
             parent_actor_id.as_deref(),
             Some(&hint.fallback_name),
@@ -618,7 +728,7 @@ impl CodexActivityTracker {
             request_reconciliation: true,
             ..CodexActivityOutput::default()
         };
-        output.push(ProviderActivityMutation::UpsertActor(actor));
+        output.push_actor_update(actor_update);
         output.push_hint(hint.native_thread_id);
         output
     }
@@ -746,7 +856,7 @@ impl CodexActivityTracker {
                 .and_then(|state| state.get("message"))
                 .and_then(Value::as_str)
                 .map(bounded_summary);
-            if let Some(actor) = self.upsert_actor_state(
+            if let Some(actor_update) = self.upsert_actor_state(
                 receiver,
                 parent_actor_id.as_deref(),
                 None,
@@ -757,7 +867,7 @@ impl CodexActivityTracker {
                 false,
                 reopen_authority,
             ) {
-                output.push(ProviderActivityMutation::UpsertActor(actor));
+                output.push_actor_update(actor_update);
             }
         }
         output
@@ -806,7 +916,7 @@ impl CodexActivityTracker {
         timestamp: &str,
         authoritative: bool,
         reopen_authority: ActorReopenAuthority<'_>,
-    ) -> Option<ActivityActorSummary> {
+    ) -> Option<ActivityActorUpdate> {
         if native_thread_id.is_empty() {
             return None;
         }
@@ -835,6 +945,12 @@ impl CodexActivityTracker {
             {
                 return None;
             }
+            if status.is_terminal()
+                && existing.active_turn_id.is_some()
+                && !activity_timestamp_is_not_older(timestamp, &existing.updated_at)
+            {
+                return None;
+            }
             let next_summary = summary.or_else(|| existing.summary.clone());
             let next_parent = if authoritative {
                 parent_actor_id
@@ -847,19 +963,24 @@ impl CodexActivityTracker {
                 .map(bounded_label)
                 .unwrap_or_else(|| existing.name.clone());
             let next_role = role.map(bounded_label).or_else(|| existing.role.clone());
-            if existing.status == status
-                && existing.summary == next_summary
-                && existing.parent_actor_id == next_parent
-                && existing.name == next_name
-                && existing.role == next_role
-            {
-                return None;
-            }
             let updated_at = latest_activity_timestamp([
                 existing.started_at.as_str(),
                 existing.updated_at.as_str(),
                 timestamp,
             ])?;
+            let clear_active_target = status.is_terminal() && existing.active_turn_id.is_some();
+            if existing.status == status
+                && existing.summary == next_summary
+                && existing.parent_actor_id == next_parent
+                && existing.name == next_name
+                && existing.role == next_role
+                && !clear_active_target
+            {
+                if !status.is_terminal() {
+                    existing.updated_at = updated_at;
+                }
+                return None;
+            }
             let mut candidate = existing.clone();
             candidate.parent_actor_id = next_parent;
             candidate.name = next_name;
@@ -868,12 +989,19 @@ impl CodexActivityTracker {
             candidate.summary = next_summary;
             candidate.updated_at = updated_at.clone();
             candidate.terminal_at = status.is_terminal().then_some(updated_at);
+            if status.is_terminal() {
+                candidate.active_turn_id = None;
+            }
             let actor = candidate.to_summary()?;
             candidate.started_at.clone_from(&actor.started_at);
             candidate.updated_at.clone_from(&actor.updated_at);
             candidate.terminal_at.clone_from(&actor.terminal_at);
             *existing = candidate;
-            return Some(actor);
+            let control = clear_active_target.then(|| ProviderActivityControlUpdate::ActorTarget {
+                actor_id: actor.id.clone(),
+                target: None,
+            });
+            return Some(ActivityActorUpdate { actor, control });
         }
         if self.actors_by_thread.len() >= MAX_TRACKED_ACTORS {
             return None;
@@ -893,10 +1021,14 @@ impl CodexActivityTracker {
             started_at: timestamp.to_owned(),
             updated_at: timestamp.to_owned(),
             terminal_at: status.is_terminal().then(|| timestamp.to_owned()),
+            active_turn_id: None,
         };
         let summary = actor.to_summary()?;
         self.actors_by_thread.insert(native_key, actor);
-        Some(summary)
+        Some(ActivityActorUpdate {
+            actor: summary,
+            control: None,
+        })
     }
 
     fn materialize_provisional_actor(
@@ -1209,11 +1341,18 @@ impl CodexActivityTracker {
                     ActivityLifecycle::Unknown
                 }
             });
-        let turn_id = turn
+        let validated_turn_id = turn
             .get("id")
             .or_else(|| params.get("turnId"))
             .and_then(Value::as_str)
-            .unwrap_or("turn");
+            .filter(|turn_id| usable_native_id(turn_id));
+        let turn_id = validated_turn_id.unwrap_or("turn");
+        let completion_conflicts_with_active_turn = method == "turn/completed"
+            && self
+                .actors_by_thread
+                .get(&thread_key(thread_id))
+                .and_then(|actor| actor.active_turn_id.as_deref())
+                .is_some_and(|active_turn_id| Some(active_turn_id) != validated_turn_id);
         let suppress_detail =
             self.suppress_detail_identity(turn_detail_identity(thread_id, turn_id));
         let entry_key = event_fallback_key(method, thread_id, turn_id, turn_id, status.as_str());
@@ -1226,6 +1365,7 @@ impl CodexActivityTracker {
             }
             return CodexActivityOutput {
                 mutations: Vec::new(),
+                controls: Vec::new(),
                 request_reconciliation: true,
                 hinted_descendant_ids: Vec::new(),
             };
@@ -1291,6 +1431,7 @@ impl CodexActivityTracker {
             .flatten();
         let mut output = CodexActivityOutput {
             mutations: Vec::new(),
+            controls: Vec::new(),
             request_reconciliation: method == "turn/completed" && status.is_terminal(),
             hinted_descendant_ids: Vec::new(),
         };
@@ -1310,11 +1451,48 @@ impl CodexActivityTracker {
         {
             output.push(ProviderActivityMutation::AppendEntry(entry));
         }
+        if method == "turn/started" {
+            if status.is_terminal() {
+                if let Some(control) = self.clear_active_turn_control(thread_id) {
+                    output.push_control(control);
+                }
+            } else {
+                let provider_timestamp = checked_provider_timestamp_millis(timestamp_ms);
+                let reopen_authority = provider_timestamp.as_deref().map_or(
+                    ActorReopenAuthority::None,
+                    ActorReopenAuthority::ProviderTimestamp,
+                );
+                if let Some(actor_update) = self.upsert_actor_state(
+                    thread_id,
+                    None,
+                    None,
+                    None,
+                    ActivityLifecycle::Running,
+                    None,
+                    &timestamp,
+                    true,
+                    reopen_authority,
+                ) {
+                    output.push_actor_update(actor_update);
+                }
+                if let Some(control) =
+                    self.update_active_turn_control(thread_id, validated_turn_id, true)
+                {
+                    output.push_control(control);
+                }
+            }
+        } else if method == "turn/completed"
+            && let Some(control) =
+                self.update_active_turn_control(thread_id, validated_turn_id, false)
+        {
+            output.push_control(control);
+        }
         if project_terminal_actor
             && method == "turn/completed"
             && status.is_terminal()
+            && !completion_conflicts_with_active_turn
             && let Some(terminal_actor_timestamp) = terminal_actor_timestamp.as_deref()
-            && let Some(actor) = self.upsert_actor_state(
+            && let Some(actor_update) = self.upsert_actor_state(
                 thread_id,
                 None,
                 None,
@@ -1326,7 +1504,7 @@ impl CodexActivityTracker {
                 ActorReopenAuthority::None,
             )
         {
-            output.push(ProviderActivityMutation::UpsertActor(actor));
+            output.push_actor_update(actor_update);
         }
         output
     }
@@ -1370,7 +1548,7 @@ impl CodexActivityTracker {
             ActorReopenAuthority::None
         };
         let mut output = CodexActivityOutput::default();
-        if let Some(actor) = self.upsert_actor_state(
+        if let Some(actor_update) = self.upsert_actor_state(
             thread_id,
             None,
             None,
@@ -1381,7 +1559,7 @@ impl CodexActivityTracker {
             false,
             reopen_authority,
         ) {
-            output.push(ProviderActivityMutation::UpsertActor(actor));
+            output.push_actor_update(actor_update);
         }
         output
     }
@@ -1475,7 +1653,7 @@ impl CodexActivityTracker {
                 } else {
                     ActorReopenAuthority::None
                 };
-                let mut actor_to_emit = self.upsert_actor_state(
+                let mut actor_update = self.upsert_actor_state(
                     native_thread_id,
                     parent_actor_id.as_deref(),
                     thread.agent_nickname.as_deref().or(thread.name.as_deref()),
@@ -1487,24 +1665,29 @@ impl CodexActivityTracker {
                     reopen_authority,
                 );
                 if !existed {
-                    if let Some(actor) = actor_to_emit.as_mut() {
-                        actor.started_at = unix_millis_to_timestamp(
+                    if let Some(update) = actor_update.as_mut() {
+                        update.actor.started_at = unix_millis_to_timestamp(
                             thread.created_at.unwrap_or_default().saturating_mul(1_000),
                         );
                         if let Some(state) = self.actors_by_thread.get_mut(&native_key) {
-                            state.started_at.clone_from(&actor.started_at);
+                            state.started_at.clone_from(&update.actor.started_at);
                         }
                     }
                 } else if was_provisional {
-                    actor_to_emit = self.materialize_provisional_actor(
-                        &native_key,
-                        parent_actor_id.as_deref(),
-                        thread.agent_nickname.as_deref().or(thread.name.as_deref()),
-                        thread.agent_role.as_deref(),
-                        thread.created_at.unwrap_or_default().saturating_mul(1_000),
-                        &timestamp,
-                    );
-                    if actor_to_emit.is_none() {
+                    actor_update = self
+                        .materialize_provisional_actor(
+                            &native_key,
+                            parent_actor_id.as_deref(),
+                            thread.agent_nickname.as_deref().or(thread.name.as_deref()),
+                            thread.agent_role.as_deref(),
+                            thread.created_at.unwrap_or_default().saturating_mul(1_000),
+                            &timestamp,
+                        )
+                        .map(|actor| ActivityActorUpdate {
+                            actor,
+                            control: None,
+                        });
+                    if actor_update.is_none() {
                         if let Some(previous) = provisional_before {
                             self.actors_by_thread.insert(native_key.clone(), previous);
                         }
@@ -1512,10 +1695,8 @@ impl CodexActivityTracker {
                         return false;
                     }
                 }
-                if let Some(actor) = actor_to_emit {
-                    reconciliation
-                        .output
-                        .push(ProviderActivityMutation::UpsertActor(actor));
+                if let Some(update) = actor_update {
+                    reconciliation.output.push_actor_update(update);
                 }
                 if self.reconciled_thread_versions.get(&native_key) != Some(&updated_version) {
                     reconciliation
@@ -1554,6 +1735,46 @@ impl CodexActivityTracker {
             projection_limit,
             &HashSet::new(),
         )
+    }
+
+    pub(crate) fn validated_reconciliation_hint_receiver_ids(
+        &self,
+        thread: &ReconciliationThread,
+    ) -> HashSet<String> {
+        let Some(owning_thread_id) = thread.id.as_deref().filter(|id| usable_native_id(id)) else {
+            return HashSet::new();
+        };
+        if !self.is_root_thread(owning_thread_id) && !self.is_verified_child(owning_thread_id) {
+            return HashSet::new();
+        }
+        let mut receiver_ids = HashSet::new();
+        let mut normalized_hint_count = 0;
+        'turns: for turn in thread.turns.iter().rev().take(MAX_RECONCILED_TURNS).rev() {
+            for item in &turn.items {
+                let ReconciliationThreadItem::SubAgentActivity {
+                    agent_thread_id,
+                    agent_path,
+                    kind,
+                    ..
+                } = item
+                else {
+                    continue;
+                };
+                if normalized_hint_count == MAX_RECONCILED_ENTRIES {
+                    break 'turns;
+                }
+                normalized_hint_count += 1;
+                if let Some(hint) = self.validate_sub_agent_hint(
+                    owning_thread_id,
+                    agent_thread_id.as_deref(),
+                    agent_path.as_deref(),
+                    kind.as_deref(),
+                ) {
+                    receiver_ids.insert(hint.native_thread_id.to_owned());
+                }
+            }
+        }
+        receiver_ids
     }
 
     pub(crate) fn reconcile_sub_agent_hints_with_projection_limit_excluding(
@@ -1731,6 +1952,9 @@ impl CodexActivityTracker {
                     emitted_at_ms,
                     false,
                 );
+                for control in turn_output.controls {
+                    output.push_control(control);
+                }
                 retained_entries.extend(turn_output.mutations.into_iter().filter(|mutation| {
                     matches!(mutation, ProviderActivityMutation::AppendEntry(_))
                 }));
@@ -1765,6 +1989,40 @@ impl CodexActivityTracker {
         for mutation in retained_entries {
             output.push(mutation);
         }
+        let active_turn_ids = if matches!(
+            thread.status,
+            Some(ReconciliationThreadStatus::Active { .. })
+        ) {
+            topology_turns
+                .iter()
+                .filter(|turn| turn.completed_at.is_none())
+                .filter_map(|turn| {
+                    let turn_id = turn
+                        .id
+                        .as_deref()
+                        .filter(|turn_id| usable_native_id(turn_id))?;
+                    let status = turn.status.as_deref().map(Self::map_status)?;
+                    matches!(
+                        status,
+                        ActivityLifecycle::Starting
+                            | ActivityLifecycle::Running
+                            | ActivityLifecycle::Waiting
+                    )
+                    .then_some(turn_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if let [turn_id] = active_turn_ids.as_slice() {
+            if let Some(control) =
+                self.update_active_turn_control(native_thread_id, Some(turn_id), true)
+            {
+                output.push_control(control);
+            }
+        } else if let Some(control) = self.clear_active_turn_control(native_thread_id) {
+            output.push_control(control);
+        }
         let native_status_allows_terminal_projection = matches!(
             thread.status,
             None | Some(ReconciliationThreadStatus::NotLoaded)
@@ -1786,7 +2044,7 @@ impl CodexActivityTracker {
                         .updated_at
                         .and_then(checked_provider_timestamp_seconds)
                 })
-            && let Some(actor) = self.upsert_actor_state(
+            && let Some(actor_update) = self.upsert_actor_state(
                 native_thread_id,
                 None,
                 None,
@@ -1798,7 +2056,7 @@ impl CodexActivityTracker {
                 ActorReopenAuthority::None,
             )
         {
-            output.push(ProviderActivityMutation::UpsertActor(actor));
+            output.push_actor_update(actor_update);
         }
         self.reconciled_thread_versions
             .insert(native_key, thread.updated_at.unwrap_or_default());
@@ -2171,7 +2429,7 @@ fn delta_stream_key(thread_id: &str, turn_id: &str, item_id: &str) -> String {
     length_prefixed_key("stream", &[thread_id, turn_id, item_id])
 }
 
-fn usable_native_id(native_id: &str) -> bool {
+pub(crate) fn usable_native_id(native_id: &str) -> bool {
     !native_id.is_empty()
         && native_id.len() <= MAX_RETAINED_KEY_BYTES
         && !native_id.chars().any(char::is_whitespace)
@@ -2430,6 +2688,522 @@ fn normalize_fractional_seconds(mut timestamp: String) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    mod targeted_control {
+        use crate::activity::{
+            ActivityActorControlState, ActivityControlRegistry, ActivityScopeRef,
+            ProviderActivityControlUpdate,
+        };
+
+        use super::*;
+
+        fn verified_child(tracker: &mut CodexActivityTracker, thread_id: &str) {
+            let child = decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": thread_id,
+                    "parentThreadId": "root-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("verified child thread")
+            .thread;
+            let reconciliation = tracker.reconcile_descendants(&[child]);
+            assert_eq!(reconciliation.accepted_thread_ids, [thread_id]);
+        }
+
+        fn target_ids(update: &ProviderActivityControlUpdate) -> Option<(&str, &str)> {
+            match update {
+                ProviderActivityControlUpdate::ActorTarget {
+                    target: Some(target),
+                    ..
+                } => target.codex_turn_ids(),
+                ProviderActivityControlUpdate::ActorTarget { target: None, .. }
+                | ProviderActivityControlUpdate::WorkTarget { .. } => None,
+            }
+        }
+
+        #[test]
+        fn verified_child_turn_lifecycle_installs_and_removes_exact_target() {
+            // Mutation caught: exposing a target before verification or retaining it after completion.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+
+            let started = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "child-turn-7", "status": "inProgress"}
+                }),
+                3_000,
+                0,
+            );
+            assert!(matches!(
+                started.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget { actor_id, .. }]
+                    if actor_id == "codex:thread:child-2"
+            ));
+            assert_eq!(
+                target_ids(&started.controls[0]),
+                Some(("child-2", "child-turn-7"))
+            );
+
+            let completed = tracker.handle_notification(
+                "turn/completed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {
+                        "id": "child-turn-7",
+                        "status": "completed",
+                        "completedAt": 4
+                    }
+                }),
+                4_000,
+                1,
+            );
+            assert!(matches!(
+                completed.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget {
+                    actor_id,
+                    target: None,
+                }] if actor_id == "codex:thread:child-2"
+            ));
+        }
+
+        #[test]
+        fn reconciled_active_child_turn_installs_the_same_exact_target() {
+            // Mutation caught: limiting exact handles to live notifications and losing reconnect recovery.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            let child = decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": "child-2",
+                    "parentThreadId": "root-1",
+                    "createdAt": 1,
+                    "updatedAt": 3,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": [{
+                        "id": "child-turn-7",
+                        "status": "inProgress",
+                        "startedAt": 3,
+                        "items": []
+                    }]
+                }
+            }))
+            .expect("active child history")
+            .thread;
+
+            let output = tracker.reconcile_thread_history(&child);
+            assert_eq!(output.controls.len(), 1);
+            assert_eq!(
+                target_ids(&output.controls[0]),
+                Some(("child-2", "child-turn-7"))
+            );
+        }
+
+        #[test]
+        fn stale_completion_cannot_terminalize_or_replace_a_new_active_turn() {
+            // Mutation caught: letting an old completion invalidate a later canonical reopening.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "inProgress"}
+                }),
+                3_000,
+                0,
+            );
+            tracker.handle_notification(
+                "turn/completed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "completed", "completedAt": 4}
+                }),
+                4_000,
+                1,
+            );
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-2", "status": "inProgress", "startedAt": 5}
+                }),
+                5_000,
+                2,
+            );
+
+            let stale = tracker.handle_notification(
+                "turn/completed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {
+                        "id": "late-old-turn",
+                        "status": "failed",
+                        "completedAt": 6
+                    }
+                }),
+                6_000,
+                3,
+            );
+
+            assert!(stale.controls.is_empty());
+            assert!(stale.mutations.iter().all(|mutation| !matches!(
+                mutation,
+                ProviderActivityMutation::UpsertActor(actor) if actor.status.is_terminal()
+            )));
+            assert!(tracker.is_current_target("child-2", "turn-2"));
+        }
+
+        #[test]
+        fn terminal_started_notification_revokes_an_existing_target() {
+            // Mutation caught: retaining an opaque target after terminal provider evidence.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "inProgress"}
+                }),
+                3_000,
+                0,
+            );
+
+            let terminal = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "completed"}
+                }),
+                4_000,
+                1,
+            );
+
+            assert!(matches!(
+                terminal.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget { target: None, .. }]
+            ));
+            assert!(!tracker.is_current_target("child-2", "turn-1"));
+        }
+
+        #[test]
+        fn terminal_thread_status_revokes_target_before_status_only_reopen() {
+            // Mutation caught: preserving a completed turn across a status-only actor reopen.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "inProgress", "startedAt": 3}
+                }),
+                3_000,
+                0,
+            );
+
+            let terminal = tracker.handle_notification(
+                "thread/status/changed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "status": {"type": "systemError"}
+                }),
+                4_000,
+                1,
+            );
+            assert!(matches!(
+                terminal.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget { target: None, .. }]
+            ));
+
+            tracker.handle_notification(
+                "thread/status/changed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "status": {"type": "active", "activeFlags": []}
+                }),
+                5_000,
+                2,
+            );
+            assert!(!tracker.is_current_target("child-2", "turn-1"));
+        }
+
+        #[test]
+        fn terminal_descendant_reconciliation_revokes_target_before_status_only_reopen() {
+            // Mutation caught: preserving a reconciled terminal actor's old active turn.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "inProgress", "startedAt": 3}
+                }),
+                3_000,
+                0,
+            );
+
+            let terminal_child = decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": "child-2",
+                    "parentThreadId": "root-1",
+                    "createdAt": 1,
+                    "updatedAt": 4,
+                    "status": {"type": "systemError"},
+                    "turns": []
+                }
+            }))
+            .expect("terminal child")
+            .thread;
+            let terminal = tracker.reconcile_descendants(&[terminal_child]);
+            assert!(matches!(
+                terminal.output.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget { target: None, .. }]
+            ));
+
+            let reopened_child = decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": "child-2",
+                    "parentThreadId": "root-1",
+                    "createdAt": 1,
+                    "updatedAt": 5,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("reopened child")
+            .thread;
+            tracker.reconcile_descendants(&[reopened_child]);
+            assert!(!tracker.is_current_target("child-2", "turn-1"));
+        }
+
+        #[test]
+        fn stale_terminal_status_cannot_revoke_a_newer_active_turn() {
+            // Mutation caught: clearing a current handle with older terminal status evidence.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            verified_child(&mut tracker, "child-2");
+            tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-2", "status": "inProgress", "startedAt": 5}
+                }),
+                5_000,
+                0,
+            );
+
+            let stale = tracker.handle_notification(
+                "thread/status/changed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "status": {"type": "systemError"}
+                }),
+                4_000,
+                1,
+            );
+
+            assert!(stale.controls.is_empty());
+            assert!(tracker.is_current_target("child-2", "turn-2"));
+        }
+
+        #[test]
+        fn ambiguous_or_untrusted_turn_evidence_never_becomes_available() {
+            // Mutation caught: accepting root, provisional, malformed, stale, or conflicting handles.
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            tracker.handle_notification(
+                "item/started",
+                &serde_json::json!({
+                    "threadId": "root-1",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "spawn",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "provisional-child",
+                        "agentPath": "/root/provisional",
+                        "kind": "started"
+                    }
+                }),
+                1_000,
+                0,
+            );
+            assert!(
+                tracker
+                    .handle_notification(
+                        "turn/started",
+                        &serde_json::json!({
+                            "threadId": "provisional-child",
+                            "turn": {"id": "provisional-turn"}
+                        }),
+                        2_000,
+                        1,
+                    )
+                    .controls
+                    .is_empty()
+            );
+            assert!(
+                tracker
+                    .handle_notification(
+                        "turn/started",
+                        &serde_json::json!({
+                            "threadId": "root-1",
+                            "turn": {"id": "root-turn"}
+                        }),
+                        2_000,
+                        2,
+                    )
+                    .controls
+                    .is_empty()
+            );
+
+            verified_child(&mut tracker, "child-2");
+            for (sequence, turn) in [
+                serde_json::json!({}),
+                serde_json::json!({"id": "x".repeat(MAX_RETAINED_KEY_BYTES + 1)}),
+                serde_json::json!({"id": "contains whitespace"}),
+                serde_json::json!({"id": "terminal-turn", "status": "completed"}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    tracker
+                        .handle_notification(
+                            "turn/started",
+                            &serde_json::json!({"threadId": "child-2", "turn": turn}),
+                            3_000 + sequence as u64,
+                            3 + sequence as u128,
+                        )
+                        .controls
+                        .is_empty()
+                );
+            }
+
+            let first = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "current-turn", "status": "inProgress"}
+                }),
+                4_000,
+                7,
+            );
+            assert_eq!(
+                target_ids(&first.controls[0]),
+                Some(("child-2", "current-turn"))
+            );
+            let conflict = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "conflicting-turn", "status": "inProgress"}
+                }),
+                4_001,
+                8,
+            );
+            assert!(matches!(
+                conflict.controls.as_slice(),
+                [ProviderActivityControlUpdate::ActorTarget { target: None, .. }]
+            ));
+            let stale = tracker.handle_notification(
+                "turn/completed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "current-turn", "status": "completed", "completedAt": 5}
+                }),
+                5_000,
+                9,
+            );
+            assert!(stale.controls.is_empty());
+        }
+
+        #[tokio::test]
+        async fn reopened_child_turn_advances_control_revision() {
+            // Mutation caught: reusing a cancellation fence when the canonical actor gets a new turn.
+            let registry = ActivityControlRegistry::new();
+            let registration = registry.register_runtime(
+                ActivityScopeRef::Thread {
+                    thread_id: "thread-1".to_owned(),
+                },
+                "scope-1".to_owned(),
+                Some("codex".to_owned()),
+            );
+            let mut tracker = CodexActivityTracker::new(Some("root-1"));
+            let child = decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": "child-2",
+                    "parentThreadId": "root-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("verified child")
+            .thread;
+            let observed = tracker.reconcile_descendants(&[child]);
+            registry
+                .observe_provider_batch(&registration, &observed.output.mutations, &[])
+                .await;
+
+            let first = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "inProgress"}
+                }),
+                3_000,
+                0,
+            );
+            registry
+                .observe_provider_batch(&registration, &first.mutations, &first.controls)
+                .await;
+            let first_revision = registry
+                .snapshot("scope-1")
+                .await
+                .actors
+                .into_iter()
+                .find(|actor| actor.actor_id == "codex:thread:child-2")
+                .expect("first control")
+                .control_revision;
+
+            let completed = tracker.handle_notification(
+                "turn/completed",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-1", "status": "completed", "completedAt": 4}
+                }),
+                4_000,
+                1,
+            );
+            registry
+                .observe_provider_batch(&registration, &completed.mutations, &completed.controls)
+                .await;
+            let reopened = tracker.handle_notification(
+                "turn/started",
+                &serde_json::json!({
+                    "threadId": "child-2",
+                    "turn": {"id": "turn-2", "status": "inProgress"}
+                }),
+                5_000,
+                2,
+            );
+            registry
+                .observe_provider_batch(&registration, &reopened.mutations, &reopened.controls)
+                .await;
+            let control = registry
+                .snapshot("scope-1")
+                .await
+                .actors
+                .into_iter()
+                .find(|actor| actor.actor_id == "codex:thread:child-2")
+                .expect("reopened control");
+            assert_eq!(control.state, ActivityActorControlState::Available);
+            assert!(control.control_revision > first_revision);
+        }
+    }
 
     #[test]
     fn authoritative_background_snapshot_interrupts_disappeared_running_work() {

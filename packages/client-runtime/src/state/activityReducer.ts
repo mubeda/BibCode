@@ -1,6 +1,11 @@
 import type {
   ActivityActorSummary,
   ActivityChange,
+  ActivityActorControl,
+  ActivityCancellationOperationSummary,
+  ActivityControlChange,
+  ActivityControlDelta,
+  ActivityControlSnapshot,
   ActivityDelta,
   ActivityEntry,
   ActivityLifecycle,
@@ -30,12 +35,33 @@ export type ActivityDeltaResult =
   | { readonly kind: "duplicate" }
   | { readonly kind: "gap" };
 
+export type ActivityControlDeltaResult = ActivityDeltaResult;
+
 export type EnvironmentActivityDeltaResult =
   | { readonly kind: "applied"; readonly state: EnvironmentActivityState }
   | { readonly kind: "duplicate"; readonly state: EnvironmentActivityState }
   | { readonly kind: "gap"; readonly state: EnvironmentActivityState };
 
 type ActivitySummary = ActivityActorSummary | ActivityWorkItemSummary;
+
+export function activityActorControl(
+  snapshot: ActivitySnapshot,
+  actorId: ActivityRecordId,
+): ActivityActorControl | null {
+  const matches = Arr.filter(snapshot.control.actors, (control) => control.actorId === actorId);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+export function activityCancellationOperation(
+  snapshot: ActivitySnapshot,
+  rootActorId: ActivityRecordId,
+): ActivityCancellationOperationSummary | null {
+  const matches = Arr.filter(
+    snapshot.control.operations,
+    (operation) => operation.rootActorId === rootActorId,
+  );
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
 
 function absurd(value: never): never {
   throw new Error(`Unexpected activity variant: ${String(value)}`);
@@ -328,6 +354,119 @@ export function applyActivityDelta(
   };
 }
 
+function upsertById<T>(
+  values: ReadonlyArray<T>,
+  incoming: T,
+  id: (value: T) => ActivityRecordId,
+): ReadonlyArray<T> {
+  const incomingId = id(incoming);
+  const index = Arr.findFirstIndex(values, (value) => id(value) === incomingId);
+  if (Option.isNone(index)) {
+    return Arr.append(values, incoming);
+  }
+  return Option.getOrElse(Arr.replace(values, index.value, incoming), () => values);
+}
+
+function removeById<T>(
+  values: ReadonlyArray<T>,
+  removedId: ActivityRecordId,
+  id: (value: T) => ActivityRecordId,
+): ReadonlyArray<T> {
+  return Arr.some(values, (value) => id(value) === removedId)
+    ? Arr.filter(values, (value) => id(value) !== removedId)
+    : values;
+}
+
+function applyControlChange(
+  control: ActivityControlSnapshot,
+  change: ActivityControlChange,
+): ActivityControlSnapshot {
+  switch (change.kind) {
+    case "actor-upserted":
+      return {
+        ...control,
+        actors: upsertById(control.actors, change.actor, (actor) => actor.actorId),
+      };
+    case "actor-removed":
+      return {
+        ...control,
+        actors: removeById(control.actors, change.actorId, (actor) => actor.actorId),
+      };
+    case "operation-upserted":
+      return {
+        ...control,
+        operations: upsertById(
+          control.operations,
+          change.operation,
+          (operation) => operation.rootActorId,
+        ),
+      };
+    case "operation-removed":
+      return {
+        ...control,
+        operations: removeById(
+          control.operations,
+          change.rootActorId,
+          (operation) => operation.rootActorId,
+        ),
+      };
+    default:
+      return absurd(change);
+  }
+}
+
+export function applyActivityControlSnapshot(
+  snapshot: ActivitySnapshot,
+  incoming: ActivityControlSnapshot,
+): ActivityControlDeltaResult {
+  if (incoming.scopeId !== snapshot.scopeId) {
+    return { kind: "gap" };
+  }
+  if (incoming.revision <= snapshot.control.revision) {
+    return { kind: "duplicate" };
+  }
+  return {
+    kind: "applied",
+    snapshot: {
+      ...snapshot,
+      control: incoming,
+    },
+  };
+}
+
+export function applyActivityControlDelta(
+  snapshot: ActivitySnapshot,
+  delta: ActivityControlDelta,
+): ActivityControlDeltaResult {
+  if (delta.scopeId !== snapshot.scopeId) {
+    return { kind: "gap" };
+  }
+  if (delta.revision <= snapshot.control.revision) {
+    return { kind: "duplicate" };
+  }
+  if (delta.previousRevision !== snapshot.control.revision) {
+    return { kind: "gap" };
+  }
+
+  const nextControl = Arr.reduce(delta.changes, snapshot.control, applyControlChange);
+  if (
+    nextControl.actors.length > ACTIVITY_PAGE_MAX_LENGTH ||
+    nextControl.operations.length > ACTIVITY_PAGE_MAX_LENGTH
+  ) {
+    return { kind: "gap" };
+  }
+  return {
+    kind: "applied",
+    snapshot: {
+      ...snapshot,
+      control: {
+        ...nextControl,
+        revision: delta.revision,
+      },
+    },
+  };
+}
+
 function appendRecentEntries(
   current: ReadonlyMap<ActivityRecordId, ReadonlyArray<ActivityEntry>>,
   changes: ReadonlyArray<ActivityChange>,
@@ -438,6 +577,51 @@ export function applyEnvironmentActivityDelta(
           status: "live",
           error: Option.none(),
           recentEntries: appendRecentEntries(state.recentEntries, delta.changes),
+        },
+      };
+  }
+}
+
+export function applyEnvironmentActivityControlDelta(
+  state: EnvironmentActivityState,
+  delta: ActivityControlDelta,
+): EnvironmentActivityDeltaResult {
+  if (Option.isNone(state.snapshot)) {
+    return {
+      kind: "gap",
+      state:
+        state.status === "synchronizing"
+          ? state
+          : {
+              ...state,
+              status: "synchronizing",
+            },
+    };
+  }
+
+  const result = applyActivityControlDelta(state.snapshot.value, delta);
+  switch (result.kind) {
+    case "duplicate":
+      return { kind: "duplicate", state };
+    case "gap":
+      return {
+        kind: "gap",
+        state:
+          state.status === "stale"
+            ? state
+            : {
+                ...state,
+                status: "stale",
+              },
+      };
+    case "applied":
+      return {
+        kind: "applied",
+        state: {
+          ...state,
+          snapshot: Option.some(result.snapshot),
+          status: "live",
+          error: Option.none(),
         },
       };
   }

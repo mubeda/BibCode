@@ -47,6 +47,14 @@ registers their RPC adapters in `RpcRegistry`:
   and projections;
 - `ProviderRuntimeSupervisor` owns provider session processes and native
   protocol adapters;
+- `ActivityCancellationService` owns bounded, generation-fenced targeted
+  cancellation admission and dispatches only server-held provider targets. The
+  provider supervisor accepts those targets only for the matching current live
+  session, runtime generation, and control registration, then invokes the
+  driver's targeted-cancellation seam outside the ordered root turn-delivery
+  lane. Drivers without an exact provider-native adapter fail closed with
+  `targetUnavailable`; this path never translates an activity request into a
+  root turn interrupt;
 - `TurnDeliveryService` routes admitted turns to provider runtimes while
   preserving delivery and recovery invariants;
 - activity, preview, Git/VCS, terminal, settings, diagnostics, authentication,
@@ -127,6 +135,63 @@ valid context-window activity for each turn, so a newer valid reading replaces
 the prior valid reading for that turn. A malformed row cannot evict a valid row,
 and reverting a turn removes only that turn's projected usage; neither behavior
 creates a separate usage cache.
+
+## Targeted Activity cancellation flow
+
+Targeted Activity control uses typed WebSocket RPC in browser and desktop
+modes. It does not cross `DesktopBridge`. Reads and `subscribeActivity` require
+`orchestration:read`; `activity.cancelSubtree` and
+`activity.retrySubtreeCancellation` are maintenance-classified mutations and
+require `orchestration:operate`. Both mutations reject terminal Activity scopes
+before provider I/O.
+
+```mermaid
+sequenceDiagram
+  participant UI as Activity panel
+  participant RPC as Activity RPC
+  participant Cancel as Cancellation service
+  participant Provider as Current provider runtime
+  participant Stream as Activity subscription
+
+  UI->>RPC: cancelSubtree(scope, scopeId, actorId, controlRevision)
+  RPC->>Cancel: authorize and admit canonical subtree
+  Cancel-->>Stream: requested overlay / Stopping
+  Cancel->>Provider: exact server-held targets, selected actor first
+  RPC-->>UI: accepted, inProgress, or alreadyTerminal
+  Provider-->>Stream: authoritative lifecycle events
+  Cancel-->>Stream: operation removed or partial residual summary
+  UI->>RPC: retrySubtreeCancellation(rootActorId, operationRevision)
+  RPC->>Cancel: residuals plus late descendants under original fence only
+```
+
+The client supplies canonical scope and actor identities plus concurrency
+revisions; it never supplies descendants or provider-native thread, turn, task,
+process, or agent identifiers. Admission installs the cancellation fence before
+provider dispatch. The selected actor is sent first, descendants use bounded
+parallelism, each native attempt has a two-second timeout, and one operation has
+a lifecycle-owned ten-second deadline. The deadline finalizes any still-active
+residual as `partial` even after dispatch draining has ended; it is fenced by
+runtime generation, operation ownership, and a private deadline identity and
+cannot terminalize provider observation. Coverage, residual, and public
+operation-revision reconciliation leaves that deadline identity unchanged;
+retry and absorption create a fresh deadline window. Duplicate and overlapping
+requests join or absorb the existing operation without broadening the canonical
+boundary.
+
+Observation history and its revision persist in SQLite. Exact handles,
+cancellation fences, operation summaries, residuals, and the independently
+monotonic control revision are bounded runtime state only. Reconnect can recover
+the current server's control snapshot; restart or provider-generation
+replacement invalidates it. `Stopping` is server-authoritative intent, while
+provider events remain the sole authority for terminal lifecycle. A partial
+retry is fenced by its operation revision and cannot recompute parents,
+siblings, or unrelated work. Public operation revisions are allocated from one
+checked registry-lifetime monotonic high-water counter, so a stable scope/root
+pair cannot replay an old retry revision after replacement or bounded scope
+eviction; exhaustion fails closed before provider I/O. Runtime cleanup retains
+only bounded target-free scope/actor revision tombstones so a stable public
+scope cannot reuse a stale pre-restart control fence; no operation or
+provider-native identity survives.
 
 ## Provider usage refresh
 

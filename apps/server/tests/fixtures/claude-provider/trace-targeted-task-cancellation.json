@@ -1,0 +1,236 @@
+{
+  "sessionId": "session-targeted",
+  "orders": [
+    {
+      "name": "tool-hook-task-actor",
+      "facts": [
+        {
+          "type": "stream_event",
+          "session_id": "session-targeted",
+          "uuid": "tool-a",
+          "parent_tool_use_id": null,
+          "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+              "type": "tool_use",
+              "id": "tool-agent-a",
+              "name": "Agent",
+              "input": {
+                "description": "same description",
+                "prompt": "same prompt",
+                "subagent_type": "same-role"
+              }
+            }
+          }
+        },
+        {
+          "hook_event_name": "PostToolUse",
+          "session_id": "session-targeted",
+          "tool_name": "Agent",
+          "tool_use_id": "tool-agent-a",
+          "tool_response": {
+            "status": "async_launched",
+            "agentId": "agent-a",
+            "prompt": "must not be retained"
+          }
+        },
+        {
+          "type": "system",
+          "subtype": "task_started",
+          "session_id": "session-targeted",
+          "uuid": "task-a-start",
+          "task_id": "task-a",
+          "tool_use_id": "tool-agent-a",
+          "task_type": "local_agent",
+          "description": "same description"
+        },
+        {
+          "hook_event_name": "SubagentStart",
+          "session_id": "session-targeted",
+          "agent_id": "agent-a",
+          "agent_type": "same-role",
+          "description": "same description",
+          "prompt": "same prompt"
+        }
+      ]
+    },
+    {
+      "name": "actor-task-hook-tool",
+      "facts": [
+        {
+          "hook_event_name": "SubagentStart",
+          "session_id": "session-targeted",
+          "agent_id": "agent-a",
+          "agent_type": "same-role",
+          "description": "same description",
+          "prompt": "same prompt"
+        },
+        {
+          "type": "system",
+          "subtype": "task_started",
+          "session_id": "session-targeted",
+          "uuid": "task-a-start",
+          "task_id": "task-a",
+          "tool_use_id": "tool-agent-a",
+          "task_type": "local_agent",
+          "description": "same description"
+        },
+        {
+          "hook_event_name": "PostToolUse",
+          "session_id": "session-targeted",
+          "tool_name": "Agent",
+          "tool_use_id": "tool-agent-a",
+          "tool_response": {
+            "status": "async_launched",
+            "agentId": "agent-a",
+            "prompt": "must not be retained"
+          }
+        },
+        {
+          "type": "stream_event",
+          "session_id": "session-targeted",
+          "uuid": "tool-a",
+          "parent_tool_use_id": null,
+          "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+              "type": "tool_use",
+              "id": "tool-agent-a",
+              "name": "Agent",
+              "input": {
+                "description": "same description",
+                "prompt": "same prompt",
+                "subagent_type": "same-role"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "semanticCollisionFacts": [
+    {
+      "type": "stream_event",
+      "session_id": "session-targeted",
+      "uuid": "tool-b",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "tool_use",
+          "id": "tool-agent-b",
+          "name": "Agent",
+          "input": {
+            "description": "same description",
+            "prompt": "same prompt",
+            "subagent_type": "same-role"
+          }
+        }
+      }
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "session-targeted",
+      "tool_name": "Agent",
+      "tool_use_id": "tool-agent-b",
+      "tool_response": { "status": "async_launched", "agentId": "agent-b" }
+    },
+    {
+      "type": "system",
+      "subtype": "task_started",
+      "session_id": "session-targeted",
+      "uuid": "task-b-start",
+      "task_id": "task-b",
+      "tool_use_id": "tool-agent-b",
+      "task_type": "local_agent",
+      "description": "same description"
+    },
+    {
+      "hook_event_name": "SubagentStart",
+      "session_id": "session-targeted",
+      "agent_id": "agent-b",
+      "agent_type": "same-role",
+      "description": "same description",
+      "prompt": "same prompt"
+    }
+  ],
+  "nestedFacts": [
+    {
+      "type": "stream_event",
+      "session_id": "session-targeted",
+      "uuid": "tool-child",
+      "parent_tool_use_id": "tool-agent-a",
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "tool_use",
+          "id": "tool-agent-child",
+          "name": "Agent",
+          "input": { "description": "same description", "prompt": "same prompt" }
+        }
+      }
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "session-targeted",
+      "agent_id": "agent-a",
+      "tool_name": "Agent",
+      "tool_use_id": "tool-agent-child",
+      "tool_response": { "status": "async_launched", "agentId": "agent-child" }
+    },
+    {
+      "type": "system",
+      "subtype": "task_started",
+      "session_id": "session-targeted",
+      "uuid": "task-child-start",
+      "task_id": "task-child",
+      "tool_use_id": "tool-agent-child",
+      "task_type": "local_agent"
+    },
+    {
+      "hook_event_name": "SubagentStart",
+      "session_id": "session-targeted",
+      "agent_id": "agent-child",
+      "parent_agent_id": "agent-a",
+      "agent_type": "same-role"
+    },
+    {
+      "type": "system",
+      "subtype": "task_notification",
+      "session_id": "session-targeted",
+      "uuid": "task-child-failed",
+      "task_id": "task-child",
+      "status": "failed"
+    },
+    {
+      "hook_event_name": "SubagentStop",
+      "session_id": "session-targeted",
+      "agent_id": "agent-child",
+      "parent_agent_id": "agent-a",
+      "agent_type": "same-role"
+    }
+  ],
+  "terminalFacts": [
+    {
+      "type": "system",
+      "subtype": "task_notification",
+      "session_id": "session-targeted",
+      "uuid": "task-a-stopped",
+      "task_id": "task-a",
+      "status": "stopped",
+      "output_file": "/must/not/be/retained",
+      "summary": "must not be retained"
+    },
+    {
+      "hook_event_name": "SubagentStop",
+      "session_id": "session-targeted",
+      "agent_id": "agent-a",
+      "agent_type": "same-role",
+      "last_assistant_message": "must not replace cancellation"
+    }
+  ]
+}

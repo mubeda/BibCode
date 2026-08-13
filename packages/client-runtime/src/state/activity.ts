@@ -20,8 +20,15 @@ import { connectionProjectionPhase, type SupervisorConnectionState } from "../co
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { request, subscribeInSession } from "../rpc/client.ts";
-import { applyEnvironmentActivityDelta, type EnvironmentActivityState } from "./activityReducer.ts";
 import {
+  applyActivityControlSnapshot,
+  applyEnvironmentActivityControlDelta,
+  applyEnvironmentActivityDelta,
+  type EnvironmentActivityState,
+} from "./activityReducer.ts";
+import {
+  createAtomCommandScheduler,
+  createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   environmentRpcKey,
   followStreamInEnvironment,
@@ -34,6 +41,26 @@ export type { EnvironmentActivityState } from "./activityReducer.ts";
 export const ACTIVITY_STATE_IDLE_TTL_MS = 0;
 export const ACTIVITY_QUERY_STALE_TIME_MS = 2_000;
 export const ACTIVITY_QUERY_IDLE_TTL_MS = 0;
+
+export const activityCancelSubtreeConcurrencyKey = (target: {
+  readonly environmentId: EnvironmentId;
+  readonly input: { readonly scopeId: string; readonly actorId: string };
+}): string => JSON.stringify([target.environmentId, target.input.scopeId, target.input.actorId]);
+
+export const activityRetrySubtreeCancellationConcurrencyKey = (target: {
+  readonly environmentId: EnvironmentId;
+  readonly input: {
+    readonly scopeId: string;
+    readonly rootActorId: string;
+    readonly expectedOperationRevision: number;
+  };
+}): string =>
+  JSON.stringify([
+    target.environmentId,
+    target.input.scopeId,
+    target.input.rootActorId,
+    target.input.expectedOperationRevision,
+  ]);
 
 const ACTIVITY_STREAM_ERROR_MESSAGE = "Could not synchronize activity.";
 const ACTIVITY_CAPABILITY_ERROR_MESSAGE = "Could not determine activity support.";
@@ -87,6 +114,10 @@ function snapshotCanReplace(
     return true;
   }
   return current.value.scopeId !== incoming.scopeId || incoming.revision >= current.value.revision;
+}
+
+function hasConsistentActivityScope(snapshot: ActivitySnapshot): boolean {
+  return snapshot.scopeId === snapshot.control.scopeId;
 }
 
 function stateWithSnapshot(
@@ -159,47 +190,57 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   const supervisor = yield* EnvironmentSupervisor;
   const state = yield* SubscriptionRef.make<EnvironmentActivityState>(emptyActivityState());
   const stateLock = yield* Semaphore.make(1);
-  const stateVersion = yield* Ref.make(0);
   const sessionEpoch = yield* Ref.make(0);
   const negotiatedCapability = yield* Ref.make<"checking" | "supported" | "unsupported">(
     "checking",
   );
   const acceptedScopeId = yield* Ref.make<string | null>(null);
   const recoverySequence = yield* Ref.make(0);
+  type RecoveryDomain = "observation" | "control";
   interface RecoveryToken {
     readonly id: number;
     readonly sessionEpoch: number;
-    readonly baseVersion: number;
+    readonly domain: RecoveryDomain;
+    readonly baseRevision: number | null;
   }
-  const activeRecovery = yield* Ref.make<RecoveryToken | null>(null);
+  interface ActiveRecoveries {
+    readonly observation: RecoveryToken | null;
+    readonly control: RecoveryToken | null;
+  }
+  const activeRecoveries = yield* Ref.make<ActiveRecoveries>({
+    observation: null,
+    control: null,
+  });
   const featureDisabled = yield* Deferred.make<void>();
 
-  const transitionFeatureDisabled = Effect.fn("EnvironmentActivityState.transitionFeatureDisabled")(
-    function* () {
-      yield* stateLock.withPermits(1)(
-        Effect.gen(function* () {
-          yield* Ref.set(activeRecovery, null);
-          yield* Ref.set(negotiatedCapability, "unsupported");
-          yield* SubscriptionRef.set(state, stateUnsupported());
-          const currentVersion = yield* Ref.get(stateVersion);
-          yield* Ref.set(stateVersion, currentVersion + 1);
+  const retireRecovery = Effect.fn("EnvironmentActivityState.retireRecovery")(function* (
+    domain: RecoveryDomain,
+    epoch: number,
+  ) {
+    yield* Ref.update(activeRecoveries, (current) => ({
+      ...current,
+      [domain]: current[domain]?.sessionEpoch === epoch ? null : current[domain],
+    }));
+  });
+
+  const retainStaleStatusForRecovery = Effect.fn(
+    "EnvironmentActivityState.retainStaleStatusForRecovery",
+  )(function* () {
+    const recoveries = yield* Ref.get(activeRecoveries);
+    if (recoveries.observation !== null || recoveries.control !== null) {
+      yield* SubscriptionRef.update(
+        state,
+        (current): EnvironmentActivityState => ({
+          ...current,
+          status: "stale",
         }),
       );
-      yield* Deferred.succeed(featureDisabled, undefined);
-    },
-  );
-
-  const retireMatchingRecovery = Effect.fn("EnvironmentActivityState.retireMatchingRecovery")(
-    function* (epoch: number, baseVersion: number) {
-      yield* Ref.update(activeRecovery, (current) =>
-        current?.sessionEpoch === epoch && current.baseVersion === baseVersion ? null : current,
-      );
-    },
-  );
+    }
+  });
 
   const replaceSnapshotLocked = Effect.fn("EnvironmentActivityState.replaceSnapshotLocked")(
-    function* (incoming: ActivitySnapshot, epoch: number) {
-      if (!scopeRefEqual(scope, incoming.scope)) {
+    function* (incoming: ActivitySnapshot) {
+      if (!scopeRefEqual(scope, incoming.scope) || !hasConsistentActivityScope(incoming)) {
         return;
       }
       yield* Ref.set(acceptedScopeId, incoming.scopeId);
@@ -208,10 +249,8 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
       if (next === current) {
         return;
       }
-      const previousVersion = yield* Ref.get(stateVersion);
       yield* SubscriptionRef.set(state, next);
-      yield* Ref.set(stateVersion, previousVersion + 1);
-      yield* retireMatchingRecovery(epoch, previousVersion);
+      yield* Ref.set(activeRecoveries, { observation: null, control: null });
     },
   );
 
@@ -221,21 +260,54 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   ) {
     yield* stateLock.withPermits(1)(
       Effect.gen(function* () {
-        const currentRecovery = yield* Ref.get(activeRecovery);
+        const recoveries = yield* Ref.get(activeRecoveries);
+        const currentRecovery = recoveries[token.domain];
         const currentEpoch = yield* Ref.get(sessionEpoch);
-        const currentVersion = yield* Ref.get(stateVersion);
         if (
           currentRecovery?.id !== token.id ||
           currentRecovery.sessionEpoch !== token.sessionEpoch ||
-          currentRecovery.baseVersion !== token.baseVersion ||
+          currentRecovery.baseRevision !== token.baseRevision ||
           currentEpoch !== token.sessionEpoch ||
-          currentVersion !== token.baseVersion
+          !scopeRefEqual(scope, incoming.scope) ||
+          !hasConsistentActivityScope(incoming)
         ) {
           return;
         }
-
-        yield* replaceSnapshotLocked(incoming, token.sessionEpoch);
-        yield* Ref.update(activeRecovery, (current) => (current?.id === token.id ? null : current));
+        const current = yield* SubscriptionRef.get(state);
+        const currentSnapshot = Option.getOrNull(current.snapshot);
+        const currentRevision =
+          currentSnapshot === null
+            ? null
+            : token.domain === "observation"
+              ? currentSnapshot.revision
+              : currentSnapshot.control.revision;
+        if (currentRevision !== token.baseRevision) {
+          return;
+        }
+        yield* retireRecovery(token.domain, token.sessionEpoch);
+        if (currentSnapshot === null || currentSnapshot.scopeId !== incoming.scopeId) {
+          yield* replaceSnapshotLocked(incoming);
+          return;
+        }
+        const canApply =
+          token.domain === "observation"
+            ? incoming.revision >= currentSnapshot.revision
+            : incoming.control.scopeId === currentSnapshot.scopeId &&
+              incoming.control.revision >= currentSnapshot.control.revision;
+        if (!canApply) {
+          return;
+        }
+        const merged =
+          token.domain === "observation"
+            ? { ...incoming, control: currentSnapshot.control }
+            : { ...currentSnapshot, control: incoming.control };
+        const remaining = yield* Ref.get(activeRecoveries);
+        yield* SubscriptionRef.set(state, {
+          ...current,
+          snapshot: Option.some(merged),
+          status: remaining.observation === null && remaining.control === null ? "live" : "stale",
+          error: Option.none(),
+        });
       }),
     );
   });
@@ -245,32 +317,95 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   ) {
     yield* stateLock.withPermits(1)(
       Effect.gen(function* () {
-        const currentRecovery = yield* Ref.get(activeRecovery);
+        const recoveries = yield* Ref.get(activeRecoveries);
+        const currentRecovery = recoveries[token.domain];
         const currentEpoch = yield* Ref.get(sessionEpoch);
-        const currentVersion = yield* Ref.get(stateVersion);
+        const currentSnapshot = Option.getOrNull((yield* SubscriptionRef.get(state)).snapshot);
+        const currentRevision =
+          currentSnapshot === null
+            ? null
+            : token.domain === "observation"
+              ? currentSnapshot.revision
+              : currentSnapshot.control.revision;
         if (
           currentRecovery?.id !== token.id ||
           currentRecovery.sessionEpoch !== token.sessionEpoch ||
-          currentRecovery.baseVersion !== token.baseVersion ||
+          currentRecovery.baseRevision !== token.baseRevision ||
           currentEpoch !== token.sessionEpoch ||
-          currentVersion !== token.baseVersion
+          currentRevision !== token.baseRevision
         ) {
           return;
         }
 
         const current = yield* SubscriptionRef.get(state);
         yield* SubscriptionRef.set(state, stateWithError(current, ACTIVITY_SNAPSHOT_ERROR_MESSAGE));
-        yield* Ref.set(stateVersion, currentVersion + 1);
-        yield* Ref.set(activeRecovery, null);
+        yield* retireRecovery(token.domain, token.sessionEpoch);
       }),
     );
+  });
+
+  const transitionFeatureDisabledForRecovery = Effect.fn(
+    "EnvironmentActivityState.transitionFeatureDisabledForRecovery",
+  )(function* (token: RecoveryToken) {
+    const transitioned = yield* stateLock.withPermits(1)(
+      Effect.gen(function* () {
+        const recoveries = yield* Ref.get(activeRecoveries);
+        const currentRecovery = recoveries[token.domain];
+        const currentEpoch = yield* Ref.get(sessionEpoch);
+        const currentSnapshot = Option.getOrNull((yield* SubscriptionRef.get(state)).snapshot);
+        const currentRevision =
+          currentSnapshot === null
+            ? null
+            : token.domain === "observation"
+              ? currentSnapshot.revision
+              : currentSnapshot.control.revision;
+        if (
+          currentRecovery?.id !== token.id ||
+          currentRecovery.sessionEpoch !== token.sessionEpoch ||
+          currentRecovery.baseRevision !== token.baseRevision ||
+          currentEpoch !== token.sessionEpoch ||
+          currentRevision !== token.baseRevision
+        ) {
+          return false;
+        }
+        yield* Ref.set(activeRecoveries, { observation: null, control: null });
+        yield* Ref.set(negotiatedCapability, "unsupported");
+        yield* SubscriptionRef.set(state, stateUnsupported());
+        return true;
+      }),
+    );
+    if (transitioned) {
+      yield* Deferred.succeed(featureDisabled, undefined);
+    }
+  });
+
+  const transitionFeatureDisabledForStream = Effect.fn(
+    "EnvironmentActivityState.transitionFeatureDisabledForStream",
+  )(function* (epoch: number) {
+    const transitioned = yield* stateLock.withPermits(1)(
+      Effect.gen(function* () {
+        if ((yield* Ref.get(sessionEpoch)) !== epoch) {
+          return false;
+        }
+        yield* Ref.set(activeRecoveries, { observation: null, control: null });
+        yield* Ref.set(negotiatedCapability, "unsupported");
+        yield* SubscriptionRef.set(state, stateUnsupported());
+        return true;
+      }),
+    );
+    if (transitioned) {
+      yield* Deferred.succeed(featureDisabled, undefined);
+    }
   });
 
   const clearRecovery = Effect.fn("EnvironmentActivityState.clearRecovery")(function* (
     token: RecoveryToken,
   ) {
     yield* stateLock.withPermits(1)(
-      Ref.update(activeRecovery, (current) => (current?.id === token.id ? null : current)),
+      Ref.update(activeRecoveries, (current) => ({
+        ...current,
+        [token.domain]: current[token.domain]?.id === token.id ? null : current[token.domain],
+      })),
     );
   });
 
@@ -281,7 +416,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
       Effect.flatMap((incoming) => completeRecovery(token, incoming)),
       Effect.catchCause((cause) =>
         hasFeatureDisabledActivityFailure(cause)
-          ? transitionFeatureDisabled()
+          ? transitionFeatureDisabledForRecovery(token)
           : failRecovery(token),
       ),
       Effect.ensuring(clearRecovery(token)),
@@ -290,19 +425,27 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
 
   const beginRecoveryLocked = Effect.fn("EnvironmentActivityState.beginRecoveryLocked")(function* (
     epoch: number,
+    domain: RecoveryDomain,
   ) {
-    const current = yield* Ref.get(activeRecovery);
-    if (current !== null) {
+    const current = yield* Ref.get(activeRecoveries);
+    if (current[domain] !== null) {
       return null;
     }
     const recoveryId = yield* Ref.updateAndGet(recoverySequence, (value) => value + 1);
-    const baseVersion = yield* Ref.get(stateVersion);
+    const currentSnapshot = Option.getOrNull((yield* SubscriptionRef.get(state)).snapshot);
+    const baseRevision =
+      currentSnapshot === null
+        ? null
+        : domain === "observation"
+          ? currentSnapshot.revision
+          : currentSnapshot.control.revision;
     const token = {
       id: recoveryId,
       sessionEpoch: epoch,
-      baseVersion,
+      domain,
+      baseRevision,
     };
-    yield* Ref.set(activeRecovery, token);
+    yield* Ref.set(activeRecoveries, { ...current, [domain]: token });
     return token;
   });
 
@@ -319,7 +462,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
 
         switch (item.kind) {
           case "snapshot":
-            yield* replaceSnapshotLocked(item.snapshot, epoch);
+            yield* replaceSnapshotLocked(item.snapshot);
             return null;
           case "delta": {
             const acceptedScope = yield* Ref.get(acceptedScopeId);
@@ -333,20 +476,73 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
             ) {
               return null;
             }
-            const previousVersion = yield* Ref.get(stateVersion);
             const result = applyEnvironmentActivityDelta(current, item.delta);
             if (result.state !== current) {
               yield* SubscriptionRef.set(state, result.state);
-              yield* Ref.set(stateVersion, previousVersion + 1);
             }
             switch (result.kind) {
               case "applied":
-                yield* retireMatchingRecovery(epoch, previousVersion);
+                yield* retireRecovery("observation", epoch);
+                yield* retainStaleStatusForRecovery();
                 return null;
               case "duplicate":
                 return null;
               case "gap":
-                return yield* beginRecoveryLocked(epoch);
+                return yield* beginRecoveryLocked(epoch, "observation");
+            }
+          }
+          case "control-snapshot": {
+            const acceptedScope = yield* Ref.get(acceptedScopeId);
+            if (acceptedScope !== null && acceptedScope !== item.control.scopeId) {
+              return null;
+            }
+            const current = yield* SubscriptionRef.get(state);
+            if (Option.isNone(current.snapshot)) {
+              return yield* beginRecoveryLocked(epoch, "control");
+            }
+            const result = applyActivityControlSnapshot(current.snapshot.value, item.control);
+            switch (result.kind) {
+              case "applied":
+                yield* SubscriptionRef.set(state, {
+                  ...current,
+                  snapshot: Option.some(result.snapshot),
+                  status: "live",
+                  error: Option.none(),
+                });
+                yield* retireRecovery("control", epoch);
+                yield* retainStaleStatusForRecovery();
+                return null;
+              case "duplicate":
+                return null;
+              case "gap":
+                return yield* beginRecoveryLocked(epoch, "control");
+            }
+          }
+          case "control-delta": {
+            const acceptedScope = yield* Ref.get(acceptedScopeId);
+            if (acceptedScope !== null && acceptedScope !== item.delta.scopeId) {
+              return null;
+            }
+            const current = yield* SubscriptionRef.get(state);
+            if (
+              Option.isSome(current.snapshot) &&
+              current.snapshot.value.scopeId !== item.delta.scopeId
+            ) {
+              return null;
+            }
+            const result = applyEnvironmentActivityControlDelta(current, item.delta);
+            if (result.state !== current) {
+              yield* SubscriptionRef.set(state, result.state);
+            }
+            switch (result.kind) {
+              case "applied":
+                yield* retireRecovery("control", epoch);
+                yield* retainStaleStatusForRecovery();
+                return null;
+              case "duplicate":
+                return null;
+              case "gap":
+                return yield* beginRecoveryLocked(epoch, "control");
             }
           }
         }
@@ -398,7 +594,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
     Stream.mapEffect((session) =>
       stateLock.withPermits(1)(
         Ref.updateAndGet(sessionEpoch, (current) => current + 1).pipe(
-          Effect.tap(() => Ref.set(activeRecovery, null)),
+          Effect.tap(() => Ref.set(activeRecoveries, { observation: null, control: null })),
           Effect.tap(() => Ref.set(negotiatedCapability, "checking")),
           Effect.tap(() => projectCurrentConnectionStateLocked()),
           Effect.map((epoch) => ({ epoch, session })),
@@ -419,7 +615,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
                     ).pipe(Effect.as(false)),
                   ),
                 onSuccess: (config) => {
-                  const supported = config.environment.capabilities.activityProtocolVersion === 1;
+                  const supported = config.environment.capabilities.activityProtocolVersion === 2;
                   return stateLock.withPermits(1)(
                     Ref.set(negotiatedCapability, supported ? "supported" : "unsupported").pipe(
                       Effect.andThen(projectCurrentConnectionStateLocked()),
@@ -440,7 +636,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
                     {
                       onExpectedFailure: (cause) =>
                         hasFeatureDisabledActivityFailure(cause)
-                          ? transitionFeatureDisabled()
+                          ? transitionFeatureDisabledForStream(epoch)
                           : SubscriptionRef.update(state, (current) =>
                               stateWithError(current, ACTIVITY_STREAM_ERROR_MESSAGE),
                             ),
@@ -471,6 +667,7 @@ interface EnvironmentActivityTarget {
 export function createEnvironmentActivityAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
+  const cancellationScheduler = createAtomCommandScheduler();
   const stateFamily = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<ActivityScopeRef>(key);
     return runtime
@@ -516,6 +713,24 @@ export function createEnvironmentActivityAtoms<R, E>(
       tag: WS_METHODS.activityListDetail,
       staleTimeMs: ACTIVITY_QUERY_STALE_TIME_MS,
       idleTtlMs: ACTIVITY_QUERY_IDLE_TTL_MS,
+    }),
+    cancelSubtree: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:activity:cancel-subtree",
+      tag: WS_METHODS.activityCancelSubtree,
+      scheduler: cancellationScheduler,
+      concurrency: {
+        mode: "singleFlight",
+        key: activityCancelSubtreeConcurrencyKey,
+      },
+    }),
+    retrySubtreeCancellation: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:activity:retry-subtree-cancellation",
+      tag: WS_METHODS.activityRetrySubtreeCancellation,
+      scheduler: cancellationScheduler,
+      concurrency: {
+        mode: "singleFlight",
+        key: activityRetrySubtreeCancellationConcurrencyKey,
+      },
     }),
   };
 }

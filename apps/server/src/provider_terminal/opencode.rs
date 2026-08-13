@@ -1061,6 +1061,7 @@ async fn run_opencode_observer(
         background_work: false,
         history_recovery: ActivityHistoryRecovery::Full,
         terminal_observation: true,
+        targeted_actor_cancellation: false,
     };
     if !inner
         .publisher
