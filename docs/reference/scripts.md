@@ -58,10 +58,12 @@ Use `vp test` for the built-in Vite+ test command. Use `vp run test` when the
 workspace package-script graph is specifically required. The graph keeps
 package test tasks concurrent, while server and desktop Rust test commands use
 the default parallel harness threads with Cargo compilation bounded by `-j 2`.
-When an explicit `CARGO_TARGET_DIR` is supplied to a macOS Cargo test command,
-the shared Cargo launcher creates that directory and passes its canonical
-filesystem path to Cargo. This keeps Tauri's secured starting-binary identity
-valid when an isolated target was requested through an alias such as `/tmp`.
+When an explicit `CARGO_TARGET_DIR` is supplied to a Cargo test command, the
+shared Cargo launcher resolves it from the launch directory, creates it, and
+passes its native canonical filesystem path to Cargo. This gives each platform
+one unambiguous test-binary identity and keeps Tauri's secured starting-binary
+lookup valid when an isolated target was requested through an alias such as
+macOS `/tmp`; non-test commands and implicit Cargo targets are unchanged.
 Exact subprocess tests may use `--test-threads=1` only inside an isolated child
 process that intentionally owns process-global state.
 

@@ -12,8 +12,9 @@ instance under default parallel Rust tests.
 **Architecture:** First minimize the observed bridge metadata, update
 availability, operation-readiness, and scheduler failures without changing
 source. Preserve the desktop updater and its Tauri security boundary; repair the
-standard package launcher so an explicitly isolated macOS Cargo test target is
-represented by its canonical filesystem path before the test process starts.
+standard package launcher so an explicitly isolated Cargo test target is
+represented by its native canonical filesystem path before the test process
+starts on every platform.
 Keep fixture events, listeners, request release channels, background tasks, and
 operation guards attached to the exact manager/application that created them.
 
@@ -55,10 +56,12 @@ An application-level executable override is not viable because
 `tauri-plugin-updater::UpdaterBuilder::build` eagerly resolves Tauri's secured
 starting binary before honoring the explicit executable path. Enabling Tauri's
 dangerous macOS symlink feature would weaken production security. The revised
-owner is the standard Cargo-test launcher: on macOS only, when an explicit
-`CARGO_TARGET_DIR` is configured for `cargo test`, create that intended target
-directory and pass its filesystem-canonical path to Cargo. Other platforms and
-non-test commands remain unchanged.
+owner is the standard Cargo-test launcher: when an explicit `CARGO_TARGET_DIR`
+is configured for `cargo test`, resolve it from the launcher working directory,
+create that intended target directory, and pass its native filesystem-canonical
+path to Cargo. This is cross-platform launcher hygiene: it removes symlink and
+relative-path identity ambiguity without reading ambient host-platform state.
+Non-test commands and implicit targets remain unchanged.
 
 ---
 
@@ -124,7 +127,7 @@ Test these in order without production edits:
 Record the prediction and observation for each probe. Do not proceed to a fix
 until one root cause is proven.
 
-### Task 2: Canonicalize the macOS Cargo-test launch identity
+### Task 2: Canonicalize the Cargo-test launch identity
 
 **Files:**
 
@@ -136,13 +139,13 @@ until one root cause is proven.
 
 - Preserves: all updater implementation, security features, endpoints,
   signature checks, bridge commands, and production runtime paths.
-- Produces: `canonicalizeMacosCargoTestTarget(args, env, options)`, which uses
-  the same explicit target directory through its real path on macOS and leaves
-  every other command/platform unchanged.
+- Produces: `canonicalizeCargoTestTarget(args, env, options)`, which uses the
+  same explicit target directory through its native real path on every platform
+  and leaves non-test commands and implicit targets unchanged.
 
 - [ ] **Step 1: Write the launcher contract RED**
 
-Call `runMsvcX64(["cargo", "test", ...])` with macOS and
+Call `runMsvcX64(["cargo", "test", ...])` with
 `CARGO_TARGET_DIR=/tmp/bibcode-task9f-target`. Require directory creation,
 real-path resolution to `/private/tmp/bibcode-task9f-target`, and only that
 canonical value in the spawned Cargo environment. Verify RED because the
@@ -150,17 +153,18 @@ wrapper currently forwards `/tmp/...` unchanged.
 
 - [ ] **Step 2: Implement the smallest canonicalization seam**
 
-For macOS `cargo test` with a non-empty explicit target, resolve relative paths
+For `cargo test` with a non-empty explicit target, resolve relative paths
 against the wrapper working directory, create the directory recursively, and
-call `realpath`. Return a copied environment with that canonical target. Do not
-copy a binary, mutate CWD or the parent environment, or normalize an implicit
-Cargo target.
+call native `realpath`. Return a copied environment with that canonical target.
+Do not read ambient host-platform state, copy a binary, mutate CWD or the parent
+environment, or normalize an implicit Cargo target.
 
 - [ ] **Step 3: Prove unrelated commands remain unchanged**
 
-Add cases for Windows/Linux, `cargo check`, a non-Cargo command, and an unset
-target. Require no filesystem calls and unchanged environment values. Document
-the narrow macOS Cargo-test rule.
+Add mocked native canonical results for macOS, Linux, and Windows. Add no-op
+cases for `cargo check`, a non-Cargo command, and unset or empty targets. Require
+no filesystem calls for no-op cases and unchanged caller environment values.
+Document the exact cross-platform Cargo-test rule.
 
 - [ ] **Step 4: Run GREEN in the original failing target**
 
