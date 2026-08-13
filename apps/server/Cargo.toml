@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-server"
-version = "0.3.12"
+version = "0.3.13"
 description = "BiBCode Rust server runtime"
 edition.workspace = true
 rust-version.workspace = true
