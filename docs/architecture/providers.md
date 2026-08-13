@@ -212,6 +212,9 @@ inside the server and dispatch through the child-specific App Server
 Claude structured chat reports targeted actor cancellation provisionally when
 both hook-event switches and the private hook sink are available. A fully
 correlated private task handle dispatches the stream-JSON `stop_task` request.
+The Agent invocation identity is accepted from current Claude `assistant`
+messages and the legacy `stream_event` content-block shape; both remain bounded,
+opaque, and key-equivalent for publication.
 That handle comes from either the complete explicit PostToolUse identity chain
 or the bounded authenticated parent-local cardinality-one fallback for a nested
 actor only. Because documented SubagentStart hooks omit parent identity, the

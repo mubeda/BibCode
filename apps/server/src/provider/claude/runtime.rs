@@ -2458,25 +2458,47 @@ enum ClaudeMessageRoute {
 }
 
 fn agent_tool_identity(value: &Value) -> Option<(&str, &str, &str, Option<&str>)> {
-    if value.get("type").and_then(Value::as_str) != Some("stream_event")
-        || value.pointer("/event/type").and_then(Value::as_str) != Some("content_block_start")
-        || value
-            .pointer("/event/content_block/type")
-            .and_then(Value::as_str)
-            != Some("tool_use")
-    {
-        return None;
-    }
     let parent = value.get("parent_tool_use_id")?;
     let parent_tool_use_id = if parent.is_null() {
         None
     } else {
         Some(parent.as_str()?)
     };
+    let (tool_use_id, tool_name) = match value.get("type").and_then(Value::as_str) {
+        Some("stream_event")
+            if value.pointer("/event/type").and_then(Value::as_str)
+                == Some("content_block_start")
+                && value
+                    .pointer("/event/content_block/type")
+                    .and_then(Value::as_str)
+                    == Some("tool_use") =>
+        {
+            (
+                value.pointer("/event/content_block/id")?.as_str()?,
+                value.pointer("/event/content_block/name")?.as_str()?,
+            )
+        }
+        Some("assistant") => {
+            let mut tool_uses = value
+                .pointer("/message/content")?
+                .as_array()?
+                .iter()
+                .filter(|content| content.get("type").and_then(Value::as_str) == Some("tool_use"));
+            let tool_use = tool_uses.next()?;
+            if tool_uses.next().is_some() {
+                return None;
+            }
+            (
+                tool_use.get("id")?.as_str()?,
+                tool_use.get("name")?.as_str()?,
+            )
+        }
+        _ => return None,
+    };
     Some((
         value.get("session_id")?.as_str()?,
-        value.pointer("/event/content_block/id")?.as_str()?,
-        value.pointer("/event/content_block/name")?.as_str()?,
+        tool_use_id,
+        tool_name,
         parent_tool_use_id,
     ))
 }
@@ -3573,6 +3595,109 @@ mod targeted_task_correlation_tests {
                 .get("agent-child"),
             Some(&ClaudeVerifiedLineage::Root)
         );
+    }
+
+    #[test]
+    fn targeted_task_correlation_keys_current_assistant_nested_invocation_after_ambiguity() {
+        // Current Claude CLI releases emit completed Agent tool uses as `assistant` messages,
+        // not only as legacy `stream_event` content-block starts. When that assistant record is
+        // the last exact fact after a parentless SubagentStart, its target and hierarchy must be
+        // published with a stable production event key instead of being dropped by the pump.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+
+        let unresolved_root = [
+            json!({
+                "type":"stream_event", "session_id":"session", "parent_tool_use_id":null,
+                "event":{"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"tool-root-pending","name":"Agent","input":{}}}
+            }),
+            json!({
+                "type":"system", "subtype":"task_started", "session_id":"session",
+                "task_id":"task-root-pending", "tool_use_id":"tool-root-pending",
+                "task_type":"local_agent"
+            }),
+        ];
+        let child_before_invocation = [
+            json!({
+                "hook_event_name":"PreToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent"
+            }),
+            json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            }),
+            json!({
+                "type":"system", "subtype":"task_started", "session_id":"session",
+                "task_id":"task-child", "tool_use_id":"tool-child", "task_type":"local_agent"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart", "session_id":"session",
+                "agent_id":"agent-child", "agent_type":"general-purpose"
+            }),
+        ];
+        let mut prior = Vec::new();
+        for (index, fact) in unresolved_root
+            .iter()
+            .chain(child_before_invocation.iter())
+            .enumerate()
+        {
+            prior.push(handle_fact(&mut runtime, fact, true, 10 + index as u64));
+        }
+        assert!(mapped_targets(&prior).is_empty());
+
+        let resolved = handle_fact(
+            &mut runtime,
+            &json!({
+                "type":"assistant",
+                "session_id":"session",
+                "uuid":"assistant-child",
+                "parent_tool_use_id":"tool-parent",
+                "message":{
+                    "id":"message-child",
+                    "content":[
+                        {"type":"text","text":"Launching child."},
+                        {"type":"tool_use","id":"tool-child","name":"Agent","input":{
+                            "name":"child", "run_in_background":true
+                        }}
+                    ]
+                }
+            }),
+            false,
+            20,
+        );
+
+        assert_eq!(
+            mapped_targets(std::slice::from_ref(&resolved)),
+            [(
+                "claude:agent:agent-child".to_owned(),
+                "task-child".to_owned()
+            )]
+        );
+        assert!(
+            resolved.activity.iter().any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::UpsertActor(actor)
+                    if actor.id == "claude:agent:agent-child"
+                        && actor.parent_actor_id.as_deref()
+                            == Some("claude:agent:agent-parent")
+            )),
+            "current assistant invocation must publish exact child hierarchy"
+        );
+        let key = resolved
+            .native_event_id
+            .as_deref()
+            .expect("effect-producing current assistant invocation has a production key");
+        assert!(key.starts_with("claude:control:"));
+        assert!(!key.contains("tool-child"));
+        assert!(!key.contains("agent-child"));
+        assert!(!key.contains("task-child"));
     }
 
     #[test]
