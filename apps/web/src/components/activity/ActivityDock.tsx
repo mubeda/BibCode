@@ -345,19 +345,20 @@ export function ActivityDock({
         <>
           <span
             aria-hidden="true"
-            className="flex whitespace-nowrap text-xs tabular-nums"
+            className="whitespace-nowrap text-xs tabular-nums"
             data-activity-count="active"
           >
-            <LoaderCircleIcon className="mr-1 size-3" />
-            {active}
+            Active {active}
+          </span>
+          <span aria-hidden="true" className="text-xs text-muted-foreground">
+            ·
           </span>
           <span
             aria-hidden="true"
-            className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
+            className="whitespace-nowrap text-xs text-muted-foreground tabular-nums"
             data-activity-count="done"
           >
-            <CheckCircle2Icon className="mr-1 size-3" />
-            {done}
+            Done {done}
           </span>
         </>
       ) : (
