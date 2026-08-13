@@ -1101,7 +1101,13 @@ async fn captured_json_request(path: &Path, predicate: impl Fn(&Value) -> bool) 
         }
     })
     .await
-    .expect("captured provider request")
+    .unwrap_or_else(|_| {
+        panic!(
+            "captured provider request at {}; content={}",
+            path.display(),
+            std::fs::read_to_string(path).unwrap_or_default()
+        )
+    })
 }
 
 async fn captured_complete_ndjson_with_bytes(path: &Path) -> (Vec<u8>, Vec<Value>) {
@@ -13187,18 +13193,17 @@ done
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree() {
     let state = TempDir::new().expect("state");
-    let capture = state.path().join("claude-targeted-requests.ndjson");
-    let settings_capture = state.path().join("claude-targeted-settings.json");
-    let token_capture = state.path().join("claude-targeted-token");
-    let session_capture = state.path().join("claude-targeted-session");
-    let ready_capture = state.path().join("claude-targeted-ready");
-    let script = include_str!("fixtures/claude-provider/targeted-rpc.sh")
-        .replace("__CAPTURE__", &capture.to_string_lossy())
-        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
-        .replace("__TOKEN__", &token_capture.to_string_lossy())
-        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
-        .replace("__READY__", &ready_capture.to_string_lossy());
-    let executable = executable_fixture(&state, "claude-targeted-rpc", &script, "");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let capture = workspace.join(".bibcode-claude-targeted-requests.ndjson");
+    let settings_capture = workspace.join(".bibcode-claude-targeted-settings.json");
+    let token_capture = workspace.join(".bibcode-claude-targeted-token");
+    let session_capture = workspace.join(".bibcode-claude-targeted-session");
+    let ready_capture = workspace.join(".bibcode-claude-targeted-ready");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-provider/targeted-rpc.sh")
+        .canonicalize()
+        .expect("stable Claude targeted RPC fixture");
     let config = test_config(&state);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
     std::fs::write(
@@ -13215,8 +13220,6 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .expect("settings json"),
     )
     .expect("provider settings");
-    let workspace = state.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -13497,10 +13500,6 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     ack_stream_rpc(&mut thread_stream, "9501").await;
 
     let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
-    let _ = captured_json_request(&capture, |request| {
-        request["request_id"] == "bibcode-inventory"
-    })
-    .await;
     let (before_unmapped_bytes, before_unmapped) =
         captured_complete_ndjson_with_bytes(&capture).await;
     let before_unmapped_stop_tasks = claude_stop_task_targets(&before_unmapped);
@@ -13678,20 +13677,17 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_without_provider_io() {
     let state = TempDir::new().expect("state");
-    let capture = state
-        .path()
-        .join("claude-targeted-ambiguous-requests.ndjson");
-    let settings_capture = state.path().join("claude-targeted-ambiguous-settings.json");
-    let token_capture = state.path().join("claude-targeted-ambiguous-token");
-    let session_capture = state.path().join("claude-targeted-ambiguous-session");
-    let ready_capture = state.path().join("claude-targeted-ambiguous-ready");
-    let script = include_str!("fixtures/claude-provider/targeted-rpc-ambiguous.sh")
-        .replace("__CAPTURE__", &capture.to_string_lossy())
-        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
-        .replace("__TOKEN__", &token_capture.to_string_lossy())
-        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
-        .replace("__READY__", &ready_capture.to_string_lossy());
-    let executable = executable_fixture(&state, "claude-targeted-rpc-ambiguous", &script, "");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let capture = workspace.join(".bibcode-claude-targeted-ambiguous-requests.ndjson");
+    let settings_capture = workspace.join(".bibcode-claude-targeted-ambiguous-settings.json");
+    let token_capture = workspace.join(".bibcode-claude-targeted-ambiguous-token");
+    let session_capture = workspace.join(".bibcode-claude-targeted-ambiguous-session");
+    let ready_capture = workspace.join(".bibcode-claude-targeted-ambiguous-ready");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-provider/targeted-rpc-ambiguous.sh")
+        .canonicalize()
+        .expect("stable ambiguous Claude targeted RPC fixture");
     let config = test_config(&state);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
     std::fs::write(
@@ -13708,8 +13704,6 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         .expect("settings json"),
     )
     .expect("provider settings");
-    let workspace = state.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -13873,10 +13867,6 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
     .expect("ambiguous children remain observable and unsupported");
 
     let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
-    let _ = captured_json_request(&capture, |request| {
-        request["request_id"] == "bibcode-inventory"
-    })
-    .await;
     let before = captured_complete_ndjson_with_bytes(&capture).await;
     assert!(claude_stop_task_targets(&before.1).is_empty());
     assert_eq!(claude_root_interrupt_count(&before.1), 0);

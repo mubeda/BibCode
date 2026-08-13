@@ -4,6 +4,28 @@ case "$1" in
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
 esac
 
+capture='__CAPTURE__'
+settings_capture='__SETTINGS__'
+token_capture='__TOKEN__'
+session_capture='__SESSION_PATH__'
+ready_capture='__READY__'
+case "$capture" in __*__) capture="$PWD/.bibcode-claude-targeted-requests.ndjson";; esac
+case "$settings_capture" in __*__) settings_capture="$PWD/.bibcode-claude-targeted-settings.json";; esac
+case "$token_capture" in __*__) token_capture="$PWD/.bibcode-claude-targeted-token";; esac
+case "$session_capture" in __*__) session_capture="$PWD/.bibcode-claude-targeted-session";; esac
+case "$ready_capture" in __*__) ready_capture="$PWD/.bibcode-claude-targeted-ready";; esac
+has_session=false
+for argument in "$@"; do
+  case "$argument" in --session-id|--resume) has_session=true;; esac
+done
+if [ "$has_session" = false ]; then
+  capture=/dev/null
+  settings_capture=/dev/null
+  token_capture=/dev/null
+  session_capture=/dev/null
+  ready_capture=/dev/null
+fi
+
 session_id=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -13,15 +35,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --settings)
       shift
-      printf '%s' "$1" > '__SETTINGS__'
+      printf '%s' "$1" > "$settings_capture"
       ;;
   esac
   shift
 done
-printf '%s' "$BIBCODE_CLAUDE_HOOK_TOKEN" > '__TOKEN__'
-printf '%s' "$session_id" > '__SESSION_PATH__'
-if [ -s '__SETTINGS__' ] && [ -s '__TOKEN__' ] && [ -s '__SESSION_PATH__' ]; then
-  : > '__READY__'
+printf '%s' "$BIBCODE_CLAUDE_HOOK_TOKEN" > "$token_capture"
+printf '%s' "$session_id" > "$session_capture"
+if [ -s "$settings_capture" ] && [ -s "$token_capture" ] && [ -s "$session_capture" ]; then
+  : > "$ready_capture"
 fi
 
 emit() {
@@ -39,7 +61,7 @@ emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid
 
 stop_count=0
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> '__CAPTURE__'
+  printf '%s\n' "$line" >> "$capture"
   case "$line" in
     *'"subtype":"stop_task"'*)
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
