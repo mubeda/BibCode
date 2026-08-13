@@ -161,6 +161,14 @@ fn provider_is_enabled(driver: &str, configured: bool) -> bool {
     configured && driver != "grok"
 }
 
+fn default_provider_binary(driver: &str) -> &str {
+    if driver == "cursor" {
+        "cursor-agent"
+    } else {
+        driver
+    }
+}
+
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
     let legacy = settings.get("providers").and_then(Value::as_object);
     let instances = settings.get("providerInstances").and_then(Value::as_object);
@@ -198,7 +206,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                         ),
                         binary_path: string_setting(config, "binaryPath")
                             .or_else(|| string_setting(legacy_settings, "binaryPath"))
-                            .unwrap_or(driver)
+                            .unwrap_or_else(|| default_provider_binary(driver))
                             .to_owned(),
                         available: is_builtin_driver(driver),
                         custom_models: string_array(config, "customModels")
@@ -242,10 +250,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 driver_settings
                     .and_then(|value| value.get("enabled"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(driver != "cursor"),
+                    .unwrap_or(true),
             ),
             binary_path: string_setting(driver_settings, "binaryPath")
-                .unwrap_or(driver)
+                .unwrap_or_else(|| default_provider_binary(driver))
                 .to_owned(),
             available: true,
             custom_models: string_array(driver_settings, "customModels").unwrap_or_default(),
@@ -1788,6 +1796,33 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cursor_inventory_is_enabled_with_the_supported_binary() {
+        let fresh_definitions = definitions(&json!({}));
+        let cursor = fresh_definitions
+            .iter()
+            .find(|definition| definition.instance_id == "cursor")
+            .expect("built-in Cursor definition");
+
+        assert!(cursor.enabled);
+        assert_eq!(cursor.binary_path, "cursor-agent");
+
+        let explicit = definitions(&json!({
+            "providerInstances": {
+                "cursor": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": {}
+                }
+            }
+        }));
+        let explicit_cursor = explicit
+            .iter()
+            .find(|definition| definition.instance_id == "cursor")
+            .expect("explicit Cursor definition");
+        assert_eq!(explicit_cursor.binary_path, "cursor-agent");
+    }
+
+    #[test]
     fn configured_instances_do_not_hide_enabled_legacy_providers() {
         let settings = json!({
             "providerInstances": {
@@ -2180,6 +2215,13 @@ mod tests {
         });
         let settings = json!({
             "enableProviderUpdateChecks": false,
+            "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            },
             "providerInstances": {
                 "first": {
                     "driver": "opencode",

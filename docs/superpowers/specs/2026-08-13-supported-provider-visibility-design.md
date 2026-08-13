@@ -13,15 +13,18 @@ default and resolve its default executable as `cursor-agent`. Existing
 persisted settings remain authoritative, including an explicit user choice to
 disable Cursor. OpenCode remains enabled by default and has no preview badge.
 Grok remains disabled and hidden because it is outside this supported default
-set.
+set. This exclusion covers both provider cards and user-facing action surfaces:
+the new-panel menu must not expose either a Grok chat action or a Grok Terminal
+action, even when a legacy settings payload enables the driver.
 
 ## Ownership and data flow
 
 - `packages/contracts` owns browser-safe provider setting defaults.
 - `apps/server` owns persisted server-setting defaults and provider-inventory
   fallback definitions.
-- `apps/web` owns permanent rendering of the four supported built-in cards and
-  their presentation metadata.
+- `apps/web` owns permanent rendering of the four supported built-in cards,
+  their presentation metadata, and the supported provider action model shared
+  by panel/worktree entry points.
 - Provider installation and authentication probes remain asynchronous server
   concerns. No synthetic “installed” or “authenticated” state is introduced.
 
@@ -41,6 +44,7 @@ Behavioral tests must prove:
    `cursor-agent`;
 4. explicit Cursor `enabled: false` remains false;
 5. provider inventory falls back to an enabled `cursor-agent` definition.
+6. legacy-enabled Grok inventory never produces a chat or terminal action.
 
 The final packaged v0.3.14 application must be visually verified with Codex
 Computer Use, including the Providers panel, external-worktree adoption, and

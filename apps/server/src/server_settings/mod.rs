@@ -47,7 +47,7 @@ impl ProvidersState {
                 ..ProviderBinarySettingsState::default()
             },
             cursor: ProviderBinarySettingsState {
-                enabled: false,
+                enabled: true,
                 binary_path: "cursor-agent".to_owned(),
                 ..ProviderBinarySettingsState::default()
             },
@@ -596,6 +596,24 @@ mod tests {
     #[test]
     fn grok_is_disabled_by_default() {
         assert!(!ProviderSettingsState::default().providers.grok.enabled);
+    }
+
+    #[test]
+    fn cursor_is_enabled_by_default_and_explicit_disable_is_preserved() {
+        let defaults = ProviderSettingsState::default();
+        assert!(defaults.providers.cursor.enabled);
+        assert_eq!(defaults.providers.cursor.binary_path, "cursor-agent");
+
+        let explicit: ProviderSettingsState = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "cursor": {
+                    "enabled": false,
+                    "binaryPath": "cursor-agent"
+                }
+            }
+        }))
+        .expect("explicit Cursor settings");
+        assert!(!explicit.providers.cursor.enabled);
     }
 
     #[tokio::test]
