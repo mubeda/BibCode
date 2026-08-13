@@ -340,6 +340,15 @@ backing-store size through xterm's WebGL resize layers so the drawing viewport
 and glyph shader resolution change atomically with the canvas; resizing the
 canvas alone is not a valid renderer state during center-panel splits.
 
+A terminal session may keep running after its center panel stops rendering. The
+per-terminal input scheduler therefore survives renderer unmounts so an
+immediate replacement can preserve ordering, but its retained writer is
+created outside the renderer effect's closure and captures only the command and
+terminal identity. Teardown detaches the transcript and disposes xterm and
+WebGL without abandoning input already accepted by the scheduler. A later
+renderer retargets error presentation, while the retained writer cannot keep
+the departed renderer or its terminal buffers reachable.
+
 ## Request and event flow
 
 1. The client runtime resolves a connection target and obtains any required
