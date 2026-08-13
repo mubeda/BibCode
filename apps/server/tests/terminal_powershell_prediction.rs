@@ -82,18 +82,28 @@ async fn run_managed_powershell_proof(shell: &str, expected_edition: &str) {
             .await
             .map_err(|error| format!("terminal opens: {error}"))?;
 
-        // Wait for the interactive prompt (PowerShell emits the cursor-position query),
-        // then answer the Device Status Report exactly once so PSReadLine stops waiting.
-        if wait_for_history(&manager, |history| history.contains("\u{1b}[6n"))
-            .await
-            .is_none()
-        {
-            return Err("PowerShell must reach an interactive prompt".to_owned());
+        // Windows PowerShell may emit a cursor-position query before its prompt,
+        // while PowerShell 7 can render the prompt directly. Both mean the
+        // managed shell is ready for input.
+        let readiness = wait_for_history(&manager, |history| {
+            history.contains("\u{1b}[6n")
+                || (history.contains("PS ") && history.contains('>'))
+        })
+        .await;
+        let readiness = if let Some(readiness) = readiness {
+            readiness
+        } else {
+            return Err(format!(
+                "PowerShell must reach an interactive prompt, transcript: {:?}",
+                read_history(&manager).await
+            ));
+        };
+        if readiness.contains("\u{1b}[6n") {
+            manager
+                .write("thread-pred", "terminal-pred", "\u{1b}[1;1R")
+                .await
+                .map_err(|error| format!("terminal accepts cursor response: {error}"))?;
         }
-        manager
-            .write("thread-pred", "terminal-pred", "\u{1b}[1;1R")
-            .await
-            .map_err(|error| format!("terminal accepts cursor response: {error}"))?;
 
         // The requested executable must be the process that handled the PTY bootstrap.
         manager
