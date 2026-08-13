@@ -391,6 +391,16 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                 props.previewDesktopByTabId,
                 props.terminalLabelsById,
               );
+              const tabButton = (
+                <button
+                  type="button"
+                  className="flex min-w-0 flex-1 items-center gap-1.5"
+                  onClick={() => props.onActivate(surface)}
+                >
+                  <SurfaceIcon surface={surface} theme={resolvedTheme} />
+                  <span className="truncate">{title}</span>
+                </button>
+              );
               return (
                 <div
                   key={surface.id}
@@ -405,21 +415,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                   )}
                 >
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <button
-                          type="button"
-                          className="flex min-w-0 flex-1 items-center gap-1.5"
-                          onClick={() => props.onActivate(surface)}
-                        >
-                          <SurfaceIcon surface={surface} theme={resolvedTheme} />
-                          <span className="truncate">{title}</span>
-                        </button>
-                      }
-                    />
-                    <TooltipPopup>{title}</TooltipPopup>
-                  </Tooltip>
+                  {surface.kind === "activity" ? (
+                    tabButton
+                  ) : (
+                    <Tooltip>
+                      <TooltipTrigger render={tabButton} />
+                      <TooltipPopup>{title}</TooltipPopup>
+                    </Tooltip>
+                  )}
                   <button
                     type="button"
                     className={cn(
