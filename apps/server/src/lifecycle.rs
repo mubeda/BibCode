@@ -23,6 +23,7 @@ use crate::{
         },
         jwt::PersistentJwtCodec,
         managed_endpoint::ManagedEndpointRuntime,
+        server_terminal::ProcessTreeCleanup,
     },
     rpc::RpcRegistry,
 };
@@ -81,14 +82,26 @@ pub enum ServerError {
 impl ServerRuntime {
     pub async fn start(config: ServerConfig) -> Result<ServerHandle, ServerError> {
         let ui_process_observer = default_ui_process_observer(config.mode);
-        Self::start_internal(config, None, ui_process_observer).await
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
+            ProcessTreeCleanup::StandaloneServer,
+        )
+        .await
     }
 
     pub async fn start_with_ui_process_observer(
         config: ServerConfig,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
     ) -> Result<ServerHandle, ServerError> {
-        Self::start_internal(config, None, ui_process_observer).await
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
+            ProcessTreeCleanup::EmbeddedHost,
+        )
+        .await
     }
 
     pub async fn start_with_registry(
@@ -96,13 +109,20 @@ impl ServerRuntime {
         rpc_registry: RpcRegistry,
     ) -> Result<ServerHandle, ServerError> {
         let ui_process_observer = default_ui_process_observer(config.mode);
-        Self::start_internal(config, Some(rpc_registry), ui_process_observer).await
+        Self::start_internal(
+            config,
+            Some(rpc_registry),
+            ui_process_observer,
+            ProcessTreeCleanup::StandaloneServer,
+        )
+        .await
     }
 
     async fn start_internal(
         mut config: ServerConfig,
         custom_registry: Option<RpcRegistry>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+        process_tree_cleanup: ProcessTreeCleanup,
     ) -> Result<ServerHandle, ServerError> {
         let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
         config.base_dir = resolved_data_root.effective.clone();
@@ -172,12 +192,13 @@ impl ServerRuntime {
             }
             None => {
                 let runtime = Arc::new(
-                    ProductionRuntime::start(
+                    ProductionRuntime::start_with_process_tree_cleanup(
                         &config,
                         database.clone(),
                         auth.clone(),
                         asset_secret,
                         ui_process_observer,
+                        process_tree_cleanup,
                     )
                     .await
                     .map_err(ServerError::ProductionInitialize)?,

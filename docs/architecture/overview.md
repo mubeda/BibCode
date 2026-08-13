@@ -43,7 +43,11 @@ flowchart TB
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
-  and process supervision.
+  and process supervision. A standalone server may perform a final sweep of
+  descendants rooted at its own process after its managed owners shut down. An
+  in-process desktop server shares the Tauri host PID and therefore skips that
+  sweep: provider and terminal owners still stop their registered processes,
+  while host-owned WebView children remain under the desktop lifecycle.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -323,6 +327,9 @@ exits as expected, stops every backend from the captured running set, and does
 not invoke the platform installer until every included backend has committed
 and stopped. A prepare, cancel, commit, stop, or installer failure attempts to
 restart the exact prior running set before update coordination is released.
+Stopping the primary in-process backend never sweeps descendants of the shared
+desktop PID; doing so would terminate the system WebView before the installer
+can take ownership of application restart.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -420,6 +427,7 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Desktop update installation requires a verified pre-update backup for the
   primary and every non-excluded running secondary, stops the captured running
   set before invoking the installer, and restarts that exact set on failure.
+  In-process backend shutdown preserves desktop-owned WebView descendants.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
