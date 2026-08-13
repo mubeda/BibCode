@@ -233,6 +233,8 @@ mod security;
 mod shell_environment;
 pub mod ssh;
 mod tailscale;
+#[cfg(test)]
+mod test_support;
 mod updates;
 mod window;
 
