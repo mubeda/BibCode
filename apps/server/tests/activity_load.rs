@@ -17,7 +17,7 @@ use bibcode_server::{
         ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
         ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
         ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
-        ProviderActivityMutation, register_activity_rpc,
+        ProviderActivityMutation, register_activity_rpc_for_integration_test,
     },
     diagnostics::{ProcessAttributionRegistry, ProcessIdentity, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -68,6 +68,61 @@ const DISABLED_EVENT_COUNT: usize = 10_000;
 const PREVIOUSLY_INSTRUMENTED_TERMINALS: usize = 2;
 const DISABLED_TERMINAL_LAUNCHES: usize = 8;
 const SECRET_DISABLED_PAYLOAD: &str = "disabled-load-secret-content";
+
+#[test]
+fn cancellation_control_mutation_surface_is_not_publicly_exported() {
+    // Mutation caught: letting external crates register scopes or inject activity into the overlay.
+    let activity_module = include_str!("../src/activity/mod.rs");
+    let cancellation_module = include_str!("../src/activity/cancellation.rs");
+    let control_module = include_str!("../src/activity/control.rs");
+
+    assert!(!activity_module.contains("pub use control::"));
+    for signature in [
+        "pub struct ActivityControlRegistry",
+        "pub struct ActivityRuntimeControlRegistration",
+        "pub enum ActivityControlEvent",
+        "    pub fn register_runtime(",
+        "    pub fn observe_provider_batch(",
+        "    pub fn observe_activity_batch(",
+        "pub trait ActivityCancellationDispatcher",
+        "pub struct ActivityCancellationService",
+    ] {
+        assert!(
+            !control_module.contains(signature) && !cancellation_module.contains(signature),
+            "cancellation mutation surface leaked publicly: {signature}"
+        );
+    }
+}
+
+#[test]
+fn targeted_activity_bridge_exposes_no_production_test_bypass() {
+    // Mutation caught: making a generation, native target constructor, dispatcher error, or
+    // supervisor test hook callable by an external production-library consumer.
+    let activity_module = include_str!("../src/activity/mod.rs");
+    let cancellation_module = include_str!("../src/activity/cancellation.rs");
+    let model_module = include_str!("../src/activity/model.rs");
+    let provider_runtime = include_str!("../src/production/provider_runtime.rs");
+
+    for forbidden in [
+        "pub struct ActivityRuntimeGeneration",
+        "pub enum ActivityDispatchError",
+        "pub fn codex_turn_for_integration_test",
+        "pub fn claude_task_for_integration_test",
+        "pub fn codex_actor_for_integration_test",
+        "pub async fn activity_runtime_generation_for_integration_test",
+        "pub async fn cancel_activity_target_for_integration_test",
+        "pub async fn attach_activity_cancellation_for_integration_test",
+        "pub async fn cancel_activity_subtree_for_integration_test",
+    ] {
+        assert!(
+            !activity_module.contains(forbidden)
+                && !cancellation_module.contains(forbidden)
+                && !model_module.contains(forbidden)
+                && !provider_runtime.contains(forbidden),
+            "production test bypass is publicly callable: {forbidden}"
+        );
+    }
+}
 
 #[derive(Debug)]
 struct RejectingProviderDriverFactory;
@@ -1828,7 +1883,7 @@ impl RpcFixture {
         );
         let projection = projections.chat();
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projections);
+        register_activity_rpc_for_integration_test(&mut registry, projections);
         let directory = tempfile::tempdir().expect("server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())

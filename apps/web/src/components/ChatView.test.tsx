@@ -58,6 +58,7 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
+    commandOptions: [] as Array<{ key: string; options: unknown }>,
     commandResults: {} as Record<string, (input: unknown) => unknown>,
     defaultCommandResult: (() => undefined) as (input?: unknown) => unknown,
     environments: [] as unknown[],
@@ -112,8 +113,9 @@ const h = vi.hoisted(() => {
 // ── Heavy state/atom modules ─────────────────────────────────────────
 
 vi.mock("../state/use-atom-command", () => ({
-  useAtomCommand: (command: { key?: string } | null | undefined, _options?: unknown) => {
+  useAtomCommand: (command: { key?: string } | null | undefined, options?: unknown) => {
     const key = command && typeof command.key === "string" ? command.key : "unknown-command";
+    h.commandOptions.push({ key, options });
     return (input: unknown) => {
       h.commandCalls.push({ key, input });
       const respond = h.commandResults[key] ?? h.defaultCommandResult;
@@ -257,6 +259,8 @@ vi.mock("../state/activity", () => {
       stateAtom: (target: unknown) => atom("activity-state-source", target),
       roster: (target: unknown) => atom("activity-roster", target),
       detail: (target: unknown) => atom("activity-detail", target),
+      cancelSubtree: { key: "activity.cancelSubtree" },
+      retrySubtreeCancellation: { key: "activity.retrySubtreeCancellation" },
     },
   };
 });
@@ -767,7 +771,7 @@ interface TestEnvironmentPresentation {
       readonly label: string;
       readonly serverVersion?: string;
       readonly capabilities?: {
-        readonly activityProtocolVersion: 1 | null;
+        readonly activityProtocolVersion: 2 | null;
         readonly worktreeCatalog?: boolean;
       };
     };
@@ -787,7 +791,7 @@ function makeEnvironmentPresentation(
       providers: [codexProvider],
       environment: {
         label: "Local",
-        capabilities: { activityProtocolVersion: 1, worktreeCatalog: true },
+        capabilities: { activityProtocolVersion: 2, worktreeCatalog: true },
       },
     },
     ...overrides,
@@ -889,6 +893,7 @@ beforeEach(() => {
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
   h.commandCalls.length = 0;
+  h.commandOptions.length = 0;
   h.commandResults = {};
   h.defaultCommandResult = () => AsyncResult.success(undefined);
   h.environments = [];
@@ -984,7 +989,7 @@ describe("ChatView", () => {
       overrides: Partial<ActivitySnapshot> = {},
     ): ActivitySnapshot =>
       ({
-        protocolVersion: 1,
+        protocolVersion: 2,
         scopeId: `scope-${scope.threadId}`,
         scope,
         revision: 1,
@@ -996,6 +1001,7 @@ describe("ChatView", () => {
           backgroundWork: true,
           historyRecovery: "full",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         observationState: "live",
         sections: {
@@ -1010,6 +1016,12 @@ describe("ChatView", () => {
         workItems: [],
         actorsHasMore: false,
         workItemsHasMore: false,
+        control: {
+          scopeId: `scope-${scope.threadId}`,
+          revision: 0,
+          actors: [],
+          operations: [],
+        },
         updatedAt: "2026-07-22T20:10:00.000Z",
         ...overrides,
       }) as unknown as ActivitySnapshot;
@@ -1044,6 +1056,7 @@ describe("ChatView", () => {
       records: ActivityRosterPageData["records"],
       nextCursor: string | null = null,
       cursor?: string,
+      actorControls: ActivityRosterPageData["actorControls"] = [],
     ): void => {
       h.queryDataByKey.set(
         activityKey("activity-roster", {
@@ -1057,7 +1070,7 @@ describe("ChatView", () => {
             limit: 200,
           },
         }),
-        { records, nextCursor } satisfies ActivityRosterPageData,
+        { records, actorControls, nextCursor } satisfies ActivityRosterPageData,
       );
     };
 
@@ -1205,6 +1218,557 @@ describe("ChatView", () => {
       expect(props).toBeDefined();
       return props as ActivityPanelProps;
     };
+
+    it("binds server-fenced cancel and residual retry commands without reporting raw failures", async () => {
+      const child = actor("actor-cancellable", "Cancellable reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+        control: {
+          scopeId: `scope-${threadId}` as ActivitySnapshot["scopeId"],
+          revision: 19,
+          actors: [
+            {
+              actorId: child.id,
+              state: "available",
+              controlRevision: 11,
+              activeDescendantCount: 2,
+            },
+          ],
+          operations: [
+            {
+              rootActorId: child.id,
+              state: "partial",
+              residualCount: 2,
+              message: "Some agents are still running.",
+              operationRevision: 17,
+            },
+          ],
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedRoster(environmentId, snapshot, "subagents", "active", [child], null, undefined, [
+        snapshot.control.actors[0]!,
+      ]);
+      seedRoster(environmentId, snapshot, "subagents", "done", []);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        const panel = latestActivityPanelProps();
+        await act(async () => panel.onCancelActor?.(child.id, 11));
+        await act(async () => panel.onRetryCancellation?.(child.id, 17));
+
+        expect(h.commandCalls.filter((call) => call.key.startsWith("activity."))).toEqual([
+          {
+            key: "activity.cancelSubtree",
+            input: {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                actorId: child.id,
+                expectedControlRevision: 11,
+              },
+            },
+          },
+          {
+            key: "activity.retrySubtreeCancellation",
+            input: {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                rootActorId: child.id,
+                expectedOperationRevision: 17,
+              },
+            },
+          },
+        ]);
+        expect(h.commandOptions.filter((entry) => entry.key.startsWith("activity."))).toEqual(
+          expect.arrayContaining([
+            { key: "activity.cancelSubtree", options: { reportFailure: false } },
+            {
+              key: "activity.retrySubtreeCancellation",
+              options: { reportFailure: false },
+            },
+          ]),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("maps typed cancellation failures to bounded copy without leaking native payloads", async () => {
+      const child = actor("actor-provider-down", "Provider-down reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const nativePayload = "claude-task-id=secret-native-42 provider socket exploded";
+      h.commandResults["activity.cancelSubtree"] = () =>
+        AsyncResult.failure(
+          Cause.fail(new ActivityError({ reason: "providerUnavailable", message: nativePayload })),
+        );
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await act(async () => latestActivityPanelProps().onCancelActor?.(child.id, 5));
+        await vi.waitFor(() => {
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          );
+        });
+        expect(container.textContent).not.toContain(nativePayload);
+        expect(container.textContent).not.toContain("secret-native-42");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("ignores a late cancellation failure after the Activity target changes environments", async () => {
+      const child = actor("actor-old-target", "Old target reviewer");
+      const oldSnapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        scopeId: "colliding-scope" as ActivitySnapshot["scopeId"],
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const oldFailure = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      h.commandResults["activity.cancelSubtree"] = () => oldFailure.promise;
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, oldSnapshot.scope, oldSnapshot);
+      seedActivityQueries(environmentId, oldSnapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+
+        const nextEnvironmentId = EnvironmentId.make("environment-remote");
+        const nextThreadRef = scopeThreadRef(nextEnvironmentId, threadId);
+        const nextChild = actor("actor-new-target", "New target reviewer");
+        const nextSnapshot = activitySnapshot({ _tag: "thread", threadId }, [nextChild], {
+          scopeId: "colliding-scope" as ActivitySnapshot["scopeId"],
+          capabilities: oldSnapshot.capabilities,
+        });
+        seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+        seedProject(makeProject({ environmentId: nextEnvironmentId }));
+        seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+        seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
+        seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
+        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={nextEnvironmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).scopeId).toBe(
+            nextSnapshot.scopeId,
+          ),
+        );
+
+        await act(async () => {
+          oldFailure.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "providerUnavailable",
+                  message: "secret old environment payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("secret old environment payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("does not resurrect a rendered cancellation failure after leaving and returning to its target", async () => {
+      const child = actor("actor-return-target", "Returning reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        scopeId: "reused-scope" as ActivitySnapshot["scopeId"],
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      h.commandResults["activity.cancelSubtree"] = () =>
+        AsyncResult.failure(
+          Cause.fail(
+            new ActivityError({
+              reason: "providerUnavailable",
+              message: "secret returning-target payload",
+            }),
+          ),
+        );
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await act(async () => latestActivityPanelProps().onCancelActor?.(child.id, 5));
+        await vi.waitFor(() =>
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          ),
+        );
+        expect(container.textContent).not.toContain("secret returning-target payload");
+
+        const nextEnvironmentId = EnvironmentId.make("environment-away");
+        const nextThreadRef = scopeThreadRef(nextEnvironmentId, threadId);
+        const nextChild = actor("actor-away-target", "Away reviewer");
+        const nextSnapshot = activitySnapshot({ _tag: "thread", threadId }, [nextChild], {
+          scopeId: snapshot.scopeId,
+          capabilities: snapshot.capabilities,
+          control: {
+            ...snapshot.control,
+            actors: [
+              {
+                actorId: nextChild.id,
+                state: "available",
+                controlRevision: 5,
+                activeDescendantCount: 0,
+              },
+            ],
+          },
+        });
+        seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+        seedProject(makeProject({ environmentId: nextEnvironmentId }));
+        seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+        seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
+        seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
+        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={nextEnvironmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).actors[0]?.id).toBe(
+            nextChild.id,
+          ),
+        );
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+
+        useRightPanelStore.getState().openActivity(threadRef, "subagents", snapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={environmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).actors[0]?.id).toBe(
+            child.id,
+          ),
+        );
+
+        expect(latestActivityPanelProps().snapshot.control.revision).toBe(
+          snapshot.control.revision,
+        );
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("secret returning-target payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("lets the latest cancel or retry success or failure exclusively own the single banner", async () => {
+      const child = actor("actor-command-order", "Ordered reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const olderCancel = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      const newerRetry = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      h.commandResults["activity.cancelSubtree"] = () => olderCancel.promise;
+      h.commandResults["activity.retrySubtreeCancellation"] = () => newerRetry.promise;
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+        void latestActivityPanelProps().onRetryCancellation?.(child.id, 7);
+
+        await act(async () => {
+          newerRetry.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "providerUnavailable",
+                  message: "new secret payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          ),
+        );
+
+        await act(async () => {
+          olderCancel.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({ reason: "dispatchTimeout", message: "old secret payload" }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBe(
+          "The provider is unavailable. Try again when it reconnects.",
+        );
+        expect(container.textContent).not.toContain("new secret payload");
+        expect(container.textContent).not.toContain("old secret payload");
+
+        const secondOlderCancel = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+        const latestRetrySuccess = deferredResult<ReturnType<typeof AsyncResult.success>>();
+        h.commandResults["activity.cancelSubtree"] = () => secondOlderCancel.promise;
+        h.commandResults["activity.retrySubtreeCancellation"] = () => latestRetrySuccess.promise;
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+        void latestActivityPanelProps().onRetryCancellation?.(child.id, 7);
+        await act(async () => {
+          latestRetrySuccess.resolve(AsyncResult.success(undefined));
+          await Promise.resolve();
+        });
+        await act(async () => {
+          secondOlderCancel.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "dispatchTimeout",
+                  message: "superseded failure payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("superseded failure payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it.each(["requested", "partial"] as const)(
+      "invalidates a pending failure when authoritative control state advances to %s",
+      async (operationState) => {
+        const child = actor("actor-authoritative", "Authoritative reviewer");
+        const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+          capabilities: {
+            actors: true,
+            attributedActivity: true,
+            backgroundWork: true,
+            historyRecovery: "full",
+            terminalObservation: false,
+            targetedActorCancellation: true,
+          },
+          control: {
+            scopeId: `scope-${threadId}` as ActivitySnapshot["scopeId"],
+            revision: 3,
+            actors: [
+              {
+                actorId: child.id,
+                state: "available",
+                controlRevision: 3,
+                activeDescendantCount: 0,
+              },
+            ],
+            operations: [],
+          },
+        });
+        const pending = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+        h.commandResults["activity.cancelSubtree"] = () => pending.promise;
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        seedActivityQueries(environmentId, snapshot, [child]);
+
+        const { container, root } = await mountActivityRoute();
+        try {
+          await openSubagents(container);
+          void latestActivityPanelProps().onCancelActor?.(child.id, 3);
+          const authoritative = activitySnapshot(snapshot.scope, [child], {
+            scopeId: snapshot.scopeId,
+            revision: snapshot.revision,
+            capabilities: snapshot.capabilities,
+            control: {
+              scopeId: snapshot.scopeId,
+              revision: 4,
+              actors: [
+                {
+                  actorId: child.id,
+                  state: operationState === "requested" ? "requested" : "available",
+                  controlRevision: 4,
+                  activeDescendantCount: 0,
+                },
+              ],
+              operations: [
+                {
+                  rootActorId: child.id,
+                  state: operationState,
+                  residualCount: 1,
+                  message: null,
+                  operationRevision: 4,
+                },
+              ],
+            },
+          });
+          seedActivityState(environmentId, authoritative.scope, authoritative);
+          await act(async () => {
+            useRightPanelStore.getState().navigateActivity(threadRef, {
+              section: "subagents",
+              selectedRecordKind: "actor",
+              selectedRecordId: child.id,
+            });
+            await Promise.resolve();
+          });
+
+          await act(async () => {
+            pending.resolve(
+              AsyncResult.failure(
+                Cause.fail(
+                  new ActivityError({ reason: "dispatchTimeout", message: "late secret payload" }),
+                ),
+              ),
+            );
+            await Promise.resolve();
+          });
+          expect(latestActivityPanelProps().snapshot.control.revision).toBe(4);
+          expect(latestActivityPanelProps().cancellationError).toBeNull();
+          expect(container.textContent).not.toContain("late secret payload");
+        } finally {
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
+    it("keeps provider-terminal Activity bindings read-only", async () => {
+      const terminalScope: ActivityScopeRef = {
+        _tag: "terminal",
+        threadId,
+        terminalId: "terminal-activity-1",
+      };
+      const child = actor("terminal-actor", "Terminal observer");
+      const snapshot = activitySnapshot(terminalScope, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "bounded",
+          terminalObservation: true,
+          targetedActorCancellation: true,
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.settings = { ...h.settings, enableTerminalAgentActivity: true };
+      seedActivityState(environmentId, terminalScope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      useRightPanelStore.getState().openActivity(threadRef, "subagents", terminalScope);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await vi.waitFor(() =>
+          expect(container.querySelector("[data-activity-panel]")).not.toBeNull(),
+        );
+        expect(latestActivityPanelProps().onCancelActor).toBeUndefined();
+        expect(latestActivityPanelProps().onRetryCancellation).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
 
     it("removes activity UI and its persisted surface on settingsUpdated, then restores the dock", async () => {
       const child = actor("actor-settings-toggle", "Settings toggle reviewer");
@@ -1460,6 +2024,7 @@ describe("ChatView", () => {
           backgroundWork: false,
           historyRecovery: "none",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         sections: {
           subagents: {
@@ -1508,6 +2073,7 @@ describe("ChatView", () => {
           backgroundWork: false,
           historyRecovery: "full",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         sections: {
           subagents: { state: "live", message: null, retryable: false },
@@ -1523,6 +2089,7 @@ describe("ChatView", () => {
             backgroundWork: false,
             historyRecovery: "none",
             terminalObservation: false,
+            targetedActorCancellation: false,
           },
           sections: {
             subagents: { state: "unsupported", message: null, retryable: false },
@@ -1539,7 +2106,7 @@ describe("ChatView", () => {
             providers: [codexProvider],
             environment: {
               label: "Local",
-              capabilities: { activityProtocolVersion: 1 },
+              capabilities: { activityProtocolVersion: 2 },
             },
           },
         }),
@@ -5217,7 +5784,7 @@ describe("ChatView adopted workspace availability", () => {
           providers: [codexProvider],
           environment: {
             label: "Legacy",
-            capabilities: { activityProtocolVersion: 1, worktreeCatalog: false },
+            capabilities: { activityProtocolVersion: 2, worktreeCatalog: false },
           },
         },
       }),

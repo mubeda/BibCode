@@ -53,6 +53,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
+        | "activity.cancelSubtree"
+        | "activity.retrySubtreeCancellation"
         | "orchestration.dispatchCommand"
         | "preview.close"
         | "preview.navigate"
@@ -185,6 +187,16 @@ mod tests {
         );
         for method in ["worktree.remove", "worktree.removeFromBibCode"] {
             assert_eq!(required_scope(method), Some(SCOPE_ORCHESTRATION_OPERATE));
+        }
+        for method in [
+            "activity.cancelSubtree",
+            "activity.retrySubtreeCancellation",
+        ] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_OPERATE),
+                "wrong activity mutation scope for {method}"
+            );
         }
         assert_eq!(required_scope("unknown.method"), None);
     }

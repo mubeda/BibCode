@@ -518,6 +518,30 @@ function isRemovedActivityFailure(failure: unknown): failure is ActivityError {
   return isActivityError(failure) && failure.reason === "notFound";
 }
 
+function activityCancellationFailureMessage(failure: unknown): string {
+  if (!isActivityError(failure)) {
+    return "Unable to stop agents. Try again.";
+  }
+  switch (failure.reason) {
+    case "cancellationUnsupported":
+      return "Stopping this agent is not supported.";
+    case "staleScope":
+    case "staleActor":
+    case "staleOperation":
+      return "Activity changed before the request could be applied. Refresh and try again.";
+    case "providerUnavailable":
+      return "The provider is unavailable. Try again when it reconnects.";
+    case "targetUnavailable":
+      return "This agent can no longer be stopped.";
+    case "partialCancellation":
+      return "Some agents are still running.";
+    case "dispatchTimeout":
+      return "Stopping agents timed out. Some agents may still be running.";
+    default:
+      return "Unable to stop agents. Try again.";
+  }
+}
+
 const ActivityPanelBinding = memo(function ActivityPanelBinding({
   target,
   threadRef,
@@ -532,6 +556,18 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const refreshSnapshot = useAtomRefresh(stateSourceAtom);
+  const cancelSubtree = useAtomCommand(environmentActivity.cancelSubtree, {
+    reportFailure: false,
+  });
+  const retrySubtreeCancellation = useAtomCommand(environmentActivity.retrySubtreeCancellation, {
+    reportFailure: false,
+  });
+  const [cancellationFailure, setCancellationFailure] = useState<{
+    readonly message: string;
+    readonly targetKey: string;
+    readonly controlRevision: number;
+    readonly invocation: number;
+  } | null>(null);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
   const section = surface.section;
   const queryBaseKey =
@@ -665,6 +701,132 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       bucket === "active" ? activeRoster.loadMore() : doneRoster.loadMore(),
     [activeRoster.loadMore, doneRoster.loadMore],
   );
+  const cancellationTarget = useMemo(
+    () =>
+      snapshot !== null &&
+      snapshot.scope._tag === "thread" &&
+      snapshot.capabilities.targetedActorCancellation
+        ? {
+            environmentId: threadRef.environmentId,
+            scope: snapshot.scope,
+            scopeId: snapshot.scopeId,
+            controlRevision: snapshot.control.revision,
+            key: JSON.stringify([
+              threadRef.environmentId,
+              snapshot.scope._tag,
+              snapshot.scope.threadId,
+              snapshot.scopeId,
+            ]),
+          }
+        : null,
+    [snapshot, threadRef.environmentId],
+  );
+  // The panel has one scoped mutation banner, so the newest cancel or retry invocation owns it.
+  const cancellationOwnershipRef = useRef<{
+    targetKey: string | null;
+    controlRevision: number;
+    invocation: number;
+  }>({ targetKey: null, controlRevision: -1, invocation: 0 });
+  const currentCancellationTargetKey = cancellationTarget?.key ?? null;
+  const currentCancellationControlRevision = snapshot?.control.revision ?? -1;
+  useLayoutEffect(() => {
+    const ownership = cancellationOwnershipRef.current;
+    ownership.targetKey = currentCancellationTargetKey;
+    ownership.controlRevision = currentCancellationControlRevision;
+    ownership.invocation += 1;
+    return () => {
+      if (
+        ownership.targetKey === currentCancellationTargetKey &&
+        ownership.controlRevision === currentCancellationControlRevision
+      ) {
+        ownership.targetKey = null;
+        ownership.invocation += 1;
+      }
+    };
+  }, [currentCancellationControlRevision, currentCancellationTargetKey]);
+  const cancellationError =
+    cancellationFailure !== null &&
+    cancellationFailure.targetKey === currentCancellationTargetKey &&
+    cancellationFailure.controlRevision === currentCancellationControlRevision &&
+    cancellationFailure.invocation === cancellationOwnershipRef.current.invocation
+      ? cancellationFailure.message
+      : null;
+  const onCancelActor = useCallback(
+    async (actorId: ActivityRecordId, expectedControlRevision: number) => {
+      if (cancellationTarget === null) {
+        return;
+      }
+      const ownership = cancellationOwnershipRef.current;
+      const invocation = ownership.invocation + 1;
+      ownership.invocation = invocation;
+      const targetKey = cancellationTarget.key;
+      const controlRevision = cancellationTarget.controlRevision;
+      setCancellationFailure(null);
+      const result = await cancelSubtree({
+        environmentId: cancellationTarget.environmentId,
+        input: {
+          scope: cancellationTarget.scope,
+          scopeId: cancellationTarget.scopeId,
+          actorId,
+          expectedControlRevision,
+        },
+      });
+      if (
+        ownership.targetKey !== targetKey ||
+        ownership.controlRevision !== controlRevision ||
+        ownership.invocation !== invocation
+      ) {
+        return;
+      }
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        setCancellationFailure({
+          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
+          targetKey,
+          controlRevision,
+          invocation,
+        });
+      }
+    },
+    [cancelSubtree, cancellationTarget],
+  );
+  const onRetryCancellation = useCallback(
+    async (rootActorId: ActivityRecordId, expectedOperationRevision: number) => {
+      if (cancellationTarget === null) {
+        return;
+      }
+      const ownership = cancellationOwnershipRef.current;
+      const invocation = ownership.invocation + 1;
+      ownership.invocation = invocation;
+      const targetKey = cancellationTarget.key;
+      const controlRevision = cancellationTarget.controlRevision;
+      setCancellationFailure(null);
+      const result = await retrySubtreeCancellation({
+        environmentId: cancellationTarget.environmentId,
+        input: {
+          scope: cancellationTarget.scope,
+          scopeId: cancellationTarget.scopeId,
+          rootActorId,
+          expectedOperationRevision,
+        },
+      });
+      if (
+        ownership.targetKey !== targetKey ||
+        ownership.controlRevision !== controlRevision ||
+        ownership.invocation !== invocation
+      ) {
+        return;
+      }
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        setCancellationFailure({
+          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
+          targetKey,
+          controlRevision,
+          invocation,
+        });
+      }
+    },
+    [cancellationTarget, retrySubtreeCancellation],
+  );
 
   if (snapshot === null) {
     return null;
@@ -679,6 +841,8 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       onLoadMoreRoster={onLoadMoreRoster}
       onLoadMoreDetail={detailQuery.loadMore}
       onRefreshSnapshot={refreshSnapshot}
+      cancellationError={cancellationError}
+      {...(cancellationTarget === null ? {} : { onCancelActor, onRetryCancellation })}
     />
   );
 });

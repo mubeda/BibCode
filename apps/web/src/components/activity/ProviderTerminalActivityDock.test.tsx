@@ -70,7 +70,7 @@ function actor(id: string): ActivityActorSummary {
 function snapshot(terminalId: string, overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   const currentActor = actor(`actor-${terminalId}`);
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: `scope-${terminalId}`,
     scope: { _tag: "terminal", threadId, terminalId },
     revision: 1,
@@ -82,6 +82,7 @@ function snapshot(terminalId: string, overrides: Partial<ActivitySnapshot> = {})
       backgroundWork: false,
       historyRecovery: "full",
       terminalObservation: true,
+      targetedActorCancellation: false,
     },
     observationState: "live",
     sections: {
@@ -96,6 +97,12 @@ function snapshot(terminalId: string, overrides: Partial<ActivitySnapshot> = {})
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: {
+      scopeId: `scope-${terminalId}`,
+      revision: 0,
+      actors: [],
+      operations: [],
+    },
     updatedAt: "2026-07-22T20:01:00.000Z",
     ...overrides,
   } as ActivitySnapshot;

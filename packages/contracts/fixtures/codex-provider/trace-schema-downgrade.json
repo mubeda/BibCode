@@ -36,7 +36,8 @@
         "attributedActivity": true,
         "backgroundWork": false,
         "historyRecovery": "none",
-        "terminalObservation": false
+        "terminalObservation": false,
+        "targetedActorCancellation": true
       },
       "observationState": "live"
     }

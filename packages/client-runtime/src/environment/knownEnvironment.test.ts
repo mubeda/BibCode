@@ -55,13 +55,14 @@ describe("known environment bootstrap helpers", () => {
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
-        activityProtocolVersion: 1,
+        activityProtocolVersion: 2,
       },
     } satisfies ExecutionEnvironmentDescriptor;
 
     expect(attachEnvironmentDescriptor(environment, descriptor).storageInstanceId).toBe(
       "0d93cbea-f237-4f37-8829-d816667be35f",
     );
+    expect(attachEnvironmentDescriptor(environment, descriptor).descriptor).toEqual(descriptor);
   });
 
   it("retains the complete descriptor on an attached environment", () => {

@@ -39,6 +39,12 @@ impl RuntimeProcessOwnership {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeProcessRecord {
+    pub identity: ProcessIdentity,
+    pub ppid: u32,
+}
+
 impl Default for NativeProcessSampler {
     fn default() -> Self {
         Self {
@@ -58,13 +64,20 @@ impl ProcessSampler for NativeProcessSampler {
 }
 
 impl NativeProcessSampler {
-    pub(crate) fn process_identity(pid: u32) -> Result<ProcessIdentity, SamplingError> {
+    pub fn process_record(pid: u32) -> Result<NativeProcessRecord, SamplingError> {
         let record = platform_process_record(pid)
             .map_err(|error| SamplingError::Failed(error.to_string()))?;
-        Ok(ProcessIdentity {
-            pid,
-            started_at: record.started_at,
+        Ok(NativeProcessRecord {
+            identity: ProcessIdentity {
+                pid,
+                started_at: record.started_at,
+            },
+            ppid: record.ppid,
         })
+    }
+
+    pub(crate) fn process_identity(pid: u32) -> Result<ProcessIdentity, SamplingError> {
+        Self::process_record(pid).map(|record| record.identity)
     }
 
     pub(crate) fn collect_rows(
@@ -846,6 +859,20 @@ mod tests {
 
         assert_eq!(identity.pid, std::process::id());
         assert_eq!(identity.started_at, platform.started_at);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_process_record_exposes_the_current_linux_identity_and_parent() {
+        let record = NativeProcessSampler::process_record(std::process::id())
+            .expect("current process record");
+        let expected =
+            platform_process_record(std::process::id()).expect("current platform record");
+
+        assert_eq!(record.identity.pid, std::process::id());
+        assert_eq!(record.identity.started_at, expected.started_at);
+        assert_eq!(record.ppid, expected.ppid);
+        assert_ne!(record.identity.started_at, 0);
     }
 
     #[test]

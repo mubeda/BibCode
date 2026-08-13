@@ -28,9 +28,11 @@ const fn stream(name: &'static str) -> RpcMethodSpec {
 }
 
 pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
+    unary("activity.cancelSubtree"),
     unary("activity.getSnapshot"),
     unary("activity.listDetail"),
     unary("activity.listRoster"),
+    unary("activity.retrySubtreeCancellation"),
     unary("assets.createUrl"),
     unary("cloud.getRelayClientStatus"),
     stream("cloud.installRelayClient"),

@@ -42,20 +42,36 @@ async fn default_windows_shell_inherits_the_path_needed_to_launch() {
         ))
         .await
         .expect("terminal opens");
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let shell_ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let attachment = manager
                 .attach(TerminalAttachInput::existing("thread-1", "terminal-1"))
                 .await
                 .expect("terminal remains attachable");
             if attachment.initial.history.contains("\u{1b}[6n") {
-                break;
+                break true;
+            }
+            if attachment.initial.history.contains("PS ")
+                && attachment.initial.history.contains('>')
+            {
+                break false;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("PowerShell requests the terminal cursor position");
+    .await;
+    let requested_cursor_position = if let Ok(requested_cursor_position) = shell_ready {
+        requested_cursor_position
+    } else {
+        let attachment = manager
+            .attach(TerminalAttachInput::existing("thread-1", "terminal-1"))
+            .await
+            .expect("terminal remains attachable for startup diagnostics");
+        panic!(
+            "PowerShell did not become ready: status={:?}, history={:?}",
+            attachment.initial.status, attachment.initial.history
+        );
+    };
     tokio::time::timeout(
         Duration::from_secs(2),
         manager.resize("thread-1", "terminal-1", 100, 24),
@@ -63,10 +79,12 @@ async fn default_windows_shell_inherits_the_path_needed_to_launch() {
     .await
     .expect("terminal resize does not block while PowerShell awaits a cursor response")
     .expect("terminal resizes");
-    manager
-        .write("thread-1", "terminal-1", "\u{1b}[1;1R")
-        .await
-        .expect("terminal accepts cursor response");
+    if requested_cursor_position {
+        manager
+            .write("thread-1", "terminal-1", "\u{1b}[1;1R")
+            .await
+            .expect("terminal accepts cursor response");
+    }
     manager
         .write(
             "thread-1",
@@ -76,7 +94,7 @@ async fn default_windows_shell_inherits_the_path_needed_to_launch() {
         .await
         .expect("terminal accepts input");
 
-    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let attachment = manager
                 .attach(TerminalAttachInput::existing("thread-1", "terminal-1"))

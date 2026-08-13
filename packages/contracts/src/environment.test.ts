@@ -117,16 +117,30 @@ describe("execution environment contracts", () => {
     ).toBeNull();
   });
 
-  it("allows a server descriptor to advertise activity protocol version 1", () => {
+  it("allows a server descriptor to advertise activity protocol version 2", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
         ...descriptor,
         capabilities: {
           repositoryIdentity: true,
-          activityProtocolVersion: 1,
+          activityProtocolVersion: 2,
         },
       }).capabilities.activityProtocolVersion,
-    ).toBe(1);
+    ).toBe(2);
+  });
+
+  it("rejects obsolete and future activity protocol versions", () => {
+    for (const activityProtocolVersion of [0, 1, 3]) {
+      expect(() =>
+        decodeExecutionEnvironmentDescriptor({
+          ...descriptor,
+          capabilities: {
+            repositoryIdentity: true,
+            activityProtocolVersion,
+          },
+        }),
+      ).toThrow();
+    }
   });
 
   it("keeps a legacy non-activity client compatible with additive descriptors and conversation traffic", () => {

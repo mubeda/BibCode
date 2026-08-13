@@ -24,7 +24,7 @@ pub use model::{
 };
 pub use monitor::{CurrentProcessDiagnostics, DiagnosticsMonitor, ProcessSampler, SamplingError};
 pub(crate) use native::RuntimeProcessOwnership;
-pub use native::{NativeProcessSampler, ProcessSignal, SignalError};
+pub use native::{NativeProcessRecord, NativeProcessSampler, ProcessSignal, SignalError};
 pub(crate) use registry::ProcessRegistrationError;
 pub use registry::{
     ProcessAttributionRegistry, ProcessRegistration, ProcessRegistrationMetadata,

@@ -221,7 +221,10 @@ classifies the resolved store and inventories verified backups without changing
 database, WAL, marker, or catalog bytes. `bibcode storage restore --backup-id`
 accepts only a selected generation whose manifest, location, storage identity,
 checksum, SQLite integrity, and migration prefix verify for that same state
-kind. `bibcode storage start-empty` is the separate destructive choice. Both
+kind. Restore reopens the verified database through a no-follow, read-capable
+file handle before copying it into recovery staging; on Windows, directories
+remain attributes-only while database files explicitly request generic read
+access. `bibcode storage start-empty` is the separate destructive choice. Both
 mutating commands first acquire an exclusive runtime lock and the storage
 operation lock, write and flush a recovery journal, and preserve every existing
 database, WAL, SHM, and marker entry in a private recovery generation before
@@ -399,6 +402,15 @@ backing-store size through xterm's WebGL resize layers so the drawing viewport
 and glyph shader resolution change atomically with the canvas; resizing the
 canvas alone is not a valid renderer state during center-panel splits.
 
+A terminal session may keep running after its center panel stops rendering. The
+per-terminal input scheduler therefore survives renderer unmounts so an
+immediate replacement can preserve ordering, but its retained writer is
+created outside the renderer effect's closure and captures only the command and
+terminal identity. Teardown detaches the transcript and disposes xterm and
+WebGL without abandoning input already accepted by the scheduler. A later
+renderer retargets error presentation, while the retained writer cannot keep
+the departed renderer or its terminal buffers reachable.
+
 ## Request and event flow
 
 1. The client runtime resolves a connection target and obtains any required
@@ -452,6 +464,15 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - WSL-only desktop startup never falls back to a native Windows backend.
   Planning and primary-start failures remain tagged through the desktop bridge;
   only an explicit settings action switches the primary runtime to Windows.
+- Forced linked-worktree deletion cleans the registered worktree contents before
+  asking Git to deregister it, but only after the candidate's administrative
+  `.git` file and backlink verify against the repository's common worktree
+  metadata. The link remains until filesystem cleanup succeeds, so a blocked
+  cleanup is safely retryable across client and server restarts. Compatibility cleanup of a
+  previously deregistered directory is limited to a normal directory without a
+  `.git` entry whose canonical parent is exactly BiBCode's computed
+  per-repository worktree namespace; primary checkouts and arbitrary paths are
+  never pre-cleaned.
 - Configured secondary WSL planning/start failures remain desired, unavailable
   topology with stable identity and no endpoint/session. They do not remove
   cached project/thread state; explicit disable or distro replacement does.

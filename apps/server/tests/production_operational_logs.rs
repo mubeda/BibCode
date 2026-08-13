@@ -23,6 +23,7 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
         event_type: "assistant.message.delta".to_owned(),
         thread_id: "thread-1".to_owned(),
         turn_id: Some("turn-1".to_owned()),
+        item_id: None,
         request_id: None,
         payload: json!({
             "text": "Bearer PRIVATE_BEARER_TOKEN",
@@ -31,6 +32,7 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
             "raw": "https://hooks.example/activity?token=PRIVATE_HOOK_TOKEN"
         }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 
@@ -45,6 +47,47 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
         "PRIVATE_HOOK_TOKEN",
     ] {
         assert!(!contents.contains(private_value));
+    }
+}
+
+#[tokio::test]
+async fn provider_logs_reject_malformed_item_ids() {
+    let temp = TempDir::new().expect("temporary log directory");
+    let path = temp.path().join("events.log");
+    let log = ProviderOperationalLog::start(path.clone(), OperationalLogOptions::default())
+        .await
+        .expect("provider log starts");
+
+    for item_id in [
+        format!("SENSITIVE_OVERSIZED_ITEM_ID{}", "x".repeat(5_000)),
+        "SENSITIVE_CONTROL_ITEM_ID\u{0007}".to_owned(),
+        " SENSITIVE_LEADING_SPACE_ITEM_ID".to_owned(),
+        "SENSITIVE_TRAILING_SPACE_ITEM_ID ".to_owned(),
+        "SENSITIVE_TRAILING_NEWLINE_ITEM_ID\n".to_owned(),
+    ] {
+        assert!(log.record(&ProviderEvent {
+            native_event_id: None,
+            event_type: "assistant.message.delta".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            item_id: Some(item_id),
+            request_id: None,
+            payload: json!({}),
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        }));
+    }
+    log.shutdown().await.expect("provider log shuts down");
+
+    let contents = std::fs::read_to_string(path).expect("read provider log");
+    assert!(!contents.contains("SENSITIVE_OVERSIZED_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_CONTROL_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_LEADING_SPACE_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_TRAILING_SPACE_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_TRAILING_NEWLINE_ITEM_ID"));
+    for line in contents.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("provider record");
+        assert!(record.get("itemId").is_none());
     }
 }
 
@@ -94,9 +137,11 @@ async fn startup_removes_provider_log_files_that_exceed_the_configured_bound() {
         event_type: "turn.completed".to_owned(),
         thread_id: "thread-1".to_owned(),
         turn_id: None,
+        item_id: None,
         request_id: None,
         payload: json!({ "text": "must not be persisted" }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 

@@ -33,7 +33,7 @@ protocol:
 | -------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Codex    | Codex App Server JSON-RPC                      | Structured chat and managed-terminal observation.                                          |
 | Claude   | Claude stream-JSON CLI and authenticated hooks | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor   | Agent Client Protocol                          | Normal chat only in activity protocol v1.                                                  |
+| Cursor   | Agent Client Protocol                          | Normal chat only in activity protocol v2.                                                  |
 | OpenCode | OpenCode server/events API                     | Structured chat and managed-terminal observation.                                          |
 
 Provider-specific events are normalized into shared orchestration contracts;
@@ -218,15 +218,38 @@ disables that fallback. Equal, ambiguous, or missing comparisons remain
 ## Activity support
 
 Activity is a separate capability from provider execution. The server
-advertises activity protocol v1 only after its RPC surface is registered, and
+advertises activity protocol v2 only after its RPC surface is registered, and
 each adapter reports only the activity it can prove.
 
-| Provider | Structured chat | Structured activity                                                                            | Provider-terminal observation                                                                                      | Downgrade behavior                                                                                       |
-| -------- | --------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| Codex    | Supported       | Actors, attributed entries, and version-gated background tasks.                                | Supported when the executable advertises the required App Server listener and remote-TUI features.                 | Incompatible recovery or background methods reduce capabilities without disabling ordinary provider use. |
-| Claude   | Supported       | Actors and attributed entries when both hook-event switches are detected; no background tasks. | Supported after safe settings composition, authenticated hooks, merge attestation, and private executable pinning. | Failed probes or recovery preserve normal chat/terminal execution without claiming unsupported activity. |
-| OpenCode | Supported       | Actors and attributed entries after child-session correlation; no background tasks.            | Supported after authenticated serve/attach preparation and owned-root correlation.                                 | Reconciliation can report none, bounded, full, or stale without restarting the original command.         |
-| Cursor   | Supported       | Unsupported in protocol v1.                                                                    | Unsupported in protocol v1.                                                                                        | Cursor remains usable for ordinary chat without an activity dock.                                        |
+Codex structured chat also reports targeted actor cancellation when its adapter
+can publish exact verified child-thread/active-turn handles. Those handles stay
+inside the server and dispatch through the child-specific App Server
+`turn/interrupt` request; provider terminals remain observation-only.
+
+Claude structured chat reports targeted actor cancellation provisionally when
+both hook-event switches and the private hook sink are available. A fully
+correlated private task handle dispatches the stream-JSON `stop_task` request.
+The Agent invocation identity is accepted from current Claude `assistant`
+messages and the legacy `stream_event` content-block shape; both remain bounded,
+opaque, and key-equivalent for publication.
+That handle comes from either the complete explicit PostToolUse identity chain
+or the bounded authenticated parent-local cardinality-one fallback for a nested
+actor only. Because documented SubagentStart hooks omit parent identity, the
+fallback additionally requires one unmatched child globally and no unresolved
+root launch; exact PostToolUse can instead prove and reparent its named child.
+Ambiguous nested actors remain observable but unsupported, and are rejected
+before provider I/O. Only the exact unsupported-control response
+revokes targeted support for the current runtime generation; generic failure,
+timeout, and connection closure do not. Revocation clears all exact and
+fallback handles before later clicks are admitted and never falls back to the
+root interrupt path.
+
+| Provider | Structured chat | Structured activity                                                                                                                                                                                                                   | Provider-terminal observation                                                                                      | Downgrade behavior                                                                                                                                                                              |
+| -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex    | Supported       | Actors, attributed entries, and version-gated background tasks.                                                                                                                                                                       | Supported when the executable advertises the required App Server listener and remote-TUI features.                 | Incompatible recovery or background methods reduce capabilities without disabling ordinary provider use.                                                                                        |
+| Claude   | Supported       | Actors and attributed entries when both hook-event switches are detected; complete explicit correlation or the bounded nested-only parent-local cardinality-one fallback supports generation-scoped `stop_task`; no background tasks. | Supported after safe settings composition, authenticated hooks, merge attestation, and private executable pinning. | Failed probes preserve ordinary use; ambiguous nested actors remain observable but unsupported, and exact unsupported `stop_task` revokes every target for only the current runtime generation. |
+| OpenCode | Supported       | Actors and attributed entries after child-session correlation; no background tasks.                                                                                                                                                   | Supported after authenticated serve/attach preparation and owned-root correlation.                                 | Reconciliation can report none, bounded, full, or stale without restarting the original command.                                                                                                |
+| Cursor   | Supported       | Unsupported in protocol v2.                                                                                                                                                                                                           | Unsupported in protocol v2.                                                                                        | Cursor remains usable for ordinary chat without an activity dock.                                                                                                                               |
 
 For every terminal observer, failed or timed-out preparation passes through the
 original command. Once a prepared command is running, later observer failure

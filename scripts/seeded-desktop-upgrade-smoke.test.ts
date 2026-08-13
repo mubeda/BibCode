@@ -51,6 +51,7 @@ describe("seeded packaged desktop upgrade harness", () => {
   });
 
   it("parses deterministic platform arguments and resolves only absolute isolated roots", () => {
+    const repositoryRoot = NodePath.resolve("/repo");
     const input = parseSeededDesktopUpgradeSmokeArgs(
       [
         "--platform",
@@ -78,7 +79,7 @@ describe("seeded packaged desktop upgrade harness", () => {
         "--restart-timeout-ms",
         "90000",
       ],
-      "/repo",
+      repositoryRoot,
     );
 
     expect(input).toEqual({
@@ -90,7 +91,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       previousTag: "v0.3.10",
       previousVersion: "0.3.10",
       publicKeyFile: absolute("keys", "updater.key.pub"),
-      repositoryRoot: "/repo",
+      repositoryRoot,
       restartTimeoutMs: 90_000,
       runId: "run-17-mac-arm64",
       updaterPort: 4_312,

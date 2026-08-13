@@ -92,7 +92,7 @@ function entry(
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: "scope-1",
     scope: { _tag: "thread", threadId: "thread-1" },
     revision: 1,
@@ -104,6 +104,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
       backgroundWork: true,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: false,
     },
     observationState: "live",
     sections: {
@@ -118,6 +119,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: { scopeId: "scope-1", revision: 0, actors: [], operations: [] },
     updatedAt: "2026-07-22T20:10:00.000Z",
     ...overrides,
   } as unknown as ActivitySnapshot;
@@ -139,7 +141,7 @@ function rosterPage(
   records: ActivityRosterPageData["records"],
   nextCursor: string | null = null,
 ): ActivityRosterPageData {
-  return { records, nextCursor } as ActivityRosterPageData;
+  return { records, actorControls: [], nextCursor } as ActivityRosterPageData;
 }
 
 function detailPage(
@@ -147,7 +149,7 @@ function detailPage(
   entries: ActivityDetailPageData["entries"],
   nextCursor: string | null = null,
 ): ActivityDetailPageData {
-  return { record, entries, nextCursor } as ActivityDetailPageData;
+  return { record, actorControl: null, entries, nextCursor } as ActivityDetailPageData;
 }
 
 function detailQuery(
@@ -239,6 +241,105 @@ afterAll(() => {
 });
 
 describe("ActivityPanel roster", () => {
+  it("renders only server-authoritative partial retries and forwards the fenced summary", async () => {
+    const onRetryCancellation = vi.fn();
+    const partialSnapshot = snapshot({
+      capabilities: {
+        actors: true,
+        attributedActivity: true,
+        backgroundWork: true,
+        historyRecovery: "full",
+        terminalObservation: false,
+        targetedActorCancellation: true,
+      },
+      control: {
+        scopeId: "scope-1" as ActivitySnapshot["scopeId"],
+        revision: 12,
+        actors: [],
+        operations: [
+          {
+            rootActorId: "root-actor" as ActivityActorSummary["id"],
+            state: "partial",
+            residualCount: 2,
+            message: "Some agents are still running.",
+            operationRevision: 6,
+          },
+        ],
+      },
+    });
+    const container = await mount(
+      <ActivityPanel {...props({ snapshot: partialSnapshot, onRetryCancellation })} />,
+    );
+
+    expect(container.textContent).toContain("Some agents are still running. 2 remaining.");
+    const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Retry remaining",
+    );
+    expect(retry).toBeDefined();
+    await act(async () => retry?.click());
+    expect(onRetryCancellation).toHaveBeenCalledWith("root-actor", 6);
+  });
+
+  it("suppresses command failures while a server operation is requested", async () => {
+    const requestedSnapshot = snapshot({
+      capabilities: {
+        actors: true,
+        attributedActivity: true,
+        backgroundWork: true,
+        historyRecovery: "full",
+        terminalObservation: false,
+        targetedActorCancellation: true,
+      },
+      control: {
+        scopeId: "scope-1" as ActivitySnapshot["scopeId"],
+        revision: 13,
+        actors: [],
+        operations: [
+          {
+            rootActorId: "root-actor" as ActivityActorSummary["id"],
+            state: "requested",
+            residualCount: 0,
+            message: null,
+            operationRevision: 7,
+          },
+        ],
+      },
+    });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          snapshot: requestedSnapshot,
+          cancellationError: "Unable to stop agents. Try again.",
+          onRetryCancellation: vi.fn(),
+        })}
+      />,
+    );
+
+    expect(container.textContent).not.toContain("Unable to stop agents");
+    expect(container.textContent).not.toContain("Retry remaining");
+  });
+
+  it("keeps the last provider lifecycle visible beside a bounded command failure", async () => {
+    const running = actor("still-running", { name: "Still running" });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          cancellationError: "Stopping agents timed out. Some agents may still be running.",
+          roster: {
+            active: query([rosterPage([running])]),
+            done: query([rosterPage([])]),
+          },
+        })}
+      />,
+    );
+
+    expect(container.textContent).toContain(
+      "Stopping agents timed out. Some agents may still be running.",
+    );
+    expect(
+      container.querySelector('button[data-activity-row="still-running"]')?.textContent,
+    ).toContain("Running");
+  });
   it("shows only actors in active-oldest and done-newest order with safe row fields", async () => {
     const onNavigate = vi.fn();
     const active = [
@@ -296,8 +397,8 @@ describe("ActivityPanel roster", () => {
     expect(older.className).toContain("min-h-9");
     expect(older.className).toContain("sm:min-h-8");
     expect(older.className).not.toContain("sm:h-8");
-    expect(older.querySelector('[data-activity-provider-glyph="claude"]')).not.toBeNull();
-    expect(older.querySelector('[data-activity-record-glyph="actor"]')).not.toBeNull();
+    expect(older.querySelectorAll('[data-activity-provider-glyph="claude"]')).toHaveLength(1);
+    expect(older.querySelector('[data-activity-record-glyph="actor"]')).toBeNull();
     expect(rows[2]?.textContent).toContain("Completed in 18m");
 
     await act(async () => older.click());
@@ -671,6 +772,7 @@ describe("ActivityPanel roster", () => {
               backgroundWork: true,
               historyRecovery: "none",
               terminalObservation: false,
+              targetedActorCancellation: false,
             },
             sections: {
               subagents: { state: "unsupported", message: null, retryable: false },

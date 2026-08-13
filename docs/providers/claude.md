@@ -169,6 +169,105 @@ only when help advertises both exact switches:
 If either switch is unavailable or the bounded probe fails, Claude still runs in
 its normal stream-JSON mode without structured hook activity.
 
+Structured chat control correlation is stricter than display observation.
+BiBCode exposes a private task target only after one session and Activity
+generation proves the complete identity chain: an Agent/legacy Task tool
+invocation, its authenticated asynchronous PostToolUse result carrying the
+same `tool_use_id` and `agentId`, a `task_started` record carrying that
+`tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
+`task_type` may be absent or exactly `local_agent` or `remote_agent`; every
+other value fails closed.
+Root invocations require both the stream invocation and authenticated hook to
+identify the root as their source and `SubagentStart` to report no parent. A
+nested invocation additionally requires its stream `parent_tool_use_id` to
+resolve to an active exact parent correlation whose launched `agentId` equals
+the nested authenticated PostToolUse hook's top-level source `agent_id`; the
+exact PostToolUse `agentId` names the child. Documented `SubagentStart` hook
+payloads do not include `parent_agent_id`; after the exact source proof, BiBCode
+privately reparents that named child to the source parent. If a future payload
+does include explicit lineage, it must agree. Root/nested mismatch, sibling
+cross-wiring, conflicting lineage, or mismatched source ownership never enables
+control. A bounded dependency fixpoint settles already-present parent, child,
+and deeper chains in one observation regardless of lexical identity order.
+
+The complete PostToolUse chain is the authoritative path. When a nested Claude
+version provides no usable PostToolUse launch result, an authenticated
+`PreToolUse` from an already exact parent instead opens a parent-owned pending
+interval. The nested-only parent-local fallback admits control only when the
+stream parent tool, the accepted nested `task_started` candidate, and the
+unmatched verified child are globally unique, with no unresolved root launch
+that could own the child. The correlator then privately assigns that child to
+the exact source parent. A later exact PostToolUse result promotes that pending
+state to an exact target or contradicts it, retires it, and tombstones its
+identity chain so replay cannot recreate the target. Multiple nested candidates,
+multiple unmatched children, or any unresolved root launch remain observable
+but unsupported and cause zero provider I/O; BiBCode does not infer identity
+from text, timing, order, proximity, or transcript contents.
+
+Arrival order is irrelevant. Every accepted fact that installs, retires, or
+terminalizes a target carries a deterministic domain-separated SHA-256 event
+key through the production event pump. The key is duplicate-stable, bounded,
+status-separated, and contains no provider-native identity. Effect-producing
+conflicts use bounded canonical classes such as asynchronous/other and
+local-agent/other, so arbitrary status or type labels cannot suppress a target
+retirement. Optional source and parent identities are framed as explicit
+`none` or `some` plus the bounded value; the valid literal native identity
+`<root>` is therefore never confused with absence. Present invalid hook source
+or parent fields are rejected at the authenticated boundary rather than being
+coerced to the absent/root form. Names, roles, descriptions, prompts,
+timestamps, output paths, and event proximity are never correlation keys;
+incomplete, conflicting, stale, malformed, or saturated chains remain
+observable but uncontrollable. Live identity maps and unmatched terminal
+statuses are each bounded at the Activity page limit, including the
+generation-owned parent-local pending set (200 correlations). The fallback uses
+no timers, polling, or transcript reads. Terminal retirement, Activity
+disablement, and runtime replacement clear or retire its pending and installed
+state. Terminal retirement
+atomically removes the live tool/agent/task join and records generation-scoped identities in three
+fixed 256-word tombstone filters (2 KiB each; 6 KiB total). Tombstones are never
+evicted within a generation: a filter false positive can only disable a private
+target, never create one or invent lifecycle. At exact terminal-status-map
+saturation new ambiguous task facts fail closed rather than displacing earlier
+terminal authority. Only bounded identities and terminal status are retained,
+and provider-native IDs do not cross persistence, contracts, or logs.
+
+A `task_notification` with status `stopped`/`cancelled`, `failed`, or
+`interrupted` is authoritative Cancelled, Failed, or Interrupted lifecycle for
+an exactly mapped actor and retires its private target. The runtime retains a
+bounded exact terminal task-to-agent link after an ordinary SubagentStop so a
+reordered authoritative task notification can still replace Completed. A later
+`SubagentStop` cannot rewrite cancelled, interrupted, or failed lifecycle to
+completed.
+
+When the compatibility probe proves both hook switches and the authenticated
+hook sink starts, targeted cancellation is provisionally enabled for that
+structured-chat runtime generation. Clicking an actor with a complete exact
+mapping or admitted nested-only parent-local fallback sends one stream-JSON
+control request with subtype `stop_task` and that private `task_id`. Any
+non-Claude target, root/foreground actor, ambiguous nested actor, or actor
+without a current admitted mapping is rejected before provider I/O; BiBCode
+never falls back to the conversation-wide interrupt request.
+
+The control response must carry the matching request ID. Only Claude's exact
+unsupported-control protocol error authoritatively disables targeted
+cancellation for the current generation. Before the caller receives that
+result, BiBCode removes every current Claude task handle and operation,
+publishes targeted cancellation as unsupported, and cancels and reaps queued or
+in-flight targeted work. Future clicks then fail without another provider
+write. Generic provider errors, timeouts, malformed responses, and connection
+closure remain safe operation failures and do not disable the capability. A
+restarted or re-enabled runtime starts a fresh generation and may prove support
+and exact mappings again. Private task IDs and raw control errors are redacted
+from Activity errors, logs, and Debug output.
+
+The Activity panel shows `Stopping` from the server's ephemeral control overlay;
+the `stop_task` response itself does not terminalize the actor. Authenticated
+hook and task lifecycle events remain authoritative. If only part of a selected
+subtree is delivered, **Retry remaining** sends only the current exact residual
+task mappings and late descendants already captured by the original
+generation-scoped fence. It never performs a new semantic lookup or falls back
+to Claude's conversation-wide interrupt.
+
 Provider-terminal observation has a separate capability and safety gate. The
 executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the

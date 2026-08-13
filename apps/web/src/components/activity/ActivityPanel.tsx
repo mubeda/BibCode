@@ -48,6 +48,9 @@ export interface ActivityPanelProps {
   readonly onLoadMoreRoster: (bucket: "active" | "done") => void;
   readonly onLoadMoreDetail: () => void;
   readonly onRefreshSnapshot: () => void;
+  readonly onCancelActor?: (actorId: ActivityRecordId, controlRevision: number) => void;
+  readonly onRetryCancellation?: (rootActorId: ActivityRecordId, operationRevision: number) => void;
+  readonly cancellationError?: string | null;
   readonly now?: string;
 }
 
@@ -115,6 +118,9 @@ export function ActivityPanel({
   onLoadMoreRoster,
   onLoadMoreDetail,
   onRefreshSnapshot,
+  onCancelActor,
+  onRetryCancellation,
+  cancellationError = null,
   now,
 }: ActivityPanelProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -147,6 +153,12 @@ export function ActivityPanel({
     removed || removalNotice?.section === route.section
       ? "This activity record is no longer available."
       : null;
+  const requestedCancellation = snapshot.control.operations.some(
+    (operation) => operation.state === "requested",
+  );
+  const partialCancellations = snapshot.control.operations.filter(
+    (operation) => operation.state === "partial",
+  );
 
   useEffect(() => {
     if (previousSectionRef.current === route.section) {
@@ -246,6 +258,7 @@ export function ActivityPanel({
       now={effectiveNow}
       onFocusRestored={focusRestored}
       onLoadMore={onLoadMoreRoster}
+      {...(onCancelActor === undefined ? {} : { onCancelActor })}
       onSelect={selectRecord}
       reconciled={reconciledRoster}
       section={route.section}
@@ -273,6 +286,33 @@ export function ActivityPanel({
           stale={sectionHealth.state === "stale"}
         />
       ) : null}
+      {!requestedCancellation && cancellationError !== null ? (
+        <RetryBanner message={cancellationError} />
+      ) : null}
+      {snapshot.scope._tag === "thread"
+        ? partialCancellations.map((operation) => (
+            <Alert className="mx-3 mt-3" key={operation.rootActorId} variant="error">
+              <TriangleAlertIcon />
+              <AlertDescription>
+                {operation.message ?? "Some agents are still running."} {operation.residualCount}{" "}
+                remaining.
+              </AlertDescription>
+              {onRetryCancellation === undefined ? null : (
+                <AlertAction>
+                  <Button
+                    onClick={() =>
+                      onRetryCancellation(operation.rootActorId, operation.operationRevision)
+                    }
+                    size="xs"
+                    variant="outline"
+                  >
+                    Retry remaining
+                  </Button>
+                </AlertAction>
+              )}
+            </Alert>
+          ))
+        : null}
       <ScrollArea className="min-h-0 flex-1">
         {selected && !removed && resolvedDetail !== null ? (
           <ActivityRecordDetail

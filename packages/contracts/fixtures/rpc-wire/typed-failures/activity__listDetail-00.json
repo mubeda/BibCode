@@ -9,7 +9,7 @@
         "error": {
           "_tag": "ActivityError",
           "message": " h",
-          "reason": "notFound"
+          "reason": "staleScope"
         }
       }
     ]
