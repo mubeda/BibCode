@@ -61,7 +61,7 @@ graph.
 - [ ] **Step 1: Run only the two exact observed failures**
 
 ```bash
-cargo test -p bibcode-server --lib process::supervised::tests::completed_and_reaped_execution_wins_the_timeout_boundary -- --exact --nocapture
+cargo test -p bibcode-server --lib process::supervised::tests::ready_execution_wins_the_timeout_wake_without_a_separate_waker -- --exact --nocapture
 cargo test -p bibcode-server --lib production::provider_runtime::tests::native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands -- --exact --nocapture
 ```
 
@@ -141,7 +141,7 @@ the same execution future has proved ready.
 - [ ] **Step 2: Run the exact RED**
 
 ```bash
-cargo test -p bibcode-server --lib process::supervised::tests::completed_and_reaped_execution_wins_the_timeout_boundary -- --exact --nocapture
+cargo test -p bibcode-server --lib process::supervised::tests::ready_execution_wins_the_timeout_wake_without_a_separate_waker -- --exact --nocapture
 ```
 
 Expected: fail for the old proxy or arbitration at the named boundary, not from
