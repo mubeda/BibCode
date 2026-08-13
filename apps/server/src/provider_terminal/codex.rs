@@ -2024,15 +2024,17 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 permit,
                 self.readiness_timeout,
                 #[cfg(test)]
-                self.integration_deadline,
-                #[cfg(test)]
-                self.fixture_events
-                    .as_ref()
-                    .map(|events| events.reaped.clone()),
-                #[cfg(test)]
-                self.fixture_events
-                    .as_ref()
-                    .and_then(|events| events.watchdog_spawn_race.clone()),
+                CodexHelperSupervisionFixture {
+                    integration_deadline: self.integration_deadline,
+                    reaped: self
+                        .fixture_events
+                        .as_ref()
+                        .map(|events| events.reaped.clone()),
+                    watchdog_spawn_race: self
+                        .fixture_events
+                        .as_ref()
+                        .and_then(|events| events.watchdog_spawn_race.clone()),
+                },
             );
             ready
                 .await
@@ -2174,9 +2176,7 @@ impl CodexHelperSupervisor {
         socket_path: PathBuf,
         permit: tokio::sync::OwnedSemaphorePermit,
         readiness_timeout: Duration,
-        #[cfg(test)] integration_deadline: Option<tokio::time::Instant>,
-        #[cfg(test)] fixture_reaped: Option<Arc<crate::test_support::FixtureEvent>>,
-        #[cfg(test)] fixture_watchdog_spawn_race: Option<Arc<CodexHelperWatchdogSpawnRace>>,
+        #[cfg(test)] fixture: CodexHelperSupervisionFixture,
     ) -> (
         SystemCodexHelperProcess,
         tokio::sync::oneshot::Receiver<Result<(), String>>,
@@ -2184,6 +2184,12 @@ impl CodexHelperSupervisor {
         let termination = tokio_util::sync::CancellationToken::new();
         let child_termination = termination.clone();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        #[cfg(test)]
+        let CodexHelperSupervisionFixture {
+            integration_deadline,
+            reaped: fixture_reaped,
+            watchdog_spawn_race: fixture_watchdog_spawn_race,
+        } = fixture;
         self.runtime.spawn(async move {
             let ready_deadline = {
                 #[cfg(test)]
@@ -2260,6 +2266,14 @@ impl CodexHelperSupervisor {
         });
         (SystemCodexHelperProcess { termination }, ready_receiver)
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CodexHelperSupervisionFixture {
+    integration_deadline: Option<tokio::time::Instant>,
+    reaped: Option<Arc<crate::test_support::FixtureEvent>>,
+    watchdog_spawn_race: Option<Arc<CodexHelperWatchdogSpawnRace>>,
 }
 
 async fn terminate_and_reap_codex_helper(mut child: Child) {
@@ -3007,9 +3021,10 @@ mod tests {
             socket_path,
             permit,
             CODEX_HELPER_READY_TIMEOUT,
-            None,
-            Some(reaped.clone()),
-            None,
+            CodexHelperSupervisionFixture {
+                reaped: Some(reaped.clone()),
+                ..CodexHelperSupervisionFixture::default()
+            },
         );
         ready
             .await
