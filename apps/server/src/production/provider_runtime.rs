@@ -9337,6 +9337,7 @@ mod tests {
         time::timeout,
     };
 
+    #[cfg(unix)]
     static CLAUDE_STOP_TASK_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn targeted_claude_runtime(
