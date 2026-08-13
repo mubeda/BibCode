@@ -4257,6 +4257,20 @@ async fn kill_child(child: &SharedChild) {
     log_cleanup_failures("provider process", &report);
 }
 
+#[cfg(test)]
+async fn shutdown_codex_fixture_bounded(
+    driver: &CodexDriver,
+    graceful_timeout: Duration,
+) -> Result<bool, ProviderRuntimeError> {
+    match tokio::time::timeout(graceful_timeout, driver.shutdown()).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => {
+            kill_child(&driver.child).await;
+            Ok(false)
+        }
+    }
+}
+
 fn runtime_mode(value: &str) -> CodexRuntimeMode {
     match value {
         "approval-required" => CodexRuntimeMode::ApprovalRequired,
@@ -8554,6 +8568,10 @@ lines.on("line", (line) => {
       result = { thread: { id: "native-codex-thread", turns: [] } };
       break;
     case "shutdown":
+      if (process.env.BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER) {
+        fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER, request.method);
+      }
+      if (process.env.BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE) return;
       result = null;
       break;
     default:
@@ -9028,7 +9046,10 @@ while IFS= read -r line; do
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"thread/rollback"'*) printf '{"id":%s,"result":{"thread":{"id":"native-codex-thread","turns":[]}}}\n' "$id" ;;
-    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+    *'"method":"shutdown"'*)
+      [ -z "$BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER"
+      [ -n "$BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE" ] || printf '{"id":%s,"result":null}\n' "$id"
+      ;;
   esac
 done
 "#;
@@ -10454,6 +10475,62 @@ done
     }
 
     #[tokio::test]
+    async fn codex_fixture_timeout_cleanup_reaps_an_unresponsive_shutdown() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let codex_fixture = executable_fixture(&temp, "codex-timeout-fixture", CODEX_FIXTURE);
+        let shutdown_request_ready = temp.path().join("codex-shutdown-request-ready");
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER".to_owned(),
+            shutdown_request_ready.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE".to_owned(),
+            "1".to_owned(),
+        );
+        let driver = super::CodexDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+            true,
+        )
+        .await
+        .expect("Codex timeout driver should create");
+        driver
+            .start()
+            .await
+            .expect("Codex timeout driver should start");
+
+        let shutdown_outcome = timeout(
+            std::time::Duration::from_secs(3),
+            super::shutdown_codex_fixture_bounded(&driver, std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("Codex timeout cleanup must remain bounded");
+
+        assert!(
+            matches!(shutdown_outcome, Ok(false)),
+            "unresponsive graceful shutdown must force owned cleanup: {shutdown_outcome:?}"
+        );
+        assert!(
+            shutdown_request_ready.is_file(),
+            "fixture must positively receive the shutdown request"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped Codex fixture status")
+                .is_some(),
+            "bounded cleanup must kill and reap the owned fixture child"
+        );
+    }
+
+    #[tokio::test]
     async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
         let temp = TempDir::new().expect("provider fixture directory");
         let attachment_root = temp.path().join("state&").join("attachments");
@@ -10602,10 +10679,16 @@ done
             "BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER".to_owned(),
             codex_thread_response_ready.to_string_lossy().into_owned(),
         );
-        let codex = factory
-            .create(codex_request)
+        let codex = Arc::new(
+            super::CodexDriver::spawn(
+                codex_request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
             .await
-            .expect("Codex driver should create");
+            .expect("Codex driver should create"),
+        );
         let start_completed = Arc::new(FixtureEvent::default());
         let start_checkpoint = start_completed.checkpoint();
         let start_driver = codex.clone();
@@ -10626,13 +10709,13 @@ done
             let thread_response_ready = codex_thread_response_ready.is_file();
             start_task.abort();
             let _ = start_task.await;
-            codex
-                .shutdown()
-                .await
-                .expect("Codex should shut down after startup observation timeout");
+            let shutdown_outcome =
+                super::shutdown_codex_fixture_bounded(&codex, std::time::Duration::from_secs(2))
+                    .await;
             panic!(
                 "Codex start observation timeout: initialize_response_ready={initialize_response_ready}, \
-                 thread_response_ready={thread_response_ready}, owner_completed=false"
+                 thread_response_ready={thread_response_ready}, owner_completed=false, \
+                 shutdown_outcome={shutdown_outcome:?}"
             );
         }
         assert!(
