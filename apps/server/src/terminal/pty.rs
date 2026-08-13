@@ -444,7 +444,10 @@ impl PortablePtyBackend {
                     if let Err(error) = wait_for_unix_child_exit_without_reaping(pid) {
                         tracing::warn!(%error, pid, "failed to reserve PTY root identity through group cleanup");
                     }
-                    if let Err(error) = kill_unix_process_group(process_group) {
+                    if let Err(error) = kill_reserved_unix_process_group(
+                        process_group,
+                        &waiter_process_group_identity_reserved,
+                    ) {
                         tracing::warn!(%error, process_group, "failed to terminate PTY process group after root exit");
                     }
                 }
@@ -837,7 +840,11 @@ impl PtyProcess for PortablePtyProcess {
             if !self.process_group_identity_reserved.load(Ordering::Acquire) {
                 return Ok(());
             }
-            return kill_unix_process_group(process_group).map_err(|error| error.to_string());
+            return kill_reserved_unix_process_group(
+                process_group,
+                &self.process_group_identity_reserved,
+            )
+            .map_err(|error| error.to_string());
         }
         #[cfg(windows)]
         {
@@ -891,6 +898,26 @@ unsafe extern "C" {
 fn kill_unix_process_group(process_group: i32) -> std::io::Result<()> {
     // Negative PIDs target the complete process group created by the PTY.
     kill_unix_target(-process_group)
+}
+
+#[cfg(unix)]
+fn kill_reserved_unix_process_group(
+    process_group: i32,
+    identity_reserved: &AtomicBool,
+) -> std::io::Result<()> {
+    if identity_reserved
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+    match kill_unix_process_group(process_group) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            identity_reserved.store(true, Ordering::Release);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(unix)]
