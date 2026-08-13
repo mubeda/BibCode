@@ -12,6 +12,10 @@ import type * as RpcMessage from "effect/unstable/rpc/RpcMessage";
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as FastCheck from "fast-check";
 
+import {
+  ActivityCancelSubtreeInput,
+  ActivityRetrySubtreeCancellationInput,
+} from "../src/activity.ts";
 import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "../src/orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
 import {
@@ -162,7 +166,7 @@ const fixtureEnvironmentDescriptor = {
   platform: { os: "windows", arch: "x64" },
   serverVersion: "0.1.1",
   storageInstanceId: "00000000-0000-4000-8000-000000000002",
-  capabilities: { repositoryIdentity: true, activityProtocolVersion: 1 },
+  capabilities: { repositoryIdentity: true, activityProtocolVersion: 2 },
 } as const;
 const fixtureServerConfig = {
   environment: fixtureEnvironmentDescriptor,
@@ -311,7 +315,7 @@ const fixtureActivityActor = {
   terminalAt: null,
 } as const;
 const fixtureActivitySnapshot = {
-  protocolVersion: 1,
+  protocolVersion: 2,
   scopeId: "thread:thread-1",
   scope: { _tag: "thread", threadId: "thread-1" },
   revision: 3,
@@ -323,6 +327,7 @@ const fixtureActivitySnapshot = {
     backgroundWork: true,
     historyRecovery: "full",
     terminalObservation: false,
+    targetedActorCancellation: true,
   },
   observationState: "live",
   sections: {
@@ -337,6 +342,19 @@ const fixtureActivitySnapshot = {
   workItems: [],
   actorsHasMore: false,
   workItemsHasMore: false,
+  control: {
+    scopeId: "thread:thread-1",
+    revision: 8,
+    actors: [
+      {
+        actorId: "actor:child-1",
+        state: "available",
+        controlRevision: 3,
+        activeDescendantCount: 2,
+      },
+    ],
+    operations: [],
+  },
   updatedAt: "2026-07-22T12:00:01Z",
 } as const;
 
@@ -547,6 +565,36 @@ dynamicFixtures.set(
   } satisfies RpcMessage.RequestEncoded),
 );
 dynamicFixtures.set(
+  "contract-shapes/activity__cancelSubtree-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: "activity.cancelSubtree",
+    payload: compileUnknownEncoder(ActivityCancelSubtreeInput)({
+      scope: { _tag: "thread", threadId: "thread-1" },
+      scopeId: "thread:thread-1",
+      actorId: "actor:child-1",
+      expectedControlRevision: 3,
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+dynamicFixtures.set(
+  "contract-shapes/activity__retrySubtreeCancellation-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: "activity.retrySubtreeCancellation",
+    payload: compileUnknownEncoder(ActivityRetrySubtreeCancellationInput)({
+      scope: { _tag: "thread", threadId: "thread-1" },
+      scopeId: "thread:thread-1",
+      rootActorId: "actor:child-1",
+      expectedOperationRevision: 4,
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+dynamicFixtures.set(
   "contract-shapes/terminal__open-provider-activity-request.json",
   serializeWireFixture({
     _tag: "Request",
@@ -656,16 +704,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 93) {
-  throw new Error(`Expected 93 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 95) {
+  throw new Error(`Expected 95 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 16) {
   throw new Error(`Expected 16 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 57) {
+if (topLevelStreamShapeCount !== 59) {
   throw new Error(
-    `Expected 57 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 59 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
@@ -673,8 +721,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 220) {
-  throw new Error(`Expected 220 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 224) {
+  throw new Error(`Expected 224 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 23) {
   throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

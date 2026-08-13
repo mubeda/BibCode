@@ -1,10 +1,13 @@
 import {
+  ACTIVITY_PAGE_MAX_LENGTH,
   ActivityEntryId,
   ActivityRecordId,
   ActivityScopeId,
   ProviderDriverKind,
   ThreadId,
   type ActivityActorSummary,
+  type ActivityControlDelta,
+  type ActivityControlSnapshot,
   type ActivityDelta,
   type ActivityEntry,
   type ActivitySnapshot,
@@ -14,6 +17,9 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Option from "effect/Option";
 
 import {
+  activityActorControl,
+  activityCancellationOperation,
+  applyActivityControlDelta,
   applyActivityDelta,
   applyEnvironmentActivityDelta,
   type EnvironmentActivityState,
@@ -61,7 +67,7 @@ function workItem(overrides: Partial<ActivityWorkItemSummary> = {}): ActivityWor
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: SCOPE_ID,
     scope: { _tag: "thread", threadId: ThreadId.make("thread-1") },
     revision: 3,
@@ -73,6 +79,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
       backgroundWork: true,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: true,
     },
     observationState: "live",
     sections: {
@@ -87,7 +94,40 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
     workItems: [workItem()],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: controlSnapshot(),
     updatedAt: "2026-07-22T12:00:01Z",
+    ...overrides,
+  };
+}
+
+function controlSnapshot(
+  overrides: Partial<ActivityControlSnapshot> = {},
+): ActivityControlSnapshot {
+  return {
+    scopeId: SCOPE_ID,
+    revision: 7,
+    actors: [
+      {
+        actorId: ACTOR_ID,
+        state: "available",
+        controlRevision: 3,
+        activeDescendantCount: 1,
+      },
+    ],
+    operations: [],
+    ...overrides,
+  };
+}
+
+function controlDelta(
+  changes: ActivityControlDelta["changes"],
+  overrides: Partial<ActivityControlDelta> = {},
+): ActivityControlDelta {
+  return {
+    scopeId: SCOPE_ID,
+    previousRevision: 7,
+    revision: 8,
+    changes,
     ...overrides,
   };
 }
@@ -566,5 +606,294 @@ describe("applyActivityDelta", () => {
     expect(result.state.recentEntries.has(ActivityRecordId.make("actor:owner-199"))).toBe(false);
     expect(result.state.recentEntries.has(ActivityRecordId.make("actor:owner-200"))).toBe(false);
     expect(result.state.recentEntries.has(ActivityRecordId.make("actor:owner-201"))).toBe(true);
+  });
+});
+
+describe("activity control reduction", () => {
+  it("returns null for ambiguous actor-control and operation lookups", () => {
+    const actorControl = controlSnapshot().actors[0]!;
+    const operation = {
+      rootActorId: ACTOR_ID,
+      state: "partial" as const,
+      residualCount: 1,
+      message: null,
+      operationRevision: 3,
+    };
+    const ambiguous = snapshot({
+      control: controlSnapshot({
+        actors: [actorControl, actorControl],
+        operations: [operation, operation],
+      }),
+    });
+    const conflicting = snapshot({
+      control: controlSnapshot({
+        actors: [actorControl, { ...actorControl, state: "requested" }],
+        operations: [operation, { ...operation, state: "requested", residualCount: 0 }],
+      }),
+    });
+
+    expect(activityActorControl(ambiguous, ACTOR_ID)).toBeNull();
+    expect(activityCancellationOperation(ambiguous, ACTOR_ID)).toBeNull();
+    expect(activityActorControl(conflicting, ACTOR_ID)).toBeNull();
+    expect(activityCancellationOperation(conflicting, ACTOR_ID)).toBeNull();
+  });
+
+  it("keeps exact lookups linear within the protocol bound", () => {
+    const controls = Array.from({ length: ACTIVITY_PAGE_MAX_LENGTH }, (_, index) => ({
+      actorId: ActivityRecordId.make(`actor:lookup-${index}`),
+      state: "available" as const,
+      controlRevision: index,
+      activeDescendantCount: 0,
+    }));
+    const current = snapshot({ control: controlSnapshot({ actors: controls }) });
+    expect(activityActorControl(current, controls.at(-1)!.actorId)).toBe(controls.at(-1));
+  });
+
+  it("upserts and removes actor controls and operations without advancing observation", () => {
+    const current = snapshot();
+    const operation = {
+      rootActorId: ACTOR_ID,
+      state: "partial" as const,
+      residualCount: 1,
+      message: "One child is still active.",
+      operationRevision: 11,
+    };
+    const requested = {
+      actorId: ACTOR_ID,
+      state: "requested" as const,
+      controlRevision: 4,
+      activeDescendantCount: 1,
+    };
+
+    const upserted = applyActivityControlDelta(
+      current,
+      controlDelta([
+        { kind: "actor-upserted", actor: requested },
+        { kind: "operation-upserted", operation },
+      ]),
+    );
+    expect(upserted.kind).toBe("applied");
+    if (upserted.kind !== "applied") return;
+    expect(upserted.snapshot.revision).toBe(current.revision);
+    expect(upserted.snapshot.control.revision).toBe(8);
+    expect(activityActorControl(upserted.snapshot, ACTOR_ID)).toEqual(requested);
+    expect(activityCancellationOperation(upserted.snapshot, ACTOR_ID)).toEqual(operation);
+
+    const removed = applyActivityControlDelta(
+      upserted.snapshot,
+      controlDelta(
+        [
+          { kind: "actor-removed", actorId: ACTOR_ID },
+          { kind: "operation-removed", rootActorId: ACTOR_ID },
+        ],
+        { previousRevision: 8, revision: 9 },
+      ),
+    );
+    expect(removed.kind).toBe("applied");
+    if (removed.kind !== "applied") return;
+    expect(activityActorControl(removed.snapshot, ACTOR_ID)).toBeNull();
+    expect(activityCancellationOperation(removed.snapshot, ACTOR_ID)).toBeNull();
+  });
+
+  it("keeps observation and control revisions independent and ignores duplicate controls", () => {
+    const observation = applyActivityDelta(
+      snapshot(),
+      delta([{ kind: "actor-upserted", actor: actor({ name: "Observed" }) }]),
+    );
+    expect(observation.kind).toBe("applied");
+    if (observation.kind !== "applied") return;
+    expect(observation.snapshot.control.revision).toBe(7);
+
+    const control = applyActivityControlDelta(
+      observation.snapshot,
+      controlDelta([
+        {
+          kind: "actor-upserted",
+          actor: {
+            actorId: ACTOR_ID,
+            state: "requested",
+            controlRevision: 4,
+            activeDescendantCount: 1,
+          },
+        },
+      ]),
+    );
+    expect(control.kind).toBe("applied");
+    if (control.kind !== "applied") return;
+    expect(control.snapshot.revision).toBe(4);
+    expect(control.snapshot.control.revision).toBe(8);
+    expect(
+      applyActivityControlDelta(
+        control.snapshot,
+        controlDelta([], { previousRevision: 6, revision: 7 }),
+      ),
+    ).toEqual({ kind: "duplicate" });
+  });
+
+  it("reports only a control gap and fails closed on a scope mismatch", () => {
+    const current = snapshot();
+    expect(
+      applyActivityControlDelta(current, controlDelta([], { previousRevision: 9, revision: 10 })),
+    ).toEqual({ kind: "gap" });
+    expect(
+      applyActivityControlDelta(
+        current,
+        controlDelta([], { scopeId: ActivityScopeId.make("scope:other") }),
+      ),
+    ).toEqual({ kind: "gap" });
+    expect(current.revision).toBe(3);
+    expect(current.control.revision).toBe(7);
+  });
+
+  it("rejects actor and operation overflow atomically", () => {
+    const actors = Array.from({ length: ACTIVITY_PAGE_MAX_LENGTH }, (_, index) => ({
+      actorId: ActivityRecordId.make(`actor:bounded-${index}`),
+      state: "available" as const,
+      controlRevision: 1,
+      activeDescendantCount: 0,
+    }));
+    const operations = Array.from({ length: ACTIVITY_PAGE_MAX_LENGTH }, (_, index) => ({
+      rootActorId: ActivityRecordId.make(`actor:operation-${index}`),
+      state: "partial" as const,
+      residualCount: 1,
+      message: null,
+      operationRevision: 1,
+    }));
+    const current = snapshot({ control: controlSnapshot({ actors, operations }) });
+
+    const actorOverflow = applyActivityControlDelta(
+      current,
+      controlDelta([
+        {
+          kind: "actor-upserted",
+          actor: {
+            actorId: ActivityRecordId.make("actor:overflow"),
+            state: "available",
+            controlRevision: 1,
+            activeDescendantCount: 0,
+          },
+        },
+      ]),
+    );
+    const operationOverflow = applyActivityControlDelta(
+      current,
+      controlDelta([
+        {
+          kind: "operation-upserted",
+          operation: {
+            rootActorId: ActivityRecordId.make("actor:operation-overflow"),
+            state: "partial",
+            residualCount: 1,
+            message: null,
+            operationRevision: 1,
+          },
+        },
+      ]),
+    );
+
+    expect(actorOverflow).toEqual({ kind: "gap" });
+    expect(operationOverflow).toEqual({ kind: "gap" });
+    expect(current.control.actors).toBe(actors);
+    expect(current.control.operations).toBe(operations);
+    expect(current.control.revision).toBe(7);
+  });
+
+  it("accepts remove-and-upsert batches whose final control arrays remain bounded", () => {
+    const actors = Array.from({ length: ACTIVITY_PAGE_MAX_LENGTH }, (_, index) => ({
+      actorId: ActivityRecordId.make(`actor:replace-${index}`),
+      state: "available" as const,
+      controlRevision: 1,
+      activeDescendantCount: 0,
+    }));
+    const current = snapshot({ control: controlSnapshot({ actors }) });
+    const replacementId = ActivityRecordId.make("actor:replacement");
+    const result = applyActivityControlDelta(
+      current,
+      controlDelta([
+        { kind: "actor-removed", actorId: actors[0]!.actorId },
+        {
+          kind: "actor-upserted",
+          actor: {
+            actorId: replacementId,
+            state: "available",
+            controlRevision: 1,
+            activeDescendantCount: 0,
+          },
+        },
+      ]),
+    );
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") return;
+    expect(result.snapshot.control.actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+    expect(activityActorControl(result.snapshot, replacementId)?.state).toBe("available");
+  });
+
+  it("fails closed when a control delta creates duplicate canonical IDs", () => {
+    const actorControl = controlSnapshot().actors[0]!;
+    const current = snapshot({ control: controlSnapshot({ actors: [] }) });
+    const result = applyActivityControlDelta(
+      current,
+      controlDelta([
+        { kind: "actor-upserted", actor: actorControl },
+        { kind: "actor-upserted", actor: { ...actorControl, state: "requested" } },
+      ]),
+    );
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") return;
+    expect(result.snapshot.control.actors).toHaveLength(1);
+    expect(activityActorControl(result.snapshot, ACTOR_ID)?.state).toBe("requested");
+  });
+
+  it("rejects an overflowing observation upsert without mutating the bounded page", () => {
+    const actors = Array.from({ length: ACTIVITY_PAGE_MAX_LENGTH }, (_, index) =>
+      actor({ id: ActivityRecordId.make(`actor:observation-bound-${index}`) }),
+    );
+    const current = snapshot({ actors, actorsHasMore: false });
+    const result = applyActivityDelta(
+      current,
+      delta([
+        {
+          kind: "actor-upserted",
+          actor: actor({ id: ActivityRecordId.make("actor:observation-overflow") }),
+        },
+      ]),
+    );
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") return;
+    expect(result.snapshot.actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+    expect(result.snapshot.actorsHasMore).toBe(true);
+    expect(current.actors).toBe(actors);
+  });
+
+  it("retains requested control when observation becomes terminal until server removal", () => {
+    const current = snapshot({
+      control: controlSnapshot({
+        actors: [
+          {
+            actorId: ACTOR_ID,
+            state: "requested",
+            controlRevision: 4,
+            activeDescendantCount: 0,
+          },
+        ],
+      }),
+    });
+    const result = applyActivityDelta(
+      current,
+      delta([
+        {
+          kind: "actor-upserted",
+          actor: actor({
+            status: "cancelled",
+            updatedAt: "2026-07-22T12:00:02Z",
+            terminalAt: "2026-07-22T12:00:02Z",
+          }),
+        },
+      ]),
+    );
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") return;
+    expect(result.snapshot.actors[0]?.status).toBe("cancelled");
+    expect(activityActorControl(result.snapshot, ACTOR_ID)?.state).toBe("requested");
   });
 });

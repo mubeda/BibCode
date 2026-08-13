@@ -161,6 +161,16 @@ async fn grok_runtime_matches_user_input_and_cancel_traces() {
     assert_eq!(second.event_type, "thread.started");
     let first_turn_id = send_turn.await.expect("first join").expect("first turn");
     let mut requested = runtime.collect_events(4).await;
+    let (assistant_chunk_index, assistant_chunk) = requested
+        .iter()
+        .enumerate()
+        .find(|(_, event)| event.event_type == "content.delta")
+        .expect("Grok assistant chunk");
+    assert_eq!(assistant_chunk.item_id, None);
+    assert_eq!(assistant_chunk.payload["delta"], json!("hello from grok"));
+    assert!(requested[assistant_chunk_index + 1..].iter().any(|event| {
+        event.event_type == "turn.completed" && event.turn_id == assistant_chunk.turn_id
+    }));
     normalize_turn_ids(&mut requested, &first_turn_id, "turn-3");
     assert_eq!(
         requested,
@@ -429,6 +439,7 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
                 event_type: "session.started".to_owned(),
                 thread_id: "grok-thread-resumed".to_owned(),
                 turn_id: None,
+                item_id: None,
                 request_id: None,
                 payload: json!({}),
             },
@@ -436,6 +447,7 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
                 event_type: "thread.started".to_owned(),
                 thread_id: "grok-thread-resumed".to_owned(),
                 turn_id: None,
+                item_id: None,
                 request_id: None,
                 payload: json!({}),
             },

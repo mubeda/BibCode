@@ -710,7 +710,7 @@ function activitySnapshot(
     providerType: "codex",
   } as unknown as ActivityActorSummary;
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: `scope-${terminalId}`,
     scope: { _tag: "terminal", threadId: THREAD_ID, terminalId },
     revision: 1,
@@ -722,6 +722,7 @@ function activitySnapshot(
       backgroundWork: false,
       historyRecovery: "full",
       terminalObservation: true,
+      targetedActorCancellation: false,
     },
     observationState: "live",
     sections: {
@@ -736,6 +737,12 @@ function activitySnapshot(
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: {
+      scopeId: `scope-${terminalId}`,
+      revision: 0,
+      actors: [],
+      operations: [],
+    },
     updatedAt: "2026-07-22T20:01:00.000Z",
     ...overrides,
   } as ActivitySnapshot;

@@ -1,0 +1,2071 @@
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
+
+    use futures_util::future::BoxFuture;
+
+    use crate::activity::{
+        ActivityCancellationDispatcher, ActivityCancellationError, ActivityCancellationService,
+        ActivityCapabilities, ActivityDispatchError, ActivityHistoryRecovery,
+        ActivityObservationState, ActivityTargetDispatchDisposition,
+    };
+
+    use super::*;
+
+    fn thread_scope() -> ActivityScopeRef {
+        ActivityScopeRef::Thread {
+            thread_id: "thread-control".to_owned(),
+        }
+    }
+
+    fn terminal_scope() -> ActivityScopeRef {
+        ActivityScopeRef::Terminal {
+            thread_id: "thread-control".to_owned(),
+            terminal_id: "terminal-control".to_owned(),
+        }
+    }
+
+    fn running_actor(id: &str, parent: Option<&str>) -> ProviderActivityMutation {
+        ProviderActivityMutation::upsert_actor(id, parent, id, "running").expect("actor")
+    }
+
+    fn actor<'a>(snapshot: &'a ActivityControlSnapshot, id: &str) -> &'a ActivityActorControl {
+        snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.actor_id == id)
+            .expect("actor control")
+    }
+
+    #[derive(Default)]
+    struct CountingDispatcher(AtomicUsize);
+
+    impl ActivityCancellationDispatcher for CountingDispatcher {
+        fn cancel_target(
+            &self,
+            _scope: ActivityScopeRef,
+            _generation: ActivityRuntimeGeneration,
+            _target: ProviderActivityNativeTarget,
+        ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>>
+        {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_starts_at_revision_zero_without_available_actors() {
+        // Mutation caught: initializing a new runtime with stale control state.
+        let registry = ActivityControlRegistry::new();
+        let _registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("codex".to_owned()),
+        );
+
+        assert_eq!(
+            registry.snapshot("scope-control").await,
+            ActivityControlSnapshot::empty("scope-control")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_actor_without_exact_native_target_is_unsupported() {
+        // Mutation caught: marking a provider-observed actor cancellable without a native handle.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("codex".to_owned()),
+        );
+
+        let jobs = registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+
+        assert!(jobs.is_empty());
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            actor(&snapshot, "actor-a").state,
+            ActivityActorControlState::Unsupported
+        );
+        assert_eq!(actor(&snapshot, "actor-a").control_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_canonical_batches_do_not_install_control_handles() {
+        // Mutation caught: applying a target update before rejecting the batch's invalid graph data.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    ProviderActivityMutation::SetScope {
+                        capabilities: ActivityCapabilities {
+                            actors: false,
+                            attributed_activity: true,
+                            background_work: false,
+                            history_recovery: ActivityHistoryRecovery::None,
+                            terminal_observation: false,
+                            targeted_actor_cancellation: false,
+                        },
+                        observation_state: ActivityObservationState::Live,
+                    },
+                    running_actor("actor-a", None),
+                ],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            registry.snapshot("scope-control").await,
+            ActivityControlSnapshot::empty("scope-control")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_target_becomes_available_without_changing_activity_revision() {
+        // Mutation caught: coupling target fencing to the durable activity revision.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("codex".to_owned()),
+        );
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        let activity_revision = registry.snapshot("scope-control").await.revision;
+
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "native-thread".to_owned(),
+                        "native-turn".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(snapshot.revision, activity_revision + 1);
+        assert_eq!(
+            actor(&snapshot, "actor-a").state,
+            ActivityActorControlState::Available
+        );
+        assert_eq!(actor(&snapshot, "actor-a").control_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_commits_publish_contiguous_revisions_in_commit_order() {
+        // Mutation caught: releasing the registry lock between allocating N and publishing N.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            Arc::new(registry.register_runtime(thread_scope(), "scope-control".to_owned(), None));
+        let mut events = registry.subscribe();
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        let _ = events.recv().await.expect("initial delta");
+
+        let (first_reached_tx, first_reached_rx) = mpsc::sync_channel(1);
+        let (second_reached_tx, second_reached_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let release_first_rx = Arc::new(Mutex::new(release_first_rx));
+        let first_seen = Arc::new(AtomicBool::new(false));
+        registry.set_before_publish_hook(Arc::new({
+            let release_first_rx = release_first_rx.clone();
+            let first_seen = first_seen.clone();
+            move |revision| {
+                if revision == 2 && !first_seen.swap(true, Ordering::AcqRel) {
+                    first_reached_tx.send(()).expect("first reached");
+                    release_first_rx
+                        .lock()
+                        .expect("release receiver")
+                        .recv()
+                        .expect("release first");
+                } else if revision == 3 {
+                    second_reached_tx.send(()).expect("second reached");
+                }
+            }
+        }));
+
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for turn_id in ["turn-1", "turn-2"] {
+            let registry = registry.clone();
+            let registration = registration.clone();
+            let start = start.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(registry.observe_provider_batch(
+                        &registration,
+                        &[],
+                        &[ProviderActivityControlUpdate::ActorTarget {
+                            actor_id: "actor-a".to_owned(),
+                            target: Some(ProviderActivityNativeTarget::codex_turn(
+                                "native-thread".to_owned(),
+                                turn_id.to_owned(),
+                            )),
+                        }],
+                    ));
+            }));
+        }
+        start.wait();
+        first_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first publication paused");
+        let second_overtook = second_reached_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        release_first_tx.send(()).expect("release publication");
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        let mut revisions = Vec::new();
+        for _ in 0..2 {
+            let ActivityControlEvent::Delta(delta) = events.recv().await.expect("ordered delta");
+            revisions.push(delta.revision);
+        }
+        assert!(
+            !second_overtook,
+            "revision 3 reached send before revision 2"
+        );
+        assert_eq!(revisions, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn replacing_or_removing_a_target_advances_its_fencing_revision() {
+        // Mutation caught: dispatching against a replaced or removed native target with its old fence.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        for target in [
+            Some(ProviderActivityNativeTarget::codex_turn(
+                "native-thread".to_owned(),
+                "turn-1".to_owned(),
+            )),
+            Some(ProviderActivityNativeTarget::codex_turn(
+                "native-thread".to_owned(),
+                "turn-2".to_owned(),
+            )),
+            None,
+        ] {
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[],
+                    &[ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor-a".to_owned(),
+                        target,
+                    }],
+                )
+                .await;
+        }
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(actor(&snapshot, "actor-a").control_revision, 3);
+        assert_eq!(
+            actor(&snapshot, "actor-a").state,
+            ActivityActorControlState::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn descendant_changes_advance_overlay_without_advancing_parent_target_fence() {
+        // Mutation caught: invalidating a root target merely because its descendant count changed.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&registration, &[running_actor("root", None)], &[])
+            .await;
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "root".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let before = registry.snapshot("scope-control").await;
+
+        registry
+            .observe_provider_batch(&registration, &[running_actor("child", Some("root"))], &[])
+            .await;
+
+        let after = registry.snapshot("scope-control").await;
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(
+            actor(&after, "root").control_revision,
+            actor(&before, "root").control_revision
+        );
+        assert_eq!(actor(&after, "root").active_descendant_count, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_actors_lose_target_availability() {
+        // Mutation caught: retaining a cancellation target after the actor has reached a terminal state.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    ProviderActivityMutation::set_actor_status("actor-a", "completed")
+                        .expect("terminal actor"),
+                ],
+                &[],
+            )
+            .await;
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(
+            actor(&snapshot, "actor-a").state,
+            ActivityActorControlState::Unsupported
+        );
+        assert_eq!(actor(&snapshot, "actor-a").control_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn replacing_a_runtime_clears_old_targets_and_advances_their_fences() {
+        // Mutation caught: allowing a new runtime generation to dispatch a previous generation's handle.
+        let registry = ActivityControlRegistry::new();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &first,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        let _replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(
+            actor(&snapshot, "actor-a").state,
+            ActivityActorControlState::Unsupported
+        );
+        assert_eq!(actor(&snapshot, "actor-a").control_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn authoritative_runtime_downgrade_clears_every_exact_target_and_operation() {
+        // Mutation caught: leaving another Claude actor clickable after this generation rejects stop_task.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("claudeAgent".to_owned()),
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("actor-a", None),
+                    running_actor("actor-b", Some("actor-a")),
+                ],
+                &[
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor-a".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-a".to_owned(),
+                        )),
+                    },
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor-b".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-b".to_owned(),
+                        )),
+                    },
+                ],
+            )
+            .await;
+        assert!(registration.downgrade_targeted_control());
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert!(snapshot.actors.iter().all(|actor| {
+            actor.state == ActivityActorControlState::Unsupported && actor.control_revision == 2
+        }));
+        assert!(snapshot.operations.is_empty());
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-b".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "queued-before-downgrade".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        assert_eq!(
+            actor(&registry.snapshot("scope-control").await, "actor-b").state,
+            ActivityActorControlState::Unsupported,
+            "a provider batch already queued before downgrade must not reinstall a target"
+        );
+        assert!(!registration.downgrade_targeted_control());
+    }
+
+    #[tokio::test]
+    async fn oversized_runtime_replacement_is_rejected_without_mutating_state_or_revision() {
+        // Mutation caught: publishing an over-256 control delta while replacing a runtime.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        {
+            let mut state = registry.lock();
+            let scope = state.scopes.get_mut("scope-control").expect("scope");
+            for index in 0..=ACTIVITY_DELTA_MAX_CHANGES {
+                scope.actors.insert(
+                    format!("actor-{index}"),
+                    ActivityControlActor {
+                        parent_actor_id: None,
+                        status: ActivityLifecycle::Running,
+                        target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                            "native-{index}"
+                        ))),
+                        control_revision: 1,
+                    },
+                );
+            }
+        }
+        let before = registry.snapshot("scope-control").await;
+
+        let replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        assert!(!replacement.active);
+        assert_eq!(registry.snapshot("scope-control").await, before);
+        assert_eq!(
+            registry.lock().scopes["scope-control"].generation,
+            first.generation
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_control_batch_is_rejected_without_a_partial_overlay_update() {
+        // Mutation caught: accepting the prefix of an oversized provider control batch.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        let before = registry.snapshot("scope-control").await;
+        let controls = (0..=ACTIVITY_DELTA_MAX_CHANGES)
+            .map(|index| ProviderActivityControlUpdate::ActorTarget {
+                actor_id: "actor-a".to_owned(),
+                target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                    "native-{index}"
+                ))),
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .observe_provider_batch(&registration, &[], &controls)
+            .await;
+
+        assert_eq!(registry.snapshot("scope-control").await, before);
+    }
+
+    #[tokio::test]
+    async fn dropping_current_registration_removes_its_scope_with_one_bounded_delta() {
+        // Mutation caught: retaining a completed runtime's native handles after its registration drops.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let _ = events.recv().await.expect("upsert delta");
+
+        drop(registration);
+
+        let ActivityControlEvent::Delta(delta) = events.recv().await.expect("removal delta");
+        assert!(delta.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
+        assert_eq!(delta.changes.len(), 1);
+        let tombstone = registry.snapshot("scope-control").await;
+        assert_eq!(tombstone.scope_id, "scope-control");
+        assert_eq!(tombstone.revision, delta.revision);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_scope_tombstone_keeps_stream_and_actor_fences_monotonic_on_restart() {
+        // Mutation caught: deleting the public scope and reusing revision zero for replacement work.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let first =
+            registry.register_runtime(thread_scope(), "thread:stable-thread".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &first,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "old-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let available = registry.snapshot("thread:stable-thread").await;
+        let old_actor_revision = actor(&available, "actor-a").control_revision;
+        let _ = events.recv().await.expect("available delta");
+
+        drop(first);
+        let ActivityControlEvent::Delta(removal) = events.recv().await.expect("removal delta");
+        let removed = registry.snapshot("thread:stable-thread").await;
+        assert_eq!(removed.revision, removal.revision);
+        assert!(removed.revision > available.revision);
+        assert!(removed.actors.is_empty());
+
+        let replacement =
+            registry.register_runtime(thread_scope(), "thread:stable-thread".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &replacement,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let replacement_snapshot = registry.snapshot("thread:stable-thread").await;
+        assert!(replacement_snapshot.revision > removed.revision);
+        assert!(
+            actor(&replacement_snapshot, "actor-a").control_revision > old_actor_revision,
+            "replacement actor fence must not repeat"
+        );
+        let ActivityControlEvent::Delta(replacement_delta) =
+            events.recv().await.expect("replacement delta");
+        assert_eq!(replacement_delta.previous_revision, removed.revision);
+        assert_eq!(replacement_delta.revision, replacement_snapshot.revision);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_superseded_registration_cannot_remove_its_replacement() {
+        // Mutation caught: an old runtime teardown deleting a newer runtime's overlay.
+        let registry = ActivityControlRegistry::new();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&first, &[running_actor("actor-a", None)], &[])
+            .await;
+        let replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        drop(first);
+
+        assert_eq!(registry.snapshot("scope-control").await.actors.len(), 1);
+        drop(replacement);
+        let tombstone = registry.snapshot("scope-control").await;
+        assert!(tombstone.revision > 0);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
+    }
+
+    #[test]
+    fn repeated_registration_churn_retains_only_the_bounded_tombstone_window() {
+        // Mutation caught: growing the registry's generation-safe scope tombstones without bound.
+        let registry = ActivityControlRegistry::new();
+        for index in 0..ACTIVITY_DELTA_MAX_CHANGES * 2 {
+            let registration =
+                registry.register_runtime(thread_scope(), format!("scope-control-{index}"), None);
+            drop(registration);
+        }
+
+        assert!(registry.lock().scopes.len() <= ACTIVITY_PAGE_MAX_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn repeated_actor_churn_retains_a_bounded_fence_window_and_advances_evictions() {
+        // Mutation caught: retaining one fence counter per completed native actor without bound,
+        // or letting an actor whose exact counter was evicted reuse its stale fence.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-000", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-000".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "old-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let old_revision =
+            actor(&registry.snapshot("scope-control").await, "actor-000").control_revision;
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[ProviderActivityMutation::RemoveActor {
+                    actor_id: "actor-000".to_owned(),
+                }],
+                &[],
+            )
+            .await;
+
+        for index in 1..=ACTIVITY_PAGE_MAX_LENGTH {
+            let actor_id = format!("actor-{index:03}");
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[
+                        running_actor(&actor_id, None),
+                        ProviderActivityMutation::RemoveActor { actor_id },
+                    ],
+                    &[],
+                )
+                .await;
+        }
+
+        assert!(
+            registry.lock().scopes["scope-control"]
+                .actor_revision_tombstones
+                .len()
+                <= ACTIVITY_PAGE_MAX_LENGTH
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-000", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-000".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        assert!(
+            actor(&registry.snapshot("scope-control").await, "actor-000").control_revision
+                > old_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_operation_revision_clock_fails_closed_before_provider_io() {
+        // Mutation caught: wrapping the registry-lifetime operation fence to a replayable value.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("claude".to_owned()),
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        registry
+            .operation_revision_clock
+            .store(u64::MAX, Ordering::Release);
+        let dispatcher = Arc::new(CountingDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        let snapshot = registry.snapshot("scope-control").await;
+
+        assert_eq!(
+            service
+                .cancel_subtree(
+                    thread_scope(),
+                    "scope-control",
+                    "actor-a",
+                    actor(&snapshot, "actor-a").control_revision,
+                )
+                .await,
+            Err(ActivityCancellationError::CapacityExceeded)
+        );
+        assert_eq!(dispatcher.0.load(Ordering::Acquire), 0);
+        assert!(
+            registry
+                .snapshot("scope-control")
+                .await
+                .operations
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_four_level_tree_emits_one_delta_and_cleans_up_replaced_generations() {
+        // Mutation caught: keeping the 201st actor, splitting one batch, or letting stale teardown
+        // erase its replacement.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        let mutations = (0..=ACTIVITY_PAGE_MAX_LENGTH)
+            .map(|index| {
+                let actor_id = format!("actor-{index}");
+                let parent_id = (index % 4 != 0).then(|| format!("actor-{}", index - 1));
+                running_actor(&actor_id, parent_id.as_deref())
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .observe_provider_batch(&first, &mutations, &[])
+            .await;
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(snapshot.actors.len(), ACTIVITY_PAGE_MAX_LENGTH);
+        assert!(
+            !snapshot
+                .actors
+                .iter()
+                .any(|actor| actor.actor_id == "actor-200")
+        );
+        for (actor_id, descendant_count) in [
+            ("actor-0", 3),
+            ("actor-1", 2),
+            ("actor-2", 1),
+            ("actor-3", 0),
+        ] {
+            assert_eq!(
+                actor(&snapshot, actor_id).active_descendant_count,
+                descendant_count
+            );
+        }
+        let ActivityControlEvent::Delta(delta) = events.recv().await.expect("batch delta");
+        assert!(delta.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&first, &[mutations[0].clone()], &[])
+            .await;
+        drop(first);
+        assert_eq!(
+            registry.snapshot("scope-control").await.actors.len(),
+            ACTIVITY_PAGE_MAX_LENGTH
+        );
+        drop(replacement);
+        let ActivityControlEvent::Delta(removal) = events.recv().await.expect("removal delta");
+        assert!(removal.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
+        let tombstone = registry.snapshot("scope-control").await;
+        assert_eq!(tombstone.revision, removal.revision);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_scopes_never_gain_control_capability() {
+        // Mutation caught: accepting a native cancellation target from a provider-terminal observer.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(terminal_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            actor(&registry.snapshot("scope-control").await, "actor-a").state,
+            ActivityActorControlState::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_control_state_never_exceeds_protocol_bounds() {
+        // Mutation caught: allocating one retained control record for every provider actor or update.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        let actors = (0..=ACTIVITY_PAGE_MAX_LENGTH)
+            .map(|index| {
+                let actor_id = format!("actor-{index}");
+                let parent_id = (index % 4 != 0).then(|| format!("actor-{}", index - 1));
+                running_actor(&actor_id, parent_id.as_deref())
+            })
+            .collect::<Vec<_>>();
+        let controls = (0..ACTIVITY_DELTA_MAX_CHANGES)
+            .map(|index| ProviderActivityControlUpdate::ActorTarget {
+                actor_id: format!("actor-{index}"),
+                target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                    "native-{index}"
+                ))),
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .observe_provider_batch(&registration, &actors, &controls)
+            .await;
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert_eq!(snapshot.actors.len(), ACTIVITY_PAGE_MAX_LENGTH);
+        assert_eq!(actor(&snapshot, "actor-0").active_descendant_count, 3);
+        assert!(snapshot.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH);
+        assert!(registry.bounded_counts().2 <= ACTIVITY_DELTA_MAX_CHANGES);
+    }
+
+    #[test]
+    fn native_target_debug_is_redacted() {
+        // Mutation caught: logging a provider-native thread, turn, or task identifier.
+        let codex = format!(
+            "{:?}",
+            ProviderActivityNativeTarget::codex_turn(
+                "thread-secret".to_owned(),
+                "turn-secret".to_owned(),
+            )
+        );
+        let claude = format!(
+            "{:?}",
+            ProviderActivityNativeTarget::claude_task("task-secret".to_owned())
+        );
+
+        assert_eq!(codex, "CodexTurn { .. }");
+        assert_eq!(claude, "ClaudeTask { .. }");
+    }
+}
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    fmt,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use super::cancellation::CancellationOperation;
+use super::model::{
+    ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_PAGE_MAX_LENGTH,
+    ActivityActorControl, ActivityActorControlState, ActivityControlChange, ActivityControlDelta,
+    ActivityControlSnapshot, ActivityLifecycle, ActivityRuntimeGeneration, ActivityScopeRef,
+    ProviderActivityMutation, ProviderActivityNativeTarget, validate_text,
+};
+use tokio::sync::broadcast;
+
+pub(crate) struct ActivityRuntimeControlRegistration {
+    scope_id: String,
+    generation: ActivityRuntimeGeneration,
+    active: bool,
+    inner: Weak<Mutex<ActivityControlRegistryState>>,
+    publisher: ActivityControlEventPublisher,
+}
+
+impl ActivityRuntimeControlRegistration {
+    pub(crate) fn generation(&self) -> ActivityRuntimeGeneration {
+        self.generation.clone()
+    }
+
+    pub(crate) fn downgrade_targeted_control(&self) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let mut state = inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(scope) = state.scopes.get_mut(&self.scope_id) else {
+            return false;
+        };
+        if scope.generation != self.generation {
+            return false;
+        }
+        let mut staged = scope.clone();
+        let mut changed = staged.targeted_control_supported || !staged.operations.is_empty();
+        staged.targeted_control_supported = false;
+        staged.operations.clear();
+        let actor_revision_clock = staged.actor_revision_clock.clone();
+        for actor in staged.actors.values_mut() {
+            if actor.target.take().is_some() {
+                ActivityControlScope::advance_actor_revision(&actor_revision_clock, actor);
+                changed = true;
+            }
+        }
+        for work_item in staged.work_items.values_mut() {
+            changed |= work_item.target.take().is_some();
+        }
+        if !changed {
+            return false;
+        }
+        let Ok(changes) = staged.pending_changes(scope) else {
+            return false;
+        };
+        *scope = staged;
+        if let Some(event) = scope.publish_changes(changes) {
+            self.publisher.send_delta(event);
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderActivityControlUpdate {
+    ActorTarget {
+        actor_id: String,
+        target: Option<ProviderActivityNativeTarget>,
+    },
+    WorkTarget {
+        work_item_id: String,
+        target: Option<ProviderActivityNativeTarget>,
+    },
+}
+
+/// A cancellation dispatch candidate. The cancellation layer owns populating these after it has
+/// installed an operation fence; observation alone never dispatches provider cancellation.
+#[derive(Clone)]
+pub(crate) struct ActivityDispatchJob {
+    pub(crate) scope_id: String,
+    pub(crate) scope: ActivityScopeRef,
+    pub(crate) generation: ActivityRuntimeGeneration,
+    pub(crate) operation_root_actor_id: String,
+    pub(crate) subject: ActivityDispatchSubject,
+    pub(crate) target: ProviderActivityNativeTarget,
+}
+
+#[derive(Clone)]
+pub(crate) enum ActivityDispatchSubject {
+    Actor { actor_id: String },
+    WorkItem { work_item_id: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActivityControlEvent {
+    Delta(ActivityControlDelta),
+}
+
+#[cfg(test)]
+type BeforePublishHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+#[derive(Clone)]
+pub(super) struct ActivityControlEventPublisher {
+    events: broadcast::Sender<ActivityControlEvent>,
+    #[cfg(test)]
+    before_publish: Arc<Mutex<Option<BeforePublishHook>>>,
+}
+
+impl fmt::Debug for ActivityControlEventPublisher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivityControlEventPublisher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActivityControlEventPublisher {
+    pub(super) fn send_delta(&self, delta: ActivityControlDelta) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook(delta.revision);
+        }
+        let _ = self.events.send(ActivityControlEvent::Delta(delta));
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityControlRegistry {
+    pub(super) inner: Arc<Mutex<ActivityControlRegistryState>>,
+    pub(super) publisher: ActivityControlEventPublisher,
+    scope_revision_clock: Arc<AtomicU64>,
+    actor_revision_clock: Arc<AtomicU64>,
+    operation_revision_clock: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ActivityControlRegistryState {
+    pub(super) scopes: BTreeMap<String, ActivityControlScope>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ActivityControlScope {
+    scope_id: String,
+    pub(super) scope: ActivityScopeRef,
+    pub(super) generation: ActivityRuntimeGeneration,
+    _provider_instance_id: Option<String>,
+    revision: u64,
+    scope_revision_clock: Arc<AtomicU64>,
+    actor_revision_clock: Arc<AtomicU64>,
+    operation_revision_clock: Arc<AtomicU64>,
+    actor_revision_floor: u64,
+    actor_revision_tombstones: BTreeMap<String, u64>,
+    targeted_control_supported: bool,
+    pub(super) actors: BTreeMap<String, ActivityControlActor>,
+    pub(super) work_items: BTreeMap<String, ActivityControlWorkItem>,
+    pub(super) operations: BTreeMap<String, CancellationOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ActivityControlActor {
+    pub(super) parent_actor_id: Option<String>,
+    pub(super) status: ActivityLifecycle,
+    pub(super) target: Option<ProviderActivityNativeTarget>,
+    pub(super) control_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ActivityControlWorkItem {
+    pub(super) owner_actor_id: Option<String>,
+    pub(super) status: ActivityLifecycle,
+    pub(super) target: Option<ProviderActivityNativeTarget>,
+}
+
+impl ActivityControlRegistry {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let (events, _) = broadcast::channel(ACTIVITY_DELTA_MAX_CHANGES);
+        Self {
+            inner: Arc::new(Mutex::new(ActivityControlRegistryState::default())),
+            publisher: ActivityControlEventPublisher {
+                events,
+                #[cfg(test)]
+                before_publish: Arc::new(Mutex::new(None)),
+            },
+            scope_revision_clock: Arc::new(AtomicU64::new(0)),
+            actor_revision_clock: Arc::new(AtomicU64::new(0)),
+            operation_revision_clock: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn register_runtime(
+        &self,
+        scope: ActivityScopeRef,
+        scope_id: String,
+        provider_instance_id: Option<String>,
+    ) -> ActivityRuntimeControlRegistration {
+        self.register_runtime_with_generation(
+            scope,
+            scope_id,
+            provider_instance_id,
+            ActivityRuntimeGeneration::new(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn register_runtime_with_generation(
+        &self,
+        scope: ActivityScopeRef,
+        scope_id: String,
+        provider_instance_id: Option<String>,
+        generation: ActivityRuntimeGeneration,
+    ) -> ActivityRuntimeControlRegistration {
+        let mut active = true;
+        {
+            let mut state = self.lock();
+            let event = if let Some(existing) = state.scopes.get_mut(&scope_id) {
+                let mut staged = existing.clone();
+                staged.generation = generation.clone();
+                staged.scope = scope;
+                staged._provider_instance_id = provider_instance_id;
+                staged.targeted_control_supported = true;
+                let actor_revision_clock = staged.actor_revision_clock.clone();
+                for actor in staged.actors.values_mut() {
+                    if actor.target.take().is_some() {
+                        ActivityControlScope::advance_actor_revision(&actor_revision_clock, actor);
+                    }
+                }
+                for work_item in staged.work_items.values_mut() {
+                    work_item.target = None;
+                }
+                // Cancellation operations are generation-scoped and cannot outlive their targets.
+                staged.operations.clear();
+                let Ok(changes) = staged.pending_changes(existing) else {
+                    active = false;
+                    return ActivityRuntimeControlRegistration {
+                        scope_id,
+                        generation,
+                        active,
+                        inner: Arc::downgrade(&self.inner),
+                        publisher: self.publisher.clone(),
+                    };
+                };
+                *existing = staged;
+                existing.publish_changes(changes)
+            } else {
+                if state.scopes.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+                    let tombstone = state.scopes.iter().find_map(|(scope_id, scope)| {
+                        (!scope.targeted_control_supported
+                            && scope.actors.is_empty()
+                            && scope.work_items.is_empty()
+                            && scope.operations.is_empty())
+                        .then(|| scope_id.clone())
+                    });
+                    if let Some(tombstone) = tombstone {
+                        state.scopes.remove(&tombstone);
+                    } else {
+                        active = false;
+                        return ActivityRuntimeControlRegistration {
+                            scope_id,
+                            generation,
+                            active,
+                            inner: Arc::downgrade(&self.inner),
+                            publisher: self.publisher.clone(),
+                        };
+                    }
+                }
+                let revision = self.scope_revision_clock.fetch_add(1, Ordering::AcqRel);
+                let actor_revision_floor = self.actor_revision_clock.fetch_add(1, Ordering::AcqRel);
+                state.scopes.insert(
+                    scope_id.clone(),
+                    ActivityControlScope {
+                        scope_id: scope_id.clone(),
+                        scope,
+                        generation: generation.clone(),
+                        _provider_instance_id: provider_instance_id,
+                        revision,
+                        scope_revision_clock: self.scope_revision_clock.clone(),
+                        actor_revision_clock: self.actor_revision_clock.clone(),
+                        operation_revision_clock: self.operation_revision_clock.clone(),
+                        actor_revision_floor,
+                        actor_revision_tombstones: BTreeMap::new(),
+                        targeted_control_supported: true,
+                        actors: BTreeMap::new(),
+                        work_items: BTreeMap::new(),
+                        operations: BTreeMap::new(),
+                    },
+                );
+                None
+            };
+            if let Some(event) = event {
+                self.publisher.send_delta(event);
+            }
+        }
+        ActivityRuntimeControlRegistration {
+            scope_id,
+            generation,
+            active,
+            inner: Arc::downgrade(&self.inner),
+            publisher: self.publisher.clone(),
+        }
+    }
+
+    pub(crate) async fn observe_provider_batch(
+        &self,
+        registration: &ActivityRuntimeControlRegistration,
+        activity: &[ProviderActivityMutation],
+        controls: &[ProviderActivityControlUpdate],
+    ) -> Vec<ActivityDispatchJob> {
+        if activity.len() > ACTIVITY_DELTA_MAX_CHANGES
+            || controls.len() > ACTIVITY_DELTA_MAX_CHANGES
+        {
+            return Vec::new();
+        }
+        {
+            let mut state = self.lock();
+            let Some(scope) = state.scopes.get_mut(&registration.scope_id) else {
+                return Vec::new();
+            };
+            if scope.generation != registration.generation {
+                return Vec::new();
+            }
+            let mut staged = scope.clone();
+            if !staged.apply_activity(activity) {
+                return Vec::new();
+            }
+            staged.apply_control_updates(controls);
+            let jobs = staged.reconcile_operations();
+            if !staged.validate_graph() || !staged.within_bounds() {
+                return Vec::new();
+            }
+            let Ok(changes) = staged.pending_changes(scope) else {
+                return Vec::new();
+            };
+            *scope = staged;
+            if let Some(event) = scope.publish_changes(changes) {
+                self.publisher.send_delta(event);
+            }
+            jobs
+        }
+    }
+
+    pub(crate) async fn snapshot(&self, scope_id: &str) -> ActivityControlSnapshot {
+        self.lock()
+            .scopes
+            .get(scope_id)
+            .map(ActivityControlScope::snapshot)
+            .unwrap_or_else(|| ActivityControlSnapshot::empty(scope_id))
+    }
+
+    pub(crate) async fn actor_controls_for(
+        &self,
+        scope_id: &str,
+        actors: &[super::model::ActivityActorSummary],
+    ) -> Vec<ActivityActorControl> {
+        let state = self.lock();
+        let Some(scope) = state.scopes.get(scope_id) else {
+            return actors
+                .iter()
+                .map(|actor| ActivityActorControl::unsupported(actor.id.clone()))
+                .collect();
+        };
+        let by_id = scope.actor_controls();
+        actors
+            .iter()
+            .map(|actor| {
+                by_id
+                    .get(&actor.id)
+                    .cloned()
+                    .unwrap_or_else(|| ActivityActorControl::unsupported(actor.id.clone()))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn snapshot_for_actors(
+        &self,
+        scope_id: &str,
+        actors: &[super::model::ActivityActorSummary],
+    ) -> ActivityControlSnapshot {
+        let state = self.lock();
+        let Some(scope) = state.scopes.get(scope_id) else {
+            return ActivityControlSnapshot {
+                scope_id: scope_id.to_owned(),
+                revision: 0,
+                actors: actors
+                    .iter()
+                    .map(|actor| ActivityActorControl::unsupported(actor.id.clone()))
+                    .collect(),
+                operations: Vec::new(),
+            };
+        };
+        let by_id = scope.actor_controls();
+        ActivityControlSnapshot {
+            scope_id: scope.scope_id(),
+            revision: scope.revision,
+            actors: actors
+                .iter()
+                .map(|actor| {
+                    by_id
+                        .get(&actor.id)
+                        .cloned()
+                        .unwrap_or_else(|| ActivityActorControl::unsupported(actor.id.clone()))
+                })
+                .collect(),
+            operations: scope
+                .operations
+                .values()
+                .map(CancellationOperation::summary)
+                .collect(),
+        }
+    }
+
+    pub(crate) async fn actor_control_for(
+        &self,
+        scope_id: &str,
+        actor_id: &str,
+    ) -> Option<ActivityActorControl> {
+        self.lock()
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.actor_controls().remove(actor_id))
+    }
+
+    #[must_use]
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ActivityControlEvent> {
+        self.publisher.events.subscribe()
+    }
+
+    #[cfg(test)]
+    fn set_before_publish_hook(&self, hook: BeforePublishHook) {
+        *self
+            .publisher
+            .before_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    pub(super) fn publish_delta(&self, delta: ActivityControlDelta) {
+        self.publisher.send_delta(delta);
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) fn bounded_counts(&self) -> (usize, usize, usize) {
+        let state = self.lock();
+        let actor_count = state.scopes.values().map(|scope| scope.actors.len()).sum();
+        let operation_count = state
+            .scopes
+            .values()
+            .map(|scope| scope.operations.len())
+            .sum();
+        let target_count = state
+            .scopes
+            .values()
+            .map(|scope| {
+                scope
+                    .actors
+                    .values()
+                    .filter(|actor| actor.target.is_some())
+                    .count()
+                    .saturating_add(
+                        scope
+                            .work_items
+                            .values()
+                            .filter(|work_item| work_item.target.is_some())
+                            .count(),
+                    )
+            })
+            .sum();
+        (actor_count, operation_count, target_count)
+    }
+
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, ActivityControlRegistryState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ActivityRuntimeControlRegistration {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(inner) = self.inner.upgrade() {
+            let mut state = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_current = state
+                .scopes
+                .get(&self.scope_id)
+                .is_some_and(|scope| scope.generation == self.generation);
+            if !is_current {
+                return;
+            }
+            let Some(scope) = state.scopes.get_mut(&self.scope_id) else {
+                return;
+            };
+            let before = scope.clone();
+            scope.targeted_control_supported = false;
+            scope.operations.clear();
+            let actors = std::mem::take(&mut scope.actors);
+            for (actor_id, mut actor) in actors {
+                if actor.target.take().is_some() {
+                    ActivityControlScope::advance_actor_revision(
+                        &scope.actor_revision_clock,
+                        &mut actor,
+                    );
+                }
+                scope.remember_actor_revision(actor_id, actor.control_revision);
+            }
+            scope.work_items.clear();
+            let Ok(changes) = scope.pending_changes(&before) else {
+                return;
+            };
+            if let Some(event) = scope.publish_changes(changes) {
+                self.publisher.send_delta(event);
+            }
+        }
+    }
+}
+
+impl Default for ActivityControlRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivityControlScope {
+    pub(super) fn next_operation_revision(&self) -> Option<u64> {
+        self.operation_revision_clock
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            })
+            .ok()
+    }
+
+    fn advance_actor_revision(actor_revision_clock: &AtomicU64, actor: &mut ActivityControlActor) {
+        actor.control_revision = actor.control_revision.saturating_add(1);
+        actor_revision_clock.fetch_max(actor.control_revision.saturating_add(1), Ordering::AcqRel);
+    }
+
+    fn remember_actor_revision(&mut self, actor_id: String, revision: u64) {
+        if self.actor_revision_tombstones.len() >= ACTIVITY_PAGE_MAX_LENGTH
+            && !self.actor_revision_tombstones.contains_key(&actor_id)
+        {
+            if let Some(evicted) = self.actor_revision_tombstones.keys().next().cloned() {
+                self.actor_revision_tombstones.remove(&evicted);
+            }
+            self.actor_revision_floor = self
+                .actor_revision_clock
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+        }
+        self.actor_revision_tombstones.insert(actor_id, revision);
+    }
+
+    fn apply_activity(&mut self, activity: &[ProviderActivityMutation]) -> bool {
+        if !activity.iter().all(validate_canonical_mutation) {
+            return false;
+        }
+        for mutation in activity {
+            match mutation {
+                ProviderActivityMutation::UpsertActor(actor) => {
+                    if let Some(existing) = self.actors.get_mut(&actor.id) {
+                        if actor.name.is_empty() {
+                            existing.status = actor.status;
+                        } else {
+                            existing.parent_actor_id = actor.parent_actor_id.clone();
+                            existing.status = actor.status;
+                        }
+                    } else if self.actors.len() < ACTIVITY_PAGE_MAX_LENGTH {
+                        self.actors.insert(
+                            actor.id.clone(),
+                            ActivityControlActor {
+                                parent_actor_id: actor.parent_actor_id.clone(),
+                                status: actor.status,
+                                target: None,
+                                control_revision: self
+                                    .actor_revision_tombstones
+                                    .remove(&actor.id)
+                                    .unwrap_or(self.actor_revision_floor),
+                            },
+                        );
+                    }
+                }
+                ProviderActivityMutation::RemoveActor { actor_id } => {
+                    if let Some(mut actor) = self.actors.remove(actor_id) {
+                        if actor.target.take().is_some() {
+                            Self::advance_actor_revision(&self.actor_revision_clock, &mut actor);
+                        }
+                        self.remember_actor_revision(actor_id.clone(), actor.control_revision);
+                    }
+                }
+                ProviderActivityMutation::UpsertWorkItem(work_item) => {
+                    if let Some(existing) = self.work_items.get_mut(&work_item.id) {
+                        existing.owner_actor_id = work_item.owner_actor_id.clone();
+                        existing.status = work_item.status;
+                    } else if self.work_items.len() < ACTIVITY_PAGE_MAX_LENGTH {
+                        self.work_items.insert(
+                            work_item.id.clone(),
+                            ActivityControlWorkItem {
+                                owner_actor_id: work_item.owner_actor_id.clone(),
+                                status: work_item.status,
+                                target: None,
+                            },
+                        );
+                    }
+                }
+                ProviderActivityMutation::RemoveWorkItem { work_item_id } => {
+                    self.work_items.remove(work_item_id);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn apply_control_updates(&mut self, controls: &[ProviderActivityControlUpdate]) {
+        for update in controls {
+            match update {
+                ProviderActivityControlUpdate::ActorTarget { actor_id, target } => {
+                    let Some(actor) = self.actors.get_mut(actor_id) else {
+                        continue;
+                    };
+                    let target = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                        && self.targeted_control_supported
+                        && !actor.status.is_terminal()
+                    {
+                        target.clone()
+                    } else {
+                        None
+                    };
+                    if actor.target != target {
+                        actor.target = target;
+                        Self::advance_actor_revision(&self.actor_revision_clock, actor);
+                    }
+                }
+                ProviderActivityControlUpdate::WorkTarget {
+                    work_item_id,
+                    target,
+                } => {
+                    let Some(work_item) = self.work_items.get_mut(work_item_id) else {
+                        continue;
+                    };
+                    work_item.target = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                        && self.targeted_control_supported
+                        && !work_item.status.is_terminal()
+                        && work_item.owner_actor_id.is_some()
+                    {
+                        target.clone()
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+        for actor in self.actors.values_mut() {
+            if actor.status.is_terminal() && actor.target.take().is_some() {
+                Self::advance_actor_revision(&self.actor_revision_clock, actor);
+            }
+        }
+        for work_item in self.work_items.values_mut() {
+            if work_item.status.is_terminal() {
+                work_item.target = None;
+            }
+        }
+    }
+
+    fn validate_graph(&self) -> bool {
+        self.actors.iter().all(|(actor_id, actor)| {
+            actor.parent_actor_id.as_ref().is_none_or(|parent_id| {
+                parent_id != actor_id && self.actors.contains_key(parent_id)
+            })
+        }) && self.actors.keys().all(|actor_id| {
+            let mut cursor = Some(actor_id.as_str());
+            let mut visited = BTreeSet::new();
+            while let Some(current) = cursor {
+                if !visited.insert(current) {
+                    return false;
+                }
+                cursor = self
+                    .actors
+                    .get(current)
+                    .and_then(|actor| actor.parent_actor_id.as_deref());
+            }
+            true
+        }) && self.work_items.values().all(|work_item| {
+            work_item
+                .owner_actor_id
+                .as_ref()
+                .is_none_or(|owner| self.actors.contains_key(owner))
+        })
+    }
+
+    pub(super) fn within_bounds(&self) -> bool {
+        let target_count = self
+            .actors
+            .values()
+            .filter(|actor| actor.target.is_some())
+            .count()
+            .saturating_add(
+                self.work_items
+                    .values()
+                    .filter(|work_item| work_item.target.is_some())
+                    .count(),
+            );
+        self.actors.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.work_items.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.operations.values().all(|operation| {
+                operation.covered_actor_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
+                    && operation.covered_work_item_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
+                    && operation.dispatched_targets.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation.retryable_targets.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation
+                        .retryable_targets
+                        .iter()
+                        .all(|target| operation.dispatched_targets.contains(target))
+                    && operation.active_attempt_ids.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation.active_attempt_targets.len() == operation.active_attempt_ids.len()
+                    && operation
+                        .active_attempt_ids
+                        .iter()
+                        .all(|id| operation.active_attempt_targets.contains_key(id))
+                    && operation
+                        .active_attempt_targets
+                        .values()
+                        .map(HashSet::len)
+                        .sum::<usize>()
+                        <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation
+                        .active_attempt_targets
+                        .values()
+                        .flatten()
+                        .all(|target| operation.dispatched_targets.contains(target))
+                    && self.operation_retained_target_count(operation) <= ACTIVITY_DELTA_MAX_CHANGES
+            })
+            && self
+                .operations
+                .values()
+                .map(|operation| operation.active_attempt_ids.len())
+                .sum::<usize>()
+                <= ACTIVITY_DELTA_MAX_CHANGES
+            && target_count <= ACTIVITY_DELTA_MAX_CHANGES
+            && self.actors.len().saturating_add(self.operations.len()) <= ACTIVITY_DELTA_MAX_CHANGES
+    }
+
+    fn actor_controls(&self) -> BTreeMap<String, ActivityActorControl> {
+        self.actors
+            .iter()
+            .map(|(actor_id, actor)| {
+                let active_descendant_count = self
+                    .actors
+                    .iter()
+                    .filter(|(candidate_id, candidate)| {
+                        *candidate_id != actor_id
+                            && !candidate.status.is_terminal()
+                            && self.is_descendant_of(candidate_id, actor_id)
+                    })
+                    .count() as u64;
+                let state = if self
+                    .operations
+                    .values()
+                    .any(|operation| operation.covered_actor_ids.contains(actor_id))
+                    && !actor.status.is_terminal()
+                {
+                    ActivityActorControlState::Requested
+                } else if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                    && !actor.status.is_terminal()
+                    && actor.target.is_some()
+                {
+                    ActivityActorControlState::Available
+                } else {
+                    ActivityActorControlState::Unsupported
+                };
+                (
+                    actor_id.clone(),
+                    ActivityActorControl {
+                        actor_id: actor_id.clone(),
+                        state,
+                        control_revision: actor.control_revision,
+                        active_descendant_count,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn is_descendant_of(&self, actor_id: &str, ancestor_id: &str) -> bool {
+        let mut cursor = self
+            .actors
+            .get(actor_id)
+            .and_then(|actor| actor.parent_actor_id.as_deref());
+        while let Some(parent_id) = cursor {
+            if parent_id == ancestor_id {
+                return true;
+            }
+            cursor = self
+                .actors
+                .get(parent_id)
+                .and_then(|actor| actor.parent_actor_id.as_deref());
+        }
+        false
+    }
+
+    pub(super) fn jobs_for_operation(
+        &self,
+        root_actor_id: &str,
+        residuals_only: bool,
+    ) -> Vec<ActivityDispatchJob> {
+        let Some(operation) = self.operations.get(root_actor_id) else {
+            return Vec::new();
+        };
+        let mut jobs = Vec::new();
+        let mut targets = std::collections::HashSet::new();
+        let actor_ids = std::iter::once(root_actor_id)
+            .chain(
+                self.actors
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|actor_id| *actor_id != root_actor_id),
+            )
+            .collect::<Vec<_>>();
+        for actor_id in actor_ids {
+            let Some(actor) = self.actors.get(actor_id) else {
+                continue;
+            };
+            let included = if residuals_only {
+                operation.residual_actor_ids.contains(actor_id)
+            } else {
+                operation.covered_actor_ids.contains(actor_id)
+            };
+            let Some(target) = included
+                .then_some(actor)
+                .filter(|actor| !actor.status.is_terminal())
+                .and_then(|actor| actor.target.clone())
+            else {
+                continue;
+            };
+            if operation.dispatched_targets.contains(&target) || !targets.insert(target.clone()) {
+                continue;
+            }
+            jobs.push(ActivityDispatchJob {
+                scope_id: self.scope_id.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation.clone(),
+                operation_root_actor_id: root_actor_id.to_owned(),
+                subject: ActivityDispatchSubject::Actor {
+                    actor_id: actor_id.to_owned(),
+                },
+                target,
+            });
+        }
+        for (work_item_id, work_item) in &self.work_items {
+            let included = if residuals_only {
+                operation.residual_work_item_ids.contains(work_item_id)
+            } else {
+                operation.covered_work_item_ids.contains(work_item_id)
+            };
+            let Some(target) = included
+                .then_some(work_item)
+                .filter(|work_item| !work_item.status.is_terminal())
+                .and_then(|work_item| work_item.target.clone())
+            else {
+                continue;
+            };
+            if operation.dispatched_targets.contains(&target) || !targets.insert(target.clone()) {
+                continue;
+            }
+            jobs.push(ActivityDispatchJob {
+                scope_id: self.scope_id.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation.clone(),
+                operation_root_actor_id: root_actor_id.to_owned(),
+                subject: ActivityDispatchSubject::WorkItem {
+                    work_item_id: work_item_id.clone(),
+                },
+                target,
+            });
+        }
+        jobs
+    }
+
+    fn reconcile_operations(&mut self) -> Vec<ActivityDispatchJob> {
+        let roots = self.operations.keys().cloned().collect::<Vec<_>>();
+        let mut jobs = Vec::new();
+        let mut completed = Vec::new();
+        for root_actor_id in roots {
+            let Some(mut operation) = self.operations.remove(&root_actor_id) else {
+                continue;
+            };
+            let before_covered_actors = operation.covered_actor_ids.clone();
+            let before_covered_work = operation.covered_work_item_ids.clone();
+            let before_residual_actors = operation.residual_actor_ids.clone();
+            let before_residual_work = operation.residual_work_item_ids.clone();
+
+            operation
+                .covered_actor_ids
+                .retain(|actor_id| self.actors.contains_key(actor_id));
+            operation
+                .covered_work_item_ids
+                .retain(|work_item_id| self.work_items.contains_key(work_item_id));
+
+            operation.residual_actor_ids.retain(|actor_id| {
+                self.actors
+                    .get(actor_id)
+                    .is_some_and(|actor| !actor.status.is_terminal())
+            });
+            operation.residual_work_item_ids.retain(|work_item_id| {
+                self.work_items
+                    .get(work_item_id)
+                    .is_some_and(|work_item| !work_item.status.is_terminal())
+            });
+
+            loop {
+                let newly_covered =
+                    self.actors
+                        .iter()
+                        .filter(|(actor_id, actor)| {
+                            !operation.covered_actor_ids.contains(*actor_id)
+                                && actor.parent_actor_id.as_ref().is_some_and(|parent| {
+                                    operation.covered_actor_ids.contains(parent)
+                                })
+                        })
+                        .map(|(actor_id, _)| actor_id.clone())
+                        .collect::<Vec<_>>();
+                if newly_covered.is_empty() {
+                    break;
+                }
+                for actor_id in newly_covered {
+                    operation.covered_actor_ids.insert(actor_id.clone());
+                    if self
+                        .actors
+                        .get(&actor_id)
+                        .is_some_and(|actor| !actor.status.is_terminal())
+                    {
+                        operation.residual_actor_ids.insert(actor_id);
+                    }
+                }
+            }
+            for (work_item_id, work_item) in &self.work_items {
+                if work_item
+                    .owner_actor_id
+                    .as_ref()
+                    .is_some_and(|owner| operation.covered_actor_ids.contains(owner))
+                    && work_item.target.is_some()
+                {
+                    operation.covered_work_item_ids.insert(work_item_id.clone());
+                    if !work_item.status.is_terminal() {
+                        operation
+                            .residual_work_item_ids
+                            .insert(work_item_id.clone());
+                    }
+                }
+            }
+            self.prune_operation_targets(&mut operation);
+            let changed = before_covered_actors != operation.covered_actor_ids
+                || before_covered_work != operation.covered_work_item_ids
+                || before_residual_actors != operation.residual_actor_ids
+                || before_residual_work != operation.residual_work_item_ids;
+            if changed {
+                let Some(operation_revision) = self.next_operation_revision() else {
+                    continue;
+                };
+                operation.operation_revision = operation_revision;
+            }
+            if operation.residual_actor_ids.is_empty()
+                && operation.residual_work_item_ids.is_empty()
+            {
+                completed.push(root_actor_id);
+                continue;
+            }
+            self.operations.insert(root_actor_id.clone(), operation);
+            jobs.extend(self.jobs_for_operation(&root_actor_id, true));
+        }
+        for root in completed {
+            self.operations.remove(&root);
+        }
+        jobs
+    }
+
+    fn operation_live_targets(
+        &self,
+        operation: &CancellationOperation,
+    ) -> HashSet<ProviderActivityNativeTarget> {
+        let mut targets = HashSet::new();
+        for actor_id in &operation.covered_actor_ids {
+            if let Some(target) = self
+                .actors
+                .get(actor_id)
+                .filter(|actor| !actor.status.is_terminal())
+                .and_then(|actor| actor.target.clone())
+            {
+                targets.insert(target);
+            }
+        }
+        for work_item_id in &operation.covered_work_item_ids {
+            if let Some(target) = self
+                .work_items
+                .get(work_item_id)
+                .filter(|work_item| !work_item.status.is_terminal())
+                .and_then(|work_item| work_item.target.clone())
+            {
+                targets.insert(target);
+            }
+        }
+        targets
+    }
+
+    fn operation_retained_target_count(&self, operation: &CancellationOperation) -> usize {
+        let mut targets = self.operation_live_targets(operation);
+        targets.extend(operation.dispatched_targets.iter().cloned());
+        targets.len()
+    }
+
+    pub(super) fn prune_operation_targets(&self, operation: &mut CancellationOperation) {
+        let mut retained = self.operation_live_targets(operation);
+        retained.extend(operation.active_attempt_targets.values().flatten().cloned());
+        operation
+            .dispatched_targets
+            .retain(|target| retained.contains(target));
+        operation
+            .retryable_targets
+            .retain(|target| retained.contains(target));
+    }
+
+    pub(super) fn pending_changes(
+        &self,
+        before: &ActivityControlScope,
+    ) -> Result<Vec<ActivityControlChange>, ()> {
+        let before_actors = before.actor_controls();
+        let after = self.actor_controls();
+        let mut changes = Vec::new();
+        for actor_id in before_actors
+            .keys()
+            .chain(after.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            match (before_actors.get(actor_id), after.get(actor_id)) {
+                (Some(before), Some(after)) if before == after => {}
+                (_, Some(actor)) => changes.push(ActivityControlChange::ActorUpserted {
+                    actor: actor.clone(),
+                }),
+                (Some(_), None) => changes.push(ActivityControlChange::ActorRemoved {
+                    actor_id: (*actor_id).clone(),
+                }),
+                (None, None) => {}
+            }
+        }
+        for root_actor_id in before
+            .operations
+            .keys()
+            .chain(self.operations.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            match (
+                before
+                    .operations
+                    .get(root_actor_id)
+                    .map(CancellationOperation::summary),
+                self.operations
+                    .get(root_actor_id)
+                    .map(CancellationOperation::summary),
+            ) {
+                (Some(before), Some(after)) if before == after => {}
+                (_, Some(operation)) => {
+                    changes.push(ActivityControlChange::OperationUpserted { operation });
+                }
+                (Some(_), None) => changes.push(ActivityControlChange::OperationRemoved {
+                    root_actor_id: (*root_actor_id).clone(),
+                }),
+                (None, None) => {}
+            }
+        }
+        if changes.len() > ACTIVITY_DELTA_MAX_CHANGES {
+            return Err(());
+        }
+        Ok(changes)
+    }
+
+    pub(super) fn publish_changes(
+        &mut self,
+        changes: Vec<ActivityControlChange>,
+    ) -> Option<ActivityControlDelta> {
+        if changes.is_empty() || changes.len() > ACTIVITY_DELTA_MAX_CHANGES {
+            return None;
+        }
+        let previous_revision = self.revision;
+        self.revision = self.revision.saturating_add(1);
+        self.scope_revision_clock
+            .fetch_max(self.revision.saturating_add(1), Ordering::AcqRel);
+        Some(ActivityControlDelta {
+            scope_id: self.scope_id(),
+            previous_revision,
+            revision: self.revision,
+            changes,
+        })
+    }
+
+    fn snapshot(&self) -> ActivityControlSnapshot {
+        ActivityControlSnapshot {
+            scope_id: self.scope_id(),
+            revision: self.revision,
+            actors: self.actor_controls().into_values().collect(),
+            operations: self
+                .operations
+                .values()
+                .map(CancellationOperation::summary)
+                .collect(),
+        }
+    }
+
+    fn scope_id(&self) -> String {
+        self.scope_id.clone()
+    }
+}
+
+fn validate_canonical_mutation(mutation: &ProviderActivityMutation) -> bool {
+    match mutation {
+        ProviderActivityMutation::SetScope { capabilities, .. } => capabilities.validate().is_ok(),
+        ProviderActivityMutation::SetSectionHealth { health, .. } => health.validate().is_ok(),
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.name.is_empty()
+                || actor.started_at.is_empty()
+                || actor.updated_at.is_empty() =>
+        {
+            validate_text(actor.id.clone(), "actor id", ACTIVITY_ID_MAX_LENGTH, true).is_ok()
+        }
+        ProviderActivityMutation::UpsertActor(actor) => actor.validate().is_ok(),
+        ProviderActivityMutation::RemoveActor { actor_id } => {
+            validate_text(actor_id.clone(), "actor id", ACTIVITY_ID_MAX_LENGTH, true).is_ok()
+        }
+        ProviderActivityMutation::UpsertWorkItem(work_item) => work_item.validate().is_ok(),
+        ProviderActivityMutation::RemoveWorkItem { work_item_id } => validate_text(
+            work_item_id.clone(),
+            "work item id",
+            ACTIVITY_ID_MAX_LENGTH,
+            true,
+        )
+        .is_ok(),
+        ProviderActivityMutation::AppendEntry(entry) => entry.validate().is_ok(),
+    }
+}

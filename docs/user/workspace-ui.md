@@ -196,6 +196,49 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
 
+### Activity and targeted Stop
+
+Activity combines provider-attributed observation with capability-gated
+control. The dock shows one provider icon for the active scope; each Subagents
+row shows one provider icon for its actor. Active and Done counts are the only
+multiplicity signal: they are primary row content, while elapsed time is
+secondary metadata. The same Activity presentation is used in the inline right
+panel and its responsive sheet.
+
+Subagents follow the canonical actor hierarchy, using indentation and a
+connector for a visible parent. Missing, invalid, cyclic, or otherwise unusable
+parentage safely renders the actor as a root rather than inventing a hierarchy.
+In a structured-chat **Subagents** roster, an active actor shows a persistent
+trailing action only while the current provider runtime has proved a current
+admitted control target for that actor. The row and action are separate
+keyboard-focusable controls: the row opens detail, while the action acts
+immediately and does not open detail. Its accessible label and tooltip name the
+actor and the number of currently active child agents included in the subtree.
+An active actor without a current exact provider target keeps its observed
+**Running** lifecycle and shows read-only **Stop unavailable** in the action
+column. That label performs no RPC and is distinct from server-authoritative
+**Stopping**; it makes restart or target-retirement state explicit without
+inventing cancellation authority.
+
+**Stop subtree** targets the selected actor and every attributable descendant
+in its canonical subtree; **Stop** targets an actor with no active descendants.
+Neither targets the actor's parent, siblings, root chat, unrelated work, or an
+Activity-enabled terminal. Unsupported and terminal actors have no action. The
+composer Stop remains the separate root-turn action.
+
+After admission, every currently covered active actor shows **Stopping** and
+its action is disabled. This label is server-authoritative intent, not a
+completed lifecycle: the row moves to Done only after provider events report a
+terminal state. If dispatch finishes with active residuals, the panel reports
+the bounded remaining count and offers **Retry remaining**. Retry is constrained
+by the server to residuals and late descendants under the original cancellation
+fence; it cannot expand to a parent, sibling, or replacement provider runtime.
+An operation that still has active residuals ten seconds after admission becomes
+partial even if provider delivery returned without a terminal lifecycle event,
+so the UI cannot remain on **Stopping** indefinitely.
+Reconnect restores the current server's control state, while a server restart
+requires the new runtime to prove exact targets again.
+
 Right-panel terminals retain their internal terminal grouping and splitting.
 When a right-panel terminal owns focus, the terminal new, split right, split
 down, and close shortcuts operate within that right-panel terminal surface;

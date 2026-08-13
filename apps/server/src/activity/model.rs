@@ -1,8 +1,9 @@
-use std::{cmp::Ordering, str::FromStr};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 pub const ACTIVITY_ID_MAX_LENGTH: usize = 256;
 pub const ACTIVITY_LABEL_MAX_LENGTH: usize = 256;
@@ -29,6 +30,71 @@ pub enum ActivityModelError {
 }
 
 pub type ActivityModelResult<T> = Result<T, ActivityModelError>;
+
+/// An opaque generation fence for one live provider runtime's Activity controls.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ActivityRuntimeGeneration(Uuid);
+
+impl ActivityRuntimeGeneration {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// An opaque provider-native cancellation handle.
+///
+/// The provider identifiers remain inaccessible outside the Rust server and this type deliberately
+/// has no serialization implementation.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ProviderActivityNativeTarget(ProviderActivityNativeTargetKind);
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+#[allow(dead_code)] // Provider adapters install these exact handles in Tasks 6 and 8.
+enum ProviderActivityNativeTargetKind {
+    CodexTurn { thread_id: String, turn_id: String },
+    ClaudeTask { task_id: String },
+}
+
+impl ProviderActivityNativeTarget {
+    #[allow(dead_code)] // Used by the Codex adapter installed in Task 6.
+    pub(crate) fn codex_turn(thread_id: String, turn_id: String) -> Self {
+        Self(ProviderActivityNativeTargetKind::CodexTurn { thread_id, turn_id })
+    }
+
+    #[allow(dead_code)] // Used by the Claude adapter installed in Task 8.
+    pub(crate) fn claude_task(task_id: String) -> Self {
+        Self(ProviderActivityNativeTargetKind::ClaudeTask { task_id })
+    }
+
+    pub(crate) fn codex_turn_ids(&self) -> Option<(&str, &str)> {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::CodexTurn { thread_id, turn_id } => {
+                Some((thread_id, turn_id))
+            }
+            ProviderActivityNativeTargetKind::ClaudeTask { .. } => None,
+        }
+    }
+
+    pub(crate) fn claude_task_id(&self) -> Option<&str> {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::ClaudeTask { task_id } => Some(task_id),
+            ProviderActivityNativeTargetKind::CodexTurn { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for ProviderActivityNativeTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::CodexTurn { .. } => {
+                formatter.write_str("CodexTurn { .. }")
+            }
+            ProviderActivityNativeTargetKind::ClaudeTask { .. } => {
+                formatter.write_str("ClaudeTask { .. }")
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -344,6 +410,7 @@ pub struct ActivityCapabilities {
     pub background_work: bool,
     pub history_recovery: ActivityHistoryRecovery,
     pub terminal_observation: bool,
+    pub targeted_actor_cancellation: bool,
 }
 
 impl ActivityCapabilities {
@@ -354,6 +421,7 @@ impl ActivityCapabilities {
             background_work: true,
             history_recovery: ActivityHistoryRecovery::Full,
             terminal_observation,
+            targeted_actor_cancellation: false,
         }
     }
 
@@ -364,6 +432,7 @@ impl ActivityCapabilities {
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     }
 
@@ -855,6 +924,101 @@ pub struct ActivitySummaryCounts {
     pub background_tasks: ActivityCounts,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityActorControlState {
+    Unsupported,
+    Available,
+    Requested,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityActorControl {
+    pub actor_id: String,
+    pub state: ActivityActorControlState,
+    pub control_revision: u64,
+    pub active_descendant_count: u64,
+}
+
+impl ActivityActorControl {
+    pub(crate) fn unsupported(actor_id: String) -> Self {
+        Self {
+            actor_id,
+            state: ActivityActorControlState::Unsupported,
+            control_revision: 0,
+            active_descendant_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityCancellationOperationState {
+    Requested,
+    Partial,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityCancellationOperationSummary {
+    pub root_actor_id: String,
+    pub state: ActivityCancellationOperationState,
+    pub residual_count: u64,
+    pub message: Option<String>,
+    pub operation_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityControlSnapshot {
+    pub scope_id: String,
+    pub revision: u64,
+    pub actors: Vec<ActivityActorControl>,
+    pub operations: Vec<ActivityCancellationOperationSummary>,
+}
+
+impl ActivityControlSnapshot {
+    pub(crate) fn empty(scope_id: impl Into<String>) -> Self {
+        Self {
+            scope_id: scope_id.into(),
+            revision: 0,
+            actors: Vec::new(),
+            operations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ActivityControlChange {
+    ActorUpserted {
+        actor: ActivityActorControl,
+    },
+    ActorRemoved {
+        actor_id: String,
+    },
+    OperationUpserted {
+        operation: ActivityCancellationOperationSummary,
+    },
+    OperationRemoved {
+        root_actor_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityControlDelta {
+    pub scope_id: String,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub changes: Vec<ActivityControlChange>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -935,6 +1099,7 @@ pub struct ActivitySnapshot {
     pub work_items: Vec<ActivityWorkItemSummary>,
     pub actors_has_more: bool,
     pub work_items_has_more: bool,
+    pub control: ActivityControlSnapshot,
     pub updated_at: String,
 }
 
@@ -942,6 +1107,7 @@ pub struct ActivitySnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ActivityRosterPage {
     pub records: Vec<ActivityRecordSummary>,
+    pub actor_controls: Vec<ActivityActorControl>,
     pub next_cursor: Option<String>,
 }
 
@@ -949,6 +1115,7 @@ pub struct ActivityRosterPage {
 #[serde(rename_all = "camelCase")]
 pub struct ActivityDetailPage {
     pub record: ActivityRecordSummary,
+    pub actor_control: Option<ActivityActorControl>,
     pub entries: Vec<ActivityEntry>,
     pub next_cursor: Option<String>,
 }

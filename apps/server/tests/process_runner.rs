@@ -15,21 +15,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
-const WINDOWS_STDIN_FIXTURE_ROLE: &str = "BIBCODE_PROCESS_RUNNER_STDIN_ROLE";
+const WINDOWS_BROKEN_STDIN_FIXTURE: &str = "BIBCODE_PROCESS_RUNNER_BROKEN_STDIN_FIXTURE";
 #[cfg(windows)]
-const WINDOWS_STDIN_ROOT_READY: &str = "BIBCODE_PROCESS_RUNNER_STDIN_ROOT_READY";
+const WINDOWS_BROKEN_STDIN_TREE: &str = "BIBCODE_PROCESS_RUNNER_BROKEN_STDIN_TREE";
 #[cfg(windows)]
-const WINDOWS_STDIN_CHILD_READY: &str = "BIBCODE_PROCESS_RUNNER_STDIN_CHILD_READY";
-#[cfg(windows)]
-const WINDOWS_STDIN_GRANDCHILD_READY: &str = "BIBCODE_PROCESS_RUNNER_STDIN_GRANDCHILD_READY";
-#[cfg(windows)]
-const WINDOWS_STDIN_ROOT_SURVIVED: &str = "BIBCODE_PROCESS_RUNNER_STDIN_ROOT_SURVIVED";
-#[cfg(windows)]
-const WINDOWS_STDIN_CHILD_SURVIVED: &str = "BIBCODE_PROCESS_RUNNER_STDIN_CHILD_SURVIVED";
-#[cfg(windows)]
-const WINDOWS_STDIN_GRANDCHILD_SURVIVED: &str = "BIBCODE_PROCESS_RUNNER_STDIN_GRANDCHILD_SURVIVED";
-#[cfg(windows)]
-const WINDOWS_STDIN_RELEASE: &str = "BIBCODE_PROCESS_RUNNER_STDIN_RELEASE";
+const WINDOWS_BROKEN_STDIN_ARGUMENT_PREFIX: &str = "BIBCODE_PROCESS_RUNNER_BROKEN_STDIN_ARG_";
 
 #[test]
 fn process_run_input_builders_preserve_defaults_and_apply_overrides() {
@@ -444,11 +434,9 @@ async fn process_runner_times_out_and_cleans_up_children() {
     .await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn process_runner_cleans_up_tree_after_broken_stdin() {
     let temp = TempDir::new().expect("temporary directory");
-    let script = write_broken_stdin_tree_script(temp.path());
     let parent_ready_path = temp.path().join("stdin-parent.ready");
     let child_ready_path = temp.path().join("stdin-child.ready");
     let grandchild_ready_path = temp.path().join("stdin-grandchild.ready");
@@ -457,8 +445,8 @@ async fn process_runner_cleans_up_tree_after_broken_stdin() {
     let grandchild_survived_path = temp.path().join("stdin-grandchild.survived");
     let release_path = temp.path().join("stdin.release");
 
-    let mut input = script_input(
-        &script,
+    let mut input = broken_stdin_tree_input(
+        temp.path(),
         &[
             parent_ready_path.to_string_lossy().as_ref(),
             child_ready_path.to_string_lossy().as_ref(),
@@ -494,169 +482,73 @@ async fn process_runner_cleans_up_tree_after_broken_stdin() {
 
 #[cfg(windows)]
 #[test]
+#[allow(clippy::zombie_processes)]
 fn process_runner_windows_broken_stdin_fixture() {
-    let Some(role) = std::env::var_os(WINDOWS_STDIN_FIXTURE_ROLE) else {
+    if std::env::var_os(WINDOWS_BROKEN_STDIN_FIXTURE).is_none() {
         return;
+    }
+    // SAFETY: this reads the disposable fixture process's standard-input
+    // handle without transferring ownership.
+    let stdin = unsafe {
+        windows_sys::Win32::System::Console::GetStdHandle(
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        )
     };
-    let (ready, survived) = match role.to_string_lossy().as_ref() {
-        "root" => {
-            spawn_windows_stdin_fixture_role("child");
-            wait_for_windows_stdin_fixture_path(WINDOWS_STDIN_CHILD_READY);
-            wait_for_windows_stdin_fixture_path(WINDOWS_STDIN_GRANDCHILD_READY);
-            (WINDOWS_STDIN_ROOT_READY, WINDOWS_STDIN_ROOT_SURVIVED)
-        }
-        "child" => {
-            spawn_windows_stdin_fixture_role("grandchild");
-            wait_for_windows_stdin_fixture_path(WINDOWS_STDIN_GRANDCHILD_READY);
-            (WINDOWS_STDIN_CHILD_READY, WINDOWS_STDIN_CHILD_SURVIVED)
-        }
-        "grandchild" => (
-            WINDOWS_STDIN_GRANDCHILD_READY,
-            WINDOWS_STDIN_GRANDCHILD_SURVIVED,
-        ),
-        other => panic!("unknown Windows stdin fixture role: {other}"),
-    };
-    fs::write(
-        std::env::var_os(ready).expect("Windows stdin fixture ready path"),
-        "ready",
-    )
-    .expect("write Windows stdin fixture ready");
-    if role == "root" {
-        // SAFETY: the standard-input handle belongs to this disposable fixture
-        // process. Closing it is the injected failure under test.
-        let stdin = unsafe {
-            windows_sys::Win32::System::Console::GetStdHandle(
-                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+    assert!(!stdin.is_null(), "fixture stdin handle should exist");
+    // SAFETY: the handle is valid for this fixture process. Clearing its
+    // inheritance prevents the process-tree descendants from retaining extra
+    // read ends that would mask the injected broken pipe.
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(
+                stdin,
+                windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+                0,
             )
-        };
-        assert!(!stdin.is_null(), "fixture stdin handle should exist");
-        // SAFETY: the fixture closes its standard-input handle exactly once.
-        assert_ne!(
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(stdin) },
-            0,
-            "fixture stdin handle should close"
-        );
-    }
-    let release = PathBuf::from(
-        std::env::var_os(WINDOWS_STDIN_RELEASE).expect("Windows stdin fixture release path"),
+        },
+        0,
+        "fixture stdin handle should become non-inheritable"
     );
-    while !release.is_file() {
-        std::thread::sleep(Duration::from_millis(10));
+    let process_tree = PathBuf::from(
+        std::env::var_os(WINDOWS_BROKEN_STDIN_TREE)
+            .expect("Windows broken-stdin process-tree path"),
+    );
+    let arguments = (0..7)
+        .map(|index| {
+            std::env::var_os(format!("{WINDOWS_BROKEN_STDIN_ARGUMENT_PREFIX}{index}"))
+                .unwrap_or_else(|| panic!("missing Windows broken-stdin argument {index}"))
+        })
+        .collect::<Vec<_>>();
+    let mut command = std::process::Command::new(platform_interpreter());
+    command
+        .args(platform_script_prefix(&process_tree))
+        .args(&arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _tree = command
+        .spawn()
+        .expect("spawn Windows broken-stdin process tree");
+    for argument in arguments.iter().take(3) {
+        let path = PathBuf::from(argument);
+        for _ in 0..1_000 {
+            if path.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path.is_file(), "timed out waiting for {}", path.display());
     }
-    fs::write(
-        std::env::var_os(survived).expect("Windows stdin fixture survived path"),
-        "survived",
-    )
-    .expect("write Windows stdin fixture survived");
+
+    // SAFETY: the fixture closes its standard-input handle exactly once.
+    assert_ne!(
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(stdin) },
+        0,
+        "fixture stdin handle should close"
+    );
     loop {
         std::thread::park();
     }
-}
-
-#[cfg(windows)]
-#[allow(clippy::zombie_processes)]
-fn spawn_windows_stdin_fixture_role(role: &str) {
-    std::process::Command::new(std::env::current_exe().expect("current test executable"))
-        .args([
-            "--exact",
-            "process_runner_windows_broken_stdin_fixture",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(WINDOWS_STDIN_FIXTURE_ROLE, role)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn Windows stdin fixture role");
-}
-
-#[cfg(windows)]
-fn wait_for_windows_stdin_fixture_path(key: &str) {
-    let path = PathBuf::from(
-        std::env::var_os(key)
-            .unwrap_or_else(|| panic!("missing Windows stdin fixture path: {key}")),
-    );
-    for _ in 0..1_000 {
-        if path.is_file() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {}", path.display());
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn process_runner_cleans_up_windows_tree_after_broken_stdin() {
-    let temp = TempDir::new().expect("Windows stdin fixture directory");
-    let root_ready = temp.path().join("root.ready");
-    let child_ready = temp.path().join("child.ready");
-    let grandchild_ready = temp.path().join("grandchild.ready");
-    let root_survived = temp.path().join("root.survived");
-    let child_survived = temp.path().join("child.survived");
-    let grandchild_survived = temp.path().join("grandchild.survived");
-    let release = temp.path().join("release");
-    let mut environment = std::env::vars().collect::<BTreeMap<_, _>>();
-    environment.extend([
-        (WINDOWS_STDIN_FIXTURE_ROLE.to_string(), "root".to_string()),
-        (
-            WINDOWS_STDIN_ROOT_READY.to_string(),
-            root_ready.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_CHILD_READY.to_string(),
-            child_ready.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_GRANDCHILD_READY.to_string(),
-            grandchild_ready.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_ROOT_SURVIVED.to_string(),
-            root_survived.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_CHILD_SURVIVED.to_string(),
-            child_survived.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_GRANDCHILD_SURVIVED.to_string(),
-            grandchild_survived.to_string_lossy().into_owned(),
-        ),
-        (
-            WINDOWS_STDIN_RELEASE.to_string(),
-            release.to_string_lossy().into_owned(),
-        ),
-    ]);
-    let mut input = ProcessRunInput::new(
-        std::env::current_exe()
-            .expect("current test executable")
-            .to_string_lossy()
-            .into_owned(),
-        [
-            "--exact",
-            "process_runner_windows_broken_stdin_fixture",
-            "--nocapture",
-            "--test-threads=1",
-        ],
-    );
-    input.env = Some(environment);
-    input.stdin = Some("x".repeat(8 * 1024 * 1024));
-
-    let task = tokio::spawn(async move { ProcessRunner.run(input).await });
-    wait_for_file(&root_ready).await;
-    let error = tokio::time::timeout(Duration::from_secs(10), task)
-        .await
-        .expect("broken-stdin runner should finish")
-        .expect("join Windows broken-stdin runner")
-        .expect_err("closed stdin should fail");
-    assert!(matches!(error, ProcessError::Stdin(_)));
-    assert_cleanup_sentinels_remain_absent(
-        &release,
-        &[&root_survived, &child_survived, &grandchild_survived],
-    )
-    .await;
 }
 
 #[cfg(windows)]
@@ -702,6 +594,43 @@ fn script_input(script: &Path, extra_args: &[&str]) -> ProcessRunInput {
     let mut args = platform_script_prefix(script);
     args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
     ProcessRunInput::new(platform_interpreter().to_string_lossy().into_owned(), args)
+}
+
+#[cfg(windows)]
+fn broken_stdin_tree_input(directory: &Path, extra_args: &[&str]) -> ProcessRunInput {
+    let process_tree = write_process_tree_script(directory);
+    let mut environment = std::env::vars().collect::<BTreeMap<_, _>>();
+    environment.insert(WINDOWS_BROKEN_STDIN_FIXTURE.to_string(), "1".to_string());
+    environment.insert(
+        WINDOWS_BROKEN_STDIN_TREE.to_string(),
+        process_tree.to_string_lossy().into_owned(),
+    );
+    for (index, argument) in extra_args.iter().enumerate() {
+        environment.insert(
+            format!("{WINDOWS_BROKEN_STDIN_ARGUMENT_PREFIX}{index}"),
+            (*argument).to_string(),
+        );
+    }
+    let mut input = ProcessRunInput::new(
+        std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned(),
+        [
+            "--exact",
+            "process_runner_windows_broken_stdin_fixture",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    );
+    input.env = Some(environment);
+    input
+}
+
+#[cfg(unix)]
+fn broken_stdin_tree_input(directory: &Path, extra_args: &[&str]) -> ProcessRunInput {
+    let script = write_broken_stdin_tree_script(directory);
+    script_input(&script, extra_args)
 }
 
 #[cfg(windows)]

@@ -9,7 +9,7 @@
         "error": {
           "_tag": "ActivityError",
           "message": "*3",
-          "reason": "internal"
+          "reason": "targetUnavailable"
         }
       }
     ]

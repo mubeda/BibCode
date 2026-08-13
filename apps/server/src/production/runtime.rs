@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ServerConfig,
     activity::{
-        ActivityProjections, ActivityRepository, AgentActivityController, AgentActivitySource,
-        register_activity_rpc,
+        ActivityCancellationService, ActivityProjections, ActivityRepository,
+        AgentActivityController, AgentActivitySource, register_activity_rpc,
     },
     assets::{AssetAccess, ResolvedAsset},
     auth::AuthService,
@@ -238,6 +238,13 @@ impl ProductionRuntime {
             SupervisorOptions::default(),
             operational_logs.provider(),
         ));
+        let activity_cancellation = ActivityCancellationService::new(
+            activity_projections.chat().activity_control_registry(),
+            provider_runtime.clone(),
+        );
+        provider_runtime
+            .attach_activity_cancellation(activity_cancellation.clone())
+            .await;
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
         let workspace_availability = WorkspaceAvailabilityRegistry::new();
@@ -324,7 +331,11 @@ impl ProductionRuntime {
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
-        register_activity_rpc(&mut registry, activity_projections.clone());
+        register_activity_rpc(
+            &mut registry,
+            activity_projections.clone(),
+            activity_cancellation,
+        );
         register_orchestration_rpc_with_delivery_and_availability(
             &mut registry,
             orchestration.clone(),

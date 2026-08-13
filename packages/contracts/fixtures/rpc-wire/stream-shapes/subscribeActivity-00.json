@@ -5,7 +5,7 @@
     {
       "kind": "snapshot",
       "snapshot": {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "scopeId": "thread:thread-1",
         "scope": {
           "_tag": "thread",
@@ -19,7 +19,8 @@
           "attributedActivity": true,
           "backgroundWork": true,
           "historyRecovery": "full",
-          "terminalObservation": false
+          "terminalObservation": false,
+          "targetedActorCancellation": true
         },
         "observationState": "live",
         "sections": {
@@ -62,6 +63,19 @@
         "workItems": [],
         "actorsHasMore": false,
         "workItemsHasMore": false,
+        "control": {
+          "scopeId": "thread:thread-1",
+          "revision": 8,
+          "actors": [
+            {
+              "actorId": "actor:child-1",
+              "state": "available",
+              "controlRevision": 3,
+              "activeDescendantCount": 2
+            }
+          ],
+          "operations": []
+        },
         "updatedAt": "2026-07-22T12:00:01Z"
       }
     }
