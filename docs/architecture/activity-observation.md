@@ -261,11 +261,13 @@ recovery is `full` only for
 These recovery downgrades do not disable ordinary Codex chat.
 
 Claude structured control normally joins native task identity only through the
-complete same-session, same-generation Agent/Task `tool_use_id` chain: root
-tool invocation, authenticated asynchronous PostToolUse `agentId`, an exact
-`task_started` `task_id` whose optional `task_type` is absent, `local_agent`, or
-`remote_agent`, and verified `SubagentStart` `agent_id`. Other task types fail
-closed. This exact PostToolUse path remains authoritative: it can promote a
+complete same-session, same-generation Agent/Task `tool_use_id` chain: an Agent
+tool invocation from either the current `assistant` record or the legacy
+`stream_event` content-block record, authenticated asynchronous PostToolUse
+`agentId`, an exact `task_started` `task_id` whose optional `task_type` is
+absent, `local_agent`, or `remote_agent`, and verified `SubagentStart`
+`agent_id`. Other task types fail closed. This exact PostToolUse path remains
+authoritative: it can promote a
 pending nested fallback to an exact target or contradict it, retire it, and
 tombstone its identity chain so replay cannot recreate the target.
 
@@ -290,6 +292,10 @@ The bounded correlator fails closed on conflicts, malformed identity, duplicate
 assignment, stale generation, or saturation. Accepted effect facts always carry
 opaque event keys; target updates share the provider event batch with the
 canonical actor mutation, and native identities remain private and redacted.
+Current `assistant` and legacy `stream_event` forms of the same exact Agent
+invocation derive the same bounded key inputs, so event ordering cannot leave a
+resolved target private to the correlator while the Activity overlay stays
+unsupported.
 `task_notification(stopped)` monotonically cancels the mapped actor and retires
 its handle, so later hook completion cannot rewrite cancellation. When targeted
 dispatch is provisionally supported, an admitted handle maps to the Claude
