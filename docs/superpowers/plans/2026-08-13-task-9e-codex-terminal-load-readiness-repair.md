@@ -202,6 +202,20 @@ Run the existing saturation regression and a paired live-helper regression.
 Require slot recovery only after the helper's owned wait/reap completes, then
 verify no exact PID survives. No event may stand in for joining the real owner.
 
+- [ ] **Step 4A: Close independent-review deadline and detached-owner gaps**
+
+Add a paused-time regression proving a precomputed absolute integration
+deadline is not re-anchored after delayed owner polling. Carry that absolute
+deadline through the private probe and helper seams to the timer that owns
+execution/readiness, and give the probe pair a cleanup-safe outer deadline that
+cancels and awaits its supervised owner. Add a real-child helper regression
+whose integration watchdog expires after PID publication; the fixture must
+abort and join the retained start owner, await bounded owned reap, prove
+`ECHILD`, and report its last milestone instead of panicking inside the helper.
+Publish the helper completion event only after the supervisor permit has been
+dropped so the paired test observes capacity recovery, not merely child wait.
+Keep both production defaults at three seconds.
+
 - [ ] **Step 5: Commit scoped RED-to-GREEN changes**
 
 Commit only the Codex provider-terminal source/test changes and any required
