@@ -86,9 +86,10 @@ impl ManagedEndpointRuntime {
 
     #[must_use]
     pub fn with_executable_override(executable: PathBuf) -> Self {
-        let mut runtime = Self::default();
-        runtime.executable_override = Some(executable);
-        runtime
+        Self {
+            executable_override: Some(executable),
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]
@@ -281,7 +282,7 @@ fn connector_is_live(child: &mut dyn ChildWrapper) -> Result<bool, String> {
         // SAFETY: successful waitid initialized siginfo.
         let information = unsafe { information.assume_init() };
         // SAFETY: si_pid reads initialized siginfo.
-        return Ok(unsafe { information.si_pid() } == 0);
+        Ok(unsafe { information.si_pid() } == 0)
     }
     #[cfg(not(unix))]
     child
