@@ -51,6 +51,10 @@ use super::{
     TerminalGenerationActivityPublisher, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
+#[cfg(test)]
+use crate::process::supervised::{
+    run_supervised_with_spawn_observer, run_supervised_with_spawn_observer_until,
+};
 use crate::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityHistoryRecovery, ActivityLifecycle,
@@ -1725,11 +1729,69 @@ fn current_timestamp() -> String {
 #[derive(Debug)]
 struct SystemClaudeCapabilityProbeRunner {
     timeout: Duration,
+    #[cfg(test)]
+    integration_deadline: Option<tokio::time::Instant>,
+    #[cfg(test)]
+    fixture_spawned: Option<ClaudeProbeSpawnFixture>,
+    #[cfg(test)]
+    fixture_cancellation: Option<CancellationToken>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ClaudeProbeSpawnFixture {
+    spawned: Arc<crate::test_support::FixtureEvent>,
+    pid_path: PathBuf,
+}
+
+#[cfg(test)]
+impl ClaudeProbeSpawnFixture {
+    fn publish(&self, process_id: Option<u32>) {
+        let process_id = process_id.expect("Claude probe PID is available after spawn");
+        let mut temporary_name = self.pid_path.as_os_str().to_owned();
+        temporary_name.push(".tmp");
+        let temporary_path = PathBuf::from(temporary_name);
+        std::fs::write(&temporary_path, process_id.to_string())
+            .expect("stage Claude probe PID after spawn");
+        std::fs::rename(&temporary_path, &self.pid_path)
+            .expect("publish Claude probe PID after spawn");
+        self.spawned.publish();
+    }
 }
 
 impl SystemClaudeCapabilityProbeRunner {
     const fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            #[cfg(test)]
+            integration_deadline: None,
+            #[cfg(test)]
+            fixture_spawned: None,
+            #[cfg(test)]
+            fixture_cancellation: None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_integration_deadline(deadline: tokio::time::Instant) -> Self {
+        Self {
+            timeout: Duration::from_secs(2),
+            integration_deadline: Some(deadline),
+            fixture_spawned: None,
+            fixture_cancellation: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_spawn_fixture(mut self, fixture_spawned: ClaudeProbeSpawnFixture) -> Self {
+        self.fixture_spawned = Some(fixture_spawned);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_fixture_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.fixture_cancellation = Some(cancellation);
+        self
     }
 }
 
@@ -1753,19 +1815,50 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let output = run_supervised(
-                SupervisedRunRequest {
-                    command,
-                    stdin: None,
-                    timeout: self.timeout,
-                    cleanup_timeout: Duration::from_secs(1),
-                    max_output_bytes: CLAUDE_PROBE_OUTPUT_LIMIT,
-                    overflow: SupervisedOverflow::Truncate,
-                },
-                &CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| format!("Claude capability probe failed: {error:?}"))?;
+            let request = SupervisedRunRequest {
+                command,
+                stdin: None,
+                timeout: self.timeout,
+                cleanup_timeout: Duration::from_secs(1),
+                max_output_bytes: CLAUDE_PROBE_OUTPUT_LIMIT,
+                overflow: SupervisedOverflow::Truncate,
+            };
+            #[cfg(test)]
+            let cancellation = self.fixture_cancellation.clone().unwrap_or_default();
+            #[cfg(not(test))]
+            let cancellation = CancellationToken::new();
+            #[cfg(test)]
+            let output = match (self.integration_deadline, self.fixture_spawned.clone()) {
+                (Some(deadline), Some(fixture_spawned)) => {
+                    run_supervised_with_spawn_observer_until(
+                        request,
+                        &cancellation,
+                        deadline,
+                        move |process_id| fixture_spawned.publish(process_id),
+                    )
+                    .await
+                }
+                (Some(deadline), None) => {
+                    run_supervised_with_spawn_observer_until(
+                        request,
+                        &cancellation,
+                        deadline,
+                        |_| {},
+                    )
+                    .await
+                }
+                (None, Some(fixture_spawned)) => {
+                    run_supervised_with_spawn_observer(request, &cancellation, move |process_id| {
+                        fixture_spawned.publish(process_id)
+                    })
+                    .await
+                }
+                (None, None) => run_supervised(request, &cancellation).await,
+            };
+            #[cfg(not(test))]
+            let output = run_supervised(request, &cancellation).await;
+            let output =
+                output.map_err(|error| format!("Claude capability probe failed: {error:?}"))?;
             Ok(ClaudeProbeOutput {
                 success: output.status.success(),
                 stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
@@ -1936,44 +2029,159 @@ mod tests {
     struct ClaudeBoundedProbeFixture {
         _sandbox: TestSandbox,
         executable: PathBuf,
-        started: PathBuf,
-        completed: PathBuf,
+        spawned: Arc<crate::test_support::FixtureEvent>,
+        pid_path: PathBuf,
+        entered_path: PathBuf,
+        stdout_complete_path: PathBuf,
+        stderr_complete_path: PathBuf,
+        completed_path: PathBuf,
+        input_bytes: usize,
     }
 
     fn bounded_probe_fixture(sandbox: TestSandbox) -> ClaudeBoundedProbeFixture {
-        let bytes = CLAUDE_PROBE_OUTPUT_LIMIT + 8 * 1024;
-        let started = sandbox.path("probe.started");
-        let completed = sandbox.path("probe.completed");
+        let input_bytes = CLAUDE_PROBE_OUTPUT_LIMIT + 8 * 1024;
+        let pid_path = sandbox.path("probe.pid");
+        let entered_path = sandbox.path("probe.entered");
+        let stdout_complete_path = sandbox.path("probe.stdout-complete");
+        let stderr_complete_path = sandbox.path("probe.stderr-complete");
+        let completed_path = sandbox.path("probe.completed");
         let executable = sandbox.executable_script(
             "large-claude-probe",
             &format!(
-                "printf started > \"$1\"\n\
-                 dd if=/dev/zero bs={bytes} count=1 2>/dev/null\n\
-                 dd if=/dev/zero bs={bytes} count=1 1>&2 2>/dev/null\n\
-                 printf completed > \"$2\""
+                "printf entered > \"$1\"\n\
+                 dd if=/dev/zero bs={input_bytes} count=1 2>/dev/null || exit 70\n\
+                 printf '{input_bytes}' > \"$2\"\n\
+                 dd if=/dev/zero bs={input_bytes} count=1 1>&2 2>/dev/null || exit 71\n\
+                 printf '{input_bytes}' > \"$3\"\n\
+                 printf completed > \"$4\""
             ),
             "",
         );
         ClaudeBoundedProbeFixture {
             _sandbox: sandbox,
             executable,
-            started,
-            completed,
+            spawned: Arc::new(crate::test_support::FixtureEvent::default()),
+            pid_path,
+            entered_path,
+            stdout_complete_path,
+            stderr_complete_path,
+            completed_path,
+            input_bytes,
         }
     }
 
     impl ClaudeBoundedProbeFixture {
-        async fn run(&self) -> Result<ClaudeProbeOutput, String> {
-            SystemClaudeCapabilityProbeRunner::default()
+        async fn run_until(
+            &self,
+            deadline: tokio::time::Instant,
+        ) -> Result<ClaudeProbeOutput, String> {
+            SystemClaudeCapabilityProbeRunner::with_integration_deadline(deadline)
+                .with_spawn_fixture(ClaudeProbeSpawnFixture {
+                    spawned: self.spawned.clone(),
+                    pid_path: self.pid_path.clone(),
+                })
                 .run(
                     &self.executable,
                     vec![
-                        self.started.to_string_lossy().into_owned(),
-                        self.completed.to_string_lossy().into_owned(),
+                        self.entered_path.to_string_lossy().into_owned(),
+                        self.stdout_complete_path.to_string_lossy().into_owned(),
+                        self.stderr_complete_path.to_string_lossy().into_owned(),
+                        self.completed_path.to_string_lossy().into_owned(),
                     ],
                 )
                 .await
         }
+
+        fn assert_completed_and_reaped(&self) -> i32 {
+            assert!(
+                self.spawned.checkpoint() > 0,
+                "Claude probe owner did not publish child spawn"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&self.entered_path)
+                    .expect("read Claude probe entry milestone"),
+                "entered",
+                "Claude probe fixture did not enter its body"
+            );
+            let expected_input_bytes = self.input_bytes.to_string();
+            assert_eq!(
+                std::fs::read_to_string(&self.stdout_complete_path)
+                    .expect("read Claude probe stdout milestone"),
+                expected_input_bytes,
+                "Claude probe fixture did not publish its exact stdout input"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&self.stderr_complete_path)
+                    .expect("read Claude probe stderr milestone"),
+                expected_input_bytes,
+                "Claude probe fixture did not publish its exact stderr input"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&self.completed_path)
+                    .expect("read Claude probe completion milestone"),
+                "completed",
+                "Claude probe fixture body did not complete"
+            );
+            let pid = read_fixture_pid(&self.pid_path).expect("Claude probe fixture PID");
+            assert!(
+                !process_exists(pid),
+                "Claude probe process survived owner completion"
+            );
+            assert_child_was_reaped(pid, "Claude probe");
+            pid
+        }
+    }
+
+    async fn await_probe_owner_with_observation_watchdog(
+        mut owner: Pin<&mut (dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_)>,
+        cancellation: CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<ClaudeProbeOutput, String> {
+        tokio::select! {
+            biased;
+            result = owner.as_mut() => result,
+            () = tokio::time::sleep_until(deadline) => {
+                cancellation.cancel();
+                let owner_result = owner.await;
+                match owner_result {
+                    Ok(_) => Err("Claude probe observation deadline expired after owner success".to_owned()),
+                    Err(error) => Err(format!(
+                        "Claude probe observation deadline expired; owner failed: {error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn read_fixture_pid(path: &Path) -> Result<i32, String> {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("failed reading fixture PID: {error}"))?
+            .parse::<i32>()
+            .map_err(|error| format!("fixture PID was not numeric: {error}"))
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal zero checks existence and permission without
+        // delivering a signal.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    fn assert_child_was_reaped(pid: i32, label: &str) {
+        let mut status = 0;
+        // SAFETY: `status` is valid writable storage and WNOHANG does not
+        // block.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let error = io::Error::last_os_error();
+        assert_eq!(
+            result, -1,
+            "{label} PID {pid} remained waitable after its owner returned"
+        );
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ECHILD),
+            "{label} PID {pid} was absent but not positively reaped by its owner"
+        );
     }
 
     fn restore_modified_time(source: &Path, target: &Path) {
@@ -1990,23 +2198,132 @@ mod tests {
     async fn two_claude_probes_bound_both_output_streams_in_parallel() {
         let left = bounded_probe_fixture(TestSandbox::new("claude-probe-left"));
         let right = bounded_probe_fixture(TestSandbox::new("claude-probe-right"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
-        let (left_output, right_output) = tokio::join!(left.run(), right.run());
+        let (left_output, right_output) =
+            tokio::join!(left.run_until(deadline), right.run_until(deadline));
 
+        let mut probe_pids = Vec::new();
         for (fixture, output) in [(&left, left_output), (&right, right_output)] {
-            assert!(
-                fixture.started.is_file(),
-                "Claude probe child did not start"
-            );
-            assert!(
-                fixture.completed.is_file(),
-                "Claude probe fixture body did not complete before {output:?}"
-            );
             let output = output.expect("large Claude probe");
             assert!(output.success);
             assert_eq!(output.stdout.len(), CLAUDE_PROBE_OUTPUT_LIMIT);
             assert_eq!(output.stderr.len(), CLAUDE_PROBE_OUTPUT_LIMIT);
+            assert_eq!(fixture.input_bytes, 72 * 1024);
+            probe_pids.push(fixture.assert_completed_and_reaped());
         }
+        assert_ne!(probe_pids[0], probe_pids[1]);
+    }
+
+    #[tokio::test]
+    async fn probe_fixture_reports_owner_failure_before_observation_watchdog() {
+        let sandbox = TestSandbox::new("claude-probe-owner-error");
+        let cancellation = CancellationToken::new();
+        let runner = SystemClaudeCapabilityProbeRunner::with_integration_deadline(
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .with_fixture_cancellation(cancellation.clone());
+        let mut owner = runner.run(&sandbox.path("missing-claude-probe"), Vec::new());
+
+        let error = await_probe_owner_with_observation_watchdog(
+            owner.as_mut(),
+            cancellation,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        .expect_err("missing Claude probe must report its owned spawn error");
+
+        assert!(
+            error.contains("Spawn"),
+            "unexpected Claude probe owner error: {error}"
+        );
+        assert!(
+            !error.contains("observation deadline expired"),
+            "the observation watchdog hid the immediate owner error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_observation_watchdog_cancels_joins_and_reaps_the_owned_process() {
+        let sandbox = TestSandbox::new("claude-probe-watchdog-cleanup");
+        let pid_path = sandbox.path("probe.pid");
+        let executable = sandbox.executable_script("hung-claude-probe", "exec sleep 3600", "");
+        let spawned = Arc::new(crate::test_support::FixtureEvent::default());
+        let cancellation = CancellationToken::new();
+        let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let runner = SystemClaudeCapabilityProbeRunner::with_integration_deadline(owner_deadline)
+            .with_spawn_fixture(ClaudeProbeSpawnFixture {
+                spawned: spawned.clone(),
+                pid_path: pid_path.clone(),
+            })
+            .with_fixture_cancellation(cancellation.clone());
+        let spawn_checkpoint = spawned.checkpoint();
+        let mut owner = runner.run(&executable, Vec::new());
+
+        tokio::select! {
+            biased;
+            result = owner.as_mut() => {
+                panic!("Claude probe owner returned before spawn publication: {result:?}");
+            }
+            result = tokio::time::timeout_at(
+                owner_deadline,
+                spawned.wait_after(spawn_checkpoint),
+            ) => {
+                result.expect("Claude probe did not publish its PID before the owner deadline");
+            }
+        }
+
+        let error = await_probe_owner_with_observation_watchdog(
+            owner.as_mut(),
+            cancellation,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .expect_err("Claude probe observation watchdog must expire");
+
+        assert!(
+            error.contains("observation deadline expired"),
+            "watchdog error omitted its boundary: {error}"
+        );
+        assert!(spawned.checkpoint() > 0, "watchdog probe did not spawn");
+        let pid = read_fixture_pid(&pid_path).expect("watchdog Claude probe PID");
+        assert!(
+            !process_exists(pid),
+            "watchdog Claude probe survived cleanup"
+        );
+        assert_child_was_reaped(pid, "watchdog Claude probe");
+    }
+
+    #[tokio::test]
+    async fn default_system_probe_timeout_terminates_and_reaps_the_owned_process() {
+        let sandbox = TestSandbox::new("claude-probe-default-timeout");
+        let pid_path = sandbox.path("probe.pid");
+        let executable = sandbox.executable_script("hung-claude-probe", "exec sleep 3600", "");
+        let spawned = Arc::new(crate::test_support::FixtureEvent::default());
+        let runner = SystemClaudeCapabilityProbeRunner::default().with_spawn_fixture(
+            ClaudeProbeSpawnFixture {
+                spawned: spawned.clone(),
+                pid_path: pid_path.clone(),
+            },
+        );
+        assert_eq!(runner.timeout, Duration::from_secs(2));
+
+        let error = runner
+            .run(&executable, Vec::new())
+            .await
+            .expect_err("hung Claude probe must fail closed");
+
+        assert!(spawned.checkpoint() > 0, "hung Claude probe did not spawn");
+        assert!(
+            error.contains("Timeout"),
+            "hung Claude probe failed outside the default timeout boundary: {error}"
+        );
+        let pid = read_fixture_pid(&pid_path).expect("default-timeout Claude probe PID");
+        assert!(
+            !process_exists(pid),
+            "timed-out Claude probe process was not terminated and reaped"
+        );
+        assert_child_was_reaped(pid, "default-timeout Claude probe");
     }
 
     #[tokio::test]
