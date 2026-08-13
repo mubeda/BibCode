@@ -182,21 +182,25 @@ identify the root as their source and `SubagentStart` to report no parent. A
 nested invocation additionally requires its stream `parent_tool_use_id` to
 resolve to an active exact parent correlation whose launched `agentId` equals
 the nested authenticated PostToolUse hook's top-level source `agent_id`; the
-Activity-verified `parent_agent_id` must equal that same parent actor.
-Root/nested mismatch, sibling cross-wiring, missing lineage, or mismatched
-source ownership never enables control. A bounded dependency fixpoint settles
-already-present parent, child, and deeper chains in one observation regardless
-of lexical identity order.
+exact PostToolUse `agentId` names the child. Documented `SubagentStart` hook
+payloads do not include `parent_agent_id`; after the exact source proof, BiBCode
+privately reparents that named child to the source parent. If a future payload
+does include explicit lineage, it must agree. Root/nested mismatch, sibling
+cross-wiring, conflicting lineage, or mismatched source ownership never enables
+control. A bounded dependency fixpoint settles already-present parent, child,
+and deeper chains in one observation regardless of lexical identity order.
 
 The complete PostToolUse chain is the authoritative path. When a nested Claude
 version provides no usable PostToolUse launch result, an authenticated
 `PreToolUse` from an already exact parent instead opens a parent-owned pending
 interval. The nested-only parent-local fallback admits control only when the
 stream parent tool, the accepted nested `task_started` candidate, and the
-Activity-verified child lineage agree on that parent, with exactly one candidate
-on each side. A later exact PostToolUse result promotes that pending state to an
-exact target or contradicts it, retires it, and tombstones its identity chain
-so replay cannot recreate the target. Ambiguous candidates remain observable
+unmatched verified child are globally unique, with no unresolved root launch
+that could own the child. The correlator then privately assigns that child to
+the exact source parent. A later exact PostToolUse result promotes that pending
+state to an exact target or contradicts it, retires it, and tombstones its
+identity chain so replay cannot recreate the target. Multiple nested candidates,
+multiple unmatched children, or any unresolved root launch remain observable
 but unsupported and cause zero provider I/O; BiBCode does not infer identity
 from text, timing, order, proximity, or transcript contents.
 
