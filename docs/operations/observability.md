@@ -29,16 +29,25 @@ native tracing event is mirrored to every active runtime-owned sink; those log
 files are not runtime-isolated. Public initialization and runtime-owned
 initialization that resolve to the same physical log path share one writer,
 rotation state, and reference-counted registry entry, so a process event is
-written only once to that file. Existing final-component aliases are
-canonicalized, while absent final components use a platform-aware reservation
-key and are revalidated against the opened physical file before publication.
-Concurrent same-target initialization waits for that reservation and reuses
-the resulting writer, including across log rotation. A lease-free entry stays
-discoverable while an in-flight event snapshot can still write; the exact
+written only once to that file. Existing final-component aliases use the
+filesystem's fully canonicalized physical target. An absent target is reserved
+by its canonical parent identity plus one opaque native filename component.
+Every unresolved component retains its exact native spelling on every
+platform; case aliases reconcile only after the filesystem opens and identifies
+them as one physical target. POSIX filename bytes are never interpreted as
+Windows separators, and no platform guesses pre-open case equivalence with a
+Unicode fold. Concurrent same-target initialization waits for the reservation
+and reuses the resulting writer, including across log rotation. Rotation
+advances the writer's identity generation, and the next registration refreshes
+the full physical-file index outside the registry mutex before resolving
+aliases. Descriptor/path identity checks share one registration-wide budget of
+three attempts; repeated target replacement fails startup, rolls the exact
+pending reservation back, and wakes same-target waiters. A lease-free entry
+stays discoverable while an in-flight event snapshot can still write; the exact
 entry is removed only after its last lease and last snapshot drop. A panicking
-or failed opener rolls its pending reservation back and wakes same-target
-waiters. These guarantees prevent one runtime or in-flight event from
-retargeting or tearing down another runtime's logging without accumulating
+or failed opener likewise rolls its pending reservation back and wakes
+same-target waiters. These guarantees prevent one runtime or in-flight event
+from retargeting or tearing down another runtime's logging without accumulating
 completed entries. `BIBCODE_LOG` controls the filter and falls back to the
 standard `RUST_LOG` behavior, then `info`.
 
