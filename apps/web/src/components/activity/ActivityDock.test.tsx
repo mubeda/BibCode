@@ -736,6 +736,17 @@ describe("ActivityDock", () => {
     expect(
       container.querySelector('button[data-activity-section="subagents"]')?.textContent,
     ).toContain("Subagents");
+
+    const collapsed = await mount(<ActivityDock {...props({ compact: true, expanded: false })} />);
+    const toggle = collapsed.querySelector<HTMLButtonElement>(
+      'button[aria-label^="Expand activity summary"]',
+    );
+    expect(toggle?.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+    expect(toggle?.textContent).toContain("Active 3");
+    expect(toggle?.textContent).toContain("·");
+    expect(toggle?.textContent).toContain("Done 2");
+    expect(toggle?.querySelector(".lucide-loader-circle")).toBeNull();
+    expect(toggle?.querySelector(".lucide-circle-check-big")).toBeNull();
   });
 
   it("saturates unsafe finite counts and never renders overflow, Infinity, or NaN", async () => {
