@@ -16762,7 +16762,7 @@ done
     #[test]
     fn explicit_instance_overrides_legacy_binary_settings() {
         let providers = ProvidersState::default();
-        assert!(!providers.cursor.enabled);
+        assert!(providers.cursor.enabled);
         let instance = ProviderInstanceState {
             driver: "cursor".to_owned(),
             enabled: true,

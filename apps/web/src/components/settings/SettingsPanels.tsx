@@ -1331,13 +1331,7 @@ function EnvironmentScopedProviderSettingsPanel({
     [providerUpdateCandidates],
   );
   const visibleProviderSettings = PROVIDER_SETTINGS.filter(
-    (providerSettings) =>
-      providerSettings.provider !== "grok" &&
-      (providerSettings.provider !== "cursor" ||
-        serverProviders.some(
-          (provider) =>
-            provider.instanceId === defaultInstanceIdForDriver(ProviderDriverKind.make("cursor")),
-        )),
+    (providerSettings) => providerSettings.provider !== "grok",
   );
   const textGenerationModelSelection = resolveAppModelSelectionState(settings, serverProviders);
   const textGenInstanceId = textGenerationModelSelection.instanceId;

@@ -1326,9 +1326,19 @@ describe("ProviderSettingsPanel", () => {
     expect(control("button", "Add provider instance").props.hidden).toBe(true);
 
     const cardIds = h.instanceCards.map((card) => String(card.instanceId));
-    // Cursor's default slot is hidden (no live cursor provider), but the
-    // custom cursor instance still renders as an orphaned row.
-    expect(cardIds).toEqual(["codex", "codex_personal", "claudeAgent", "opencode", "cursor_alt"]);
+    expect(cardIds).toEqual([
+      "codex",
+      "codex_personal",
+      "claudeAgent",
+      "cursor",
+      "cursor_alt",
+      "opencode",
+    ]);
+
+    const cursorCard = h.instanceCards.find((card) => String(card.instanceId) === "cursor")!;
+    const opencodeCard = h.instanceCards.find((card) => String(card.instanceId) === "opencode")!;
+    expect((cursorCard.driverOption as { badgeLabel?: string }).badgeLabel).toBeUndefined();
+    expect((opencodeCard.driverOption as { badgeLabel?: string }).badgeLabel).toBeUndefined();
 
     const codexCard = h.instanceCards.find((card) => String(card.instanceId) === "codex")!;
     expect(codexCard.headerAction).not.toBeNull();

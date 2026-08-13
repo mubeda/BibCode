@@ -30,10 +30,10 @@
 - Consumes: `PROVIDER_CLIENT_DEFINITIONS`, `serverProviders`.
 - Produces: permanent built-in cards for literal IDs `codex`, `claudeAgent`, `cursor`, and `opencode`.
 
-- [ ] Add a test whose empty/partial live inventory expects the literal card order `codex`, `codex_personal`, `claudeAgent`, `cursor`, `opencode`, `cursor_alt` and rejects an Early Access label for Cursor/OpenCode.
-- [ ] Run the focused test and observe the missing `cursor` failure.
-- [ ] Remove the Cursor inventory-presence filter and Cursor badge metadata while retaining the Grok exclusion.
-- [ ] Run the focused settings tests and observe GREEN.
+- [x] Add a test whose empty/partial live inventory expects the literal card order `codex`, `codex_personal`, `claudeAgent`, `cursor`, `cursor_alt`, `opencode` and rejects an Early Access label for Cursor/OpenCode.
+- [x] Run the focused test and observe the missing `cursor` failure.
+- [x] Remove the Cursor inventory-presence filter and Cursor badge metadata while retaining the Grok exclusion.
+- [x] Run the focused settings tests and observe GREEN.
 
 ### Task 2: Make Cursor an enabled, executable default
 
@@ -48,10 +48,10 @@
 - Consumes: absent or explicit Cursor provider settings.
 - Produces: absent values resolve to `{ enabled: true, binaryPath: "cursor-agent" }`; explicit false remains false.
 
-- [ ] Add contract and Rust tests for enabled-by-default, explicit-false preservation, and inventory fallback to `cursor-agent`.
-- [ ] Run exact tests and observe the literal false/wrong fallback failures.
-- [ ] Change only absent-value defaults in contracts, Rust settings, and inventory fallback.
-- [ ] Run exact tests and affected suites GREEN.
+- [x] Add contract and Rust tests for enabled-by-default, explicit-false preservation, and inventory fallback to `cursor-agent`.
+- [x] Run exact tests and observe the literal false/wrong fallback failures.
+- [x] Change only absent-value defaults in contracts, Rust settings, and inventory fallback.
+- [x] Run exact tests and affected suites GREEN.
 
 ### Task 3: Align living provider documentation
 
@@ -62,8 +62,23 @@
 **Interfaces:**
 - Produces: current setup/default/support documentation matching executable behavior.
 
-- [ ] Remove Early Access/default-disabled wording and document truthful probe states and explicit disable behavior.
-- [ ] Run formatting and documentation checks through `vp check`.
+- [x] Remove Early Access/default-disabled wording and document truthful probe states and explicit disable behavior.
+- [x] Run formatting and documentation checks through `vp check`.
+
+### Task 3A: Remove Grok from user-facing provider actions
+
+**Files:**
+- Modify: `apps/web/src/components/chat/ChatHeaderPanelMenu.logic.test.ts`
+- Modify: `apps/web/src/components/chat/ChatHeaderPanelMenu.logic.ts`
+- Modify: `apps/web/src/components/chat/providerAgentActions.test.ts`
+
+**Interfaces:**
+- Consumes: enabled provider inventory/settings, including legacy Grok state.
+- Produces: the action catalog shared by the chat-header, worktree, and default-agent entry points.
+
+- [x] Add deterministic regressions that observe `chat:grok` and `terminal:grok` on the old implementation.
+- [x] Exclude Grok once at the shared panel-menu model boundary.
+- [x] Prove both Grok actions are absent while Codex/OpenCode actions remain ordered and available.
 
 ### Task 4: Verify the merged v0.3.14 branch
 
@@ -74,9 +89,9 @@
 - Consumes: the complete branch after main merges and provider fix.
 - Produces: automated and visual completion evidence.
 
-- [ ] Run focused web/contracts/server tests.
-- [ ] Run `vp run test` and `cargo test --workspace -j 2`.
-- [ ] Run `vp check`, `vp run typecheck`, `cargo fmt --all --check`, and workspace Clippy with warnings denied.
-- [ ] Rebuild the v0.3.14 macOS app and run the complete packaged UI suite.
-- [ ] Use Codex Computer Use to verify provider cards, an external worktree not created by BiBCode, thread state, panels, and performance-sensitive navigation; capture screenshots and inspect them at pixel level.
-- [ ] Fetch remote main again, review the final diff/status, and commit the scoped fix without losing main's changes.
+- [x] Run focused web/contracts/server tests.
+- [x] Run `vp run test` and `cargo test --workspace -j 2`.
+- [x] Run `vp check`, `vp run typecheck`, `cargo fmt --all --check`, and workspace Clippy with warnings denied.
+- [x] Rebuild the v0.3.14 macOS app and run the complete packaged UI suite.
+- [x] Use Codex Computer Use to verify provider cards, an external worktree not created by BiBCode, thread state, panels, and performance-sensitive navigation; capture screenshots and inspect them at pixel level.
+- [x] Fetch remote main again, review the final diff/status, and commit the scoped fix without losing main's changes.
