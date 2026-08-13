@@ -245,6 +245,20 @@ describe("ActivityRoster targeted cancellation controls", () => {
     expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "available" }));
   });
 
+  it("explains an active actor whose exact Stop target is unavailable", async () => {
+    const container = await mount(<ActivityRoster {...props()} />);
+
+    const unavailable = container.querySelector(
+      '[data-activity-control-unavailable="unsupported"]',
+    );
+    expect(unavailable?.textContent).toBe("Stop unavailable");
+    expect(unavailable?.closest("button")).toBeNull();
+    expect(
+      container.querySelector('button[data-activity-row="unsupported"]')?.textContent,
+    ).toContain("Running");
+    expect(container.querySelector('[data-activity-control-unavailable="done"]')).toBeNull();
+  });
+
   it("is keyboard reachable and exposes the same exact subtree impact in its tooltip", async () => {
     const container = await mount(<ActivityRoster {...props()} />);
     const stop = container.querySelector<HTMLButtonElement>(
@@ -434,6 +448,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
       />,
     );
     expect(terminal.querySelector('button[aria-label^="Stop "]')).toBeNull();
+    expect(terminal.querySelector("[data-activity-control-unavailable]")).toBeNull();
 
     const work = workItem("work-1");
     const background = await mount(
@@ -447,6 +462,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
       />,
     );
     expect(background.querySelector('button[aria-label^="Stop "]')).toBeNull();
+    expect(background.querySelector("[data-activity-control-unavailable]")).toBeNull();
     const row = background.querySelector('button[data-activity-row="work-1"]');
     expect(row?.querySelectorAll('[data-activity-record-glyph="workItem"]')).toHaveLength(1);
     expect(

@@ -296,6 +296,7 @@ interface ActivityRecordRowProps {
   readonly depth: number;
   readonly connectedToVisibleParent: boolean;
   readonly control: ActivityActorControl | null;
+  readonly controlUnavailable: boolean;
   readonly provider: string;
   readonly now: string;
   readonly onSelect: (record: ActivityRecordSummary) => void;
@@ -308,6 +309,7 @@ function ActivityRecordRow({
   depth,
   connectedToVisibleParent,
   control,
+  controlUnavailable,
   provider,
   now,
   onSelect,
@@ -388,7 +390,14 @@ function ActivityRecordRow({
           </span>
         </span>
       </Button>
-      {stopImpactLabel === null || control === null || onCancelActor === undefined ? null : (
+      {controlUnavailable ? (
+        <span
+          className="mt-2 shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+          data-activity-control-unavailable={record.id}
+        >
+          Stop unavailable
+        </span>
+      ) : stopImpactLabel === null || control === null || onCancelActor === undefined ? null : (
         <Tooltip>
           <TooltipTrigger
             render={
@@ -461,6 +470,11 @@ export function ActivityRoster({
     (active.loading || done.loading) &&
     snapshot.sections[section].state !== "unsupported";
   const hasRosterError = active.error !== null || done.error !== null;
+  const targetedActorMutationAvailable =
+    section === "subagents" &&
+    snapshot.scope._tag === "thread" &&
+    snapshot.capabilities.targetedActorCancellation &&
+    onCancelActor !== undefined;
   const actorControls = new Map<string, ActivityActorControl>();
   for (const query of [active, done]) {
     for (const page of query.pages) {
@@ -552,20 +566,29 @@ export function ActivityRoster({
                     data-activity-window-group={`active-${groupIndex}`}
                     key={group[0]?.record.id}
                   >
-                    {group.map(({ record, depth, connectedToVisibleParent }) => (
-                      <ActivityRecordRow
-                        connectedToVisibleParent={connectedToVisibleParent}
-                        control={controlForRecord(record)}
-                        depth={depth}
-                        key={record.id}
-                        now={now}
-                        onSelect={onSelect}
-                        {...(onCancelActor === undefined ? {} : { onCancelActor })}
-                        provider={snapshot.provider}
-                        record={record}
-                        registerRow={registerRow}
-                      />
-                    ))}
+                    {group.map(({ record, depth, connectedToVisibleParent }) => {
+                      const control = controlForRecord(record);
+                      return (
+                        <ActivityRecordRow
+                          connectedToVisibleParent={connectedToVisibleParent}
+                          control={control}
+                          controlUnavailable={
+                            targetedActorMutationAvailable &&
+                            record._tag === "actor" &&
+                            isActivityLifecycleActive(record.status) &&
+                            control === null
+                          }
+                          depth={depth}
+                          key={record.id}
+                          now={now}
+                          onSelect={onSelect}
+                          {...(onCancelActor === undefined ? {} : { onCancelActor })}
+                          provider={snapshot.provider}
+                          record={record}
+                          registerRow={registerRow}
+                        />
+                      );
+                    })}
                   </div>
                 ))}
               </div>
@@ -584,6 +607,7 @@ export function ActivityRoster({
                       <ActivityRecordRow
                         connectedToVisibleParent={connectedToVisibleParent}
                         control={controlForRecord(record)}
+                        controlUnavailable={false}
                         depth={depth}
                         key={record.id}
                         now={now}

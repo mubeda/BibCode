@@ -170,6 +170,11 @@ admitted control target for that actor. The row and action are separate
 keyboard-focusable controls: the row opens detail, while the action acts
 immediately and does not open detail. Its accessible label and tooltip name the
 actor and the number of currently active child agents included in the subtree.
+An active actor without a current exact provider target keeps its observed
+**Running** lifecycle and shows read-only **Stop unavailable** in the action
+column. That label performs no RPC and is distinct from server-authoritative
+**Stopping**; it makes restart or target-retirement state explicit without
+inventing cancellation authority.
 
 **Stop subtree** targets the selected actor and every attributable descendant
 in its canonical subtree; **Stop** targets an actor with no active descendants.
