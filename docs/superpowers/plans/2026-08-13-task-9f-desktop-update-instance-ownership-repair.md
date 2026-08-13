@@ -9,14 +9,12 @@ loaded Task 9 graph so update capability, configuration, requests, scheduler
 events, and operation lifetimes remain owned by each desktop application
 instance under default parallel Rust tests.
 
-**Architecture:** Treat `DesktopUpdateManager` and its owning Tauri application
-as the update-runtime boundary. First minimize the observed bridge metadata,
-update availability, operation-readiness, and scheduler failures without
-changing source. If ambient Tauri mock/plugin configuration crosses application
-instances, replace that ambient dependency in tests with a private
-instance-owned update capability/source carried by `DesktopUpdateManager`, while
-production continues to resolve and execute the configured Tauri updater. Keep
-fixture events, listeners, request release channels, background tasks, and
+**Architecture:** First minimize the observed bridge metadata, update
+availability, operation-readiness, and scheduler failures without changing
+source. Preserve the desktop updater and its Tauri security boundary; repair the
+standard package launcher so an explicitly isolated macOS Cargo test target is
+represented by its canonical filesystem path before the test process starts.
+Keep fixture events, listeners, request release channels, background tasks, and
 operation guards attached to the exact manager/application that created them.
 
 **Tech Stack:** Rust 2024, Tokio multi-thread tests and paused time, Tauri 2
@@ -37,11 +35,30 @@ Vite+ concurrent package graph.
   update availability policy.
 - Update capability/configuration, fixture events, listeners, request-release
   channels, operation tasks, and scheduler tasks must be instance-owned.
-- A test capability may be injected only through a private desktop/test seam;
-  it must not infer availability from ambient host configuration or another
-  Tauri application.
+- Do not bypass Tauri's macOS starting-binary symlink defense or inject a fake
+  update capability into desktop application code.
 - Use strict vertical RED-to-GREEN cycles and stop if a different failure
   appears.
+
+## Root-Cause Amendment: Canonical Test-Binary Launch Identity
+
+The preserved Task 9E graph binary reproduced the identical 270/16 failure
+split outside the graph. On macOS, `tauri_utils::platform::current_exe` rejects
+that binary because its launch path has `/tmp` as a symlink ancestor. The graph
+supplied `CARGO_TARGET_DIR=/tmp/bibcode-task9e-target`; the standard desktop
+package command passed it unchanged through
+`scripts/run-msvc-x64.mjs cargo test`. Every updater call therefore failed
+before HTTP, and the three fixture-event waits were downstream symptoms of no
+request owner starting.
+
+An application-level executable override is not viable because
+`tauri-plugin-updater::UpdaterBuilder::build` eagerly resolves Tauri's secured
+starting binary before honoring the explicit executable path. Enabling Tauri's
+dangerous macOS symlink feature would weaken production security. The revised
+owner is the standard Cargo-test launcher: on macOS only, when an explicit
+`CARGO_TARGET_DIR` is configured for `cargo test`, create that intended target
+directory and pass its filesystem-canonical path to Cargo. Other platforms and
+non-test commands remain unchanged.
 
 ---
 
@@ -107,62 +124,51 @@ Test these in order without production edits:
 Record the prediction and observation for each probe. Do not proceed to a fix
 until one root cause is proven.
 
-### Task 2: Make update capability and source instance-owned
+### Task 2: Canonicalize the macOS Cargo-test launch identity
 
 **Files:**
 
-- Modify/Test: `apps/desktop/src-tauri/src/updates.rs`
-- Modify/Test only if bridge construction requires it:
-  `apps/desktop/src-tauri/src/bridge.rs`
-- Modify only if application ownership changes:
-  `apps/desktop/src-tauri/src/lib.rs`
-- Modify only if a documented invariant changes:
-  `docs/architecture/overview.md`
+- Modify: `scripts/run-msvc-x64.mjs`
+- Test: `scripts/run-msvc-x64.test.mjs`
+- Modify: `docs/reference/scripts.md`
 
 **Interfaces:**
 
-- Preserves: `DesktopUpdateManager::new()` as the production constructor and all
-  existing bridge command inputs/outputs.
-- Produces: a private, immutable update capability/source owned by each
-  `DesktopUpdateManager`; test construction supplies its own enabled or disabled
-  source explicitly, while production delegates to the updater configured on
-  that exact Tauri application.
-- Produces: an enabled/disabled two-application regression where both
-  applications remain alive and retain their own metadata and action results
-  concurrently.
+- Preserves: all updater implementation, security features, endpoints,
+  signature checks, bridge commands, and production runtime paths.
+- Produces: `canonicalizeMacosCargoTestTarget(args, env, options)`, which uses
+  the same explicit target directory through its real path on macOS and leaves
+  every other command/platform unchanged.
 
-- [ ] **Step 1: Write the cross-instance capability RED**
+- [ ] **Step 1: Write the launcher contract RED**
 
-Add one behavioral regression that constructs an explicitly disabled
-application and an explicitly enabled loopback-update application, keeps both
-alive, and calls metadata/state/check through each instance in both creation
-orders. Require the disabled instance to remain disabled and the enabled
-instance to issue exactly one request and remain enabled. Run it at 8 and 12
-threads and verify it fails for the observed wrong owner/value.
+Call `runMsvcX64(["cargo", "test", ...])` with macOS and
+`CARGO_TARGET_DIR=/tmp/bibcode-task9f-target`. Require directory creation,
+real-path resolution to `/private/tmp/bibcode-task9f-target`, and only that
+canonical value in the spawned Cargo environment. Verify RED because the
+wrapper currently forwards `/tmp/...` unchanged.
 
-- [ ] **Step 2: Implement the smallest private ownership seam**
+- [ ] **Step 2: Implement the smallest canonicalization seam**
 
-Move the decision and updater construction behind an immutable source owned by
-`DesktopUpdateManager`. The production source must call the configured Tauri
-updater for the same application handle. The test source must carry the exact
-enabled/disabled capability and endpoint/signature material for its own
-application; it may not read environment variables, process CWD, a static, or
-another app's plugin state. Keep real updater HTTP and signature behavior in the
-existing integration tests.
+For macOS `cargo test` with a non-empty explicit target, resolve relative paths
+against the wrapper working directory, create the directory recursively, and
+call `realpath`. Return a copied environment with that canonical target. Do not
+copy a binary, mutate CWD or the parent environment, or normalize an implicit
+Cargo target.
 
-- [ ] **Step 3: Route metadata and actions through the same owner**
+- [ ] **Step 3: Prove unrelated commands remain unchanged**
 
-Make bridge metadata, `state`, `check_for_update`, `download_update`, install
-admission, and background checks derive capability from the same manager-owned
-source. Do not create a second feature-flag truth or convert genuine updater
-construction errors into disabled state.
+Add cases for Windows/Linux, `cargo check`, a non-Cargo command, and an unset
+target. Require no filesystem calls and unchanged environment values. Document
+the narrow macOS Cargo-test rule.
 
-- [ ] **Step 4: Run GREEN before addressing any remaining timeout**
+- [ ] **Step 4: Run GREEN in the original failing target**
 
-Run the new cross-instance regression, the exact metadata failure, and every
-exact update capability/action failure. If a readiness/scheduler timeout
-remains while capability is enabled, stop and return to Task 1 for a separately
-proven lifecycle cause.
+Rebuild through the wrapper using the original
+`CARGO_TARGET_DIR=/tmp/bibcode-task9e-target`, then run the exact bridge failure
+and all update tests. Confirm the test binary starts through the canonical path
+and all original failures are green. If any event wait remains, return to Task
+1 rather than changing a timeout.
 
 ### Task 3: Close any independently proven scheduler/readiness ownership gap
 
