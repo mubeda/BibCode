@@ -69,7 +69,7 @@ No living architecture document changes are expected because the production runt
 **Files:**
 
 - Modify ignored evidence only: `.superpowers/sdd/2026-08-11-parallel-rust-test-sandboxes/task-9-report.md`
-- Modify ignored evidence only: `.superpowers/sdd/2026-08-11-parallel-rust-test-sandboxes/tasks.md`
+- Modify ignored evidence only: `.superpowers/sdd/2026-08-11-parallel-rust-test-sandboxes/progress.md`
 
 1. Run `cargo fmt --all --check`.
 2. Run focused exact tests, all affected Claude/provider-runtime tests, and the full `production_provider_runtime` integration target with default, 8, and 12 threads.

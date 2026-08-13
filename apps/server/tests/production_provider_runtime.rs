@@ -64,27 +64,25 @@ use bibcode_server::{
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use provider_runtime::{
-    BoxRuntimeFuture, ClaudeActivitySupport, NativeProviderDriverFactory, ProviderDeliveryOutcome,
-    ProviderDriver, ProviderDriverFactory, ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig,
-    ProviderNativeEventId, ProviderReconciliationOutcome, ProviderRuntimeError,
-    ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
-    build_claude_launch_arguments_for_test, build_claude_launch_arguments_with_settings_for_test,
-    claude_activity_probe_cache_len_for_test, claude_activity_probe_cache_paths_for_test,
+    BoxRuntimeFuture, ClaudeActivityProbeTestContext, ClaudeActivitySupport,
+    NativeProviderDriverFactory, ProviderDeliveryOutcome, ProviderDriver, ProviderDriverFactory,
+    ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig, ProviderNativeEventId,
+    ProviderReconciliationOutcome, ProviderRuntimeError, ProviderRuntimeSupervisor, StartedSession,
+    SupervisorOptions, build_claude_launch_arguments_for_test,
+    build_claude_launch_arguments_with_settings_for_test,
     claude_output_shutdown_with_open_stream_for_test, deliver_durable_orchestration_turn,
-    deliver_orchestration_turn, freeze_delivery_route, probe_claude_activity_support_for_test,
-    probe_claude_activity_support_with_resolution_delay_for_test,
-    reconcile_abandoned_provider_sessions, reconcile_orchestration_turn,
-    reset_claude_activity_probe_cache_for_test, route_orchestration_command,
-    seed_claude_activity_probe_cache_for_test,
+    deliver_orchestration_turn, freeze_delivery_route, reconcile_abandoned_provider_sessions,
+    reconcile_orchestration_turn, route_orchestration_command,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
-static CLAUDE_ACTIVITY_PROBE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WINDOWS_CLAUDE_FIXTURE: &str = r#"
 [Console]::Out.WriteLine("ignored non-json output")
@@ -9431,8 +9429,7 @@ async fn claude_transcript_recovery_shutdown_cancels_idle_output_reads() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_transcript_recovery_shutdown_breaks_event_queue_backpressure() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let output_written_path = temp.path().join("output-written");
     let executable = executable_fixture(
@@ -9453,7 +9450,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -9492,8 +9489,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_transcript_recovery_worker_emits_bounded_activity_without_disclosing_paths() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("recovery-settings.json");
     let token_path = temp.path().join("recovery-token");
@@ -9528,7 +9524,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -9921,8 +9917,7 @@ fn claude_fast_mode_is_merged_into_session_settings() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_is_cached_by_executable_identity() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let script = format!(
@@ -9931,9 +9926,12 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
     );
     let executable = executable_fixture(&temp, "claude-probe", &script, "");
 
-    let first = probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
-    let second =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let first = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
+    let second = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(
         first,
@@ -9954,8 +9952,7 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_singleflights_concurrent_misses() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let script = format!(
@@ -9969,9 +9966,10 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
     for _ in 0..8 {
         let barrier = barrier.clone();
         let binary_path = binary_path.clone();
+        let probe_context = probe_context.clone();
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            probe_claude_activity_support_for_test(&binary_path).await
+            probe_context.probe(&binary_path).await
         }));
     }
     barrier.wait().await;
@@ -9994,9 +9992,138 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn claude_activity_probe_test_contexts_isolate_concurrent_cache_mutation() {
+    let temp = TempDir::new().unwrap();
+    let ready_fifo = temp.path().join("probe-ready.fifo");
+    let release_fifos = (0..8)
+        .map(|index| temp.path().join(format!("probe-release-{index}.fifo")))
+        .collect::<Vec<_>>();
+    let fifo_creation = Command::new("mkfifo")
+        .arg(&ready_fifo)
+        .args(&release_fifos)
+        .output()
+        .expect("create probe fixture FIFOs");
+    assert!(
+        fifo_creation.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&fifo_creation.stderr)
+    );
+    let ready_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&ready_fifo)
+        .expect("open probe readiness FIFO");
+    let mut ready_lines = BufReader::new(tokio::fs::File::from_std(ready_file)).lines();
+    let mut release_files = release_fifos
+        .iter()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open probe release FIFO")
+        })
+        .collect::<Vec<_>>();
+    let executables = (0..8)
+        .map(|index| {
+            executable_fixture(
+                &temp,
+                &format!("claude-isolated-probe-{index}"),
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{index}' > '{}'; IFS= read -r _ < '{}'; printf '%s\\n' '2.1.218';;\n  --help) printf '%s\\n' '--include-hook-events --forward-subagent-text';;\n  *) exit 1;;\nesac\n",
+                    ready_fifo.display(),
+                    release_fifos[index].display()
+                ),
+                "",
+            )
+        })
+        .collect::<Vec<_>>();
+    let probe_contexts = (0..8)
+        .map(|_| ClaudeActivityProbeTestContext::new())
+        .collect::<Vec<_>>();
+    let seed_context = ClaudeActivityProbeTestContext::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(probe_contexts.len() + 2));
+
+    let mut probes = tokio::task::JoinSet::new();
+    for (probe_context, executable) in probe_contexts.iter().cloned().zip(executables.iter()) {
+        let barrier = barrier.clone();
+        let binary_path = executable.to_string_lossy().into_owned();
+        probes.spawn(async move {
+            barrier.wait().await;
+            probe_context.probe(&binary_path).await
+        });
+    }
+    let seed = tokio::spawn({
+        let barrier = barrier.clone();
+        let seed_context = seed_context.clone();
+        async move {
+            barrier.wait().await;
+            seed_context.seed_cache(65);
+        }
+    });
+    barrier.wait().await;
+
+    let mut ready_indices = std::collections::HashSet::new();
+    while ready_indices.len() < probe_contexts.len() {
+        tokio::select! {
+            line = ready_lines.next_line() => {
+                let line = line
+                    .expect("read probe readiness FIFO")
+                    .expect("probe readiness FIFO remains open");
+                assert!(ready_indices.insert(line), "each probe child publishes readiness once");
+            }
+            result = probes.join_next() => {
+                panic!("probe child completed before all peers were ready: {result:?}");
+            }
+        }
+    }
+    assert_eq!(
+        ready_indices,
+        (0..probe_contexts.len())
+            .map(|index| index.to_string())
+            .collect(),
+        "every distinct probe child must overlap before release"
+    );
+    for release_file in &mut release_files {
+        std::io::Write::write_all(release_file, b"\n").expect("release probe child");
+    }
+
+    while let Some(probe) = probes.join_next().await {
+        let support = probe.unwrap();
+        assert_eq!(
+            support,
+            ClaudeActivitySupport {
+                include_hook_events: true,
+                forward_subagent_text: true,
+                transcript_recovery: false,
+            }
+        );
+    }
+    seed.await.unwrap();
+    for (probe_context, executable) in probe_contexts.into_iter().zip(executables) {
+        let expected_path = std::fs::canonicalize(&executable)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(probe_context.cache_len(), 1);
+        assert_eq!(
+            probe_context.cache_paths(),
+            std::slice::from_ref(&expected_path)
+        );
+    }
+    assert_eq!(seed_context.cache_len(), 64);
+    assert!(
+        seed_context
+            .cache_paths()
+            .iter()
+            .all(|path| path.starts_with("/bibcode-test/claude-cache-"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn claude_activity_probe_retries_transient_failures_without_poisoning_cache() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let marker_path = temp.path().join("failed-once");
     let count_path = temp.path().join("probe-count");
@@ -10009,11 +10136,15 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
     let executable = executable_fixture(&temp, "claude-retry-probe", &script, "");
 
     assert_eq!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await,
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
+            .await,
         ClaudeActivitySupport::default()
     );
     assert_eq!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await,
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
+            .await,
         ClaudeActivitySupport {
             include_hook_events: true,
             forward_subagent_text: true,
@@ -10025,14 +10156,13 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
         "xxx",
         "a failed version probe must be retried, then cache the successful version/help pair"
     );
-    assert_eq!(claude_activity_probe_cache_len_for_test().await, 1);
+    assert_eq!(probe_context.cache_len(), 1);
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_change() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let first_script = format!(
@@ -10041,7 +10171,8 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
     );
     let executable = executable_fixture(&temp, "claude-changing-probe", &first_script, "");
     assert!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref())
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
             .await
             .include_hook_events
     );
@@ -10051,8 +10182,9 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
         count_path.display()
     );
     std::fs::write(&executable, second_script).expect("changed probe fixture should write");
-    let changed =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let changed = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(changed, ClaudeActivitySupport::default());
     assert_eq!(
@@ -10065,16 +10197,15 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_success_cache_is_lru_bounded() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
-    seed_claude_activity_probe_cache_for_test(65).await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    probe_context.seed_cache(65);
 
     assert_eq!(
-        claude_activity_probe_cache_len_for_test().await,
+        probe_context.cache_len(),
         64,
         "the ready cache must prune its least recently used entry"
     );
-    let cached_paths = claude_activity_probe_cache_paths_for_test().await;
+    let cached_paths = probe_context.cache_paths();
     assert!(
         !cached_paths
             .iter()
@@ -10092,8 +10223,7 @@ async fn claude_activity_probe_success_cache_is_lru_bounded() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let executable = executable_fixture(
         &temp,
@@ -10102,8 +10232,9 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
         "",
     );
     let started_at = Instant::now();
-    let support =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let support = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(support, ClaudeActivitySupport::default());
     assert!(
@@ -10111,7 +10242,7 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
         "the complete probe must be bounded by its two-second timeout"
     );
 
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -10127,8 +10258,7 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let descendant_pid_path = temp.path().join("descendant-pid");
     let script = format!(
@@ -10140,11 +10270,9 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 
     let resolution_started = Instant::now();
     assert_eq!(
-        probe_claude_activity_support_with_resolution_delay_for_test(
-            &binary_path,
-            Duration::from_secs(5)
-        )
-        .await,
+        probe_context
+            .probe_with_resolution_delay(&binary_path, Duration::from_secs(5))
+            .await,
         ClaudeActivitySupport::default()
     );
     assert!(
@@ -10154,7 +10282,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 
     let probe_started = Instant::now();
     assert_eq!(
-        probe_claude_activity_support_for_test(&binary_path).await,
+        probe_context.probe(&binary_path).await,
         ClaudeActivitySupport::default()
     );
     assert!(
@@ -10184,8 +10312,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_startup_capabilities_follow_hook_sink_availability() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let supported = executable_fixture(
         &temp,
@@ -10205,7 +10332,7 @@ cat >/dev/null
         "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.218'; exit 0;;\n  --help) exit 0;;\nesac\ncat >/dev/null\n",
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
 
     let mut supported_request = launch();
     supported_request.provider = "claudeAgent".to_owned();
@@ -10311,8 +10438,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_driver_captures_authenticated_http_hook_input_from_launch_settings() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("launch-settings.json");
     let token_path = temp.path().join("hook-token");
@@ -10339,7 +10465,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -10484,8 +10610,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_driver_closes_hook_sink_and_event_channel_after_natural_exit() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("natural-exit-settings.json");
     let token_path = temp.path().join("natural-exit-hook-token");
@@ -10511,7 +10636,7 @@ while [ ! -f "$BIBCODE_TEST_EXIT_RELEASE" ]; do sleep 0.01; done
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
