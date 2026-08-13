@@ -49,8 +49,8 @@ flowchart TB
   rebuildable projection, established only by a trusted primary-checkout scan,
   and joined into project reads; generic projection writes cannot change it,
   and projection rewind/replay preserves it. It fences later fallback anchors
-  and is not a persisted live catalog. Projects sharing a repository may share Git
-  observation, but retain isolated latest-value snapshots, streams, thread
+  and is not a persisted live catalog. Projects sharing a repository may share
+  Git observation, but retain isolated latest-value snapshots, streams, thread
   joins, subscribers, suppressions, and mutation epochs. Catalog views retain
   the last authoritative arrays through degraded observations and cancel
   pending poll, Git, and probe work after their final subscriber before bounded
@@ -86,6 +86,11 @@ flowchart TB
   missing. Public adoption receipts bind the canonical opaque payload and an
   immutable result. Only healthy authoritative catalog observations may
   reconcile durable adopted-thread branch metadata.
+  A standalone server may perform a final sweep of
+  descendants rooted at its own process after its managed owners shut down. An
+  in-process desktop server shares the Tauri host PID and therefore skips that
+  sweep: provider and terminal owners still stop their registered processes,
+  while host-owned WebView children remain under the desktop lifecycle.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -382,6 +387,9 @@ exits as expected, stops every backend from the captured running set, and does
 not invoke the platform installer until every included backend has committed
 and stopped. A prepare, cancel, commit, stop, or installer failure attempts to
 restart the exact prior running set before update coordination is released.
+Stopping the primary in-process backend never sweeps descendants of the shared
+desktop PID; doing so would terminate the system WebView before the installer
+can take ownership of application restart.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -479,6 +487,7 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Desktop update installation requires a verified pre-update backup for the
   primary and every non-excluded running secondary, stops the captured running
   set before invoking the installer, and restarts that exact set on failure.
+  In-process backend shutdown preserves desktop-owned WebView descendants.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

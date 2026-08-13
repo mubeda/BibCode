@@ -3263,10 +3263,10 @@ exit /b 9
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
-        let handle = ServerRuntime::start(server_config_for_launch(
-            test_cli_data_root(base_dir),
-            &config,
-        ))
+        let handle = ServerRuntime::start_with_ui_process_observer(
+            server_config_for_launch(test_cli_data_root(base_dir), &config),
+            Arc::new(UnavailableDesktopUiProcessObserver),
+        )
         .await
         .expect("test server should start");
         config.port = handle.local_addr().port();
@@ -3279,9 +3279,12 @@ exit /b 9
         let mut config = local_test_config(0);
         let server_config =
             server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
-        let handle = ServerRuntime::start(server_config)
-            .await
-            .expect("RPC test server should start");
+        let handle = ServerRuntime::start_with_ui_process_observer(
+            server_config,
+            Arc::new(UnavailableDesktopUiProcessObserver),
+        )
+        .await
+        .expect("RPC test server should start");
         config.port = handle.local_addr().port();
         (handle, config)
     }
@@ -5901,14 +5904,9 @@ $client.Dispose()
             bootstrap_line
         );
 
-        stop_managed_backend(
-            backend,
-            BackendShutdownConfig {
-                timeout: Duration::from_secs(3),
-            },
-        )
-        .await
-        .expect("external backend should shut down gracefully");
+        stop_managed_backend(backend, BackendShutdownConfig::default())
+            .await
+            .expect("external backend should shut down gracefully");
         let shutdown = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown request should be captured")
