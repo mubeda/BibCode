@@ -745,6 +745,14 @@ describe("ActivityDock", () => {
     expect(toggle?.textContent).toContain("Active 3");
     expect(toggle?.textContent).toContain("·");
     expect(toggle?.textContent).toContain("Done 2");
+    const separator = Array.from(toggle?.querySelectorAll<HTMLSpanElement>("span") ?? []).find(
+      (span) => span.textContent === "·",
+    );
+    expect(separator?.classList.contains("text-foreground/70")).toBe(true);
+    expect(separator?.classList.contains("font-medium")).toBe(true);
+    expect(separator?.classList.contains("text-muted-foreground")).toBe(false);
+    expect(separator?.getAttribute("data-activity-count-separator")).toBe("true");
+    expect(separator?.getAttribute("aria-hidden")).toBe("true");
     expect(toggle?.querySelector(".lucide-loader-circle")).toBeNull();
     expect(toggle?.querySelector(".lucide-circle-check-big")).toBeNull();
   });

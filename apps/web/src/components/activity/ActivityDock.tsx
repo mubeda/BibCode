@@ -350,7 +350,11 @@ export function ActivityDock({
           >
             Active {active}
           </span>
-          <span aria-hidden="true" className="text-xs text-muted-foreground">
+          <span
+            aria-hidden="true"
+            className="text-xs font-medium text-foreground/70"
+            data-activity-count-separator="true"
+          >
             ·
           </span>
           <span
