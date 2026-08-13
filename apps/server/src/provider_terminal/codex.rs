@@ -2049,15 +2049,15 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
             #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref() {
-                if let Some(race) = events.admission_race.as_ref() {
-                    if let Err(error) = events.publish_pid(child.id()) {
-                        terminate_and_reap_codex_helper(child).await;
-                        return Err(error);
-                    }
-                    race.spawned.publish();
-                    race.release.wait_after(0).await;
+            if let Some(events) = self.fixture_events.as_ref()
+                && let Some(race) = events.admission_race.as_ref()
+            {
+                if let Err(error) = events.publish_pid(child.id()) {
+                    terminate_and_reap_codex_helper(child).await;
+                    return Err(error);
                 }
+                race.spawned.publish();
+                race.release.wait_after(0).await;
             }
             let identity = child
                 .id()
@@ -2103,18 +2103,20 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 }
             };
             #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref() {
-                if let Err(error) = events.publish_spawned(child.id()) {
-                    terminate_and_reap_codex_helper(child).await;
-                    return Err(error);
-                }
+            if let Some(events) = self.fixture_events.as_ref()
+                && let Err(error) = events.publish_spawned(child.id())
+            {
+                terminate_and_reap_codex_helper(child).await;
+                return Err(error);
             }
             let (process, ready) = supervisor.supervise(
                 child,
-                Some(registration),
                 launch.socket_path,
-                permit,
-                owned_task,
+                CodexHelperSupervisionOwnership {
+                    registration: Some(registration),
+                    permit,
+                    task: owned_task,
+                },
                 self.readiness_timeout,
                 #[cfg(test)]
                 CodexHelperSupervisionFixture {
@@ -2175,6 +2177,13 @@ impl CodexHelperTaskRegistry {
 #[derive(Debug)]
 struct CodexHelperTaskGuard {
     registry: Arc<CodexHelperTaskRegistry>,
+}
+
+#[derive(Debug)]
+struct CodexHelperSupervisionOwnership {
+    registration: Option<ProcessRegistration>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    task: CodexHelperTaskGuard,
 }
 
 impl Drop for CodexHelperTaskGuard {
@@ -2309,16 +2318,19 @@ impl CodexHelperSupervisor {
     fn supervise(
         &self,
         child: Box<dyn ChildWrapper>,
-        registration: Option<ProcessRegistration>,
         socket_path: PathBuf,
-        permit: tokio::sync::OwnedSemaphorePermit,
-        owned_task: CodexHelperTaskGuard,
+        ownership: CodexHelperSupervisionOwnership,
         readiness_timeout: Duration,
         #[cfg(test)] fixture: CodexHelperSupervisionFixture,
     ) -> (
         SystemCodexHelperProcess,
         tokio::sync::oneshot::Receiver<Result<(), String>>,
     ) {
+        let CodexHelperSupervisionOwnership {
+            registration,
+            permit,
+            task: owned_task,
+        } = ownership;
         let termination = tokio_util::sync::CancellationToken::new();
         let child_termination = termination.clone();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -3246,10 +3258,12 @@ mod tests {
         let reaped = Arc::new(FixtureEvent::default());
         let (helper, ready) = supervisor.supervise(
             child,
-            None,
             socket_path,
-            permit,
-            Arc::new(CodexHelperTaskRegistry::default()).register(),
+            CodexHelperSupervisionOwnership {
+                registration: None,
+                permit,
+                task: Arc::new(CodexHelperTaskRegistry::default()).register(),
+            },
             CODEX_HELPER_READY_TIMEOUT,
             CodexHelperSupervisionFixture {
                 reaped: Some(reaped.clone()),

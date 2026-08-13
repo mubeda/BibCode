@@ -1937,15 +1937,15 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 .spawn()
                 .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
             #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref() {
-                if let Some(race) = events.admission_race.as_ref() {
-                    if let Err(error) = events.publish_pid(child.id()) {
-                        terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
-                        return Err(error);
-                    }
-                    race.spawned.publish();
-                    race.release.wait_after(0).await;
+            if let Some(events) = self.fixture_events.as_ref()
+                && let Some(race) = events.admission_race.as_ref()
+            {
+                if let Err(error) = events.publish_pid(child.id()) {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    return Err(error);
                 }
+                race.spawned.publish();
+                race.release.wait_after(0).await;
             }
             let identity = child
                 .id()
@@ -2667,6 +2667,24 @@ impl OpenCodeRetainedReaper {
         let registration = self.reserve_pending();
         self.submit_reserved(
             registration,
+            OpenCodeReapSubmission {
+                child,
+                process_group_id,
+                permit,
+                process_registration,
+                stdout_task,
+                #[cfg(test)]
+                fixture_events,
+            },
+        )
+    }
+
+    fn submit_reserved(
+        self: &Arc<Self>,
+        mut registration: OpenCodePendingReaperRegistration,
+        submission: OpenCodeReapSubmission,
+    ) -> watch::Receiver<bool> {
+        let OpenCodeReapSubmission {
             child,
             process_group_id,
             permit,
@@ -2674,19 +2692,7 @@ impl OpenCodeRetainedReaper {
             stdout_task,
             #[cfg(test)]
             fixture_events,
-        )
-    }
-
-    fn submit_reserved(
-        self: &Arc<Self>,
-        mut registration: OpenCodePendingReaperRegistration,
-        child: Box<dyn ChildWrapper>,
-        process_group_id: Option<i32>,
-        permit: OwnedSemaphorePermit,
-        process_registration: Option<ProcessRegistration>,
-        stdout_task: Option<JoinHandle<()>>,
-        #[cfg(test)] fixture_events: Option<OpenCodeHelperFixtureEvents>,
-    ) -> watch::Receiver<bool> {
+        } = submission;
         let cleanup = SystemOpenCodeReapGuard {
             child: Some(child),
             #[cfg(unix)]
@@ -2994,6 +3000,16 @@ impl OpenCodeRetainedReaper {
             notified.await;
         }
     }
+}
+
+struct OpenCodeReapSubmission {
+    child: Box<dyn ChildWrapper>,
+    process_group_id: Option<i32>,
+    permit: OwnedSemaphorePermit,
+    process_registration: Option<ProcessRegistration>,
+    stdout_task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    fixture_events: Option<OpenCodeHelperFixtureEvents>,
 }
 
 impl Drop for OpenCodePendingReaperRegistration {
@@ -3620,17 +3636,19 @@ mod tests {
         ) -> watch::Receiver<bool> {
             self.launcher.reaper.submit_reserved(
                 registration,
-                prepared.child,
-                prepared.process_group_id,
-                prepared.permit,
-                None,
-                None,
-                Some(
-                    self.launcher
-                        .fixture_events
-                        .clone()
-                        .expect("retained fixture events"),
-                ),
+                OpenCodeReapSubmission {
+                    child: prepared.child,
+                    process_group_id: prepared.process_group_id,
+                    permit: prepared.permit,
+                    process_registration: None,
+                    stdout_task: None,
+                    fixture_events: Some(
+                        self.launcher
+                            .fixture_events
+                            .clone()
+                            .expect("retained fixture events"),
+                    ),
+                },
             )
         }
 

@@ -6,11 +6,7 @@ use std::{
     fmt,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
 };
@@ -431,9 +427,13 @@ impl PortablePtyBackend {
         #[cfg(unix)]
         let process_group = child.process_group;
         #[cfg(unix)]
-        let process_group_identity_reserved = Arc::new(AtomicBool::new(process_group.is_some()));
+        let process_group_ownership = Arc::new(Mutex::new(if process_group.is_some() {
+            UnixProcessGroupOwnership::Reserved
+        } else {
+            UnixProcessGroupOwnership::Released
+        }));
         #[cfg(unix)]
-        let waiter_process_group_identity_reserved = Arc::clone(&process_group_identity_reserved);
+        let waiter_process_group_ownership = Arc::clone(&process_group_ownership);
         let wait_child = child.handoff_child_to_waiter();
         spawn_pty_thread(
             format!("bibcode-pty-wait-{pid}"),
@@ -444,11 +444,17 @@ impl PortablePtyBackend {
                     if let Err(error) = wait_for_unix_child_exit_without_reaping(pid) {
                         tracing::warn!(%error, pid, "failed to reserve PTY root identity through group cleanup");
                     }
-                    if let Err(error) = kill_reserved_unix_process_group(
-                        process_group,
-                        &waiter_process_group_identity_reserved,
-                    ) {
-                        tracing::warn!(%error, process_group, "failed to terminate PTY process group after root exit");
+                    loop {
+                        match kill_reserved_unix_process_group_after_root_exit(
+                            process_group,
+                            &waiter_process_group_ownership,
+                        ) {
+                            Ok(()) => break,
+                            Err(error) => {
+                                tracing::warn!(%error, process_group, "failed to terminate PTY process group after root exit; retaining ownership for retry");
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
                     }
                 }
                 let event = match child.wait() {
@@ -472,8 +478,6 @@ impl PortablePtyBackend {
                         Err(error) => tracing::warn!(%error, "failed waiting for PTY Job cleanup"),
                     }
                 }
-                #[cfg(unix)]
-                waiter_process_group_identity_reserved.store(false, Ordering::Release);
                 let _ = exit_sender.send(Some(event));
             }),
         )
@@ -493,7 +497,7 @@ impl PortablePtyBackend {
             #[cfg(unix)]
             process_group,
             #[cfg(unix)]
-            process_group_identity_reserved,
+            process_group_ownership,
             #[cfg(windows)]
             job,
         }))
@@ -771,7 +775,7 @@ struct PortablePtyProcess {
     #[cfg(unix)]
     process_group: Option<i32>,
     #[cfg(unix)]
-    process_group_identity_reserved: Arc<AtomicBool>,
+    process_group_ownership: Arc<Mutex<UnixProcessGroupOwnership>>,
     #[cfg(windows)]
     job: Arc<WindowsJob>,
 }
@@ -837,14 +841,8 @@ impl PtyProcess for PortablePtyProcess {
     fn kill(&self) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            if !self.process_group_identity_reserved.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            return kill_reserved_unix_process_group(
-                process_group,
-                &self.process_group_identity_reserved,
-            )
-            .map_err(|error| error.to_string());
+            return kill_reserved_unix_process_group(process_group, &self.process_group_ownership)
+                .map_err(|error| error.to_string());
         }
         #[cfg(windows)]
         {
@@ -901,23 +899,53 @@ fn kill_unix_process_group(process_group: i32) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn kill_reserved_unix_process_group(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixProcessGroupOwnership {
+    Reserved,
+    Released,
+}
+
+#[cfg(unix)]
+fn signal_reserved_unix_process_group_with(
     process_group: i32,
-    identity_reserved: &AtomicBool,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+    signal: impl FnOnce(i32) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if identity_reserved
-        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let mut ownership = ownership
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *ownership == UnixProcessGroupOwnership::Released {
         return Ok(());
     }
-    match kill_unix_process_group(process_group) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            identity_reserved.store(true, Ordering::Release);
-            Err(error)
+    signal(process_group)?;
+    *ownership = UnixProcessGroupOwnership::Released;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_reserved_unix_process_group(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+) -> std::io::Result<()> {
+    signal_reserved_unix_process_group_with(process_group, ownership, kill_unix_process_group)
+}
+
+#[cfg(unix)]
+fn kill_reserved_unix_process_group_after_root_exit(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+) -> std::io::Result<()> {
+    signal_reserved_unix_process_group_with(process_group, ownership, |process_group| {
+        match kill_unix_process_group(process_group) {
+            Ok(()) => Ok(()),
+            // Once the owned root is observed exited but kept waitable,
+            // EPERM means the group contains no signalable process. Any live
+            // descendant of this same-user ownership unit would make the
+            // group signal succeed, so there is no owned live member left.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(()),
+            Err(error) => Err(error),
         }
-    }
+    })
 }
 
 #[cfg(unix)]
@@ -1327,6 +1355,59 @@ mod tests {
 
         assert!(result.is_err());
         assert!(killed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_group_signal_keeps_authority_until_waiter_retry_succeeds() {
+        let ownership = Arc::new(Mutex::new(UnixProcessGroupOwnership::Reserved));
+        let first_entered = Arc::new(std::sync::Barrier::new(2));
+        let first_release = Arc::new(std::sync::Barrier::new(2));
+        let first_ownership = ownership.clone();
+        let entered = first_entered.clone();
+        let release = first_release.clone();
+        let first = std::thread::spawn(move || {
+            signal_reserved_unix_process_group_with(42, &first_ownership, |_| {
+                entered.wait();
+                release.wait();
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            })
+        });
+        first_entered.wait();
+
+        let second_ownership = ownership.clone();
+        let (second_entered, second_entry) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            signal_reserved_unix_process_group_with(42, &second_ownership, |_| {
+                second_entered.send(()).expect("waiter signal observer");
+                Ok(())
+            })
+        });
+        assert!(
+            second_entry
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "waiter signal must serialize behind the in-progress manager attempt"
+        );
+        first_release.wait();
+        assert_eq!(
+            first
+                .join()
+                .expect("manager signal task")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        second_entry
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter retries after manager failure");
+        second.join().expect("waiter signal task").unwrap();
+        assert_eq!(
+            *ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            UnixProcessGroupOwnership::Released
+        );
     }
 
     #[cfg(unix)]
@@ -2189,7 +2270,7 @@ mod tests {
             #[cfg(unix)]
             process_group: None,
             #[cfg(unix)]
-            process_group_identity_reserved: Arc::new(AtomicBool::new(false)),
+            process_group_ownership: Arc::new(Mutex::new(UnixProcessGroupOwnership::Released)),
         };
 
         assert!(process.write("data").unwrap_err().contains("write failed"));
@@ -2235,7 +2316,7 @@ mod tests {
             #[cfg(unix)]
             process_group: None,
             #[cfg(unix)]
-            process_group_identity_reserved: Arc::new(AtomicBool::new(false)),
+            process_group_ownership: Arc::new(Mutex::new(UnixProcessGroupOwnership::Released)),
         };
 
         let _ = catch_unwind(AssertUnwindSafe(|| {
