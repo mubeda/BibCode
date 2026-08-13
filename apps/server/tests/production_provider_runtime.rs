@@ -12776,7 +12776,7 @@ done
         "orchestration.dispatchCommand",
         json!({
             "type":"thread.create","commandId":"targeted-thread","threadId":"targeted-thread",
-            "projectId":"targeted-project","title":"Targeted thread","kind":"workspace",
+            "projectId":"targeted-project","title":"Targeted thread",
             "modelSelection":{"instanceId":"codex-targeted","model":"gpt-5"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
@@ -13242,7 +13242,7 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         json!({
             "type":"thread.create","commandId":"claude-targeted-thread",
             "threadId":"claude-targeted-thread","projectId":"claude-targeted-project",
-            "title":"Claude targeted thread","kind":"workspace",
+            "title":"Claude targeted thread",
             "modelSelection":{"instanceId":"claude-targeted","model":"claude-sonnet"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
@@ -13735,7 +13735,7 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         json!({
             "type":"thread.create","commandId":"claude-ambiguous-thread",
             "threadId":"claude-ambiguous-thread","projectId":"claude-ambiguous-project",
-            "title":"Claude ambiguous thread","kind":"workspace",
+            "title":"Claude ambiguous thread",
             "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
