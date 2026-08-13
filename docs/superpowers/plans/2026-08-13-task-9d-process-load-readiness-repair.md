@@ -31,7 +31,8 @@ graph.
 - Preserve bounded stdout/stderr collection, finite process admission,
   cancellation, process-tree termination, direct-root fallback, and final reap.
 - Test bounds diagnose an owner that never publishes its positive milestone;
-  they do not replace an internal production timeout assertion.
+  they are test-only outer watchdogs and do not define or replace a production
+  provider latency/deadline contract.
 - Each deterministic source repair requires a RED at the owning seam before
   GREEN. A fixture-only watchdog repair requires retained graph-failure evidence,
   positive fixture/protocol events, and unchanged protocol-result assertions.
@@ -214,13 +215,22 @@ that owner rather than changing the wrapper.
 
 - [ ] **Step 3: Make only the evidence-authorized repair**
 
-If the fixture and protocol completed before delayed test observation, replace
-the two-second outer Codex-start scheduling watchdog with a single test-only
-failure bound sized for the complete owner operation under the measured graph
-envelope, while retaining separate positive milestone assertions and every
-result/protocol assertion. Do not change `codex.start`, a production deadline,
-or any internal provider timeout. If a product milestone did not complete,
-repair only its owner using a deterministic channel/barrier RED.
+Graph pass 3 proved that the two-second wrapper measures host scheduling rather
+than a production/provider latency contract: neither fixture response was
+prepared by the wrapper deadline, while the same fixture immediately processed
+graceful shutdown during bounded cleanup. Replace that wrapper with a single
+15-second integration-scale, test-only diagnostic deadline shared by ordered
+positive milestones: initialize response ready, thread/start response ready,
+then owner completion. Retain one joined owner task and every result, resume,
+event, request, command, and shutdown assertion. On watchdog expiry, report the
+last reached milestone, abort and join the owner, then run bounded graceful to
+owned kill/reap cleanup. Do not change `codex.start`, a production deadline, or
+any internal provider timeout.
+
+Add a deterministic paused/gated owner regression proving work delayed beyond
+two seconds but released before the shared diagnostic deadline succeeds only
+after all ordered milestones. Retain the unresponsive-shutdown regression to
+prove an owner that never reaches the next milestone fails bounded and reaps.
 
 - [ ] **Step 4: Verify exact and module coverage at three widths**
 
