@@ -6,10 +6,12 @@ four job groups:
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
   desktop build pipeline on Ubuntu 24.04.
-- **Test** runs every workspace package `test` script with `vp run test`, then
-  runs `cargo test --workspace -j 2 -- --test-threads=1` explicitly on Ubuntu
-  24.04. Rust test cases run serially because the process and Git integration
-  fixtures own process-global resources while each case executes.
+- **Test** runs every workspace package `test` script concurrently with
+  `vp run test`, then runs `cargo test --workspace -j 2` explicitly on Ubuntu
+  24.04. The `-j 2` bound limits concurrent Cargo compilation jobs; Rust test
+  binaries use the default parallel harness threads. Exact subprocess tests may
+  still select `--test-threads=1` inside an isolated child process that
+  intentionally owns process-global state.
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.

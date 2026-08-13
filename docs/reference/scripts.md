@@ -55,7 +55,11 @@ state kind.
   upgrade ledger.
 
 Use `vp test` for the built-in Vite+ test command. Use `vp run test` when the
-workspace package-script graph is specifically required.
+workspace package-script graph is specifically required. The graph keeps
+package test tasks concurrent, while server and desktop Rust test commands use
+the default parallel harness threads with Cargo compilation bounded by `-j 2`.
+Exact subprocess tests may use `--test-threads=1` only inside an isolated child
+process that intentionally owns process-global state.
 
 ## Desktop Artifacts
 
