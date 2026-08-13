@@ -187,14 +187,15 @@ mod tests {
 
     #[test]
     fn expands_a_leading_tilde_from_the_supplied_home_directory() {
+        let temp = tempfile::tempdir().expect("temp home");
         let resolved = resolve_data_root(DataRootRequest {
             source: DataRootSource::Environment,
             requested: Some(PathBuf::from("~/.bibcode")),
-            home_dir: PathBuf::from("/home/alice"),
+            home_dir: temp.path().to_path_buf(),
         })
         .expect("resolve home-relative root");
 
-        assert_eq!(resolved.requested, PathBuf::from("/home/alice/.bibcode"));
+        assert_eq!(resolved.requested, temp.path().join(".bibcode"));
     }
 
     #[test]
