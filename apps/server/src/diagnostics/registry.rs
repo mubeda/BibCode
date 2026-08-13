@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
+use thiserror::Error;
 
 use super::{
     AttributionKind, AttributionScope, PROCESS_CLAIM_LABEL_MAX_SCALARS, ProcessClaim,
@@ -39,8 +40,17 @@ pub struct ProcessRegistration {
     registry: Weak<Mutex<RegistryState>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ProcessRegistrationError {
+    #[error("process ownership registration is closed for shutdown")]
+    Shutdown,
+    #[error("process ownership registry capacity is exhausted")]
+    Capacity,
+}
+
 #[derive(Debug)]
 struct RegistryState {
+    accepting_registrations: bool,
     next_registration_id: u64,
     entries: HashMap<u64, RegistryEntry>,
     registration_order: VecDeque<u64>,
@@ -65,6 +75,7 @@ impl ProcessAttributionRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryState {
+                accepting_registrations: true,
                 next_registration_id: 0,
                 entries: HashMap::new(),
                 registration_order: VecDeque::new(),
@@ -72,13 +83,16 @@ impl ProcessAttributionRegistry {
         }
     }
 
-    pub fn register_identity(
+    pub(crate) fn register_identity(
         &self,
         identity: ProcessIdentity,
         mut metadata: ProcessRegistrationMetadata,
-    ) -> Option<ProcessRegistration> {
+    ) -> Result<ProcessRegistration, ProcessRegistrationError> {
         let now = Instant::now();
         let mut state = lock_state(&self.inner);
+        if !state.accepting_registrations {
+            return Err(ProcessRegistrationError::Shutdown);
+        }
         {
             let RegistryState {
                 entries,
@@ -97,9 +111,9 @@ impl ProcessAttributionRegistry {
         if state.entries.len() >= REGISTRY_CAPACITY {
             tracing::warn!(
                 capacity = REGISTRY_CAPACITY,
-                "process attribution registry is full; using external fallback"
+                "process attribution registry is full; rejecting new process root"
             );
-            return None;
+            return Err(ProcessRegistrationError::Capacity);
         }
 
         metadata.label = normalize_label(&metadata.label);
@@ -117,10 +131,25 @@ impl ProcessAttributionRegistry {
         );
         state.registration_order.push_back(registration_id);
 
-        Some(ProcessRegistration {
+        Ok(ProcessRegistration {
             registration_id,
             registry: Arc::downgrade(&self.inner),
         })
+    }
+
+    pub(crate) fn freeze_and_snapshot_identities(&self) -> Vec<ProcessIdentity> {
+        let mut state = lock_state(&self.inner);
+        state.accepting_registrations = false;
+        state
+            .registration_order
+            .iter()
+            .filter_map(|registration_id| {
+                state
+                    .entries
+                    .get(registration_id)
+                    .map(|entry| entry.identity)
+            })
+            .collect()
     }
 
     #[must_use]
@@ -483,11 +512,10 @@ mod tests {
             .map(|pid| register(&registry, pid, 100, "external/provider"))
             .collect::<Vec<_>>();
 
-        assert!(
-            registry
-                .register_identity(identity(999, 100), metadata("overflow"))
-                .is_none()
-        );
+        assert!(matches!(
+            registry.register_identity(identity(999, 100), metadata("overflow")),
+            Err(ProcessRegistrationError::Capacity)
+        ));
         assert_eq!(
             registry.bind_and_snapshot(&[row(0, 1, 100)], Instant::now()),
             vec![crate::diagnostics::ProcessClaim {
@@ -587,6 +615,29 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn shutdown_freeze_is_idempotent_and_rejects_late_roots() {
+        let registry = ProcessAttributionRegistry::new();
+        let _first = register(&registry, 2, 20, "first");
+        let _second = register(&registry, 1, 10, "second");
+
+        let first_snapshot = registry.freeze_and_snapshot_identities();
+        let second_snapshot = registry.freeze_and_snapshot_identities();
+        let late = registry.register_identity(identity(3, 30), metadata("late"));
+
+        assert_eq!(
+            first_snapshot,
+            [identity(2, 20), identity(1, 10)],
+            "freeze must preserve exact registration order"
+        );
+        assert_eq!(second_snapshot, first_snapshot);
+        assert!(
+            matches!(late, Err(ProcessRegistrationError::Shutdown)),
+            "a frozen runtime cannot publish a late root"
+        );
+        assert_eq!(registry.freeze_and_snapshot_identities(), first_snapshot);
     }
 
     #[test]

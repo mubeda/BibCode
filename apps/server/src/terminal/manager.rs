@@ -24,8 +24,8 @@ use super::{
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
-        ProcessRegistration, ProcessRegistrationMetadata, ProcessSampler, RegistrationSource,
-        build_descendant_entries,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata, ProcessSampler,
+        RegistrationSource, build_descendant_entries,
     },
     process::{Platform, ProcessCleanupReport, ShellCandidate, resolve_shell_candidates},
     provider_terminal::{
@@ -931,6 +931,27 @@ impl UncommittedPtyProcess {
     fn commit(mut self) {
         self.process = None;
     }
+
+    async fn cleanup(mut self) {
+        let Some(process) = self.process.take() else {
+            return;
+        };
+        let exit = process.subscribe_exit();
+        if let Err(error) = process.kill() {
+            tracing::debug!(
+                %error,
+                pid = process.pid(),
+                "failed to kill rejected terminal process"
+            );
+        }
+        if let Err(error) = wait_for_terminal_process_tree_exit(process.clone(), exit).await {
+            tracing::debug!(
+                %error,
+                pid = process.pid(),
+                "rejected terminal process did not finish cleanup cleanly"
+            );
+        }
+    }
 }
 
 impl Drop for UncommittedPtyProcess {
@@ -1360,6 +1381,10 @@ impl TerminalManager {
                 restart_after_exact_cleanup_barrier: std::sync::Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn process_attribution_registry(&self) -> ProcessAttributionRegistry {
+        self.inner.attribution.clone()
     }
 
     pub async fn set_agent_activity_enabled(
@@ -1802,7 +1827,7 @@ impl TerminalManager {
                     env,
                 })
                 .map_err(|error| TerminalError::Spawn {
-                    attempted,
+                    attempted: attempted.clone(),
                     message: error,
                 })?;
             uncommitted_process = UncommittedPtyProcess::new(process);
@@ -1835,20 +1860,39 @@ impl TerminalManager {
             .unwrap_or_else(|| terminal_label(&input.terminal_id));
         let exit = process.subscribe_exit();
         let process_has_exited = exit.borrow().is_some();
-        let attribution_registration = (!process_has_exited)
-            .then(|| process.process_identity())
-            .flatten()
-            .and_then(|identity| {
-                self.inner.attribution.register_identity(
-                    identity,
-                    ProcessRegistrationMetadata {
-                        scope: AttributionScope::External,
-                        kind: AttributionKind::Terminal,
-                        label: label.clone(),
-                        source: RegistrationSource::Terminal,
-                    },
-                )
-            });
+        let attribution_registration = if process_has_exited {
+            None
+        } else {
+            let Some(identity) = process.process_identity() else {
+                uncommitted_process.cleanup().await;
+                return Err(TerminalError::Spawn {
+                    attempted,
+                    message: "spawned terminal process has no stable process identity".to_owned(),
+                });
+            };
+            match self.inner.attribution.register_identity(
+                identity,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Terminal,
+                    label: label.clone(),
+                    source: RegistrationSource::Terminal,
+                },
+            ) {
+                Ok(registration) => Some(registration),
+                Err(ProcessRegistrationError::Shutdown) => {
+                    uncommitted_process.cleanup().await;
+                    return Err(TerminalError::Shutdown);
+                }
+                Err(error @ ProcessRegistrationError::Capacity) => {
+                    uncommitted_process.cleanup().await;
+                    return Err(TerminalError::Spawn {
+                        attempted,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
         let history = TerminalHistory::new(self.inner.options.history_line_limit);
         debug_assert_eq!(
             history.line_limit(),
@@ -3412,7 +3456,7 @@ mod tests {
             let (exit, _) = tokio::sync::watch::channel(None);
             Self {
                 pid,
-                process_identity: None,
+                process_identity: Some(crate::diagnostics::ProcessIdentity { pid, started_at: 0 }),
                 exit_on_identity_read: std::sync::Mutex::new(None),
                 output,
                 exit,
@@ -5172,6 +5216,91 @@ mod tests {
         .expect("terminal exit event");
         assert!(terminal_claims(&registry, &[pid]).is_empty());
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frozen_runtime_rejects_and_reaps_a_late_terminal_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: true,
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let manager = attributed_manager(backend.clone(), registry.clone());
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
+
+        let result = manager
+            .open(TerminalOpenInput::new(
+                "thread-after-freeze",
+                "term-after-freeze",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+
+        assert!(matches!(result, Err(TerminalError::Shutdown)));
+        let process = backend.latest();
+        assert!(process.is_killed(), "rejected late process must be killed");
+        assert!(
+            process.subscribe_exit().borrow().is_some(),
+            "rejected late process must be observed as exited before open returns"
+        );
+        assert!(
+            manager
+                .require_session("thread-after-freeze", "term-after-freeze")
+                .await
+                .is_err(),
+            "a rejected process must never be published as a terminal session"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_registry_rejects_and_reaps_an_unattributed_terminal_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: true,
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let registrations = (0..512_u32)
+            .map(|pid| {
+                registry
+                    .register_identity(
+                        crate::diagnostics::ProcessIdentity {
+                            pid: pid + 10_000,
+                            started_at: u64::from(pid),
+                        },
+                        ProcessRegistrationMetadata {
+                            scope: AttributionScope::External,
+                            kind: AttributionKind::Provider,
+                            label: "capacity fixture".to_owned(),
+                            source: RegistrationSource::Provider,
+                        },
+                    )
+                    .expect("fill registry")
+            })
+            .collect::<Vec<_>>();
+        let manager = attributed_manager(backend.clone(), registry);
+
+        let result = manager
+            .open(TerminalOpenInput::new(
+                "thread-at-capacity",
+                "term-at-capacity",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+
+        assert!(matches!(result, Err(TerminalError::Spawn { .. })));
+        let process = backend.latest();
+        assert!(process.is_killed(), "unattributed process must be killed");
+        assert!(
+            process.subscribe_exit().borrow().is_some(),
+            "unattributed process must be reaped before open returns"
+        );
+        drop(registrations);
     }
 
     #[tokio::test]

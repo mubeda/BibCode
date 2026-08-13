@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -131,16 +131,8 @@ impl ProductionServerControl for FixtureControl {
 
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn terminal_rpc_test_lock() -> &'static tokio::sync::Mutex<()> {
-    // Server shutdown cleans every descendant of this test process, so parallel
-    // runtimes in the same integration binary can otherwise kill each other's PTYs.
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
 #[tokio::test]
 async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_close() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let registry = WorkspaceAvailabilityRegistry::new();
     assert!(
@@ -216,7 +208,6 @@ async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_clos
 #[cfg(unix)]
 #[tokio::test]
 async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let availability = WorkspaceAvailabilityRegistry::new();
     let services = fixture_services().with_availability_registry(availability.clone());
@@ -323,7 +314,6 @@ async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -430,7 +420,6 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
 
 #[tokio::test]
 async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let config = test_config(&temp);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -632,7 +621,6 @@ async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace(
 
 #[tokio::test]
 async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -703,7 +691,6 @@ async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
 
 #[tokio::test]
 async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let calls = Arc::new(AtomicUsize::new(0));
     let now = time::OffsetDateTime::now_utc();
@@ -786,7 +773,6 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
 
 #[tokio::test]
 async fn terminal_command_activity_hint_decodes_strictly_without_entering_launch_env() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let mut registry = RpcRegistry::empty();
     register_server_terminal_rpc(&mut registry, fixture_services());
@@ -898,7 +884,6 @@ async fn terminal_command_activity_hint_decodes_strictly_without_entering_launch
 
 #[tokio::test]
 async fn provider_usage_reset_rpc_rejects_blank_request_ids_with_typed_error() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let mut registry = RpcRegistry::empty();
     register_server_terminal_rpc(&mut registry, fixture_services());
@@ -935,7 +920,6 @@ async fn provider_usage_reset_rpc_rejects_blank_request_ids_with_typed_error() {
 
 #[tokio::test]
 async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_processes() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -1099,7 +1083,6 @@ async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_process
 
 #[tokio::test]
 async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round_trip() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -1473,7 +1456,6 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
 
 #[tokio::test]
 async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_interrupts() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();

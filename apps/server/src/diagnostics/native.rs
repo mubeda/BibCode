@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     sync::{Arc, Mutex},
 };
@@ -10,12 +11,32 @@ use crate::process::ProcessCleanupReport;
 
 use super::{
     PROCESS_COMMAND_MAX_SCALARS, ProcessIdentity, ProcessRow, ProcessSampler, SamplingError,
-    bound_diagnostic_string, build_descendant_entries,
+    bound_diagnostic_string,
 };
 
 #[derive(Debug)]
 pub struct NativeProcessSampler {
     system: Arc<Mutex<System>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuntimeProcessOwnership {
+    roots: Vec<ProcessIdentity>,
+    captured: Vec<ProcessIdentity>,
+}
+
+impl RuntimeProcessOwnership {
+    pub(crate) fn roots_only(roots: Vec<ProcessIdentity>) -> Self {
+        Self {
+            roots,
+            captured: Vec::new(),
+        }
+    }
+
+    fn capture(rows: &[ProcessRow], roots: Vec<ProcessIdentity>) -> Self {
+        let captured = runtime_owned_process_identities(rows, &roots);
+        Self { roots, captured }
+    }
 }
 
 impl Default for NativeProcessSampler {
@@ -67,41 +88,126 @@ impl NativeProcessSampler {
         signal_process_identity(expected_identity, signal)
     }
 
-    pub(crate) async fn cleanup_descendants(
+    pub(crate) async fn capture_runtime_process_ownership(
         &self,
-        root_pid: u32,
+        roots: Vec<ProcessIdentity>,
+    ) -> Result<RuntimeProcessOwnership, SamplingError> {
+        let rows = self.sample().await?;
+        Ok(RuntimeProcessOwnership::capture(&rows, roots))
+    }
+
+    pub(crate) async fn cleanup_runtime_process_ownership(
+        &self,
+        ownership: RuntimeProcessOwnership,
     ) -> Result<ProcessCleanupReport, SignalError> {
         let rows = self
             .sample()
             .await
             .map_err(|error| SignalError::Read(error.to_string()))?;
-        let mut descendants = build_descendant_entries(&rows, root_pid);
-        descendants.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
-        let identities = descendants
-            .into_iter()
-            .filter_map(|entry| {
-                rows.iter()
-                    .find(|row| row.pid == entry.pid)
-                    .map(|row| ProcessIdentity {
-                        pid: row.pid,
-                        started_at: row.started_at,
-                    })
-            })
-            .collect::<Vec<_>>();
-        Ok(cleanup_process_identities(&identities, |identity| {
-            signal_process_identity(identity, ProcessSignal::Kill)
-        }))
+        let identities = residual_runtime_owned_process_identities(&rows, &ownership);
+        Ok(cleanup_runtime_process_identities(
+            &identities,
+            |identity| signal_process_identity(identity, ProcessSignal::Kill),
+        ))
     }
 }
 
-fn cleanup_process_identities(
+fn runtime_owned_process_identities(
+    rows: &[ProcessRow],
+    roots: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    let rows_by_pid = rows
+        .iter()
+        .map(|row| (row.pid, row))
+        .collect::<HashMap<_, _>>();
+    let mut children_by_pid = HashMap::<u32, Vec<&ProcessRow>>::new();
+    for row in rows {
+        children_by_pid.entry(row.ppid).or_default().push(row);
+    }
+    for children in children_by_pid.values_mut() {
+        children.sort_by_key(|row| row.pid);
+    }
+
+    fn visit(
+        identity: ProcessIdentity,
+        rows_by_pid: &HashMap<u32, &ProcessRow>,
+        children_by_pid: &HashMap<u32, Vec<&ProcessRow>>,
+        visited: &mut HashSet<ProcessIdentity>,
+        owned: &mut Vec<ProcessIdentity>,
+    ) {
+        let Some(row) = rows_by_pid.get(&identity.pid) else {
+            return;
+        };
+        if row.started_at != identity.started_at || !visited.insert(identity) {
+            return;
+        }
+        for child in children_by_pid
+            .get(&identity.pid)
+            .into_iter()
+            .flatten()
+            .filter(|child| child.started_at >= identity.started_at)
+        {
+            visit(
+                ProcessIdentity {
+                    pid: child.pid,
+                    started_at: child.started_at,
+                },
+                rows_by_pid,
+                children_by_pid,
+                visited,
+                owned,
+            );
+        }
+        owned.push(identity);
+    }
+
+    let mut visited = HashSet::new();
+    let mut owned = Vec::new();
+    for root in roots {
+        visit(
+            *root,
+            &rows_by_pid,
+            &children_by_pid,
+            &mut visited,
+            &mut owned,
+        );
+    }
+    owned
+}
+
+fn residual_runtime_owned_process_identities(
+    rows: &[ProcessRow],
+    ownership: &RuntimeProcessOwnership,
+) -> Vec<ProcessIdentity> {
+    let live = rows
+        .iter()
+        .map(|row| ProcessIdentity {
+            pid: row.pid,
+            started_at: row.started_at,
+        })
+        .collect::<HashSet<_>>();
+    let mut residual = runtime_owned_process_identities(rows, &ownership.roots);
+    let mut included = residual.iter().copied().collect::<HashSet<_>>();
+    residual.extend(
+        ownership
+            .captured
+            .iter()
+            .copied()
+            .filter(|identity| live.contains(identity) && included.insert(*identity)),
+    );
+    residual
+}
+
+fn cleanup_runtime_process_identities(
     identities: &[ProcessIdentity],
     mut signal: impl FnMut(ProcessIdentity) -> Result<(), SignalError>,
 ) -> ProcessCleanupReport {
     let mut report = ProcessCleanupReport::default();
     for identity in identities {
         match signal(*identity) {
-            Ok(()) => report.record_success(),
+            Ok(()) | Err(SignalError::NotFound(_) | SignalError::StaleIdentity(_)) => {
+                report.record_success();
+            }
             Err(error) => {
                 report.record_failure(format!("process {}: {error}", identity.pid));
             }
@@ -819,7 +925,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut attempted = Vec::new();
 
-        let report = cleanup_process_identities(&identities, |identity| {
+        let report = cleanup_runtime_process_identities(&identities, |identity| {
             attempted.push(identity.pid);
             if identity.pid == 2 {
                 Ok(())
@@ -838,6 +944,106 @@ mod tests {
                 .failures
                 .iter()
                 .all(|failure| failure.chars().count() <= 160)
+        );
+    }
+
+    #[test]
+    fn owned_closure_excludes_a_peer_runtime_under_the_same_server_pid() {
+        let mut server = ProcessRow::fixture(10, 1, "server");
+        server.started_at = 10;
+        let mut runtime_a = ProcessRow::fixture(20, 10, "runtime-a");
+        runtime_a.started_at = 20;
+        let mut runtime_a_child = ProcessRow::fixture(21, 20, "runtime-a-child");
+        runtime_a_child.started_at = 21;
+        let mut runtime_b = ProcessRow::fixture(30, 10, "runtime-b");
+        runtime_b.started_at = 30;
+        let mut runtime_b_child = ProcessRow::fixture(31, 30, "runtime-b-child");
+        runtime_b_child.started_at = 31;
+
+        let owned = runtime_owned_process_identities(
+            &[
+                server,
+                runtime_a,
+                runtime_a_child,
+                runtime_b,
+                runtime_b_child,
+            ],
+            &[ProcessIdentity {
+                pid: 20,
+                started_at: 20,
+            }],
+        );
+
+        assert_eq!(
+            owned,
+            [
+                ProcessIdentity {
+                    pid: 21,
+                    started_at: 21,
+                },
+                ProcessIdentity {
+                    pid: 20,
+                    started_at: 20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_closure_rejects_pid_reuse_and_creation_time_inversion() {
+        let mut replacement = ProcessRow::fixture(20, 10, "replacement");
+        replacement.started_at = 200;
+        let mut older_child = ProcessRow::fixture(21, 20, "older-child");
+        older_child.started_at = 150;
+
+        let owned = runtime_owned_process_identities(
+            &[replacement, older_child],
+            &[ProcessIdentity {
+                pid: 20,
+                started_at: 100,
+            }],
+        );
+
+        assert!(owned.is_empty(), "a reused PID cannot inherit ownership");
+    }
+
+    #[test]
+    fn residual_selection_includes_descendants_forked_after_initial_capture() {
+        let root_a = ProcessIdentity {
+            pid: 20,
+            started_at: 20,
+        };
+        let initial_rows = [ProcessRow {
+            started_at: 20,
+            ..ProcessRow::fixture(20, 10, "runtime-a")
+        }];
+        let ownership = RuntimeProcessOwnership::capture(&initial_rows, vec![root_a]);
+        let residual_rows = [
+            ProcessRow {
+                started_at: 20,
+                ..ProcessRow::fixture(20, 10, "runtime-a")
+            },
+            ProcessRow {
+                started_at: 21,
+                ..ProcessRow::fixture(21, 20, "late-a-child")
+            },
+            ProcessRow {
+                started_at: 30,
+                ..ProcessRow::fixture(30, 10, "runtime-b")
+            },
+        ];
+
+        let residual = residual_runtime_owned_process_identities(&residual_rows, &ownership);
+
+        assert_eq!(
+            residual,
+            [
+                ProcessIdentity {
+                    pid: 21,
+                    started_at: 21,
+                },
+                root_a,
+            ]
         );
     }
 

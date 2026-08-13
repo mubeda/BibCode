@@ -474,6 +474,7 @@ impl ProductionRuntime {
         if *quiesced {
             return Ok(());
         }
+        let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.worktree_catalog_operations.shutdown().await;
         self._worktree_catalog.shutdown().await;
         self.worktree_runtime.shutdown().await;
@@ -486,7 +487,9 @@ impl ProductionRuntime {
             tracing::warn!(%error, "provider process-owner cleanup completed with failures");
             first_error = Some(error);
         }
-        self.terminal_services.shutdown().await;
+        self.terminal_services
+            .shutdown_with_process_ownership(process_ownership)
+            .await;
         if let Err(error) = self.operational_logs.shutdown().await {
             tracing::warn!(%error, "failed to shut down operational logs cleanly");
             if first_error.is_none() {

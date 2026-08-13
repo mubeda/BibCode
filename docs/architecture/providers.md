@@ -47,6 +47,15 @@ simultaneous wake. At the timeout boundary, an execution whose process wait and
 pipe collection are already complete returns that result; only an execution
 that remains pending is terminated as timed out.
 
+Long-lived provider roots register their exact process identity in the owning
+server runtime before publication. Runtime shutdown freezes this admission
+before provider supervision drains. A root that races the freeze is not
+published: the spawn returns the typed shutdown error only after its local
+process-group or Windows Job owner has terminated and reaped the child. The
+same per-runtime registry is shared with terminal roots and is the only input
+to residual runtime cleanup; provider shutdown never infers ownership from the
+shared application PID.
+
 The canonical `thread.token-usage.updated` event describes two distinct values:
 `usedTokens` is active context-window usage, while optional
 `totalProcessedTokens` is lifetime tokens processed by the provider. The latter
