@@ -1005,6 +1005,29 @@ mod tests {
         );
 
         assert!(owned.is_empty(), "a reused PID cannot inherit ownership");
+
+        let matching_root = ProcessIdentity {
+            pid: 20,
+            started_at: 200,
+        };
+        let owned = runtime_owned_process_identities(
+            &[
+                ProcessRow {
+                    started_at: 200,
+                    ..ProcessRow::fixture(20, 10, "matching-root")
+                },
+                ProcessRow {
+                    started_at: 150,
+                    ..ProcessRow::fixture(21, 20, "older-child")
+                },
+            ],
+            &[matching_root],
+        );
+        assert_eq!(
+            owned,
+            [matching_root],
+            "a child older than its matching parent identity cannot inherit ownership"
+        );
     }
 
     #[test]
