@@ -15,6 +15,7 @@
 - Preserve production semantics: one process-global cache, exact executable metadata/version keys, ready-entry LRU capacity 64, bounded in-flight entries, and watch-based single-flight.
 - A test cache owner must be independently bounded and must become reclaimable when its test context, factories, and in-flight producers are gone.
 - The deterministic regression must prove two cache owners can mutate their caches concurrently without capacity, reset, or identity interference.
+- On macOS, concurrently executing several previously unseen temporary script paths is admitted serially and can consume the production two-second probe deadline. The isolated test context therefore launches Unix `.sh` fixtures as data through the stable `/bin/sh` executable. This is a fixture-launch policy only: production continues executing the resolved Claude program directly, and the deadline is not widened.
 - Run affected tests in the default harness and explicitly with 8 and 12 test threads; test correctness must not depend on their scheduling order.
 
 ### Alternatives considered
@@ -22,6 +23,8 @@
 1. **Make every production factory own a fresh cache.** This eliminates the global owner, but changes supported production behavior: multiple runtimes/factories would repeat executable resolution and `--version`/`--help` probes. That is an unnecessary startup and process-load regression, so it is rejected.
 2. **Namespace test entries inside the process-global state.** This avoids reset collisions but retains shared capacity, eviction, mutex, in-flight bookkeeping, and namespace-cleanup coupling. It also leaves test-only identifiers in the production cache abstraction, so it is rejected.
 3. **Use an explicit cache owner with a static production default and isolated test contexts.** This preserves the production topology and moves only test fixture state into the fixture that owns it. This is the selected design.
+
+For the newly exposed cold-script admission failure, serializing tests or widening the production deadline would both hide load behavior and are rejected. A process-global mutable dispatcher would reintroduce shared fixture state. A test-context-owned launch policy using the stable platform interpreter keeps payloads and caches independent while allowing the operating system to execute one already-admitted program concurrently; this is selected for Unix integration fixtures. Windows already launches `.ps1` fixtures through the stable PowerShell program.
 
 No living architecture document changes are expected because the production runtime topology, public protocol, and lifecycle guarantees are unchanged. The Task 9 evidence report will record the test-fixture ownership change.
 
@@ -31,7 +34,7 @@ No living architecture document changes are expected because the production runt
 
 - Modify: `apps/server/tests/production_provider_runtime.rs`
 
-1. Add an integration test that creates two Claude probe test contexts and drives their cache mutation concurrently from a positive synchronization barrier.
+1. Add an integration test that creates multiple Claude probe test contexts and drives distinct real script probes plus cache mutation concurrently from a positive synchronization barrier.
 2. Seed one owner's cache to its capacity while the other owner completes a real executable probe, then assert each owner sees only its own bounded entries and paths.
 3. Import the not-yet-existing test context and run the exact test. Record the expected compile failure as RED: the server exposes no independently owned Claude probe cache fixture.
 
@@ -45,8 +48,9 @@ No living architecture document changes are expected because the production runt
 2. Replace direct access to the `OnceLock<StdMutex<_>>` with a `OnceLock` holding the production owner. Default production construction must continue cloning that single owner.
 3. Pass the owner explicitly through executable resolution, cache lookup/single-flight, producer completion, and the Claude driver spawn path.
 4. Add a documentation-hidden `ClaudeActivityProbeTestContext` whose fresh owner can construct a bound `NativeProviderDriverFactory`, run direct probes, and inspect or seed only its own cache.
-5. Keep every mutex critical section synchronous and bounded; in-flight producer tasks retain an owner clone only until completion.
-6. Run the exact isolation test and the existing cache behavior tests until GREEN.
+5. Carry a test-only fixture launch policy with that context so Unix `.sh` payloads run through `/bin/sh`; keep the production launch policy direct and unchanged.
+6. Keep every mutex critical section synchronous and bounded; in-flight producer tasks retain an owner clone only until completion.
+7. Run the exact isolation test and the existing cache behavior tests until GREEN.
 
 ## Task 3: Remove process-global test coordination
 
