@@ -86,6 +86,19 @@ impl ServerRuntime {
             config,
             None,
             ui_process_observer,
+            ProcessTreeCleanup::EmbeddedHost,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_standalone(
+        config: ServerConfig,
+    ) -> Result<ServerHandle, ServerError> {
+        let ui_process_observer = default_ui_process_observer(config.mode);
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
             ProcessTreeCleanup::StandaloneServer,
         )
         .await
@@ -113,7 +126,7 @@ impl ServerRuntime {
             config,
             Some(rpc_registry),
             ui_process_observer,
-            ProcessTreeCleanup::StandaloneServer,
+            ProcessTreeCleanup::EmbeddedHost,
         )
         .await
     }
