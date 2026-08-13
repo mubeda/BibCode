@@ -72,7 +72,7 @@ pub(crate) async fn run_supervised(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    run_supervised_with_observer(request, cancellation, |_| {}).await
+    run_supervised_with_observer(request, cancellation, None, |_| {}).await
 }
 
 #[cfg(test)]
@@ -84,12 +84,26 @@ pub(crate) async fn run_supervised_with_spawn_observer<F>(
 where
     F: FnOnce(Option<u32>) + Send,
 {
-    run_supervised_with_observer(request, cancellation, observer).await
+    run_supervised_with_observer(request, cancellation, None, observer).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_supervised_with_spawn_observer_until<F>(
+    request: SupervisedRunRequest,
+    cancellation: &CancellationToken,
+    deadline: tokio::time::Instant,
+    observer: F,
+) -> Result<SupervisedRunOutput, SupervisedRunError>
+where
+    F: FnOnce(Option<u32>) + Send,
+{
+    run_supervised_with_observer(request, cancellation, Some(deadline), observer).await
 }
 
 async fn run_supervised_with_observer<F>(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
     observer: F,
 ) -> Result<SupervisedRunOutput, SupervisedRunError>
 where
@@ -117,7 +131,7 @@ where
     let mut child = spawn_wrapped(&mut command).map_err(SupervisedRunError::Spawn)?;
     observer(child.id());
 
-    let outcome = execute_child(&mut *child, &execution, cancellation).await;
+    let outcome = execute_child(&mut *child, &execution, cancellation, deadline).await;
     if outcome.is_err() {
         terminate_and_wait_owned(child, cleanup_timeout, "supervised process").await;
     }
@@ -145,10 +159,26 @@ async fn select_execution_outcome<F>(
 where
     F: Future + ?Sized,
 {
+    select_execution_outcome_until(
+        execution.as_mut(),
+        tokio::time::Instant::now() + timeout,
+        cancellation,
+    )
+    .await
+}
+
+async fn select_execution_outcome_until<F>(
+    mut execution: std::pin::Pin<&mut F>,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> ExecutionOutcome<F::Output>
+where
+    F: Future + ?Sized,
+{
     tokio::select! {
         biased;
         () = cancellation.cancelled() => ExecutionOutcome::Cancelled,
-        () = tokio::time::sleep(timeout) => {
+        () = tokio::time::sleep_until(deadline) => {
             let completed = std::future::poll_fn(|context| {
                 std::task::Poll::Ready(match execution.as_mut().poll(context) {
                     std::task::Poll::Ready(result) => Some(result),
@@ -169,6 +199,7 @@ async fn execute_child(
     child: &mut dyn ChildWrapper,
     request: &SupervisedExecution,
     cancellation: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
     let stdout = child
         .stdout()
@@ -207,7 +238,14 @@ async fn execute_child(
             })
         };
         tokio::pin!(execution);
-        select_execution_outcome(execution.as_mut(), request.timeout, cancellation).await
+        match deadline {
+            Some(deadline) => {
+                select_execution_outcome_until(execution.as_mut(), deadline, cancellation).await
+            }
+            None => {
+                select_execution_outcome(execution.as_mut(), request.timeout, cancellation).await
+            }
+        }
     };
 
     match outcome {
@@ -755,6 +793,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn pending_execution_does_not_reanchor_a_precomputed_absolute_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let (execution, _ready, polls) = controlled_execution(37usize);
+        tokio::pin!(execution);
+        let cancellation = CancellationToken::new();
+        let outcome = select_execution_outcome_until(execution.as_mut(), deadline, &cancellation);
+        tokio::pin!(outcome);
+
+        std::future::poll_fn(|context| {
+            assert!(outcome.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(outcome.await, ExecutionOutcome::TimedOut));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancellation_wins_over_simultaneous_completion_and_timeout() {
         let (execution, ready, polls) = controlled_execution(37usize);
         tokio::pin!(execution);
@@ -779,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn missing_required_stream_still_kills_and_waits() {
         let (mut child, kill_calls, wait_calls) = tracking_child(false);
-        let error = execute_child(&mut *child, &execution(), &CancellationToken::new())
+        let error = execute_child(&mut *child, &execution(), &CancellationToken::new(), None)
             .await
             .expect_err("missing stdout should fail");
         assert!(matches!(
