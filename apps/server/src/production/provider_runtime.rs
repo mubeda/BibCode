@@ -10630,6 +10630,7 @@ case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
 esac
+[ -z "$BIBCODE_TEST_READY_FIFO" ] || printf '%s\n' ready > "$BIBCODE_TEST_READY_FIFO"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   case "$line" in
@@ -10662,9 +10663,30 @@ done
             .join(format!("claude-stop-task-{outcome}.jsonl"));
         let executable = executable_fixture(
             temp,
-            &format!("claude-stop-task-{outcome}"),
+            &format!("claude-stop-task-{outcome}.sh"),
             CLAUDE_STOP_TASK_FIXTURE,
         );
+        let ready_fifo = temp
+            .path()
+            .join(format!("claude-stop-task-{outcome}.ready"));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&ready_fifo)
+                .status()
+                .expect("mkfifo starts")
+                .success(),
+            "Claude stop-task readiness FIFO is created"
+        );
+        use std::os::unix::fs::OpenOptionsExt;
+        let ready = tokio::io::unix::AsyncFd::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&ready_fifo)
+                .expect("open Claude stop-task readiness FIFO without blocking"),
+        )
+        .expect("register Claude stop-task readiness FIFO");
         let factory = probe_context.driver_factory(temp.path().join("attachments"));
         let mut request = native_launch(temp, "claudeAgent");
         request.binary_path = executable.to_string_lossy().into_owned();
@@ -10675,6 +10697,10 @@ done
         request.environment.insert(
             "BIBCODE_TEST_STOP_TASK_OUTCOME".to_owned(),
             outcome.to_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_READY_FIFO".to_owned(),
+            ready_fifo.to_string_lossy().into_owned(),
         );
         let driver = Arc::new(
             super::ClaudeDriver::spawn(
@@ -10688,6 +10714,30 @@ done
             .await
             .expect("Claude stop-task driver"),
         );
+        let marker = tokio::time::timeout(Duration::from_secs(15), async {
+            use std::io::Read;
+
+            let mut bytes = [0_u8; 32];
+            loop {
+                let mut readable = ready
+                    .readable()
+                    .await
+                    .expect("Claude stop-task readiness FIFO remains registered");
+                match readable.try_io(|inner| {
+                    let mut file = inner.get_ref();
+                    file.read(&mut bytes)
+                }) {
+                    Ok(Ok(count)) if count > 0 => {
+                        break String::from_utf8_lossy(&bytes[..count]).into_owned();
+                    }
+                    Ok(Ok(_)) | Err(_) => continue,
+                    Ok(Err(error)) => panic!("read Claude stop-task readiness FIFO: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Claude stop-task fixture readiness outer bound");
+        assert_eq!(marker.trim(), "ready");
         (driver, capture)
     }
 

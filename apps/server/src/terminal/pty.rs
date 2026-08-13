@@ -2178,18 +2178,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn natural_root_exit_kills_late_hup_resistant_descendant_before_exit_publication() {
         let directory = tempfile::tempdir().expect("late descendant fixture");
+        let descendant_release = directory.path().join("release-descendant");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&descendant_release)
+                .status()
+                .expect("mkfifo starts")
+                .success(),
+            "late-descendant release FIFO is created"
+        );
         let process = PortablePtyBackend
             .spawn(&PtySpawnInput {
                 executable: "/bin/sh".to_owned(),
                 args: vec![
                     "-c".to_owned(),
-                    "trap 'exit 0' USR1; BIBCODE_ROOT_PID=$$; export BIBCODE_ROOT_PID; /bin/sh -c 'trap \"\" HUP; printf \"\\nBIBCODE_DESCENDANT_PID=%s\\n\" \"$$\"; kill -USR1 \"$BIBCODE_ROOT_PID\"; exec sleep 30' & wait"
+                    "trap 'exit 0' USR1; BIBCODE_ROOT_PID=$$; export BIBCODE_ROOT_PID; /bin/sh -c 'trap \"\" HUP; printf \"\\nBIBCODE_DESCENDANT_PID=%s\\n\" \"$$\"; IFS= read -r _ < \"$BIBCODE_RELEASE_FIFO\"; kill -USR1 \"$BIBCODE_ROOT_PID\"; exec sleep 30' & wait"
                         .to_owned(),
                 ],
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
                 rows: 24,
-                env: BTreeMap::new(),
+                env: BTreeMap::from([(
+                    "BIBCODE_RELEASE_FIFO".to_owned(),
+                    descendant_release.to_string_lossy().into_owned(),
+                )]),
             })
             .expect("spawn natural-exit PTY root");
         let descendant_identity_marker = "BIBCODE_DESCENDANT_PID=";
@@ -2211,6 +2223,12 @@ mod tests {
         .expect("late descendant publishes its framed PID");
         let descendant_identity = NativeProcessSampler::process_identity(descendant_pid)
             .expect("capture late descendant identity");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&descendant_release)
+            .expect("open late-descendant release FIFO")
+            .write_all(b"release\n")
+            .expect("release late descendant after identity capture");
 
         tokio::time::timeout(Duration::from_secs(3), exit.changed())
             .await
