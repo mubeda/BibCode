@@ -2,6 +2,7 @@ import * as NodePath from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  canonicalizeMacosCargoTestTarget,
   defaultWindowsCargoRunner,
   discoverVcVarsAll,
   quoteCmdArg,
@@ -95,6 +96,98 @@ describe("run-msvc-x64", () => {
       ["test"],
       expect.objectContaining({ shell: false }),
     );
+  });
+
+  it("canonicalizes an explicit macOS Cargo test target before launch", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn(() => "/private/tmp/bibcode-task9f-target");
+    const spawnSync = vi.fn(() => ({ status: 0 }));
+
+    expect(
+      runMsvcX64(["cargo", "test", "-p", "bibcode-desktop"], {
+        platform: "darwin",
+        env: { CARGO_TARGET_DIR: "/tmp/bibcode-task9f-target" },
+        programFilesX86: "",
+        mkdirSync,
+        realpathSync,
+        spawnSync,
+      }),
+    ).toBe(0);
+
+    expect(mkdirSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target", {
+      recursive: true,
+    });
+    expect(realpathSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target");
+    expect(spawnSync).toHaveBeenCalledWith(
+      "cargo",
+      ["test", "-p", "bibcode-desktop"],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CARGO_TARGET_DIR: "/private/tmp/bibcode-task9f-target",
+        }),
+      }),
+    );
+  });
+
+  it("leaves unrelated platforms and commands outside target canonicalization", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn();
+    const configured = { CARGO_TARGET_DIR: "relative-target", SENTINEL: "kept" };
+    const options = { cwd: "/repo", mkdirSync, realpathSync };
+
+    expect(
+      canonicalizeMacosCargoTestTarget(["cargo", "test"], configured, {
+        ...options,
+        platform: "linux",
+      }),
+    ).toBe(configured);
+    expect(
+      canonicalizeMacosCargoTestTarget(["cargo", "test"], configured, {
+        ...options,
+        platform: "win32",
+      }),
+    ).toBe(configured);
+    expect(
+      canonicalizeMacosCargoTestTarget(["cargo", "check"], configured, {
+        ...options,
+        platform: "darwin",
+      }),
+    ).toBe(configured);
+    expect(
+      canonicalizeMacosCargoTestTarget(["vp", "test"], configured, {
+        ...options,
+        platform: "darwin",
+      }),
+    ).toBe(configured);
+    expect(
+      canonicalizeMacosCargoTestTarget(["cargo", "test"], { SENTINEL: "kept" }, {
+        ...options,
+        platform: "darwin",
+      }),
+    ).toEqual({ SENTINEL: "kept" });
+    expect(mkdirSync).not.toHaveBeenCalled();
+    expect(realpathSync).not.toHaveBeenCalled();
+  });
+
+  it("resolves relative macOS Cargo test targets against the launch directory", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn(() => "/canonical/repo/isolated-target");
+    const configured = { CARGO_TARGET_DIR: "isolated-target", SENTINEL: "kept" };
+
+    const canonical = canonicalizeMacosCargoTestTarget(["cargo", "test"], configured, {
+      platform: "darwin",
+      cwd: "/repo",
+      mkdirSync,
+      realpathSync,
+    });
+
+    expect(mkdirSync).toHaveBeenCalledWith("/repo/isolated-target", { recursive: true });
+    expect(realpathSync).toHaveBeenCalledWith("/repo/isolated-target");
+    expect(canonical).toEqual({
+      CARGO_TARGET_DIR: "/canonical/repo/isolated-target",
+      SENTINEL: "kept",
+    });
+    expect(configured.CARGO_TARGET_DIR).toBe("isolated-target");
   });
 
   it("writes, runs, and removes an MSVC wrapper even when cleanup fails", () => {
