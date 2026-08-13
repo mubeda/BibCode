@@ -907,6 +907,8 @@ struct SshChildReaperInner {
     active: AtomicUsize,
     capacity: Arc<Semaphore>,
     idle: Notify,
+    #[cfg(test)]
+    admitted: Notify,
     shutdown_sender: watch::Sender<bool>,
 }
 
@@ -926,6 +928,8 @@ impl SshChildReaper {
                 active: AtomicUsize::new(0),
                 capacity: Arc::new(Semaphore::new(SSH_CHILD_REAPER_CAPACITY)),
                 idle: Notify::new(),
+                #[cfg(test)]
+                admitted: Notify::new(),
                 shutdown_sender,
             }),
         }
@@ -942,6 +946,8 @@ impl SshChildReaper {
             .try_acquire_owned()
             .map_err(|_| "SSH process owner capacity was exceeded.".to_string())?;
         self.inner.active.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        self.inner.admitted.notify_waiters();
         let permit = SshChildReaperPermit {
             inner: self.inner.clone(),
             capacity: Some(capacity),
@@ -980,6 +986,19 @@ impl SshChildReaper {
     #[cfg(test)]
     fn active(&self) -> usize {
         self.inner.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    async fn wait_until_active(&self) {
+        loop {
+            let admitted = self.inner.admitted.notified();
+            tokio::pin!(admitted);
+            admitted.as_mut().enable();
+            if self.active() > 0 {
+                return;
+            }
+            admitted.await;
+        }
     }
 }
 
@@ -2401,11 +2420,10 @@ mod tests {
         let owner = tokio::spawn(async move {
             start_ssh_tunnel(&plan, &SshAuthOptions::batch(), launcher).await
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while manager.child_reaper.active() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.child_reaper.wait_until_active(),
+        )
         .await
         .expect("unpublished tunnel should reserve ownership before readiness");
 
