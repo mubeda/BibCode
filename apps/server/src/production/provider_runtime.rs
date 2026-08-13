@@ -10379,8 +10379,11 @@ lines.on("line", (line) => {
                 r#"const fs = require("node:fs");
 const readline = require("node:readline");
 const lines = readline.createInterface({ input: process.stdin });
-lines.on("line", (line) => {
-  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+	lines.on("line", (line) => {
+	  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+	  if (process.env.BIBCODE_TEST_REQUEST_READY) {
+	    fs.writeFileSync(process.env.BIBCODE_TEST_REQUEST_READY, "ready\n");
+	  }
   const timer = setInterval(() => {
     if (!fs.existsSync(process.env.BIBCODE_TEST_ACK_GATE)) return;
     clearInterval(timer);
@@ -10552,7 +10555,8 @@ done
     const CLAUDE_REPLAY_FIXTURE: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
-  while [ ! -f "$BIBCODE_TEST_ACK_GATE" ]; do sleep 0.01; done
+  [ -z "$BIBCODE_TEST_REQUEST_READY" ] || printf '%s\n' ready > "$BIBCODE_TEST_REQUEST_READY"
+  IFS= read -r _ < "$BIBCODE_TEST_ACK_GATE"
   printf '%s\n' "$line"
 done
 "#;
@@ -10595,6 +10599,7 @@ done
         fixture: &str,
         capture_path: &std::path::Path,
         acknowledgement_gate: Option<&std::path::Path>,
+        request_ready: Option<&std::path::Path>,
     ) -> Arc<super::ClaudeDriver> {
         let executable = executable_fixture(temp, name, fixture);
         let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
@@ -10608,6 +10613,12 @@ done
             request.environment.insert(
                 "BIBCODE_TEST_ACK_GATE".to_owned(),
                 gate.to_string_lossy().into_owned(),
+            );
+        }
+        if let Some(ready) = request_ready {
+            request.environment.insert(
+                "BIBCODE_TEST_REQUEST_READY".to_owned(),
+                ready.to_string_lossy().into_owned(),
             );
         }
         Arc::new(
@@ -10972,12 +10983,52 @@ done
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
         let acknowledgement_gate = temp.path().join("release-acknowledgement");
+        #[cfg(unix)]
+        let request_ready_path = temp.path().join("request-ready");
+        #[cfg(unix)]
+        let (request_ready, mut acknowledgement_writer) = {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            for path in [&request_ready_path, &acknowledgement_gate] {
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(path)
+                        .status()
+                        .expect("Claude delivery mkfifo starts")
+                        .success(),
+                    "Claude delivery FIFO is created"
+                );
+            }
+            let open_fifo = |path: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .expect("open Claude delivery FIFO without blocking")
+            };
+            (
+                tokio::io::unix::AsyncFd::new(open_fifo(&request_ready_path))
+                    .expect("register Claude delivery readiness FIFO"),
+                open_fifo(&acknowledgement_gate),
+            )
+        };
         let driver = claude_delivery_fixture(
             &temp,
             "claude-delivery-replay",
             CLAUDE_REPLAY_FIXTURE,
             &capture_path,
             Some(&acknowledgement_gate),
+            {
+                #[cfg(unix)]
+                {
+                    Some(request_ready_path.as_path())
+                }
+                #[cfg(windows)]
+                {
+                    None
+                }
+            },
         )
         .await;
         driver.start().await.expect("Claude fixture should start");
@@ -10992,10 +11043,41 @@ done
                 )
                 .await
         });
+        #[cfg(unix)]
+        timeout(Duration::from_secs(15), async {
+            use std::io::Read;
+
+            let mut bytes = [0_u8; 16];
+            loop {
+                let mut readable = request_ready
+                    .readable()
+                    .await
+                    .expect("Claude delivery readiness FIFO remains registered");
+                match readable.try_io(|inner| {
+                    let mut file = inner.get_ref();
+                    file.read(&mut bytes)
+                }) {
+                    Ok(Ok(count)) if count > 0 => break,
+                    Ok(Ok(_)) | Err(_) => continue,
+                    Ok(Err(error)) => panic!("read Claude delivery readiness FIFO: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Claude delivery request reaches the fixture");
+        #[cfg(windows)]
         captured_request(&capture_path, |value| value["type"] == "user").await;
 
         let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
         let was_pending = premature.is_err();
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            acknowledgement_writer
+                .write_all(b"release\n")
+                .expect("release acknowledgement");
+        }
+        #[cfg(windows)]
         std::fs::write(&acknowledgement_gate, b"release").expect("release acknowledgement");
         let outcome = match premature {
             Ok(outcome) => outcome.expect("delivery task should join"),
@@ -11025,6 +11107,7 @@ done
             "claude-delivery-disconnect",
             CLAUDE_DISCONNECT_FIXTURE,
             &capture_path,
+            None,
             None,
         )
         .await;
@@ -11063,6 +11146,7 @@ done
             "claude-context-query",
             CLAUDE_CONTEXT_QUERY_FIXTURE,
             &capture_path,
+            None,
             None,
         )
         .await;
