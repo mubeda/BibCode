@@ -18,6 +18,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -76,8 +77,9 @@ function snapshot(
   name = "Explore provider events",
   overrides: Partial<ActivitySnapshot> = {},
 ): ActivitySnapshot {
+  const snapshotScopeId = overrides.scopeId ?? SCOPE_ID;
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: SCOPE_ID,
     scope: SCOPE,
     revision,
@@ -89,6 +91,7 @@ function snapshot(
       backgroundWork: false,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: true,
     },
     observationState: "live",
     sections: {
@@ -117,6 +120,19 @@ function snapshot(
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: {
+      scopeId: snapshotScopeId,
+      revision: 5,
+      actors: [
+        {
+          actorId: ACTOR_ID,
+          state: "available",
+          controlRevision: 3,
+          activeDescendantCount: 0,
+        },
+      ],
+      operations: [],
+    },
     updatedAt: "2026-07-22T12:00:01Z",
     ...overrides,
   };
@@ -140,7 +156,7 @@ function gapDelta(previousRevision = 5, revision = 6): ActivityDelta {
   };
 }
 
-function serverConfig(protocolVersion: 1 | null): ServerConfig {
+function serverConfig(protocolVersion: number | null): ServerConfig {
   return {
     environment: {
       capabilities: {
@@ -152,7 +168,7 @@ function serverConfig(protocolVersion: 1 | null): ServerConfig {
 
 function testSession(
   client: WsRpcProtocolClient,
-  protocolVersion: 1 | null = 1,
+  protocolVersion: number | null = 2,
   initialConfig: Effect.Effect<ServerConfig, ConnectionTransientError> = Effect.succeed(
     serverConfig(protocolVersion),
   ),
@@ -180,7 +196,7 @@ function awaitState(
 }
 
 interface HarnessOptions {
-  readonly protocolVersion?: 1 | null;
+  readonly protocolVersion?: number | null;
   readonly initialConfig?: Effect.Effect<ServerConfig, ConnectionTransientError>;
   readonly getSnapshot?: (
     requestNumber: number,
@@ -230,7 +246,7 @@ const makeHarnessCore = Effect.fn("TestEnvironmentActivity.makeHarnessCore")(fun
   const initialConfig =
     options.initialConfig ??
     Effect.succeed(
-      serverConfig(options.protocolVersion === undefined ? 1 : options.protocolVersion),
+      serverConfig(options.protocolVersion === undefined ? 2 : options.protocolVersion),
     );
   const supervisorState = yield* SubscriptionRef.make<SupervisorConnectionState>({
     ...AVAILABLE_CONNECTION_STATE,
@@ -264,7 +280,7 @@ const makeHarnessCore = Effect.fn("TestEnvironmentActivity.makeHarnessCore")(fun
     supervisorSession,
     reconnect: SubscriptionRef.set(
       supervisorSession,
-      Option.some(testSession(client, 1, Effect.succeed(serverConfig(1)))),
+      Option.some(testSession(client, 2, Effect.succeed(serverConfig(2)))),
     ),
   };
 });
@@ -363,7 +379,390 @@ describe("environment activity stream state", () => {
       );
 
       expect(Option.getOrThrow(live.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(live.snapshot).control.revision).toBe(5);
       expect(Option.isNone(live.error)).toBe(true);
+    }),
+  );
+
+  it.effect("rejects combined snapshots whose control scope does not match observation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(3, "Rejected initial", {
+          control: {
+            ...snapshot().control,
+            scopeId: REPLACEMENT_SCOPE_ID,
+          },
+        }),
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      expect(Option.isNone((yield* SubscriptionRef.get(harness.state)).snapshot)).toBe(true);
+
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(4, "Rejected replacement", {
+          control: {
+            ...snapshot().control,
+            scopeId: REPLACEMENT_SCOPE_ID,
+            revision: 8,
+          },
+        }),
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Explore provider events");
+      expect(Option.getOrThrow(retained.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(retained.snapshot).control.revision).toBe(5);
+    }),
+  );
+
+  it.effect("rejects a cross-scope control snapshot returned by recovery", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Deferred.succeed(
+        recovery,
+        snapshot(6, "Rejected recovery", {
+          control: { ...snapshot().control, scopeId: REPLACEMENT_SCOPE_ID, revision: 8 },
+        }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(retained.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(retained.snapshot).control.revision).toBe(5);
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Explore provider events");
+    }),
+  );
+
+  it.effect("ignores feature-disabled from a recovery superseded by stream progress", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Queue.offer(harness.inputs, {
+        kind: "delta",
+        delta: {
+          ...gapDelta(3, 4),
+          changes: [
+            {
+              kind: "actor-upserted",
+              actor: { ...snapshot().actors[0]!, name: "Newer progress" },
+            },
+          ],
+        },
+      });
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 4,
+      );
+      yield* Deferred.fail(
+        recovery,
+        new ActivityError({ reason: "featureDisabled", message: "Late disabled result." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Newer progress");
+      expect(yield* Ref.get(harness.streamFinalizerCount)).toBe(0);
+    }),
+  );
+
+  it.effect("ignores feature-disabled from a recovery owned by a replaced session", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* harness.reconnect;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(7, "New session"),
+      });
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 7,
+      );
+      yield* Deferred.fail(
+        recovery,
+        new ActivityError({ reason: "featureDisabled", message: "Old session disabled." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("New session");
+    }),
+  );
+
+  it.effect("ignores a feature-disabled failure from a replaced subscription", () =>
+    Effect.gen(function* () {
+      const oldFailure = yield* Deferred.make<ActivityStreamItem, ActivityError>();
+      const harness = yield* makeHarness({
+        streamForSubscription: (subscription) =>
+          subscription === 1
+            ? Stream.fromEffect(Deferred.await(oldFailure))
+            : Stream.concat(
+                Stream.fromIterable([
+                  { kind: "snapshot" as const, snapshot: snapshot(8, "Replacement stream") },
+                ]),
+                Stream.never,
+              ),
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* harness.reconnect;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 8,
+      );
+      yield* Deferred.fail(
+        oldFailure,
+        new ActivityError({ reason: "featureDisabled", message: "Old stream disabled." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Replacement stream");
+    }),
+  );
+
+  it.effect("applies control stream items independently from observation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "control-snapshot",
+        control: {
+          scopeId: SCOPE_ID,
+          revision: 9,
+          actors: [
+            {
+              actorId: ACTOR_ID,
+              state: "requested",
+              controlRevision: 4,
+              activeDescendantCount: 0,
+            },
+          ],
+          operations: [],
+        },
+      });
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.control.revision === 9,
+      );
+      yield* Queue.offer(harness.inputs, {
+        kind: "delta",
+        delta: {
+          scopeId: SCOPE_ID,
+          previousRevision: 3,
+          revision: 4,
+          changes: [
+            {
+              kind: "actor-upserted",
+              actor: { ...snapshot().actors[0]!, name: "Observed independently" },
+            },
+          ],
+          updatedAt: "2026-07-22T12:00:02Z",
+        },
+      });
+      yield* Queue.offer(harness.inputs, {
+        kind: "control-delta",
+        delta: {
+          scopeId: SCOPE_ID,
+          previousRevision: 9,
+          revision: 10,
+          changes: [
+            {
+              kind: "operation-upserted",
+              operation: {
+                rootActorId: ACTOR_ID,
+                state: "partial",
+                residualCount: 1,
+                message: "One child is still active.",
+                operationRevision: 6,
+              },
+            },
+          ],
+        },
+      });
+      const current = yield* awaitState(
+        harness.state,
+        (state) =>
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.revision === 4 &&
+          state.snapshot.value.control.revision === 10,
+      );
+      const currentSnapshot = Option.getOrThrow(current.snapshot);
+      expect(currentSnapshot.actors[0]?.name).toBe("Observed independently");
+      expect(currentSnapshot.control.actors[0]?.state).toBe("requested");
+      expect(currentSnapshot.control.operations[0]?.state).toBe("partial");
+    }),
+  );
+
+  it.effect("recovers only after a control gap while retaining observation", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "control-delta",
+        delta: {
+          scopeId: SCOPE_ID,
+          previousRevision: 8,
+          revision: 9,
+          changes: [{ kind: "actor-removed", actorId: ACTOR_ID }],
+        },
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      const duringRecovery = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(duringRecovery.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(duringRecovery.snapshot).actors[0]?.name).toBe(
+        "Explore provider events",
+      );
+      expect(Option.getOrThrow(duringRecovery.snapshot).control.revision).toBe(5);
+
+      yield* Queue.offer(harness.inputs, {
+        kind: "delta",
+        delta: {
+          scopeId: SCOPE_ID,
+          previousRevision: 3,
+          revision: 4,
+          changes: [
+            {
+              kind: "actor-upserted",
+              actor: { ...snapshot().actors[0]!, name: "Observation progressed" },
+            },
+          ],
+          updatedAt: "2026-07-22T12:00:03Z",
+        },
+      });
+      const progressed = yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 4,
+      );
+      expect(progressed.status).toBe("stale");
+      expect(Option.getOrThrow(progressed.snapshot).control.revision).toBe(5);
+
+      yield* Deferred.succeed(
+        recovery,
+        snapshot(3, "Recovered observation", {
+          control: {
+            scopeId: SCOPE_ID,
+            revision: 9,
+            actors: [],
+            operations: [],
+          },
+        }),
+      );
+      const recovered = yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.control.revision === 9,
+      );
+      expect(Option.getOrThrow(recovered.snapshot).revision).toBe(4);
+      expect(Option.getOrThrow(recovered.snapshot).actors[0]?.name).toBe("Observation progressed");
+    }),
+  );
+
+  it.effect("ignores cross-scope control items without requesting recovery", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "control-snapshot",
+        control: {
+          scopeId: REPLACEMENT_SCOPE_ID,
+          revision: 99,
+          actors: [],
+          operations: [],
+        },
+      });
+      yield* Queue.offer(harness.inputs, {
+        kind: "control-delta",
+        delta: {
+          scopeId: REPLACEMENT_SCOPE_ID,
+          previousRevision: 99,
+          revision: 100,
+          changes: [{ kind: "actor-removed", actorId: ACTOR_ID }],
+        },
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const current = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(current.snapshot).control.revision).toBe(5);
+      expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(0);
+    }),
+  );
+
+  it.effect("atomically replaces observation and control in a combined snapshot", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(4, "Replacement", {
+          control: {
+            scopeId: SCOPE_ID,
+            revision: 12,
+            actors: [],
+            operations: [
+              {
+                rootActorId: ACTOR_ID,
+                state: "partial",
+                residualCount: 1,
+                message: null,
+                operationRevision: 7,
+              },
+            ],
+          },
+        }),
+      });
+      const replaced = yield* awaitState(
+        harness.state,
+        (state) =>
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.revision === 4 &&
+          state.snapshot.value.control.revision === 12,
+      );
+      expect(Option.getOrThrow(replaced.snapshot).actors[0]?.name).toBe("Replacement");
+      expect(Option.getOrThrow(replaced.snapshot).control.operations[0]?.state).toBe("partial");
     }),
   );
 
@@ -403,6 +802,70 @@ describe("environment activity stream state", () => {
       }
 
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+    }),
+  );
+
+  it.effect("restores requested controls and partial operations after reconnect", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        ...AVAILABLE_CONNECTION_STATE,
+        desired: true,
+        network: "offline",
+        phase: "offline",
+        generation: 1,
+      } satisfies SupervisorConnectionState);
+      yield* awaitState(harness.state, (state) => state.status === "stale");
+      yield* harness.reconnect;
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        ...AVAILABLE_CONNECTION_STATE,
+        desired: true,
+        network: "online",
+        phase: "connected",
+        generation: 2,
+      } satisfies SupervisorConnectionState);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(4, "Reconnected", {
+          control: {
+            scopeId: SCOPE_ID,
+            revision: 8,
+            actors: [
+              {
+                actorId: ACTOR_ID,
+                state: "requested",
+                controlRevision: 4,
+                activeDescendantCount: 0,
+              },
+            ],
+            operations: [
+              {
+                rootActorId: ACTOR_ID,
+                state: "partial",
+                residualCount: 1,
+                message: "One actor remains.",
+                operationRevision: 6,
+              },
+            ],
+          },
+        }),
+      });
+      const restored = yield* awaitState(
+        harness.state,
+        (state) =>
+          state.status === "live" &&
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.control.revision === 8,
+      );
+      expect(Option.getOrThrow(restored.snapshot).control.actors[0]?.state).toBe("requested");
+      expect(Option.getOrThrow(restored.snapshot).control.operations[0]?.state).toBe("partial");
     }),
   );
 
@@ -814,15 +1277,14 @@ describe("environment activity stream state", () => {
 
   it.effect("does not subscribe when the activity protocol is unsupported", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ protocolVersion: null });
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        yield* Effect.yieldNow;
+      for (const protocolVersion of [1, null, 3] as const) {
+        const harness = yield* makeHarness({ protocolVersion });
+        for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+        const current = yield* SubscriptionRef.get(harness.state);
+        expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
+        expect(current.status).toBe("empty");
+        expect(Option.isNone(current.error)).toBe(true);
       }
-
-      const current = yield* SubscriptionRef.get(harness.state);
-      expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
-      expect(current.status).toBe("empty");
-      expect(Option.isNone(current.error)).toBe(true);
     }),
   );
 
@@ -930,7 +1392,7 @@ describe("environment activity stream state", () => {
       } as unknown as WsRpcProtocolClient;
       yield* SubscriptionRef.set(
         harness.supervisorSession,
-        Option.some(testSession(replacementClient, 1)),
+        Option.some(testSession(replacementClient, 2)),
       );
       for (let attempt = 0; attempt < 100; attempt += 1) {
         if ((yield* Ref.get(replacementSubscriptions)) === 1) {
@@ -988,6 +1450,230 @@ describe("environment activity stream state", () => {
 });
 
 describe("createEnvironmentActivityAtoms", () => {
+  it.effect("single-flights cancellation commands by canonical target and revision", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly method: string; readonly input: unknown }> = [];
+      const cancelLatch = Latch.makeUnsafe();
+      const retryLatch = Latch.makeUnsafe();
+      const otherActorId = ActivityRecordId.make("actor:child-2");
+      const otherEnvironmentId = EnvironmentId.make("environment-2");
+      const client = {
+        [WS_METHODS.activityCancelSubtree]: (input: unknown) =>
+          Effect.sync(() => calls.push({ method: WS_METHODS.activityCancelSubtree, input })).pipe(
+            Effect.andThen(cancelLatch.await),
+            Effect.as({
+              disposition: "accepted" as const,
+              rootActorId: ACTOR_ID,
+              operationRevision: 6,
+            }),
+          ),
+        [WS_METHODS.activityRetrySubtreeCancellation]: (input: unknown) =>
+          Effect.sync(() =>
+            calls.push({ method: WS_METHODS.activityRetrySubtreeCancellation, input }),
+          ).pipe(
+            Effect.andThen(retryLatch.await),
+            Effect.as({
+              disposition: "inProgress" as const,
+              rootActorId: ACTOR_ID,
+              operationRevision: 7,
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const session = yield* SubscriptionRef.make(
+        Option.some({ client } as unknown as RpcSession.RpcSession),
+      );
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        session,
+      } as never);
+      const selectedEnvironments: string[] = [];
+      const run: EnvironmentRegistry["Service"]["run"] = (environmentId, effect) => {
+        selectedEnvironments.push(environmentId);
+        return Effect.provideService(
+          effect,
+          EnvironmentSupervisor.EnvironmentSupervisor,
+          supervisor,
+        );
+      };
+      const environmentRegistry = EnvironmentRegistry.of({ run } as never);
+      const activity = createEnvironmentActivityAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+      );
+      const atomRegistry = AtomRegistry.make();
+      const cancelInput = {
+        scope: SCOPE,
+        scopeId: SCOPE_ID,
+        actorId: ACTOR_ID,
+        expectedControlRevision: 3,
+      };
+      const duplicateCancel = {
+        ...cancelInput,
+        expectedControlRevision: 99,
+      };
+      const otherCancel = {
+        ...cancelInput,
+        actorId: otherActorId,
+      };
+
+      const firstCancel = activity.cancelSubtree.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: cancelInput,
+      });
+      const secondCancel = activity.cancelSubtree.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: duplicateCancel,
+      });
+      const independentCancel = activity.cancelSubtree.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: otherCancel,
+      });
+      const otherEnvironmentCancel = activity.cancelSubtree.run(atomRegistry, {
+        environmentId: otherEnvironmentId,
+        input: cancelInput,
+      });
+      for (let attempt = 0; attempt < 100 && calls.length < 3; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(calls).toEqual([
+        { method: "activity.cancelSubtree", input: cancelInput },
+        { method: "activity.cancelSubtree", input: otherCancel },
+        { method: "activity.cancelSubtree", input: cancelInput },
+      ]);
+      cancelLatch.openUnsafe();
+      yield* Effect.promise(() =>
+        Promise.all([firstCancel, secondCancel, independentCancel, otherEnvironmentCancel]),
+      );
+      yield* Effect.promise(() =>
+        activity.cancelSubtree.run(atomRegistry, {
+          environmentId: ENVIRONMENT_ID,
+          input: cancelInput,
+        }),
+      );
+      expect(calls[3]).toEqual({ method: "activity.cancelSubtree", input: cancelInput });
+
+      const retryInput = {
+        scope: SCOPE,
+        scopeId: SCOPE_ID,
+        rootActorId: ACTOR_ID,
+        expectedOperationRevision: 6,
+      };
+      const firstRetry = activity.retrySubtreeCancellation.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: retryInput,
+      });
+      const duplicateRetry = activity.retrySubtreeCancellation.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { ...retryInput },
+      });
+      const independentRetry = activity.retrySubtreeCancellation.run(atomRegistry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { ...retryInput, expectedOperationRevision: 7 },
+      });
+      for (let attempt = 0; attempt < 100 && calls.length < 6; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(calls.slice(4)).toEqual([
+        { method: "activity.retrySubtreeCancellation", input: retryInput },
+        {
+          method: "activity.retrySubtreeCancellation",
+          input: { ...retryInput, expectedOperationRevision: 7 },
+        },
+      ]);
+      retryLatch.openUnsafe();
+      yield* Effect.promise(() => Promise.all([firstRetry, duplicateRetry, independentRetry]));
+
+      expect(selectedEnvironments).toEqual([
+        ENVIRONMENT_ID,
+        ENVIRONMENT_ID,
+        otherEnvironmentId,
+        ENVIRONMENT_ID,
+        ENVIRONMENT_ID,
+        ENVIRONMENT_ID,
+      ]);
+      atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("keeps streamed control authoritative when a cancellation command fails", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarnessCore();
+      let attempts = 0;
+      Object.assign(harness.client as object, {
+        [WS_METHODS.activityCancelSubtree]: () =>
+          Effect.sync(() => {
+            attempts += 1;
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ActivityError({
+                  reason: "providerUnavailable",
+                  message: "Targeted cancellation is temporarily unavailable.",
+                }),
+              ),
+            ),
+          ),
+      });
+      const run: EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+        Effect.provideService(
+          effect,
+          EnvironmentSupervisor.EnvironmentSupervisor,
+          harness.supervisor,
+        );
+      const environmentRegistry = EnvironmentRegistry.of({
+        followStream: (_environmentId: EnvironmentId, stream: Stream.Stream<unknown, unknown>) =>
+          Stream.provideService(
+            stream,
+            EnvironmentSupervisor.EnvironmentSupervisor,
+            harness.supervisor,
+          ),
+        run,
+      } as never);
+      const activity = createEnvironmentActivityAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+      );
+      const atomRegistry = AtomRegistry.make();
+      const stateValueAtom = activity.stateValueAtom({
+        environmentId: ENVIRONMENT_ID,
+        input: SCOPE,
+      });
+      const unsubscribe = atomRegistry.subscribe(stateValueAtom, () => undefined, {
+        immediate: true,
+      });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (atomRegistry.get(stateValueAtom).status === "live") break;
+        yield* Effect.yieldNow;
+      }
+      const input = {
+        scope: SCOPE,
+        scopeId: SCOPE_ID,
+        actorId: ACTOR_ID,
+        expectedControlRevision: 3,
+      };
+      const first = yield* Effect.promise(() =>
+        activity.cancelSubtree.run(atomRegistry, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+      const second = yield* Effect.promise(() =>
+        activity.cancelSubtree.run(atomRegistry, {
+          environmentId: ENVIRONMENT_ID,
+          input,
+        }),
+      );
+
+      expect(first._tag).toBe("Failure");
+      expect(second._tag).toBe("Failure");
+      expect(attempts).toBe(2);
+      expect(
+        Option.getOrThrow(atomRegistry.get(stateValueAtom).snapshot).control.actors[0]?.state,
+      ).toBe("available");
+      unsubscribe();
+      atomRegistry.dispose();
+    }),
+  );
+
   it.effect(
     "finalizes and starts a fresh subscription when the same target is disabled and re-enabled",
     () =>

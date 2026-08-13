@@ -525,14 +525,56 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        activity::ProviderActivityMutation,
-        production::provider_runtime::{ProviderEvent, ProviderNativeEventId},
+        activity::{
+            ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
+        },
+        production::provider_runtime::{
+            ProviderActivityControls, ProviderEvent, ProviderNativeEventId,
+        },
         terminal::{TerminalEvent, TerminalSessionSnapshot, TerminalStatus},
     };
 
     use super::{
         BoundedNdjsonWriter, OperationalLogOptions, ProviderOperationalLog, TerminalOperationalLog,
     };
+
+    #[tokio::test]
+    async fn targeted_activity_native_targets_never_enter_provider_logs_or_debug_output() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let path = temp.path().join("events.log");
+        let log = ProviderOperationalLog::start(path.clone(), OperationalLogOptions::default())
+            .await
+            .expect("provider log starts");
+        let event = ProviderEvent {
+            native_event_id: None,
+            event_type: "activity.native".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: None,
+            item_id: None,
+            request_id: None,
+            payload: json!({}),
+            activity: Vec::new(),
+            activity_controls: ProviderActivityControls::from_updates(vec![
+                ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-1".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "PRIVATE_NATIVE_THREAD".to_owned(),
+                        "PRIVATE_NATIVE_TURN".to_owned(),
+                    )),
+                },
+            ]),
+        };
+
+        assert!(log.record(&event));
+        let debug = format!("{event:?}");
+        log.shutdown().await.expect("provider log shuts down");
+        let contents = std::fs::read_to_string(path).expect("read provider log");
+
+        for native_value in ["PRIVATE_NATIVE_THREAD", "PRIVATE_NATIVE_TURN"] {
+            assert!(!debug.contains(native_value));
+            assert!(!contents.contains(native_value));
+        }
+    }
 
     #[tokio::test]
     async fn terminal_output_records_never_persist_output_data() {
@@ -767,6 +809,7 @@ mod tests {
                 )
                 .expect("valid activity mutation"),
             ],
+            activity_controls: Default::default(),
         }));
         log.shutdown().await.expect("provider log shuts down");
 
@@ -857,6 +900,7 @@ mod tests {
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
+            activity_controls: Default::default(),
         }));
         log.shutdown().await.expect("provider log shuts down");
 

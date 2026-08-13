@@ -1011,6 +1011,7 @@ async fn process_claude_hook(
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: true,
+            targeted_actor_cancellation: false,
         };
         if !inner.activity.admission_is_current(&admission) {
             return StatusCode::NO_CONTENT;
@@ -1116,6 +1117,7 @@ async fn process_claude_hook(
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::Bounded,
                     terminal_observation: true,
+                    targeted_actor_cancellation: false,
                 },
                 observation_state: ActivityObservationState::Live,
             });

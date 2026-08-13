@@ -14,10 +14,13 @@ use std::{
 
 use crate::{
     activity::{
-        ACTIVITY_ID_MAX_LENGTH, ActivityCapabilities, ActivityHistoryRecovery,
-        ActivityObservationState, ActivityProjection, ActivityRepositoryError, ActivityScopeRef,
-        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
-        AgentActivityController, ProviderActivityMutation,
+        ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
+        ActivityCancellationService, ActivityCapabilities, ActivityDispatchError,
+        ActivityDispatchJob, ActivityHistoryRecovery, ActivityObservationState, ActivityProjection,
+        ActivityRepositoryError, ActivityRuntimeControlRegistration, ActivityRuntimeGeneration,
+        ActivityScopeRef, ActivityScopeSeed, ActivitySection, ActivitySectionHealth,
+        ActivitySummaryCounts, ActivityTargetDispatchDisposition, AgentActivityController,
+        ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -96,6 +99,7 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
+const CLAUDE_CONTROL_RESPONSE_CAPACITY: usize = 128;
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVITY_ONLY_PROVIDER_EVENT_TYPE: &str = "activity.native";
 const DELIVERY_ROUTE_FINGERPRINT_FIELD: &str = "_bibcodeProviderRouteFingerprint";
@@ -206,6 +210,39 @@ pub struct ProviderEvent {
     pub request_id: Option<String>,
     pub payload: Value,
     pub activity: Vec<ProviderActivityMutation>,
+    pub activity_controls: ProviderActivityControls,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ProviderActivityControls(Vec<ProviderActivityControlUpdate>);
+
+impl ProviderActivityControls {
+    fn take(&mut self) -> Vec<ProviderActivityControlUpdate> {
+        std::mem::take(&mut self.0)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn from_updates(updates: Vec<ProviderActivityControlUpdate>) -> Self {
+        Self(updates)
+    }
+}
+
+impl std::fmt::Debug for ProviderActivityControls {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderActivityControls")
+            .field("update_count", &self.0.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -298,6 +335,21 @@ pub trait ProviderDriver: Send + Sync {
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async { Ok(()) })
     }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        debug_assert!(
+            target.codex_turn_ids().is_some() || target.claude_task_id().is_some(),
+            "provider-native activity targets have a recognized private shape"
+        );
+        Box::pin(async {
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "activity".to_owned(),
+                capability: "targeted activity cancellation",
+            })
+        })
+    }
     fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn reapply_options_on_model_change(&self) -> bool {
         false
@@ -356,6 +408,8 @@ pub enum ProviderRuntimeError {
         provider: String,
         capability: &'static str,
     },
+    #[error("provider {provider} does not support targeted activity cancellation in this runtime")]
+    ActivityTargetUnsupported { provider: String },
     #[error("failed to spawn {provider} provider process: {detail}")]
     Spawn { provider: String, detail: String },
     #[error("{provider} provider operation failed: {detail}")]
@@ -372,6 +426,7 @@ pub struct ProviderRuntimeSupervisor {
     stopped: CancellationToken,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 }
 
 enum SupervisorMessage {
@@ -397,6 +452,22 @@ enum SupervisorMessage {
         enabled: bool,
         response: oneshot::Sender<Result<usize, ProviderRuntimeError>>,
     },
+    CancelActivityTarget {
+        scope: ActivityScopeRef,
+        generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
+        response: oneshot::Sender<Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>>,
+    },
+    InvalidateActivityControls {
+        thread_id: String,
+        generation: ActivityRuntimeGeneration,
+        response: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    InspectActivityRuntimeGeneration {
+        thread_id: String,
+        response: oneshot::Sender<Option<ActivityRuntimeGeneration>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
@@ -414,6 +485,40 @@ enum SupervisorMessage {
         idle_generation: Arc<AtomicU64>,
         generation: u64,
     },
+    ActivityDispatchTaskComplete {
+        thread_id: String,
+        generation: ActivityRuntimeGeneration,
+        task_id: ActivityDispatchTaskId,
+    },
+    ActivityTargetUnsupported {
+        thread_id: String,
+        generation: ActivityRuntimeGeneration,
+        response: oneshot::Sender<Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>>,
+        provider: String,
+    },
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct ActivityDispatchTaskId(u64);
+
+struct ActivityDispatchEnvelope {
+    thread_id: String,
+    generation: ActivityRuntimeGeneration,
+    jobs: Vec<ActivityDispatchJob>,
+}
+
+enum SupervisorInput {
+    Control(SupervisorMessage),
+    Activity(ActivityDispatchEnvelope),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ActivityDispatchCompletionTestHook {
+    hold_before_return: Arc<AtomicBool>,
+    sent: Arc<tokio::sync::Notify>,
+    received: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 struct SessionEntry {
@@ -423,12 +528,22 @@ struct SessionEntry {
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     activity_capable: bool,
+    activity_runtime_generation: ActivityRuntimeGeneration,
+    activity_dispatch_cancellation: CancellationToken,
+    activity_dispatch_tasks: Vec<JoinHandle<()>>,
+    activity_late_dispatch_cancellation: CancellationToken,
+    activity_late_dispatch_tasks: HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    next_activity_late_dispatch_task_id: u64,
+    activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     activity_lifecycle: SharedActivityLifecycle,
     activity_compensation_key: String,
     event_task: JoinHandle<()>,
     event_cancellation: CancellationToken,
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    activity_dispatch_capacity: usize,
     idle_timeout: Duration,
 }
 
@@ -554,6 +669,12 @@ impl ProviderActivityLifecycleState {
             self.runtime_observed_capabilities = true;
         }
     }
+
+    fn downgrade_targeted_actor_cancellation(&mut self) -> ActivityCapabilities {
+        self.capabilities.targeted_actor_cancellation = false;
+        self.runtime_observed_capabilities = true;
+        self.capabilities.clone()
+    }
 }
 
 impl ProviderRuntimeSupervisor {
@@ -564,7 +685,15 @@ impl ProviderRuntimeSupervisor {
         activity: ActivityProjection,
         options: SupervisorOptions,
     ) -> Self {
-        Self::start_inner(engine, factory, activity, options, None)
+        Self::start_inner(
+            engine,
+            factory,
+            activity,
+            options,
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[must_use]
@@ -575,7 +704,15 @@ impl ProviderRuntimeSupervisor {
         options: SupervisorOptions,
         operational_log: ProviderOperationalLog,
     ) -> Self {
-        Self::start_inner(engine, factory, activity, options, Some(operational_log))
+        Self::start_inner(
+            engine,
+            factory,
+            activity,
+            options,
+            Some(operational_log),
+            #[cfg(test)]
+            None,
+        )
     }
 
     fn start_inner(
@@ -584,14 +721,18 @@ impl ProviderRuntimeSupervisor {
         activity: ActivityProjection,
         options: SupervisorOptions,
         operational_log: Option<ProviderOperationalLog>,
+        #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
         let session_idle_timeout = options.session_idle_timeout;
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
+        let (activity_dispatch_sender, activity_dispatch_receiver) = mpsc::channel(queue_capacity);
         let stopped = CancellationToken::new();
         let worker_stopped = stopped.clone();
         let worker_sender = sender.clone();
+        let activity_cancellation = Arc::new(RwLock::new(None));
+        let worker_activity_cancellation = activity_cancellation.clone();
         let worker = tokio::spawn(async move {
             run_supervisor(
                 engine,
@@ -601,10 +742,15 @@ impl ProviderRuntimeSupervisor {
                 worker_sender,
                 terminal_sender,
                 terminal_receiver,
+                activity_dispatch_sender,
+                activity_dispatch_receiver,
                 queue_capacity,
                 session_idle_timeout,
                 worker_stopped,
                 operational_log,
+                worker_activity_cancellation,
+                #[cfg(test)]
+                activity_dispatch_completion_hook,
             )
             .await;
         });
@@ -613,7 +759,12 @@ impl ProviderRuntimeSupervisor {
             stopped,
             worker: Arc::new(Mutex::new(Some(worker))),
             connect_mcp: Arc::new(RwLock::new(None)),
+            activity_cancellation,
         }
+    }
+
+    pub(crate) async fn attach_activity_cancellation(&self, service: ActivityCancellationService) {
+        *self.activity_cancellation.write().await = Some(service);
     }
 
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
@@ -758,6 +909,7 @@ impl ProviderRuntimeSupervisor {
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
         }
+        self.activity_cancellation.write().await.take();
         result
     }
 
@@ -776,6 +928,67 @@ impl ProviderRuntimeSupervisor {
         response_rx
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn activity_runtime_generation(
+        &self,
+        thread_id: &str,
+    ) -> Option<ActivityRuntimeGeneration> {
+        if self.stopped.is_cancelled() {
+            return None;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::InspectActivityRuntimeGeneration {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .await
+            .ok()?;
+        response_rx.await.ok().flatten()
+    }
+}
+
+impl ActivityCancellationDispatcher for ProviderRuntimeSupervisor {
+    fn cancel_target(
+        &self,
+        scope: ActivityScopeRef,
+        generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<ActivityTargetDispatchDisposition, ActivityDispatchError>,
+    > {
+        let supervisor = self.clone();
+        Box::pin(async move {
+            if supervisor.stopped.is_cancelled() {
+                return Err(ActivityDispatchError::ProviderUnavailable);
+            }
+            let (response_tx, response_rx) = oneshot::channel();
+            supervisor
+                .sender
+                .send(SupervisorMessage::CancelActivityTarget {
+                    scope,
+                    generation,
+                    target,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| ActivityDispatchError::ProviderUnavailable)?;
+            response_rx
+                .await
+                .map_err(|_| ActivityDispatchError::ProviderUnavailable)?
+                .map_err(|error| match error {
+                    ProviderRuntimeError::SessionNotFound { .. }
+                    | ProviderRuntimeError::StaleSession { .. }
+                    | ProviderRuntimeError::UnsupportedCapability { .. }
+                    | ProviderRuntimeError::ActivityTargetUnsupported { .. } => {
+                        ActivityDispatchError::TargetUnavailable
+                    }
+                    _ => ActivityDispatchError::ProviderUnavailable,
+                })
+        })
     }
 }
 
@@ -1827,24 +2040,53 @@ async fn run_supervisor(
     sender: mpsc::Sender<SupervisorMessage>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     mut terminal_receiver: mpsc::UnboundedReceiver<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    mut activity_dispatch_receiver: mpsc::Receiver<ActivityDispatchEnvelope>,
     deferred_capacity: usize,
     session_idle_timeout: Duration,
     stopped: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
+    #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
     let mut next_delivery_generation = 0_u64;
     let mut deferred_configuration = DeferredConfigurations::new();
     loop {
-        let message = tokio::select! {
+        let activity_task_count = sessions
+            .values()
+            .map(|entry| entry.activity_late_dispatch_tasks.len())
+            .sum::<usize>();
+        let input = tokio::select! {
+            biased;
+            message = terminal_receiver.recv(), if !terminal_receiver.is_closed() => {
+                let Some(message) = message else { continue };
+                SupervisorInput::Control(message)
+            }
             message = receiver.recv() => {
                 let Some(message) = message else { break };
-                message
+                SupervisorInput::Control(message)
             }
-            message = terminal_receiver.recv() => {
-                let Some(message) = message else { continue };
-                message
+            envelope = activity_dispatch_receiver.recv(),
+                if activity_task_count < deferred_capacity => {
+                let Some(envelope) = envelope else { continue };
+                SupervisorInput::Activity(envelope)
+            }
+        };
+        let message = match input {
+            SupervisorInput::Control(message) => message,
+            SupervisorInput::Activity(envelope) => {
+                dispatch_activity_envelope(
+                    &activity,
+                    &mut sessions,
+                    envelope,
+                    terminal_sender.clone(),
+                    #[cfg(test)]
+                    activity_dispatch_completion_hook.clone(),
+                )
+                .await;
+                continue;
             }
         };
         match message {
@@ -1858,7 +2100,10 @@ async fn run_supervisor(
                     operational_log.as_ref(),
                     None,
                     terminal_sender.clone(),
+                    activity_dispatch_sender.clone(),
+                    deferred_capacity,
                     session_idle_timeout,
+                    activity_cancellation.clone(),
                 )
                 .await;
                 let _ = response.send(result);
@@ -1992,8 +2237,186 @@ async fn run_supervisor(
                 }
             }
             SupervisorMessage::SetAgentActivityEnabled { enabled, response } => {
-                let result = set_live_agent_activity_enabled(&activity, &sessions, enabled).await;
+                let result =
+                    set_live_agent_activity_enabled(&activity, &mut sessions, enabled).await;
                 let _ = response.send(result);
+            }
+            SupervisorMessage::CancelActivityTarget {
+                scope,
+                generation,
+                target,
+                response,
+            } => {
+                let activity_enabled = activity.agent_activity_controller().snapshot().enabled;
+                let result = match scope {
+                    ActivityScopeRef::Thread { thread_id } => {
+                        if let Some(entry) = sessions.get_mut(&thread_id) {
+                            reap_completed_activity_tasks(&mut entry.activity_dispatch_tasks).await;
+                            let control_current = entry.activity_control.read().await.is_some();
+                            if !activity_enabled
+                                || !control_current
+                                || entry.activity_runtime_generation != generation
+                                || !entry.configuration_healthy
+                            {
+                                Err(ProviderRuntimeError::StaleSession {
+                                    thread_id,
+                                    action: "targeted activity cancellation".to_owned(),
+                                })
+                            } else {
+                                Ok((
+                                    entry.driver.clone(),
+                                    entry.activity_dispatch_cancellation.clone(),
+                                    entry.launch.thread_id.clone(),
+                                    entry.terminal_sender.clone(),
+                                    entry.activity_runtime_generation.clone(),
+                                ))
+                            }
+                        } else {
+                            Err(ProviderRuntimeError::SessionNotFound { thread_id })
+                        }
+                    }
+                    ActivityScopeRef::Terminal { thread_id, .. } => {
+                        Err(ProviderRuntimeError::StaleSession {
+                            thread_id,
+                            action: "targeted activity cancellation".to_owned(),
+                        })
+                    }
+                };
+                match result {
+                    Ok((driver, dispatch_cancellation, thread_id, terminal_sender, generation)) => {
+                        let task_thread_id = thread_id.clone();
+                        let task = tokio::spawn(async move {
+                            let mut response = response;
+                            tokio::select! {
+                                biased;
+                                () = response.closed() => {}
+                                () = dispatch_cancellation.cancelled() => {
+                                    let _ = response.send(Err(ProviderRuntimeError::StaleSession {
+                                        thread_id: task_thread_id,
+                                        action: "targeted activity cancellation".to_owned(),
+                                    }));
+                                }
+                                result = driver.cancel_activity_target(target) => {
+                                    match result {
+                                        Err(ProviderRuntimeError::ActivityTargetUnsupported { provider }) => {
+                                            let _ = terminal_sender.send(
+                                                SupervisorMessage::ActivityTargetUnsupported {
+                                                    thread_id: task_thread_id,
+                                                    generation,
+                                                    response,
+                                                    provider,
+                                                },
+                                            );
+                                        }
+                                        result => {
+                                            let _ = response.send(result);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        if let Some(entry) = sessions.get_mut(&thread_id) {
+                            entry.activity_dispatch_tasks.push(task);
+                        } else {
+                            task.abort();
+                            tracing::debug!(
+                                thread_id = %thread_id,
+                                "discarded targeted cancellation after session removal"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
+            }
+            SupervisorMessage::InvalidateActivityControls {
+                thread_id,
+                generation,
+                response,
+            } => {
+                if let Some(entry) = sessions.get_mut(&thread_id)
+                    && entry.activity_runtime_generation == generation
+                {
+                    entry.activity_control.write().await.take();
+                    cancel_and_reap_activity_tasks(entry).await;
+                }
+                let _ = response.send(());
+            }
+            SupervisorMessage::ActivityDispatchTaskComplete {
+                thread_id,
+                generation,
+                task_id,
+            } => {
+                #[cfg(test)]
+                if let Some(hook) = &activity_dispatch_completion_hook {
+                    hook.received.notify_one();
+                }
+                if let Some(entry) = sessions.get_mut(&thread_id) {
+                    reap_activity_dispatch_task(
+                        &entry.activity_runtime_generation,
+                        &mut entry.activity_late_dispatch_tasks,
+                        &generation,
+                        task_id,
+                    )
+                    .await;
+                }
+            }
+            SupervisorMessage::ActivityTargetUnsupported {
+                thread_id,
+                generation,
+                response,
+                provider,
+            } => {
+                if let Some(entry) = sessions.get_mut(&thread_id)
+                    && entry.activity_runtime_generation == generation
+                {
+                    let registration = entry.activity_control.read().await.clone();
+                    if let Some(registration) = registration {
+                        registration.downgrade_targeted_control();
+                    }
+                    let capabilities = entry
+                        .activity_lifecycle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .downgrade_targeted_actor_cancellation();
+                    if let Err(error) = ensure_live_activity_scope(
+                        &activity,
+                        &entry.launch,
+                        &entry.activity_lifecycle,
+                        &capabilities,
+                        format!("supervisor:targeted-unsupported:{}", Uuid::new_v4()),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            thread_id,
+                            %error,
+                            "targeted activity downgrade scope publication failed"
+                        );
+                    }
+                    cancel_and_reap_activity_tasks(entry).await;
+                }
+                let _ = response.send(Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                    provider,
+                }));
+            }
+            #[cfg(test)]
+            SupervisorMessage::InspectActivityRuntimeGeneration {
+                thread_id,
+                response,
+            } => {
+                let generation = if let Some(entry) = sessions.get(&thread_id) {
+                    entry
+                        .activity_control
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|_| entry.activity_runtime_generation.clone())
+                } else {
+                    None
+                };
+                let _ = response.send(generation);
             }
             SupervisorMessage::DeliveryComplete {
                 thread_id,
@@ -2372,6 +2795,114 @@ fn provider_supports_agent_activity(provider: &str) -> bool {
     matches!(provider, "codex" | "claude" | "claudeAgent" | "opencode")
 }
 
+async fn dispatch_activity_envelope(
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    envelope: ActivityDispatchEnvelope,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
+) {
+    if envelope.jobs.is_empty()
+        || envelope.jobs.len() > ACTIVITY_DELTA_MAX_CHANGES
+        || envelope
+            .jobs
+            .iter()
+            .any(|job| job.generation != envelope.generation)
+        || !activity.agent_activity_controller().snapshot().enabled
+    {
+        return;
+    }
+    let Some(entry) = sessions.get_mut(&envelope.thread_id) else {
+        return;
+    };
+    let control_current = entry
+        .activity_control
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|registration| registration.generation() == envelope.generation);
+    if !control_current
+        || entry.activity_runtime_generation != envelope.generation
+        || !entry.configuration_healthy
+    {
+        return;
+    }
+    let service = entry.activity_cancellation.read().await.clone();
+    let Some(service) = service else {
+        return;
+    };
+    let dispatch_cancellation = entry.activity_late_dispatch_cancellation.clone();
+    let task_id = allocate_activity_dispatch_task_id(entry);
+    let thread_id = envelope.thread_id;
+    let generation = envelope.generation;
+    let completion_thread_id = thread_id.clone();
+    let completion_generation = generation.clone();
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = dispatch_cancellation.cancelled() => {}
+            () = service.dispatch_observed_jobs(envelope.jobs) => {}
+        }
+        let _completion_sent = terminal_sender
+            .send(SupervisorMessage::ActivityDispatchTaskComplete {
+                thread_id: completion_thread_id,
+                generation: completion_generation,
+                task_id,
+            })
+            .is_ok();
+        #[cfg(test)]
+        if _completion_sent
+            && let Some(hook) = activity_dispatch_completion_hook
+            && hook.hold_before_return.swap(false, Ordering::AcqRel)
+        {
+            hook.sent.notify_one();
+            hook.release.notified().await;
+        }
+    });
+    let replaced = entry.activity_late_dispatch_tasks.insert(task_id, task);
+    debug_assert!(replaced.is_none());
+}
+
+fn allocate_activity_dispatch_task_id(entry: &mut SessionEntry) -> ActivityDispatchTaskId {
+    for _ in 0..=entry.activity_late_dispatch_tasks.len() {
+        let task_id = ActivityDispatchTaskId(entry.next_activity_late_dispatch_task_id);
+        entry.next_activity_late_dispatch_task_id =
+            entry.next_activity_late_dispatch_task_id.wrapping_add(1);
+        if !entry.activity_late_dispatch_tasks.contains_key(&task_id) {
+            return task_id;
+        }
+    }
+    unreachable!("bounded activity dispatch task IDs always have a free slot")
+}
+
+async fn reap_activity_dispatch_task(
+    current_generation: &ActivityRuntimeGeneration,
+    tasks: &mut HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    completion_generation: &ActivityRuntimeGeneration,
+    task_id: ActivityDispatchTaskId,
+) -> bool {
+    if current_generation != completion_generation {
+        return false;
+    }
+    let Some(task) = tasks.remove(&task_id) else {
+        return false;
+    };
+    let _ = task.await;
+    true
+}
+
+async fn send_activity_dispatch_envelope(
+    sender: &mpsc::Sender<ActivityDispatchEnvelope>,
+    cancellation: &CancellationToken,
+    envelope: ActivityDispatchEnvelope,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => false,
+        result = sender.send(envelope) => result.is_ok(),
+    }
+}
+
 async fn ensure_live_activity_scope(
     activity: &ActivityProjection,
     request: &ProviderLaunchRequest,
@@ -2420,20 +2951,43 @@ async fn ensure_live_activity_scope(
 
 async fn set_live_agent_activity_enabled(
     activity: &ActivityProjection,
-    sessions: &HashMap<String, SessionEntry>,
+    sessions: &mut HashMap<String, SessionEntry>,
     enabled: bool,
 ) -> Result<usize, ProviderRuntimeError> {
     let mut successful_sessions = 0;
     let mut first_error = None;
     let controller_state = activity.agent_activity_controller().snapshot();
-    let mut thread_ids = sessions.keys().collect::<Vec<_>>();
+    let mut thread_ids = sessions.keys().cloned().collect::<Vec<_>>();
     thread_ids.sort();
     for thread_id in thread_ids {
-        let entry = &sessions[thread_id];
+        let entry = sessions
+            .get_mut(&thread_id)
+            .expect("sorted session key remains present");
+        if !enabled {
+            entry.activity_control.write().await.take();
+            cancel_and_reap_activity_tasks(entry).await;
+        }
         match entry.driver.set_agent_activity_enabled(enabled).await {
             Ok(()) => {
                 successful_sessions += 1;
                 if enabled && entry.activity_capable && controller_state.enabled {
+                    let generation = ActivityRuntimeGeneration::new();
+                    let registration = Arc::new(
+                        activity
+                            .activity_control_registry()
+                            .register_runtime_with_generation(
+                                ActivityScopeRef::Thread {
+                                    thread_id: entry.launch.thread_id.clone(),
+                                },
+                                format!("thread:{}", entry.launch.thread_id),
+                                entry.launch.provider_instance_id.clone(),
+                                generation.clone(),
+                            ),
+                    );
+                    entry.activity_runtime_generation = generation;
+                    entry.activity_dispatch_cancellation = CancellationToken::new();
+                    entry.activity_late_dispatch_cancellation = CancellationToken::new();
+                    *entry.activity_control.write().await = Some(registration);
                     let capabilities = entry
                         .activity_lifecycle
                         .lock()
@@ -2466,6 +3020,29 @@ async fn set_live_agent_activity_enabled(
     first_error.map_or(Ok(successful_sessions), Err)
 }
 
+async fn reap_completed_activity_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    let mut active = Vec::with_capacity(tasks.len());
+    for task in std::mem::take(tasks) {
+        if task.is_finished() {
+            let _ = task.await;
+        } else {
+            active.push(task);
+        }
+    }
+    *tasks = active;
+}
+
+async fn cancel_and_reap_activity_tasks(entry: &mut SessionEntry) {
+    entry.activity_late_dispatch_cancellation.cancel();
+    entry.activity_dispatch_cancellation.cancel();
+    for (_, task) in std::mem::take(&mut entry.activity_late_dispatch_tasks) {
+        let _ = task.await;
+    }
+    for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
+        let _ = task.await;
+    }
+}
+
 fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> ProviderRuntimeError {
     let category = match error {
         ProviderRuntimeError::Shutdown => "supervisor shutdown",
@@ -2476,6 +3053,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::SessionAlreadyExists { .. } => "session conflict",
         ProviderRuntimeError::UnsupportedProvider { .. } => "unsupported provider",
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
+        ProviderRuntimeError::ActivityTargetUnsupported { .. } => "targeted activity unsupported",
         ProviderRuntimeError::Spawn { .. } => "provider spawn failure",
         ProviderRuntimeError::Provider { .. } => "provider operation failure",
         ProviderRuntimeError::Persistence(_) => "persistence failure",
@@ -2497,7 +3075,10 @@ async fn launch_session(
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    activity_dispatch_capacity: usize,
     idle_timeout: Duration,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 ) -> Result<(), ProviderRuntimeError> {
     let option_application_method = if inherited_activity_lifecycle.is_some() {
         "restart"
@@ -2514,6 +3095,7 @@ async fn launch_session(
             thread_id: request.thread_id,
         });
     }
+    let activity_runtime_generation = ActivityRuntimeGeneration::new();
     let activity_controller = activity.agent_activity_controller();
     if activity_controller.snapshot().enabled {
         request.activity_causal_revision = match activity
@@ -2531,6 +3113,18 @@ async fn launch_session(
             }
         };
     }
+    let activity_control = Arc::new(RwLock::new(Some(Arc::new(
+        activity
+            .activity_control_registry()
+            .register_runtime_with_generation(
+                ActivityScopeRef::Thread {
+                    thread_id: request.thread_id.clone(),
+                },
+                format!("thread:{}", request.thread_id),
+                request.provider_instance_id.clone(),
+                activity_runtime_generation.clone(),
+            ),
+    ))));
     let driver = factory.create(request.clone()).await?;
     persist_runtime(
         &engine.repositories(),
@@ -2616,7 +3210,13 @@ async fn launch_session(
     .await?;
     dispatch_session_state(engine, &request, "ready", None, None).await?;
 
+    if !activity_controller.snapshot().enabled {
+        activity_control.write().await.take();
+    }
+
     let cancellation = CancellationToken::new();
+    let activity_dispatch_cancellation = CancellationToken::new();
+    let activity_late_dispatch_cancellation = CancellationToken::new();
     let idle_generation = Arc::new(AtomicU64::new(0));
     let event_task = spawn_event_pump(
         engine.clone(),
@@ -2627,6 +3227,8 @@ async fn launch_session(
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
+        activity_control.clone(),
+        activity_dispatch_sender.clone(),
         format!("supervisor:stream-ended:{activity_lifecycle_id}"),
         cancellation.clone(),
         operational_log.cloned(),
@@ -2643,12 +3245,22 @@ async fn launch_session(
             resume_cursor: started.resume_cursor,
             runtime_payload: started.runtime_payload,
             activity_capable,
+            activity_runtime_generation,
+            activity_dispatch_cancellation,
+            activity_dispatch_tasks: Vec::new(),
+            activity_late_dispatch_cancellation,
+            activity_late_dispatch_tasks: HashMap::new(),
+            next_activity_late_dispatch_task_id: 0,
+            activity_control,
+            activity_cancellation,
             activity_lifecycle,
             activity_compensation_key: format!("supervisor:cancelled-live:{activity_lifecycle_id}"),
             event_task,
             event_cancellation: cancellation,
             idle_generation,
             terminal_sender,
+            activity_dispatch_sender,
+            activity_dispatch_capacity,
             idle_timeout,
         },
     );
@@ -3061,11 +3673,19 @@ async fn restart_session(
     let mut inherited_activity_lifecycle = None;
     let mut terminal_sender = None;
     let mut idle_timeout = None;
-    if let Some(entry) = sessions.get(thread_id) {
+    let mut activity_cancellation = None;
+    let mut activity_dispatch_sender = None;
+    let mut activity_dispatch_capacity = None;
+    if let Some(entry) = sessions.get_mut(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
         terminal_sender = Some(entry.terminal_sender.clone());
         idle_timeout = Some(entry.idle_timeout);
+        activity_cancellation = Some(entry.activity_cancellation.clone());
+        activity_dispatch_sender = Some(entry.activity_dispatch_sender.clone());
+        activity_dispatch_capacity = Some(entry.activity_dispatch_capacity);
+        entry.activity_control.write().await.take();
+        cancel_and_reap_activity_tasks(entry).await;
         entry.driver.shutdown().await?;
     }
     if let Some(entry) = sessions.remove(thread_id) {
@@ -3103,7 +3723,16 @@ async fn restart_session(
         terminal_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
+        activity_dispatch_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        activity_dispatch_capacity.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
         idle_timeout.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        activity_cancellation.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
     )
@@ -3236,6 +3865,8 @@ fn spawn_event_pump(
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
+    activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     stream_ended_event_key: String,
     cancellation: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
@@ -3316,6 +3947,7 @@ fn spawn_event_pump(
                                     "error": { "message": STREAM_END_ERROR },
                                 }),
                                 activity: Vec::new(),
+                                activity_controls: Default::default(),
                             };
                             if let Err(error) = project_provider_event(
                                 &engine,
@@ -3351,15 +3983,18 @@ fn spawn_event_pump(
                     let activity_state = activity_controller.snapshot();
                     if activity_capable
                         && activity_state.enabled
-                        && !event.activity.is_empty()
+                        && (!event.activity.is_empty() || !event.activity_controls.is_empty())
                     {
                         let activity_batch = std::mem::take(&mut event.activity);
+                        let control_batch = event.activity_controls.take();
                         let native_event_id = event.native_event_id.take();
                         let activity_mutation_count = activity_batch.len();
+                        let activity_control_count = control_batch.len();
                         if event.thread_id != launch.thread_id {
                             tracing::warn!(
                                 provider = %launch.provider,
                                 activity_mutation_count,
+                                activity_control_count,
                                 "dropped provider activity batch for mismatched event thread"
                             );
                         } else if let Some(native_event_id) = native_event_id {
@@ -3369,35 +4004,124 @@ fn spawn_event_pump(
                                 activity_state.generation,
                                 native_event_id.as_str(),
                             );
-                            match activity.apply(
-                                &format!("thread:{}", launch.thread_id),
-                                native_event_key,
-                                activity_batch,
-                                now(),
-                            ).await {
-                                    Err(error) => tracing::warn!(
+                            let registration = activity_control.read().await.clone();
+                            let observed_generation = registration
+                                .as_ref()
+                                .map(|registration| registration.generation());
+                            let jobs = if let Some(registration) = &registration {
+                                Some(
+                                    activity
+                                        .activity_control_registry()
+                                        .observe_provider_batch(
+                                            registration,
+                                            &activity_batch,
+                                            &control_batch,
+                                        )
+                                        .await,
+                                )
+                            } else {
+                                None
+                            };
+                            let projection_result = if activity_batch.is_empty() {
+                                Ok(Vec::new())
+                            } else {
+                                activity
+                                    .apply(
+                                        &format!("thread:{}", launch.thread_id),
+                                        native_event_key,
+                                        activity_batch,
+                                        now(),
+                                    )
+                                    .await
+                            };
+                            let projection_succeeded = match projection_result {
+                                Err(error) => {
+                                    if let Some(generation) = &observed_generation {
+                                        let mut current_registration = activity_control.write().await;
+                                        if current_registration.as_ref().is_some_and(|registration| {
+                                            registration.generation() == *generation
+                                        }) {
+                                            current_registration.take();
+                                        }
+                                    }
+                                    drop(registration);
+                                    let (response, completion) = oneshot::channel();
+                                    let invalidation_sent = observed_generation
+                                        .clone()
+                                        .is_some_and(|generation| {
+                                            terminal_sender
+                                                .send(
+                                                    SupervisorMessage::InvalidateActivityControls {
+                                                        thread_id: launch.thread_id.clone(),
+                                                        generation,
+                                                        response,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        });
+                                    tracing::warn!(
                                         %error,
                                         activity_mutation_count,
-                                        "failed to project provider activity batch"
-                                    ),
-                                    Ok(deltas) if !deltas.is_empty() => {
-                                        activity_lifecycle
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .observe_projected_batch(&lifecycle_mutations);
+                                        activity_control_count,
+                                        "failed to project provider activity batch; invalidated targeted controls"
+                                    );
+                                    if invalidation_sent {
+                                        tokio::select! {
+                                            biased;
+                                            () = cancellation.cancelled() => return,
+                                            _ = completion => {}
+                                        }
                                     }
-                                    Ok(_) => {}
+                                    false
+                                }
+                                Ok(deltas) if !deltas.is_empty() => {
+                                    activity_lifecycle
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .observe_projected_batch(&lifecycle_mutations);
+                                    true
+                                }
+                                Ok(_) => true,
+                            };
+                            if projection_succeeded
+                                && let Some(generation) = observed_generation
+                                && let Some(jobs) = jobs
+                                && !jobs.is_empty()
+                            {
+                                if jobs.len() > ACTIVITY_DELTA_MAX_CHANGES {
+                                    tracing::warn!(
+                                        activity_dispatch_job_count = jobs.len(),
+                                        "dropped oversized targeted activity dispatch batch"
+                                    );
+                                } else {
+                                    let envelope = ActivityDispatchEnvelope {
+                                        thread_id: launch.thread_id.clone(),
+                                        generation,
+                                        jobs,
+                                    };
+                                    if !send_activity_dispatch_envelope(
+                                        &activity_dispatch_sender,
+                                        &cancellation,
+                                        envelope,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
                             }
                         } else {
                             tracing::warn!(
                                 provider = %launch.provider,
                                 thread_id = %launch.thread_id,
                                 activity_mutation_count,
+                                activity_control_count,
                                 "dropped activity batch without a stable native event key"
                             );
                         }
                     }
                     event.activity.clear();
+                    event.activity_controls = ProviderActivityControls::default();
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
@@ -3939,7 +4663,7 @@ async fn detach_session(
     sessions: &mut HashMap<String, SessionEntry>,
     thread_id: &str,
 ) -> Result<DetachedSession, ProviderRuntimeError> {
-    let Some(entry) = sessions.remove(thread_id) else {
+    let Some(mut entry) = sessions.remove(thread_id) else {
         return Err(ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         });
@@ -3950,6 +4674,8 @@ async fn detach_session(
         resume_cursor: entry.resume_cursor.clone(),
         runtime_payload: entry.runtime_payload.clone(),
     };
+    entry.activity_control.write().await.take();
+    cancel_and_reap_activity_tasks(&mut entry).await;
     entry.event_cancellation.cancel();
     entry.event_task.abort();
     let _ = entry.event_task.await;
@@ -4382,6 +5108,39 @@ struct CodexDriver {
     attachments: AttachmentMaterializer,
 }
 
+fn codex_activity_target_ids(
+    target: &ProviderActivityNativeTarget,
+) -> Result<(&str, &str), ProviderRuntimeError> {
+    target
+        .codex_turn_ids()
+        .ok_or_else(|| ProviderRuntimeError::UnsupportedCapability {
+            provider: "codex".to_owned(),
+            capability: "targeted activity cancellation",
+        })
+}
+
+fn claude_activity_target_id(
+    target: &ProviderActivityNativeTarget,
+) -> Result<&str, ProviderRuntimeError> {
+    let task_id =
+        target
+            .claude_task_id()
+            .ok_or_else(|| ProviderRuntimeError::UnsupportedCapability {
+                provider: "claude".to_owned(),
+                capability: "targeted activity cancellation",
+            })?;
+    if task_id.is_empty()
+        || task_id.chars().count() > ACTIVITY_ID_MAX_LENGTH
+        || task_id.chars().any(char::is_control)
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: "claude".to_owned(),
+            detail: "targeted activity handle is invalid".to_owned(),
+        });
+    }
+    Ok(task_id)
+}
+
 impl CodexDriver {
     async fn spawn(
         mut request: ProviderLaunchRequest,
@@ -4504,6 +5263,7 @@ impl ProviderDriver for CodexDriver {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::None,
                     terminal_observation: false,
+                    targeted_actor_cancellation: true,
                 },
             })
         })
@@ -4624,6 +5384,19 @@ impl ProviderDriver for CodexDriver {
             Ok(())
         })
     }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let (thread_id, turn_id) = codex_activity_target_ids(&target)?;
+            self.runtime
+                .interrupt_targeted_turn(thread_id, turn_id)
+                .await
+                .map_err(provider_error("codex"))?;
+            Ok(ActivityTargetDispatchDisposition::Delivered)
+        })
+    }
     fn set_model(&self, _model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("codex", "post-start model changes")
     }
@@ -4697,6 +5470,7 @@ impl ProviderDriver for CodexDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
+                activity_controls: ProviderActivityControls(event.activity_controls),
             })
         })
     }
@@ -4949,6 +5723,7 @@ impl ProviderDriver for CursorDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             })
         })
     }
@@ -5149,6 +5924,7 @@ impl ProviderDriver for GrokDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             })
         })
     }
@@ -5457,6 +6233,7 @@ impl ProviderDriver for OpenCodeDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
+                activity_controls: Default::default(),
             })
         })
     }
@@ -5528,14 +6305,43 @@ impl Drop for ClaudeAcknowledgementRegistration {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaudeControlQueryError {
-    Remote,
+#[derive(Clone, PartialEq)]
+enum ClaudeControlQueryOutcome {
+    Success(Value),
+    Unsupported,
+    Timeout,
     Closed,
+    Failed,
+}
+
+impl std::fmt::Debug for ClaudeControlQueryOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success(_) => formatter.write_str("Success(..)"),
+            Self::Unsupported => formatter.write_str("Unsupported"),
+            Self::Timeout => formatter.write_str("Timeout"),
+            Self::Closed => formatter.write_str("Closed"),
+            Self::Failed => formatter.write_str("Failed"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeControlResponseRoute {
+    NotControl,
+    Matched,
+    Mismatched,
+    Invalid,
+}
+
+impl ClaudeControlResponseRoute {
+    fn consumed(self) -> bool {
+        self != Self::NotControl
+    }
 }
 
 type ClaudeControlResponseWaiters =
-    Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value, ClaudeControlQueryError>>>>>;
+    Arc<StdMutex<HashMap<String, oneshot::Sender<ClaudeControlQueryOutcome>>>>;
 
 #[derive(Clone)]
 struct ClaudeControlResponseRouter {
@@ -5559,7 +6365,10 @@ impl ClaudeControlResponseRouter {
         }
         let (sender, receiver) = oneshot::channel();
         let mut pending = self.pending.lock().expect("Claude control response lock");
-        if self.closed.load(Ordering::Acquire) || pending.contains_key(&request_id) {
+        if self.closed.load(Ordering::Acquire)
+            || pending.len() >= CLAUDE_CONTROL_RESPONSE_CAPACITY
+            || pending.contains_key(&request_id)
+        {
             return None;
         }
         pending.insert(request_id.clone(), sender);
@@ -5570,31 +6379,38 @@ impl ClaudeControlResponseRouter {
         })
     }
 
-    fn route(&self, value: &Value) -> bool {
+    fn route(&self, value: &Value) -> ClaudeControlResponseRoute {
         if value.get("type").and_then(Value::as_str) != Some("control_response") {
-            return false;
+            return ClaudeControlResponseRoute::NotControl;
         }
         let Ok(frame) = serde_json::from_value::<ClaudeControlResponseFrame>(value.clone()) else {
-            return false;
+            return ClaudeControlResponseRoute::Invalid;
         };
         let response = frame.response;
         let result = if response.subtype == "success" && response.error.is_none() {
-            Ok(response.response)
+            ClaudeControlQueryOutcome::Success(response.response)
+        } else if response.subtype == "error"
+            && response.error.as_deref().map(str::trim)
+                == Some("Unsupported control request subtype: stop_task")
+        {
+            ClaudeControlQueryOutcome::Unsupported
         } else {
-            Err(ClaudeControlQueryError::Remote)
+            ClaudeControlQueryOutcome::Failed
         };
         let mut pending = self.pending.lock().expect("Claude control response lock");
         if let Some(sender) = pending.remove(&response.request_id) {
             let _ = sender.send(result);
+            ClaudeControlResponseRoute::Matched
+        } else {
+            ClaudeControlResponseRoute::Mismatched
         }
-        true
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let mut pending = self.pending.lock().expect("Claude control response lock");
         for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(ClaudeControlQueryError::Closed));
+            let _ = sender.send(ClaudeControlQueryOutcome::Closed);
         }
     }
 
@@ -5610,17 +6426,17 @@ impl ClaudeControlResponseRouter {
 struct ClaudeControlResponseRegistration {
     request_id: String,
     pending: ClaudeControlResponseWaiters,
-    receiver: Option<oneshot::Receiver<Result<Value, ClaudeControlQueryError>>>,
+    receiver: Option<oneshot::Receiver<ClaudeControlQueryOutcome>>,
 }
 
 impl ClaudeControlResponseRegistration {
-    async fn receive(mut self) -> Result<Value, ClaudeControlQueryError> {
+    async fn receive(mut self) -> ClaudeControlQueryOutcome {
         let result = self
             .receiver
             .as_mut()
             .expect("Claude control response receiver")
             .await
-            .unwrap_or(Err(ClaudeControlQueryError::Closed));
+            .unwrap_or(ClaudeControlQueryOutcome::Closed);
         self.receiver = None;
         result
     }
@@ -5649,7 +6465,7 @@ async fn query_claude_context_usage(
     sequence: u64,
     timeout: Duration,
 ) -> Option<Value> {
-    query_claude_control(
+    match query_claude_control(
         provider,
         writer,
         responses,
@@ -5658,6 +6474,13 @@ async fn query_claude_context_usage(
         timeout,
     )
     .await
+    {
+        ClaudeControlQueryOutcome::Success(value) => Some(value),
+        ClaudeControlQueryOutcome::Unsupported
+        | ClaudeControlQueryOutcome::Timeout
+        | ClaudeControlQueryOutcome::Closed
+        | ClaudeControlQueryOutcome::Failed => None,
+    }
 }
 
 async fn query_claude_mcp_status(
@@ -5668,12 +6491,39 @@ async fn query_claude_mcp_status(
     sequence: u64,
     timeout: Duration,
 ) -> Option<Value> {
-    query_claude_control(
+    match query_claude_control(
         provider,
         writer,
         responses,
         cancellation,
         ClaudeControlRequest::mcp_status(sequence),
+        timeout,
+    )
+    .await
+    {
+        ClaudeControlQueryOutcome::Success(value) => Some(value),
+        ClaudeControlQueryOutcome::Unsupported
+        | ClaudeControlQueryOutcome::Timeout
+        | ClaudeControlQueryOutcome::Closed
+        | ClaudeControlQueryOutcome::Failed => None,
+    }
+}
+
+async fn query_claude_stop_task(
+    provider: &str,
+    writer: &Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    responses: &ClaudeControlResponseRouter,
+    cancellation: &CancellationToken,
+    sequence: u64,
+    task_id: &str,
+    timeout: Duration,
+) -> ClaudeControlQueryOutcome {
+    query_claude_control(
+        provider,
+        writer,
+        responses,
+        cancellation,
+        ClaudeControlRequest::stop_task(sequence, task_id),
         timeout,
     )
     .await
@@ -5686,33 +6536,34 @@ async fn query_claude_control(
     cancellation: &CancellationToken,
     request: ClaudeControlRequest,
     timeout: Duration,
-) -> Option<Value> {
+) -> ClaudeControlQueryOutcome {
     let query = async {
-        let registration = responses.register(request.request_id().to_owned())?;
-        let mut bytes = serde_json::to_vec(&request)
-            .map_err(provider_error(provider))
-            .ok()?;
+        let Some(registration) = responses.register(request.request_id().to_owned()) else {
+            return if responses.closed.load(Ordering::Acquire) {
+                ClaudeControlQueryOutcome::Closed
+            } else {
+                ClaudeControlQueryOutcome::Failed
+            };
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&request).map_err(provider_error(provider)) else {
+            return ClaudeControlQueryOutcome::Failed;
+        };
         bytes.push(b'\n');
         {
             let mut writer = writer.lock().await;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(provider_error(provider))
-                .ok()?;
-            writer
-                .flush()
-                .await
-                .map_err(provider_error(provider))
-                .ok()?;
+            if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                return ClaudeControlQueryOutcome::Failed;
+            }
         }
-        registration.receive().await.ok()
+        registration.receive().await
     };
 
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => None,
-        result = tokio::time::timeout(timeout, query) => result.ok().flatten(),
+        () = cancellation.cancelled() => ClaudeControlQueryOutcome::Closed,
+        result = tokio::time::timeout(timeout, query) => {
+            result.unwrap_or(ClaudeControlQueryOutcome::Timeout)
+        },
     }
 }
 
@@ -5728,7 +6579,10 @@ fn claude_completion_query_turn_id(event: &ProviderEvent) -> Option<&str> {
 
 #[cfg(test)]
 mod claude_control_response_tests {
-    use super::{ClaudeControlQueryError, ClaudeControlResponseRouter};
+    use super::{
+        CLAUDE_CONTROL_RESPONSE_CAPACITY, ClaudeControlQueryOutcome, ClaudeControlResponseRoute,
+        ClaudeControlResponseRouter,
+    };
     use serde_json::json;
 
     #[tokio::test]
@@ -5738,27 +6592,37 @@ mod claude_control_response_tests {
             .register("bibcode-20".to_owned())
             .expect("registration");
 
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": { "subtype": "success", "request_id": "other", "response": {} }
-        })));
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": "other", "response": {} }
+            })),
+            ClaudeControlResponseRoute::Mismatched
+        );
         assert_eq!(router.pending_count(), 1);
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": "bibcode-20",
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
                 "response": {
-                    "totalTokens": 31251,
-                    "maxTokens": 200000,
-                    "isAutoCompactEnabled": true
+                    "subtype": "success",
+                    "request_id": "bibcode-20",
+                    "response": {
+                        "totalTokens": 31251,
+                        "maxTokens": 200000,
+                        "isAutoCompactEnabled": true
+                    }
                 }
-            }
-        })));
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
 
         assert_eq!(
-            registration.receive().await.expect("response")["totalTokens"],
-            31_251
+            registration.receive().await,
+            ClaudeControlQueryOutcome::Success(json!({
+                "totalTokens": 31251,
+                "maxTokens": 200000,
+                "isAutoCompactEnabled": true
+            }))
         );
         assert_eq!(router.pending_count(), 0);
     }
@@ -5770,20 +6634,155 @@ mod claude_control_response_tests {
             .register("bibcode-21".to_owned())
             .expect("registration");
 
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "error",
-                "request_id": "bibcode-21",
-                "error": "get_context_usage is unsupported"
-            }
-        })));
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-21",
+                    "error": "get_context_usage is unsupported"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
 
         assert_eq!(
             registration.receive().await,
-            Err(ClaudeControlQueryError::Remote)
+            ClaudeControlQueryOutcome::Failed
         );
         assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn classifies_only_the_protocols_exact_unsupported_control_error() {
+        // Mutation caught: downgrading targeted control after any generic Claude task failure.
+        let router = ClaudeControlResponseRouter::default();
+        let unsupported = router
+            .register("bibcode-31".to_owned())
+            .expect("unsupported registration");
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-31",
+                    "error": "Unsupported control request subtype: stop_task"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
+        assert_eq!(
+            unsupported.receive().await,
+            ClaudeControlQueryOutcome::Unsupported
+        );
+
+        let failed = router
+            .register("bibcode-32".to_owned())
+            .expect("failed registration");
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-32",
+                    "error": "task task-private failed"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
+        let outcome = failed.receive().await;
+        assert_eq!(outcome, ClaudeControlQueryOutcome::Failed);
+        assert_eq!(format!("{outcome:?}"), "Failed");
+    }
+
+    #[test]
+    fn mismatched_request_ids_are_consumed_without_settling_another_waiter() {
+        // Mutation caught: delivering a control response to whichever request happens to be pending.
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-33".to_owned())
+            .expect("registration");
+
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "bibcode-other",
+                    "response": {}
+                }
+            })),
+            ClaudeControlResponseRoute::Mismatched
+        );
+        assert_eq!(router.pending_count(), 1);
+        drop(registration);
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_and_malformed_responses_are_consumed_without_leaking_or_settling_waiters() {
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-34".to_owned())
+            .expect("registration");
+        let response = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "bibcode-34", "response": {} }
+        });
+        assert_eq!(router.route(&response), ClaudeControlResponseRoute::Matched);
+        assert_eq!(
+            router.route(&response),
+            ClaudeControlResponseRoute::Mismatched
+        );
+        assert_eq!(router.pending_count(), 0);
+        drop(registration);
+
+        let pending = router
+            .register("bibcode-35".to_owned())
+            .expect("pending registration");
+        assert_eq!(
+            router.route(&json!({"type": "control_response", "response": {}})),
+            ClaudeControlResponseRoute::Invalid
+        );
+        assert_eq!(router.pending_count(), 1);
+        drop(pending);
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn pending_router_is_bounded_and_releases_capacity_on_drop() {
+        let router = ClaudeControlResponseRouter::default();
+        let registrations = (0..CLAUDE_CONTROL_RESPONSE_CAPACITY)
+            .map(|index| {
+                router
+                    .register(format!("bibcode-{index}"))
+                    .expect("bounded registration")
+            })
+            .collect::<Vec<_>>();
+        assert!(router.register("bibcode-overflow".to_owned()).is_none());
+        assert_eq!(router.pending_count(), CLAUDE_CONTROL_RESPONSE_CAPACITY);
+
+        drop(registrations);
+        assert_eq!(router.pending_count(), 0);
+        assert!(router.register("bibcode-after-drop".to_owned()).is_some());
+    }
+
+    #[test]
+    fn response_debug_redacts_request_ids_and_provider_errors() {
+        let frame = serde_json::from_value::<
+            crate::provider::claude::protocol::ClaudeControlResponseFrame,
+        >(json!({
+            "response": {
+                "subtype": "error",
+                "request_id": "task-private-request",
+                "error": "raw-private-provider-error"
+            }
+        }))
+        .expect("control response");
+        let debug = format!("{frame:?}");
+        assert_eq!(debug, "ClaudeControlResponseFrame { .. }");
+        assert!(!debug.contains("task-private-request"));
+        assert!(!debug.contains("raw-private-provider-error"));
     }
 
     #[test]
@@ -5815,17 +6814,138 @@ mod claude_control_response_tests {
         router.close();
 
         assert_eq!(router.pending_count(), 0);
-        assert_eq!(first.receive().await, Err(ClaudeControlQueryError::Closed));
-        assert_eq!(second.receive().await, Err(ClaudeControlQueryError::Closed));
+        assert_eq!(first.receive().await, ClaudeControlQueryOutcome::Closed);
+        assert_eq!(second.receive().await, ClaudeControlQueryOutcome::Closed);
         assert!(router.register("bibcode-25".to_owned()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod claude_stop_task_control_tests {
+    use super::{
+        ClaudeControlQueryOutcome, ClaudeControlResponseRoute, ClaudeControlResponseRouter,
+        query_claude_stop_task,
+    };
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWrite, BufReader},
+        sync::Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn stop_task_writes_the_exact_request_and_returns_typed_success() {
+        // Mutation caught: sending a root interrupt or accepting a response for another request.
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        let responder = async {
+            let mut lines = BufReader::new(reader_stream).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("stop task read")
+                .expect("stop task line");
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).expect("stop task json"),
+                json!({
+                    "type": "control_request",
+                    "request_id": "bibcode-41",
+                    "request": { "subtype": "stop_task", "task_id": "task-a" }
+                })
+            );
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": "bibcode-41",
+                        "response": {}
+                    }
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
+        };
+
+        let (outcome, ()) = tokio::join!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                41,
+                "task-a",
+                Duration::from_secs(1),
+            ),
+            responder,
+        );
+
+        assert_eq!(outcome, ClaudeControlQueryOutcome::Success(json!({})));
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_task_timeout_is_typed_and_releases_the_waiter() {
+        // Mutation caught: collapsing a bounded wait into an ambiguous generic failure or leak.
+        let (writer_stream, _reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+
+        assert_eq!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &CancellationToken::new(),
+                42,
+                "task-a",
+                Duration::from_millis(1),
+            )
+            .await,
+            ClaudeControlQueryOutcome::Timeout
+        );
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_task_closed_router_fails_before_provider_io() {
+        // Mutation caught: writing a provider request after its response router has closed.
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        responses.close();
+
+        assert_eq!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &CancellationToken::new(),
+                43,
+                "task-a",
+                Duration::from_secs(1),
+            )
+            .await,
+            ClaudeControlQueryOutcome::Closed
+        );
+        let mut lines = BufReader::new(reader_stream).lines();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), lines.next_line())
+                .await
+                .is_err(),
+            "closed query must not write a line"
+        );
     }
 }
 
 #[cfg(test)]
 mod claude_context_query_tests {
     use super::{
-        ClaudeControlResponseRouter, ProviderEvent, claude_completion_query_turn_id,
-        claude_provider_event, query_claude_context_usage, query_claude_mcp_status,
+        ClaudeControlResponseRoute, ClaudeControlResponseRouter, ProviderEvent,
+        claude_completion_query_turn_id, claude_provider_event, query_claude_context_usage,
+        query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -5858,18 +6978,21 @@ mod claude_context_query_tests {
                     "request": { "subtype": "get_context_usage" }
                 })
             );
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-20",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "totalTokens": 31251,
-                        "maxTokens": 200000,
-                        "isAutoCompactEnabled": true
+                        "subtype": "success",
+                        "request_id": "bibcode-20",
+                        "response": {
+                            "totalTokens": 31251,
+                            "maxTokens": 200000,
+                            "isAutoCompactEnabled": true
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -5909,16 +7032,19 @@ mod claude_context_query_tests {
                     "request": { "subtype": "mcp_status" }
                 })
             );
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-21",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "mcpServers": [{ "name": "context7", "status": "connected" }]
+                        "subtype": "success",
+                        "request_id": "bibcode-21",
+                        "response": {
+                            "mcpServers": [{ "name": "context7", "status": "connected" }]
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -5966,18 +7092,21 @@ mod claude_context_query_tests {
                 turn_id: "turn-2".to_owned(),
                 input: "second turn".to_owned(),
             });
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-24",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "totalTokens": 31251,
-                        "maxTokens": 200000,
-                        "isAutoCompactEnabled": true
+                        "subtype": "success",
+                        "request_id": "bibcode-24",
+                        "response": {
+                            "totalTokens": 31251,
+                            "maxTokens": 200000,
+                            "isAutoCompactEnabled": true
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -6099,6 +7228,7 @@ mod claude_context_query_tests {
                 request_id: None,
                 payload: json!({ "state": state }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             }
         }
 
@@ -6167,6 +7297,8 @@ struct ClaudeDriver {
     interaction_mode: Mutex<String>,
     options: Vec<Value>,
     supports_fast_mode: bool,
+    targeted_activity_provisionally_supported: bool,
+    targeted_activity_control_supported: AtomicBool,
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
     pending_acknowledgement: ClaudeAcknowledgementSlot,
@@ -6764,6 +7896,8 @@ impl ClaudeDriver {
         } else {
             None
         };
+        let targeted_activity_provisionally_supported =
+            support.include_hook_events && support.forward_subagent_text && hook_sink.is_some();
         let hook_settings = hook_sink
             .as_ref()
             .map(|sink| claude_hook_settings(&sink.endpoint));
@@ -6787,13 +7921,15 @@ impl ClaudeDriver {
             .stderr()
             .take()
             .ok_or_else(|| pipe_error(&request.provider, "stderr"))?;
-        let runtime = Arc::new(Mutex::new(
-            ClaudeProviderRuntime::new_with_agent_activity_enabled(
-                request.thread_id.clone(),
-                session_id.clone(),
-                activity_enabled,
-            ),
-        ));
+        let mut provider_runtime = ClaudeProviderRuntime::new_with_agent_activity_enabled(
+            request.thread_id.clone(),
+            session_id.clone(),
+            activity_enabled,
+        );
+        provider_runtime.set_targeted_activity_control_supported(
+            targeted_activity_provisionally_supported && activity_enabled,
+        );
+        let runtime = Arc::new(Mutex::new(provider_runtime));
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (hook_receiver, hook_handle) = match hook_sink {
             Some(sink) => (Some(sink.receiver), Some(Arc::new(sink.handle))),
@@ -6826,6 +7962,10 @@ impl ClaudeDriver {
             interaction_mode: Mutex::new(request.interaction_mode),
             options: request.options,
             supports_fast_mode,
+            targeted_activity_provisionally_supported,
+            targeted_activity_control_supported: AtomicBool::new(
+                targeted_activity_provisionally_supported && activity_enabled,
+            ),
             sequence: Mutex::new(0),
             attachments,
             pending_acknowledgement,
@@ -6905,6 +8045,9 @@ impl ProviderDriver for ClaudeDriver {
                         background_work: false,
                         history_recovery: ActivityHistoryRecovery::None,
                         terminal_observation: false,
+                        targeted_actor_cancellation: self
+                            .targeted_activity_control_supported
+                            .load(Ordering::Acquire),
                     }
                 } else {
                     ActivityCapabilities::none()
@@ -7067,11 +8210,67 @@ impl ProviderDriver for ClaudeDriver {
         enabled: bool,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            self.runtime
-                .lock()
-                .await
-                .set_agent_activity_enabled(enabled);
+            let supported = enabled && self.targeted_activity_provisionally_supported;
+            self.targeted_activity_control_supported
+                .store(supported, Ordering::Release);
+            let mut runtime = self.runtime.lock().await;
+            runtime.set_agent_activity_enabled(enabled);
+            runtime.set_targeted_activity_control_supported(supported);
             Ok(())
+        })
+    }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let task_id = claude_activity_target_id(&target)?.to_owned();
+            if !self
+                .targeted_activity_control_supported
+                .load(Ordering::Acquire)
+            {
+                return Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                    provider: self.provider.clone(),
+                });
+            }
+            match query_claude_stop_task(
+                &self.provider,
+                &self.writer,
+                &self.control_responses,
+                &self.output.cancellation,
+                self.next_sequence().await,
+                &task_id,
+                CLAUDE_CONTEXT_QUERY_TIMEOUT,
+            )
+            .await
+            {
+                ClaudeControlQueryOutcome::Success(_) => {
+                    Ok(ActivityTargetDispatchDisposition::Delivered)
+                }
+                ClaudeControlQueryOutcome::Unsupported => {
+                    self.targeted_activity_control_supported
+                        .store(false, Ordering::Release);
+                    self.runtime
+                        .lock()
+                        .await
+                        .set_targeted_activity_control_supported(false);
+                    Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                        provider: self.provider.clone(),
+                    })
+                }
+                ClaudeControlQueryOutcome::Timeout => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation timed out".to_owned(),
+                }),
+                ClaudeControlQueryOutcome::Closed => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation connection closed".to_owned(),
+                }),
+                ClaudeControlQueryOutcome::Failed => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation failed".to_owned(),
+                }),
+            }
         })
     }
     fn set_interaction_mode(
@@ -7237,6 +8436,7 @@ fn spawn_claude_recovery_worker(
                     request_id: None,
                     payload: json!({}),
                     activity: output.activity,
+                    activity_controls: Default::default(),
                 },
             )
             .await
@@ -7291,7 +8491,7 @@ fn spawn_claude_output(
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if stdout_control_responses.route(&value) {
+            if stdout_control_responses.route(&value).consumed() {
                 continue;
             }
             if !emit_claude_value(
@@ -7369,6 +8569,7 @@ fn spawn_claude_output(
                     request_id: None,
                     payload: json!({"message":line}),
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 },
             )
             .await
@@ -7747,6 +8948,7 @@ fn claude_provider_event(
         request_id: event.request_id,
         payload: event.payload,
         activity,
+        activity_controls: ProviderActivityControls::default(),
     }
 }
 
@@ -7782,7 +8984,9 @@ async fn emit_claude_value(
     let native_event_id = output
         .native_event_id
         .and_then(|value| ProviderNativeEventId::new(value).ok());
-    if output.events.is_empty() && !output.activity.is_empty() {
+    if output.events.is_empty()
+        && (!output.activity.is_empty() || !output.activity_controls.is_empty())
+    {
         let sent = send_claude_output(
             sender,
             cancellation,
@@ -7795,6 +8999,7 @@ async fn emit_claude_value(
                 request_id: None,
                 payload: json!({}),
                 activity: output.activity,
+                activity_controls: ProviderActivityControls::from_updates(output.activity_controls),
             },
         )
         .await;
@@ -7804,17 +9009,20 @@ async fn emit_claude_value(
         return sent;
     }
     let mut activity = Some(output.activity);
+    let mut activity_controls = Some(output.activity_controls);
     let mut native_event_id = native_event_id;
     for event in output.events {
-        if !send_claude_output(
-            sender,
-            cancellation,
-            claude_provider_event(
+        if !send_claude_output(sender, cancellation, {
+            let mut provider_event = claude_provider_event(
                 event,
                 native_event_id.take(),
                 activity.take().unwrap_or_default(),
-            ),
-        )
+            );
+            provider_event.activity_controls = ProviderActivityControls::from_updates(
+                activity_controls.take().unwrap_or_default(),
+            );
+            provider_event
+        })
         .await
         {
             return false;
@@ -8088,6 +9296,12 @@ async fn wait_for_endpoint(
 mod tests {
     use super::{ProviderDriver, ProviderDriverFactory, ProviderEvent};
     use crate::{
+        activity::{
+            ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher, ActivityCancellationError,
+            ActivityCancellationService, ActivityDispatchError, ActivityLifecycle,
+            ActivityRepository, ActivityRuntimeGeneration, ActivityScopeRef,
+            ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
+        },
         diagnostics::{
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
             ProcessSampler,
@@ -8105,19 +9319,37 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
+        collections::HashSet,
         io,
         pin::Pin,
-        sync::{Arc, Mutex as StdMutex},
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream},
         net::TcpListener,
-        sync::mpsc,
+        sync::{RwLock, mpsc},
         time::timeout,
     };
+
+    static CLAUDE_STOP_TASK_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn targeted_claude_runtime(
+        thread_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> crate::provider::claude::ClaudeProviderRuntime {
+        let mut runtime = crate::provider::claude::ClaudeProviderRuntime::new(
+            thread_id.into(),
+            session_id.into(),
+        );
+        runtime.set_targeted_activity_control_supported(true);
+        runtime
+    }
 
     struct CurrentDirectoryGuard {
         original: std::path::PathBuf,
@@ -8146,13 +9378,22 @@ mod tests {
         approvals: usize,
         answers: usize,
         modes: Vec<String>,
+        set_mode_unsupported: bool,
         interaction_modes: Vec<String>,
         models: Vec<String>,
         rollbacks: Vec<i64>,
         shutdowns: usize,
         send_gate: Option<Arc<tokio::sync::Notify>>,
+        send_entered: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_started: Option<Arc<tokio::sync::Notify>>,
+        targeted_calls: Vec<String>,
+        targeted_unsupported_after: Option<usize>,
+        targeted_hold_after: Option<usize>,
+        targeted_entered: Option<Arc<tokio::sync::Notify>>,
+        targeted_release: Option<Arc<tokio::sync::Notify>>,
+        targeted_active: Arc<AtomicUsize>,
+        activity_capabilities: crate::activity::ActivityCapabilities,
     }
 
     struct SupervisorDriver {
@@ -8170,7 +9411,7 @@ mod tests {
                 Ok(super::StartedSession {
                     resume_cursor: Some(json!({"threadId":"unit-session"})),
                     runtime_payload: Some(json!({"transport":"unit"})),
-                    activity_capabilities: super::ActivityCapabilities::none(),
+                    activity_capabilities: self.state.lock().unwrap().activity_capabilities.clone(),
                 })
             })
         }
@@ -8183,7 +9424,13 @@ mod tests {
         ) -> super::BoxRuntimeFuture<'_, Result<Option<String>, super::ProviderRuntimeError>>
         {
             Box::pin(async move {
-                let gate = self.state.lock().unwrap().send_gate.clone();
+                let (gate, entered) = {
+                    let state = self.state.lock().unwrap();
+                    (state.send_gate.clone(), state.send_entered.clone())
+                };
+                if let Some(entered) = entered {
+                    entered.notify_one();
+                }
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
@@ -8244,7 +9491,14 @@ mod tests {
             mode: String,
         ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
-                self.state.lock().unwrap().modes.push(mode);
+                let mut state = self.state.lock().unwrap();
+                state.modes.push(mode);
+                if state.set_mode_unsupported {
+                    return Err(super::ProviderRuntimeError::UnsupportedCapability {
+                        provider: "codex".to_owned(),
+                        capability: "runtime mode",
+                    });
+                }
                 Ok(())
             })
         }
@@ -8256,6 +9510,60 @@ mod tests {
             Box::pin(async move {
                 self.state.lock().unwrap().interaction_modes.push(mode);
                 Ok(())
+            })
+        }
+
+        fn cancel_activity_target(
+            &self,
+            target: ProviderActivityNativeTarget,
+        ) -> super::BoxRuntimeFuture<
+            '_,
+            Result<super::ActivityTargetDispatchDisposition, super::ProviderRuntimeError>,
+        > {
+            Box::pin(async move {
+                let (call_index, unsupported_after, hold_after, entered, release, active) = {
+                    let mut state = self.state.lock().unwrap();
+                    let target_label = target
+                        .codex_turn_ids()
+                        .map(|(thread_id, turn_id)| format!("codex:{thread_id}:{turn_id}"))
+                        .or_else(|| {
+                            target
+                                .claude_task_id()
+                                .map(|task_id| format!("claude:{task_id}"))
+                        })
+                        .expect("known target shape");
+                    state.targeted_calls.push(target_label);
+                    (
+                        state.targeted_calls.len(),
+                        state.targeted_unsupported_after,
+                        state.targeted_hold_after,
+                        state.targeted_entered.clone(),
+                        state.targeted_release.clone(),
+                        state.targeted_active.clone(),
+                    )
+                };
+                active.fetch_add(1, Ordering::AcqRel);
+                struct ActiveTarget(Arc<AtomicUsize>);
+                impl Drop for ActiveTarget {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                let _active = ActiveTarget(active);
+                if unsupported_after.is_some_and(|after| call_index >= after) {
+                    return Err(super::ProviderRuntimeError::ActivityTargetUnsupported {
+                        provider: "claudeAgent".to_owned(),
+                    });
+                }
+                if hold_after.is_some_and(|hold_after| call_index >= hold_after) {
+                    if let Some(entered) = entered {
+                        entered.notify_one();
+                    }
+                    if let Some(release) = release {
+                        release.notified().await;
+                    }
+                }
+                Ok(super::ActivityTargetDispatchDisposition::Delivered)
             })
         }
 
@@ -8316,6 +9624,37 @@ mod tests {
                     events: tokio::sync::Mutex::new(
                         self.events.lock().unwrap().take().expect("event receiver"),
                     ),
+                }) as Arc<dyn ProviderDriver>)
+            })
+        }
+    }
+
+    type SequencedSupervisorDrivers = std::collections::VecDeque<(
+        Arc<StdMutex<SupervisorDriverState>>,
+        mpsc::Receiver<super::ProviderEvent>,
+    )>;
+
+    struct SequencedSupervisorFactory {
+        drivers: StdMutex<SequencedSupervisorDrivers>,
+    }
+
+    impl ProviderDriverFactory for SequencedSupervisorFactory {
+        fn create(
+            &self,
+            _: super::ProviderLaunchRequest,
+        ) -> super::BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, super::ProviderRuntimeError>>
+        {
+            Box::pin(async move {
+                let (state, events) = self
+                    .drivers
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("sequenced provider driver");
+                state.lock().unwrap().launches += 1;
+                Ok(Arc::new(SupervisorDriver {
+                    state,
+                    events: tokio::sync::Mutex::new(events),
                 }) as Arc<dyn ProviderDriver>)
             })
         }
@@ -8866,6 +10205,263 @@ done
         )
     }
 
+    #[cfg(unix)]
+    const CLAUDE_STOP_TASK_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.218'; exit 0;;
+  --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+esac
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"subtype":"stop_task"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      if [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "unsupported" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Unsupported control request subtype: stop_task"}}\n' "$request_id"
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "failed" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"provider task-private failed with raw payload"}}\n' "$request_id"
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "closed" ]; then
+        exit 0
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "timeout" ]; then
+        :
+      else
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
+      fi
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    async fn claude_stop_task_driver(
+        temp: &TempDir,
+        outcome: &str,
+    ) -> (Arc<super::ClaudeDriver>, std::path::PathBuf) {
+        super::reset_claude_activity_probe_cache_for_test().await;
+        let capture = temp
+            .path()
+            .join(format!("claude-stop-task-{outcome}.jsonl"));
+        let executable = executable_fixture(
+            temp,
+            &format!("claude-stop-task-{outcome}"),
+            CLAUDE_STOP_TASK_FIXTURE,
+        );
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(temp, "claudeAgent");
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_STOP_TASK_OUTCOME".to_owned(),
+            outcome.to_owned(),
+        );
+        let driver = Arc::new(
+            super::ClaudeDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("Claude stop-task driver"),
+        );
+        (driver, capture)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_targeted_activity_writes_only_stop_task_for_the_exact_target() {
+        // Mutation caught: falling back to root interrupt or sending a foreign target variant.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude stop-task fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "success").await;
+        assert!(
+            driver
+                .start()
+                .await
+                .expect("Claude start")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+
+        let wrong = ProviderActivityNativeTarget::codex_turn(
+            "child-thread".to_owned(),
+            "child-turn".to_owned(),
+        );
+        assert!(driver.cancel_activity_target(wrong).await.is_err());
+        assert!(
+            !capture.exists(),
+            "wrong target must fail before provider I/O"
+        );
+
+        assert_eq!(
+            driver
+                .cancel_activity_target(ProviderActivityNativeTarget::claude_task(
+                    "task-a".to_owned(),
+                ))
+                .await
+                .expect("exact stop_task"),
+            crate::activity::ActivityTargetDispatchDisposition::Delivered
+        );
+        let requests = std::fs::read_to_string(&capture).expect("captured stop_task request");
+        assert_eq!(requests.lines().count(), 1);
+        assert!(requests.contains("\"subtype\":\"stop_task\""));
+        assert!(requests.contains("\"task_id\":\"task-a\""));
+        assert!(!requests.contains("\"subtype\":\"interrupt\""));
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_authoritative_unsupported_downgrades_until_a_fresh_generation() {
+        // Mutation caught: retrying provider I/O after authoritative unsupported, or persisting it forever.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude unsupported fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "unsupported").await;
+        let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
+
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { provider })
+                if provider == "claudeAgent"
+        ));
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { provider })
+                if provider == "claudeAgent"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&capture)
+                .expect("unsupported request")
+                .lines()
+                .count(),
+            1,
+            "the downgraded generation must fail before another provider write"
+        );
+        assert!(
+            !driver
+                .start()
+                .await
+                .expect("downgraded start state")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+
+        driver
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable Activity");
+        driver
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("fresh Activity generation");
+        assert!(
+            driver
+                .start()
+                .await
+                .expect("fresh generation state")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&capture)
+                .expect("fresh unsupported request")
+                .lines()
+                .count(),
+            2
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_generic_stop_task_failure_does_not_downgrade_the_generation() {
+        // Mutation caught: treating every remote task failure as authoritative protocol unsupported.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude failure fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "failed").await;
+        let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
+
+        for _ in 0..2 {
+            let error = driver
+                .cancel_activity_target(target())
+                .await
+                .expect_err("generic failure");
+            assert_eq!(
+                error.to_string(),
+                "claudeAgent provider operation failed: targeted activity cancellation failed"
+            );
+            assert!(!format!("{error:?}").contains("task-private"));
+            assert!(
+                driver
+                    .start()
+                    .await
+                    .expect("capability remains")
+                    .activity_capabilities
+                    .targeted_actor_cancellation
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(capture)
+                .expect("failed requests")
+                .lines()
+                .count(),
+            2
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_timeout_and_closed_stop_task_do_not_downgrade_the_generation() {
+        // Mutation caught: permanently disabling targeted control for transient transport failures.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        for (outcome, expected_detail) in [
+            ("timeout", "targeted activity cancellation timed out"),
+            ("closed", "targeted activity cancellation connection closed"),
+        ] {
+            let temp = TempDir::new().expect("Claude transport failure fixture");
+            let (driver, capture) = claude_stop_task_driver(&temp, outcome).await;
+            let error = driver
+                .cancel_activity_target(ProviderActivityNativeTarget::claude_task(
+                    "task-private".to_owned(),
+                ))
+                .await
+                .expect_err("transport failure");
+            assert_eq!(
+                error.to_string(),
+                format!("claudeAgent provider operation failed: {expected_detail}")
+            );
+            assert!(!format!("{error:?}").contains("task-private"));
+            assert!(
+                driver
+                    .start()
+                    .await
+                    .expect("capability remains provisional")
+                    .activity_capabilities
+                    .targeted_actor_cancellation
+            );
+            assert_eq!(
+                std::fs::read_to_string(capture)
+                    .expect("captured request")
+                    .lines()
+                    .count(),
+                1
+            );
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
     #[tokio::test]
     async fn claude_options_acknowledge_the_exact_launch_vector_and_restart_only_fast_changes() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
@@ -9146,6 +10742,733 @@ done
             acknowledgement_receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn claude_exact_task_correlation_crosses_the_provider_control_bridge() {
+        // Mutation caught: dropping ClaudeRuntimeOutput activity controls before projection.
+        let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+            "claude-control-thread".to_owned(),
+            "claude-control-session".to_owned(),
+        )));
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
+        let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let facts = [
+            (
+                false,
+                json!({
+                    "type": "stream_event",
+                    "session_id": "claude-control-session",
+                    "uuid": "tool-event",
+                    "parent_tool_use_id": null,
+                    "event": {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Agent","input":{}}}
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"claude-control-session",
+                    "tool_name":"Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"async_launched","agentId":"agent-a"}
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "type":"system",
+                    "subtype":"task_started",
+                    "session_id":"claude-control-session",
+                    "task_id":"task-a",
+                    "tool_use_id":"tool-a",
+                    "task_type":"local_agent"
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"SubagentStart",
+                    "session_id":"claude-control-session",
+                    "agent_id":"agent-a",
+                    "agent_type":"Explore"
+                }),
+            ),
+        ];
+        for (authenticated, value) in facts {
+            assert!(
+                super::emit_claude_value(
+                    &runtime,
+                    "claude-control-thread",
+                    value,
+                    &event_sender,
+                    authenticated,
+                    &recovery_sender,
+                    &cancellation,
+                    &slot,
+                )
+                .await
+            );
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = event_receiver.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .filter(|event| !event.activity_controls.is_empty())
+                .all(|event| event.native_event_id.is_some())
+        );
+        assert_eq!(
+            events
+                .iter()
+                .flat_map(|event| event.activity_controls.0.iter())
+                .filter_map(|update| match update {
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id,
+                        target: Some(target),
+                    } => target
+                        .claude_task_id()
+                        .map(|task_id| (actor_id.as_str(), task_id)),
+                    ProviderActivityControlUpdate::ActorTarget { .. }
+                    | ProviderActivityControlUpdate::WorkTarget { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            [("claude:agent:agent-a", "task-a")]
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_control_keys_survive_the_real_event_pump_for_every_completing_fact() {
+        // Mutation caught: the emitter carries controls but the production pump drops an unkeyed batch.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let capabilities = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            background_work: false,
+            history_recovery: crate::activity::ActivityHistoryRecovery::None,
+            terminal_observation: false,
+            targeted_actor_cancellation: true,
+        };
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: capabilities.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (event_sender, event_receiver) = mpsc::channel(256);
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claude");
+        launch.thread_id = "t1".to_owned();
+        let generation = ActivityRuntimeGeneration::new();
+        let registration = Arc::new(
+            activity
+                .activity_control_registry()
+                .register_runtime_with_generation(
+                    ActivityScopeRef::Thread {
+                        thread_id: launch.thread_id.clone(),
+                    },
+                    format!("thread:{}", launch.thread_id),
+                    launch.provider_instance_id.clone(),
+                    generation,
+                ),
+        );
+        let activity_control = Arc::new(RwLock::new(Some(registration)));
+        let activity_lifecycle = Arc::new(StdMutex::new(
+            super::ProviderActivityLifecycleState::new(capabilities.clone()),
+        ));
+        super::ensure_live_activity_scope(
+            &activity,
+            &launch,
+            &activity_lifecycle,
+            &capabilities,
+            "claude-pump-live".to_owned(),
+        )
+        .await
+        .expect("live activity scope");
+        let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+            state,
+            events: tokio::sync::Mutex::new(event_receiver),
+        });
+        let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(256);
+        let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+        let pump_cancellation = tokio_util::sync::CancellationToken::new();
+        let pump = super::spawn_event_pump(
+            engine.clone(),
+            driver,
+            launch,
+            None,
+            None,
+            activity.clone(),
+            activity_lifecycle,
+            true,
+            activity_control,
+            activity_dispatch_sender,
+            "claude-pump-stream-ended".to_owned(),
+            pump_cancellation.clone(),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            terminal_sender,
+            Duration::from_secs(3_600),
+        );
+        let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        let mut orders = Vec::new();
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if order.iter().copied().collect::<HashSet<_>>().len() == 4 {
+                            orders.push(order);
+                        }
+                    }
+                }
+            }
+        }
+        for (index, order) in orders.iter().enumerate() {
+            let session = format!("claude-pump-session-{index}");
+            let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+                "t1".to_owned(),
+                session.clone(),
+            )));
+            let tool = format!("tool-pump-{index}");
+            let agent = format!("agent-pump-{index}");
+            let task = format!("task-pump-{index}");
+            let facts = [
+                (
+                    false,
+                    json!({
+                        "type":"stream_event","session_id":session,
+                        "uuid":format!("stream-{index}"),"parent_tool_use_id":null,
+                        "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool,"name":"Agent","input":{}}}
+                    }),
+                ),
+                (
+                    true,
+                    json!({
+                        "hook_event_name":"PostToolUse","session_id":session,
+                        "tool_name":"Agent","tool_use_id":tool,
+                        "tool_response":{"status":"async_launched","agentId":agent}
+                    }),
+                ),
+                (
+                    false,
+                    json!({
+                        "type":"system","subtype":"task_started","session_id":session,
+                        "task_id":task,"tool_use_id":tool,"task_type":"local_agent"
+                    }),
+                ),
+                (
+                    true,
+                    json!({
+                        "hook_event_name":"SubagentStart","session_id":session,
+                        "agent_id":agent,"agent_type":"Explore"
+                    }),
+                ),
+            ];
+            for fact in order {
+                let (authenticated, value) = &facts[*fact];
+                assert!(
+                    super::emit_claude_value(
+                        &runtime,
+                        "t1",
+                        value.clone(),
+                        &event_sender,
+                        *authenticated,
+                        &recovery_sender,
+                        &cancellation,
+                        &slot,
+                    )
+                    .await
+                );
+            }
+        }
+        let nested_runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+            "t1".to_owned(),
+            "claude-pump-nested-session".to_owned(),
+        )));
+        for (authenticated, value) in [
+            (
+                false,
+                json!({"type":"stream_event","session_id":"claude-pump-nested-session","uuid":"nested-parent-stream","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"nested-parent-tool","name":"Agent","input":{}}}}),
+            ),
+            (
+                true,
+                json!({"hook_event_name":"PostToolUse","session_id":"claude-pump-nested-session","tool_name":"Agent","tool_use_id":"nested-parent-tool","tool_response":{"status":"async_launched","agentId":"nested-parent-agent"}}),
+            ),
+            (
+                false,
+                json!({"type":"system","subtype":"task_started","session_id":"claude-pump-nested-session","task_id":"nested-parent-task","tool_use_id":"nested-parent-tool","task_type":"local_agent"}),
+            ),
+            (
+                true,
+                json!({"hook_event_name":"SubagentStart","session_id":"claude-pump-nested-session","agent_id":"nested-parent-agent","agent_type":"Explore"}),
+            ),
+            (
+                true,
+                json!({"hook_event_name":"PostToolUse","session_id":"claude-pump-nested-session","agent_id":"nested-parent-agent","tool_name":"Agent","tool_use_id":"nested-child-tool","tool_response":{"status":"async_launched","agentId":"nested-child-agent"}}),
+            ),
+            (
+                false,
+                json!({"type":"system","subtype":"task_started","session_id":"claude-pump-nested-session","task_id":"nested-child-task","tool_use_id":"nested-child-tool","task_type":"local_agent"}),
+            ),
+            (
+                true,
+                json!({"hook_event_name":"SubagentStart","session_id":"claude-pump-nested-session","agent_id":"nested-child-agent","parent_agent_id":"nested-parent-agent","agent_type":"Explore"}),
+            ),
+            (
+                false,
+                json!({"type":"stream_event","session_id":"claude-pump-nested-session","uuid":"nested-child-stream","parent_tool_use_id":"nested-parent-tool","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"nested-child-tool","name":"Agent","input":{}}}}),
+            ),
+        ] {
+            assert!(
+                super::emit_claude_value(
+                    &nested_runtime,
+                    "t1",
+                    value,
+                    &event_sender,
+                    authenticated,
+                    &recovery_sender,
+                    &cancellation,
+                    &slot,
+                )
+                .await
+            );
+        }
+        let projected = timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match activity.snapshot(&scope).await {
+                    Ok(snapshot)
+                        if snapshot.actors.len() >= orders.len() + 2
+                            && snapshot
+                                .control
+                                .actors
+                                .iter()
+                                .filter(|actor| {
+                                    actor.state
+                                        == crate::activity::ActivityActorControlState::Available
+                                })
+                                .count()
+                                >= orders.len() + 2 =>
+                    {
+                        break snapshot;
+                    }
+                    Ok(_) | Err(crate::activity::ActivityRepositoryError::NotFound) => {}
+                    Err(error) => panic!("pump snapshot: {error}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            projected.is_ok(),
+            "all actors projected; final snapshot: {:?}",
+            activity
+                .snapshot(&scope)
+                .await
+                .expect("final pump snapshot"),
+        );
+        let snapshot = projected.expect("all actors and controls projected");
+        let available = snapshot
+            .control
+            .actors
+            .iter()
+            .filter(|actor| actor.state == crate::activity::ActivityActorControlState::Available)
+            .count();
+        assert_eq!(
+            available,
+            orders.len() + 2,
+            "public controls: {:?}",
+            snapshot.control,
+        );
+        pump_cancellation.cancel();
+        pump.await.expect("event pump shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claude_poison_retirements_survive_the_real_event_pump() {
+        // Mutation caught: an accepted conflicting status/type retired in memory but had no pump key.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let capabilities = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            background_work: false,
+            history_recovery: crate::activity::ActivityHistoryRecovery::None,
+            terminal_observation: false,
+            targeted_actor_cancellation: true,
+        };
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: capabilities.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (event_sender, event_receiver) = mpsc::channel(64);
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claude");
+        launch.thread_id = "t1".to_owned();
+        let registration = Arc::new(
+            activity
+                .activity_control_registry()
+                .register_runtime_with_generation(
+                    ActivityScopeRef::Thread {
+                        thread_id: launch.thread_id.clone(),
+                    },
+                    format!("thread:{}", launch.thread_id),
+                    launch.provider_instance_id.clone(),
+                    ActivityRuntimeGeneration::new(),
+                ),
+        );
+        let activity_control = Arc::new(RwLock::new(Some(registration)));
+        let activity_lifecycle = Arc::new(StdMutex::new(
+            super::ProviderActivityLifecycleState::new(capabilities.clone()),
+        ));
+        super::ensure_live_activity_scope(
+            &activity,
+            &launch,
+            &activity_lifecycle,
+            &capabilities,
+            "claude-poison-live".to_owned(),
+        )
+        .await
+        .expect("live activity scope");
+        let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+            state,
+            events: tokio::sync::Mutex::new(event_receiver),
+        });
+        let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(64);
+        let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+        let pump_cancellation = tokio_util::sync::CancellationToken::new();
+        let pump = super::spawn_event_pump(
+            engine.clone(),
+            driver,
+            launch,
+            None,
+            None,
+            activity.clone(),
+            activity_lifecycle,
+            true,
+            activity_control,
+            activity_dispatch_sender,
+            "claude-poison-stream-ended".to_owned(),
+            pump_cancellation.clone(),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            terminal_sender,
+            Duration::from_secs(3_600),
+        );
+        let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let mut runtimes = Vec::new();
+        for index in 0..2 {
+            let session = format!("claude-poison-session-{index}");
+            let tool = format!("poison-tool-{index}");
+            let agent = format!("poison-agent-{index}");
+            let task = format!("poison-task-{index}");
+            let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+                "t1".to_owned(),
+                session.clone(),
+            )));
+            for (authenticated, value) in [
+                (
+                    false,
+                    json!({"type":"stream_event","session_id":session,"parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool,"name":"Agent","input":{}}}}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"PostToolUse","session_id":session,"tool_name":"Agent","tool_use_id":tool,"tool_response":{"status":"async_launched","agentId":agent}}),
+                ),
+                (
+                    false,
+                    json!({"type":"system","subtype":"task_started","session_id":session,"task_id":task,"tool_use_id":tool,"task_type":"local_agent"}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"SubagentStart","session_id":session,"agent_id":agent,"agent_type":"Explore"}),
+                ),
+            ] {
+                assert!(
+                    super::emit_claude_value(
+                        &runtime,
+                        "t1",
+                        value,
+                        &event_sender,
+                        authenticated,
+                        &recovery_sender,
+                        &cancellation,
+                        &slot,
+                    )
+                    .await
+                );
+            }
+            runtimes.push((runtime, session, tool, agent, task));
+        }
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("installed snapshot");
+                if snapshot
+                    .control
+                    .actors
+                    .iter()
+                    .filter(|actor| {
+                        actor.state == crate::activity::ActivityActorControlState::Available
+                    })
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both targets installed");
+        for (index, (runtime, session, tool, agent, task)) in runtimes.iter().enumerate() {
+            let conflict = if index == 0 {
+                json!({"hook_event_name":"PostToolUse","session_id":session,"tool_name":"Agent","tool_use_id":tool,"tool_response":{"status":"not async","agentId":agent}})
+            } else {
+                json!({"type":"system","subtype":"task_started","session_id":session,"task_id":task,"tool_use_id":tool,"task_type":"not local agent"})
+            };
+            assert!(
+                super::emit_claude_value(
+                    runtime,
+                    "t1",
+                    conflict,
+                    &event_sender,
+                    index == 0,
+                    &recovery_sender,
+                    &cancellation,
+                    &slot,
+                )
+                .await
+            );
+        }
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("retired snapshot");
+                if snapshot.control.actors.iter().all(|actor| {
+                    actor.state != crate::activity::ActivityActorControlState::Available
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both poison retirements survive the production pump");
+        let snapshot = activity
+            .snapshot(&scope)
+            .await
+            .expect("final poison snapshot");
+        assert_eq!(
+            snapshot.actors.len(),
+            2,
+            "conflict must not widen the graph"
+        );
+        pump_cancellation.cancel();
+        pump.await.expect("event pump shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claude_terminal_control_keys_survive_the_real_event_pump() {
+        // Mutation caught: unkeyed task notifications are dropped before lifecycle/target projection.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let capabilities = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            background_work: false,
+            history_recovery: crate::activity::ActivityHistoryRecovery::None,
+            terminal_observation: false,
+            targeted_actor_cancellation: false,
+        };
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: capabilities.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (event_sender, event_receiver) = mpsc::channel(64);
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claude");
+        launch.thread_id = "t1".to_owned();
+        let generation = ActivityRuntimeGeneration::new();
+        let registration = Arc::new(
+            activity
+                .activity_control_registry()
+                .register_runtime_with_generation(
+                    ActivityScopeRef::Thread {
+                        thread_id: launch.thread_id.clone(),
+                    },
+                    format!("thread:{}", launch.thread_id),
+                    launch.provider_instance_id.clone(),
+                    generation,
+                ),
+        );
+        let activity_control = Arc::new(RwLock::new(Some(registration)));
+        let activity_lifecycle = Arc::new(StdMutex::new(
+            super::ProviderActivityLifecycleState::new(capabilities.clone()),
+        ));
+        super::ensure_live_activity_scope(
+            &activity,
+            &launch,
+            &activity_lifecycle,
+            &capabilities,
+            "claude-terminal-live".to_owned(),
+        )
+        .await
+        .expect("live activity scope");
+        let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+            state,
+            events: tokio::sync::Mutex::new(event_receiver),
+        });
+        let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(64);
+        let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+        let pump_cancellation = tokio_util::sync::CancellationToken::new();
+        let pump = super::spawn_event_pump(
+            engine.clone(),
+            driver,
+            launch,
+            None,
+            None,
+            activity.clone(),
+            activity_lifecycle,
+            true,
+            activity_control,
+            activity_dispatch_sender,
+            "claude-terminal-stream-ended".to_owned(),
+            pump_cancellation.clone(),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            terminal_sender,
+            Duration::from_secs(3_600),
+        );
+        let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        for (index, (status, _)) in [
+            ("stopped", ActivityLifecycle::Cancelled),
+            ("failed", ActivityLifecycle::Failed),
+            ("interrupted", ActivityLifecycle::Interrupted),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = format!("claude-terminal-session-{index}");
+            let runtime = Arc::new(tokio::sync::Mutex::new(
+                crate::provider::claude::ClaudeProviderRuntime::new(
+                    "t1".to_owned(),
+                    session.clone(),
+                ),
+            ));
+            let facts = [
+                (
+                    false,
+                    json!({"type":"stream_event","session_id":session,"uuid":format!("stream-{index}"),"parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":format!("tool-{index}"),"name":"Agent","input":{}}}}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"PostToolUse","session_id":session,"tool_name":"Agent","tool_use_id":format!("tool-{index}"),"tool_response":{"status":"async_launched","agentId":format!("agent-{index}")}}),
+                ),
+                (
+                    false,
+                    json!({"type":"system","subtype":"task_started","session_id":session,"task_id":format!("task-{index}"),"tool_use_id":format!("tool-{index}"),"task_type":"local_agent"}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"SubagentStart","session_id":session,"agent_id":format!("agent-{index}"),"agent_type":"Explore"}),
+                ),
+            ];
+            for (authenticated, value) in facts {
+                assert!(
+                    super::emit_claude_value(
+                        &runtime,
+                        "t1",
+                        value,
+                        &event_sender,
+                        authenticated,
+                        &recovery_sender,
+                        &cancellation,
+                        &slot
+                    )
+                    .await
+                );
+            }
+            assert!(super::emit_claude_value(
+                &runtime,
+                "t1",
+                json!({"type":"system","subtype":"task_notification","session_id":session,"task_id":format!("task-{index}"),"status":status}),
+                &event_sender,
+                false,
+                &recovery_sender,
+                &cancellation,
+                &slot,
+            ).await);
+        }
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        let snapshot = timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match activity.snapshot(&scope).await {
+                    Ok(snapshot)
+                        if snapshot.actors.len() == 3
+                            && snapshot
+                                .actors
+                                .iter()
+                                .all(|actor| actor.status.is_terminal()) =>
+                    {
+                        break snapshot;
+                    }
+                    Ok(_) | Err(crate::activity::ActivityRepositoryError::NotFound) => {}
+                    Err(error) => panic!("terminal snapshot: {error}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal notifications projected");
+        for (index, (_, expected)) in [
+            ("stopped", ActivityLifecycle::Cancelled),
+            ("failed", ActivityLifecycle::Failed),
+            ("interrupted", ActivityLifecycle::Interrupted),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                snapshot
+                    .actors
+                    .iter()
+                    .find(|actor| actor.id == format!("claude:agent:agent-{index}"))
+                    .map(|actor| actor.status),
+                Some(expected)
+            );
+        }
+        assert!(
+            snapshot.control.actors.iter().all(|actor| {
+                actor.state != crate::activity::ActivityActorControlState::Available
+            })
+        );
+        pump_cancellation.cancel();
+        pump.await.expect("event pump shutdown");
+        engine.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -9695,6 +12018,1662 @@ done
     }
 
     #[tokio::test]
+    async fn activity_cancellation_queue_and_response_drop_map_to_safe_categories() {
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "thread-activity-cancel".to_owned(),
+        };
+        let generation = ActivityRuntimeGeneration::new();
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let supervisor = super::ProviderRuntimeSupervisor {
+            sender,
+            stopped: tokio_util::sync::CancellationToken::new(),
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
+            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+        };
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope.clone(),
+                    generation.clone(),
+                    ProviderActivityNativeTarget::claude_task("native-task".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::ProviderUnavailable)
+        );
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor {
+            sender,
+            stopped: tokio_util::sync::CancellationToken::new(),
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
+            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+        };
+        let drop_response = tokio::spawn(async move {
+            let Some(super::SupervisorMessage::CancelActivityTarget { response, .. }) =
+                receiver.recv().await
+            else {
+                panic!("targeted cancellation message");
+            };
+            drop(response);
+        });
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope,
+                    generation,
+                    ProviderActivityNativeTarget::codex_turn(
+                        "native-thread".to_owned(),
+                        "native-turn".to_owned(),
+                    ),
+                )
+                .await,
+            Err(ActivityDispatchError::ProviderUnavailable)
+        );
+        drop_response.await.expect("drop response worker");
+
+        let unpolled = supervisor.cancel_target(
+            ActivityScopeRef::Thread {
+                thread_id: "never-polled".to_owned(),
+            },
+            ActivityRuntimeGeneration::new(),
+            ProviderActivityNativeTarget::codex_turn(
+                "native-thread-dropped".to_owned(),
+                "native-turn-dropped".to_owned(),
+            ),
+        );
+        drop(unpolled);
+    }
+
+    #[tokio::test]
+    async fn targeted_activity_dispatches_the_exact_private_target_to_only_the_fenced_session() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create", "commandId":"thread-two", "threadId":"t2",
+                    "projectId":"p1", "title":"Thread two", "kind":"workspace",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "branch":null, "worktreePath":null,
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .expect("second thread command"),
+            )
+            .await
+            .expect("second thread");
+        let first = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let second = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let (_first_tx, first_rx) = mpsc::channel(1);
+        let (_second_tx, second_rx) = mpsc::channel(1);
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SequencedSupervisorFactory {
+                drivers: StdMutex::new(std::collections::VecDeque::from([
+                    (first.clone(), first_rx),
+                    (second.clone(), second_rx),
+                ])),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut first_launch = native_launch(&temp, "codex");
+        first_launch.thread_id = "t1".to_owned();
+        supervisor.launch(first_launch).await.expect("first launch");
+        let mut second_launch = native_launch(&temp, "codex");
+        second_launch.thread_id = "t2".to_owned();
+        supervisor
+            .launch(second_launch)
+            .await
+            .expect("second launch");
+
+        let generation = supervisor
+            .activity_runtime_generation("t1")
+            .await
+            .expect("first generation");
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    ActivityScopeRef::Thread {
+                        thread_id: "t1".to_owned(),
+                    },
+                    generation,
+                    ProviderActivityNativeTarget::codex_turn(
+                        "native-child-thread".to_owned(),
+                        "native-child-turn".to_owned(),
+                    ),
+                )
+                .await,
+            Ok(super::ActivityTargetDispatchDisposition::Delivered)
+        );
+        assert_eq!(
+            first.lock().unwrap().targeted_calls,
+            ["codex:native-child-thread:native-child-turn"]
+        );
+        assert!(second.lock().unwrap().targeted_calls.is_empty());
+        assert_eq!(first.lock().unwrap().interrupts, 0);
+        assert_eq!(second.lock().unwrap().interrupts, 0);
+
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    ActivityScopeRef::Thread {
+                        thread_id: "t1".to_owned(),
+                    },
+                    ActivityRuntimeGeneration::new(),
+                    ProviderActivityNativeTarget::claude_task("unrelated-task".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::TargetUnavailable)
+        );
+        assert_eq!(first.lock().unwrap().targeted_calls.len(), 1);
+        assert!(second.lock().unwrap().targeted_calls.is_empty());
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claude_targeted_unsupported_clears_the_current_overlay_before_returning() {
+        // Mutation caught: leaving sibling targets available or issuing another provider call after downgrade.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            targeted_unsupported_after: Some(1),
+            activity_capabilities: crate::activity::ActivityCapabilities {
+                actors: true,
+                attributed_activity: true,
+                background_work: false,
+                history_recovery: crate::activity::ActivityHistoryRecovery::None,
+                terminal_observation: false,
+                targeted_actor_cancellation: true,
+            },
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let generation = supervisor
+            .activity_runtime_generation("t1")
+            .await
+            .expect("runtime generation");
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("claude-targets".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:a", None, "A", "running")
+                        .expect("actor a"),
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:b",
+                        Some("actor:a"),
+                        "B",
+                        "running",
+                    )
+                    .expect("actor b"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:a".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-a".to_owned(),
+                        )),
+                    },
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:b".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-b".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("target batch");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("target snapshot");
+                if snapshot.control.actors.len() == 2
+                    && snapshot.control.actors.iter().all(|actor| {
+                        actor.state == crate::activity::ActivityActorControlState::Available
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both Claude targets become available");
+
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope.clone(),
+                    generation.clone(),
+                    ProviderActivityNativeTarget::claude_task("task-a".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::TargetUnavailable)
+        );
+        let downgraded = activity
+            .snapshot(&scope)
+            .await
+            .expect("downgraded snapshot");
+        assert!(!downgraded.capabilities.targeted_actor_cancellation);
+        assert!(downgraded.control.actors.iter().all(|actor| {
+            actor.state == crate::activity::ActivityActorControlState::Unsupported
+        }));
+
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope,
+                    generation,
+                    ProviderActivityNativeTarget::claude_task("task-b".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::TargetUnavailable)
+        );
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+        assert_eq!(state.lock().unwrap().interrupts, 0);
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn targeted_activity_response_drop_cancels_held_provider_io() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            targeted_hold_after: Some(1),
+            targeted_entered: Some(entered.clone()),
+            targeted_release: Some(release.clone()),
+            targeted_active: active.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let generation = supervisor
+            .activity_runtime_generation("t1")
+            .await
+            .expect("runtime generation");
+        let dispatch_supervisor = supervisor.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_supervisor
+                .cancel_target(
+                    ActivityScopeRef::Thread {
+                        thread_id: "t1".to_owned(),
+                    },
+                    generation,
+                    ProviderActivityNativeTarget::codex_turn(
+                        "native-child-thread".to_owned(),
+                        "native-child-turn".to_owned(),
+                    ),
+                )
+                .await
+        });
+        timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("provider I/O entered");
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        dispatch.abort();
+        let _ = dispatch.await;
+        timeout(std::time::Duration::from_secs(2), async {
+            while active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped response cancels provider I/O");
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+        assert_eq!(state.lock().unwrap().interrupts, 0);
+        release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn post_reenable_provider_batches_use_fresh_generation_for_late_children() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        activity.agent_activity_controller().disable().await;
+        supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable runtime activity");
+        activity.agent_activity_controller().enable();
+        supervisor
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("re-enable runtime activity");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("batch-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("root snapshot");
+                if snapshot.actors.len() == 1 && snapshot.control.actors.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root batch projected");
+        cancellation
+            .cancel_subtree(scope.clone(), "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("batch-late".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:late",
+                        Some("actor:root"),
+                        "Late child",
+                        "running",
+                    )
+                    .expect("late mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:late".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-late-thread".to_owned(),
+                            "native-late-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("late batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            while state.lock().unwrap().targeted_calls.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late child dispatched");
+
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("batch-terminal".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::set_actor_status("actor:root", "completed")
+                        .expect("terminal root"),
+                    ProviderActivityMutation::set_actor_status("actor:late", "completed")
+                        .expect("terminal child"),
+                ],
+                activity_controls: super::ProviderActivityControls::default(),
+            })
+            .await
+            .expect("terminal batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("terminal snapshot");
+                if snapshot.control.operations.is_empty()
+                    && snapshot
+                        .actors
+                        .iter()
+                        .all(|actor| actor.status.is_terminal())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal residuals retired");
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 2);
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_activity_handoff_cancellation_does_not_enqueue_or_block() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let generation = ActivityRuntimeGeneration::new();
+        sender
+            .send(super::ActivityDispatchEnvelope {
+                thread_id: "t1".to_owned(),
+                generation: generation.clone(),
+                jobs: Vec::new(),
+            })
+            .await
+            .expect("fill bounded handoff");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let send_cancellation = cancellation.clone();
+        let send = tokio::spawn(async move {
+            super::send_activity_dispatch_envelope(
+                &sender,
+                &send_cancellation,
+                super::ActivityDispatchEnvelope {
+                    thread_id: "t1".to_owned(),
+                    generation,
+                    jobs: Vec::new(),
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "full handoff must backpressure");
+        cancellation.cancel();
+        assert!(
+            !timeout(std::time::Duration::from_secs(2), send)
+                .await
+                .expect("cancelled handoff returns")
+                .expect("handoff task"),
+            "cancelled handoff must report that it did not enqueue"
+        );
+        assert_eq!(receiver.len(), 1);
+        receiver
+            .recv()
+            .await
+            .expect("first envelope remains queued");
+        assert!(receiver.try_recv().is_err());
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        assert!(
+            !super::send_activity_dispatch_envelope(
+                &closed_sender,
+                &tokio_util::sync::CancellationToken::new(),
+                super::ActivityDispatchEnvelope {
+                    thread_id: "t1".to_owned(),
+                    generation: ActivityRuntimeGeneration::new(),
+                    jobs: Vec::new(),
+                },
+            )
+            .await,
+            "closed handoff must fail without blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_activity_completion_id_cannot_remove_current_generation_handle() {
+        let current_generation = ActivityRuntimeGeneration::new();
+        let stale_generation = ActivityRuntimeGeneration::new();
+        let task_id = super::ActivityDispatchTaskId(7);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = release.clone();
+        let mut tasks = std::collections::HashMap::from([(
+            task_id,
+            tokio::spawn(async move {
+                task_release.notified().await;
+            }),
+        )]);
+
+        assert!(
+            !super::reap_activity_dispatch_task(
+                &current_generation,
+                &mut tasks,
+                &stale_generation,
+                task_id,
+            )
+            .await
+        );
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[&task_id].is_finished());
+
+        release.notify_one();
+        assert!(
+            super::reap_activity_dispatch_task(
+                &current_generation,
+                &mut tasks,
+                &current_generation,
+                task_id,
+            )
+            .await
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_activity_completion_id_is_idempotent() {
+        let generation = ActivityRuntimeGeneration::new();
+        let task_id = super::ActivityDispatchTaskId(11);
+        let mut tasks = std::collections::HashMap::from([(task_id, tokio::spawn(async {}))]);
+
+        assert!(
+            super::reap_activity_dispatch_task(&generation, &mut tasks, &generation, task_id,)
+                .await
+        );
+        assert!(
+            !super::reap_activity_dispatch_task(&generation, &mut tasks, &generation, task_id,)
+                .await
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_received_before_task_return_reaps_exact_handle_and_wakes_capacity() {
+        const LATE_BATCH_COUNT: usize = 5;
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let completion_hook = super::ActivityDispatchCompletionTestHook {
+            hold_before_return: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sent: Arc::new(tokio::sync::Notify::new()),
+            received: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let supervisor = super::ProviderRuntimeSupervisor::start_inner(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions {
+                queue_capacity: 1,
+                ..super::SupervisorOptions::default()
+            },
+            None,
+            Some(completion_hook.clone()),
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("completion-race-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if activity
+                    .snapshot(&scope)
+                    .await
+                    .expect("root snapshot")
+                    .control
+                    .actors
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root control");
+        cancellation
+            .cancel_subtree(scope, "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+
+        let late_event = |index: usize| {
+            let actor_id = format!("actor:completion-race:{index}");
+            super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new(format!("completion-race-{index}"))
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        actor_id.clone(),
+                        Some("actor:root"),
+                        format!("Late {index}"),
+                        "running",
+                    )
+                    .expect("late mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id,
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            format!("native-completion-thread-{index}"),
+                            format!("native-completion-turn-{index}"),
+                        )),
+                    },
+                ]),
+            }
+        };
+        events_tx
+            .send(late_event(0))
+            .await
+            .expect("first late batch");
+        timeout(
+            std::time::Duration::from_secs(2),
+            completion_hook.sent.notified(),
+        )
+        .await
+        .expect("completion sent before aggregate task return");
+        timeout(
+            std::time::Duration::from_secs(2),
+            completion_hook.received.notified(),
+        )
+        .await
+        .expect("supervisor received early completion");
+
+        let producer = tokio::spawn(async move {
+            for index in 1..LATE_BATCH_COUNT {
+                events_tx
+                    .send(late_event(index))
+                    .await
+                    .expect("queued late batch");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !producer.is_finished(),
+            "capacity-one handoff must backpressure while the first handle is owned"
+        );
+
+        completion_hook.release.notify_one();
+        timeout(std::time::Duration::from_secs(2), producer)
+            .await
+            .expect("exact completion wakes bounded capacity")
+            .expect("late producer");
+        timeout(std::time::Duration::from_secs(2), async {
+            while state.lock().unwrap().targeted_calls.len() != LATE_BATCH_COUNT + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every exact target dispatched once");
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.interrupts, 0);
+            for index in 0..LATE_BATCH_COUNT {
+                assert_eq!(
+                    state
+                        .targeted_calls
+                        .iter()
+                        .filter(|target| {
+                            target.as_str()
+                                == format!(
+                                    "codex:native-completion-thread-{index}:native-completion-turn-{index}"
+                                )
+                        })
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn late_job_handoff_backpressures_at_configured_capacity_without_dropping_targets() {
+        const LATE_BATCH_COUNT: usize = 16;
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let send_gate = Arc::new(tokio::sync::Notify::new());
+        let send_entered = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            send_gate: Some(send_gate.clone()),
+            send_entered: Some(send_entered.clone()),
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions {
+                queue_capacity: 2,
+                ..super::SupervisorOptions::default()
+            },
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("saturation-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if activity
+                    .snapshot(&scope)
+                    .await
+                    .expect("root snapshot")
+                    .control
+                    .actors
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root control");
+        cancellation
+            .cancel_subtree(scope, "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+
+        let blocked_supervisor = supervisor.clone();
+        let blocked_command = tokio::spawn(async move {
+            blocked_supervisor
+                .handle_orchestration(
+                    serde_json::from_value(json!({
+                        "type":"thread.turn.start", "commandId":"block-supervisor",
+                        "threadId":"t1",
+                        "message":{"messageId":"message","role":"user","text":"hold","attachments":[]},
+                        "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                        "runtimeMode":"full-access", "interactionMode":"default",
+                        "createdAt":"2026-07-16T00:00:00Z"
+                    }))
+                    .expect("blocking command"),
+                )
+                .await
+        });
+        timeout(std::time::Duration::from_secs(2), send_entered.notified())
+            .await
+            .expect("supervisor stalled in provider send");
+
+        let producer = tokio::spawn(async move {
+            for index in 0..LATE_BATCH_COUNT {
+                let actor_id = format!("actor:late:{index}");
+                events_tx
+                    .send(super::ProviderEvent {
+                        native_event_id: Some(
+                            super::ProviderNativeEventId::new(format!("saturation-{index}"))
+                                .expect("native event id"),
+                        ),
+                        event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                        thread_id: "t1".to_owned(),
+                        turn_id: None,
+                        item_id: None,
+                        request_id: None,
+                        payload: json!({}),
+                        activity: vec![
+                            ProviderActivityMutation::upsert_actor(
+                                actor_id.clone(),
+                                Some("actor:root"),
+                                format!("Late {index}"),
+                                "running",
+                            )
+                            .expect("late mutation"),
+                        ],
+                        activity_controls: super::ProviderActivityControls::from_updates(vec![
+                            ProviderActivityControlUpdate::ActorTarget {
+                                actor_id,
+                                target: Some(ProviderActivityNativeTarget::codex_turn(
+                                    format!("native-late-thread-{index}"),
+                                    format!("native-late-turn-{index}"),
+                                )),
+                            },
+                        ]),
+                    })
+                    .await
+                    .expect("late batch");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !producer.is_finished(),
+            "late-job producer bypassed the bounded supervisor handoff"
+        );
+
+        send_gate.notify_waiters();
+        blocked_command
+            .await
+            .expect("blocking task")
+            .expect("blocking command completes");
+        timeout(std::time::Duration::from_secs(2), producer)
+            .await
+            .expect("backpressured producer resumes")
+            .expect("producer task");
+        timeout(std::time::Duration::from_secs(2), async {
+            while state.lock().unwrap().targeted_calls.len() != LATE_BATCH_COUNT + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every admitted exact target dispatched");
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.interrupts, 0);
+            for index in 0..LATE_BATCH_COUNT {
+                assert!(state.targeted_calls.contains(&format!(
+                    "codex:native-late-thread-{index}:native-late-turn-{index}"
+                )));
+            }
+        }
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    async fn establish_held_late_activity(
+        engine: &super::OrchestrationEngine,
+        activity: &super::ActivityProjection,
+        supervisor: &super::ProviderRuntimeSupervisor,
+        state: &Arc<StdMutex<SupervisorDriverState>>,
+        events_tx: &mpsc::Sender<super::ProviderEvent>,
+    ) -> (
+        ActivityCancellationService,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+    ) {
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("held-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root event");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if activity
+                    .snapshot(&scope)
+                    .await
+                    .expect("root snapshot")
+                    .control
+                    .actors
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root control");
+        cancellation
+            .cancel_subtree(scope, "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("held-child".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:held",
+                        Some("actor:root"),
+                        "Held child",
+                        "running",
+                    )
+                    .expect("held child mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:held".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-held-thread".to_owned(),
+                            "native-held-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("held event");
+        let (entered, release, active) = {
+            let state = state.lock().unwrap();
+            (
+                state.targeted_entered.clone().expect("entered gate"),
+                state.targeted_release.clone().expect("release gate"),
+                state.targeted_active.clone(),
+            )
+        };
+        timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("held late dispatch entered");
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let root = load_snapshot(&engine.repositories())
+            .await
+            .expect("root remains readable");
+        assert!(root.messages.is_empty());
+        (cancellation, release, active)
+    }
+
+    fn held_late_driver_state() -> Arc<StdMutex<SupervisorDriverState>> {
+        Arc::new(StdMutex::new(SupervisorDriverState {
+            targeted_hold_after: Some(2),
+            targeted_entered: Some(Arc::new(tokio::sync::Notify::new())),
+            targeted_release: Some(Arc::new(tokio::sync::Notify::new())),
+            targeted_active: Arc::new(AtomicUsize::new(0)),
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }))
+    }
+
+    struct HeldLateRuntime {
+        engine: super::OrchestrationEngine,
+        activity: super::ActivityProjection,
+        supervisor: super::ProviderRuntimeSupervisor,
+        state: Arc<StdMutex<SupervisorDriverState>>,
+        release: Arc<tokio::sync::Notify>,
+        active: Arc<AtomicUsize>,
+        cancellation: ActivityCancellationService,
+    }
+
+    async fn start_held_late_runtime() -> HeldLateRuntime {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = held_late_driver_state();
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let (cancellation, release, active) =
+            establish_held_late_activity(&engine, &activity, &supervisor, &state, &events_tx).await;
+        HeldLateRuntime {
+            engine,
+            activity,
+            supervisor,
+            state,
+            release,
+            active,
+            cancellation,
+        }
+    }
+
+    async fn assert_held_dispatch_was_reaped(runtime: &HeldLateRuntime) {
+        assert_eq!(runtime.active.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.state.lock().unwrap().targeted_calls.len(), 2);
+        runtime.release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(runtime.active.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.state.lock().unwrap().targeted_calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn activity_disablement_cancels_and_reaps_held_late_dispatch_before_returning() {
+        let runtime = start_held_late_runtime().await;
+        runtime.activity.agent_activity_controller().disable().await;
+        timeout(
+            std::time::Duration::from_secs(2),
+            runtime.supervisor.set_agent_activity_enabled(false),
+        )
+        .await
+        .expect("disable returns")
+        .expect("disable succeeds");
+        assert_held_dispatch_was_reaped(&runtime).await;
+        assert!(
+            runtime
+                .supervisor
+                .activity_runtime_generation("t1")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .cancellation
+                .retry_subtree_cancellation(
+                    ActivityScopeRef::Thread {
+                        thread_id: "t1".to_owned(),
+                    },
+                    "thread:t1",
+                    "actor:root",
+                    1,
+                )
+                .await,
+            Err(ActivityCancellationError::StaleOperation)
+        );
+        runtime
+            .supervisor
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        runtime.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_stop_cancels_and_reaps_held_late_dispatch_before_returning() {
+        let runtime = start_held_late_runtime().await;
+        timeout(
+            std::time::Duration::from_secs(2),
+            runtime.supervisor.handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.session.stop", "commandId":"stop-held", "threadId":"t1",
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .expect("stop command"),
+            ),
+        )
+        .await
+        .expect("stop returns")
+        .expect("stop succeeds");
+        assert_held_dispatch_was_reaped(&runtime).await;
+        runtime
+            .supervisor
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        runtime.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_restart_cancels_and_reaps_held_late_dispatch_before_replacement_launch() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let first = held_late_driver_state();
+        first.lock().unwrap().set_mode_unsupported = true;
+        let replacement = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (first_tx, first_rx) = mpsc::channel(4);
+        let (_replacement_tx, replacement_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SequencedSupervisorFactory {
+                drivers: StdMutex::new(std::collections::VecDeque::from([
+                    (first.clone(), first_rx),
+                    (replacement.clone(), replacement_rx),
+                ])),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let (_cancellation, release, active) =
+            establish_held_late_activity(&engine, &activity, &supervisor, &first, &first_tx).await;
+
+        timeout(
+            std::time::Duration::from_secs(2),
+            supervisor.handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+                command_id: "restart-held".to_owned(),
+                thread_id: "t1".to_owned(),
+                runtime_mode: "full-access".to_owned(),
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+            }),
+        )
+        .await
+        .expect("restart returns")
+        .expect("restart succeeds");
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(first.lock().unwrap().targeted_calls.len(), 2);
+        assert_eq!(replacement.lock().unwrap().launches, 1);
+        release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(first.lock().unwrap().targeted_calls.len(), 2);
+        assert!(replacement.lock().unwrap().targeted_calls.is_empty());
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_cancels_and_reaps_held_late_dispatch_before_returning() {
+        let runtime = start_held_late_runtime().await;
+        timeout(
+            std::time::Duration::from_secs(2),
+            runtime.supervisor.shutdown(),
+        )
+        .await
+        .expect("shutdown returns")
+        .expect("shutdown succeeds");
+        assert_held_dispatch_was_reaped(&runtime).await;
+        runtime.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn post_reenable_projection_failure_invalidates_fresh_controls_and_suppresses_dispatch() {
+        // Mutation caught: retaining the committed control overlay and dispatching its late-child
+        // job after the durable Activity projection rejects the same provider batch.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        assert!(activity.agent_activity_controller().snapshot().enabled);
+        let targeted_entered = Arc::new(tokio::sync::Notify::new());
+        let targeted_release = Arc::new(tokio::sync::Notify::new());
+        let targeted_active = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            targeted_hold_after: Some(1),
+            targeted_entered: Some(targeted_entered.clone()),
+            targeted_release: Some(targeted_release.clone()),
+            targeted_active: targeted_active.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        activity.agent_activity_controller().disable().await;
+        supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable runtime activity");
+        activity.agent_activity_controller().enable();
+        supervisor
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("re-enable runtime activity");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("activity-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root event");
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: None,
+                event_type: "activity-root-barrier".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: Vec::new(),
+                activity_controls: Default::default(),
+            })
+            .await
+            .expect("root barrier");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if load_snapshot(&engine.repositories())
+                    .await
+                    .expect("root snapshot")
+                    .activities
+                    .iter()
+                    .any(|event| event.summary == "activity-root-barrier")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root barrier projected");
+        let root_snapshot = timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("activity snapshot");
+                if snapshot.revision >= 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root target projected");
+        assert_eq!(root_snapshot.actors.len(), 1);
+        assert_eq!(root_snapshot.control.actors.len(), 1);
+        assert_eq!(
+            root_snapshot.control.actors[0].state,
+            crate::activity::ActivityActorControlState::Available
+        );
+        let direct_cancellation = cancellation.clone();
+        let direct_scope = scope.clone();
+        let direct_dispatch = tokio::spawn(async move {
+            direct_cancellation
+                .cancel_subtree(direct_scope, "thread:t1", "actor:root", 1)
+                .await
+        });
+        timeout(
+            std::time::Duration::from_secs(2),
+            targeted_entered.notified(),
+        )
+        .await
+        .expect("held direct dispatch entered");
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+        assert_eq!(targeted_active.load(Ordering::Acquire), 1);
+
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("activity-held-late".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:held",
+                        Some("actor:root"),
+                        "Held late child",
+                        "running",
+                    )
+                    .expect("held child mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:held".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-held-thread".to_owned(),
+                            "native-held-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("held late event");
+        timeout(
+            std::time::Duration::from_secs(2),
+            targeted_entered.notified(),
+        )
+        .await
+        .expect("held late dispatch entered");
+        assert_eq!(targeted_active.load(Ordering::Acquire), 2);
+
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_targeted_activity_apply
+                     BEFORE INSERT ON activity_journal
+                     BEGIN
+                       SELECT RAISE(FAIL, 'injected targeted activity apply failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("install apply failure");
+        let failed_event = super::ProviderEvent {
+            native_event_id: Some(
+                super::ProviderNativeEventId::new("activity-late-failure".to_owned())
+                    .expect("native event id"),
+            ),
+            event_type: "provider.activity-apply-failed".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: None,
+            item_id: None,
+            request_id: None,
+            payload: json!({}),
+            activity: vec![
+                ProviderActivityMutation::upsert_actor(
+                    "actor:late",
+                    Some("actor:root"),
+                    "Late child",
+                    "running",
+                )
+                .expect("late child mutation"),
+            ],
+            activity_controls: super::ProviderActivityControls(vec![
+                ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor:late".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "private-late-thread".to_owned(),
+                        "private-late-turn".to_owned(),
+                    )),
+                },
+            ]),
+        };
+        let diagnostic = format!("{failed_event:?}");
+        assert!(!diagnostic.contains("private-late-thread"));
+        assert!(!diagnostic.contains("private-late-turn"));
+        assert!(diagnostic.len() < 2_048);
+        events_tx.send(failed_event).await.expect("failed batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if load_snapshot(&engine.repositories())
+                    .await
+                    .expect("root snapshot")
+                    .activities
+                    .iter()
+                    .any(|event| event.summary == "provider.activity-apply-failed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("chat event continues after activity failure");
+        tokio::task::yield_now().await;
+
+        let snapshot = activity.snapshot(&scope).await.expect("failed snapshot");
+        assert_eq!(snapshot.actors.len(), 2);
+        assert!(snapshot.actors.iter().any(|actor| actor.id == "actor:root"));
+        assert!(snapshot.actors.iter().any(|actor| actor.id == "actor:held"));
+        assert!(snapshot.control.operations.is_empty());
+        assert!(snapshot.control.actors.iter().all(|actor| {
+            actor.state == crate::activity::ActivityActorControlState::Unsupported
+        }));
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 2);
+        let orphaned = targeted_active.load(Ordering::Acquire) != 0;
+        targeted_release.notify_waiters();
+        timeout(std::time::Duration::from_secs(2), async {
+            while targeted_active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release held late dispatch");
+        assert!(
+            !orphaned,
+            "projection failure left direct or late provider I/O active"
+        );
+        direct_dispatch
+            .await
+            .expect("direct cancellation task")
+            .expect("direct cancellation admission remains bounded");
+        assert_eq!(
+            cancellation
+                .retry_subtree_cancellation(scope, "thread:t1", "actor:root", 1)
+                .await,
+            Err(ActivityCancellationError::StaleOperation)
+        );
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn native_factory_attributes_provider_until_child_exit() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
@@ -9858,6 +13837,7 @@ done
                     request_id: None,
                     payload,
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -9913,6 +13893,7 @@ done
                     request_id: None,
                     payload,
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -11155,6 +15136,7 @@ done
             request_id: None,
             payload: json!({"streamKind":"assistant_text","delta":"First."}),
             activity: Vec::new(),
+            activity_controls: Default::default(),
         };
         assert_eq!(
             super::assistant_message_id(&identified),
@@ -11192,6 +15174,7 @@ done
                 request_id: None,
                 payload: json!({}),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             };
             assert_eq!(
                 super::assistant_message_id(&event),
@@ -11208,6 +15191,7 @@ done
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
+            activity_controls: Default::default(),
         };
         assert_eq!(
             super::assistant_message_id(&event),
@@ -11227,6 +15211,7 @@ done
                 request_id: None,
                 payload: json!({}),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             })
         };
 
@@ -11258,6 +15243,7 @@ done
             request_id: None,
             payload,
             activity: Vec::new(),
+            activity_controls: Default::default(),
         };
         assert_eq!(
             super::assistant_message_id(&event(json!({"messageId":"message-1"}), Some("turn-1"))),
@@ -11344,6 +15330,7 @@ done
                     }
                 }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await
@@ -11392,6 +15379,7 @@ done
                 request_id: None,
                 payload: json!({ "usage": {} }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await
@@ -11429,6 +15417,7 @@ done
                     "servers": [{ "name": "context7", "state": "connected" }]
                 }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await
@@ -11859,6 +15848,50 @@ done
             super::event_activity_shape("turn.completed"),
             ("info", "provider.turn")
         );
+    }
+
+    #[test]
+    fn codex_targeted_activity_accepts_only_exact_codex_turn_handles() {
+        // Mutation caught: routing another provider's target into Codex or widening to root interrupt.
+        let codex = ProviderActivityNativeTarget::codex_turn(
+            "child-thread-2".to_owned(),
+            "child-turn-7".to_owned(),
+        );
+        assert_eq!(
+            super::codex_activity_target_ids(&codex).expect("exact Codex target"),
+            ("child-thread-2", "child-turn-7")
+        );
+
+        let claude = ProviderActivityNativeTarget::claude_task("task-1".to_owned());
+        assert!(matches!(
+            super::codex_activity_target_ids(&claude),
+            Err(super::ProviderRuntimeError::UnsupportedCapability {
+                provider,
+                capability: "targeted activity cancellation",
+            }) if provider == "codex"
+        ));
+    }
+
+    #[test]
+    fn claude_targeted_activity_accepts_only_bounded_exact_task_handles() {
+        // Mutation caught: routing a Codex turn, empty/oversized ID, or control character to Claude.
+        let claude = ProviderActivityNativeTarget::claude_task("task-1".to_owned());
+        assert_eq!(
+            super::claude_activity_target_id(&claude).expect("exact Claude target"),
+            "task-1"
+        );
+
+        for invalid in [
+            ProviderActivityNativeTarget::codex_turn(
+                "child-thread".to_owned(),
+                "child-turn".to_owned(),
+            ),
+            ProviderActivityNativeTarget::claude_task(String::new()),
+            ProviderActivityNativeTarget::claude_task("x".repeat(ACTIVITY_ID_MAX_LENGTH + 1)),
+            ProviderActivityNativeTarget::claude_task("task\nprivate".to_owned()),
+        ] {
+            assert!(super::claude_activity_target_id(&invalid).is_err());
+        }
     }
 
     #[test]

@@ -216,6 +216,203 @@ struct ClaudeActivityLaunchExpectation {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeTargetedCancellationFixture {
+    session_id: String,
+    orders: Vec<ClaudeTargetedCancellationOrder>,
+    semantic_collision_facts: Vec<Value>,
+    nested_facts: Vec<Value>,
+    terminal_facts: Vec<Value>,
+}
+
+#[test]
+fn targeted_task_correlation_fixture_requires_exact_nested_source_owner() {
+    // Mutation caught: accepting nested Agent correlation without its exact parent tool owner.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    let mut runtime =
+        ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+    for (index, fact) in fixture.orders[0].facts.iter().enumerate() {
+        let _ = apply_targeted_correlation_fact(&mut runtime, fact, index as u64);
+    }
+    let outputs = fixture
+        .nested_facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            apply_targeted_correlation_fact(&mut runtime, fact, 100 + index as u64)
+        })
+        .collect::<Vec<_>>();
+    let statuses = outputs
+        .iter()
+        .flat_map(|output| &output.activity)
+        .filter_map(|mutation| match mutation {
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.id == "claude:agent:agent-child" && actor.status.is_terminal() =>
+            {
+                Some(actor.status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, [ActivityLifecycle::Failed]);
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeTargetedCancellationOrder {
+    name: String,
+    facts: Vec<Value>,
+}
+
+fn apply_targeted_correlation_fact(
+    runtime: &mut ClaudeProviderRuntime,
+    fact: &Value,
+    emitted_at_ms: u64,
+) -> claude::runtime::ClaudeRuntimeOutput {
+    if fact.get("hook_event_name").is_some() {
+        runtime.handle_authenticated_hook_value(fact, emitted_at_ms)
+    } else {
+        runtime.handle_raw_value(fact, emitted_at_ms)
+    }
+}
+
+#[test]
+fn targeted_task_correlation_fixture_keeps_stopped_authoritative_after_subagent_stop() {
+    // Mutation caught: ignoring a stopped task or allowing the later hook to rewrite it completed.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    assert_eq!(fixture.orders.len(), 2);
+    assert!(fixture.orders.iter().all(|order| !order.name.is_empty()));
+
+    for order in &fixture.orders {
+        let mut runtime =
+            ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+        for (index, fact) in order.facts.iter().enumerate() {
+            let _ = apply_targeted_correlation_fact(&mut runtime, fact, 1_000 + index as u64);
+        }
+        for (index, fact) in fixture.semantic_collision_facts.iter().enumerate() {
+            let _ = apply_targeted_correlation_fact(&mut runtime, fact, 2_000 + index as u64);
+        }
+
+        let stopped =
+            apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[0], 3_000);
+        let after_stop =
+            apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[1], 4_000);
+        let stopped_statuses = stopped
+            .activity
+            .iter()
+            .chain(&after_stop.activity)
+            .filter_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertActor(actor)
+                    if actor.id == "claude:agent:agent-a" =>
+                {
+                    Some(actor.status)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stopped_statuses,
+            [ActivityLifecycle::Cancelled],
+            "{} must preserve stopped as the sole terminal lifecycle",
+            order.name
+        );
+        assert!(
+            stopped
+                .activity
+                .iter()
+                .all(|mutation| !format!("{mutation:?}").contains("must not be retained")),
+            "task output paths and summaries are not activity data"
+        );
+    }
+}
+
+#[test]
+fn targeted_task_subtree_keeps_siblings_live_and_unmapped_agents_observable() {
+    // Mutation caught: joining siblings by semantic fields or hiding an observable actor merely
+    // because it lacks the exact Agent-tool/task identity chain required for control.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    let mut runtime =
+        ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+    let mut outputs = Vec::new();
+    for (index, fact) in fixture.orders[0].facts.iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            1_000 + index as u64,
+        ));
+    }
+    for (index, fact) in fixture.semantic_collision_facts.iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            2_000 + index as u64,
+        ));
+    }
+    for (index, fact) in fixture.nested_facts[..4].iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            3_000 + index as u64,
+        ));
+    }
+    outputs.push(runtime.handle_authenticated_hook_value(
+        &json!({
+            "hook_event_name":"SubagentStart",
+            "session_id":fixture.session_id,
+            "agent_id":"agent-unmapped",
+            "agent_type":"same-role",
+            "description":"same description",
+            "prompt":"same prompt"
+        }),
+        4_000,
+    ));
+
+    let actors = outputs
+        .iter()
+        .flat_map(|output| &output.activity)
+        .filter_map(|mutation| match mutation {
+            ProviderActivityMutation::UpsertActor(actor) => Some(actor.clone()),
+            _ => None,
+        })
+        .fold(std::collections::BTreeMap::new(), |mut latest, actor| {
+            latest.insert(actor.id.clone(), actor);
+            latest
+        });
+    assert_eq!(
+        actors["claude:agent:agent-child"]
+            .parent_actor_id
+            .as_deref(),
+        Some("claude:agent:agent-a")
+    );
+    assert!(actors["claude:agent:agent-a"].parent_actor_id.is_none());
+    assert!(actors["claude:agent:agent-b"].parent_actor_id.is_none());
+    assert!(
+        actors["claude:agent:agent-unmapped"]
+            .parent_actor_id
+            .is_none()
+    );
+    assert!(actors.values().all(|actor| !actor.status.is_terminal()));
+
+    let stopped = apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[0], 5_000);
+    assert!(stopped.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "claude:agent:agent-a"
+                && actor.status == ActivityLifecycle::Cancelled
+    )));
+    assert!(stopped.activity.iter().all(|mutation| !matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "claude:agent:agent-b"
+                || actor.id == "claude:agent:agent-unmapped"
+    )));
+}
+
+#[derive(Debug, serde::Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -1802,6 +1999,28 @@ fn control_requests_encode_official_correlated_frames() {
         serde_json::to_value(ClaudeControlRequest::mcp_status(21)).expect("MCP status json"),
         fixture.mcp_status
     );
+}
+
+#[test]
+fn stop_task_control_request_encodes_the_exact_private_task_target() {
+    // Mutation caught: using the root interrupt subtype or the wrong native task-id field.
+    assert_eq!(
+        serde_json::to_value(ClaudeControlRequest::stop_task(41, "task-a"))
+            .expect("stop task json"),
+        json!({
+            "type": "control_request",
+            "request_id": "bibcode-41",
+            "request": { "subtype": "stop_task", "task_id": "task-a" }
+        })
+    );
+}
+
+#[test]
+fn stop_task_control_request_debug_redacts_the_private_target() {
+    let debug = format!("{:?}", ClaudeControlRequest::stop_task(41, "task-private"));
+
+    assert_eq!(debug, "ClaudeControlRequest { .. }");
+    assert!(!debug.contains("task-private"));
 }
 
 #[test]

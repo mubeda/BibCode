@@ -305,6 +305,7 @@ describe("RightPanelTabs mounted interactions", () => {
   });
 
   it("renders the Activity singleton with the Bot icon", async () => {
+    const onActivate = vi.fn();
     const activitySurface: RightPanelSurface = {
       id: "activity",
       kind: "activity",
@@ -318,12 +319,17 @@ describe("RightPanelTabs mounted interactions", () => {
         {...tabsProps({
           surfaces: [activitySurface],
           activeSurfaceId: "activity",
+          onActivate,
         })}
       />,
     );
 
-    expect(buttonWithText("Activity")).toBeDefined();
+    const activityButton = buttonWithText("Activity");
+    expect(activityButton).toBeDefined();
     expect(document.querySelector(".lucide-bot")).not.toBeNull();
+    expect(document.querySelector('[data-testid="tooltip"]')).toBeNull();
+    await click(activityButton);
+    expect(onActivate).toHaveBeenCalledWith(activitySurface);
   });
 
   it("renders every surface title, icon, preview fallback, and terminal label", async () => {
@@ -393,6 +399,11 @@ describe("RightPanelTabs mounted interactions", () => {
     );
 
     expect(buttonWithText("Current page")).toBeDefined();
+    expect(
+      Array.from(document.querySelectorAll('[data-testid="tooltip"]')).find(
+        (tooltip) => tooltip.textContent === "Current page",
+      ),
+    ).toBeDefined();
     expect(document.body.textContent).not.toContain("Project docs");
   });
 

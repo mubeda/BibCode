@@ -9,10 +9,11 @@ use tokio::sync::Notify;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use super::{
-    ActivityDelta, ActivityDetailPage, ActivityRecordKind, ActivityRepository,
-    ActivityRepositoryError, ActivityRosterBucket, ActivityRosterPage, ActivityScopeRef,
-    ActivityScopeSeed, ActivitySection, ActivitySnapshot, AgentActivityAdmission,
-    AgentActivityController, AgentActivitySource, ProviderActivityMutation,
+    ActivityControlRegistry, ActivityControlSnapshot, ActivityDelta, ActivityDetailPage,
+    ActivityRecordKind, ActivityRecordSummary, ActivityRepository, ActivityRepositoryError,
+    ActivityRosterBucket, ActivityRosterPage, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
+    ActivitySnapshot, AgentActivityAdmission, AgentActivityController, AgentActivitySource,
+    ProviderActivityMutation,
 };
 
 const DEFAULT_BROADCAST_CAPACITY: usize = 256;
@@ -73,6 +74,7 @@ pub struct ActivityProjectionApplyCompletionForIntegrationTest {
 #[derive(Clone, Debug)]
 pub struct ActivityProjection {
     repository: ActivityRepository,
+    control_registry: ActivityControlRegistry,
     controller: AgentActivityController,
     source: Option<AgentActivitySource>,
     events: broadcast::Sender<ActivityProjectionEvent>,
@@ -164,6 +166,12 @@ impl ActivityProjection {
         self.controller.clone()
     }
 
+    #[must_use]
+    #[allow(dead_code)] // Provider runtime registration is introduced with cancellation dispatch.
+    pub(crate) fn activity_control_registry(&self) -> ActivityControlRegistry {
+        self.control_registry.clone()
+    }
+
     /// Returns the controller used by this projection for black-box integration diagnostics.
     #[doc(hidden)]
     #[must_use]
@@ -207,6 +215,7 @@ impl ActivityProjection {
         let (apply_completions, _) = broadcast::channel(capacity.max(1));
         Self {
             repository,
+            control_registry: ActivityControlRegistry::new(),
             controller,
             source,
             events,
@@ -469,7 +478,14 @@ impl ActivityProjection {
         &self,
         scope: &ActivityScopeRef,
     ) -> ActivityResult<ActivityAdmittedRead<ActivitySnapshot>> {
-        self.admit_read(self.repository.snapshot(scope)).await
+        self.admit_read(async {
+            let mut snapshot = self.repository.snapshot(scope).await?;
+            snapshot.control = self
+                .control_snapshot_for(&snapshot.scope_id, &snapshot.actors)
+                .await;
+            Ok(snapshot)
+        })
+        .await
     }
 
     pub async fn list_roster(
@@ -495,10 +511,25 @@ impl ActivityProjection {
         cursor: Option<&str>,
         limit: usize,
     ) -> ActivityResult<ActivityAdmittedRead<ActivityRosterPage>> {
-        self.admit_read(
-            self.repository
-                .list_roster(scope, scope_id, section, bucket, cursor, limit),
-        )
+        self.admit_read(async {
+            let mut page = self
+                .repository
+                .list_roster(scope, scope_id, section, bucket, cursor, limit)
+                .await?;
+            let actors = page
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    ActivityRecordSummary::Actor(actor) => Some(actor.clone()),
+                    ActivityRecordSummary::WorkItem(_) => None,
+                })
+                .collect::<Vec<_>>();
+            page.actor_controls = self
+                .control_registry
+                .actor_controls_for(scope_id, &actors)
+                .await;
+            Ok(page)
+        })
         .await
     }
 
@@ -525,15 +556,32 @@ impl ActivityProjection {
         cursor: Option<&str>,
         limit: usize,
     ) -> ActivityResult<ActivityAdmittedRead<ActivityDetailPage>> {
-        self.admit_read(self.repository.list_detail(
-            scope,
-            scope_id,
-            record_kind,
-            record_id,
-            cursor,
-            limit,
-        ))
+        self.admit_read(async {
+            let mut page = self
+                .repository
+                .list_detail(scope, scope_id, record_kind, record_id, cursor, limit)
+                .await?;
+            page.actor_control = match &page.record {
+                ActivityRecordSummary::Actor(actor) => self
+                    .control_registry
+                    .actor_control_for(scope_id, record_id)
+                    .await
+                    .or_else(|| Some(super::ActivityActorControl::unsupported(actor.id.clone()))),
+                ActivityRecordSummary::WorkItem(_) => None,
+            };
+            Ok(page)
+        })
         .await
+    }
+
+    async fn control_snapshot_for(
+        &self,
+        scope_id: &str,
+        actors: &[super::ActivityActorSummary],
+    ) -> ActivityControlSnapshot {
+        self.control_registry
+            .snapshot_for_actors(scope_id, actors)
+            .await
     }
 
     async fn admit_read<T>(
@@ -685,6 +733,53 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), controller.disable())
             .await
             .expect("admission released after registry cleanup");
+    }
+
+    #[tokio::test]
+    async fn projection_owned_control_updates_reserve_no_sqlite_queue_work() {
+        // Mutation caught: making the ephemeral overlay schedule repository work through its owner.
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let observer = database
+            .enable_queue_backpressure_observation_for_integration_test()
+            .expect("queue observer");
+        let before = database.queue_backpressure_snapshot_for_integration_test();
+        let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let registry = projection.activity_control_registry();
+        {
+            let registration = registry.register_runtime(
+                ActivityScopeRef::Thread {
+                    thread_id: "thread:control-queue".to_owned(),
+                },
+                "scope:control-queue".to_owned(),
+                None,
+            );
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[ProviderActivityMutation::upsert_actor(
+                        "actor:control-queue",
+                        None,
+                        "Control queue actor",
+                        "running",
+                    )
+                    .expect("actor")],
+                    &[],
+                )
+                .await;
+        }
+
+        assert_eq!(
+            database.queue_backpressure_snapshot_for_integration_test(),
+            before
+        );
+        drop(observer);
     }
 
     #[tokio::test]

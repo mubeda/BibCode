@@ -1,0 +1,86 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "control-delta",
+      "delta": {
+        "scopeId": "am",
+        "previousRevision": 25,
+        "revision": 1628247106,
+        "changes": [
+          {
+            "kind": "actor-removed",
+            "actorId": "ZcIHX\"qSLd"
+          },
+          {
+            "kind": "actor-removed",
+            "actorId": "="
+          },
+          {
+            "kind": "actor-upserted",
+            "actor": {
+              "actorId": "-F;#t=fdwI?%",
+              "state": "unsupported",
+              "controlRevision": 893097961,
+              "activeDescendantCount": 502531120
+            }
+          },
+          {
+            "kind": "operation-removed",
+            "rootActorId": "SvY}Y2"
+          },
+          {
+            "kind": "actor-removed",
+            "actorId": "oC{cAtId?"
+          },
+          {
+            "kind": "actor-removed",
+            "actorId": "x8%{A`LD[1<"
+          },
+          {
+            "kind": "operation-upserted",
+            "operation": {
+              "rootActorId": ",g Z-",
+              "state": "requested",
+              "residualCount": 68889190,
+              "message": null,
+              "operationRevision": 209542279
+            }
+          },
+          {
+            "kind": "operation-removed",
+            "rootActorId": ",SPD>0177c}"
+          },
+          {
+            "kind": "actor-upserted",
+            "actor": {
+              "actorId": "Q^$ubVf0",
+              "state": "requested",
+              "controlRevision": 1953387117,
+              "activeDescendantCount": 1580885828
+            }
+          },
+          {
+            "kind": "actor-upserted",
+            "actor": {
+              "actorId": "\"",
+              "state": "unsupported",
+              "controlRevision": 363065350,
+              "activeDescendantCount": 592300522
+            }
+          },
+          {
+            "kind": "actor-upserted",
+            "actor": {
+              "actorId": "kG`&$B7@FMT",
+              "state": "requested",
+              "controlRevision": 901964021,
+              "activeDescendantCount": 1495467413
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

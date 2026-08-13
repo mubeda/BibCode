@@ -90,6 +90,43 @@ describe("Rust RPC fixture parity", () => {
     expect(unhinted.payload.command).not.toHaveProperty("activity");
   });
 
+  it("tracks client-only targeted cancellation wire fixtures", () => {
+    // Mutation caught: serializing provider-native identities or caller-computed descendant sets.
+    const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
+    const readFixture = (name: string): unknown =>
+      JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
+    const cancel = readFixture("contract-shapes/activity__cancelSubtree-request.json") as {
+      readonly tag: string;
+      readonly payload: Readonly<Record<string, unknown>>;
+    };
+    const retry = readFixture(
+      "contract-shapes/activity__retrySubtreeCancellation-request.json",
+    ) as {
+      readonly tag: string;
+      readonly payload: Readonly<Record<string, unknown>>;
+    };
+
+    expect(cancel.tag).toBe("activity.cancelSubtree");
+    expect(cancel.payload).toEqual({
+      scope: { _tag: "thread", threadId: "thread-1" },
+      scopeId: "thread:thread-1",
+      actorId: "actor:child-1",
+      expectedControlRevision: 3,
+    });
+    expect(retry.tag).toBe("activity.retrySubtreeCancellation");
+    expect(retry.payload).toEqual({
+      scope: { _tag: "thread", threadId: "thread-1" },
+      scopeId: "thread:thread-1",
+      rootActorId: "actor:child-1",
+      expectedOperationRevision: 4,
+    });
+    for (const payload of [cancel.payload, retry.payload]) {
+      expect(payload).not.toHaveProperty("nativeThreadId");
+      expect(payload).not.toHaveProperty("nativeActorId");
+      expect(payload).not.toHaveProperty("descendantIds");
+    }
+  });
+
   it("tracks attributed diagnostics and identity-bound signal wire fixtures", () => {
     const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
     const readFixture = (name: string): unknown =>
@@ -325,6 +362,8 @@ describe("Rust RPC fixture parity", () => {
         { name: "activity.getSnapshot", mode: "unary" },
         { name: "activity.listRoster", mode: "unary" },
         { name: "activity.listDetail", mode: "unary" },
+        { name: "activity.cancelSubtree", mode: "unary" },
+        { name: "activity.retrySubtreeCancellation", mode: "unary" },
         { name: "subscribeActivity", mode: "stream" },
       ]),
     );
