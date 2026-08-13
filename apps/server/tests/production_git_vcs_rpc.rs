@@ -531,7 +531,11 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         json!({ "cwd": cwd }),
     )
     .await;
-    let snapshot = next_server_message(&mut status_socket).await;
+    let snapshot = next_server_message_for(
+        &mut status_socket,
+        "initial clean VCS status snapshot after subscription",
+    )
+    .await;
     assert!(matches!(
         snapshot,
         ServerMessage::Chunk { request_id, values }
@@ -545,7 +549,11 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     )
     .await;
 
-    let initial_remote = next_server_message(&mut status_socket).await;
+    let initial_remote = next_server_message_for(
+        &mut status_socket,
+        "initial remote VCS status after subscription",
+    )
+    .await;
     assert!(matches!(
         initial_remote,
         ServerMessage::Chunk { request_id, values }
@@ -556,11 +564,6 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         json!({ "_tag": "Ack", "requestId": "703" }),
     )
     .await;
-
-    // The broadcaster's interval emits one immediate tick when its poller starts.
-    // Let that settle before the save so only event-driven invalidation can meet
-    // the latency assertion below; the fallback interval is 30 seconds.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     request(
         &mut write_socket,
@@ -573,16 +576,21 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         }),
     )
     .await;
-    assert_success_eq(
+    assert_success_eq_for(
         &mut write_socket,
         "704",
         json!({ "relativePath": "tracked.txt" }),
+        "projects.writeFile success after mutation notification",
     )
     .await;
 
     let local_update = timeout(Duration::from_millis(750), async {
         loop {
-            let message = next_server_message(&mut status_socket).await;
+            let message = next_server_message_for(
+                &mut status_socket,
+                "event-driven dirty local VCS status after project file save",
+            )
+            .await;
             if let ServerMessage::Chunk { request_id, values } = message
                 && request_id.as_str() == "703"
                 && values[0]["_tag"] == "localUpdated"
@@ -2499,6 +2507,17 @@ where
     assert_eq!(success_value(socket, id).await, expected);
 }
 
+async fn assert_success_eq_for<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    expected: Value,
+    context: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    assert_eq!(success_value_for(socket, id, context).await, expected);
+}
+
 async fn failure_value<S>(socket: &mut WebSocketStream<S>, id: &str) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2532,6 +2551,21 @@ where
     }
 }
 
+async fn success_value_for<S>(socket: &mut WebSocketStream<S>, id: &str, context: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match next_server_message_for(socket, context).await {
+        ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Success { value },
+        } if request_id == RequestId::try_from(id).expect("request id") => {
+            value.unwrap_or(Value::Null)
+        }
+        message => panic!("expected successful response for {id}, got {message:?}"),
+    }
+}
+
 async fn send_json<S>(socket: &mut WebSocketStream<S>, value: Value)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2547,6 +2581,21 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     next_server_message_with_timeout(socket, Duration::from_secs(15)).await
+}
+
+async fn next_server_message_for<S>(socket: &mut WebSocketStream<S>, context: &str) -> ServerMessage
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = timeout(Duration::from_secs(15), socket.next())
+        .await
+        .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
+        .expect("WebSocket remains open")
+        .expect("valid WebSocket frame");
+    let Message::Text(text) = frame else {
+        panic!("expected text WebSocket message while waiting for {context}, got {frame:?}");
+    };
+    serde_json::from_str(&text).expect("valid server RPC message")
 }
 
 async fn next_server_message_with_timeout<S>(

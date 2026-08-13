@@ -57,6 +57,11 @@ flowchart TB
   idle eviction. Project and repository lifecycle epochs make poller
   initialization transferable across subscriber aborts and prevent canceled
   prior-lifecycle work from publishing into an immediate reattachment.
+  Each live VCS-status repository entry gives coalesced local mutation
+  invalidations and its delayed fallback scan one local worker independent of
+  remote and ref refresh work. A slow fetch or remote probe therefore cannot
+  delay editor-save status publication; the final subscriber cancels both
+  worker lifecycles through the repository entry's shared cancellation owner.
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A
   scan leader moves the repository single-flight guard into repository-owned
