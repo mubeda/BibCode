@@ -536,6 +536,7 @@ reader.on("line", (line) => {
   }
   const sessionId = message.session_id ?? "bibcode-ui-claude-session";
   appendProviderInput("claudeAgent", promptTextFromParts(message.message?.content));
+  send(message);
   send({
     type: "stream_event",
     session_id: sessionId,

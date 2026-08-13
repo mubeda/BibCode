@@ -1,4 +1,5 @@
 {
+  "identifier": "com.bibcode.desktop.e2e",
   "app": {
     "withGlobalTauri": true,
     "security": {

@@ -29,10 +29,7 @@ export const desktopActivityMarkerFileName =
 const desktopActivityModelSelection = {
   instanceId: "codex",
   model: "gpt-5.4",
-  options: [
-    { id: "reasoningEffort", value: "medium" },
-    { id: "serviceTier", value: "default" },
-  ],
+  options: [{ id: "reasoningEffort", value: "medium" }],
 } as const;
 
 /**
@@ -57,7 +54,6 @@ export function desktopActivitySessionCommands(projectPath: string) {
       threadId: desktopActivityFixture.thread.id,
       projectId: desktopActivityFixture.project.id,
       title: desktopActivityFixture.thread.title,
-      kind: "workspace",
       modelSelection: desktopActivityModelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",

@@ -42,6 +42,46 @@ const screenshotPath = (title: string): string =>
       .toLowerCase()}.png`,
   );
 
+async function resetDesktopUiConnectionCache(): Promise<void> {
+  const resetError = await browser.executeAsync((done: (error: string | null) => void) => {
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+    let settled = false;
+    const finish = (error: string | null) => {
+      if (settled) return;
+      settled = true;
+      done(error);
+    };
+    const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
+    openRequest.addEventListener("error", () => {
+      finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
+    });
+    openRequest.addEventListener("upgradeneeded", () => {
+      finish("The E2E connection catalog schema was unexpectedly missing.");
+    });
+    openRequest.addEventListener("success", () => {
+      const database = openRequest.result;
+      const storeNames = ["catalog", "shell", "thread"];
+      const transaction = database.transaction(storeNames, "readwrite");
+      transaction.addEventListener("error", () => {
+        database.close();
+        finish(String(transaction.error ?? "Could not reset the E2E connection catalog."));
+      });
+      transaction.addEventListener("complete", () => {
+        database.close();
+        finish(null);
+      });
+      for (const storeName of storeNames) {
+        transaction.objectStore(storeName).clear();
+      }
+    });
+  });
+  if (resetError !== null) {
+    throw new Error(resetError);
+  }
+  await browser.refresh();
+}
+
 export const config = {
   runner: "local",
   specs:
@@ -92,6 +132,7 @@ export const config = {
     timeout: 120_000,
   },
   before: async () => {
+    await resetDesktopUiConnectionCache();
     await browser.execute(() => {
       const sheet = [...document.styleSheets].find((candidate) => {
         try {
