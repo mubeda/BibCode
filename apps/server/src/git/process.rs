@@ -110,8 +110,30 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.run_with_environment(request, cancellation, false)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_with_clean_environment_for_test(
+        &self,
+        request: ProcessRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_with_environment(request, cancellation, true).await
+    }
+
+    async fn run_with_environment(
+        &self,
+        request: ProcessRequest,
+        cancellation: &CancellationToken,
+        clear_environment: bool,
+    ) -> Result<ProcessOutput, ProcessError> {
         let command_label = request.command.to_string_lossy().into_owned();
         let mut command = Command::new(&request.command);
+        if clear_environment {
+            command.env_clear();
+        }
         command
             .args(&request.args)
             .current_dir(&request.cwd)

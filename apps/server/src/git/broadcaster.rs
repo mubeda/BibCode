@@ -308,6 +308,8 @@ impl StatusBroadcaster {
     }
 
     #[must_use]
+    /// Returns the number of repository polling owners, each of which owns the
+    /// local-status and remote/ref worker lifecycles.
     pub fn active_poller_count(&self) -> usize {
         self.lock_state().repositories.len()
     }
@@ -456,10 +458,14 @@ mod tests {
     use crate::git::{
         BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessRequest, ProcessRunner,
     };
-    use std::{fs, process::Command};
+    use crate::test_support::TestSandbox;
+    use std::{collections::BTreeMap, ffi::OsString, fs, process::Command};
     use tokio::sync::{Semaphore, mpsc};
 
     struct BlockingRemoteGitRunner {
+        command: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+        expected_git_config: PathBuf,
         remote_started: mpsc::UnboundedSender<()>,
         remote_cancelled: mpsc::UnboundedSender<()>,
         local_status_started: mpsc::UnboundedSender<()>,
@@ -469,9 +475,25 @@ mod tests {
     impl GitProcessRunner for BlockingRemoteGitRunner {
         fn run<'a>(
             &'a self,
-            request: ProcessRequest,
+            mut request: ProcessRequest,
             cancellation: &'a CancellationToken,
         ) -> BoxGitProcessFuture<'a> {
+            request.command.clone_from(&self.command);
+            let mut environment = self.environment.iter().cloned().collect::<BTreeMap<_, _>>();
+            environment.extend(request.env);
+            request.env = environment.into_iter().collect();
+            assert!(
+                request.env.iter().any(|(name, value)| {
+                    name == "GIT_CONFIG_GLOBAL" && value == self.expected_git_config.as_os_str()
+                }),
+                "production Git request did not receive the test-owned global config"
+            );
+            assert!(request.env.iter().all(|(name, _)| {
+                !matches!(
+                    name.to_string_lossy().to_ascii_uppercase().as_str(),
+                    "GIT_DIR" | "GIT_WORK_TREE" | "GIT_INDEX_FILE" | "GIT_CONFIG_SYSTEM"
+                )
+            }));
             Box::pin(async move {
                 if request.operation == "GitVcsDriver.statusDetailsLocal.status" {
                     let _ = self.local_status_started.send(());
@@ -490,22 +512,94 @@ mod tests {
                         }
                     }
                 }
-                ProcessRunner.run(request, cancellation).await
+                ProcessRunner
+                    .run_with_clean_environment_for_test(request, cancellation)
+                    .await
             })
         }
     }
 
-    fn initialize_test_repository() -> tempfile::TempDir {
-        let repository = tempfile::tempdir().expect("temporary Git repository");
+    fn isolated_git_environment(sandbox: &TestSandbox) -> (PathBuf, Vec<(OsString, OsString)>) {
+        let hooks = sandbox.path("hooks");
+        fs::create_dir(&hooks).expect("isolated hooks directory");
+        let isolated_config = sandbox.path("isolated-global.gitconfig");
+        fs::write(
+            &isolated_config,
+            format!(
+                "[commit]\n\tgpgSign = false\n[core]\n\thooksPath = {}\n",
+                hooks.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .expect("isolated global config");
+
+        let hostile_config = sandbox.path("hostile-global.gitconfig");
+        fs::write(
+            &hostile_config,
+            "[commit]\n\tgpgSign = true\n[core]\n\thooksPath = missing-hooks\n",
+        )
+        .expect("hostile global config");
+        let hostile_git_dir = sandbox.path("hostile-git-dir");
+        let hostile_work_tree = sandbox.path("hostile-work-tree");
+        let hostile_index = sandbox.path("hostile-index");
+        let mut environment = sandbox.environment([
+            (
+                "GIT_CONFIG_GLOBAL",
+                hostile_config.to_string_lossy().into_owned(),
+            ),
+            (
+                "GIT_CONFIG_SYSTEM",
+                hostile_config.to_string_lossy().into_owned(),
+            ),
+            ("GIT_DIR", hostile_git_dir.to_string_lossy().into_owned()),
+            (
+                "GIT_WORK_TREE",
+                hostile_work_tree.to_string_lossy().into_owned(),
+            ),
+            (
+                "GIT_INDEX_FILE",
+                hostile_index.to_string_lossy().into_owned(),
+            ),
+        ]);
+        environment.retain(|name, _| {
+            !name
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+        });
+        environment.extend([
+            (
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                isolated_config.to_string_lossy().into_owned(),
+            ),
+            ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+            ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ]);
+        (
+            isolated_config,
+            environment
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+        )
+    }
+
+    fn initialize_test_repository(
+        sandbox: &TestSandbox,
+        command: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> PathBuf {
+        let repository = sandbox.path("repository");
+        fs::create_dir(&repository).expect("temporary Git repository");
         for args in [
             &["init", "--quiet", "-b", "main"][..],
             &["config", "user.name", "BiBCode Test"][..],
             &["config", "user.email", "bibcode@example.invalid"][..],
         ] {
-            let output = Command::new("git")
+            let output = Command::new(command)
                 .args(args)
-                .current_dir(repository.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&repository)
+                .env_clear()
+                .envs(environment.iter().cloned())
                 .output()
                 .expect("Git fixture command starts");
             assert!(
@@ -514,19 +608,16 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        fs::write(repository.path().join("tracked.txt"), "base\n").expect("clean fixture file");
+        fs::write(repository.join("tracked.txt"), "base\n").expect("clean fixture file");
         for args in [
             &["add", "--", "tracked.txt"][..],
             &["commit", "--quiet", "-m", "initial"][..],
         ] {
-            let output = Command::new("git")
+            let output = Command::new(command)
                 .args(args)
-                .current_dir(repository.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_AUTHOR_NAME", "BiBCode Test")
-                .env("GIT_AUTHOR_EMAIL", "bibcode@example.invalid")
-                .env("GIT_COMMITTER_NAME", "BiBCode Test")
-                .env("GIT_COMMITTER_EMAIL", "bibcode@example.invalid")
+                .current_dir(&repository)
+                .env_clear()
+                .envs(environment.iter().cloned())
                 .output()
                 .expect("Git fixture command starts");
             assert!(
@@ -560,12 +651,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_invalidation_starts_while_remote_refresh_is_blocked() {
-        let repository = initialize_test_repository();
+        let sandbox = TestSandbox::new("git-broadcaster-invalidation");
+        let command = sandbox.executable_on_path("git");
+        let (expected_git_config, environment) = isolated_git_environment(&sandbox);
+        let repository = initialize_test_repository(&sandbox, &command, &environment);
         let (remote_started, mut remote_started_rx) = mpsc::unbounded_channel();
         let (remote_cancelled, mut remote_cancelled_rx) = mpsc::unbounded_channel();
         let (local_status_started, mut local_status_started_rx) = mpsc::unbounded_channel();
         let release_remote = Arc::new(Semaphore::new(0));
         let git = GitRepository::with_runner_for_test(Arc::new(BlockingRemoteGitRunner {
+            command,
+            environment,
+            expected_git_config,
             remote_started,
             remote_cancelled,
             local_status_started,
@@ -578,7 +675,7 @@ mod tests {
             4,
         );
         let mut subscription = broadcaster
-            .subscribe(repository.path().to_path_buf(), CancellationToken::new())
+            .subscribe(repository.clone(), CancellationToken::new())
             .await
             .expect("status subscription starts");
         assert!(matches!(
@@ -595,9 +692,9 @@ mod tests {
             .expect("initial remote status scan starts")
             .expect("remote status checkpoint owner remains alive");
 
-        fs::write(repository.path().join("tracked.txt"), "changed in editor\n")
+        fs::write(repository.join("tracked.txt"), "changed in editor\n")
             .expect("mutate tracked fixture file");
-        broadcaster.notify_local_change(repository.path()).await;
+        broadcaster.notify_local_change(&repository).await;
 
         tokio::time::timeout(Duration::from_secs(5), local_status_started_rx.recv())
             .await
