@@ -86,12 +86,8 @@ export function defaultWindowsCargoRunner(options = {}) {
     .join(" ");
 }
 
-export function canonicalizeMacosCargoTestTarget(args, env, options = {}) {
-  if (
-    (options.platform ?? process.platform) !== "darwin" ||
-    args[0] !== "cargo" ||
-    args[1] !== "test"
-  ) {
+export function canonicalizeCargoTestTarget(args, env, options = {}) {
+  if (args[0] !== "cargo" || args[1] !== "test") {
     return env;
   }
 
@@ -129,7 +125,7 @@ export function runMsvcX64(args, options = {}) {
       }),
     ...options.env,
   };
-  const env = canonicalizeMacosCargoTestTarget(args, configuredEnv, options);
+  const env = canonicalizeCargoTestTarget(args, configuredEnv, options);
   const vcvarsall = discoverVcVarsAll({
     programFilesX86: options.programFilesX86,
     existsSync: options.existsSync,
