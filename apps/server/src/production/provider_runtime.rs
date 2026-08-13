@@ -3980,6 +3980,8 @@ pub struct NativeProviderDriverFactory {
     attachments: AttachmentMaterializer,
     attribution: ProcessAttributionRegistry,
     activity_controller: AgentActivityController,
+    claude_probe_cache: ClaudeActivityProbeCache,
+    claude_probe_launch_policy: ClaudeProbeLaunchPolicy,
 }
 
 impl NativeProviderDriverFactory {
@@ -4006,10 +4008,28 @@ impl NativeProviderDriverFactory {
         attribution: ProcessAttributionRegistry,
         activity_controller: AgentActivityController,
     ) -> Self {
+        Self::with_claude_probe_cache(
+            attachments_dir,
+            attribution,
+            activity_controller,
+            production_claude_probe_cache(),
+            ClaudeProbeLaunchPolicy::Direct,
+        )
+    }
+
+    fn with_claude_probe_cache(
+        attachments_dir: PathBuf,
+        attribution: ProcessAttributionRegistry,
+        activity_controller: AgentActivityController,
+        claude_probe_cache: ClaudeActivityProbeCache,
+        claude_probe_launch_policy: ClaudeProbeLaunchPolicy,
+    ) -> Self {
         Self {
             attachments: AttachmentMaterializer::new(attachments_dir),
             attribution,
             activity_controller,
+            claude_probe_cache,
+            claude_probe_launch_policy,
         }
     }
 }
@@ -4058,6 +4078,8 @@ impl ProviderDriverFactory for NativeProviderDriverFactory {
                         self.attachments.clone(),
                         self.attribution.clone(),
                         activity_enabled,
+                        self.claude_probe_cache.clone(),
+                        self.claude_probe_launch_policy,
                     )
                     .await?,
                 ) as Arc<dyn ProviderDriver>),
@@ -6218,39 +6240,47 @@ struct ClaudeProbeCacheState {
     tick: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ClaudeActivityProbeCache {
+    state: Arc<StdMutex<ClaudeProbeCacheState>>,
+}
+
+impl ClaudeActivityProbeCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClaudeProbeCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum ClaudeProbeLaunchPolicy {
+    #[default]
+    Direct,
+    #[cfg(unix)]
+    PosixShellFixture,
+}
+
 #[derive(Debug, Default)]
 struct ClaudeProbeResult {
     version: String,
     support: ClaudeActivitySupport,
 }
 
-static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<StdMutex<ClaudeProbeCacheState>> = OnceLock::new();
+static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<ClaudeActivityProbeCache> = OnceLock::new();
 
-fn claude_probe_cache() -> &'static StdMutex<ClaudeProbeCacheState> {
-    CLAUDE_ACTIVITY_PROBE_CACHE.get_or_init(|| StdMutex::new(ClaudeProbeCacheState::default()))
-}
-
-async fn probe_claude_activity_support(binary_path: &str) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_environment(binary_path, std::iter::empty(), Duration::ZERO)
-        .await
-}
-
-async fn probe_claude_activity_support_with_resolution_delay(
-    binary_path: &str,
-    resolution_delay: Duration,
-) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_environment(
-        binary_path,
-        std::iter::empty(),
-        resolution_delay,
-    )
-    .await
+fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
+    CLAUDE_ACTIVITY_PROBE_CACHE
+        .get_or_init(ClaudeActivityProbeCache::default)
+        .clone()
 }
 
 async fn probe_claude_activity_support_with_environment<'a>(
     binary_path: &str,
     environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
     resolution_delay: Duration,
+    cache: ClaudeActivityProbeCache,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let binary_path = binary_path.to_owned();
     let search_path = effective_provider_search_path(environment);
@@ -6291,7 +6321,8 @@ async fn probe_claude_activity_support_with_environment<'a>(
         let Some((key, executable)) = resolution else {
             return ClaudeActivitySupport::default();
         };
-        probe_resolved_claude_activity_support(key, executable, deadline).await
+        probe_resolved_claude_activity_support(key, executable, deadline, cache, launch_policy)
+            .await
     })
     .await
     .unwrap_or_default()
@@ -6301,52 +6332,54 @@ async fn probe_resolved_claude_activity_support(
     key: ClaudeProbeCacheKey,
     executable: PathBuf,
     deadline: Instant,
+    cache: ClaudeActivityProbeCache,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let mut receiver = {
-        let mut cache = claude_probe_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.tick = cache.tick.saturating_add(1);
-        let tick = cache.tick;
-        if let Some(version) = cache.ready_versions.get(&key).cloned() {
+        let mut cache_state = cache.lock();
+        cache_state.tick = cache_state.tick.saturating_add(1);
+        let tick = cache_state.tick;
+        if let Some(version) = cache_state.ready_versions.get(&key).cloned() {
             let versioned_key = ClaudeVersionedProbeKey {
                 executable: key.clone(),
                 version,
             };
-            if let Some(ready) = cache.ready.get_mut(&versioned_key) {
+            if let Some(ready) = cache_state.ready.get_mut(&versioned_key) {
                 ready.last_used = tick;
                 return ready.probe.support;
             }
-            cache.ready_versions.remove(&key);
+            cache_state.ready_versions.remove(&key);
         }
-        if let Some(in_flight) = cache.in_flight.get(&key) {
+        if let Some(in_flight) = cache_state.in_flight.get(&key) {
             in_flight.receiver.clone()
         } else {
-            if cache.in_flight.len() >= CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY {
+            if cache_state.in_flight.len() >= CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY {
                 return ClaudeActivitySupport::default();
             }
-            cache.next_id = cache.next_id.saturating_add(1);
-            let id = cache.next_id;
+            cache_state.next_id = cache_state.next_id.saturating_add(1);
+            let id = cache_state.next_id;
             let (sender, receiver) = tokio::sync::watch::channel(None);
-            cache.in_flight.insert(
+            cache_state.in_flight.insert(
                 key.clone(),
                 ClaudeInFlightProbe {
                     id,
                     receiver: receiver.clone(),
                 },
             );
+            let producer_cache = cache.clone();
             tokio::spawn(async move {
-                let result = probe_claude_activity_support_uncached(&executable, deadline)
-                    .await
-                    .filter(|result| !result.version.is_empty())
-                    .map(|result| ClaudeCachedProbe {
-                        version: result.version,
-                        support: result.support,
-                    });
+                let result =
+                    probe_claude_activity_support_uncached(&executable, deadline, launch_policy)
+                        .await
+                        .filter(|result| !result.version.is_empty())
+                        .map(|result| ClaudeCachedProbe {
+                            version: result.version,
+                            support: result.support,
+                        });
                 let outcome = result
                     .clone()
                     .map_or(ClaudeProbeOutcome::Failed, ClaudeProbeOutcome::Supported);
-                finish_claude_probe(key, id, result);
+                finish_claude_probe(&producer_cache, key, id, result);
                 sender.send_replace(Some(outcome));
             });
             receiver
@@ -6371,10 +6404,13 @@ async fn probe_resolved_claude_activity_support(
     }
 }
 
-fn finish_claude_probe(key: ClaudeProbeCacheKey, id: u64, result: Option<ClaudeCachedProbe>) {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn finish_claude_probe(
+    owner: &ClaudeActivityProbeCache,
+    key: ClaudeProbeCacheKey,
+    id: u64,
+    result: Option<ClaudeCachedProbe>,
+) {
+    let mut cache = owner.lock();
     if !matches!(
         cache.in_flight.get(&key),
         Some(ClaudeInFlightProbe { id: current_id, .. }) if *current_id == id
@@ -6427,9 +6463,12 @@ fn insert_claude_ready_probe(
 async fn probe_claude_activity_support_uncached(
     executable: &Path,
     deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<ClaudeProbeResult> {
-    let version = run_claude_probe_command(executable, "--version", deadline).await?;
-    let Some(help) = run_claude_probe_command(executable, "--help", deadline).await else {
+    let version =
+        run_claude_probe_command(executable, "--version", deadline, launch_policy).await?;
+    let Some(help) = run_claude_probe_command(executable, "--help", deadline, launch_policy).await
+    else {
         return Some(ClaudeProbeResult {
             version,
             ..ClaudeProbeResult::default()
@@ -6451,9 +6490,10 @@ async fn run_claude_probe_command(
     executable: &Path,
     argument: &str,
     deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
-    let launch = prepare_provider_launch(executable, [argument]).ok()?;
+    let launch = prepare_claude_probe_launch(executable, argument, launch_policy)?;
     let mut command = tokio::process::Command::new(launch.program);
     command
         .args(launch.args)
@@ -6489,6 +6529,25 @@ async fn run_claude_probe_command(
     }
     let text = text.trim().to_owned();
     (!text.is_empty()).then_some(text)
+}
+
+fn prepare_claude_probe_launch(
+    executable: &Path,
+    argument: &str,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Option<PreparedLaunch> {
+    #[cfg(unix)]
+    if matches!(launch_policy, ClaudeProbeLaunchPolicy::PosixShellFixture)
+        && executable.extension() == Some(OsStr::new("sh"))
+    {
+        return Some(PreparedLaunch {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![executable.as_os_str().to_owned(), OsString::from(argument)],
+            raw_windows_args: None,
+        });
+    }
+    let _ = launch_policy;
+    prepare_provider_launch(executable, [argument]).ok()
 }
 
 fn build_claude_launch_arguments(
@@ -6634,72 +6693,108 @@ pub fn build_claude_launch_arguments_with_settings_for_test(
     build_claude_launch_arguments(request, session_id, support, hook_settings.as_ref())
 }
 
+/// Owns an isolated Claude activity-probe cache for integration tests.
+///
+/// Production constructors intentionally use the process-global cache. Tests
+/// that seed or inspect cache state use this context so parallel test cases do
+/// not mutate one another's fixtures.
 #[doc(hidden)]
-pub async fn probe_claude_activity_support_for_test(binary_path: &str) -> ClaudeActivitySupport {
-    probe_claude_activity_support(binary_path).await
+#[derive(Clone, Debug, Default)]
+pub struct ClaudeActivityProbeTestContext {
+    cache: ClaudeActivityProbeCache,
 }
 
-#[doc(hidden)]
-pub async fn probe_claude_activity_support_with_resolution_delay_for_test(
-    binary_path: &str,
-    resolution_delay: Duration,
-) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_resolution_delay(binary_path, resolution_delay).await
-}
+impl ClaudeActivityProbeTestContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-#[doc(hidden)]
-pub async fn reset_claude_activity_probe_cache_for_test() {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *cache = ClaudeProbeCacheState::default();
-}
+    #[must_use]
+    pub fn driver_factory(&self, attachments_dir: PathBuf) -> NativeProviderDriverFactory {
+        NativeProviderDriverFactory::with_claude_probe_cache(
+            attachments_dir,
+            ProcessAttributionRegistry::new(),
+            AgentActivityController::new(true),
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+    }
 
-#[doc(hidden)]
-pub async fn claude_activity_probe_cache_len_for_test() -> usize {
-    claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .ready
-        .len()
-}
+    pub async fn probe(&self, binary_path: &str) -> ClaudeActivitySupport {
+        probe_claude_activity_support_with_environment(
+            binary_path,
+            std::iter::empty(),
+            Duration::ZERO,
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+        .await
+    }
 
-#[doc(hidden)]
-pub async fn seed_claude_activity_probe_cache_for_test(count: usize) {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for index in 0..count {
-        let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
-        let key = ClaudeProbeCacheKey {
-            executable,
-            modified: None,
-            length: u64::try_from(index).unwrap_or(u64::MAX),
-            file_identity: None,
-        };
-        insert_claude_ready_probe(
-            &mut cache,
-            key,
-            ClaudeCachedProbe {
-                version: format!("test-{index}"),
-                support: ClaudeActivitySupport::default(),
-            },
-        );
+    pub async fn probe_with_resolution_delay(
+        &self,
+        binary_path: &str,
+        resolution_delay: Duration,
+    ) -> ClaudeActivitySupport {
+        probe_claude_activity_support_with_environment(
+            binary_path,
+            std::iter::empty(),
+            resolution_delay,
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+        .await
+    }
+
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.cache.lock().ready.len()
+    }
+
+    pub fn seed_cache(&self, count: usize) {
+        let mut cache = self.cache.lock();
+        for index in 0..count {
+            let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
+            let key = ClaudeProbeCacheKey {
+                executable,
+                modified: None,
+                length: u64::try_from(index).unwrap_or(u64::MAX),
+                file_identity: None,
+            };
+            insert_claude_ready_probe(
+                &mut cache,
+                key,
+                ClaudeCachedProbe {
+                    version: format!("test-{index}"),
+                    support: ClaudeActivitySupport::default(),
+                },
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn cache_paths(&self) -> Vec<String> {
+        let cache = self.cache.lock();
+        let mut paths = cache
+            .ready
+            .keys()
+            .map(|key| key.executable.executable.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 }
 
-#[doc(hidden)]
-pub async fn claude_activity_probe_cache_paths_for_test() -> Vec<String> {
-    let cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut paths = cache
-        .ready
-        .keys()
-        .map(|key| key.executable.executable.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
+const fn test_claude_probe_launch_policy() -> ClaudeProbeLaunchPolicy {
+    #[cfg(unix)]
+    {
+        ClaudeProbeLaunchPolicy::PosixShellFixture
+    }
+    #[cfg(not(unix))]
+    {
+        ClaudeProbeLaunchPolicy::Direct
+    }
 }
 
 impl ClaudeDriver {
@@ -6708,6 +6803,8 @@ impl ClaudeDriver {
         attachments: AttachmentMaterializer,
         attribution: ProcessAttributionRegistry,
         activity_enabled: bool,
+        probe_cache: ClaudeActivityProbeCache,
+        probe_launch_policy: ClaudeProbeLaunchPolicy,
     ) -> Result<Self, ProviderRuntimeError> {
         let supports_fast_mode = claude_supports_fast_mode(request.model.as_deref());
         validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
@@ -6728,6 +6825,8 @@ impl ClaudeDriver {
                 .iter()
                 .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
             Duration::ZERO,
+            probe_cache,
+            probe_launch_policy,
         )
         .await;
         let hook_sink = if support.include_hook_events && support.forward_subagent_text {
@@ -8487,6 +8586,31 @@ mod tests {
         launch_request_for_provider_with_options("codex", "gpt-5.6", options).await
     }
 
+    #[test]
+    fn production_native_factories_share_the_direct_claude_probe_cache() {
+        let temp = TempDir::new().expect("provider factory fixture directory");
+        let first = super::NativeProviderDriverFactory::new(temp.path().join("attachments-a"));
+        let second = super::NativeProviderDriverFactory::new(temp.path().join("attachments-b"));
+
+        assert!(
+            Arc::ptr_eq(
+                &first.claude_probe_cache.state,
+                &second.claude_probe_cache.state
+            ),
+            "production factories must preserve process-wide Claude probe reuse"
+        );
+        assert!(matches!(
+            (
+                first.claude_probe_launch_policy,
+                second.claude_probe_launch_policy
+            ),
+            (
+                super::ClaudeProbeLaunchPolicy::Direct,
+                super::ClaudeProbeLaunchPolicy::Direct
+            )
+        ));
+    }
+
     #[tokio::test]
     async fn launch_request_preserves_canonical_options() {
         let request = launch_request_with_options(vec![
@@ -8952,6 +9076,8 @@ done
                 factory.attachments.clone(),
                 factory.attribution.clone(),
                 false,
+                factory.claude_probe_cache.clone(),
+                factory.claude_probe_launch_policy,
             )
             .await
             .expect("Claude delivery fixture should start"),
@@ -8972,6 +9098,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             false,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("Claude driver should create");
@@ -10962,6 +11090,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             true,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("Claude driver should create");
@@ -11051,6 +11181,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             true,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("fresh Claude driver should create");
