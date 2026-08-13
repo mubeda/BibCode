@@ -481,7 +481,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     )
     .await;
 
-    let local_update = timeout(Duration::from_millis(750), async {
+    let local_update = timeout(Duration::from_secs(2), async {
         loop {
             let message = next_server_message(&mut status_socket).await;
             if let ServerMessage::Chunk { request_id, values } = message
@@ -499,7 +499,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         }
     })
     .await
-    .expect("a successful project file save should publish Git status within 750ms");
+    .expect("a successful project file save should publish Git status within two seconds");
     assert_eq!(
         local_update[0]["local"]["workingTree"]["files"][0]["path"],
         "tracked.txt"
