@@ -128,14 +128,45 @@ async function openMaterializedFixtureChat(): Promise<{
       2,
     ),
   );
-  await browser.execute((threadId: string) => {
-    window.location.hash = `#/primary/${encodeURIComponent(threadId)}`;
-  }, materialized.threadId);
+  await browser.refresh();
+  await browser.waitUntil(
+    async () => {
+      for (const project of await browser.$$(
+        `//*[normalize-space()="${desktopActivityFixture.project.title}"]`,
+      )) {
+        if (await project.isDisplayed()) return true;
+      }
+      return false;
+    },
+    { timeoutMsg: "The RPC-materialized activity project did not enter the connected shell." },
+  );
+  const activityThreadSelector = `//*[starts-with(@data-testid, "thread-row-") and .//*[normalize-space()="${desktopActivityFixture.thread.title}"]]`;
+  const activityProject = browser.$(
+    `//button[@data-sidebar="menu-button" and .//*[normalize-space()="${desktopActivityFixture.project.title}"]]`,
+  );
+  if (!(await browser.$(activityThreadSelector).isDisplayed())) {
+    await activityProject.waitForDisplayed();
+    await activityProject.click();
+    await browser.$(activityThreadSelector).waitForDisplayed({
+      timeoutMsg: "The RPC-materialized activity thread did not expand in the main sidebar.",
+    });
+  }
+  let openedActivityThread = false;
+  for (const candidate of await browser.$$(activityThreadSelector)) {
+    if (await candidate.isDisplayed()) {
+      await candidate.click();
+      openedActivityThread = true;
+      break;
+    }
+  }
+  if (!openedActivityThread) {
+    throw new Error("The RPC-materialized activity thread was not visible in the main sidebar.");
+  }
   const composer = browser.$('[data-testid="composer-editor"]');
   await composer.waitForExist();
   if (!(await composer.isDisplayed())) {
     const mainPanel = browser.$(
-      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Main"]]',
+      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
     );
     if (await mainPanel.isExisting()) {
       await mainPanel.click();
@@ -199,7 +230,7 @@ async function readActivityGeometry(): Promise<ActivityGeometry> {
     return {
       composer: rectangle('[data-chat-composer-form="true"]', true, true)!,
       dock: rectangle('[data-testid="activity-dock"]', true, true)!,
-      workspaceHeader: rectangle("[data-chat-header]", true, true)!,
+      workspaceHeader: rectangle("[data-center-panel-group-header]", true, true)!,
       inspector: rectangle("[data-activity-panel]", false),
       sheet: rectangle('[role="dialog"]:has([data-activity-panel])', false),
       viewportHeight: window.innerHeight,
@@ -213,12 +244,32 @@ async function assertBoundedActivityGeometry(
   expectInspector: boolean,
 ): Promise<void> {
   await setDesktopUiWindowSize(width, 720);
+  await browser.waitUntil(
+    async () => {
+      const candidate = await readActivityGeometry();
+      return (
+        candidate.viewportWidth === width &&
+        [candidate.workspaceHeader, candidate.dock, candidate.composer].every((rectangle) =>
+          isFullyContainedInViewport(rectangle, candidate.viewportWidth, candidate.viewportHeight),
+        )
+      );
+    },
+    {
+      timeoutMsg: `The activity surface did not settle inside the ${width}px viewport after resize.`,
+    },
+  );
   const geometry = await readActivityGeometry();
   expect(geometry.viewportWidth).toBe(width);
-  for (const rectangle of [geometry.workspaceHeader, geometry.dock, geometry.composer]) {
-    expect(
-      isFullyContainedInViewport(rectangle, geometry.viewportWidth, geometry.viewportHeight),
-    ).toBe(true);
+  for (const [name, rectangle] of [
+    ["workspace header", geometry.workspaceHeader],
+    ["activity dock", geometry.dock],
+    ["composer", geometry.composer],
+  ] as const) {
+    if (!isFullyContainedInViewport(rectangle, geometry.viewportWidth, geometry.viewportHeight)) {
+      throw new Error(
+        `${name} escaped the ${geometry.viewportWidth}x${geometry.viewportHeight} viewport: ${JSON.stringify(rectangle)}`,
+      );
+    }
   }
   expect(geometry.dock.top).toBeGreaterThanOrEqual(geometry.workspaceHeader.bottom);
   expect(rectanglesOverlap(geometry.dock, geometry.composer)).toBe(false);
@@ -273,7 +324,7 @@ async function assertActivityPresentation(width: 800 | 980 | 981 | 1_199 | 1_200
         doneCounts: [...summary.querySelectorAll('[data-activity-count="done"]')].map(
           (element) => element.textContent?.trim() ?? "",
         ),
-        glyphCount: summary.querySelectorAll("[data-activity-glyph]").length,
+        glyphCount: summary.querySelectorAll("[data-activity-provider-glyph]").length,
         text: summary.textContent ?? "",
       };
     });
@@ -289,10 +340,10 @@ async function assertActivityPresentation(width: 800 | 980 | 981 | 1_199 | 1_200
   const presentation = await readPresentation();
   expect(presentation.glyphCount).toBe(1);
   if (width < 1_200) {
-    expect(presentation.activeCounts).toEqual(["2"]);
-    expect(presentation.doneCounts).toEqual(["0"]);
-    expect(presentation.text).not.toContain("Active");
-    expect(presentation.text).not.toContain("Done");
+    expect(presentation.activeCounts).toEqual(["Active 2"]);
+    expect(presentation.doneCounts).toEqual(["Done 0"]);
+    expect(presentation.text).toContain("Active 2");
+    expect(presentation.text).toContain("Done 0");
   } else {
     expect(presentation.activeCounts).toEqual([]);
     expect(presentation.doneCounts).toEqual([]);
@@ -373,8 +424,7 @@ async function assertProviderTerminalGeometry(terminalId: string): Promise<void>
       `[data-provider-terminal-activity-host="${CSS.escape(id)}"]`,
     );
     const owner = host?.closest<HTMLElement>("[data-terminal-owner]") ?? null;
-    const toolbarButton =
-      owner?.querySelector<HTMLElement>('button[aria-label="Close Terminal"]') ?? null;
+    const toolbar = document.querySelector<HTMLElement>("[data-center-panel-group-header]");
     return {
       dock: visibleRectangle(
         host?.querySelector<HTMLElement>('[data-testid="activity-dock"]') ?? null,
@@ -382,7 +432,7 @@ async function assertProviderTerminalGeometry(terminalId: string): Promise<void>
       ),
       host: visibleRectangle(host, "provider terminal activity host"),
       owner: visibleRectangle(owner, "provider terminal owner"),
-      toolbar: visibleRectangle(toolbarButton?.parentElement ?? null, "provider terminal toolbar"),
+      toolbar: visibleRectangle(toolbar, "provider terminal toolbar"),
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
@@ -962,7 +1012,8 @@ describe("packaged responsive activity experience", () => {
     await setDesktopUiWindowSize(1_200, 720);
     const terminalId = await openCodexProviderTerminal();
     await assertProviderTerminalGeometry(terminalId);
-    const terminalInput = `[data-provider-terminal-activity-host="${terminalId}"] ~ * .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea`;
+    const terminalInput =
+      '[data-terminal-owner="center-panel"] .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea';
     expect(await focusDesktopUiElement(terminalInput)).toEqual(
       expect.objectContaining({ tagName: "TEXTAREA" }),
     );
@@ -977,13 +1028,13 @@ describe("packaged responsive activity experience", () => {
       expect.objectContaining({ tagName: "TEXTAREA" }),
     );
     const updatedSummary = browser.$(
-      'button[aria-label*="1 active subagent"][aria-label*="1 done subagent"][aria-label*="0 active background tasks"][aria-label*="1 done background task"]',
+      'button[aria-label*="1 active subagent"][aria-label*="0 done subagents"][aria-label*="0 active background tasks"][aria-label*="1 done background task"]',
     );
     await updatedSummary.waitForExist({
       timeoutMsg: "The provider follow-up did not materially update activity counts.",
     });
     const updatedAnnouncement =
-      "Activity update: 1 active subagent, 1 done subagent, 0 active background tasks, 1 done background task";
+      "Activity update: 1 active subagent, 0 done subagents, 0 active background tasks, 1 done background task";
     await browser.waitUntil(
       async () =>
         (await browser
@@ -995,7 +1046,7 @@ describe("packaged responsive activity experience", () => {
     );
     await assertProviderTerminalGeometry(terminalId);
     const mainPanel = browser.$(
-      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Main"]]',
+      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
     );
     await mainPanel.click();
     await browser.$('[data-testid="composer-editor"]').waitForDisplayed();
@@ -1022,13 +1073,12 @@ describe("packaged responsive activity experience", () => {
       document.addEventListener("focusin", state.onFocusIn, true);
     });
     await startDesktopActivityComposerFollowupTurn();
-    const composerUpdateAnnouncement =
-      "Activity update: 2 active subagents, 0 done subagents, 0 active background tasks, 1 done background task";
+    const composerUpdateAnnouncement = "Activity update: 2 active subagents, 0 done subagents";
     await browser.waitUntil(
       async () =>
         browser.execute((announcement: string) => {
           const summary = document.querySelector<HTMLButtonElement>(
-            'button[aria-label*="2 active subagents"][aria-label*="0 done subagents"][aria-label*="0 active background tasks"][aria-label*="1 done background task"]',
+            'button[aria-label*="2 active subagents"][aria-label*="0 done subagents"]',
           );
           const liveRegion = document.querySelector<HTMLElement>(
             '[data-testid="activity-dock"] [role="status"][aria-live="polite"]',

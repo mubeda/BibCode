@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Desktop UI fixture tests inspect host temp files.
+// @effect-diagnostics globalTimers:off - Native fixture protocol tests use bounded child-process watchdogs.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -194,6 +195,58 @@ describe.each(["mac", "linux"])("prepareDesktopUiTestContext on %s", (platform) 
 });
 
 describe("packaged provider composer fixture", () => {
+  it("replays the Claude user message before acknowledging the completed turn", async () => {
+    const environment: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      BIBCODE_E2E_PLATFORM: "mac",
+    };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const executable = NodePath.join(context.shimDirectory, "claude");
+    const child = NodeChildProcess.spawn(executable, ["--print", "--replay-user-messages"], {
+      env: { ...process.env, ...environment },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const lines = NodeReadline.createInterface({ input: child.stdout });
+    const messages: Array<Record<string, unknown>> = [];
+    const completed = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error(`Claude fixture emitted only ${String(messages.length)} messages.`)),
+        2_000,
+      );
+      lines.on("line", (line) => {
+        messages.push(JSON.parse(line) as Record<string, unknown>);
+        if (messages.length === 3) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      child.once("exit", (code) => {
+        if (messages.length < 3) {
+          clearTimeout(timeout);
+          reject(new Error(`Claude fixture exited before replaying the turn (${String(code)}).`));
+        }
+      });
+    });
+
+    const user = {
+      type: "user",
+      session_id: "claude-replay-session",
+      message: { role: "user", content: [{ type: "text", text: "/compact" }] },
+      parent_tool_use_id: null,
+    };
+    child.stdin.write(`${JSON.stringify(user)}\n`);
+    await completed;
+    expect(messages[0]).toEqual(user);
+    expect(messages[1]).toMatchObject({ type: "stream_event" });
+    expect(messages[2]).toMatchObject({ type: "result", subtype: "success" });
+
+    child.stdin.end();
+    if (child.exitCode === null) {
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }
+  });
+
   it("does not leak Task 4 activation into a later unrelated Codex process", async () => {
     const environment: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,
@@ -388,10 +441,7 @@ describe("packaged provider composer fixture", () => {
         defaultModelSelection: {
           instanceId: "codex",
           model: "gpt-5.4",
-          options: [
-            { id: "reasoningEffort", value: "medium" },
-            { id: "serviceTier", value: "default" },
-          ],
+          options: [{ id: "reasoningEffort", value: "medium" }],
         },
         createdAt: "2026-07-29T18:00:00.000Z",
       },
@@ -401,14 +451,10 @@ describe("packaged provider composer fixture", () => {
         threadId: "bibcode-ui-activity-thread",
         projectId: "bibcode-ui-activity-project",
         title: "Activity acceptance fixture",
-        kind: "workspace",
         modelSelection: {
           instanceId: "codex",
           model: "gpt-5.4",
-          options: [
-            { id: "reasoningEffort", value: "medium" },
-            { id: "serviceTier", value: "default" },
-          ],
+          options: [{ id: "reasoningEffort", value: "medium" }],
         },
         runtimeMode: "full-access",
         interactionMode: "default",
@@ -429,10 +475,7 @@ describe("packaged provider composer fixture", () => {
         modelSelection: {
           instanceId: "codex",
           model: "gpt-5.4",
-          options: [
-            { id: "reasoningEffort", value: "medium" },
-            { id: "serviceTier", value: "default" },
-          ],
+          options: [{ id: "reasoningEffort", value: "medium" }],
         },
         runtimeMode: "full-access",
         interactionMode: "default",

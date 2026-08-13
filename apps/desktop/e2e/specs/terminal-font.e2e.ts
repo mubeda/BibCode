@@ -25,7 +25,7 @@ const terminalGlyphProbe = "\ue0b0 \uf115";
 
 async function openGeneralSettings(): Promise<void> {
   const appOrigin = await browser.execute(() => window.location.origin);
-  await browser.url(`${appOrigin}/#/settings/general`);
+  await browser.url(`${appOrigin}/#/settings/terminal`);
   await expect(browser.$('[aria-label="Terminal font"]')).toBeDisplayed();
 }
 
@@ -132,11 +132,14 @@ describe("packaged terminal font support", () => {
       `//button[.//span[normalize-space()="${desktopUiFixture.projectName}"]]`,
     );
     await expect(project).toBeDisplayed();
-    await project.click();
-
-    const newChat = browser.$('[data-testid="new-main-chat-button"]');
-    await expect(newChat).toBeEnabled();
-    await newChat.click();
+    const primaryWorkspace = browser.$(
+      '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
+    );
+    if (!(await primaryWorkspace.isDisplayed())) {
+      await project.click();
+    }
+    await expect(primaryWorkspace).toBeDisplayed();
+    await primaryWorkspace.click();
 
     await openCenterTerminal();
     const terminalScreen = browser.$(".xterm-screen");

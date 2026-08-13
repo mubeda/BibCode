@@ -14,11 +14,14 @@ describe("packaged preferences, native integrations, and platform capabilities",
     const settings = browser.$("button=Settings");
     await expect(settings).toBeDisplayed();
     await settings.click();
+    const appOrigin = await browser.execute(() => window.location.origin);
+    await browser.url(`${appOrigin}/#/settings/about`);
     const checkForUpdates = browser.$("button=Check for Updates");
     await checkForUpdates.scrollIntoView();
     await expect(checkForUpdates).toBeDisplayed();
     await expect(checkForUpdates).toBeDisabled();
 
+    await browser.url(`${appOrigin}/#/settings/general`);
     const themePreference = browser.$('[aria-label="Theme preference"]');
     await themePreference.scrollIntoView();
     await expect(themePreference).toBeDisplayed();
@@ -39,14 +42,13 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await revealAccountEmail.click();
     await expect(browser.$("//*[contains(., 'fixture@example.test')]")).toBeDisplayed();
 
-    const appOrigin = await browser.execute(() => window.location.origin);
     await browser.url(`${appOrigin}/#/settings/connections`);
     await expect(browser.$("//*[normalize-space()='Network access']")).toBeDisplayed();
     await expect(browser.$("//*[normalize-space()='Tailscale HTTPS']")).toBeDisplayed();
     const addEnvironment = browser.$('button[aria-label="Add environment"]');
     await expect(addEnvironment).toBeEnabled();
     await addEnvironment.click();
-    await expect(browser.$("//*[normalize-space()='Add Environment']")).toBeDisplayed();
+    await expect(browser.$('[data-slot="dialog-title"]*=Add Environment')).toBeDisplayed();
     await expect(browser.$("//*[normalize-space()='SSH']")).toBeDisplayed();
     await browser.keys("Escape");
 

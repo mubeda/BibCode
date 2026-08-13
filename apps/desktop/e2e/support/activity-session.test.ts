@@ -33,7 +33,13 @@ class FixtureWebSocket {
   readonly url: string;
   closeCalls = 0;
   static instances: FixtureWebSocket[] = [];
-  static responseMode: "close" | "malformed" | "server-error" | "silent" | "success" = "success";
+  static responseMode:
+    | "close"
+    | "malformed"
+    | "pending-then-success"
+    | "server-error"
+    | "silent"
+    | "success" = "success";
 
   constructor(url: string) {
     this.url = url;
@@ -110,7 +116,7 @@ class FixtureWebSocket {
       return;
     }
     if (request.tag === "orchestration.subscribeThread") {
-      queueMicrotask(() => {
+      const publishSnapshot = (providerInstanceId: string | null) => {
         const event = new MessageEvent("message", {
           data: JSON.stringify({
             _tag: "Chunk",
@@ -123,16 +129,19 @@ class FixtureWebSocket {
                   thread: {
                     id: "server-resolved-thread",
                     projectId: "server-resolved-project",
-                    session: {
-                      activeTurnId: null,
-                      lastError: null,
-                      providerInstanceId: "server-resolved-codex",
-                      providerName: "codex",
-                      runtimeMode: "full-access",
-                      status: "ready",
-                      threadId: "server-resolved-thread",
-                      updatedAt: "2026-07-29T19:00:00.000Z",
-                    },
+                    session:
+                      providerInstanceId === null
+                        ? null
+                        : {
+                            activeTurnId: null,
+                            lastError: null,
+                            providerInstanceId,
+                            providerName: "codex",
+                            runtimeMode: "full-access",
+                            status: "ready",
+                            threadId: "server-resolved-thread",
+                            updatedAt: "2026-07-29T19:00:00.000Z",
+                          },
                   },
                 },
               },
@@ -140,6 +149,14 @@ class FixtureWebSocket {
           }),
         });
         for (const listener of this.messageListeners) listener(event);
+      };
+      queueMicrotask(() => {
+        if (FixtureWebSocket.responseMode === "pending-then-success") {
+          publishSnapshot(null);
+          queueMicrotask(() => publishSnapshot("server-resolved-codex"));
+          return;
+        }
+        publishSnapshot("server-resolved-codex");
       });
       return;
     }
@@ -260,6 +277,21 @@ describe("materializeDesktopActivitySession", () => {
     expect(socket.openListeners.size).toBe(0);
   });
 
+  it("waits on the retained thread stream until provider ownership is projected", async () => {
+    installHarness();
+    FixtureWebSocket.responseMode = "pending-then-success";
+
+    await expect(materializeDesktopActivitySession("/fixture/project")).resolves.toEqual({
+      projectId: "server-resolved-project",
+      providerInstanceId: "server-resolved-codex",
+      threadId: "server-resolved-thread",
+    });
+
+    expect(sentRequests.filter(({ tag }) => tag === "orchestration.subscribeThread")).toHaveLength(
+      1,
+    );
+  });
+
   it("can publish a later provider update without rebuilding project or thread state", async () => {
     Object.defineProperty(window, "desktopBridge", {
       configurable: true,
@@ -304,10 +336,7 @@ describe("materializeDesktopActivitySession", () => {
       modelSelection: {
         instanceId: "codex",
         model: "gpt-5.4",
-        options: [
-          { id: "reasoningEffort", value: "medium" },
-          { id: "serviceTier", value: "default" },
-        ],
+        options: [{ id: "reasoningEffort", value: "medium" }],
       },
       runtimeMode: "full-access",
       interactionMode: "default",
