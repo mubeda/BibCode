@@ -7,6 +7,12 @@ use std::{
     sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+
+#[cfg(any(target_os = "macos", windows))]
+use crate::git::{HostPathPlatform, normalize_worktree_path_key};
+
 #[cfg(not(test))]
 use std::{io::IsTerminal, sync::OnceLock};
 
@@ -50,6 +56,80 @@ impl LogWriter {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
     }
+
+    fn set_rotation_path(&self, path: PathBuf) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .path = path;
+    }
+
+    fn physical_identity(&self) -> std::io::Result<LogFileIdentity> {
+        let writer = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        log_file_identity(
+            writer
+                .file
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("rotating log file is unavailable"))?,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+fn log_file_identity(file: &File) -> std::io::Result<LogFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(LogFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn log_file_identity(file: &File) -> std::io::Result<LogFileIdentity> {
+    log_windows_metadata_identity(&file.metadata()?)
+}
+
+#[cfg(windows)]
+fn log_windows_metadata_identity(metadata: &std::fs::Metadata) -> std::io::Result<LogFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Ok(LogFileIdentity {
+        volume: u64::from(
+            metadata.volume_serial_number().ok_or_else(|| {
+                std::io::Error::other("native log volume identity is unavailable")
+            })?,
+        ),
+        file: metadata
+            .file_index()
+            .ok_or_else(|| std::io::Error::other("native log file identity is unavailable"))?,
+    })
+}
+
+#[cfg(unix)]
+fn log_path_identity(path: &Path) -> std::io::Result<LogFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok(LogFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn log_path_identity(path: &Path) -> std::io::Result<LogFileIdentity> {
+    log_windows_metadata_identity(&std::fs::metadata(path)?)
 }
 
 struct LogWriterGuard<'a>(MutexGuard<'a, RotatingFile>);
@@ -183,7 +263,7 @@ impl Write for LogWriterGuard<'_> {
 struct LogSinkRegistryState {
     next_id: u64,
     sinks: BTreeMap<u64, RegisteredLogSink>,
-    sink_ids_by_path: BTreeMap<PathBuf, u64>,
+    sink_ids_by_identity: BTreeMap<LogSinkIdentity, u64>,
 }
 
 enum RegisteredLogSink {
@@ -191,15 +271,25 @@ enum RegisteredLogSink {
         waiters: usize,
     },
     Ready {
-        identity: PathBuf,
+        identity: LogSinkIdentity,
         writer: LogWriter,
         lease_count: usize,
+        snapshot_count: usize,
     },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LogSinkIdentity {
+    #[cfg(not(windows))]
+    CaseSensitive(PathBuf),
+    #[cfg(any(target_os = "macos", windows))]
+    CaseFolded(String),
 }
 
 #[derive(Clone)]
 struct LogSinkTarget {
     path: PathBuf,
+    identity: LogSinkIdentity,
 }
 
 #[derive(Default)]
@@ -216,19 +306,19 @@ impl LogSinkRegistry {
     fn register_with<F>(
         self: &Arc<Self>,
         target: LogSinkTarget,
-        open: F,
+        mut open: F,
     ) -> Result<LogSinkLease, LoggingError>
     where
-        F: FnOnce(&Path) -> Result<LogWriter, LoggingError>,
+        F: FnMut(&Path) -> Result<LogWriter, LoggingError>,
     {
-        let identity = target.path.clone();
-        let mut open = Some(open);
+        let mut target = target;
         loop {
+            let identity = target.identity.clone();
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(id) = state.sink_ids_by_path.get(&identity).copied() {
+            if let Some(id) = state.sink_ids_by_identity.get(&identity).copied() {
                 let sink = state
                     .sinks
                     .get_mut(&id)
@@ -252,7 +342,7 @@ impl LogSinkRegistry {
                             .state_changed
                             .wait_while(state, |state| {
                                 state
-                                    .sink_ids_by_path
+                                    .sink_ids_by_identity
                                     .get(&identity)
                                     .and_then(|id| state.sinks.get(id))
                                     .is_some_and(|sink| {
@@ -275,58 +365,112 @@ impl LogSinkRegistry {
                 .sinks
                 .insert(id, RegisteredLogSink::Pending { waiters: 0 });
             debug_assert!(replaced.is_none());
-            let replaced = state.sink_ids_by_path.insert(identity.clone(), id);
+            let replaced = state.sink_ids_by_identity.insert(identity.clone(), id);
             debug_assert!(replaced.is_none());
             drop(state);
 
-            let result = open
-                .take()
-                .expect("one registration owns at most one pending reservation")(
-                &target.path
+            let mut reservation = PendingReservation::new(self.clone(), id);
+            let (writer, opened_target) = loop {
+                let writer = open(&target.path)?;
+                let opened_target = resolve_opened_log_sink_target(&target.path)?;
+                writer.set_rotation_path(opened_target.path.clone());
+                let opened_identity =
+                    writer
+                        .physical_identity()
+                        .map_err(|source| LoggingError::OpenFile {
+                            path: opened_target.path.clone(),
+                            source,
+                        })?;
+                let current_identity =
+                    log_path_identity(&opened_target.path).map_err(|source| {
+                        LoggingError::OpenFile {
+                            path: opened_target.path.clone(),
+                            source,
+                        }
+                    })?;
+                if opened_identity == current_identity {
+                    break (writer, opened_target);
+                }
+                drop(writer);
+                target.path = opened_target.path;
+            };
+
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                matches!(
+                    state.sinks.get(&id),
+                    Some(RegisteredLogSink::Pending { .. })
+                ),
+                "pending log sink remains reserved during file opening"
             );
-            match result {
-                Ok(writer) => {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let sink = state
-                        .sinks
-                        .get_mut(&id)
-                        .expect("pending log sink remains reserved during file opening");
-                    assert!(
-                        matches!(sink, RegisteredLogSink::Pending { .. }),
-                        "pending log sink token cannot be finalized twice"
-                    );
-                    *sink = RegisteredLogSink::Ready {
-                        identity,
-                        writer,
-                        lease_count: 1,
-                    };
+
+            if let Some(existing_id) = state
+                .sink_ids_by_identity
+                .get(&opened_target.identity)
+                .copied()
+                .filter(|existing_id| *existing_id != id)
+            {
+                if let Some(RegisteredLogSink::Ready { lease_count, .. }) =
+                    state.sinks.get_mut(&existing_id)
+                {
+                    *lease_count = lease_count
+                        .checked_add(1)
+                        .expect("native log sink lease count exhausted");
+                    remove_pending_reservation(&mut state, id, &identity);
+                    reservation.disarm();
                     drop(state);
                     self.state_changed.notify_all();
+                    drop(writer);
                     return Ok(LogSinkLease {
                         registry: self.clone(),
-                        id,
+                        id: existing_id,
                     });
                 }
-                Err(error) => {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let removed = state.sinks.remove(&id);
-                    assert!(
-                        matches!(removed, Some(RegisteredLogSink::Pending { .. })),
-                        "failed log sink open rolls back its exact pending token"
-                    );
-                    let indexed_id = state.sink_ids_by_path.remove(&identity);
-                    debug_assert_eq!(indexed_id, Some(id));
-                    drop(state);
-                    self.state_changed.notify_all();
-                    return Err(error);
-                }
+
+                assert!(
+                    matches!(
+                        state.sinks.get(&existing_id),
+                        Some(RegisteredLogSink::Pending { .. })
+                    ),
+                    "physical log sink index references a live sink"
+                );
+                remove_pending_reservation(&mut state, id, &identity);
+                reservation.disarm();
+                drop(state);
+                self.state_changed.notify_all();
+                drop(writer);
+                target = opened_target;
+                continue;
             }
+
+            if opened_target.identity != identity {
+                let indexed_id = state.sink_ids_by_identity.remove(&identity);
+                debug_assert_eq!(indexed_id, Some(id));
+                let replaced = state
+                    .sink_ids_by_identity
+                    .insert(opened_target.identity.clone(), id);
+                debug_assert!(replaced.is_none());
+            }
+            let sink = state
+                .sinks
+                .get_mut(&id)
+                .expect("pending log sink remains reserved during finalization");
+            *sink = RegisteredLogSink::Ready {
+                identity: opened_target.identity,
+                writer,
+                lease_count: 1,
+                snapshot_count: 0,
+            };
+            reservation.disarm();
+            drop(state);
+            self.state_changed.notify_all();
+            return Ok(LogSinkLease {
+                registry: self.clone(),
+                id,
+            });
         }
     }
 
@@ -336,48 +480,167 @@ impl LogSinkRegistry {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let remove_sink = if let Some(RegisteredLogSink::Ready { lease_count, .. }) =
-                state.sinks.get_mut(&id)
-            {
+            if let Some(RegisteredLogSink::Ready { lease_count, .. }) = state.sinks.get_mut(&id) {
                 *lease_count = lease_count
                     .checked_sub(1)
                     .expect("native log sink lease count remains positive");
-                *lease_count == 0
-            } else {
-                false
-            };
-            if remove_sink {
-                let sink = state
-                    .sinks
-                    .remove(&id)
-                    .expect("last lease references a live physical log sink");
-                let RegisteredLogSink::Ready {
-                    identity, writer, ..
-                } = sink
-                else {
-                    unreachable!("only a ready log sink can own a lease")
-                };
-                let indexed_id = state.sink_ids_by_path.remove(&identity);
-                debug_assert_eq!(indexed_id, Some(id));
-                Some(writer)
-            } else {
-                None
             }
+            remove_ready_if_unowned(&mut state, id)
         };
         drop(removed);
     }
 
-    fn snapshot(&self) -> Vec<LogWriter> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .sinks
-            .values()
-            .filter_map(|sink| match sink {
-                RegisteredLogSink::Ready { writer, .. } => Some(writer.clone()),
-                RegisteredLogSink::Pending { .. } => None,
-            })
-            .collect()
+    fn snapshot(self: &Arc<Self>) -> MultiLogWriter {
+        let (writers, ids) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut writers = Vec::new();
+            let mut ids = Vec::new();
+            for (id, sink) in &mut state.sinks {
+                let RegisteredLogSink::Ready {
+                    writer,
+                    lease_count,
+                    snapshot_count,
+                    ..
+                } = sink
+                else {
+                    continue;
+                };
+                if *lease_count == 0 {
+                    continue;
+                }
+                *snapshot_count = snapshot_count
+                    .checked_add(1)
+                    .expect("native log sink snapshot count exhausted");
+                writers.push(writer.clone());
+                ids.push(*id);
+            }
+            (writers, ids)
+        };
+        MultiLogWriter {
+            writers,
+            snapshot: Some(LogSinkSnapshot {
+                registry: self.clone(),
+                ids,
+            }),
+        }
+    }
+
+    fn rollback_pending(&self, id: u64) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(
+                state.sinks.get(&id),
+                Some(RegisteredLogSink::Pending { .. })
+            ) {
+                state.sinks.remove(&id);
+                state
+                    .sink_ids_by_identity
+                    .retain(|_, indexed_id| *indexed_id != id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.state_changed.notify_all();
+        }
+    }
+
+    fn release_snapshots(&self, ids: &[u64]) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for id in ids {
+                let Some(RegisteredLogSink::Ready { snapshot_count, .. }) = state.sinks.get_mut(id)
+                else {
+                    continue;
+                };
+                *snapshot_count = snapshot_count
+                    .checked_sub(1)
+                    .expect("native log sink snapshot count remains positive");
+            }
+            ids.iter()
+                .filter_map(|id| remove_ready_if_unowned(&mut state, *id))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+}
+
+fn remove_pending_reservation(
+    state: &mut LogSinkRegistryState,
+    id: u64,
+    identity: &LogSinkIdentity,
+) {
+    let removed = state.sinks.remove(&id);
+    assert!(
+        matches!(removed, Some(RegisteredLogSink::Pending { .. })),
+        "pending log sink rollback removes its exact token"
+    );
+    let indexed_id = state.sink_ids_by_identity.remove(identity);
+    debug_assert_eq!(indexed_id, Some(id));
+}
+
+fn remove_ready_if_unowned(state: &mut LogSinkRegistryState, id: u64) -> Option<LogWriter> {
+    let remove = matches!(
+        state.sinks.get(&id),
+        Some(RegisteredLogSink::Ready {
+            lease_count: 0,
+            snapshot_count: 0,
+            ..
+        })
+    );
+    if !remove {
+        return None;
+    }
+    let sink = state
+        .sinks
+        .remove(&id)
+        .expect("unowned log sink remains registered until exact removal");
+    let RegisteredLogSink::Ready {
+        identity, writer, ..
+    } = sink
+    else {
+        unreachable!("only a ready log sink can become unowned")
+    };
+    let indexed_id = state.sink_ids_by_identity.remove(&identity);
+    debug_assert_eq!(indexed_id, Some(id));
+    Some(writer)
+}
+
+struct PendingReservation {
+    registry: Arc<LogSinkRegistry>,
+    id: u64,
+    armed: bool,
+}
+
+impl PendingReservation {
+    fn new(registry: Arc<LogSinkRegistry>, id: u64) -> Self {
+        Self {
+            registry,
+            id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.rollback_pending(self.id);
+        }
     }
 }
 
@@ -392,8 +655,27 @@ impl Drop for LogSinkLease {
     }
 }
 
+struct LogSinkSnapshot {
+    registry: Arc<LogSinkRegistry>,
+    ids: Vec<u64>,
+}
+
+impl Drop for LogSinkSnapshot {
+    fn drop(&mut self) {
+        self.registry.release_snapshots(&self.ids);
+    }
+}
+
 struct MultiLogWriter {
     writers: Vec<LogWriter>,
+    snapshot: Option<LogSinkSnapshot>,
+}
+
+impl Drop for MultiLogWriter {
+    fn drop(&mut self) {
+        self.writers.clear();
+        drop(self.snapshot.take());
+    }
 }
 
 impl Write for MultiLogWriter {
@@ -430,16 +712,6 @@ impl Write for MultiLogWriter {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSinkRegistry {
-    type Writer = MultiLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        MultiLogWriter {
-            writers: self.snapshot(),
-        }
-    }
-}
-
 #[cfg(not(test))]
 struct SharedLogSinkRegistry(Arc<LogSinkRegistry>);
 
@@ -448,9 +720,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogSinkRegistry {
     type Writer = MultiLogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        MultiLogWriter {
-            writers: self.0.snapshot(),
-        }
+        self.0.snapshot()
     }
 }
 
@@ -575,9 +845,79 @@ fn resolve_log_sink_target(log_path: &Path) -> Result<LogSinkTarget, LoggingErro
             "native log path must name a file",
         ),
     })?;
+    let unresolved_path = canonical_parent.join(file_name);
+    match std::fs::canonicalize(&unresolved_path) {
+        Ok(path) => Ok(LogSinkTarget {
+            identity: log_sink_identity(&path),
+            path,
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(LogSinkTarget {
+            identity: log_sink_identity(&unresolved_path),
+            path: unresolved_path,
+        }),
+        Err(source) => Err(LoggingError::OpenFile {
+            path: unresolved_path,
+            source,
+        }),
+    }
+}
+
+fn resolve_opened_log_sink_target(log_path: &Path) -> Result<LogSinkTarget, LoggingError> {
+    let path = std::fs::canonicalize(log_path).map_err(|source| LoggingError::OpenFile {
+        path: log_path.to_path_buf(),
+        source,
+    })?;
     Ok(LogSinkTarget {
-        path: canonical_parent.join(file_name),
+        identity: log_sink_identity(&path),
+        path,
     })
+}
+
+/// Returns a reservation key for a fully normalized path or a not-yet-created leaf.
+///
+/// Existing leaves are canonicalized before this helper is called. Missing Windows leaves use
+/// the repository's invariant ordinal path fold. On macOS, the containing volume reports whether
+/// final components are case-sensitive; case-insensitive volumes use that same established fold.
+/// Other POSIX filesystems retain byte-sensitive `PathBuf` identity. Every opened sink is
+/// canonicalized again before its pending token can become ready.
+fn log_sink_identity(path: &Path) -> LogSinkIdentity {
+    #[cfg(windows)]
+    {
+        return LogSinkIdentity::CaseFolded(normalize_worktree_path_key(
+            path,
+            HostPathPlatform::Windows,
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if !macos_volume_is_case_sensitive(path) {
+            return LogSinkIdentity::CaseFolded(normalize_worktree_path_key(
+                path,
+                HostPathPlatform::Windows,
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        LogSinkIdentity::CaseSensitive(path.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_volume_is_case_sensitive(path: &Path) -> bool {
+    let directory = path
+        .parent()
+        .and_then(|parent| File::open(parent).ok())
+        .or_else(|| File::open(path).ok());
+    let Some(directory) = directory else {
+        return true;
+    };
+    // SAFETY: `directory` owns a live descriptor for the duration of this call. macOS defines
+    // `_PC_CASE_SENSITIVE` as a boolean path capability; errors conservatively retain exact case.
+    let result = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
+    result != 0
 }
 
 fn open_log_writer(log_path: &Path) -> Result<LogWriter, LoggingError> {
@@ -638,11 +978,14 @@ fn install_subscriber(
 mod tests {
     use std::{
         io::Write as _,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         thread,
+        time::Duration,
     };
 
     use tempfile::TempDir;
@@ -706,7 +1049,7 @@ mod tests {
             .expect("second log writer");
 
         registry
-            .make_writer()
+            .snapshot()
             .write_all(b"same-physical-path\n")
             .expect("write shared physical sink");
         let contents = std::fs::read_to_string(&log_path).expect("shared physical log");
@@ -762,7 +1105,7 @@ mod tests {
             .expect("register replacement writer");
 
         registry
-            .make_writer()
+            .snapshot()
             .write_all(b"post-rotation-marker\n")
             .expect("write through replacement registration");
         assert_eq!(
@@ -772,6 +1115,229 @@ mod tests {
         );
         drop(replacement);
         drop(staged_writer);
+    }
+
+    #[test]
+    fn opened_writer_revalidation_retries_a_descriptor_displaced_before_finalize() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let target = resolve_log_sink_target(&log_path).expect("shared log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let open_count = AtomicUsize::new(0);
+
+        let lease = registry
+            .register_with(target, |path| {
+                let writer = open_log_writer(path)?;
+                if open_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let competing = open_log_writer(path)?;
+                    competing
+                        .0
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .rotate()
+                        .expect("displace first opened descriptor");
+                }
+                Ok(writer)
+            })
+            .expect("retry displaced open and register current writer");
+        registry
+            .snapshot()
+            .write_all(b"revalidated-writer\n")
+            .expect("write through revalidated registration");
+
+        assert_eq!(open_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).expect("current server log"),
+            "revalidated-writer\n"
+        );
+        drop(lease);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[test]
+    fn an_in_flight_snapshot_keeps_the_registered_writer_discoverable() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let target = resolve_log_sink_target(&log_path).expect("shared log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let original = registry
+            .register_with(target.clone(), |path| {
+                RotatingFile::open(path.to_path_buf(), 64, 2)
+                    .map(LogWriter::new)
+                    .map_err(|source| LoggingError::OpenFile {
+                        path: path.to_path_buf(),
+                        source,
+                    })
+            })
+            .expect("register bounded original writer");
+        let mut stale_snapshot = registry.snapshot();
+        stale_snapshot
+            .write_all(&[b's'; 60])
+            .expect("seed original writer below its rotation limit");
+
+        drop(original);
+        let replacement = registry
+            .register_with(target, |path| {
+                RotatingFile::open(path.to_path_buf(), 1024, 2)
+                    .map(LogWriter::new)
+                    .map_err(|source| LoggingError::OpenFile {
+                        path: path.to_path_buf(),
+                        source,
+                    })
+            })
+            .expect("register while the old snapshot is in flight");
+
+        stale_snapshot
+            .write_all(b"snapshot-rotation\n")
+            .expect("in-flight snapshot rotates and writes");
+        let mut current_snapshot = registry.snapshot();
+        current_snapshot
+            .write_all(b"current-writer\n")
+            .expect("current registration writes after snapshot rotation");
+        current_snapshot.flush().expect("flush current writer");
+
+        assert_eq!(
+            std::fs::read_to_string(&log_path).expect("current server log"),
+            "snapshot-rotation\ncurrent-writer\n",
+            "replacement registration must reuse the writer retained by the snapshot"
+        );
+        drop(current_snapshot);
+        drop(replacement);
+        drop(stale_snapshot);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[test]
+    fn a_panicking_pending_opener_rolls_back_before_same_target_registration() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let target = resolve_log_sink_target(&log_path).expect("shared log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let opener_entered = Arc::new(Barrier::new(2));
+        let release_opener = Arc::new(Barrier::new(2));
+        let (registered_tx, registered_rx) = mpsc::sync_channel(1);
+
+        let panicking = {
+            let registry = registry.clone();
+            let target = target.clone();
+            let opener_entered = opener_entered.clone();
+            let release_opener = release_opener.clone();
+            thread::spawn(move || {
+                catch_unwind(AssertUnwindSafe(move || {
+                    let _ = registry.register_with(
+                        target,
+                        |_path| -> Result<LogWriter, LoggingError> {
+                            opener_entered.wait();
+                            release_opener.wait();
+                            panic!("injected opener panic")
+                        },
+                    );
+                }))
+            })
+        };
+        opener_entered.wait();
+        let waiter = {
+            let registry = registry.clone();
+            thread::spawn(move || {
+                let lease = registry
+                    .register(target)
+                    .expect("same target registration proceeds after opener unwind");
+                registered_tx
+                    .send(lease)
+                    .expect("publish registration after unwind");
+            })
+        };
+        let state = registry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = registry
+            .state_changed
+            .wait_while(state, |state| {
+                state.sinks.values().all(|sink| {
+                    !matches!(sink, RegisteredLogSink::Pending { waiters, .. } if *waiters > 0)
+                })
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(state);
+        release_opener.wait();
+
+        assert!(panicking.join().expect("panicking opener thread").is_err());
+        let lease = registered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pending waiter is notified after opener unwind");
+        waiter.join().expect("same-target waiter thread");
+        assert_eq!(active_sink_count(&registry), 1);
+        drop(lease);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_component_symlink_aliases_share_one_registered_writer() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temporary log directory");
+        let physical_path = temp.path().join("logs/physical.log");
+        let alias_path = temp.path().join("logs/server.log");
+        std::fs::create_dir_all(physical_path.parent().expect("log parent"))
+            .expect("log directory");
+        symlink(&physical_path, &alias_path).expect("final-component symlink");
+        let alias_target = resolve_log_sink_target(&alias_path).expect("dangling alias target");
+        let registry = Arc::new(LogSinkRegistry::default());
+
+        let physical = registry
+            .register(resolve_log_sink_target(&physical_path).expect("physical log target"))
+            .expect("register physical target");
+        let alias = registry
+            .register(alias_target)
+            .expect("merge alias after opened-target revalidation");
+        registry
+            .snapshot()
+            .write_all(b"one-physical-writer\n")
+            .expect("write aliased sink");
+
+        let contents = std::fs::read_to_string(&physical_path).expect("physical log");
+        assert_eq!(contents.matches("one-physical-writer").count(), 1);
+        assert_eq!(active_sink_count(&registry), 1);
+        assert_eq!(active_lease_count(&registry), 2);
+        drop(alias);
+        drop(physical);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn case_aliases_on_a_case_insensitive_volume_share_one_registered_writer() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let primary_path = temp.path().join("logs/Server.Log");
+        let alias_path = temp.path().join("logs/server.log");
+        std::fs::create_dir_all(primary_path.parent().expect("log parent")).expect("log directory");
+        #[cfg(target_os = "macos")]
+        if macos_volume_is_case_sensitive(&primary_path) {
+            return;
+        }
+        let primary_target = resolve_log_sink_target(&primary_path).expect("primary log target");
+        let alias_target = resolve_log_sink_target(&alias_path).expect("case-alias log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let primary = registry
+            .register(primary_target)
+            .expect("register primary spelling");
+        let alias = registry
+            .register(alias_target)
+            .expect("register case alias");
+        registry
+            .snapshot()
+            .write_all(b"one-case-insensitive-writer\n")
+            .expect("write case-aliased sink");
+
+        let contents = std::fs::read_to_string(&primary_path).expect("primary log");
+        assert_eq!(contents.matches("one-case-insensitive-writer").count(), 1);
+        assert_eq!(active_sink_count(&registry), 1);
+        assert_eq!(active_lease_count(&registry), 2);
+        drop(primary);
+        drop(alias);
+        assert_eq!(active_sink_count(&registry), 0);
     }
 
     #[test]
@@ -891,12 +1457,12 @@ mod tests {
             .expect("register right sink");
 
         registry
-            .make_writer()
+            .snapshot()
             .write_all(b"before-drop\n")
             .expect("write both registered sinks");
         drop(left);
         registry
-            .make_writer()
+            .snapshot()
             .write_all(b"after-drop\n")
             .expect("write remaining registered sink");
 
@@ -968,7 +1534,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(state.next_id, 256);
         assert!(state.sinks.is_empty());
-        assert!(state.sink_ids_by_path.is_empty());
+        assert!(state.sink_ids_by_identity.is_empty());
     }
 
     #[test]
@@ -980,6 +1546,7 @@ mod tests {
                 unavailable_writer(temp.path().join("missing/server.log")),
                 test_writer(healthy_path.clone()),
             ],
+            snapshot: None,
         };
 
         writer
@@ -1002,6 +1569,7 @@ mod tests {
                 unavailable_writer(temp.path().join("first/server.log")),
                 unavailable_writer(last_path.clone()),
             ],
+            snapshot: None,
         };
 
         let write_error = writer
