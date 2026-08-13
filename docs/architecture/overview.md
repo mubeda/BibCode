@@ -179,7 +179,10 @@ classifies the resolved store and inventories verified backups without changing
 database, WAL, marker, or catalog bytes. `bibcode storage restore --backup-id`
 accepts only a selected generation whose manifest, location, storage identity,
 checksum, SQLite integrity, and migration prefix verify for that same state
-kind. `bibcode storage start-empty` is the separate destructive choice. Both
+kind. Restore reopens the verified database through a no-follow, read-capable
+file handle before copying it into recovery staging; on Windows, directories
+remain attributes-only while database files explicitly request generic read
+access. `bibcode storage start-empty` is the separate destructive choice. Both
 mutating commands first acquire an exclusive runtime lock and the storage
 operation lock, write and flush a recovery journal, and preserve every existing
 database, WAL, SHM, and marker entry in a private recovery generation before
