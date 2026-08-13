@@ -5564,14 +5564,9 @@ while (-not [IO.File]::Exists({})) {{
             bootstrap_line
         );
 
-        stop_managed_backend(
-            backend,
-            BackendShutdownConfig {
-                timeout: Duration::from_secs(3),
-            },
-        )
-        .await
-        .expect("external backend should shut down gracefully");
+        stop_managed_backend(backend, BackendShutdownConfig::default())
+            .await
+            .expect("external backend should shut down gracefully");
         let shutdown = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown request should be captured")
