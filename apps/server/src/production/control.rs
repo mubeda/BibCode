@@ -2147,7 +2147,10 @@ mod tests {
     };
 
     use axum::{Json, Router, extract::State, routing::get};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use url::Url;
     use uuid::Uuid;
 
@@ -2415,6 +2418,13 @@ mod tests {
     }
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
+        control_with_cursor_update_fixture_environment(executable, json!([])).await
+    }
+
+    async fn control_with_cursor_update_fixture_environment(
+        executable: PathBuf,
+        environment: Value,
+    ) -> NativeServerControl {
         let directory = executable.parent().expect("fixture directory");
         let settings_path = ServerConfig::new(directory)
             .state_dir()
@@ -2430,7 +2440,8 @@ mod tests {
                     "cursor-work": {
                         "driver": "cursor",
                         "enabled": true,
-                        "config": { "binaryPath": executable }
+                        "config": { "binaryPath": executable },
+                        "environment": environment
                     }
                 }
             }))
@@ -3258,11 +3269,21 @@ mod tests {
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
         let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
         let old_release = old_executable.parent().expect("old release directory");
-        tokio::fs::write(old_release.join("version-pause"), "pause")
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("pause old version probe");
-        let control = control_with_cursor_update_fixture(old_executable.clone()).await;
-        let updating = {
+            .expect("bind fresh pre-probe control");
+        let control = control_with_cursor_update_fixture_environment(
+            old_executable.clone(),
+            json!([{
+                "name": "BIBCODE_TEST_CURSOR_VERSION_PROBE_CONTROL",
+                "value": listener
+                    .local_addr()
+                    .expect("fresh pre-probe control address")
+                    .to_string()
+            }]),
+        )
+        .await;
+        let mut updating = {
             let control = control.clone();
             tokio::spawn(async move {
                 control
@@ -3273,13 +3294,22 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !old_release.join("version-entered").is_file() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        let (mut probe_control, _) = tokio::select! {
+            connection = listener.accept() => connection.expect("accept fresh pre-probe control"),
+            result = &mut updating => {
+                panic!("provider update completed before the fresh pre-probe entered: {result:?}")
             }
-        })
-        .await
-        .expect("fresh pre-probe entered");
+        };
+        let mut entered = [0_u8; 1];
+        tokio::select! {
+            result = probe_control.read_exact(&mut entered) => {
+                result.expect("read fresh pre-probe entered event");
+            }
+            result = &mut updating => {
+                panic!("provider update completed before the fresh pre-probe entered: {result:?}")
+            }
+        }
+        assert_eq!(entered, [b'E']);
 
         control
             .update_settings(json!({
@@ -3295,7 +3325,8 @@ mod tests {
             }))
             .await
             .expect("replace target during pre-probe");
-        tokio::fs::write(old_release.join("version-release"), "release")
+        probe_control
+            .write_all(b"R")
             .await
             .expect("release old version probe");
 
