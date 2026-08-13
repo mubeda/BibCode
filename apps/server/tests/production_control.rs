@@ -300,6 +300,21 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
     path
 }
 
+fn isolated_claude_settings(instance: Value) -> Value {
+    json!({
+        "enableProviderUpdateChecks": false,
+        "providers": {
+            "codex": { "enabled": false },
+            "cursor": { "enabled": false },
+            "grok": { "enabled": false },
+            "opencode": { "enabled": false }
+        },
+        "providerInstances": {
+            "claudeAgent": instance
+        }
+    })
+}
+
 async fn call(control: &NativeServerControl, method: &'static str, payload: Value) -> Value {
     control
         .call(method, payload, CancellationToken::new())
@@ -740,23 +755,19 @@ async fn provider_inventory_uses_provider_specific_status_and_configured_models(
 async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_discovering_claude_fixture(&directory).await;
-    let settings = json!({
-        "providerInstances": {
-            "claudeAgent": {
-                "driver": "claudeAgent",
-                "enabled": true,
-                "environment": [{
-                    "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
-                    "value": "2.1.220",
-                    "sensitive": false
-                }],
-                "config": {
-                    "binaryPath": executable,
-                    "customModels": ["claude-custom-test"]
-                }
-            }
+    let settings = isolated_claude_settings(json!({
+        "driver": "claudeAgent",
+        "enabled": true,
+        "environment": [{
+            "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
+            "value": "2.1.220",
+            "sensitive": false
+        }],
+        "config": {
+            "binaryPath": executable,
+            "customModels": ["claude-custom-test"]
         }
-    });
+    }));
     let settings_path = directory.path().join("userdata/settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
@@ -765,6 +776,20 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
         .await
         .expect("write settings fixture");
     let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
+
+    let initial_config = call(&control, "server.getConfig", json!({})).await;
+    let enabled_instance_ids = initial_config["providers"]
+        .as_array()
+        .expect("initial provider snapshots")
+        .iter()
+        .filter(|provider| provider["enabled"] == true)
+        .filter_map(|provider| provider["instanceId"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        enabled_instance_ids,
+        ["claudeAgent"],
+        "Claude inventory fixture must not launch ambient providers"
+    );
 
     call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;
@@ -799,20 +824,16 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
 async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_discovering_claude_fixture(&directory).await;
-    let settings = json!({
-        "providerInstances": {
-            "claudeAgent": {
-                "driver": "claudeAgent",
-                "enabled": true,
-                "environment": [{
-                    "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
-                    "value": "2.1.220",
-                    "sensitive": false
-                }],
-                "config": { "binaryPath": executable }
-            }
-        }
-    });
+    let settings = isolated_claude_settings(json!({
+        "driver": "claudeAgent",
+        "enabled": true,
+        "environment": [{
+            "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
+            "value": "2.1.220",
+            "sensitive": false
+        }],
+        "config": { "binaryPath": executable }
+    }));
     let settings_path = directory.path().join("userdata/settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
@@ -856,15 +877,11 @@ async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid()
 async fn claude_inventory_hides_models_unsupported_by_the_installed_cli_version() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_claude_fixture(&directory, "2.1.100").await;
-    let settings = json!({
-        "providerInstances": {
-            "claudeAgent": {
-                "driver": "claudeAgent",
-                "enabled": true,
-                "config": { "binaryPath": executable }
-            }
-        }
-    });
+    let settings = isolated_claude_settings(json!({
+        "driver": "claudeAgent",
+        "enabled": true,
+        "config": { "binaryPath": executable }
+    }));
     let settings_path = directory.path().join("userdata/settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
