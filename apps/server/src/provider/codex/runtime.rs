@@ -17,6 +17,8 @@ use crate::activity::{
     ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState, ActivitySection,
     ActivitySectionHealth, ProviderActivityMutation,
 };
+#[cfg(test)]
+use crate::test_support::FixtureEvent;
 
 use super::{
     activity::{
@@ -180,6 +182,8 @@ struct RuntimeInner {
     mcp_status_publication_barrier: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     #[cfg(test)]
     mcp_status_completion_barrier: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    startup_response_events: StdMutex<Option<(Arc<FixtureEvent>, Arc<FixtureEvent>)>>,
 }
 
 #[derive(Clone, Default)]
@@ -600,6 +604,8 @@ impl CodexSessionRuntime {
             mcp_status_publication_barrier: Mutex::new(None),
             #[cfg(test)]
             mcp_status_completion_barrier: Mutex::new(None),
+            #[cfg(test)]
+            startup_response_events: StdMutex::new(None),
             activity: Mutex::new(RuntimeActivityState {
                 agent_activity_enabled,
                 tracker: CodexActivityTracker::new(None),
@@ -777,6 +783,46 @@ impl CodexSessionRuntime {
         self.start_with_mcp_opening(mcp_completion).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_startup_responses_for_test(
+        &self,
+        initialize_response_ready: Arc<FixtureEvent>,
+        thread_response_ready: Arc<FixtureEvent>,
+    ) {
+        *self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned") =
+            Some((initialize_response_ready, thread_response_ready));
+    }
+
+    #[cfg(test)]
+    fn publish_initialize_response_ready(&self) {
+        if let Some((event, _)) = self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned")
+            .as_ref()
+        {
+            event.publish();
+        }
+    }
+
+    #[cfg(test)]
+    fn publish_thread_response_ready(&self) {
+        if let Some((_, event)) = self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned")
+            .as_ref()
+        {
+            event.publish();
+        }
+    }
+
     async fn claim_mcp_opening(&self) -> Result<McpOpenCompletion, RuntimeError> {
         let reservation = self.inner.mcp_opening.lock().await.take();
         let completion = if let Some(reservation) = reservation {
@@ -832,6 +878,8 @@ impl CodexSessionRuntime {
                     build_initialize_params(&self.inner.options.version),
                 )
                 .await?;
+            #[cfg(test)]
+            self.publish_initialize_response_ready();
             connection.notify_without_params("initialized").await?;
             let opened = if let Some(resume_thread_id) = resume_thread_id {
                 match connection
@@ -867,6 +915,8 @@ impl CodexSessionRuntime {
             } else {
                 connection.request("thread/start", open_payload).await?
             };
+            #[cfg(test)]
+            self.publish_thread_response_ready();
             let provider_thread_id = opened
                 .get("thread")
                 .and_then(|thread| thread.get("id"))
