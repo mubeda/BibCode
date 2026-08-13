@@ -222,6 +222,29 @@ function atomCommandTerminalInputResult(
   };
 }
 
+function createTerminalInputWriter<A, E>(input: {
+  readonly environmentId: ScopedThreadRef["environmentId"];
+  readonly threadId: ThreadId;
+  readonly terminalId: string;
+  readonly run: (request: {
+    readonly environmentId: ScopedThreadRef["environmentId"];
+    readonly input: {
+      readonly threadId: ThreadId;
+      readonly terminalId: string;
+      readonly data: string;
+    };
+  }) => Promise<AtomCommandResult<A, E>>;
+}): NonNullable<TerminalInputBinding["write"]> {
+  const { environmentId, threadId, terminalId, run } = input;
+  return async (data, fallbackError) => {
+    const result = await run({
+      environmentId,
+      input: { threadId, terminalId, data },
+    });
+    return atomCommandTerminalInputResult(result, fallbackError);
+  };
+}
+
 export function enqueueTerminalInput<A, E>(input: {
   readonly environmentId: string;
   readonly threadId: string;
@@ -1010,13 +1033,12 @@ export function TerminalViewport({
       acquireTerminalInputBinding(inputKey);
     inputSchedulerRef.current = inputScheduler;
     inputBinding.renderer = { owner: rendererOwner, terminal };
-    inputBinding.write = async (data, fallbackError) => {
-      const result = await runTerminalWrite({
-        environmentId,
-        input: { threadId, terminalId, data },
-      });
-      return atomCommandTerminalInputResult(result, fallbackError);
-    };
+    inputBinding.write = createTerminalInputWriter({
+      environmentId,
+      threadId,
+      terminalId,
+      run: runTerminalWrite,
+    });
     const createOutputSink = () =>
       createTerminalOutputSink({
         write: (data) => terminal.write(data),
