@@ -6,7 +6,7 @@
     "build": "node ../../scripts/run-msvc-x64.mjs cargo build -p bibcode-server",
     "dev": "node ../../scripts/run-msvc-x64.mjs cargo run -p bibcode-server --bin bibcode -- serve --no-browser",
     "start": "node ../../scripts/run-msvc-x64.mjs cargo run -p bibcode-server --bin bibcode --",
-    "test": "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-server -j 2 -- --test-threads=1",
+    "test": "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-server -j 2",
     "typecheck": "node ../../scripts/run-msvc-x64.mjs cargo check -p bibcode-server --all-targets"
   }
 }
