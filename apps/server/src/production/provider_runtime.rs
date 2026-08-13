@@ -7978,7 +7978,7 @@ mod tests {
             ProviderEnvironmentVariableState, ProviderInstanceState, ProviderSettingsState,
             ProvidersState,
         },
-        test_support::TestSandbox,
+        test_support::{FixtureEvent, TestSandbox},
     };
     use axum::{
         Json, Router,
@@ -8559,6 +8559,12 @@ lines.on("line", (line) => {
     default:
       return;
   }
+  const marker = request.method === "initialize"
+      ? process.env.BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER
+      : request.method === "thread/start"
+        ? process.env.BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER
+        : undefined;
+  if (marker) fs.writeFileSync(marker, request.method);
   process.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
 });
 "#
@@ -9013,9 +9019,10 @@ done
 while IFS= read -r line; do
   [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  response_marker=
   case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"initialize"'*) response_marker=$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/start"'*) response_marker=$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
@@ -10577,22 +10584,71 @@ done
             .expect("fresh Claude should shut down");
 
         let codex_fixture = executable_fixture(&temp, "codex-fixture", CODEX_FIXTURE);
+        let codex_initialize_response_ready = temp.path().join("codex-initialize-response-ready");
+        let codex_thread_response_ready = temp.path().join("codex-thread-response-ready");
         let mut codex_request = native_launch(&temp, "codex");
         codex_request.binary_path = codex_fixture.to_string_lossy().into_owned();
         codex_request.environment.insert(
             "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
             capture_value.clone(),
         );
+        codex_request.environment.insert(
+            "BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER".to_owned(),
+            codex_initialize_response_ready
+                .to_string_lossy()
+                .into_owned(),
+        );
+        codex_request.environment.insert(
+            "BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER".to_owned(),
+            codex_thread_response_ready.to_string_lossy().into_owned(),
+        );
         let codex = factory
             .create(codex_request)
             .await
             .expect("Codex driver should create");
-        assert_eq!(
-            timeout(std::time::Duration::from_secs(2), codex.start())
+        let start_completed = Arc::new(FixtureEvent::default());
+        let start_checkpoint = start_completed.checkpoint();
+        let start_driver = codex.clone();
+        let start_completion = start_completed.clone();
+        let start_task = tokio::spawn(async move {
+            let result = start_driver.start().await;
+            start_completion.publish();
+            result
+        });
+        if timeout(
+            std::time::Duration::from_secs(2),
+            start_completed.wait_after(start_checkpoint),
+        )
+        .await
+        .is_err()
+        {
+            let initialize_response_ready = codex_initialize_response_ready.is_file();
+            let thread_response_ready = codex_thread_response_ready.is_file();
+            start_task.abort();
+            let _ = start_task.await;
+            codex
+                .shutdown()
                 .await
-                .expect("Codex start timeout")
-                .expect("Codex should start")
-                .resume_cursor,
+                .expect("Codex should shut down after startup observation timeout");
+            panic!(
+                "Codex start observation timeout: initialize_response_ready={initialize_response_ready}, \
+                 thread_response_ready={thread_response_ready}, owner_completed=false"
+            );
+        }
+        assert!(
+            codex_initialize_response_ready.is_file(),
+            "Codex fixture must prepare its initialize response"
+        );
+        assert!(
+            codex_thread_response_ready.is_file(),
+            "Codex fixture must prepare its thread/start response"
+        );
+        let started = start_task
+            .await
+            .expect("Codex start owner task should join")
+            .expect("Codex should start");
+        assert_eq!(
+            started.resume_cursor,
             Some(json!({"threadId":"native-codex-thread"})),
         );
         assert!(
