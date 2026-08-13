@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::Path,
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, mpsc},
     time::Duration,
 };
 
@@ -41,6 +41,7 @@ const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(1);
 const MAX_ISOLATED_OBSERVER_CALLBACKS: usize = 8;
 const MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS: usize = 16;
 const MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK: usize = 1;
+const OBSERVER_CALLBACK_JOIN_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const OBSERVER_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const OBSERVER_WORKER_ABORT_TIMEOUT: Duration = Duration::from_millis(50);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -451,6 +452,180 @@ struct ObserverCallbackIsolation {
     global_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     joined_callback_thread: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    callback_thread_exit_hook: Arc<StdMutex<Option<Arc<ObserverCallbackThreadExitTestHook>>>>,
+}
+
+struct ObserverCallbackThreadJoin {
+    callback: &'static str,
+    thread: std::thread::JoinHandle<()>,
+    manager_permit: tokio::sync::OwnedSemaphorePermit,
+    global_permit: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(test)]
+    joined_callback_thread: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+struct ObserverCallbackJoinReaper {
+    sender: mpsc::SyncSender<ObserverCallbackThreadJoin>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ObserverCallbackThreadExitTestHook {
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+struct ObserverCallbackThreadExitGuard(Arc<ObserverCallbackThreadExitTestHook>);
+
+#[cfg(test)]
+std::thread_local! {
+    static OBSERVER_CALLBACK_THREAD_EXIT_GUARD:
+        std::cell::RefCell<Option<ObserverCallbackThreadExitGuard>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl Default for ObserverCallbackThreadExitTestHook {
+    fn default() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new((StdMutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObserverCallbackThreadExitTestHook {
+    async fn wait_until_reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("callback thread exit hook remains open")
+            .forget();
+    }
+
+    fn block_before_exit(&self) {
+        self.reached.add_permits(1);
+        let mut released = self
+            .release
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = self
+                .release
+                .1
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .release
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObserverCallbackThreadExitGuard {
+    fn drop(&mut self) {
+        self.0.block_before_exit();
+    }
+}
+
+impl ObserverCallbackThreadJoin {
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    fn join(self) {
+        if self.thread.join().is_err() {
+            tracing::warn!(
+                callback = self.callback,
+                "provider terminal observer callback thread panicked"
+            );
+        }
+        drop(self.manager_permit);
+        drop(self.global_permit);
+        #[cfg(test)]
+        if let Some(joined_callback_thread) = self.joined_callback_thread {
+            let _ = joined_callback_thread.send(());
+        }
+    }
+}
+
+impl ObserverCallbackJoinReaper {
+    fn start() -> Option<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<ObserverCallbackThreadJoin>(
+            MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
+        );
+        std::thread::Builder::new()
+            .name("terminal-observer-callback-join-reaper".to_owned())
+            .spawn(move || Self::run(receiver))
+            .ok()?;
+        Some(Self { sender })
+    }
+
+    fn submit(
+        &self,
+        callback: ObserverCallbackThreadJoin,
+    ) -> Result<(), ObserverCallbackThreadJoin> {
+        self.sender.try_send(callback).map_err(|error| match error {
+            mpsc::TrySendError::Full(callback) | mpsc::TrySendError::Disconnected(callback) => {
+                callback
+            }
+        })
+    }
+
+    fn run(receiver: mpsc::Receiver<ObserverCallbackThreadJoin>) {
+        let mut callbacks: Vec<ObserverCallbackThreadJoin> =
+            Vec::with_capacity(MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS);
+        loop {
+            let mut index = 0;
+            while index < callbacks.len() {
+                if callbacks[index].is_finished() {
+                    callbacks.swap_remove(index).join();
+                } else {
+                    index += 1;
+                }
+            }
+
+            let callback = if callbacks.is_empty() {
+                match receiver.recv() {
+                    Ok(callback) => callback,
+                    Err(_) => return,
+                }
+            } else {
+                match receiver.recv_timeout(OBSERVER_CALLBACK_JOIN_REAPER_POLL_INTERVAL) {
+                    Ok(callback) => callback,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        for callback in callbacks {
+                            callback.join();
+                        }
+                        return;
+                    }
+                }
+            };
+
+            if callbacks.len() == MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS {
+                tracing::error!(
+                    callback = callback.callback,
+                    capacity = MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
+                    "provider terminal observer callback join reaper capacity was exceeded"
+                );
+                callback.join();
+            } else {
+                callbacks.push(callback);
+            }
+        }
+    }
 }
 
 impl Default for ObserverCallbackIsolation {
@@ -460,6 +635,8 @@ impl Default for ObserverCallbackIsolation {
             global_slots: GLOBAL_OBSERVER_CALLBACK_SLOTS.clone(),
             #[cfg(test)]
             joined_callback_thread: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            callback_thread_exit_hook: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -474,7 +651,21 @@ impl ObserverCallbackIsolation {
             slots,
             global_slots,
             joined_callback_thread: Arc::new(StdMutex::new(None)),
+            callback_thread_exit_hook: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    fn callback_thread_exit_hook(&self) -> Arc<ObserverCallbackThreadExitTestHook> {
+        let hook = Arc::new(ObserverCallbackThreadExitTestHook::default());
+        assert!(
+            self.callback_thread_exit_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(hook.clone())
+                .is_none(),
+            "only one callback thread exit can be observed at a time"
+        );
+        hook
     }
 
     fn callback_thread_joined(&self) -> tokio::sync::oneshot::Receiver<()> {
@@ -496,6 +687,13 @@ impl ObserverCallbackIsolation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
+
+    fn take_callback_thread_exit_hook(&self) -> Option<Arc<ObserverCallbackThreadExitTestHook>> {
+        self.callback_thread_exit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 static GLOBAL_OBSERVER_CALLBACK_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -504,6 +702,8 @@ static GLOBAL_OBSERVER_CALLBACK_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
             MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
         ))
     });
+static GLOBAL_OBSERVER_CALLBACK_JOIN_REAPER: LazyLock<Option<ObserverCallbackJoinReaper>> =
+    LazyLock::new(ObserverCallbackJoinReaper::start);
 
 enum IsolatedCallbackResult<T> {
     Completed(T),
@@ -523,9 +723,10 @@ where
     run_isolated_observer_callback(isolation, callback, execution_budget, move || {
         // Every admitted asynchronous callback owns one isolation thread and
         // at most one Tokio blocking-pool thread. With the process-global
-        // admission cap, callback isolation is therefore bounded to 32
-        // manager-created threads. Trusted Rust callbacks can still create
-        // unmanaged raw std::threads; this is not a sandbox.
+        // admission cap, callbacks are therefore bounded to 32
+        // manager-created threads plus the one process-wide join reaper.
+        // Trusted Rust callbacks can still create unmanaged raw std::threads;
+        // this is not a sandbox.
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK)
@@ -571,6 +772,13 @@ async fn run_isolated_observer_callback<T>(
 where
     T: Send + 'static,
 {
+    let Some(join_reaper) = GLOBAL_OBSERVER_CALLBACK_JOIN_REAPER.as_ref() else {
+        tracing::warn!(
+            callback,
+            "failed to start provider terminal observer callback join reaper"
+        );
+        return None;
+    };
     let manager_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
         isolation.slots.clone().acquire_owned(),
@@ -617,11 +825,19 @@ where
         }
     };
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    #[cfg(test)]
+    let callback_thread_exit_hook = isolation.take_callback_thread_exit_hook();
     let thread = std::thread::Builder::new()
         .name(format!("terminal-observer-{callback}"))
         .spawn(move || {
-            let _manager_permit = manager_permit;
-            let _global_permit = global_permit;
+            #[cfg(test)]
+            if let Some(callback_thread_exit_hook) = callback_thread_exit_hook {
+                OBSERVER_CALLBACK_THREAD_EXIT_GUARD.with(|guard| {
+                    guard
+                        .borrow_mut()
+                        .replace(ObserverCallbackThreadExitGuard(callback_thread_exit_hook));
+                });
+            }
             let _ = result_sender.send(invoke());
         });
     if let Err(error) = thread {
@@ -630,27 +846,22 @@ where
     }
     let thread = thread.expect("checked observer callback thread spawn result");
     #[cfg(test)]
-    match isolation.take_callback_thread_joined() {
-        Some(joined_callback_thread) => {
-            if let Err(error) = std::thread::Builder::new()
-                .name(format!("terminal-observer-join-{callback}"))
-                .spawn(move || {
-                    if thread.join().is_err() {
-                        tracing::warn!(
-                            callback,
-                            "provider terminal observer callback thread panicked"
-                        );
-                    }
-                    let _ = joined_callback_thread.send(());
-                })
-            {
-                tracing::warn!(callback, %error, "failed to start provider terminal observer callback joiner");
-            }
-        }
-        None => drop(thread),
+    let joined_callback_thread = isolation.take_callback_thread_joined();
+    let callback_join = ObserverCallbackThreadJoin {
+        callback,
+        thread,
+        manager_permit,
+        global_permit,
+        #[cfg(test)]
+        joined_callback_thread,
+    };
+    if let Err(callback_join) = join_reaper.submit(callback_join) {
+        tracing::error!(
+            callback,
+            "provider terminal observer callback join reaper stopped; joining inline"
+        );
+        callback_join.join();
     }
-    #[cfg(not(test))]
-    drop(thread);
     match tokio::time::timeout(execution_budget, result_receiver).await {
         Ok(Ok(IsolatedCallbackResult::Completed(value))) => Some(value),
         Ok(Ok(IsolatedCallbackResult::Panicked)) => {
@@ -2878,6 +3089,7 @@ mod tests {
         let isolation =
             ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
         let exited = isolation.callback_thread_joined();
+        let exit_hook = isolation.callback_thread_exit_hook();
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (release, release_receiver) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn({
@@ -2907,7 +3119,15 @@ mod tests {
         assert!(local_slots.clone().try_acquire_owned().is_err());
         assert!(global_slots.clone().try_acquire_owned().is_err());
         release.send(()).expect("release callback thread");
+        exit_hook.wait_until_reached().await;
+        let local_slot_retained_until_thread_exit =
+            local_slots.clone().try_acquire_owned().is_err();
+        let global_slot_retained_until_thread_exit =
+            global_slots.clone().try_acquire_owned().is_err();
+        exit_hook.release();
         exited.await.expect("callback thread joined");
+        assert!(local_slot_retained_until_thread_exit);
+        assert!(global_slot_retained_until_thread_exit);
         assert!(local_slots.try_acquire_owned().is_ok());
         assert!(global_slots.try_acquire_owned().is_ok());
 
@@ -2930,6 +3150,7 @@ mod tests {
         let isolation =
             ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
         let exited = isolation.callback_thread_joined();
+        let exit_hook = isolation.callback_thread_exit_hook();
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (release, release_receiver) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn({
@@ -2953,7 +3174,15 @@ mod tests {
         assert!(global_slots.clone().try_acquire_owned().is_err());
         release.send(()).expect("release callback thread");
         assert_eq!(caller.await.expect("panicked callback owner"), None);
+        exit_hook.wait_until_reached().await;
+        let local_slot_retained_until_thread_exit =
+            local_slots.clone().try_acquire_owned().is_err();
+        let global_slot_retained_until_thread_exit =
+            global_slots.clone().try_acquire_owned().is_err();
+        exit_hook.release();
         exited.await.expect("callback thread joined");
+        assert!(local_slot_retained_until_thread_exit);
+        assert!(global_slot_retained_until_thread_exit);
         assert!(local_slots.try_acquire_owned().is_ok());
         assert!(global_slots.try_acquire_owned().is_ok());
 

@@ -115,6 +115,18 @@ worker thread and permit until joining proves the OS thread exited, so a worker
 that retains its observation lease cannot form an ownership cycle or
 permanently consume observer capacity.
 
+Terminal-observer setup and activity-transition callbacks use a separate
+isolation boundary with eight admissions per manager and sixteen across the
+process. One named process-wide standard-library join reaper retains every
+callback thread's `JoinHandle` plus both its manager and global admission
+permits until `JoinHandle::join` proves the OS thread exited. Returning a
+callback result, catching its panic, timing out or cancelling its async caller,
+and tearing down the caller's Tokio runtime therefore cannot release capacity
+while native thread teardown is still running. The reaper's submission channel
+and retained set are bounded by the same sixteen-permit global admission cap;
+it does not create a per-callback joiner thread and does not depend on an
+application Tokio runtime remaining alive.
+
 OpenCode helper cleanup is owned by the system helper launcher. Before a
 foreground cleanup waiter can block, the launcher transfers the exact child,
 reserved process-group identity, and one of sixteen cleanup permits into its

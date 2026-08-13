@@ -4,7 +4,7 @@
 
 **Goal:** Close the Task 6 review blockers without restoring test serialization: break the observer worker ownership cycle, prove both callback permits survive caller cancellation, remove the stale harness lock reference, and give concurrent `ServerRuntime` instances runtime-owned native log sinks.
 
-**Architecture:** Provider worker futures receive a lightweight generation-observation lease while the terminal manager alone owns the worker registry. Callback isolation exposes both named admission resources to tests. Native tracing remains one process-wide stream, but a process-owned sink registry mirrors it to every live runtime-owned rotating log writer through exact-drop leases.
+**Architecture:** Provider worker futures receive a lightweight generation-observation lease while the terminal manager alone owns the worker registry. Callback isolation transfers each OS thread's join handle and both admission permits to one bounded process-wide join reaper, with a test-only TLS-destructor barrier proving ownership through actual thread exit. Native tracing remains one process-wide stream, but a process-owned sink registry mirrors it to every live runtime-owned rotating log writer through exact-drop leases.
 
 **Tech Stack:** Rust 2024, Tokio, `tracing`, `tracing-subscriber`, Axum server lifecycle, standard-library `Arc`/`Mutex`, Cargo test harness.
 
@@ -180,55 +180,75 @@ git commit -m "fix(provider): separate observer worker ownership"
 
 ---
 
-### Task 2: Prove both callback permits and remove the dead harness lock API
+### Task 2: Retain both callback permits through actual OS-thread exit and remove the dead harness lock API
 
 **Files:**
 - Modify: `apps/server/src/terminal/manager.rs`
 - Modify: `apps/server/tests/fixtures/task8-harness/src/lib.rs`
+- Modify: `docs/architecture/activity-observation.md`
 
 **Interfaces:**
 - Consumes: existing `ObserverCallbackIsolation { slots, global_slots }`.
 - Produces: test-only `ObserverCallbackIsolation::with_slots(slots, global_slots)` so tests own both exact admission resources.
+- Produces: one named process-wide callback join reaper whose bounded records retain
+  the callback `JoinHandle` plus the local and global permits until
+  `JoinHandle::join` returns.
+- Produces: a test-only blocking TLS-destructor barrier and a post-join event;
+  neither event is emitted from the callback body.
 - Removes: dead `external_process_test_lock()` harness function and all repository references to the deleted broad lock.
 
-- [ ] **Step 1: Strengthen the callback cancellation RED**
+- [ ] **Step 1: Strengthen the callback cancellation and panic RED**
 
-Replace the global-only injected constructor in the abort and panic tests with two one-slot semaphores. Positively gate the OS callback thread, abort the caller, and prove neither permit can be acquired before thread exit:
+Replace the global-only injected constructor in the abort and panic tests with
+two one-slot semaphores. Install a test-only TLS destructor that positively
+reports entry and then blocks actual OS-thread exit. After the callback body
+has returned (or its panic has been caught) and the caller has aborted or
+returned, prove neither permit can be acquired while that destructor remains
+gated. Release the destructor, await a separate event emitted only after
+`JoinHandle::join` returns, and then prove both permits are reusable. Do not use
+sleep, yield, timeout expiry, callback-body signals, or permit availability as
+evidence that the OS thread exited.
 
 ```rust
 let local = Arc::new(Semaphore::new(1));
 let global = Arc::new(Semaphore::new(1));
 let isolation = ObserverCallbackIsolation::with_slots(local.clone(), global.clone());
 
-started.await.expect("callback thread started");
-caller.abort();
+body_started.await.expect("callback body started");
+caller.abort(); // or await the caught-panic result
+release_body.send(()).expect("release callback body");
+exit_hook.wait_until_reached().await;
 assert!(local.clone().try_acquire_owned().is_err());
 assert!(global.clone().try_acquire_owned().is_err());
-release.send(()).expect("release callback thread");
-exited.await.expect("callback thread exited");
+exit_hook.release();
+joined.await.expect("callback thread joined");
 assert!(local.try_acquire_owned().is_ok());
 assert!(global.try_acquire_owned().is_ok());
 ```
 
-- [ ] **Step 2: Run the exact test and verify the old seam cannot prove local ownership**
+- [ ] **Step 2: Run both exact tests and preserve the ownership RED**
 
-Run the two existing callback abort/panic exact tests. Expected RED: compile failure for `with_slots`, followed by the behavioral assertions becoming meaningful only after both semaphores are injected.
+Run the exact abort and panic regressions. Expected RED against the detached
+production handle: after the callback body is complete but the TLS destructor
+still blocks actual thread exit, at least the local permit is already
+reacquirable because both permit locals died with the callback closure.
 
-- [ ] **Step 3: Add the minimal test-only constructor and make both tests GREEN**
+- [ ] **Step 3: Retain the join handle and both permits in one bounded process owner**
 
-```rust
-#[cfg(test)]
-impl ObserverCallbackIsolation {
-    fn with_slots(
-        slots: Arc<tokio::sync::Semaphore>,
-        global_slots: Arc<tokio::sync::Semaphore>,
-    ) -> Self {
-        Self { slots, global_slots }
-    }
-}
-```
+Start one named standard-library reaper through `LazyLock`. Its bounded channel
+and retained callback set use `MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS`; each
+record owns the `JoinHandle`, manager permit, and global permit. The callback
+thread owns neither permit. The reaper may drop the permits and publish the
+test-only joined event only after `JoinHandle::join` returns. Initialize the
+reaper before starting a callback; if startup fails, reject the callback. If a
+post-spawn submission invariant fails, retain correctness by joining the exact
+record inline. The reaper must remain independent of the caller's Tokio runtime
+so caller cancellation, callback panic/timeout, or runtime shutdown cannot
+detach ownership. No unbounded queue or per-callback joiner thread is allowed.
 
-Delete `with_global_slots` once all tests use the two-resource constructor. Run the manager module at eight threads.
+Keep the test-only `with_slots` constructor and remove `with_global_slots` once
+all tests use the two exact resources. Run both exact tests and the manager
+module at eight threads.
 
 - [ ] **Step 4: Remove and verify the stale harness API**
 
@@ -251,12 +271,18 @@ cargo test -p bibcode-server --lib terminal::manager::tests -- --test-threads=8
 
 Expected: `rg` returns no matches; the standalone harness and manager tests pass.
 
-- [ ] **Step 5: Commit the callback/harness repair**
+- [ ] **Step 5: Document and commit the callback/harness repair**
+
+Document the process-wide callback join owner, its local/global admission
+bounds, and its independence from runtime shutdown in the activity-observation
+living architecture document.
 
 ```bash
 git add apps/server/src/terminal/manager.rs \
-  apps/server/tests/fixtures/task8-harness/src/lib.rs
-git commit -m "test(server): verify callback permit ownership"
+  apps/server/tests/fixtures/task8-harness/src/lib.rs \
+  docs/architecture/activity-observation.md \
+  docs/superpowers/plans/2026-08-12-task-6-parallel-runtime-ownership-fixes.md
+git commit -m "fix(server): retain callback permits through thread exit"
 ```
 
 ---
