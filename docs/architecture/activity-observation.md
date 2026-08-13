@@ -273,10 +273,15 @@ For nested invocations only, an authenticated `PreToolUse` from the already
 verified parent opens a parent-owned pending interval when a matching
 PostToolUse result is not available. The fallback admits a target only when the
 stream parent tool, one accepted nested `task_started` candidate, and one
-verified unassigned child lineage all agree on that active parent. Both
-parent-local candidate sets must have cardinality one. Ambiguity is observable
-but unsupported and performs zero provider I/O; semantic text, timing, order,
-proximity, transcript reads, polling, and timers are never correlation inputs.
+verified unassigned child all agree on that active parent. Documented
+`SubagentStart` hooks omit `parent_agent_id`, so a parentless child is reparented
+only when there is one nested candidate in the whole generation, one unmatched
+verified child, and no unresolved root Agent/Task launch that could own it. An
+exact nested PostToolUse may reparent its named child directly after proving the
+same exact active source parent. Present explicit lineage must still agree.
+Ambiguity is observable but unsupported and performs zero provider I/O;
+semantic text, timing, order, proximity, transcript reads, polling, and timers
+are never correlation inputs.
 Pending state is generation-owned and bounded to 200 correlations. Terminal
 events, runtime replacement, and Activity disablement retire or clear pending
 and installed fallback state.

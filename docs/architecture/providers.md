@@ -214,8 +214,11 @@ both hook-event switches and the private hook sink are available. A fully
 correlated private task handle dispatches the stream-JSON `stop_task` request.
 That handle comes from either the complete explicit PostToolUse identity chain
 or the bounded authenticated parent-local cardinality-one fallback for a nested
-actor only. Ambiguous nested actors remain observable but unsupported, and are
-rejected before provider I/O. Only the exact unsupported-control response
+actor only. Because documented SubagentStart hooks omit parent identity, the
+fallback additionally requires one unmatched child globally and no unresolved
+root launch; exact PostToolUse can instead prove and reparent its named child.
+Ambiguous nested actors remain observable but unsupported, and are rejected
+before provider I/O. Only the exact unsupported-control response
 revokes targeted support for the current runtime generation; generic failure,
 timeout, and connection closure do not. Revocation clears all exact and
 fallback handles before later clicks are admitted and never falls back to the

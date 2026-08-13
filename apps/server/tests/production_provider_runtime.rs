@@ -13061,12 +13061,7 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         }),
         json!({
             "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child","parent_agent_id":"agent-a","agent_type":"same-role"
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-unmapped","agent_type":"same-role",
-            "description":"same description","prompt":"same prompt"
+            "agent_id":"agent-child","agent_type":"same-role"
         }),
     ] {
         assert_eq!(
@@ -13125,30 +13120,14 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
                                 && control["state"] == "available"
                         })
                     });
-            let unmapped_observable = snapshot["actors"].as_array().is_some_and(|actors| {
-                actors.iter().any(|actor| {
-                    actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
-                })
-            });
-            let unmapped_unsupported =
-                snapshot["control"]["actors"]
-                    .as_array()
-                    .is_some_and(|controls| {
-                        controls.iter().any(|control| {
-                            control["actorId"] == "claude:agent:agent-unmapped"
-                                && control["state"] == "unsupported"
-                        })
-                    });
-            if let Some(selected) = selected.filter(|_| {
-                child_available && sibling_available && unmapped_observable && unmapped_unsupported
-            }) {
+            if let Some(selected) = selected.filter(|_| child_available && sibling_available) {
                 break (snapshot, selected);
             }
             tokio::task::yield_now().await;
         }
     })
     .await;
-    let (snapshot, selected_control) = match available {
+    let (_, selected_control) = match available {
         Ok(available) => available,
         Err(_) => {
             let diagnostic = tagged_rpc_request(
@@ -13164,6 +13143,55 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
             );
         }
     };
+
+    assert_eq!(
+        client
+            .post(&hook_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-unmapped","agent_type":"same-role",
+                "description":"same description","prompt":"same prompt"
+            }))
+            .send()
+            .await
+            .expect("authenticated unmapped Claude hook")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let snapshot = timeout(Duration::from_secs(10), async {
+        let mut request_id = 9_260_u64;
+        loop {
+            request_id += 1;
+            let next = tagged_rpc_request(
+                &mut socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"claude-targeted-thread"}),
+            )
+            .await
+            .expect("snapshot after unmapped actor");
+            let observable = next["actors"].as_array().is_some_and(|actors| {
+                actors.iter().any(|actor| {
+                    actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
+                })
+            });
+            let unsupported = next["control"]["actors"]
+                .as_array()
+                .is_some_and(|controls| {
+                    controls.iter().any(|control| {
+                        control["actorId"] == "claude:agent:agent-unmapped"
+                            && control["state"] == "unsupported"
+                    })
+                });
+            if observable && unsupported {
+                break next;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unmapped Claude actor becomes observably unsupported");
 
     assert!(
         snapshot["control"]["actors"]
@@ -13521,11 +13549,11 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         }),
         json!({
             "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-one","parent_agent_id":"agent-parent","agent_type":"same-role"
+            "agent_id":"agent-child-one","agent_type":"same-role"
         }),
         json!({
             "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-two","parent_agent_id":"agent-parent","agent_type":"same-role"
+            "agent_id":"agent-child-two","agent_type":"same-role"
         }),
     ] {
         assert_eq!(

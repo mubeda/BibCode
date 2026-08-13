@@ -582,6 +582,43 @@ impl ClaudeActivityTracker {
         output
     }
 
+    pub(crate) fn handle_correlated_parent(
+        &mut self,
+        agent_id: &str,
+        parent_agent_id: &str,
+        emitted_at_ms: u64,
+    ) -> ClaudeActivityOutput {
+        if agent_id == parent_agent_id {
+            return ClaudeActivityOutput::default();
+        }
+        let agent_key = retained_key("agent", agent_id);
+        let parent_key = retained_key("agent", parent_agent_id);
+        let Some(parent_actor_id) = self
+            .actors
+            .get(&parent_key)
+            .map(|actor| actor.canonical_id.clone())
+        else {
+            return ClaudeActivityOutput::default();
+        };
+        let Some(actor) = self.actors.get_mut(&agent_key) else {
+            return ClaudeActivityOutput::default();
+        };
+        if actor.parent_actor_id.as_ref() == Some(&parent_actor_id) {
+            return ClaudeActivityOutput::default();
+        }
+        if actor.parent_actor_id.is_some() {
+            return ClaudeActivityOutput::default();
+        }
+        actor.parent_actor_id = Some(parent_actor_id);
+        actor.updated_at = unix_millis_to_timestamp(emitted_at_ms);
+        let Some(summary) = actor.to_summary() else {
+            return ClaudeActivityOutput::default();
+        };
+        let mut output = ClaudeActivityOutput::default();
+        output.push(ProviderActivityMutation::UpsertActor(summary));
+        output
+    }
+
     fn insert_terminal_actor(&mut self, agent_key: String, actor: ClaudeActorState) {
         if !self.terminal_actors.contains_key(&agent_key) {
             while self.terminal_actor_order.len() >= MAX_TRACKED_ACTORS {

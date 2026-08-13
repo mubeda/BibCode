@@ -323,6 +323,7 @@ enum ClaudeTaskControlEffect {
     Install {
         agent_id: String,
         task_id: String,
+        parent_agent_id: Option<String>,
     },
     Retire {
         agent_id: String,
@@ -834,6 +835,7 @@ impl ClaudeTaskControlCorrelator {
         let mut effects = Vec::new();
         for _ in 0..tool_use_ids.len().max(1) {
             let before = effects.len();
+            self.reconcile_parentless_exact_lineages();
             effects.extend(self.reconcile_parent_local_fallbacks());
             for tool_use_id in &tool_use_ids {
                 effects.extend(self.reconcile(tool_use_id));
@@ -843,6 +845,44 @@ impl ClaudeTaskControlCorrelator {
             }
         }
         effects
+    }
+
+    fn reconcile_parentless_exact_lineages(&mut self) {
+        let mut candidates_by_child = BTreeMap::<String, Vec<String>>::new();
+        for record in self.correlations_by_tool_use.values() {
+            let Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)) =
+                record.invocation_source.as_ref()
+            else {
+                continue;
+            };
+            let Some(child_agent_id) = record.launched_agent_id.as_ref() else {
+                continue;
+            };
+            let source = record
+                .hook_source
+                .as_ref()
+                .or(record.pre_tool_source.as_ref());
+            let Some(ClaudeHookSource::Agent(parent_agent_id)) = source else {
+                continue;
+            };
+            if !record.conflicted
+                && self.exact_parent_owns_current_target(parent_tool_use_id, parent_agent_id)
+                && self.verified_agents.get(child_agent_id) == Some(&ClaudeVerifiedLineage::Root)
+            {
+                candidates_by_child
+                    .entry(child_agent_id.clone())
+                    .or_default()
+                    .push(parent_agent_id.clone());
+            }
+        }
+        for (child_agent_id, parent_agent_ids) in candidates_by_child {
+            if let [parent_agent_id] = parent_agent_ids.as_slice() {
+                self.verified_agents.insert(
+                    child_agent_id,
+                    ClaudeVerifiedLineage::Parent(parent_agent_id.clone()),
+                );
+            }
+        }
     }
 
     fn reconcile(&mut self, tool_use_id: &str) -> Vec<ClaudeTaskControlEffect> {
@@ -910,7 +950,20 @@ impl ClaudeTaskControlCorrelator {
         } else {
             self.actor_target_by_agent
                 .insert(agent_id.clone(), task_id.clone());
-            effects.push(ClaudeTaskControlEffect::Install { agent_id, task_id });
+            let parent_agent_id =
+                self.verified_agents
+                    .get(&agent_id)
+                    .and_then(|lineage| match lineage {
+                        ClaudeVerifiedLineage::Root => None,
+                        ClaudeVerifiedLineage::Parent(parent_agent_id) => {
+                            Some(parent_agent_id.clone())
+                        }
+                    });
+            effects.push(ClaudeTaskControlEffect::Install {
+                agent_id,
+                task_id,
+                parent_agent_id,
+            });
         }
         effects
     }
@@ -1005,10 +1058,8 @@ impl ClaudeTaskControlCorrelator {
             .filter_map(ClaudeTaskCorrelation::effective_agent_id)
             .collect::<BTreeSet<_>>();
         let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+        let mut parentless_children = Vec::new();
         for (agent_id, lineage) in &self.verified_agents {
-            let ClaudeVerifiedLineage::Parent(parent_agent_id) = lineage else {
-                continue;
-            };
             if !self.actor_target_by_agent.contains_key(agent_id)
                 && !self
                     .agent_by_task
@@ -1017,10 +1068,50 @@ impl ClaudeTaskControlCorrelator {
                 && !assigned_agents.contains(agent_id.as_str())
                 && !self.tombstoned_agents.contains(agent_id)
             {
-                children_by_parent
-                    .entry(parent_agent_id.clone())
-                    .or_default()
-                    .push(agent_id.clone());
+                match lineage {
+                    ClaudeVerifiedLineage::Parent(parent_agent_id) => {
+                        children_by_parent
+                            .entry(parent_agent_id.clone())
+                            .or_default()
+                            .push(agent_id.clone());
+                    }
+                    ClaudeVerifiedLineage::Root => parentless_children.push(agent_id.clone()),
+                }
+            }
+        }
+
+        // Documented SubagentStart hooks do not carry parent_agent_id. Admit that real-world
+        // shape only when it cannot be confused with a root launch: one nested candidate in the
+        // whole generation, one unmatched verified actor, and no unresolved root Agent/Task
+        // invocation. Any concurrent or missing evidence remains observable but unsupported.
+        let unresolved_root_launch = self.correlations_by_tool_use.values().any(|record| {
+            record.invocation_source == Some(ClaudeInvocationSource::Root)
+                && record.invocation_is_agent == Some(true)
+                && (!record.conflicted
+                    && (record.effective_agent_id().is_none()
+                        || record.task_id.is_none()
+                        || record.effective_agent_id().is_some_and(|agent_id| {
+                            record.task_id.as_ref().is_none_or(|task_id| {
+                                self.actor_target_by_agent.get(agent_id) != Some(task_id)
+                            })
+                        })))
+        });
+        let nested_candidate_count = candidates_by_parent.values().map(Vec::len).sum::<usize>();
+        if nested_candidate_count == 1
+            && parentless_children.len() == 1
+            && !unresolved_root_launch
+            && let Some((parent_agent_id, tool_use_ids)) = candidates_by_parent
+                .iter()
+                .find(|(_, tool_use_ids)| tool_use_ids.len() == 1)
+            && !children_by_parent.contains_key(parent_agent_id)
+        {
+            let child_agent_id = parentless_children[0].clone();
+            self.verified_agents.insert(
+                child_agent_id.clone(),
+                ClaudeVerifiedLineage::Parent(parent_agent_id.clone()),
+            );
+            if let Some(record) = self.correlation_mut(&tool_use_ids[0]) {
+                record.fallback_agent_id = Some(child_agent_id);
             }
         }
 
@@ -1508,10 +1599,11 @@ impl ClaudeProviderRuntime {
             })
             .unwrap_or_default();
         let has_control_effects = !control_effects.is_empty();
-        let (_, activity_controls) =
+        let (activity, activity_controls) =
             self.apply_task_control_effects(control_effects, emitted_at_ms);
         let Ok(message) = serde_json::from_value::<ClaudeMessage>(value.clone()) else {
             return ClaudeRuntimeOutput {
+                activity,
                 native_event_id: has_control_effects
                     .then(|| claude_control_fact_native_event_id(value))
                     .flatten(),
@@ -1528,7 +1620,7 @@ impl ClaudeProviderRuntime {
         };
         ClaudeRuntimeOutput {
             events,
-            activity: Vec::new(),
+            activity,
             native_event_id: has_control_effects
                 .then(|| claude_control_fact_native_event_id(value))
                 .flatten(),
@@ -1652,9 +1744,20 @@ impl ClaudeProviderRuntime {
         let mut controls = Vec::new();
         for effect in effects {
             match effect {
-                ClaudeTaskControlEffect::Install { agent_id, task_id } => {
+                ClaudeTaskControlEffect::Install {
+                    agent_id,
+                    task_id,
+                    parent_agent_id,
+                } => {
                     if !self.targeted_activity_control_supported {
                         continue;
+                    }
+                    if let Some(parent_agent_id) = parent_agent_id.as_deref() {
+                        activity.extend(
+                            self.activity_tracker
+                                .handle_correlated_parent(&agent_id, parent_agent_id, emitted_at_ms)
+                                .mutations,
+                        );
                     }
                     let Some(actor_id) = canonical_actor_id(&agent_id) else {
                         continue;
@@ -3363,6 +3466,179 @@ mod targeted_task_correlation_tests {
     }
 
     #[test]
+    fn targeted_task_correlation_uses_documented_parentless_subagent_start_for_unique_nested_fallback()
+     {
+        // Real Claude SubagentStart hooks identify the child but do not publish parent_agent_id.
+        // Mutation caught: requiring that undocumented field leaves a unique nested child
+        // observable but permanently unsupported.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let mut child = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child",
+            "agent-child",
+            "task-child",
+        );
+        child[3]
+            .as_object_mut()
+            .expect("SubagentStart object")
+            .remove("parent_agent_id");
+        child[3]["agent_type"] = json!("claude");
+
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in parent.iter().enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let outputs = child
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            mapped_targets(&outputs),
+            [(
+                "claude:agent:agent-child".to_owned(),
+                "task-child".to_owned()
+            )]
+        );
+        assert!(
+            outputs
+                .iter()
+                .flat_map(|output| &output.activity)
+                .any(|mutation| matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor)
+                        if actor.id == "claude:agent:agent-child"
+                            && actor.parent_actor_id.as_deref()
+                                == Some("claude:agent:agent-parent")
+                ))
+        );
+    }
+
+    #[test]
+    fn targeted_task_correlation_parentless_fallback_rejects_unresolved_root_launch_ambiguity() {
+        // A documented parentless SubagentStart could belong to an unresolved root invocation.
+        // Mutation caught: assigning it to the nested candidate before root ownership settles.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let nested = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child",
+            "agent-child",
+            "task-child",
+        );
+        let unresolved_root = [
+            json!({
+                "type":"stream_event", "session_id":"session", "parent_tool_use_id":null,
+                "event":{"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"tool-root-pending","name":"Agent","input":{}}}
+            }),
+            json!({
+                "type":"system", "subtype":"task_started", "session_id":"session",
+                "task_id":"task-root-pending", "tool_use_id":"tool-root-pending",
+                "task_type":"local_agent"
+            }),
+        ];
+        let mut child_start = nested[3].clone();
+        child_start
+            .as_object_mut()
+            .expect("SubagentStart object")
+            .remove("parent_agent_id");
+        child_start["agent_type"] = json!("claude");
+
+        let mut outputs = Vec::new();
+        for (index, fact) in nested[..3]
+            .iter()
+            .chain(unresolved_root.iter())
+            .chain(std::iter::once(&child_start))
+            .enumerate()
+        {
+            outputs.push(handle_fact(&mut runtime, fact, true, 10 + index as u64));
+        }
+
+        assert!(mapped_targets(&outputs).is_empty());
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .verified_agents
+                .get("agent-child"),
+            Some(&ClaudeVerifiedLineage::Root)
+        );
+    }
+
+    #[test]
+    fn targeted_task_correlation_exact_nested_chain_accepts_documented_parentless_start() {
+        // Exact PostToolUse names the child and its authenticated source parent, so the
+        // documented parentless SubagentStart can be reparented without fallback inference.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let child = [
+            json!({
+                "type":"stream_event", "session_id":"session",
+                "parent_tool_use_id":"tool-parent",
+                "event":{"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"tool-child","name":"Agent","input":{}}}
+            }),
+            json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_name":"Agent", "tool_use_id":"tool-child",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            }),
+            json!({
+                "type":"system", "subtype":"task_started", "session_id":"session",
+                "task_id":"task-child", "tool_use_id":"tool-child", "task_type":"local_agent"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart", "session_id":"session",
+                "agent_id":"agent-child", "agent_type":"claude"
+            }),
+        ];
+
+        for order in permutations([0, 1, 2, 3]) {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in parent.iter().enumerate() {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let outputs = order
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| {
+                    handle_fact(&mut runtime, &child[fact], true, 10 + index as u64)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )],
+                "failed exact parentless nested order {order:?}"
+            );
+            assert!(
+                outputs
+                    .iter()
+                    .flat_map(|output| &output.activity)
+                    .any(|mutation| matches!(
+                        mutation,
+                        ProviderActivityMutation::UpsertActor(actor)
+                            if actor.id == "claude:agent:agent-child"
+                                && actor.parent_actor_id.as_deref()
+                                    == Some("claude:agent:agent-parent")
+                    )),
+                "missing exact parentless hierarchy for order {order:?}: {outputs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn targeted_task_correlation_fallback_accepts_task_variants_and_replays_idempotently() {
         // Mutation caught: treating fallback task types differently from exact PostToolUse chains.
         for task_type in [None, Some("local_agent"), Some("remote_agent")] {
@@ -4962,7 +5238,7 @@ mod targeted_task_correlation_tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 !mapped_targets(&outputs).is_empty(),
-                parent == Some("agent-a"),
+                parent.is_none() || parent == Some("agent-a"),
                 "nested lineage {parent:?}"
             );
         }
