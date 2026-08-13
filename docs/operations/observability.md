@@ -175,9 +175,10 @@ so it is incompatible with a strict Mac App Store public-API-only policy.
 Linux and other unsupported desktop targets report `unavailable`; the observer
 never claims generic browser or renderer executable-name matches.
 
-Production provider and terminal launchers register their root PID, scope,
-kind, and bounded label. The schema reserves the `helper` kind, but no
-production helper launcher currently registers it. Descendants inherit the
+Production provider, terminal, provider-helper, and managed-endpoint tunnel
+launchers register their exact root identity, scope, kind, and bounded label.
+Independent Codex/OpenCode helpers and the tunnel use the `helper` kind and
+dedicated process groups or Windows Jobs. Descendants inherit the
 nearest registered root's attribution. A process with no registered provider or
 terminal ancestor that remains descended from the native server is visible as
 External Tooling with `unknown` kind and fallback confidence; missing

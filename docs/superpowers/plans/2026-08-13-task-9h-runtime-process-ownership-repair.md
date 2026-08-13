@@ -74,7 +74,8 @@ PID reuse, but it does not prove runtime ownership, so the target set is wrong.
 | --- | --- | --- |
 | Native Codex, Claude, Cursor, Grok, and OpenCode sessions | `AttributedChild` retains a `ProcessRegistration`; process-wrap owns a Unix process group or Windows Job and `ProviderRuntimeSupervisor` kills and waits during session shutdown. | Freeze and capture the exact registered root before supervisor cleanup; leave kill/reap with the supervisor, then identity-clean only a surviving captured closure. |
 | Ordinary and provider terminals | `TerminalManager` retains a root registration; `PortablePtyProcess` owns the Unix process group or Windows Job; `UncommittedPtyProcess` owns every pre-publication failure. | Freeze registration before capture; a racing pre-publication child is rejected and cleaned by its uncommitted owner; leave normal kill/reap with the manager and identity-clean only captured residuals. |
-| Provider-terminal observer helpers | They are launched under the prepared terminal process tree and are retained by observer worker/reaper ownership. | They inherit the captured PTY root and require no second registry. |
+| Provider-terminal observer helpers | Codex and OpenCode launch independent long-lived roots; group/Job owners retain cleanup through exact reap. | Register each helper in the shared runtime registry; rejection reaps before return and factory shutdown drains retained tasks. |
+| Managed endpoint tunnel | `bibcode-connect tunnel run` is an independent long-lived runtime root. | Register it in the shared registry and close/drain its group/Job owner before residual cleanup. |
 | Shared process runner, Git runner, provider maintenance, and most inventory probes | Whole operations are bounded by cancellation/timeout and their local supervised process-group/Job owner waits before returning. | Do not register transient roots or duplicate their lifecycle in Task 9H. |
 | Provider usage and relay validation probes | The request future owns a kill-on-drop child and bounded completion; they are not persistent runtime sessions. | Keep request ownership. They are outside the runtime-session residual sweep and are not a reason to signal peer descendants. |
 | External editor launch | Intentionally detached and transferred to the user/editor application. | Explicitly exclude it from runtime shutdown ownership. |
@@ -82,7 +83,7 @@ PID reuse, but it does not prove runtime ownership, so the target set is wrong.
 
 The server runtime already creates one `ProcessAttributionRegistry` and passes
 the same clone to its provider factory, terminal manager, provider-terminal
-observer supervisor, and resource sampler. No new global registry or public
+observer supervisor, managed-endpoint runtime, and resource sampler. No new global registry or public
 configuration is required.
 
 ## Alternatives and trade-offs

@@ -1390,6 +1390,9 @@ fn format_epoch_ms(value: i128) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+
+    use futures_util::FutureExt as _;
     use std::{future::Future, pin::Pin, time::Duration};
 
     use crate::{
@@ -1402,7 +1405,9 @@ mod tests {
             ResourceSampler, SamplingError, SplitMetric, UiCoverage, UiCoverageStatus,
         },
         production::control::NativeServerControl,
-        terminal::{PortablePtyBackend, TerminalLaunchCommand, TerminalManagerOptions},
+        terminal::{
+            PortablePtyBackend, TerminalEvent, TerminalLaunchCommand, TerminalManagerOptions,
+        },
     };
 
     use super::*;
@@ -1475,43 +1480,64 @@ mod tests {
         )
     }
 
-    fn write_probe_command(path: &std::path::Path, value: &str) -> String {
+    fn write_probe_command(value: &str) -> String {
         if cfg!(windows) {
-            format!(
-                "Set-Content -NoNewline -Path '{}' -Value '{value}'\r\n",
-                path.display()
-            )
+            format!("Write-Output ''; Write-Output '{value}'\r\n")
         } else {
-            format!("printf '%s' '{value}' > '{}'\n", path.display())
+            format!("printf '\\n%s\\n' '{value}'\n")
         }
     }
 
-    async fn wait_for_probe(path: &std::path::Path, value: &str) {
-        for _ in 0..100 {
-            if tokio::fs::read_to_string(path)
-                .await
-                .is_ok_and(|contents| contents == value)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for terminal probe {}", path.display());
-    }
-
-    async fn wait_for_exact_process_exit(identity: ProcessIdentity) {
-        for _ in 0..100 {
-            match NativeProcessSampler::process_identity(identity.pid) {
-                Ok(current) if current == identity => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+    async fn wait_for_probe(
+        events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
+        thread_id: &str,
+        terminal_id: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            loop {
+                match events.recv().await {
+                    Ok(TerminalEvent::Output {
+                        thread_id: event_thread,
+                        terminal_id: event_terminal,
+                        data,
+                        ..
+                    }) if event_thread == thread_id && event_terminal == terminal_id => {
+                        output.push_str(&data.replace('\r', ""));
+                        if output.lines().any(|line| line.trim() == value) {
+                            return Ok(());
+                        }
+                        if output.len() > 16 * 1024 {
+                            return Err(format!(
+                                "terminal {terminal_id} exceeded its bounded probe output"
+                            ));
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(format!(
+                            "terminal {terminal_id} event stream closed before probe"
+                        ));
+                    }
                 }
-                Ok(_) | Err(_) => return,
             }
+        })
+        .await
+        .map_err(|_| format!("timed out waiting for terminal {terminal_id} probe"))?
+    }
+
+    fn exact_process_exited(identity: ProcessIdentity) -> Result<(), String> {
+        if matches!(
+            NativeProcessSampler::process_identity(identity.pid),
+            Ok(current) if current == identity
+        ) {
+            return Err(format!(
+                "runtime-owned process {} remained alive after shutdown",
+                identity.pid
+            ));
         }
-        panic!(
-            "runtime-owned process {} remained alive after shutdown",
-            identity.pid
-        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1522,71 +1548,87 @@ mod tests {
             real_terminal_services(root_a.path()),
             real_terminal_services(root_b.path())
         );
-        let (opened_a, opened_b) = tokio::join!(
-            services_a.terminal.open(TerminalOpenInput::new(
-                "thread-a",
-                "terminal-a",
-                root_a.path().to_path_buf(),
-                80,
-                24,
-            )),
-            services_b.terminal.open(TerminalOpenInput::new(
-                "thread-b",
-                "terminal-b",
-                root_b.path().to_path_buf(),
-                80,
-                24,
-            ))
-        );
-        let pid_a = opened_a
-            .expect("runtime A terminal opens")
-            .pid
-            .expect("A pid");
-        let pid_b = opened_b
-            .expect("runtime B terminal opens")
-            .pid
-            .expect("B pid");
-        let identity_a = NativeProcessSampler::process_identity(pid_a).expect("A identity");
-        let identity_b = NativeProcessSampler::process_identity(pid_b).expect("B identity");
-        let ready_a = root_a.path().join("ready-a");
-        let ready_b = root_b.path().join("ready-b");
-        let ready_a_command = write_probe_command(&ready_a, "ready-a");
-        let ready_b_command = write_probe_command(&ready_b, "ready-b");
-        let (written_a, written_b) = tokio::join!(
-            services_a
-                .terminal
-                .write("thread-a", "terminal-a", &ready_a_command,),
+        let mut events_a = services_a.terminal.subscribe_events();
+        let mut events_b = services_b.terminal.subscribe_events();
+        let outcome = AssertUnwindSafe(async {
+            let (opened_a, opened_b) = tokio::join!(
+                services_a.terminal.open(TerminalOpenInput::new(
+                    "thread-a",
+                    "terminal-a",
+                    root_a.path().to_path_buf(),
+                    80,
+                    24,
+                )),
+                services_b.terminal.open(TerminalOpenInput::new(
+                    "thread-b",
+                    "terminal-b",
+                    root_b.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+            );
+            let pid_a = opened_a
+                .map_err(|error| error.to_string())?
+                .pid
+                .ok_or("A pid")?;
+            let pid_b = opened_b
+                .map_err(|error| error.to_string())?
+                .pid
+                .ok_or("B pid")?;
+            let identity_a = NativeProcessSampler::process_identity(pid_a)
+                .map_err(|error| format!("A identity: {error}"))?;
+            let identity_b = NativeProcessSampler::process_identity(pid_b)
+                .map_err(|error| format!("B identity: {error}"))?;
+            let ready_a_command = write_probe_command("ready-a");
+            let ready_b_command = write_probe_command("ready-b");
+            let (written_a, written_b) = tokio::join!(
+                services_a
+                    .terminal
+                    .write("thread-a", "terminal-a", &ready_a_command,),
+                services_b
+                    .terminal
+                    .write("thread-b", "terminal-b", &ready_b_command,)
+            );
+            written_a.map_err(|error| error.to_string())?;
+            written_b.map_err(|error| error.to_string())?;
+            let (ready_a, ready_b) = tokio::join!(
+                wait_for_probe(&mut events_a, "thread-a", "terminal-a", "ready-a"),
+                wait_for_probe(&mut events_b, "thread-b", "terminal-b", "ready-b")
+            );
+            ready_a?;
+            ready_b?;
+
+            services_a.shutdown().await;
+            exact_process_exited(identity_a)?;
+            let current_b = NativeProcessSampler::process_identity(pid_b)
+                .map_err(|error| format!("runtime B remains alive: {error}"))?;
+            if current_b != identity_b {
+                return Err("runtime B identity changed during runtime A shutdown".to_owned());
+            }
             services_b
                 .terminal
-                .write("thread-b", "terminal-b", &ready_b_command,)
-        );
-        written_a.expect("runtime A child accepts input");
-        written_b.expect("runtime B child accepts input");
-        tokio::join!(
-            wait_for_probe(&ready_a, "ready-a"),
-            wait_for_probe(&ready_b, "ready-b")
-        );
+                .write(
+                    "thread-b",
+                    "terminal-b",
+                    &write_probe_command("still-alive-b"),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            wait_for_probe(&mut events_b, "thread-b", "terminal-b", "still-alive-b").await?;
+            Ok::<_, String>((identity_a, identity_b))
+        })
+        .catch_unwind()
+        .await;
 
-        services_a.shutdown().await;
-        wait_for_exact_process_exit(identity_a).await;
-        assert_eq!(
-            NativeProcessSampler::process_identity(pid_b).expect("runtime B remains alive"),
-            identity_b
-        );
-        let still_alive = root_b.path().join("still-alive-b");
-        services_b
-            .terminal
-            .write(
-                "thread-b",
-                "terminal-b",
-                &write_probe_command(&still_alive, "still-alive-b"),
-            )
-            .await
-            .expect("runtime B child still accepts input after runtime A shutdown");
-        wait_for_probe(&still_alive, "still-alive-b").await;
-
-        services_b.shutdown().await;
-        wait_for_exact_process_exit(identity_b).await;
+        tokio::join!(services_a.shutdown(), services_b.shutdown());
+        match outcome {
+            Ok(Ok((identity_a, identity_b))) => {
+                exact_process_exited(identity_a).expect("runtime A exact cleanup");
+                exact_process_exited(identity_b).expect("runtime B exact cleanup");
+            }
+            Ok(Err(error)) => panic!("two-runtime terminal assertion failed: {error}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn assert_invalid_terminal_launch_command(command: Value) {

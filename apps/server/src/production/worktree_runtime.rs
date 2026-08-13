@@ -1310,7 +1310,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::Duration,
@@ -1333,7 +1333,7 @@ mod tests {
         cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
         diagnostics::{
             DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-            NotApplicableUiProcessObserver, ProcessAttributionRegistry,
+            NotApplicableUiProcessObserver, ProcessAttributionRegistry, ProcessIdentity,
         },
         orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
         persistence::{Database, Repositories, run_migrations},
@@ -1556,6 +1556,7 @@ mod tests {
     #[derive(Debug)]
     struct RuntimeTestPty {
         pid: u32,
+        identity: ProcessIdentity,
         killed: AtomicBool,
         writes: Mutex<Vec<String>>,
         output: broadcast::Sender<String>,
@@ -1564,10 +1565,18 @@ mod tests {
 
     impl RuntimeTestPty {
         fn new(pid: u32) -> Self {
+            static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+            assert_ne!(pid, 0, "synthetic PTY PID must be nonzero");
+            let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+            assert_ne!(generation, 0, "synthetic PTY generation wrapped to zero");
             let (output, _) = broadcast::channel(16);
             let (exit, _) = watch::channel(None);
             Self {
                 pid,
+                identity: ProcessIdentity {
+                    pid,
+                    started_at: generation,
+                },
                 killed: AtomicBool::new(false),
                 writes: Mutex::new(Vec::new()),
                 output,
@@ -1589,6 +1598,10 @@ mod tests {
     impl PtyProcess for RuntimeTestPty {
         fn pid(&self) -> u32 {
             self.pid
+        }
+
+        fn process_identity(&self) -> Option<ProcessIdentity> {
+            Some(self.identity)
         }
 
         fn write(&self, data: &str) -> Result<(), String> {
@@ -1626,6 +1639,15 @@ mod tests {
         fn subscribe_exit(&self) -> watch::Receiver<Option<PtyExit>> {
             self.exit.subscribe()
         }
+    }
+
+    #[test]
+    fn runtime_test_ptys_distinguish_same_pid_generations() {
+        let first = RuntimeTestPty::new(1);
+        let replacement = RuntimeTestPty::new(1);
+        assert_ne!(first.identity.started_at, 0);
+        assert!(replacement.identity.started_at > first.identity.started_at);
+        assert_ne!(first.identity, replacement.identity);
     }
 
     #[derive(Debug, Default)]

@@ -343,7 +343,8 @@ impl PtyBackend for FakeBackend {
     fn spawn(&self, _input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
         let (output, _) = broadcast::channel(32);
         let (exit, _) = watch::channel(None);
-        let generation = self.spawned.lock().expect("spawned lock").len() as u64 + 1;
+        let mut spawned = self.spawned.lock().expect("spawned lock");
+        let generation = spawned.len() as u64 + 1;
         let pid = 4_242 + u32::try_from(generation - 1).expect("synthetic PID");
         let process = Arc::new(FakePty {
             pid,
@@ -357,10 +358,7 @@ impl PtyBackend for FakeBackend {
             output,
             exit,
         });
-        self.spawned
-            .lock()
-            .expect("spawned lock")
-            .push(process.clone());
+        spawned.push(process.clone());
         Ok(process)
     }
 }

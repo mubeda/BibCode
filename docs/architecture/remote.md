@@ -124,6 +124,9 @@ endpoint can install software, start a process, or use SSH.
 - Relay request proofs and environment health/mint responses are independently
   signed and scoped to their nonce and operation.
 - A tunnel changes reachability, not the environment's authorization rules.
+- The in-process runtime owns its managed tunnel as an exact per-runtime helper
+  root with a dedicated Unix process group or Windows Job. Shutdown closes
+  tunnel admission, drains that owner, and never signals a peer runtime's tunnel.
 - Hosted HTTPS clients must not select plain-HTTP endpoints that browsers would
   block as mixed content.
 - Remote descriptors expose storage identity but never requested/effective

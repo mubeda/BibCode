@@ -355,17 +355,19 @@ terminals, and background tasks, checkpoints SQLite's WAL, and publishes and
 reloads a verified `PreUpdate` backup while holding the store-operation lock.
 
 Each in-process server runtime owns a distinct bounded process-attribution
-registry shared by its provider and terminal managers. Runtime quiesce closes
+registry shared by its provider, terminal, provider-helper, and managed-endpoint
+owners. Runtime quiesce closes
 that registry to new roots and captures its exact `(pid, creation-time)`
 identities before either manager shuts down. A provider or PTY that finishes
 spawning after this fence is rejected with the typed shutdown outcome and its
 uncommitted owner terminates and reaps it before returning. Existing provider
-process-group or Windows Job owners and terminal PTY owners perform their
+process-group or Windows Job owners, terminal PTY owners, independently spawned
+provider helpers, and the managed endpoint tunnel perform their
 normal cleanup first; a final native sample kills only residual identities in
 the captured runtime-owned closure, including descendants forked after the
 initial sample. It never sweeps every descendant of the shared application
 PID, so shutting down one embedded runtime cannot terminate a sibling
-runtime's provider or terminal children. PID reuse is excluded by creation-time
+runtime's provider, terminal, helper, or tunnel children. PID reuse is excluded by creation-time
 identity checks, registry entries leave with their process owners, and shutdown
 is idempotent without awaiting while the registry lock is held.
 

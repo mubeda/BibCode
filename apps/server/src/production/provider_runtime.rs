@@ -4201,6 +4201,27 @@ where
                     });
                 }
             };
+            match inner.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("exited provider ownership unit", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: "provider process exited before ownership admission".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: format!(
+                            "failed to revalidate spawned provider process identity: {error}"
+                        ),
+                    });
+                }
+            }
             match attribution.register_identity(
                 identity,
                 ProcessRegistrationMetadata {

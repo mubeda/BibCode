@@ -137,6 +137,16 @@ entry to running without an await or other cancellation point. Pending and
 running entries and the active drain epoch share one registry mutex, so
 shutdown treats an in-flight submission as live work.
 
+Codex and OpenCode helpers are independent roots rather than descendants of the
+prepared PTY. Each receives a dedicated Unix process group or Windows Job and
+registers its exact root identity in the server runtime's shared attribution
+registry before publication. Registration rejection after shutdown freeze or
+at registry capacity terminates and reaps the uncommitted ownership unit.
+Codex retains a factory task guard through group/Job cleanup and exact wait;
+factory shutdown drains those guards. Natural Unix root exit is observed with
+`waitid(..., WNOWAIT)` so the leader reserves its PID/PGID until late
+same-group descendants are killed and the root is reaped.
+
 The foreground TERM/grace/KILL/wait budget remains bounded; a timed-out child
 stays registry-owned until `Child::wait` completes. An `Interrupted` wait is
 retried immediately. Any other wait failure keeps the same child,
@@ -167,9 +177,9 @@ rather than discarding the exact owner or hot-looping, while repeated shutdown
 after an empty-state linearization is inert.
 
 Terminal-manager shutdown first cancels and drains observer generations and
-sessions, then calls the launch-preparer/factory shutdown hook to drain this
-registry while the production Tokio runtime is still live. Other provider
-factories use the hook's no-op default. This makes waiter cancellation safe,
+sessions, then calls the launch-preparer/factory shutdown hook to drain helper
+owners while the production Tokio runtime is still live. Codex and OpenCode
+use the hook; other provider factories use its no-op default. This makes waiter cancellation safe,
 bounds live helper/reaper ownership, and prevents runtime teardown from
 discarding an unreaped OpenCode child.
 
