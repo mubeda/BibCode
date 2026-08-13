@@ -1659,17 +1659,17 @@ fn open_path_without_following(path: &Path, kind: PlainPathKind) -> std::io::Res
 fn open_path_without_following(path: &Path, kind: PlainPathKind) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    let directory_flag = if matches!(kind, PlainPathKind::Directory) {
-        FILE_FLAG_BACKUP_SEMANTICS
+    let (access_mode, directory_flag) = if matches!(kind, PlainPathKind::Directory) {
+        (FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS)
     } else {
-        0
+        (FILE_GENERIC_READ, 0)
     };
     OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(access_mode)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | directory_flag)
         .open(path)
@@ -2745,10 +2745,10 @@ mod tests {
         .await
         .expect_err("injected post-preservation failure");
 
-        assert!(matches!(
-            error,
-            RecoveryError::Backup(BackupError::Verification(_))
-        ));
+        assert!(
+            matches!(&error, RecoveryError::Backup(BackupError::Verification(_))),
+            "unexpected recovery error: {error:?}"
+        );
         assert!(paths.recovery_journal().is_file());
         assert!(!paths.database.exists());
         assert!(!paths.environment_id.exists());
