@@ -104,13 +104,13 @@ pub enum StoreStartupError {
     DatabaseOpen {
         path: PathBuf,
         #[source]
-        source: PersistenceError,
+        source: Box<PersistenceError>,
     },
     #[error("failed to migrate persistent database {path}")]
     Migration {
         path: PathBuf,
         #[source]
-        source: PersistenceError,
+        source: Box<PersistenceError>,
     },
     #[error("failed to protect persistent storage before mutation")]
     Backup(#[source] BackupError),
@@ -219,7 +219,7 @@ async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStar
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
             path: paths.database.clone(),
-            source,
+            source: Box::new(source),
         })?;
     migrate(&database, &paths.database).await?;
     let storage_instance_id = publish_marker(&paths, StorageInstanceId(Uuid::new_v4())).await?;
@@ -271,7 +271,7 @@ async fn prepare_existing_database(
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
             path: paths.database.clone(),
-            source,
+            source: Box::new(source),
         })?;
     let pending = match inspect_pending_migrations(&inspection_database, &paths.database).await {
         Ok(pending) => pending,
@@ -308,7 +308,7 @@ async fn prepare_existing_database(
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
             path: paths.database.clone(),
-            source,
+            source: Box::new(source),
         })?;
     apply_pending_migrations(&database, &paths.database, pending).await?;
     Ok(PreparedStore {
@@ -439,7 +439,7 @@ async fn migrate(database: &Database, path: &std::path::Path) -> Result<(), Stor
         .await
         .map_err(|source| StoreStartupError::Migration {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
 }
 
@@ -452,7 +452,7 @@ async fn inspect_pending_migrations(
         .await
         .map_err(|source| StoreStartupError::Migration {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
 }
 
@@ -469,7 +469,7 @@ async fn apply_pending_migrations(
         .await
         .map_err(|source| StoreStartupError::Migration {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
 }
 
