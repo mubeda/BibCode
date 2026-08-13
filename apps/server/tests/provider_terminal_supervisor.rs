@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -20,7 +20,7 @@ use bibcode_server::{
         ActivityRecordKind, ActivityRepository, ActivityScopeRef, AgentActivityController,
         AgentActivityDisableReport, AgentActivitySource,
     },
-    diagnostics::ProcessAttributionRegistry,
+    diagnostics::{ProcessAttributionRegistry, ProcessIdentity},
     persistence::{Database, StorageInstanceId, run_migrations},
     production::{
         agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
@@ -143,6 +143,7 @@ impl TraceCapture {
 #[derive(Debug)]
 struct RecordingProcess {
     pid: u32,
+    identity: ProcessIdentity,
     output: broadcast::Sender<String>,
     exit: watch::Sender<Option<PtyExit>>,
     killed: AtomicBool,
@@ -150,10 +151,21 @@ struct RecordingProcess {
 
 impl RecordingProcess {
     fn new(pid: u32) -> Self {
+        static NEXT_SYNTHETIC_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+        assert_ne!(pid, 0, "synthetic PTY PID must be nonzero");
+        let generation = NEXT_SYNTHETIC_PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            generation, 0,
+            "synthetic PTY process generation wrapped to zero"
+        );
         let (output, _) = broadcast::channel(8);
         let (exit, _) = watch::channel(None);
         Self {
             pid,
+            identity: ProcessIdentity {
+                pid,
+                started_at: generation,
+            },
             output,
             exit,
             killed: AtomicBool::new(false),
@@ -175,6 +187,10 @@ impl RecordingProcess {
 impl PtyProcess for RecordingProcess {
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn process_identity(&self) -> Option<ProcessIdentity> {
+        Some(self.identity)
     }
 
     fn write(&self, _data: &str) -> Result<(), String> {
@@ -201,6 +217,21 @@ impl PtyProcess for RecordingProcess {
     fn subscribe_exit(&self) -> watch::Receiver<Option<PtyExit>> {
         self.exit.subscribe()
     }
+}
+
+#[test]
+fn synthetic_pty_identities_are_nonzero_and_distinguish_pid_generations() {
+    let first = RecordingProcess::new(41);
+    let replacement = RecordingProcess::new(41);
+
+    assert_ne!(first.identity.started_at, 0);
+    assert_ne!(replacement.identity.started_at, 0);
+    assert_eq!(first.identity.pid, replacement.identity.pid);
+    assert!(
+        replacement.identity.started_at > first.identity.started_at,
+        "a replacement using the same synthetic PID needs a later stable generation"
+    );
+    assert_ne!(first.identity, replacement.identity);
 }
 
 #[derive(Debug)]
