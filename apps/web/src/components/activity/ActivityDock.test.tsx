@@ -748,8 +748,13 @@ describe("ActivityDock", () => {
     const separator = Array.from(toggle?.querySelectorAll<HTMLSpanElement>("span") ?? []).find(
       (span) => span.textContent === "·",
     );
-    expect(separator?.classList.contains("text-foreground/70")).toBe(true);
-    expect(separator?.classList.contains("font-medium")).toBe(true);
+    expect(separator?.textContent).toBe("·");
+    expect(separator?.classList.contains("text-base")).toBe(true);
+    expect(separator?.classList.contains("font-bold")).toBe(true);
+    expect(separator?.classList.contains("leading-none")).toBe(true);
+    expect(separator?.classList.contains("text-foreground")).toBe(true);
+    expect(separator?.classList.contains("text-foreground/70")).toBe(false);
+    expect(separator?.classList.contains("font-medium")).toBe(false);
     expect(separator?.classList.contains("text-muted-foreground")).toBe(false);
     expect(separator?.getAttribute("data-activity-count-separator")).toBe("true");
     expect(separator?.getAttribute("aria-hidden")).toBe("true");

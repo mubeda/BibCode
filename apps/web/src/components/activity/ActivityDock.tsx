@@ -352,7 +352,7 @@ export function ActivityDock({
           </span>
           <span
             aria-hidden="true"
-            className="text-xs font-medium text-foreground/70"
+            className="text-base leading-none font-bold text-foreground"
             data-activity-count-separator="true"
           >
             ·
