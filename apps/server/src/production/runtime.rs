@@ -42,6 +42,7 @@ use crate::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
             JsonRouteResponse, RouteContext,
         },
+        managed_endpoint::ManagedEndpointRuntime,
         operational_logs::{OperationalLogOptions, OperationalLogs},
         orchestration_effects::{
             BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
@@ -93,6 +94,7 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    managed_endpoint: ManagedEndpointRuntime,
     _worktree_catalog: WorktreeCatalogService,
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
@@ -112,6 +114,11 @@ pub fn finalize_rpc_registry(
 impl ProductionRuntime {
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
         self.provider_runtime.attach_connect_mcp(service).await;
+    }
+
+    #[must_use]
+    pub fn managed_endpoint_runtime(&self) -> ManagedEndpointRuntime {
+        self.managed_endpoint.clone()
     }
 
     pub async fn start(
@@ -179,6 +186,8 @@ impl ProductionRuntime {
             .await
             .map_err(|error| error.to_string())?;
         let process_attribution = ProcessAttributionRegistry::new();
+        let managed_endpoint =
+            ManagedEndpointRuntime::with_process_attribution(process_attribution.clone());
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
             Arc::new(ProviderSettingsInventoryAuthority::new(provider_settings)),
@@ -347,6 +356,7 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            managed_endpoint,
             _worktree_catalog: worktree_catalog,
             worktree_catalog_operations,
             worktree_runtime,
@@ -475,6 +485,7 @@ impl ProductionRuntime {
             return Ok(());
         }
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
+        self.managed_endpoint.shutdown().await;
         self.worktree_catalog_operations.shutdown().await;
         self._worktree_catalog.shutdown().await;
         self.worktree_runtime.shutdown().await;

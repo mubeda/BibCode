@@ -3,6 +3,7 @@ mod crypto;
 #[allow(dead_code)]
 pub mod activity;
 #[path = "../../../../src/diagnostics/mod.rs"]
+#[allow(dead_code, unused_imports)]
 pub mod diagnostics;
 #[allow(dead_code)]
 pub mod persistence;

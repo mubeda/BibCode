@@ -6,7 +6,11 @@ use std::{
     fmt,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -148,9 +152,9 @@ pub struct PtySpawnInput {
 
 pub trait PtyProcess: fmt::Debug + Send + Sync {
     fn pid(&self) -> u32;
-    fn process_identity(&self) -> Option<ProcessIdentity> {
-        None
-    }
+    /// Returns the stable process identity captured by the backend at spawn.
+    /// A live PTY must provide this identity before the manager can publish it.
+    fn process_identity(&self) -> Option<ProcessIdentity>;
     fn write(&self, data: &str) -> Result<(), String>;
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self) -> Result<(), String>;
@@ -420,11 +424,30 @@ impl PortablePtyBackend {
             return Err(error.to_string());
         }
         let exit_sender = exit.clone();
+        #[cfg(windows)]
+        let job = Arc::new(child.commit_job()?);
+        #[cfg(windows)]
+        let waiter_job = Arc::clone(&job);
+        #[cfg(unix)]
+        let process_group = child.process_group;
+        #[cfg(unix)]
+        let process_group_identity_reserved = Arc::new(AtomicBool::new(process_group.is_some()));
+        #[cfg(unix)]
+        let waiter_process_group_identity_reserved = Arc::clone(&process_group_identity_reserved);
         let wait_child = child.handoff_child_to_waiter();
         spawn_pty_thread(
             format!("bibcode-pty-wait-{pid}"),
             Box::new(move || {
                 let mut child = wait_child;
+                #[cfg(unix)]
+                if let Some(process_group) = process_group {
+                    if let Err(error) = wait_for_unix_child_exit_without_reaping(pid) {
+                        tracing::warn!(%error, pid, "failed to reserve PTY root identity through group cleanup");
+                    }
+                    if let Err(error) = kill_unix_process_group(process_group) {
+                        tracing::warn!(%error, process_group, "failed to terminate PTY process group after root exit");
+                    }
+                }
                 let event = match child.wait() {
                     Ok(status) => PtyExit {
                         exit_code: i32::try_from(status.exit_code()).ok(),
@@ -435,15 +458,25 @@ impl PortablePtyBackend {
                         signal: None,
                     },
                 };
+                #[cfg(windows)]
+                {
+                    if let Err(error) = waiter_job.terminate() {
+                        tracing::warn!(%error, "failed to terminate PTY Job after root exit");
+                    }
+                    match waiter_job.wait_for_exit(Duration::from_secs(3)) {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!("PTY Job did not exit before ownership release"),
+                        Err(error) => tracing::warn!(%error, "failed waiting for PTY Job cleanup"),
+                    }
+                }
+                #[cfg(unix)]
+                waiter_process_group_identity_reserved.store(false, Ordering::Release);
                 let _ = exit_sender.send(Some(event));
             }),
         )
         .map_err(|error| error.to_string())?;
         #[cfg(unix)]
         let process_group = child.commit_process_group();
-        #[cfg(windows)]
-        let job = child.commit_job()?;
-
         Ok(Arc::new(PortablePtyProcess {
             pid,
             process_identity,
@@ -456,6 +489,8 @@ impl PortablePtyBackend {
             exit,
             #[cfg(unix)]
             process_group,
+            #[cfg(unix)]
+            process_group_identity_reserved,
             #[cfg(windows)]
             job,
         }))
@@ -732,8 +767,10 @@ struct PortablePtyProcess {
     exit: watch::Sender<Option<PtyExit>>,
     #[cfg(unix)]
     process_group: Option<i32>,
+    #[cfg(unix)]
+    process_group_identity_reserved: Arc<AtomicBool>,
     #[cfg(windows)]
-    job: WindowsJob,
+    job: Arc<WindowsJob>,
 }
 
 impl fmt::Debug for PortablePtyProcess {
@@ -797,6 +834,9 @@ impl PtyProcess for PortablePtyProcess {
     fn kill(&self) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
+            if !self.process_group_identity_reserved.load(Ordering::Acquire) {
+                return Ok(());
+            }
             return kill_unix_process_group(process_group).map_err(|error| error.to_string());
         }
         #[cfg(windows)]
@@ -851,6 +891,33 @@ unsafe extern "C" {
 fn kill_unix_process_group(process_group: i32) -> std::io::Result<()> {
     // Negative PIDs target the complete process group created by the PTY.
     kill_unix_target(-process_group)
+}
+
+#[cfg(unix)]
+fn wait_for_unix_child_exit_without_reaping(process_id: u32) -> std::io::Result<()> {
+    let process_id = libc::id_t::try_from(process_id)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    loop {
+        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: information points to valid writable storage. WNOWAIT keeps
+        // the exited leader waitable so its PID/PGID cannot be reused before
+        // the owned group has been signalled.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process_id,
+                information.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1999,6 +2066,69 @@ mod tests {
         assert!(exit.borrow().is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_root_exit_kills_late_hup_resistant_descendant_before_exit_publication() {
+        let directory = tempfile::tempdir().expect("late descendant fixture");
+        let process = PortablePtyBackend
+            .spawn(&PtySpawnInput {
+                executable: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "trap 'exit 0' USR1; BIBCODE_ROOT_PID=$$; export BIBCODE_ROOT_PID; /bin/sh -c 'trap \"\" HUP; printf \"\\nBIBCODE_DESCENDANT_PID=%s\\n\" \"$$\"; kill -USR1 \"$BIBCODE_ROOT_PID\"; exec sleep 30' & wait"
+                        .to_owned(),
+                ],
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+                env: BTreeMap::new(),
+            })
+            .expect("spawn natural-exit PTY root");
+        let descendant_identity_marker = "BIBCODE_DESCENDANT_PID=";
+        let mut output = process.subscribe_output();
+        let mut exit = process.subscribe_exit();
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut observed = String::new();
+            loop {
+                observed.push_str(&output.recv().await.expect("PTY output remains open"));
+                if let Some(pid) = observed
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(descendant_identity_marker))
+                {
+                    return pid.parse::<u32>().expect("numeric late descendant PID");
+                }
+            }
+        })
+        .await
+        .expect("late descendant publishes its framed PID");
+        let descendant_identity = NativeProcessSampler::process_identity(descendant_pid)
+            .expect("capture late descendant identity");
+
+        tokio::time::timeout(Duration::from_secs(3), exit.changed())
+            .await
+            .expect("root exit publication outer bound")
+            .expect("root exit publisher remains live");
+        assert!(exit.borrow().is_some());
+        // Exit publication is the ownership-release boundary. A zombie may
+        // remain briefly visible after SIGKILL, but it is no longer a live
+        // escape; distinguish that state through the native process status.
+        let sampler = NativeProcessSampler::default();
+        let descendant_is_live = sampler
+            .collect_rows()
+            .await
+            .expect("sample descendant status")
+            .into_iter()
+            .find(|row| {
+                row.pid == descendant_identity.pid
+                    && row.started_at == descendant_identity.started_at
+            })
+            .is_some_and(|row| !row.status.to_ascii_lowercase().contains("zomb"));
+        assert!(
+            !descendant_is_live,
+            "late same-group descendant survived root exit publication"
+        );
+    }
+
     #[test]
     fn portable_backend_rejects_a_missing_executable_before_opening_a_pty() {
         let error = PortablePtyBackend
@@ -2031,6 +2161,8 @@ mod tests {
             exit,
             #[cfg(unix)]
             process_group: None,
+            #[cfg(unix)]
+            process_group_identity_reserved: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(process.write("data").unwrap_err().contains("write failed"));
@@ -2075,6 +2207,8 @@ mod tests {
             exit,
             #[cfg(unix)]
             process_group: None,
+            #[cfg(unix)]
+            process_group_identity_reserved: Arc::new(AtomicBool::new(false)),
         };
 
         let _ = catch_unwind(AssertUnwindSafe(|| {

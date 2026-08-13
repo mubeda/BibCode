@@ -4,7 +4,7 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -32,6 +32,7 @@ use bibcode_server::{
 
 #[derive(Debug)]
 struct GateTestPty {
+    identity: diagnostics::ProcessIdentity,
     killed: AtomicBool,
     output: tokio::sync::broadcast::Sender<String>,
     exit: tokio::sync::watch::Sender<Option<PtyExit>>,
@@ -39,9 +40,16 @@ struct GateTestPty {
 
 impl GateTestPty {
     fn new() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(generation, 0, "synthetic PTY generation wrapped to zero");
         let (output, _) = tokio::sync::broadcast::channel(8);
         let (exit, _) = tokio::sync::watch::channel(None);
         Self {
+            identity: diagnostics::ProcessIdentity {
+                pid: 42_424,
+                started_at: generation,
+            },
             killed: AtomicBool::new(false),
             output,
             exit,
@@ -51,7 +59,11 @@ impl GateTestPty {
 
 impl PtyProcess for GateTestPty {
     fn pid(&self) -> u32 {
-        42_424
+        self.identity.pid
+    }
+
+    fn process_identity(&self) -> Option<diagnostics::ProcessIdentity> {
+        Some(self.identity)
     }
 
     fn write(&self, _data: &str) -> Result<(), String> {
@@ -78,6 +90,16 @@ impl PtyProcess for GateTestPty {
     fn subscribe_exit(&self) -> tokio::sync::watch::Receiver<Option<PtyExit>> {
         self.exit.subscribe()
     }
+}
+
+#[test]
+fn gate_test_ptys_distinguish_same_pid_generations() {
+    let first = GateTestPty::new();
+    let replacement = GateTestPty::new();
+    assert_eq!(first.identity.pid, replacement.identity.pid);
+    assert_ne!(first.identity.started_at, 0);
+    assert!(replacement.identity.started_at > first.identity.started_at);
+    assert_ne!(first.identity, replacement.identity);
 }
 
 #[derive(Debug)]

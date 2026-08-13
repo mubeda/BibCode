@@ -68,6 +68,7 @@ struct RegistryEntry {
 enum RegistrationObservation {
     AwaitingFirstSample { deadline: Instant },
     Observed,
+    Suppressed,
 }
 
 impl ProcessAttributionRegistry {
@@ -92,21 +93,6 @@ impl ProcessAttributionRegistry {
         let mut state = lock_state(&self.inner);
         if !state.accepting_registrations {
             return Err(ProcessRegistrationError::Shutdown);
-        }
-        {
-            let RegistryState {
-                entries,
-                registration_order,
-                ..
-            } = &mut *state;
-            entries.retain(|_, entry| {
-                !matches!(
-                    entry.observation,
-                    RegistrationObservation::AwaitingFirstSample { deadline }
-                        if deadline <= now
-                )
-            });
-            registration_order.retain(|registration_id| entries.contains_key(registration_id));
         }
         if state.entries.len() >= REGISTRY_CAPACITY {
             tracing::warn!(
@@ -171,7 +157,6 @@ impl ProcessAttributionRegistry {
 
         let mut state = lock_state(&self.inner);
         let mut snapshot = Vec::with_capacity(state.entries.len());
-        let mut stale_registration_ids = Vec::new();
         {
             let RegistryState {
                 entries,
@@ -182,52 +167,54 @@ impl ProcessAttributionRegistry {
                 let Some(entry) = entries.get_mut(registration_id) else {
                     return false;
                 };
-                let (retained, emit_claim) = match entry.observation {
+                let emit_claim = match entry.observation {
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sample_started_at < entry.registered_at
                             && sampled_identities.contains(&entry.identity) =>
                     {
                         entry.observation = RegistrationObservation::Observed;
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sample_started_at < entry.registered_at =>
                     {
-                        (true, false)
+                        false
                     }
                     RegistrationObservation::AwaitingFirstSample { deadline }
                         if deadline <= sample_started_at =>
                     {
-                        (false, false)
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sampled_identities.contains(&entry.identity) =>
                     {
                         entry.observation = RegistrationObservation::Observed;
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sampled_pids.contains(&entry.identity.pid) =>
                     {
-                        (false, false)
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
                     }
-                    RegistrationObservation::AwaitingFirstSample { .. } => (true, false),
+                    RegistrationObservation::AwaitingFirstSample { .. } => false,
                     RegistrationObservation::Observed
                         if sampled_identities.contains(&entry.identity) =>
                     {
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::Observed
                         if sample_started_at < entry.registered_at =>
                     {
-                        (true, false)
+                        false
                     }
-                    RegistrationObservation::Observed => (false, false),
+                    RegistrationObservation::Observed => {
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
+                    }
+                    RegistrationObservation::Suppressed => false,
                 };
-                if !retained {
-                    stale_registration_ids.push(*registration_id);
-                    return false;
-                }
                 if emit_claim {
                     snapshot.push(ProcessClaim {
                         identity: entry.identity,
@@ -238,9 +225,6 @@ impl ProcessAttributionRegistry {
                 }
                 true
             });
-            for registration_id in &stale_registration_ids {
-                entries.remove(registration_id);
-            }
         }
         snapshot
     }
@@ -398,15 +382,22 @@ mod tests {
     }
 
     #[test]
-    fn captured_identity_expires_without_an_initial_observation() {
+    fn expired_diagnostic_visibility_preserves_shutdown_ownership_until_token_drop() {
         let registry = ProcessAttributionRegistry::new();
-        let _registration = register(&registry, 42, 100, "external/provider");
+        let registration = register(&registry, 42, 100, "external/provider");
         let registered_at = Instant::now();
 
         let claims =
             registry.bind_and_snapshot(&[row(42, 1, 100)], registered_at + FIRST_OBSERVATION_TTL);
 
         assert!(claims.is_empty());
+        assert_eq!(
+            registry.freeze_and_snapshot_identities(),
+            [identity(42, 100)],
+            "diagnostic observation expiry must not evict a live process owner"
+        );
+        drop(registration);
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
     }
 
     #[test]
@@ -491,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_captured_identity_is_pruned_after_a_sample() {
+    fn missing_captured_identity_is_suppressed_until_its_owner_drops() {
         let registry = ProcessAttributionRegistry::new();
         let _registration = register(&registry, 42, 100, "external/provider");
         let now = Instant::now();
@@ -502,6 +493,10 @@ mod tests {
             registry
                 .bind_and_snapshot(&[row(42, 1, 100)], now)
                 .is_empty()
+        );
+        assert_eq!(
+            registry.freeze_and_snapshot_identities(),
+            [identity(42, 100)]
         );
     }
 

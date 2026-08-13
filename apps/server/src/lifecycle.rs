@@ -22,7 +22,6 @@ use crate::{
             ConnectMcpConfig, ConnectMcpService, PairingCredential, PairingIssuer, PreviewInvoker,
         },
         jwt::PersistentJwtCodec,
-        managed_endpoint::ManagedEndpointRuntime,
     },
     rpc::RpcRegistry,
 };
@@ -188,7 +187,7 @@ impl ServerRuntime {
                 let jwt = PersistentJwtCodec::open(state_directory.join("environment-jwt.json"))
                     .await
                     .map_err(|error| ServerError::ProductionInitialize(error.to_string()))?;
-                let endpoint = ManagedEndpointRuntime::default();
+                let endpoint = runtime.managed_endpoint_runtime();
                 let pairing_auth = auth.clone();
                 let pairing = PairingIssuer::new(move |thumbprint| {
                     let auth = pairing_auth.clone();

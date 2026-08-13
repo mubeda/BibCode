@@ -18,9 +18,9 @@ use std::{
 
 #[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
+use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::process::Child;
 
 use super::model::TerminalObserverGenerationLease;
 #[cfg(unix)]
@@ -41,8 +41,13 @@ use crate::process::supervised::{
 use crate::provider::codex::model::CODEX_REMOTE_MESSAGE_MAX_BYTES;
 use crate::{
     activity::{ActivityCapabilities, ActivityObservationState, ProviderActivityMutation},
+    diagnostics::{
+        AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
+        RegistrationSource,
+    },
     process::{
-        configure_background_command,
+        configure_supervised_background_command_wrap,
         supervised::{SupervisedOverflow, SupervisedRunRequest, run_supervised},
     },
     provider::codex::{
@@ -314,6 +319,7 @@ pub struct CodexHelperLaunch {
     pub env: BTreeMap<String, String>,
     pub endpoint: String,
     pub socket_path: PathBuf,
+    pub process_attribution: ProcessAttributionRegistry,
 }
 
 impl fmt::Debug for CodexHelperLaunch {
@@ -338,6 +344,11 @@ type CodexHelperStartFuture<'a> =
 
 pub trait CodexHelperLauncher: Send + Sync + fmt::Debug {
     fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_>;
+
+    #[doc(hidden)]
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 pub trait CodexRemoteClient: Send {
@@ -478,6 +489,7 @@ impl CodexTerminalObserverFactory {
                 env: input.launch.launch_env.clone(),
                 endpoint: endpoint.clone(),
                 socket_path,
+                process_attribution: input.process_attribution.clone(),
             })
             .await
             .ok()?;
@@ -515,6 +527,10 @@ impl ProviderTerminalObserverFactory for CodexTerminalObserverFactory {
         input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(self.prepare_inner(input))
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.helper.shutdown()
     }
 }
 
@@ -1892,6 +1908,7 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
 #[derive(Debug)]
 struct SystemCodexHelperLauncher {
     readiness_timeout: Duration,
+    owned_tasks: Arc<CodexHelperTaskRegistry>,
     #[cfg(test)]
     integration_deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
@@ -1902,10 +1919,18 @@ struct SystemCodexHelperLauncher {
 #[derive(Clone, Debug)]
 struct CodexHelperFixtureEvents {
     spawned: Arc<crate::test_support::FixtureEvent>,
+    admission_race: Option<Arc<CodexHelperAdmissionRace>>,
     ready: Arc<crate::test_support::FixtureEvent>,
     reaped: Arc<crate::test_support::FixtureEvent>,
     pid_path: PathBuf,
     watchdog_spawn_race: Option<Arc<CodexHelperWatchdogSpawnRace>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CodexHelperAdmissionRace {
+    spawned: crate::test_support::FixtureEvent,
+    release: crate::test_support::FixtureEvent,
 }
 
 #[cfg(test)]
@@ -1933,10 +1958,7 @@ impl CodexHelperWatchdogSpawnRace {
 
 #[cfg(test)]
 impl CodexHelperFixtureEvents {
-    fn publish_spawned(&self, process_id: Option<u32>) -> Result<(), String> {
-        if let Some(race) = self.watchdog_spawn_race.as_ref() {
-            race.release_publication.wait();
-        }
+    fn publish_pid(&self, process_id: Option<u32>) -> Result<(), String> {
         let process_id = process_id.ok_or_else(|| "Codex helper PID is unavailable".to_owned())?;
         let mut temporary_name = self.pid_path.as_os_str().to_owned();
         temporary_name.push(".tmp");
@@ -1945,6 +1967,14 @@ impl CodexHelperFixtureEvents {
             .map_err(|error| format!("failed staging Codex helper PID: {error}"))?;
         std::fs::rename(&temporary_path, &self.pid_path)
             .map_err(|error| format!("failed publishing Codex helper PID: {error}"))?;
+        Ok(())
+    }
+
+    fn publish_spawned(&self, process_id: Option<u32>) -> Result<(), String> {
+        if let Some(race) = self.watchdog_spawn_race.as_ref() {
+            race.release_publication.wait();
+        }
+        self.publish_pid(process_id)?;
         self.spawned.publish();
         if let Some(race) = self.watchdog_spawn_race.as_ref() {
             race.publication_complete.wait();
@@ -1957,6 +1987,7 @@ impl Default for SystemCodexHelperLauncher {
     fn default() -> Self {
         Self {
             readiness_timeout: CODEX_HELPER_READY_TIMEOUT,
+            owned_tasks: Arc::new(CodexHelperTaskRegistry::default()),
             #[cfg(test)]
             integration_deadline: None,
             #[cfg(test)]
@@ -1967,12 +1998,13 @@ impl Default for SystemCodexHelperLauncher {
 
 impl SystemCodexHelperLauncher {
     #[cfg(test)]
-    const fn with_fixture_events(
+    fn with_fixture_events(
         readiness_timeout: Duration,
         fixture_events: CodexHelperFixtureEvents,
     ) -> Self {
         Self {
             readiness_timeout,
+            owned_tasks: Arc::new(CodexHelperTaskRegistry::default()),
             integration_deadline: None,
             fixture_events: Some(fixture_events),
         }
@@ -1985,6 +2017,7 @@ impl SystemCodexHelperLauncher {
     ) -> Self {
         Self {
             readiness_timeout: CODEX_HELPER_READY_TIMEOUT,
+            owned_tasks: Arc::new(CodexHelperTaskRegistry::default()),
             integration_deadline: Some(deadline),
             fixture_events: Some(fixture_events),
         }
@@ -2001,27 +2034,87 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
             let permit = supervisor
                 .reserve()
                 .ok_or_else(|| "Codex helper supervisor is at capacity".to_owned())?;
-            let mut command = tokio::process::Command::new(&launch.executable);
-            configure_background_command(&mut command);
-            command
-                .args(&launch.args)
-                .current_dir(&launch.cwd)
-                .envs(&launch.env)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
+            let owned_task = self.owned_tasks.register();
+            let mut command = CommandWrap::with_new(&launch.executable, |command| {
+                command
+                    .args(&launch.args)
+                    .current_dir(&launch.cwd)
+                    .envs(&launch.env)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+            });
+            configure_supervised_background_command_wrap(&mut command);
             let child = command
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
             #[cfg(test)]
             if let Some(events) = self.fixture_events.as_ref() {
-                events.publish_spawned(child.id())?;
+                if let Some(race) = events.admission_race.as_ref() {
+                    if let Err(error) = events.publish_pid(child.id()) {
+                        terminate_and_reap_codex_helper(child).await;
+                        return Err(error);
+                    }
+                    race.spawned.publish();
+                    race.release.wait_after(0).await;
+                }
+            }
+            let identity = child
+                .id()
+                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok());
+            let Some(identity) = identity else {
+                terminate_and_reap_codex_helper(child).await;
+                return Err("spawned Codex helper has no stable process identity".to_owned());
+            };
+            #[cfg(unix)]
+            let liveness = codex_helper_root_exited_without_reaping(identity.pid)
+                .map(|exited| exited.then_some(()));
+            #[cfg(not(unix))]
+            let liveness = child.try_wait();
+            match liveness {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    terminate_and_reap_codex_helper(child).await;
+                    return Err("Codex helper exited before ownership admission".to_owned());
+                }
+                Err(error) => {
+                    terminate_and_reap_codex_helper(child).await;
+                    return Err(format!(
+                        "failed to revalidate Codex helper process identity: {error}"
+                    ));
+                }
+            }
+            let registration = match launch.process_attribution.register_identity(
+                identity,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Helper,
+                    label: "Codex App Server helper".to_owned(),
+                    source: RegistrationSource::Helper,
+                },
+            ) {
+                Ok(registration) => registration,
+                Err(
+                    error @ (ProcessRegistrationError::Shutdown
+                    | ProcessRegistrationError::Capacity),
+                ) => {
+                    terminate_and_reap_codex_helper(child).await;
+                    return Err(error.to_string());
+                }
+            };
+            #[cfg(test)]
+            if let Some(events) = self.fixture_events.as_ref() {
+                if let Err(error) = events.publish_spawned(child.id()) {
+                    terminate_and_reap_codex_helper(child).await;
+                    return Err(error);
+                }
             }
             let (process, ready) = supervisor.supervise(
                 child,
+                Some(registration),
                 launch.socket_path,
                 permit,
+                owned_task,
                 self.readiness_timeout,
                 #[cfg(test)]
                 CodexHelperSupervisionFixture {
@@ -2045,6 +2138,49 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
             }
             Ok(Arc::new(process) as Arc<dyn CodexHelperProcess>)
         })
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.owned_tasks.drain())
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexHelperTaskRegistry {
+    active: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl CodexHelperTaskRegistry {
+    fn register(self: &Arc<Self>) -> CodexHelperTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        CodexHelperTaskGuard {
+            registry: Arc::clone(self),
+        }
+    }
+
+    async fn drain(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CodexHelperTaskGuard {
+    registry: Arc<CodexHelperTaskRegistry>,
+}
+
+impl Drop for CodexHelperTaskGuard {
+    fn drop(&mut self) {
+        self.registry.active.fetch_sub(1, Ordering::AcqRel);
+        self.registry.changed.notify_waiters();
     }
 }
 
@@ -2172,9 +2308,11 @@ impl CodexHelperSupervisor {
 
     fn supervise(
         &self,
-        mut child: Child,
+        child: Box<dyn ChildWrapper>,
+        registration: Option<ProcessRegistration>,
         socket_path: PathBuf,
         permit: tokio::sync::OwnedSemaphorePermit,
+        owned_task: CodexHelperTaskGuard,
         readiness_timeout: Duration,
         #[cfg(test)] fixture: CodexHelperSupervisionFixture,
     ) -> (
@@ -2191,6 +2329,8 @@ impl CodexHelperSupervisor {
             watchdog_spawn_race: fixture_watchdog_spawn_race,
         } = fixture;
         self.runtime.spawn(async move {
+            let _registration = registration;
+            let _owned_task = owned_task;
             let ready_deadline = {
                 #[cfg(test)]
                 if let Some(deadline) = integration_deadline {
@@ -2208,15 +2348,19 @@ impl CodexHelperSupervisor {
                 if socket_path.exists() {
                     break Ok(());
                 }
-                match child.try_wait() {
+                #[cfg(unix)]
+                let liveness = child
+                    .id()
+                    .ok_or_else(|| "Codex App Server helper PID is unavailable".to_owned())
+                    .and_then(codex_helper_root_exited_without_reaping)
+                    .map(|exited| exited.then_some(()));
+                #[cfg(not(unix))]
+                let liveness = child.try_wait().map_err(|error| error.to_string());
+                match liveness {
                     Ok(Some(_)) => {
                         break Err("Codex App Server helper exited before readiness".to_owned());
                     }
-                    Err(error) => {
-                        break Err(format!(
-                            "failed to inspect Codex App Server helper: {error}"
-                        ));
-                    }
+                    Err(error) => break Err(format!("failed to inspect Codex App Server helper: {error}")),
                     Ok(None) => {}
                 }
                 if tokio::time::Instant::now() >= ready_deadline {
@@ -2245,14 +2389,38 @@ impl CodexHelperSupervisor {
                 terminate_and_reap_codex_helper(child).await;
                 return;
             }
-            tokio::select! {
-                biased;
-                () = child_termination.cancelled() => {
-                    terminate_and_reap_codex_helper(child).await;
+            #[cfg(unix)]
+            {
+                let root_exit = child.id().map(wait_for_codex_helper_root_exit_without_reaping);
+                tokio::select! {
+                    biased;
+                    () = child_termination.cancelled() => {
+                        terminate_and_reap_codex_helper(child).await;
+                    }
+                    result = async {
+                        match root_exit {
+                            Some(root_exit) => root_exit.await,
+                            None => Err("Codex helper PID was unavailable after readiness".to_owned()),
+                        }
+                    } => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "failed to observe Codex helper root exit");
+                        }
+                        terminate_and_reap_codex_helper(child).await;
+                    }
                 }
-                result = child.wait() => {
-                    if let Err(error) = result {
-                        tracing::warn!(error = %error, "failed to reap Codex helper after exit");
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    biased;
+                    () = child_termination.cancelled() => {
+                        terminate_and_reap_codex_helper(child).await;
+                    }
+                    result = child.wait() => {
+                        if let Err(error) = result {
+                            tracing::warn!(error = %error, "failed to reap Codex helper after exit");
+                        }
                     }
                 }
             }
@@ -2276,7 +2444,7 @@ struct CodexHelperSupervisionFixture {
     watchdog_spawn_race: Option<Arc<CodexHelperWatchdogSpawnRace>>,
 }
 
-async fn terminate_and_reap_codex_helper(mut child: Child) {
+async fn terminate_and_reap_codex_helper(mut child: Box<dyn ChildWrapper>) {
     if let Err(error) = child.start_kill() {
         tracing::warn!(error = %error, "failed to terminate owned Codex helper");
     }
@@ -2292,6 +2460,61 @@ async fn terminate_and_reap_codex_helper(mut child: Child) {
             tracing::warn!(error = %error, "failed to reap owned Codex helper");
         }
     }
+}
+
+#[cfg(unix)]
+fn codex_helper_root_exited_without_reaping(process_id: u32) -> Result<bool, String> {
+    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: information is valid writable storage. WNOWAIT reserves the
+    // owned root identity while WNOHANG makes this a liveness observation.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            process_id as libc::id_t,
+            information.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "failed observing Codex helper root: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful waitid initialized the zeroed siginfo storage.
+    let information = unsafe { information.assume_init() };
+    // SAFETY: si_pid reads the process field of initialized siginfo.
+    Ok(unsafe { information.si_pid() } != 0)
+}
+
+#[cfg(unix)]
+async fn wait_for_codex_helper_root_exit_without_reaping(process_id: u32) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let process_id = libc::id_t::try_from(process_id)
+            .map_err(|_| "Codex helper PID exceeded the platform range".to_owned())?;
+        loop {
+            let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: information is valid writable storage. WNOWAIT retains
+            // the exited leader as the identity reservation for its PGID.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    process_id,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("failed waiting for Codex helper root: {error}"));
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("Codex helper root observer task failed: {error}"))?
 }
 
 struct SystemCodexHelperProcess {
@@ -2499,6 +2722,7 @@ mod tests {
             socket_path,
             events: CodexHelperFixtureEvents {
                 spawned: Arc::new(FixtureEvent::default()),
+                admission_race: None,
                 ready: Arc::new(FixtureEvent::default()),
                 reaped: Arc::new(FixtureEvent::default()),
                 pid_path,
@@ -2508,6 +2732,25 @@ mod tests {
     }
 
     impl CodexHelperFixture {
+        fn launch(&self, process_attribution: ProcessAttributionRegistry) -> CodexHelperLaunch {
+            let endpoint = format!("unix://{}", self.socket_path.to_string_lossy());
+            CodexHelperLaunch {
+                executable: self.executable.to_string_lossy().into_owned(),
+                args: vec![
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    endpoint.clone(),
+                ],
+                cwd: self.sandbox.root().to_path_buf(),
+                env: self
+                    .sandbox
+                    .environment(std::iter::empty::<(String, String)>()),
+                endpoint,
+                socket_path: self.socket_path.clone(),
+                process_attribution,
+            }
+        }
+
         async fn start_and_wait_until(
             &self,
             deadline: tokio::time::Instant,
@@ -2532,25 +2775,11 @@ mod tests {
             ),
             String,
         > {
-            let endpoint = format!("unix://{}", self.socket_path.to_string_lossy());
             let launcher = SystemCodexHelperLauncher::with_integration_fixture_events(
                 owner_deadline,
                 self.events.clone(),
             );
-            let launch = CodexHelperLaunch {
-                executable: self.executable.to_string_lossy().into_owned(),
-                args: vec![
-                    "app-server".to_owned(),
-                    "--listen".to_owned(),
-                    endpoint.clone(),
-                ],
-                cwd: self.sandbox.root().to_path_buf(),
-                env: self
-                    .sandbox
-                    .environment(std::iter::empty::<(String, String)>()),
-                endpoint,
-                socket_path: self.socket_path.clone(),
-            };
+            let launch = self.launch(ProcessAttributionRegistry::new());
             let spawned_checkpoint = self.events.spawned.checkpoint();
             let ready_checkpoint = self.events.ready.checkpoint();
             let reaped_checkpoint = self.events.reaped.checkpoint();
@@ -3005,9 +3234,8 @@ mod tests {
         let executable = sandbox.executable_script("helper", "exec sleep 3600", "");
         let socket_path = sandbox.path("ready.sock");
         std::fs::write(&socket_path, b"ready").expect("publish helper readiness fixture");
-        let mut command = tokio::process::Command::new(executable);
-        configure_background_command(&mut command);
-        command.kill_on_drop(true);
+        let mut command = CommandWrap::with_new(executable, |_| {});
+        configure_supervised_background_command_wrap(&mut command);
         let child = command.spawn().expect("spawn helper capacity fixture");
         let pid = i32::try_from(child.id().expect("helper capacity fixture PID"))
             .expect("helper capacity fixture PID fits i32");
@@ -3018,8 +3246,10 @@ mod tests {
         let reaped = Arc::new(FixtureEvent::default());
         let (helper, ready) = supervisor.supervise(
             child,
+            None,
             socket_path,
             permit,
+            Arc::new(CodexHelperTaskRegistry::default()).register(),
             CODEX_HELPER_READY_TIMEOUT,
             CodexHelperSupervisionFixture {
                 reaped: Some(reaped.clone()),
@@ -3053,6 +3283,7 @@ mod tests {
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
         let events = CodexHelperFixtureEvents {
             spawned: Arc::new(FixtureEvent::default()),
+            admission_race: None,
             ready: Arc::new(FixtureEvent::default()),
             reaped: Arc::new(FixtureEvent::default()),
             pid_path: pid_path.clone(),
@@ -3077,6 +3308,7 @@ mod tests {
                 env: sandbox.environment(std::iter::empty::<(String, String)>()),
                 endpoint,
                 socket_path,
+                process_attribution: ProcessAttributionRegistry::new(),
             })
             .await
             .expect_err("unready helper must fail at the default readiness timeout");
@@ -3094,6 +3326,156 @@ mod tests {
         .expect("default-timeout helper reap outer watchdog");
         assert!(!process_exists(pid), "unready helper survived cleanup");
         assert_child_was_reaped(pid, "default-timeout Codex helper");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_runtime_reaps_its_inflight_codex_helper_without_touching_a_peer_runtime() {
+        let mut owned = helper_fixture(TestSandbox::new("codex-helper-owned-freeze"));
+        let peer = helper_fixture(TestSandbox::new("codex-helper-peer-runtime"));
+        let admission_race = Arc::new(CodexHelperAdmissionRace {
+            spawned: FixtureEvent::default(),
+            release: FixtureEvent::default(),
+        });
+        owned.events.admission_race = Some(admission_race.clone());
+        let owned_registry = ProcessAttributionRegistry::new();
+        let peer_registry = ProcessAttributionRegistry::new();
+
+        let peer_launcher = SystemCodexHelperLauncher::with_fixture_events(
+            CODEX_HELPER_READY_TIMEOUT,
+            peer.events.clone(),
+        );
+        let peer_helper = peer_launcher
+            .start(peer.launch(peer_registry.clone()))
+            .await
+            .expect("peer runtime helper starts");
+        let peer_pid = read_fixture_pid(&peer.pid_path).expect("peer helper PID");
+        let peer_identity = NativeProcessSampler::process_identity(
+            u32::try_from(peer_pid).expect("positive peer helper PID"),
+        )
+        .expect("peer helper identity");
+
+        let owned_launcher = SystemCodexHelperLauncher::with_fixture_events(
+            CODEX_HELPER_READY_TIMEOUT,
+            owned.events.clone(),
+        );
+        let owned_launch = owned.launch(owned_registry.clone());
+        let owned_start = tokio::spawn(async move { owned_launcher.start(owned_launch).await });
+        admission_race.spawned.wait_after(0).await;
+        let owned_pid = read_fixture_pid(&owned.pid_path).expect("owned helper PID");
+        let owned_identity = NativeProcessSampler::process_identity(
+            u32::try_from(owned_pid).expect("positive owned helper PID"),
+        )
+        .expect("owned helper identity");
+
+        assert!(owned_registry.freeze_and_snapshot_identities().is_empty());
+        admission_race.release.publish();
+        let error = owned_start
+            .await
+            .expect("owned helper start task")
+            .expect_err("frozen runtime rejects inflight helper admission");
+        assert!(
+            error.contains("closed for shutdown"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !matches!(
+                NativeProcessSampler::process_identity(owned_identity.pid),
+                Ok(current) if current == owned_identity
+            ),
+            "rejected owned helper survived exact cleanup"
+        );
+        assert_eq!(
+            NativeProcessSampler::process_identity(peer_identity.pid)
+                .expect("peer helper remains live"),
+            peer_identity
+        );
+        assert_eq!(
+            peer_registry.freeze_and_snapshot_identities(),
+            [peer_identity],
+            "peer runtime keeps its independent helper registration"
+        );
+        assert_child_was_reaped(owned_pid, "rejected Codex helper");
+
+        peer_helper.terminate();
+        peer.events.reaped.wait_after(0).await;
+        assert!(
+            !matches!(
+                NativeProcessSampler::process_identity(peer_identity.pid),
+                Ok(current) if current == peer_identity
+            ),
+            "peer helper survived its own owner cleanup"
+        );
+        assert_child_was_reaped(peer_pid, "peer Codex helper");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_codex_helper_root_exit_reaps_late_group_descendant_before_owner_release() {
+        let sandbox = TestSandbox::new("codex-helper-natural-root-exit");
+        let pid_path = sandbox.path("helper.pid");
+        let child_pid_path = sandbox.path("descendant.pid");
+        let socket_path = sandbox.path("helper.sock");
+        let executable = sandbox.executable_script(
+            "helper",
+            "socket=${3#unix://}\n/bin/sh -c 'trap \"\" HUP; echo $$ > \"$BIBCODE_CHILD_PID\"; exec sleep 30' & while [ ! -s \"$BIBCODE_CHILD_PID\" ]; do :; done\n: > \"$socket\"\nsleep 1\nexit 0",
+            "",
+        );
+        let events = CodexHelperFixtureEvents {
+            spawned: Arc::new(FixtureEvent::default()),
+            admission_race: None,
+            ready: Arc::new(FixtureEvent::default()),
+            reaped: Arc::new(FixtureEvent::default()),
+            pid_path,
+            watchdog_spawn_race: None,
+        };
+        let launcher = SystemCodexHelperLauncher::with_fixture_events(
+            CODEX_HELPER_READY_TIMEOUT,
+            events.clone(),
+        );
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let child_pid_environment = child_pid_path.to_string_lossy().into_owned();
+        let helper = launcher
+            .start(CodexHelperLaunch {
+                executable: executable.to_string_lossy().into_owned(),
+                args: vec![
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    endpoint.clone(),
+                ],
+                cwd: sandbox.root().to_path_buf(),
+                env: sandbox.environment([("BIBCODE_CHILD_PID", &child_pid_environment)]),
+                endpoint,
+                socket_path,
+                process_attribution: ProcessAttributionRegistry::new(),
+            })
+            .await
+            .expect("Codex helper reaches readiness before natural root exit");
+        let descendant_pid = tokio::fs::read_to_string(&child_pid_path)
+            .await
+            .expect("late Codex descendant PID")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric late Codex descendant PID");
+        let descendant_identity = NativeProcessSampler::process_identity(
+            u32::try_from(descendant_pid).expect("positive late Codex descendant PID"),
+        )
+        .expect("capture late Codex descendant identity");
+
+        events.reaped.wait_after(0).await;
+        let descendant_is_live = NativeProcessSampler::default()
+            .collect_rows()
+            .await
+            .expect("sample late Codex descendant status")
+            .into_iter()
+            .find(|row| {
+                row.pid == descendant_identity.pid
+                    && row.started_at == descendant_identity.started_at
+            })
+            .is_some_and(|row| !row.status.to_ascii_lowercase().contains("zomb"));
+        assert!(
+            !descendant_is_live,
+            "late Codex helper descendant survived natural root exit"
+        );
+        drop(helper);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3159,6 +3541,7 @@ mod tests {
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
         let events = CodexHelperFixtureEvents {
             spawned: Arc::new(FixtureEvent::default()),
+            admission_race: None,
             ready: Arc::new(FixtureEvent::default()),
             reaped: Arc::new(FixtureEvent::default()),
             pid_path: pid_path.clone(),
@@ -3179,6 +3562,7 @@ mod tests {
             env: sandbox.environment(std::iter::empty::<(String, String)>()),
             endpoint,
             socket_path,
+            process_attribution: ProcessAttributionRegistry::new(),
         };
         let start = tokio::spawn(async move { launcher.start(launch).await });
         tokio::time::timeout(Duration::from_secs(10), events.spawned.wait_after(0))
@@ -3211,6 +3595,25 @@ mod tests {
             supervisor.reserve().is_some(),
             "releasing the owned helper slot must restore bounded capacity"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn helper_task_registry_drain_observes_the_last_concurrent_owner_drop() {
+        let registry = Arc::new(CodexHelperTaskRegistry::default());
+        let guard = registry.register();
+        let drain_registry = registry.clone();
+        let drain = tokio::spawn(async move { drain_registry.drain().await });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain must wait for an active helper owner"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("last helper owner wakes drain")
+            .expect("drain task");
     }
 
     #[tokio::test]
