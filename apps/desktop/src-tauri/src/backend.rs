@@ -538,6 +538,24 @@ trait WslCommandResolver: Send + Sync {
     fn server_binary_candidates(&self) -> Result<Vec<PathBuf>, String>;
 }
 
+trait BackendPortResolver: Send + Sync {
+    fn port(&self) -> u16;
+}
+
+#[derive(Debug, Default)]
+struct SystemBackendPortResolver;
+
+impl BackendPortResolver for SystemBackendPortResolver {
+    fn port(&self) -> u16 {
+        crate::config::bibcode_env_var("BIBCODE_PORT")
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse::<u16>().ok())
+            .or_else(select_desktop_backend_port)
+            .or_else(portpicker::pick_unused_port)
+            .unwrap_or(DEFAULT_BACKEND_PORT)
+    }
+}
+
 #[derive(Debug, Default)]
 struct SystemWslCommandResolver;
 
@@ -571,6 +589,7 @@ pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
     ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
+    backend_port_resolver: Arc<dyn BackendPortResolver>,
     wsl_command_resolver: Arc<dyn WslCommandResolver>,
     #[cfg(test)]
     start_publish_gate: Arc<Mutex<Option<BackendStartPublishGate>>>,
@@ -601,6 +620,7 @@ impl Default for BackendSupervisor {
             state: Arc::default(),
             start_completed: Arc::default(),
             ui_process_observer: Arc::default(),
+            backend_port_resolver: Arc::new(SystemBackendPortResolver),
             wsl_command_resolver: Arc::new(SystemWslCommandResolver),
             #[cfg(test)]
             start_publish_gate: Arc::default(),
@@ -718,6 +738,14 @@ impl BackendSupervisor {
     fn with_wsl_resolver(wsl_command_resolver: Arc<dyn WslCommandResolver>) -> Self {
         Self {
             wsl_command_resolver,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend_port_resolver(backend_port_resolver: Arc<dyn BackendPortResolver>) -> Self {
+        Self {
+            backend_port_resolver,
             ..Self::default()
         }
     }
@@ -1057,7 +1085,11 @@ impl BackendSupervisor {
         reason: &'static str,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
-        let selection = match default_launch_plans(&app, self.wsl_command_resolver.as_ref()) {
+        let selection = match default_launch_plans(
+            &app,
+            self.backend_port_resolver.as_ref(),
+            self.wsl_command_resolver.as_ref(),
+        ) {
             Ok(selection) => selection,
             Err(error) => {
                 self.record_planning_error(error.clone());
@@ -2489,18 +2521,14 @@ fn unavailable_wsl_secondary_from_plan(
 
 fn default_launch_plans<R: Runtime>(
     app: &AppHandle<R>,
+    backend_port_resolver: &dyn BackendPortResolver,
     wsl_command_resolver: &dyn WslCommandResolver,
 ) -> Result<DefaultLaunchPlans, BackendPlanError> {
     let settings =
         read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
     let log_path =
         primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
-    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        .or_else(select_desktop_backend_port)
-        .or_else(portpicker::pick_unused_port)
-        .unwrap_or(DEFAULT_BACKEND_PORT);
+    let port = backend_port_resolver.port();
     let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
     let native_bootstrap_token = desktop_bootstrap_token.clone();
     let native_log_path = log_path.clone();
@@ -2754,6 +2782,23 @@ mod tests {
         connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
+
+    #[derive(Debug)]
+    struct TestBackendPortResolver {
+        port: u16,
+    }
+
+    impl TestBackendPortResolver {
+        fn new(port: u16) -> Self {
+            Self { port }
+        }
+    }
+
+    impl BackendPortResolver for TestBackendPortResolver {
+        fn port(&self) -> u16 {
+            self.port
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn supervisors_keep_distinct_wsl_resolvers() {
@@ -4945,10 +4990,14 @@ exit /b 9
                 .ends_with("server-child-wsl-Ubuntu_Test.log")
         );
         assert!(
-            !default_launch_plans(handle, &SystemWslCommandResolver)
-                .unwrap()
-                .plans
-                .is_empty()
+            !default_launch_plans(
+                handle,
+                &SystemBackendPortResolver,
+                &SystemWslCommandResolver,
+            )
+            .unwrap()
+            .plans
+            .is_empty()
         );
     }
 
@@ -4974,13 +5023,19 @@ exit /b 9
                 .expect("temporary root should canonicalize")
                 .join("data-root")
         );
-        let supervisor = BackendSupervisor::new();
+        let supervisor = BackendSupervisor::with_backend_port_resolver(Arc::new(
+            TestBackendPortResolver::new(0),
+        ));
 
         let started = supervisor
             .start_default(app.handle().clone())
             .await
             .expect("default backend should start");
         assert_ne!(started.port, 0);
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, started.port)).is_err(),
+            "the running server must retain its published listener address"
+        );
 
         let restarted = supervisor
             .restart_default_if_active(app.handle().clone())
@@ -4988,11 +5043,17 @@ exit /b 9
             .expect("default backend should restart")
             .expect("active backend should produce a replacement config");
         assert_ne!(restarted.port, 0);
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port)).is_err(),
+            "the replacement server must retain its published listener address"
+        );
 
         supervisor
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
+        let _released_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port))
+            .expect("joined backend shutdown must release the listener address");
     }
 
     #[tokio::test]
@@ -5012,7 +5073,9 @@ exit /b 9
             .build(context)
             .expect("mock Tauri app");
 
-        let initial = BackendSupervisor::new();
+        let initial = BackendSupervisor::with_backend_port_resolver(Arc::new(
+            TestBackendPortResolver::new(0),
+        ));
         initial
             .start_default(app.handle().clone())
             .await
