@@ -21,7 +21,8 @@ use crate::{
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
-        ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
+        RegistrationSource,
     },
     orchestration::{
         ProviderTurnDelivery, TurnDeliveryState, canonical_command_digest,
@@ -4109,12 +4110,26 @@ impl ChildWrapper for AttributedChild {
     }
 }
 
-fn spawn_child(
+async fn spawn_child(
     request: &ProviderLaunchRequest,
     args: &[String],
     pipe_output: bool,
     attribution: ProcessAttributionRegistry,
 ) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError> {
+    spawn_child_after_spawn(request, args, pipe_output, attribution, |_| async {}).await
+}
+
+async fn spawn_child_after_spawn<F, Fut>(
+    request: &ProviderLaunchRequest,
+    args: &[String],
+    pipe_output: bool,
+    attribution: ProcessAttributionRegistry,
+    after_spawn: F,
+) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let provider = request.provider.clone();
     let environment = normalize_provider_environment(
         request
@@ -4162,15 +4177,31 @@ fn spawn_child(
     let mut inner = command
         .spawn()
         .map_err(|error| ProviderRuntimeError::Spawn {
-            provider,
+            provider: provider.clone(),
             detail: error.to_string(),
         })?;
-    let registration = inner
-        .id()
-        .and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
-        .filter(|_| matches!(inner.try_wait(), Ok(None)))
-        .and_then(|identity| {
-            attribution.register_identity(
+    if let Some(pid) = inner.id() {
+        after_spawn(pid).await;
+    }
+    let registration = match inner.try_wait() {
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            let identity = match inner
+                .id()
+                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
+            {
+                Some(identity) => identity,
+                None => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: "spawned provider process has no stable process identity"
+                            .to_owned(),
+                    });
+                }
+            };
+            match attribution.register_identity(
                 identity,
                 ProcessRegistrationMetadata {
                     scope: AttributionScope::External,
@@ -4178,8 +4209,32 @@ fn spawn_child(
                     label: request.provider_label.clone(),
                     source: RegistrationSource::Provider,
                 },
-            )
-        });
+            ) {
+                Ok(registration) => Some(registration),
+                Err(ProcessRegistrationError::Shutdown) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("rejected provider process", &report);
+                    return Err(ProviderRuntimeError::Shutdown);
+                }
+                Err(error @ ProcessRegistrationError::Capacity) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            let report = terminate_and_wait(&mut *inner).await;
+            log_cleanup_failures("unattributed provider process", &report);
+            return Err(ProviderRuntimeError::Spawn {
+                provider,
+                detail: format!("failed to inspect spawned provider process: {error}"),
+            });
+        }
+    };
     Ok(Box::new(AttributedChild {
         inner,
         registration,
@@ -4320,7 +4375,7 @@ impl CodexDriver {
             ]);
         }
         args.push("app-server".to_owned());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -4631,7 +4686,7 @@ impl CursorDriver {
             args.extend(["-e".to_owned(), endpoint.clone()]);
         }
         args.push("acp".to_owned());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -4888,7 +4943,7 @@ impl GrokDriver {
         }
         .to_owned();
         let args = vec!["agent".to_owned(), "stdio".to_owned()];
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -5113,12 +5168,9 @@ impl OpenCodeDriver {
             "--hostname=127.0.0.1".to_owned(),
             format!("--port={port}"),
         ];
-        let child = Arc::new(Mutex::new(spawn_child(
-            &request,
-            &args,
-            false,
-            attribution,
-        )?));
+        let child = Arc::new(Mutex::new(
+            spawn_child(&request, &args, false, attribution).await?,
+        ));
         wait_for_endpoint(&endpoint, &child).await?;
         let runtime =
             OpenCodeSessionRuntime::new_with_options_reconciliation_revision_and_agent_activity(
@@ -6672,7 +6724,7 @@ impl ClaudeDriver {
         }
         let args =
             build_claude_launch_arguments(&request, &session_id, support, hook_settings.as_ref());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -8004,7 +8056,7 @@ mod tests {
         pin::Pin,
         sync::{Arc, Mutex as StdMutex},
         task::{Context, Poll},
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use tokio::{
@@ -10336,6 +10388,7 @@ done
         let mut request = native_launch(&temp, "claudeAgent");
         request.binary_path = fixture.to_string_lossy().into_owned();
         let child = super::spawn_child(&request, &[], false, registry.clone())
+            .await
             .expect("provider child should spawn");
         assert_eq!(live_claims(&registry).await.len(), 1);
 
@@ -10343,6 +10396,115 @@ done
         assert!(live_claims(&registry).await.is_empty());
         let _ = inner.start_kill();
         let _ = inner.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_freeze_rejects_and_reaps_a_provider_spawn_in_flight() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let registry = ProcessAttributionRegistry::new();
+        let fixture = executable_fixture(&temp, "late-claude", CLAUDE_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        let (spawned_sender, spawned) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let spawned_release = release.clone();
+        let spawned_registry = registry.clone();
+        let spawn = tokio::spawn(async move {
+            super::spawn_child_after_spawn(
+                &request,
+                &[],
+                false,
+                spawned_registry,
+                move |pid| async move {
+                    spawned_sender.send(pid).expect("spawned PID receiver");
+                    spawned_release.notified().await;
+                },
+            )
+            .await
+        });
+        let pid = spawned.await.expect("provider spawned before admission");
+        let identity = NativeProcessSampler::process_identity(pid).expect("provider identity");
+
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
+        release.notify_one();
+        assert!(matches!(
+            spawn.await.expect("spawn task"),
+            Err(super::ProviderRuntimeError::Shutdown)
+        ));
+        assert!(live_claims(&registry).await.is_empty());
+        for _ in 0..100 {
+            match NativeProcessSampler::process_identity(pid) {
+                Ok(current) if current == identity => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => return,
+            }
+        }
+        panic!("rejected provider process {pid} was not reaped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_capacity_rejects_and_reaps_a_provider_spawn_in_flight() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let registry = ProcessAttributionRegistry::new();
+        let registrations = (0..512_u32)
+            .map(|pid| {
+                registry
+                    .register_identity(
+                        crate::diagnostics::ProcessIdentity {
+                            pid: pid + 10_000,
+                            started_at: u64::from(pid),
+                        },
+                        crate::diagnostics::ProcessRegistrationMetadata {
+                            scope: AttributionScope::External,
+                            kind: AttributionKind::Provider,
+                            label: "capacity fixture".to_owned(),
+                            source: crate::diagnostics::RegistrationSource::Provider,
+                        },
+                    )
+                    .expect("fill registry")
+            })
+            .collect::<Vec<_>>();
+        let fixture = executable_fixture(&temp, "capacity-claude", CLAUDE_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        let (spawned_sender, spawned) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let spawned_release = release.clone();
+        let spawned_registry = registry.clone();
+        let spawn = tokio::spawn(async move {
+            super::spawn_child_after_spawn(
+                &request,
+                &[],
+                false,
+                spawned_registry,
+                move |pid| async move {
+                    spawned_sender.send(pid).expect("spawned PID receiver");
+                    spawned_release.notified().await;
+                },
+            )
+            .await
+        });
+        let pid = spawned.await.expect("provider spawned before admission");
+        let identity = NativeProcessSampler::process_identity(pid).expect("provider identity");
+
+        release.notify_one();
+        assert!(matches!(
+            spawn.await.expect("spawn task"),
+            Err(super::ProviderRuntimeError::Spawn { .. })
+        ));
+        for _ in 0..100 {
+            match NativeProcessSampler::process_identity(pid) {
+                Ok(current) if current == identity => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => {
+                    drop(registrations);
+                    return;
+                }
+            }
+        }
+        panic!("unattributed provider process {pid} was not reaped");
     }
 
     #[tokio::test]
@@ -11745,6 +11907,7 @@ done
 
             let mut child =
                 super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
+                    .await
                     .expect("spawn instance executable");
             child.wait().await.expect("wait for runtime fixture");
 

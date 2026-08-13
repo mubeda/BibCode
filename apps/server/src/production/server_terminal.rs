@@ -11,8 +11,9 @@ use crate::{
     diagnostics::{
         AttributedProcess, AttributionConfidence, AttributionKind, AttributionScope, BucketMetric,
         CurrentProcessDiagnostics, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionTotals, ProcessIdentity, ProcessResourceHistory, ProcessResourceTotals,
-        ProcessRow, ProcessSignal, SplitMetric, UiCoverage, UiCoverageStatus,
+        ProcessAttributionRegistry, ProcessAttributionTotals, ProcessIdentity,
+        ProcessResourceHistory, ProcessResourceTotals, ProcessRow, ProcessSignal,
+        RuntimeProcessOwnership, SplitMetric, UiCoverage, UiCoverageStatus,
         bound_diagnostic_string, process_tree_metadata,
     },
     persistence::Repositories,
@@ -53,6 +54,7 @@ pub trait ProductionServerControl: std::fmt::Debug + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ServerTerminalServices {
     terminal: TerminalManager,
+    process_attribution: ProcessAttributionRegistry,
     process_sampler: Arc<NativeProcessSampler>,
     resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
@@ -73,8 +75,10 @@ impl ServerTerminalServices {
         relay: RelayClientService,
         control: Arc<dyn ProductionServerControl>,
     ) -> Self {
+        let process_attribution = terminal.process_attribution_registry();
         Self {
             terminal,
+            process_attribution,
             process_sampler,
             resource_sampler,
             process_monitor,
@@ -109,11 +113,34 @@ impl ServerTerminalServices {
         self
     }
 
-    pub async fn shutdown(&self) {
+    pub(crate) async fn freeze_process_ownership(&self) -> RuntimeProcessOwnership {
+        let roots = self.process_attribution.freeze_and_snapshot_identities();
+        match self
+            .process_sampler
+            .capture_runtime_process_ownership(roots.clone())
+            .await
+        {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                let error = bound_diagnostic_string(
+                    &error.to_string(),
+                    PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
+                );
+                tracing::warn!(
+                    %error,
+                    root_count = roots.len(),
+                    "failed to capture the initial runtime-owned process closure"
+                );
+                RuntimeProcessOwnership::roots_only(roots)
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown_with_process_ownership(&self, ownership: RuntimeProcessOwnership) {
         self.terminal.shutdown().await;
         match self
             .process_sampler
-            .cleanup_descendants(std::process::id())
+            .cleanup_runtime_process_ownership(ownership)
             .await
         {
             Ok(report) if report.failure_count > 0 => {
@@ -122,14 +149,14 @@ impl ServerTerminalServices {
                     succeeded = report.succeeded,
                     failed = report.failure_count,
                     failures = ?report.failures,
-                    "identity-bound descendant cleanup completed with failures"
+                    "runtime-owned process cleanup completed with failures"
                 );
             }
             Ok(report) if report.attempted > 0 => {
                 tracing::debug!(
                     attempted = report.attempted,
                     succeeded = report.succeeded,
-                    "identity-bound descendant cleanup completed"
+                    "runtime-owned process cleanup completed"
                 );
             }
             Ok(_) => {}
@@ -138,9 +165,14 @@ impl ServerTerminalServices {
                     &error.to_string(),
                     PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
                 );
-                tracing::warn!(%error, "failed to inspect remaining descendants during shutdown");
+                tracing::warn!(%error, "failed to inspect remaining runtime-owned processes during shutdown");
             }
         }
+    }
+
+    pub async fn shutdown(&self) {
+        let ownership = self.freeze_process_ownership().await;
+        self.shutdown_with_process_ownership(ownership).await;
     }
 
     pub async fn close_thread_terminals(&self, thread_id: &str) {
@@ -1394,6 +1426,167 @@ mod tests {
             "command": command,
         }))
         .expect("terminal attach payload decodes")
+    }
+
+    async fn real_terminal_services(root: &std::path::Path) -> ServerTerminalServices {
+        let attribution = ProcessAttributionRegistry::new();
+        let terminal = TerminalManager::with_process_attribution(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::from_millis(20),
+                ..TerminalManagerOptions::default()
+            },
+            attribution.clone(),
+        );
+        let sampler = Arc::new(NativeProcessSampler::default());
+        let resource_sampler = Arc::new(NativeResourceSampler::new(
+            sampler.clone(),
+            attribution,
+            Arc::new(NotApplicableUiProcessObserver),
+        ));
+        let monitor = Arc::new(DiagnosticsMonitor::new(
+            resource_sampler.clone(),
+            Duration::from_secs(60),
+        ));
+        let usage = ProviderUsageService::new(Vec::new(), Arc::new(OffsetDateTime::now_utc));
+        let relay = RelayClientService::new(
+            || async {
+                RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                }
+            },
+            |_report| async {
+                Ok(RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                })
+            },
+        );
+        let control = Arc::new(
+            NativeServerControl::new(ServerConfig::new(root), json!({"policy":"test"})).await,
+        );
+        ServerTerminalServices::new(
+            terminal,
+            sampler,
+            resource_sampler,
+            monitor,
+            usage,
+            relay,
+            control,
+        )
+    }
+
+    fn write_probe_command(path: &std::path::Path, value: &str) -> String {
+        if cfg!(windows) {
+            format!(
+                "Set-Content -NoNewline -Path '{}' -Value '{value}'\r\n",
+                path.display()
+            )
+        } else {
+            format!("printf '%s' '{value}' > '{}'\n", path.display())
+        }
+    }
+
+    async fn wait_for_probe(path: &std::path::Path, value: &str) {
+        for _ in 0..100 {
+            if tokio::fs::read_to_string(path)
+                .await
+                .is_ok_and(|contents| contents == value)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for terminal probe {}", path.display());
+    }
+
+    async fn wait_for_exact_process_exit(identity: ProcessIdentity) {
+        for _ in 0..100 {
+            match NativeProcessSampler::process_identity(identity.pid) {
+                Ok(current) if current == identity => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => return,
+            }
+        }
+        panic!(
+            "runtime-owned process {} remained alive after shutdown",
+            identity.pid
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutting_down_one_runtime_reaps_only_its_real_terminal_child() {
+        let root_a = tempfile::tempdir().expect("runtime A root");
+        let root_b = tempfile::tempdir().expect("runtime B root");
+        let (services_a, services_b) = tokio::join!(
+            real_terminal_services(root_a.path()),
+            real_terminal_services(root_b.path())
+        );
+        let (opened_a, opened_b) = tokio::join!(
+            services_a.terminal.open(TerminalOpenInput::new(
+                "thread-a",
+                "terminal-a",
+                root_a.path().to_path_buf(),
+                80,
+                24,
+            )),
+            services_b.terminal.open(TerminalOpenInput::new(
+                "thread-b",
+                "terminal-b",
+                root_b.path().to_path_buf(),
+                80,
+                24,
+            ))
+        );
+        let pid_a = opened_a
+            .expect("runtime A terminal opens")
+            .pid
+            .expect("A pid");
+        let pid_b = opened_b
+            .expect("runtime B terminal opens")
+            .pid
+            .expect("B pid");
+        let identity_a = NativeProcessSampler::process_identity(pid_a).expect("A identity");
+        let identity_b = NativeProcessSampler::process_identity(pid_b).expect("B identity");
+        let ready_a = root_a.path().join("ready-a");
+        let ready_b = root_b.path().join("ready-b");
+        let ready_a_command = write_probe_command(&ready_a, "ready-a");
+        let ready_b_command = write_probe_command(&ready_b, "ready-b");
+        let (written_a, written_b) = tokio::join!(
+            services_a
+                .terminal
+                .write("thread-a", "terminal-a", &ready_a_command,),
+            services_b
+                .terminal
+                .write("thread-b", "terminal-b", &ready_b_command,)
+        );
+        written_a.expect("runtime A child accepts input");
+        written_b.expect("runtime B child accepts input");
+        tokio::join!(
+            wait_for_probe(&ready_a, "ready-a"),
+            wait_for_probe(&ready_b, "ready-b")
+        );
+
+        services_a.shutdown().await;
+        wait_for_exact_process_exit(identity_a).await;
+        assert_eq!(
+            NativeProcessSampler::process_identity(pid_b).expect("runtime B remains alive"),
+            identity_b
+        );
+        let still_alive = root_b.path().join("still-alive-b");
+        services_b
+            .terminal
+            .write(
+                "thread-b",
+                "terminal-b",
+                &write_probe_command(&still_alive, "still-alive-b"),
+            )
+            .await
+            .expect("runtime B child still accepts input after runtime A shutdown");
+        wait_for_probe(&still_alive, "still-alive-b").await;
+
+        services_b.shutdown().await;
+        wait_for_exact_process_exit(identity_b).await;
     }
 
     fn assert_invalid_terminal_launch_command(command: Value) {

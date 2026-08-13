@@ -23,10 +23,3 @@ pub mod terminal;
 pub fn redact_sensitive_text(input: &str) -> String {
     diagnostics::redact_sensitive_text(input)
 }
-
-pub async fn exercise_native_cleanup_for_harness(root_pid: u32) -> bool {
-    diagnostics::NativeProcessSampler::default()
-        .cleanup_descendants(root_pid)
-        .await
-        .is_ok()
-}

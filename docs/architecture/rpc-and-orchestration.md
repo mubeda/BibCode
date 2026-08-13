@@ -483,6 +483,14 @@ checks its lease cancellation after spawn and again under the manager
 publication lock; a PTY that finishes spawning after loss is killed by its
 uncommitted-process owner and is never inserted as a live session.
 
+Runtime shutdown adds a separate per-runtime process-admission fence before
+provider and terminal managers drain. A terminal spawned after that fence is
+rejected as shut down and its uncommitted PTY owner kills and waits for the
+process tree before the RPC completes. Registered terminal and provider roots
+are captured by exact PID and creation time; residual cleanup follows only
+their descendant closure and cannot signal children registered to a peer
+runtime in the same application process.
+
 For each admitted loss transition, `WorktreeRuntime` resolves every live
 ordinary or panel thread in the same persisted project whose physical path
 matches the guarded physical workspace. It deduplicates those IDs, appends one
