@@ -38,6 +38,12 @@ const PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS: usize = 160;
 pub type JsonFuture = Pin<Box<dyn Future<Output = RpcResult> + Send + 'static>>;
 pub type JsonStream = mpsc::Receiver<RpcStreamChunk>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessTreeCleanup {
+    StandaloneServer,
+    EmbeddedHost,
+}
+
 /// Required bridge to Rust domains whose registries are assembled by the production runtime.
 /// Implementations return contract-encoded JSON from the in-process native runtime.
 pub trait ProductionServerControl: std::fmt::Debug + Send + Sync + 'static {
@@ -56,6 +62,7 @@ pub struct ServerTerminalServices {
     terminal: TerminalManager,
     process_attribution: ProcessAttributionRegistry,
     process_sampler: Arc<NativeProcessSampler>,
+    process_tree_cleanup: ProcessTreeCleanup,
     resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
     provider_usage: ProviderUsageService,
@@ -75,11 +82,35 @@ impl ServerTerminalServices {
         relay: RelayClientService,
         control: Arc<dyn ProductionServerControl>,
     ) -> Self {
+        Self::new_with_process_tree_cleanup(
+            terminal,
+            process_sampler,
+            resource_sampler,
+            process_monitor,
+            provider_usage,
+            relay,
+            control,
+            ProcessTreeCleanup::StandaloneServer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_process_tree_cleanup(
+        terminal: TerminalManager,
+        process_sampler: Arc<NativeProcessSampler>,
+        resource_sampler: Arc<NativeResourceSampler>,
+        process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
+        provider_usage: ProviderUsageService,
+        relay: RelayClientService,
+        control: Arc<dyn ProductionServerControl>,
+        process_tree_cleanup: ProcessTreeCleanup,
+    ) -> Self {
         let process_attribution = terminal.process_attribution_registry();
         Self {
             terminal,
             process_attribution,
             process_sampler,
+            process_tree_cleanup,
             resource_sampler,
             process_monitor,
             provider_usage,
@@ -168,6 +199,32 @@ impl ServerTerminalServices {
                 tracing::warn!(%error, "failed to inspect remaining runtime-owned processes during shutdown");
             }
         }
+        match cleanup_server_descendants(self.process_tree_cleanup, &self.process_sampler).await {
+            Ok(Some(report)) if report.failure_count > 0 => {
+                tracing::warn!(
+                    attempted = report.attempted,
+                    succeeded = report.succeeded,
+                    failed = report.failure_count,
+                    failures = ?report.failures,
+                    "standalone descendant cleanup completed with failures"
+                );
+            }
+            Ok(Some(report)) if report.attempted > 0 => {
+                tracing::debug!(
+                    attempted = report.attempted,
+                    succeeded = report.succeeded,
+                    "standalone descendant cleanup completed"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let error = bound_diagnostic_string(
+                    &error.to_string(),
+                    PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
+                );
+                tracing::warn!(%error, "failed to inspect standalone descendants during shutdown");
+            }
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -251,6 +308,19 @@ impl ServerTerminalServices {
         .await
         .map_err(|error| error.to_string())?;
         Ok(())
+    }
+}
+
+async fn cleanup_server_descendants(
+    process_tree_cleanup: ProcessTreeCleanup,
+    process_sampler: &NativeProcessSampler,
+) -> Result<Option<crate::process::ProcessCleanupReport>, crate::diagnostics::SignalError> {
+    match process_tree_cleanup {
+        ProcessTreeCleanup::StandaloneServer => process_sampler
+            .cleanup_descendants(std::process::id())
+            .await
+            .map(Some),
+        ProcessTreeCleanup::EmbeddedHost => Ok(None),
     }
 }
 
@@ -1391,9 +1461,9 @@ fn format_epoch_ms(value: i128) -> String {
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
+    use std::{future::Future, pin::Pin, process::Stdio, time::Duration};
 
     use futures_util::FutureExt as _;
-    use std::{future::Future, pin::Pin, time::Duration};
 
     use crate::{
         ServerConfig,
@@ -1411,6 +1481,42 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn embedded_host_cleanup_preserves_unmanaged_host_descendants() {
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("C:\\Windows\\System32\\ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut sentinel = command.spawn().expect("sentinel process starts");
+
+        let cleanup = cleanup_server_descendants(
+            ProcessTreeCleanup::EmbeddedHost,
+            &NativeProcessSampler::default(),
+        )
+        .await
+        .expect("embedded cleanup policy is evaluated");
+        let survived = sentinel
+            .try_wait()
+            .expect("sentinel status is readable")
+            .is_none();
+        if survived {
+            let _ = sentinel.start_kill();
+        }
+        let _ = sentinel.wait().await;
+
+        assert_eq!(cleanup, None);
+        assert!(
+            survived,
+            "embedded cleanup must preserve host-owned children"
+        );
+    }
 
     fn terminal_start_payload(command: Value) -> TerminalStartPayload {
         decode_payload(&json!({

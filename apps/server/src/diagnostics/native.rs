@@ -11,7 +11,7 @@ use crate::process::ProcessCleanupReport;
 
 use super::{
     PROCESS_COMMAND_MAX_SCALARS, ProcessIdentity, ProcessRow, ProcessSampler, SamplingError,
-    bound_diagnostic_string,
+    bound_diagnostic_string, build_descendant_entries,
 };
 
 #[derive(Debug)]
@@ -118,6 +118,33 @@ impl NativeProcessSampler {
             .await
             .map_err(|error| SignalError::Read(error.to_string()))?;
         let identities = residual_runtime_owned_process_identities(&rows, &ownership);
+        Ok(cleanup_runtime_process_identities(
+            &identities,
+            |identity| signal_process_identity(identity, ProcessSignal::Kill),
+        ))
+    }
+
+    pub(crate) async fn cleanup_descendants(
+        &self,
+        root_pid: u32,
+    ) -> Result<ProcessCleanupReport, SignalError> {
+        let rows = self
+            .sample()
+            .await
+            .map_err(|error| SignalError::Read(error.to_string()))?;
+        let mut descendants = build_descendant_entries(&rows, root_pid);
+        descendants.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
+        let identities = descendants
+            .into_iter()
+            .filter_map(|entry| {
+                rows.iter()
+                    .find(|row| row.pid == entry.pid)
+                    .map(|row| ProcessIdentity {
+                        pid: row.pid,
+                        started_at: row.started_at,
+                    })
+            })
+            .collect::<Vec<_>>();
         Ok(cleanup_runtime_process_identities(
             &identities,
             |identity| signal_process_identity(identity, ProcessSignal::Kill),
