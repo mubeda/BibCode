@@ -19,126 +19,130 @@ function writeFixture(root: string, relativePath: string, contents: string): voi
   NodeFS.writeFileSync(filePath, contents);
 }
 
-function createRepositoryFixture(): string {
-  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-dependency-ledger-"));
-  writeFixture(
-    root,
-    "package.json",
-    JSON.stringify({
-      name: "fixture",
-      private: true,
-      engines: { node: "24.13.1" },
-      packageManager: "pnpm@10.24.0",
-      devDependencies: {
-        effect: "catalog:",
-        "vite-plus": "catalog:",
-      },
-    }),
-  );
-  writeFixture(
-    root,
-    "pnpm-workspace.yaml",
-    [
-      "packages:",
-      "  - apps/*",
-      "catalog:",
-      '  effect: "4.0.0-beta.78"',
-      '  vite: "npm:@voidzero-dev/vite-plus-core@0.2.1"',
-      '  vite-plus: "0.2.1"',
-      "",
-    ].join("\n"),
-  );
-  writeFixture(
-    root,
-    "apps/web/package.json",
-    JSON.stringify({
-      name: "@bibcode/web",
-      dependencies: {
-        "@base-ui/react": "^1.4.1",
-        "@bibcode/contracts": "workspace:*",
-        effect: "catalog:",
-      },
-    }),
-  );
-  writeFixture(
-    root,
-    "apps/desktop/package.json",
-    JSON.stringify({
-      name: "@bibcode/desktop",
-      scripts: {
-        build: "pnpm dlx @tauri-apps/cli@2.11.4 build",
-      },
-    }),
-  );
-  writeFixture(
-    root,
-    "Cargo.toml",
-    [
-      "[workspace]",
-      'members = ["apps/server"]',
-      "",
-      "[workspace.package]",
-      'rust-version = "1.88"',
-      "",
-      "[workspace.dependencies]",
-      'serde = { version = "1", features = ["derive"] }',
-      'bibcode-server = { path = "apps/server" }',
-      "",
-    ].join("\n"),
-  );
-  writeFixture(
-    root,
-    "apps/server/Cargo.toml",
-    [
-      "[package]",
-      'name = "bibcode-server"',
-      'version = "0.0.0"',
-      "",
-      "[dependencies]",
-      "serde.workspace = true",
-      "",
-    ].join("\n"),
-  );
-  writeFixture(
-    root,
-    "apps/server/tests/fixtures/demo/Cargo.toml",
-    [
-      "[package]",
-      'name = "fixture-crate"',
-      'version = "0.0.0"',
-      "",
-      "[workspace]",
-      "",
-      "[dependencies]",
-      'serde = "1"',
-      'xpty = "0.3.6"',
-      "",
-    ].join("\n"),
-  );
-  writeFixture(
-    root,
-    ".github/workflows/ci.yml",
-    [
-      "name: CI",
-      "jobs:",
-      "  test:",
-      "    steps:",
-      "      - uses: actions/checkout@v6",
-      "      - uses: ./.github/actions/setup",
-      "",
-    ].join("\n"),
-  );
-  writeFixture(
-    root,
-    ".devcontainer/devcontainer.json",
-    JSON.stringify({
-      features: {
-        "ghcr.io/devcontainers-extra/features/bun:1": { version: "1.3.11" },
-        "ghcr.io/devcontainers/features/node:1": { version: "24.13.1" },
-      },
-    }),
-  );
-  return root;
+function withRepositoryFixture<T>(run: (root: string) => T, temporaryBase = NodeOS.tmpdir()): T {
+  const root = NodeFS.mkdtempSync(NodePath.join(temporaryBase, "bibcode-dependency-ledger-"));
+  try {
+    writeFixture(
+      root,
+      "package.json",
+      JSON.stringify({
+        name: "fixture",
+        private: true,
+        engines: { node: "24.13.1" },
+        packageManager: "pnpm@10.24.0",
+        devDependencies: {
+          effect: "catalog:",
+          "vite-plus": "catalog:",
+        },
+      }),
+    );
+    writeFixture(
+      root,
+      "pnpm-workspace.yaml",
+      [
+        "packages:",
+        "  - apps/*",
+        "catalog:",
+        '  effect: "4.0.0-beta.78"',
+        '  vite: "npm:@voidzero-dev/vite-plus-core@0.2.1"',
+        '  vite-plus: "0.2.1"',
+        "",
+      ].join("\n"),
+    );
+    writeFixture(
+      root,
+      "apps/web/package.json",
+      JSON.stringify({
+        name: "@bibcode/web",
+        dependencies: {
+          "@base-ui/react": "^1.4.1",
+          "@bibcode/contracts": "workspace:*",
+          effect: "catalog:",
+        },
+      }),
+    );
+    writeFixture(
+      root,
+      "apps/desktop/package.json",
+      JSON.stringify({
+        name: "@bibcode/desktop",
+        scripts: {
+          build: "pnpm dlx @tauri-apps/cli@2.11.4 build",
+        },
+      }),
+    );
+    writeFixture(
+      root,
+      "Cargo.toml",
+      [
+        "[workspace]",
+        'members = ["apps/server"]',
+        "",
+        "[workspace.package]",
+        'rust-version = "1.88"',
+        "",
+        "[workspace.dependencies]",
+        'serde = { version = "1", features = ["derive"] }',
+        'bibcode-server = { path = "apps/server" }',
+        "",
+      ].join("\n"),
+    );
+    writeFixture(
+      root,
+      "apps/server/Cargo.toml",
+      [
+        "[package]",
+        'name = "bibcode-server"',
+        'version = "0.0.0"',
+        "",
+        "[dependencies]",
+        "serde.workspace = true",
+        "",
+      ].join("\n"),
+    );
+    writeFixture(
+      root,
+      "apps/server/tests/fixtures/demo/Cargo.toml",
+      [
+        "[package]",
+        'name = "fixture-crate"',
+        'version = "0.0.0"',
+        "",
+        "[workspace]",
+        "",
+        "[dependencies]",
+        'serde = "1"',
+        'xpty = "0.3.6"',
+        "",
+      ].join("\n"),
+    );
+    writeFixture(
+      root,
+      ".github/workflows/ci.yml",
+      [
+        "name: CI",
+        "jobs:",
+        "  test:",
+        "    steps:",
+        "      - uses: actions/checkout@v6",
+        "      - uses: ./.github/actions/setup",
+        "",
+      ].join("\n"),
+    );
+    writeFixture(
+      root,
+      ".devcontainer/devcontainer.json",
+      JSON.stringify({
+        features: {
+          "ghcr.io/devcontainers-extra/features/bun:1": { version: "1.3.11" },
+          "ghcr.io/devcontainers/features/node:1": { version: "24.13.1" },
+        },
+      }),
+    );
+    return run(root);
+  } finally {
+    NodeFS.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function completeLedger(inventory: DependencyInventory): DependencyLedger {
@@ -227,6 +231,22 @@ function findUnexpectedSourceReferences(root: string, dependency: string): Array
 }
 
 describe("dependency upgrade ledger discovery", () => {
+  it("cleans a repository fixture when its callback fails", () => {
+    const temporaryBase = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-dependency-ledger-owner-"),
+    );
+    try {
+      expect(() =>
+        withRepositoryFixture(() => {
+          throw new Error("forced fixture failure");
+        }, temporaryBase),
+      ).toThrow("forced fixture failure");
+      expect(NodeFS.readdirSync(temporaryBase)).toEqual([]);
+    } finally {
+      NodeFS.rmSync(temporaryBase, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the direct Babel JSX transform plugin unused outside dependency metadata", () => {
     const repositoryRoot = NodePath.resolve(import.meta.dirname, "..");
 
@@ -236,8 +256,7 @@ describe("dependency upgrade ledger discovery", () => {
   });
 
   it("discovers external JavaScript dependencies and excludes workspace links", () => {
-    const root = createRepositoryFixture();
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
 
     expect(inventory.entries.map((entry) => entry.key)).toContain("js:apps/web:@base-ui/react");
     expect(inventory.entries.map((entry) => entry.key)).toContain("js:catalog:effect");
@@ -248,19 +267,19 @@ describe("dependency upgrade ledger discovery", () => {
   });
 
   it("ignores local Superpowers snapshot dependencies", () => {
-    const root = createRepositoryFixture();
-    const snapshotDirectory = NodePath.join(root, ".superpowers/sdd/snapshots/example");
-    NodeFS.mkdirSync(snapshotDirectory, { recursive: true });
-    NodeFS.writeFileSync(
-      NodePath.join(snapshotDirectory, "package.json"),
-      JSON.stringify({
-        dependencies: {
-          "snapshot-only-dependency": "1.0.0",
-        },
-      }),
-    );
-
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture((root) => {
+      const snapshotDirectory = NodePath.join(root, ".superpowers/sdd/snapshots/example");
+      NodeFS.mkdirSync(snapshotDirectory, { recursive: true });
+      NodeFS.writeFileSync(
+        NodePath.join(snapshotDirectory, "package.json"),
+        JSON.stringify({
+          dependencies: {
+            "snapshot-only-dependency": "1.0.0",
+          },
+        }),
+      );
+      return discoverDependencyInventory(root);
+    });
 
     expect(inventory.entries.some((entry) => entry.name === "snapshot-only-dependency")).toBe(
       false,
@@ -268,15 +287,15 @@ describe("dependency upgrade ledger discovery", () => {
   });
 
   it("ignores dependencies from local Git worktrees", () => {
-    const root = createRepositoryFixture();
-    const worktreeDirectory = NodePath.join(root, ".worktrees/example");
-    NodeFS.mkdirSync(worktreeDirectory, { recursive: true });
-    NodeFS.writeFileSync(
-      NodePath.join(worktreeDirectory, "package.json"),
-      JSON.stringify({ dependencies: { "worktree-only-dependency": "1.0.0" } }),
-    );
-
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture((root) => {
+      const worktreeDirectory = NodePath.join(root, ".worktrees/example");
+      NodeFS.mkdirSync(worktreeDirectory, { recursive: true });
+      NodeFS.writeFileSync(
+        NodePath.join(worktreeDirectory, "package.json"),
+        JSON.stringify({ dependencies: { "worktree-only-dependency": "1.0.0" } }),
+      );
+      return discoverDependencyInventory(root);
+    });
 
     expect(inventory.entries.some((entry) => entry.name === "worktree-only-dependency")).toBe(
       false,
@@ -284,8 +303,7 @@ describe("dependency upgrade ledger discovery", () => {
   });
 
   it("discovers registry crates, fixture-only crates, and the local path crate", () => {
-    const root = createRepositoryFixture();
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const keys = inventory.entries.map((entry) => entry.key);
 
     expect(keys).toContain("rust:workspace:serde");
@@ -296,16 +314,14 @@ describe("dependency upgrade ledger discovery", () => {
   });
 
   it("discovers external workflow actions but ignores local actions", () => {
-    const root = createRepositoryFixture();
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
 
     expect(inventory.entries.map((entry) => entry.key)).toContain("action:actions/checkout");
     expect(inventory.entries.some((entry) => entry.name === "./.github/actions/setup")).toBe(false);
   });
 
   it("discovers Node, pnpm, Rust, Vite+, Tauri CLI, and devcontainer pins", () => {
-    const root = createRepositoryFixture();
-    const inventory = discoverDependencyInventory(root);
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const keys = inventory.entries.map((entry) => entry.key);
 
     expect(keys).toEqual(
@@ -325,7 +341,7 @@ describe("dependency upgrade ledger discovery", () => {
 
 describe("dependency upgrade ledger validation", () => {
   it("rejects every stale authoritative inventory summary field", () => {
-    const inventory = discoverDependencyInventory(createRepositoryFixture());
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const summaryFields = Object.keys(inventory.summary) as Array<keyof typeof inventory.summary>;
 
     for (const field of summaryFields) {
@@ -343,7 +359,7 @@ describe("dependency upgrade ledger validation", () => {
   });
 
   it("rejects duplicate keys and missing required fields", () => {
-    const inventory = discoverDependencyInventory(createRepositoryFixture());
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const ledger = completeLedger(inventory);
     const firstDependency = ledger.dependencies[0];
     if (firstDependency === undefined) throw new Error("fixture inventory must not be empty");
@@ -358,7 +374,7 @@ describe("dependency upgrade ledger validation", () => {
   });
 
   it("rejects missing, stale, and invalid-status entries", () => {
-    const inventory = discoverDependencyInventory(createRepositoryFixture());
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const ledger = completeLedger(inventory);
     const removed = ledger.dependencies.shift();
     if (removed === undefined) throw new Error("fixture inventory must not be empty");
@@ -387,7 +403,7 @@ describe("dependency upgrade ledger validation", () => {
   });
 
   it("requires a completely green synchronized baseline before progress", () => {
-    const inventory = discoverDependencyInventory(createRepositoryFixture());
+    const inventory = withRepositoryFixture(discoverDependencyInventory);
     const ledger = completeLedger(inventory);
     const firstCommand = ledger.baseline.commands[0];
     const firstDependency = ledger.dependencies[0];

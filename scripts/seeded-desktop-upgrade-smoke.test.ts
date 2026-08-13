@@ -27,17 +27,27 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 
 describe("seeded packaged desktop upgrade harness", () => {
   it("canonicalizes symlinked work roots before installing an updater target", async () => {
-    const root = await NodeFS.promises.mkdtemp(
-      NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-canonical-"),
+    const temporaryBase = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-upgrade-canonical-owner-"),
     );
-    const target = NodePath.join(root, "target");
-    const alias = NodePath.join(root, "alias");
-    await NodeFS.promises.mkdir(target);
-    await NodeFS.promises.symlink(target, alias, "junction");
+    try {
+      const root = await NodeFS.promises.mkdtemp(NodePath.join(temporaryBase, "fixture-"));
+      try {
+        const target = NodePath.join(root, "target");
+        const alias = NodePath.join(root, "alias");
+        await NodeFS.promises.mkdir(target);
+        await NodeFS.promises.symlink(target, alias, "junction");
 
-    await expect(canonicalizeSeededUpgradeWorkRoot(alias)).resolves.toBe(
-      await NodeFS.promises.realpath(target),
-    );
+        await expect(canonicalizeSeededUpgradeWorkRoot(alias)).resolves.toBe(
+          await NodeFS.promises.realpath(target),
+        );
+      } finally {
+        await NodeFS.promises.rm(root, { recursive: true, force: true });
+      }
+      await expect(NodeFS.promises.readdir(temporaryBase)).resolves.toEqual([]);
+    } finally {
+      await NodeFS.promises.rm(temporaryBase, { recursive: true, force: true });
+    }
   });
 
   it("parses deterministic platform arguments and resolves only absolute isolated roots", () => {

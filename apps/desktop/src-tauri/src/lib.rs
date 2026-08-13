@@ -201,6 +201,8 @@ pub fn run() {
                 ) {
                     tracing::warn!("failed to stop Tauri desktop backend during exit: {error}");
                 }
+                let ssh = app_handle.state::<ssh::SshEnvironmentManager>();
+                tauri::async_runtime::block_on(ssh.shutdown());
             }
         });
 }

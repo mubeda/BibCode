@@ -94,6 +94,15 @@ RPC pipeline as other targets.
 SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
 process supervision, or access to the user's SSH configuration.
 
+The desktop host creates an unpredictable private askpass directory only while
+an SSH command or live forwarding tunnel owns it. Passwords are passed only in
+the child environment and are never written into the static helper scripts.
+Each child reserves bounded cleanup ownership before spawn; cancellation moves
+the child and helper lease together into the manager's retained reaper. Desktop
+shutdown closes new SSH child admission, terminates live tunnels, and awaits all
+retained reaps before releasing the exact helper files. Cleanup never recursively
+removes an unexpected foreign entry from an askpass directory.
+
 ## Access versus launch
 
 Direct and relay targets expect a server to be reachable through an existing
