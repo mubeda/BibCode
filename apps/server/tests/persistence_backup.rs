@@ -187,10 +187,15 @@ fn open_directory_for_test(path: &Path) -> File {
 #[cfg(windows)]
 fn open_directory_for_test(path: &Path) -> File {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES,
+    };
 
     fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0x0200_0000)
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .expect("open generation directory")
 }
