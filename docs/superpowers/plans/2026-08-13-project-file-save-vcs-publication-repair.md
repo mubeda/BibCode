@@ -182,4 +182,3 @@ vp run typecheck
 - [ ] **Step 4: Review and commit intentionally**
 
 Review `git diff`, `git status --short`, and affected tests for accidental timeout widening, sleeps/yields, unbounded spawning, lock-held I/O, debug output, dependency drift, and missing living documentation. Obtain an independent read-only review of the scoped RED-to-GREEN diff. Commit the amendment separately before the repair when practical, then commit the coherent source/test repair.
-
