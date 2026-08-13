@@ -247,6 +247,7 @@ async fn process_cancellation_removes_descendants() {
 #[derive(Debug)]
 struct FakePty {
     pid: u32,
+    identity: ProcessIdentity,
     writes: Mutex<Vec<String>>,
     sizes: Mutex<Vec<(u16, u16)>>,
     kill_count: Mutex<usize>,
@@ -263,6 +264,10 @@ impl FakePty {
 impl PtyProcess for FakePty {
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn process_identity(&self) -> Option<ProcessIdentity> {
+        Some(self.identity)
     }
 
     fn write(&self, data: &str) -> Result<(), String> {
@@ -338,8 +343,14 @@ impl PtyBackend for FakeBackend {
     fn spawn(&self, _input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
         let (output, _) = broadcast::channel(32);
         let (exit, _) = watch::channel(None);
+        let generation = self.spawned.lock().expect("spawned lock").len() as u64 + 1;
+        let pid = 4_242 + u32::try_from(generation - 1).expect("synthetic PID");
         let process = Arc::new(FakePty {
-            pid: 4_242 + self.spawned.lock().expect("spawned lock").len() as u32,
+            pid,
+            identity: ProcessIdentity {
+                pid,
+                started_at: generation,
+            },
             writes: Mutex::new(Vec::new()),
             sizes: Mutex::new(Vec::new()),
             kill_count: Mutex::new(0),
