@@ -8037,6 +8037,133 @@ mod tests {
         events: tokio::sync::Mutex<mpsc::Receiver<super::ProviderEvent>>,
     }
 
+    struct CodexStartupMilestones {
+        initialize_response_ready: Arc<FixtureEvent>,
+        initialize_checkpoint: u64,
+        thread_response_ready: Arc<FixtureEvent>,
+        thread_checkpoint: u64,
+        owner_completed: Arc<FixtureEvent>,
+        owner_checkpoint: u64,
+    }
+
+    impl CodexStartupMilestones {
+        fn new(
+            initialize_response_ready: Arc<FixtureEvent>,
+            thread_response_ready: Arc<FixtureEvent>,
+            owner_completed: Arc<FixtureEvent>,
+        ) -> Self {
+            let initialize_checkpoint = initialize_response_ready.checkpoint();
+            let thread_checkpoint = thread_response_ready.checkpoint();
+            let owner_checkpoint = owner_completed.checkpoint();
+            Self {
+                initialize_response_ready,
+                initialize_checkpoint,
+                thread_response_ready,
+                thread_checkpoint,
+                owner_completed,
+                owner_checkpoint,
+            }
+        }
+
+        async fn wait_until(&self, deadline: tokio::time::Instant) -> Result<(), &'static str> {
+            self.wait_for(
+                &self.initialize_response_ready,
+                self.initialize_checkpoint,
+                deadline,
+                "initialize_response_ready",
+            )
+            .await?;
+            self.wait_for(
+                &self.thread_response_ready,
+                self.thread_checkpoint,
+                deadline,
+                "thread_response_ready",
+            )
+            .await?;
+            self.wait_for(
+                &self.owner_completed,
+                self.owner_checkpoint,
+                deadline,
+                "owner_completed",
+            )
+            .await
+        }
+
+        async fn wait_for(
+            &self,
+            event: &FixtureEvent,
+            checkpoint: u64,
+            deadline: tokio::time::Instant,
+            milestone: &'static str,
+        ) -> Result<(), &'static str> {
+            tokio::time::timeout_at(deadline, event.wait_after(checkpoint))
+                .await
+                .map_err(|_| milestone)
+        }
+
+        fn reached(&self) -> (bool, bool, bool) {
+            (
+                self.initialize_response_ready.checkpoint() > self.initialize_checkpoint,
+                self.thread_response_ready.checkpoint() > self.thread_checkpoint,
+                self.owner_completed.checkpoint() > self.owner_checkpoint,
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_startup_milestones_accept_owner_scheduled_after_two_seconds() {
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
+        let owner_completed = Arc::new(FixtureEvent::default());
+        let milestones = CodexStartupMilestones::new(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+            owner_completed.clone(),
+        );
+        let observation =
+            milestones.wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+        tokio::pin!(observation);
+
+        std::future::poll_fn(|context| {
+            assert!(observation.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "the obsolete two-second observer bound must not complete startup"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        initialize_response_ready.publish();
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "initialize alone must not satisfy ordered startup"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        thread_response_ready.publish();
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "responses alone must not satisfy owner completion"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        owner_completed.publish();
+
+        observation
+            .await
+            .expect("all ordered milestones complete within the shared deadline");
+    }
+
     impl ProviderDriver for SupervisorDriver {
         fn start(
             &self,
@@ -8544,6 +8671,10 @@ lines.on("line", (line) => {
     fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
   }
   const request = JSON.parse(line);
+  if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER) {
+    fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER, request.method);
+  }
+  if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE) return;
   let result;
   switch (request.method) {
     case "initialize":
@@ -9039,7 +9170,13 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   response_marker=
   case "$line" in
-    *'"method":"initialize"'*) response_marker=$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      [ -z "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER"
+      [ -z "$BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE" ] || continue
+      response_marker=$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER
+      [ -z "$response_marker" ] || : > "$response_marker"
+      printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id"
+      ;;
     *'"method":"thread/start"'*) response_marker=$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
@@ -10531,6 +10668,85 @@ done
     }
 
     #[tokio::test]
+    async fn codex_startup_watchdog_reaps_a_fixture_that_never_reaches_initialize_response() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let codex_fixture = executable_fixture(&temp, "codex-stalled-start-fixture", CODEX_FIXTURE);
+        let initialize_request_ready = temp.path().join("codex-initialize-request-ready");
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER".to_owned(),
+            initialize_request_ready.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE".to_owned(),
+            "1".to_owned(),
+        );
+        let driver = Arc::new(
+            super::CodexDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("stalled Codex driver should create"),
+        );
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
+        let owner_completed = Arc::new(FixtureEvent::default());
+        driver.runtime.observe_startup_responses_for_test(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+        );
+        let milestones = CodexStartupMilestones::new(
+            initialize_response_ready,
+            thread_response_ready,
+            owner_completed.clone(),
+        );
+        let start_driver = driver.clone();
+        let start_task = tokio::spawn(async move {
+            let result = start_driver.start().await;
+            owner_completed.publish();
+            result
+        });
+
+        let missing = milestones
+            .wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .expect_err("fixture never publishes the initialize response milestone");
+        start_task.abort();
+        let _ = start_task.await;
+        let shutdown_outcome = timeout(
+            std::time::Duration::from_secs(3),
+            super::shutdown_codex_fixture_bounded(&driver, std::time::Duration::from_secs(2)),
+        )
+        .await
+        .expect("stalled startup cleanup must remain bounded");
+
+        assert_eq!(missing, "initialize_response_ready");
+        assert!(
+            initialize_request_ready.is_file(),
+            "fixture must positively receive initialize before withholding its response"
+        );
+        assert!(
+            shutdown_outcome.is_ok(),
+            "bounded cleanup must terminate the stalled fixture: {shutdown_outcome:?}"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped stalled Codex fixture status")
+                .is_some(),
+            "bounded cleanup must reap the stalled startup fixture"
+        );
+    }
+
+    #[tokio::test]
     async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
         let temp = TempDir::new().expect("provider fixture directory");
         let attachment_root = temp.path().join("state&").join("attachments");
@@ -10689,8 +10905,18 @@ done
             .await
             .expect("Codex driver should create"),
         );
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
         let start_completed = Arc::new(FixtureEvent::default());
-        let start_checkpoint = start_completed.checkpoint();
+        codex.runtime.observe_startup_responses_for_test(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+        );
+        let startup_milestones = CodexStartupMilestones::new(
+            initialize_response_ready,
+            thread_response_ready,
+            start_completed.clone(),
+        );
         let start_driver = codex.clone();
         let start_completion = start_completed.clone();
         let start_task = tokio::spawn(async move {
@@ -10698,23 +10924,19 @@ done
             start_completion.publish();
             result
         });
-        if timeout(
-            std::time::Duration::from_secs(2),
-            start_completed.wait_after(start_checkpoint),
-        )
-        .await
-        .is_err()
-        {
-            let initialize_response_ready = codex_initialize_response_ready.is_file();
-            let thread_response_ready = codex_thread_response_ready.is_file();
+        let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        if let Err(missing_milestone) = startup_milestones.wait_until(startup_deadline).await {
+            let (initialize_response_ready, thread_response_ready, owner_completed) =
+                startup_milestones.reached();
             start_task.abort();
             let _ = start_task.await;
             let shutdown_outcome =
                 super::shutdown_codex_fixture_bounded(&codex, std::time::Duration::from_secs(2))
                     .await;
             panic!(
-                "Codex start observation timeout: initialize_response_ready={initialize_response_ready}, \
-                 thread_response_ready={thread_response_ready}, owner_completed=false, \
+                "Codex start diagnostic watchdog expired at {missing_milestone}: \
+                 initialize_response_ready={initialize_response_ready}, \
+                 thread_response_ready={thread_response_ready}, owner_completed={owner_completed}, \
                  shutdown_outcome={shutdown_outcome:?}"
             );
         }
