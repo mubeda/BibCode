@@ -3406,6 +3406,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
 
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::{FixtureEvent, TestSandbox};
 
     #[cfg(unix)]

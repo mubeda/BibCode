@@ -1603,6 +1603,7 @@ fn is_builtin_driver(driver: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use crate::test_support::TestSandbox;
     use axum::{Json, Router, routing::get};
 

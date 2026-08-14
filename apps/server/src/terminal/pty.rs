@@ -266,7 +266,7 @@ impl SpawnedChildGuard {
     }
 
     #[cfg(windows)]
-    fn commit_job(mut self) -> Result<WindowsJob, String> {
+    fn commit_job(&mut self) -> Result<WindowsJob, String> {
         let job = self
             .job
             .take()

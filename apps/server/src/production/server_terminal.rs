@@ -1428,6 +1428,10 @@ fn terminal_error(error: TerminalError) -> Value {
             "_tag": "TerminalCloseError",
             "reason": "Terminal processes did not exit before cleanup timed out.",
         }),
+        TerminalError::WorktreeRemovalInProgress { .. } => json!({
+            "_tag": "TerminalSpawnError",
+            "reason": "The worktree is being removed.",
+        }),
     }
 }
 

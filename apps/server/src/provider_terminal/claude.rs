@@ -38,7 +38,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
 use super::model::TerminalObserverGenerationLease;
 #[cfg(unix)]

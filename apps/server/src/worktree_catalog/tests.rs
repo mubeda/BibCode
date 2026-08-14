@@ -18,8 +18,10 @@ use crate::git::{
 use super::service::{
     CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
     CatalogServiceOptions, CatalogShallowSignature, CatalogThread, DirectoryProbeState,
-    InventorySource, ScanFailure, TokioCatalogFileSystem,
+    InventorySource, ScanFailure,
 };
+#[cfg(unix)]
+use super::service::TokioCatalogFileSystem;
 use super::{
     CatalogRefreshTrigger, CatalogWorkspaceLossObserver, WorkspaceAvailabilityRegistry,
     WorkspaceLossTransition, WorktreeCatalogService,

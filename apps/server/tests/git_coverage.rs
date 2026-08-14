@@ -175,22 +175,28 @@ fn linked_worktree_record(
     inventory: &bibcode_server::git::GitWorktreeInventory,
     path: &Path,
 ) -> GitWorktreeRecord {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let identity = normalize_worktree_path_key(path, bibcode_server::git::host_path_platform());
     inventory
         .records
         .iter()
-        .find(|record| record.path == canonical)
+        .find(|record| {
+            normalize_worktree_path_key(&record.path, bibcode_server::git::host_path_platform())
+                == identity
+        })
         .cloned()
         .expect("linked worktree record")
 }
 
 fn has_registered_worktree(cwd: &Path, expected: &Path) -> bool {
-    let expected = fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    let expected = normalize_worktree_path_key(expected, bibcode_server::git::host_path_platform());
     git(cwd, &["worktree", "list", "--porcelain"])
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
-        .any(|path| fs::canonicalize(&path).unwrap_or(path) == expected)
+        .any(|path| {
+            normalize_worktree_path_key(&path, bibcode_server::git::host_path_platform())
+                == expected
+        })
 }
 
 fn local_file_url(path: &Path) -> String {
@@ -1044,16 +1050,16 @@ async fn worktree_inventory_returns_authoritative_primary_and_linked_records() {
     assert!(inventory.nul_delimited);
     assert_eq!(inventory.common_dir, repo.path().join(".git"));
     assert_eq!(inventory.records.len(), 2);
+    let git_paths = git(repo.path(), &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(git_paths.len(), 2);
     assert!(inventory.records[0].is_primary);
-    assert_eq!(
-        inventory.records[0].path,
-        fs::canonicalize(repo.path()).expect("canonical primary worktree path")
-    );
+    assert_eq!(inventory.records[0].path, git_paths[0]);
     assert!(!inventory.records[1].is_primary);
-    assert_eq!(
-        inventory.records[1].path,
-        fs::canonicalize(&linked).expect("canonical linked worktree path")
-    );
+    assert_eq!(inventory.records[1].path, git_paths[1]);
     assert_eq!(
         inventory.records[1].branch.as_deref(),
         Some("feature/inventory")
@@ -1625,6 +1631,383 @@ async fn worktree_prune_rejects_a_locked_missing_registration_with_its_reason() 
         .expect_err("locked target is never pruned");
     assert!(error.detail.contains("retained by operator"));
     assert!(has_registered_worktree(repo.path(), &target.path));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn git_can_deregister_a_linked_worktree_while_its_directory_is_quarantined() {
+    let repository = init_repo();
+    commit_file(repository.path(), "README.md", "base\n", "initial");
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("target");
+    let quarantine = worktree_parent.path().join("quarantine");
+    git(
+        repository.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/quarantine-probe",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    fs::rename(&worktree, &quarantine).expect("quarantine worktree directory");
+    fs::create_dir(&worktree).expect("create removal tombstone");
+    fs::copy(quarantine.join(".git"), worktree.join(".git"))
+        .expect("copy linked-worktree identity into tombstone");
+
+    git(
+        repository.path(),
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    );
+
+    assert!(quarantine.join(".git").exists());
+    assert!(!worktree.exists());
+    assert!(
+        !git(repository.path(), &["worktree", "list", "--porcelain"])
+            .replace('\\', "/")
+            .contains(&worktree.to_string_lossy().replace('\\', "/"))
+    );
+}
+
+#[tokio::test]
+async fn protected_removal_recovers_a_deregistered_durable_quarantine() {
+    let repository_root = init_repo();
+    commit_file(repository_root.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("recoverable");
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/recoverable-quarantine",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let nonce = repository
+        .prepare_worktree_removal_identity(repository_root.path(), &worktree, &cancellation())
+        .await
+        .expect("prepare durable identity");
+    let git_link = fs::read_to_string(worktree.join(".git")).expect("linked-worktree Git file");
+    let raw_admin_path = git_link
+        .trim()
+        .strip_prefix("gitdir: ")
+        .expect("linked-worktree Git directory");
+    let admin_path = Path::new(raw_admin_path);
+    let admin_path = if admin_path.is_absolute() {
+        admin_path.to_path_buf()
+    } else {
+        worktree.join(admin_path)
+    };
+    let quarantine = worktree_parent
+        .path()
+        .join(format!(".recoverable.bibcode-removal-{nonce}"));
+    fs::rename(&worktree, &quarantine).expect("simulate committed quarantine rename");
+    fs::create_dir(&worktree).expect("simulate removal tombstone");
+    fs::write(worktree.join(".bibcode-removal-tombstone"), &nonce)
+        .expect("write tombstone identity");
+    fs::copy(quarantine.join(".git"), worktree.join(".git")).expect("copy tombstone Git link");
+    let admin_quarantine = repository_root
+        .path()
+        .join(".git")
+        .join("bibcode-worktree-removals")
+        .join(&nonce);
+    fs::create_dir_all(admin_quarantine.parent().expect("admin quarantine parent"))
+        .expect("admin quarantine parent");
+    fs::rename(&admin_path, &admin_quarantine)
+        .expect("simulate committed administrative quarantine");
+    assert!(quarantine.join("README.md").exists());
+
+    repository
+        .remove_worktree_with_identity(
+            repository_root.path(),
+            &worktree,
+            true,
+            &nonce,
+            &cancellation(),
+        )
+        .await
+        .expect("retry cleans the nonce-bound quarantine");
+
+    assert!(!quarantine.exists());
+    assert!(!admin_quarantine.exists());
+}
+
+#[tokio::test]
+async fn protected_removal_repairs_a_marker_only_tombstone_after_a_crash() {
+    let repository_root = init_repo();
+    commit_file(repository_root.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("marker-only");
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/marker-only-tombstone",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let nonce = repository
+        .prepare_worktree_removal_identity(repository_root.path(), &worktree, &cancellation())
+        .await
+        .expect("prepare durable identity");
+    let quarantine = worktree_parent
+        .path()
+        .join(format!(".marker-only.bibcode-removal-{nonce}"));
+    fs::rename(&worktree, &quarantine).expect("simulate committed quarantine rename");
+    fs::create_dir(&worktree).expect("simulate partial tombstone");
+    fs::write(worktree.join(".bibcode-removal-tombstone"), &nonce)
+        .expect("write tombstone marker before simulated crash");
+
+    repository
+        .remove_worktree_with_identity(
+            repository_root.path(),
+            &worktree,
+            true,
+            &nonce,
+            &cancellation(),
+        )
+        .await
+        .expect("retry repairs tombstone and completes removal");
+
+    assert!(!worktree.exists());
+    assert!(!quarantine.exists());
+    assert_eq!(
+        repository
+            .switch_ref(
+                repository_root.path(),
+                "feature/marker-only-tombstone",
+                &cancellation(),
+            )
+            .await
+            .expect("deregistered branch is unlocked")
+            .as_deref(),
+        Some("feature/marker-only-tombstone")
+    );
+}
+
+#[tokio::test]
+async fn protected_removal_preserves_an_unidentified_empty_tombstone() {
+    let repository_root = init_repo();
+    commit_file(repository_root.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("empty-tombstone");
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/empty-tombstone",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let nonce = repository
+        .prepare_worktree_removal_identity(repository_root.path(), &worktree, &cancellation())
+        .await
+        .expect("prepare durable identity");
+    let git_link = fs::read_to_string(worktree.join(".git")).expect("linked-worktree Git file");
+    let admin_path = Path::new(
+        git_link
+            .trim()
+            .strip_prefix("gitdir: ")
+            .expect("linked-worktree Git directory"),
+    );
+    let admin_path = if admin_path.is_absolute() {
+        admin_path.to_path_buf()
+    } else {
+        worktree.join(admin_path)
+    };
+    let quarantine = worktree_parent
+        .path()
+        .join(format!(".empty-tombstone.bibcode-removal-{nonce}"));
+    fs::rename(&worktree, &quarantine).expect("simulate committed quarantine rename");
+    fs::create_dir(&worktree).expect("simulate removal tombstone");
+    fs::write(worktree.join(".bibcode-removal-tombstone"), &nonce)
+        .expect("write tombstone identity");
+    fs::copy(quarantine.join(".git"), worktree.join(".git")).expect("copy tombstone Git link");
+    let admin_quarantine = repository_root
+        .path()
+        .join(".git")
+        .join("bibcode-worktree-removals")
+        .join(&nonce);
+    fs::create_dir_all(admin_quarantine.parent().expect("admin quarantine parent"))
+        .expect("admin quarantine parent");
+    fs::rename(&admin_path, &admin_quarantine)
+        .expect("simulate committed administrative quarantine");
+    fs::remove_file(worktree.join(".git")).expect("simulate tombstone Git-link cleanup");
+    fs::remove_file(worktree.join(".bibcode-removal-tombstone"))
+        .expect("simulate tombstone marker cleanup");
+
+    repository
+        .remove_worktree_with_identity(
+            repository_root.path(),
+            &worktree,
+            true,
+            &nonce,
+            &cancellation(),
+        )
+        .await
+        .expect_err("an empty path without its nonce marker must fail closed");
+
+    assert!(worktree.is_dir());
+    assert!(quarantine.join("README.md").exists());
+    assert!(admin_quarantine.exists());
+}
+
+#[tokio::test]
+async fn protected_removal_recovers_an_empty_quarantine_after_cleanup() {
+    let repository_root = init_repo();
+    commit_file(repository_root.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("empty-quarantine");
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/empty-quarantine",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let nonce = repository
+        .prepare_worktree_removal_identity(repository_root.path(), &worktree, &cancellation())
+        .await
+        .expect("prepare durable identity");
+    let git_link = fs::read_to_string(worktree.join(".git")).expect("linked-worktree Git file");
+    let admin_path = Path::new(
+        git_link
+            .trim()
+            .strip_prefix("gitdir: ")
+            .expect("linked-worktree Git directory"),
+    );
+    let admin_path = if admin_path.is_absolute() {
+        admin_path.to_path_buf()
+    } else {
+        worktree.join(admin_path)
+    };
+    let quarantine = worktree_parent
+        .path()
+        .join(format!(".empty-quarantine.bibcode-removal-{nonce}"));
+    fs::rename(&worktree, &quarantine).expect("simulate committed quarantine rename");
+    let admin_quarantine = repository_root
+        .path()
+        .join(".git")
+        .join("bibcode-worktree-removals")
+        .join(&nonce);
+    fs::create_dir_all(admin_quarantine.parent().expect("admin quarantine parent"))
+        .expect("admin quarantine parent");
+    fs::rename(&admin_path, &admin_quarantine)
+        .expect("simulate committed administrative quarantine");
+    fs::remove_dir_all(&quarantine).expect("simulate quarantine content cleanup");
+    fs::create_dir(&quarantine).expect("leave the empty quarantine root after a crash");
+
+    repository
+        .remove_worktree_with_identity(
+            repository_root.path(),
+            &worktree,
+            true,
+            &nonce,
+            &cancellation(),
+        )
+        .await
+        .expect("retry completes from an empty quarantine");
+
+    assert!(!quarantine.exists());
+    assert!(!admin_quarantine.exists());
+}
+
+#[tokio::test]
+async fn prepared_removal_identity_cannot_delete_a_replacement_worktree() {
+    let repository_root = init_repo();
+    commit_file(repository_root.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree = worktree_parent.path().join("replaceable");
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/original-removal-identity",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let nonce = repository
+        .prepare_worktree_removal_identity(repository_root.path(), &worktree, &cancellation())
+        .await
+        .expect("prepare original removal identity");
+    git(
+        repository_root.path(),
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    );
+    git(
+        repository_root.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/replacement-removal-identity",
+            &worktree.to_string_lossy(),
+        ],
+    );
+    let sentinel = worktree.join("replacement-sentinel.txt");
+    fs::write(&sentinel, "replacement survives\n").expect("replacement sentinel");
+
+    repository
+        .remove_worktree_with_identity(
+            repository_root.path(),
+            &worktree,
+            true,
+            &nonce,
+            &cancellation(),
+        )
+        .await
+        .expect_err("the original identity must not admit the replacement");
+
+    assert_eq!(
+        fs::read_to_string(&sentinel).expect("replacement remains"),
+        "replacement survives\n"
+    );
+    assert!(
+        git(repository_root.path(), &["worktree", "list", "--porcelain"])
+            .replace('\\', "/")
+            .to_lowercase()
+            .contains(&worktree.to_string_lossy().replace('\\', "/").to_lowercase())
+    );
+}
+
+#[tokio::test]
+async fn managed_orphan_cleanup_remains_supported_by_protected_removal() {
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let repository_path = fixture.path().join("repository");
+    fs::create_dir(&repository_path).expect("repository directory");
+    git(&repository_path, &["init", "-b", "main"]);
+    commit_file(&repository_path, "README.md", "base\n", "initial");
+    let orphan = fixture
+        .path()
+        .join(".bibcode-worktrees")
+        .join("repository")
+        .join("orphan");
+    fs::create_dir_all(&orphan).expect("managed orphan directory");
+    fs::write(orphan.join("sentinel.txt"), "managed orphan\n").expect("orphan sentinel");
+
+    GitRepository::default()
+        .remove_worktree(&repository_path, &orphan, true, &cancellation())
+        .await
+        .expect("managed orphan cleanup");
+
+    assert!(!orphan.exists());
 }
 
 #[cfg(windows)]
