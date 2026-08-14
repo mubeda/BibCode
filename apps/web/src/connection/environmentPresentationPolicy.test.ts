@@ -1,0 +1,130 @@
+import {
+  BearerConnectionTarget,
+  PrimaryConnectionTarget,
+  RelayConnectionTarget,
+  SshConnectionTarget,
+  UnavailableConnectionTarget,
+  type ConnectionTarget,
+} from "@bibcode/client-runtime/connection";
+import { EnvironmentId } from "@bibcode/contracts";
+import { describe, expect, it } from "vite-plus/test";
+
+import { desktopLocalConnectionId } from "./desktopLocal";
+import {
+  createEnvironmentPresentationPolicy,
+  normalizeDesktopHostPlatform,
+} from "./environmentPresentationPolicy";
+
+const primaryTarget = new PrimaryConnectionTarget({
+  environmentId: EnvironmentId.make("primary"),
+  httpBaseUrl: "http://127.0.0.1:3773",
+  label: "This device",
+  wsBaseUrl: "ws://127.0.0.1:3773",
+});
+
+const wslTarget = new BearerConnectionTarget({
+  connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+  environmentId: EnvironmentId.make("wsl"),
+  label: "WSL: Ubuntu",
+});
+
+const unavailableWslTarget = new UnavailableConnectionTarget({
+  configuredDistro: "Ubuntu",
+  connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+  detail: "WSL is unavailable",
+  environmentId: EnvironmentId.make("wsl-unavailable"),
+  label: "WSL: Ubuntu",
+});
+
+const sshTarget = new SshConnectionTarget({
+  connectionId: "ssh:server",
+  environmentId: EnvironmentId.make("ssh"),
+  label: "SSH server",
+});
+
+const relayTarget = new RelayConnectionTarget({
+  environmentId: EnvironmentId.make("relay"),
+  label: "Relay server",
+});
+
+const remoteBearerTarget = new BearerConnectionTarget({
+  connectionId: "remote:server",
+  environmentId: EnvironmentId.make("bearer"),
+  label: "Remote server",
+});
+
+const allTargetKinds: readonly ConnectionTarget[] = [
+  primaryTarget,
+  wslTarget,
+  unavailableWslTarget,
+  sshTarget,
+  relayTarget,
+  remoteBearerTarget,
+];
+
+describe("environment presentation policy", () => {
+  it.each([
+    ["browser", "macos", "full", true],
+    ["desktop", "macos", "redirect-general", false],
+    ["desktop", "linux", "redirect-general", false],
+    ["desktop", "windows", "local-wsl", false],
+    ["desktop", "unknown", "redirect-general", false],
+  ] as const)("derives %s/%s presentation", (surface, platform, connections, remote) => {
+    const policy = createEnvironmentPresentationPolicy({ surface, platform });
+
+    expect(policy.connectionsPresentation).toBe(connections);
+    expect(policy.showRemoteDeviceControls).toBe(remote);
+  });
+
+  it("shows only primary and Windows desktop-local targets in local-only desktop mode", () => {
+    const windows = createEnvironmentPresentationPolicy({
+      surface: "desktop",
+      platform: "windows",
+    });
+
+    expect(windows.presentsTarget(primaryTarget)).toBe(true);
+    expect(windows.presentsTarget(wslTarget)).toBe(true);
+    expect(windows.presentsTarget(unavailableWslTarget)).toBe(true);
+    expect(windows.presentsTarget(sshTarget)).toBe(false);
+    expect(windows.presentsTarget(relayTarget)).toBe(false);
+    expect(windows.presentsTarget(remoteBearerTarget)).toBe(false);
+    expect(windows.permitsConnectionAction(remoteBearerTarget)).toBe(false);
+  });
+
+  it.each(["macos", "linux", "unknown"] as const)(
+    "rejects WSL and remote targets on %s desktop hosts",
+    (platform) => {
+      const policy = createEnvironmentPresentationPolicy({ surface: "desktop", platform });
+
+      expect(policy.presentsTarget(primaryTarget)).toBe(true);
+      expect(policy.presentsTarget(wslTarget)).toBe(false);
+      expect(policy.presentsTarget(unavailableWslTarget)).toBe(false);
+      expect(policy.presentsTarget(sshTarget)).toBe(false);
+      expect(policy.presentsTarget(relayTarget)).toBe(false);
+      expect(policy.presentsTarget(remoteBearerTarget)).toBe(false);
+    },
+  );
+
+  it("presents every target kind in browser mode", () => {
+    const browser = createEnvironmentPresentationPolicy({
+      surface: "browser",
+      platform: "unknown",
+    });
+
+    for (const target of allTargetKinds) {
+      expect(browser.presentsTarget(target)).toBe(true);
+      expect(browser.permitsConnectionAction(target)).toBe(true);
+    }
+  });
+
+  it.each([
+    ["MacIntel", "macos"],
+    ["MacBookPro", "macos"],
+    ["Win32", "windows"],
+    ["Windows", "windows"],
+    ["Linux x86_64", "linux"],
+    ["FreeBSD", "unknown"],
+  ] as const)("normalizes %s as %s", (platform, expected) => {
+    expect(normalizeDesktopHostPlatform(platform)).toBe(expected);
+  });
+});
