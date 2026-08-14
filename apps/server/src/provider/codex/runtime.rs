@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -2153,13 +2154,14 @@ impl CodexSessionRuntime {
             }
         }
         if background_page_decoded {
+            let observed_at = current_timestamp();
             let mut activity = self.inner.activity.lock().await;
             if !self.reconciliation_is_current_locked(&pass, &activity) {
                 return;
             }
             let background = activity.tracker.reconcile_background_terminals(
                 &background_terminals,
-                FIXED_EVENT_TIME,
+                &observed_at,
                 background_authority,
             );
             activity.stage_reconciliation_mutations(background.mutations);
@@ -3310,6 +3312,12 @@ fn pending_actor_transitions_are_valid(
 
 fn method_is_incompatible(error: &ProtocolError) -> bool {
     matches!(error, ProtocolError::RemoteRequest { code: -32601, .. })
+}
+
+fn current_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 fn request_type(kind: PendingRequestKind) -> &'static str {
@@ -6206,6 +6214,79 @@ mod tests {
         let mut activity = runtime.inner.activity.lock().await;
         activity.install_root_thread_id("provider-root");
         activity.tracker.begin_detail_baseline();
+    }
+
+    #[tokio::test]
+    async fn background_reconciliation_stamps_work_with_its_observation_time() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+
+            let root_read = read_runtime_test_json(&mut reader).await;
+            assert_eq!(root_read["method"], "thread/read");
+            write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read)).await;
+
+            let thread_list = read_runtime_test_json(&mut reader).await;
+            assert_eq!(thread_list["method"], "thread/list");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": thread_list["id"].clone(),
+                    "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
+                }),
+            )
+            .await;
+
+            let background = read_runtime_test_json(&mut reader).await;
+            assert_eq!(background["method"], "thread/backgroundTerminals/list");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": background["id"].clone(),
+                    "result": {
+                        "data": [{
+                            "itemId": "background-live",
+                            "processId": "process-live",
+                            "command": "sleep 90"
+                        }],
+                        "nextCursor": null
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let before_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        runtime.reconcile_once().await;
+        let after_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        peer.await.expect("reconciliation peer");
+
+        let events = drain_runtime_events(&runtime).await;
+        let started_at = events
+            .iter()
+            .flat_map(|event| &event.activity)
+            .find_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertWorkItem(work_item)
+                    if work_item.id == "codex:item:background-live" =>
+                {
+                    Some(work_item.started_at.as_str())
+                }
+                _ => None,
+            })
+            .expect("reconciled background work item");
+        let started_at_ms = OffsetDateTime::parse(started_at, &Rfc3339)
+            .expect("canonical RFC 3339 background timestamp")
+            .unix_timestamp_nanos()
+            / 1_000_000;
+
+        assert!(
+            (before_ms..=after_ms).contains(&started_at_ms),
+            "background observation timestamp {started_at_ms}ms must be within reconciliation bounds {before_ms}ms..={after_ms}ms"
+        );
     }
 
     fn verified_reconciliation_child() -> ReconciliationThread {
