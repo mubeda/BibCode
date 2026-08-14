@@ -366,12 +366,32 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(currentWorkflow).toHaveProperty("locationLabel", "Location");
   });
 
-  it("preserves every host and the Host selector in browser mode", async () => {
+  it("excludes an unavailable WSL location without a current bootstrap on Windows desktop", async () => {
     harness.environments = [
       ...harness.environments,
       environment(wslEnvironmentId, "Ubuntu (WSL)", {
-        _tag: "BearerConnectionTarget",
+        _tag: "UnavailableConnectionTarget",
+        configuredDistro: "Ubuntu",
         connectionId: "local:wsl:Ubuntu",
+        detail: "WSL is unavailable",
+      }),
+    ];
+    harness.presentation = presentation("desktop", "windows");
+
+    await mountWorkflow();
+
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual(["This device"]);
+    expect(currentWorkflow).toHaveProperty("locationLabel", null);
+  });
+
+  it("preserves unavailable WSL and remote hosts with the Host selector in browser mode", async () => {
+    harness.environments = [
+      ...harness.environments,
+      environment(wslEnvironmentId, "Ubuntu (WSL)", {
+        _tag: "UnavailableConnectionTarget",
+        configuredDistro: "Ubuntu",
+        connectionId: "local:wsl:Ubuntu",
+        detail: "WSL is unavailable",
       }),
       environment(sshEnvironmentId, "Build server", {
         _tag: "SshConnectionTarget",
