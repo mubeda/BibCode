@@ -6,6 +6,7 @@ import {
   GitBranchIcon,
   InfoIcon,
   KeyboardIcon,
+  MonitorIcon,
   PanelBottomIcon,
   Settings2Icon,
   TerminalIcon,
@@ -26,9 +27,12 @@ import {
   BiBCodeConnectSidebarAvatar,
   BiBCodeConnectSidebarSignIn,
 } from "../clerk/BiBCodeConnectSidebarSignIn";
+import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
+import type { EnvironmentPresentationPolicy } from "~/connection/environmentPresentationPolicy";
 
 export type SettingsSectionPath =
   | "/settings/general"
+  | "/settings/connections"
   | "/settings/agents"
   | "/settings/status-bar"
   | "/settings/terminal"
@@ -38,11 +42,13 @@ export type SettingsSectionPath =
   | "/settings/archived"
   | "/settings/about";
 
-export const SETTINGS_NAV_ITEMS: ReadonlyArray<{
-  label: string;
-  to: SettingsSectionPath;
-  icon: ComponentType<{ className?: string }>;
-}> = [
+export interface SettingsNavItem {
+  readonly label: string;
+  readonly to: SettingsSectionPath;
+  readonly icon: ComponentType<{ className?: string }>;
+}
+
+export const BASE_SETTINGS_NAV_ITEMS: ReadonlyArray<SettingsNavItem> = [
   { label: "General", to: "/settings/general", icon: Settings2Icon },
   { label: "Agents", to: "/settings/agents", icon: BotIcon },
   { label: "Status Bar", to: "/settings/status-bar", icon: PanelBottomIcon },
@@ -54,7 +60,23 @@ export const SETTINGS_NAV_ITEMS: ReadonlyArray<{
   { label: "About", to: "/settings/about", icon: InfoIcon },
 ];
 
+const LOCAL_ENVIRONMENT_NAV_ITEM = {
+  label: "Local environment",
+  to: "/settings/connections",
+  icon: MonitorIcon,
+} as const;
+
+export function settingsNavItemsFor(
+  policy: EnvironmentPresentationPolicy,
+): ReadonlyArray<SettingsNavItem> {
+  return policy.showLocalEnvironmentSettings
+    ? [BASE_SETTINGS_NAV_ITEMS[0]!, LOCAL_ENVIRONMENT_NAV_ITEM, ...BASE_SETTINGS_NAV_ITEMS.slice(1)]
+    : BASE_SETTINGS_NAV_ITEMS;
+}
+
 export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+  const policy = readCurrentEnvironmentPresentationPolicy();
+  const navItems = settingsNavItemsFor(policy);
   const navigate = useNavigate();
   const canGoBack = useCanGoBack();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -83,7 +105,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
       <SidebarContent className="overflow-x-hidden">
         <SidebarGroup className="px-2 py-3">
           <SidebarMenu>
-            {SETTINGS_NAV_ITEMS.map((item) => {
+            {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = pathname === item.to;
               return (
@@ -116,7 +138,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
 
       <SidebarSeparator />
       <SidebarFooter className="p-2">
-        <BiBCodeConnectSidebarSignIn />
+        {policy.showRemoteDeviceControls ? <BiBCodeConnectSidebarSignIn /> : null}
         <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
           <SidebarMenu className="min-w-0">
             <SidebarMenuItem>
@@ -130,7 +152,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
-          <BiBCodeConnectSidebarAvatar />
+          {policy.showRemoteDeviceControls ? <BiBCodeConnectSidebarAvatar /> : null}
         </div>
       </SidebarFooter>
     </>
