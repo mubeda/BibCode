@@ -134,7 +134,7 @@ function RootRouteView() {
       <AnchoredToastProvider>
         <DocumentTitleSync />
         {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
-        <SshPasswordPromptDialog />
+        {presentation.showRemoteDeviceControls ? <SshPasswordPromptDialog /> : null}
         <SlowRpcRequestToastCoordinator />
         <HostedStaticEnvironmentBootstrap />
         {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
