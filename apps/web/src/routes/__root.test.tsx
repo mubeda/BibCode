@@ -40,6 +40,7 @@ const s = vi.hoisted(() => ({
   hostedPairing: false,
   hostedStatic: false,
   buttonClicks: [] as Array<() => void>,
+  showRemoteDeviceControls: true,
 }));
 
 // ── React hook instrumentation ───────────────────────────────────────
@@ -165,6 +166,12 @@ vi.mock("../environments/primary", () => ({
 vi.mock("../hostedPairing", () => ({
   hasHostedPairingRequest: () => s.hostedPairing,
   isHostedStaticApp: () => s.hostedStatic,
+}));
+
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => ({
+    showRemoteDeviceControls: s.showRemoteDeviceControls,
+  }),
 }));
 
 vi.mock("../logicalProject", () => ({
@@ -308,6 +315,7 @@ beforeEach(() => {
   s.hostedPairing = false;
   s.hostedStatic = false;
   s.buttonClicks.length = 0;
+  s.showRemoteDeviceControls = true;
   reloadCalls = 0;
   hk.reset();
 
@@ -471,6 +479,15 @@ describe("RootRouteView", () => {
     expect(markup).toContain('data-mock="relay-install"');
     expect(markup).toContain('data-mock="provider-update"');
     runEffects();
+  });
+
+  it("mounts the relay installer in the browser but not the authenticated desktop shell", () => {
+    s.routeContext = { authGateState: { status: "authenticated" } };
+    s.showRemoteDeviceControls = false;
+    expect(renderComponent()).not.toContain('data-mock="relay-install"');
+
+    s.showRemoteDeviceControls = true;
+    expect(renderComponent()).toContain('data-mock="relay-install"');
   });
 
   it("renders the hosted-static shell without the authenticated-only bootstraps", () => {

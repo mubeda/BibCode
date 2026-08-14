@@ -265,6 +265,7 @@ import { getBulkThreadDeletionConfirmation } from "../worktreeCleanup";
 import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
+import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 
 const WorktreeRemovalRequestContext = createContext<
   ((target: WorktreeRemovalTarget) => void) | null
@@ -3645,6 +3646,8 @@ interface SidebarProjectsContentProps {
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   attachProjectListAutoAnimateRef: (node: HTMLElement | null) => void;
   projectAvailability: ReturnType<typeof resolveSidebarProjectAvailability>;
+  showProjectAvailabilityRetry: boolean;
+  showProjectAvailabilityConnectionSettings: boolean;
   onRetryProjectEnvironment: (environmentId: EnvironmentId) => void;
   onOpenProjectSettings: () => void;
   onViewProjectDiagnostics: () => void;
@@ -3691,6 +3694,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     suppressProjectClickForContextMenuRef,
     attachProjectListAutoAnimateRef,
     projectAvailability,
+    showProjectAvailabilityRetry,
+    showProjectAvailabilityConnectionSettings,
     onRetryProjectEnvironment,
     onOpenProjectSettings,
     onViewProjectDiagnostics,
@@ -3882,6 +3887,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 
         <SidebarProjectAvailability
           view={projectAvailability}
+          showRetry={showProjectAvailabilityRetry}
+          showConnectionSettings={showProjectAvailabilityConnectionSettings}
           onRetry={onRetryProjectEnvironment}
           onOpenSettings={onOpenProjectSettings}
           onViewDiagnostics={onViewProjectDiagnostics}
@@ -3895,6 +3902,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 
 export default function Sidebar() {
   const projects = useProjects();
+  const { environments } = useEnvironments();
+  const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const shellSummary = useEnvironmentShellSummary();
   const sidebarThreads = useThreadShells();
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
@@ -3982,6 +3991,24 @@ export default function Sidebar() {
       }),
     [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
   );
+  const projectAvailabilityTarget = useMemo(() => {
+    if (projectAvailability.environmentId === null) {
+      return null;
+    }
+    return (
+      environments.find(
+        (environment) => environment.environmentId === projectAvailability.environmentId,
+      )?.entry.target ?? null
+    );
+  }, [environments, projectAvailability.environmentId]);
+  const showProjectAvailabilityRetry =
+    projectAvailabilityTarget !== null &&
+    presentation.permitsConnectionAction(projectAvailabilityTarget);
+  const showProjectAvailabilityConnectionSettings =
+    presentation.showRemoteDeviceControls ||
+    (presentation.showLocalEnvironmentSettings &&
+      projectAvailabilityTarget !== null &&
+      presentation.presentsTarget(projectAvailabilityTarget));
   const handleRetryProjectEnvironment = useCallback(
     (environmentId: EnvironmentId) => {
       void retryProjectEnvironment(environmentId);
@@ -4020,7 +4047,6 @@ export default function Sidebar() {
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const platform = navigator.platform;
   const shortcutModifiers = useShortcutModifierState();
-  const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const environmentLabelById = useMemo(
     () =>
@@ -4632,6 +4658,8 @@ export default function Sidebar() {
             suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
             attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
             projectAvailability={projectAvailability}
+            showProjectAvailabilityRetry={showProjectAvailabilityRetry}
+            showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
             onRetryProjectEnvironment={handleRetryProjectEnvironment}
             onOpenProjectSettings={handleOpenProjectSettings}
             onViewProjectDiagnostics={handleViewProjectDiagnostics}

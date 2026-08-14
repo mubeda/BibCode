@@ -232,6 +232,7 @@ import {
 import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
+import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
@@ -1393,6 +1394,7 @@ function ChatViewContent(props: ChatViewProps) {
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
+  const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const primaryEnvironment = usePrimaryEnvironment();
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const environmentById = useMemo(
@@ -2299,6 +2301,10 @@ function ChatViewContent(props: ChatViewProps) {
     const items: ComposerBannerStackItem[] = [];
     if (activeEnvironmentUnavailableState) {
       const connection = activeEnvironmentUnavailableState.connection;
+      const target = environmentById.get(activeEnvironmentUnavailableState.environmentId)?.entry
+        ?.target;
+      const permitsReconnect = target !== undefined && presentation.permitsConnectionAction(target);
+      const showConnections = presentation.showRemoteDeviceControls;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
       items.push({
@@ -2309,28 +2315,33 @@ function ChatViewContent(props: ChatViewProps) {
         description:
           connection.error ??
           "Reconnect this environment before sending messages or running actions.",
-        actions: (
-          <>
-            <Button
-              size="xs"
-              disabled={isReconnecting}
-              onClick={() =>
-                void handleReconnectActiveEnvironment(
-                  activeEnvironmentUnavailableState.environmentId,
-                )
-              }
-            >
-              {isReconnecting ? "Reconnecting..." : "Reconnect"}
-            </Button>
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => void navigate({ to: "/settings/connections" })}
-            >
-              Connections
-            </Button>
-          </>
-        ),
+        actions:
+          permitsReconnect || showConnections ? (
+            <>
+              {permitsReconnect ? (
+                <Button
+                  size="xs"
+                  disabled={isReconnecting}
+                  onClick={() =>
+                    void handleReconnectActiveEnvironment(
+                      activeEnvironmentUnavailableState.environmentId,
+                    )
+                  }
+                >
+                  {isReconnecting ? "Reconnecting..." : "Reconnect"}
+                </Button>
+              ) : null}
+              {showConnections ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => void navigate({ to: "/settings/connections" })}
+                >
+                  Connections
+                </Button>
+              ) : null}
+            </>
+          ) : undefined,
       });
     }
     if (workspaceUnavailable) {
@@ -2375,7 +2386,9 @@ function ChatViewContent(props: ChatViewProps) {
     activeEnvironmentUnavailableState,
     activeThread?.id,
     handleReconnectActiveEnvironment,
+    environmentById,
     navigate,
+    presentation,
     providerBinding.conflict,
     showVersionMismatchBanner,
     versionMismatch,
