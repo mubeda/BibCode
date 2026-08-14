@@ -446,7 +446,10 @@ export function ActivityDock({
                     </span>
                   </>
                 ) : (
-                  <span className="min-w-0 flex-1">
+                  <span
+                    className="flex min-w-0 flex-1 flex-col"
+                    data-activity-section-copy="subagents"
+                  >
                     <span
                       className="flex min-w-0 items-center gap-2"
                       data-activity-section-primary="subagents"
@@ -508,7 +511,10 @@ export function ActivityDock({
                     </span>
                   </>
                 ) : (
-                  <span className="min-w-0 flex-1">
+                  <span
+                    className="flex min-w-0 flex-1 flex-col"
+                    data-activity-section-copy="backgroundTasks"
+                  >
                     <span
                       className="flex min-w-0 items-center gap-2"
                       data-activity-section-primary="backgroundTasks"

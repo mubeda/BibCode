@@ -354,11 +354,17 @@ describe("ActivityDock", () => {
     const subagentsPrimary = container.querySelector<HTMLElement>(
       '[data-activity-section-primary="subagents"]',
     );
+    const subagentsCopy = container.querySelector<HTMLElement>(
+      '[data-activity-section-copy="subagents"]',
+    );
     const subagentsMetadata = container.querySelector<HTMLElement>(
       '[data-activity-section-metadata="subagents"]',
     );
     const backgroundTasksPrimary = container.querySelector<HTMLElement>(
       '[data-activity-section-primary="backgroundTasks"]',
+    );
+    const backgroundTasksCopy = container.querySelector<HTMLElement>(
+      '[data-activity-section-copy="backgroundTasks"]',
     );
     const backgroundTasksMetadata = container.querySelector<HTMLElement>(
       '[data-activity-section-metadata="backgroundTasks"]',
@@ -376,6 +382,15 @@ describe("ActivityDock", () => {
     expect(backgroundTasksPrimary?.textContent).toContain("Done 1");
     expect(backgroundTasksMetadata?.textContent).toBe("5m");
     expect(backgroundTasksPrimary?.contains(backgroundTasksMetadata!)).toBe(false);
+
+    for (const [copy, primary, metadata] of [
+      [subagentsCopy, subagentsPrimary, subagentsMetadata],
+      [backgroundTasksCopy, backgroundTasksPrimary, backgroundTasksMetadata],
+    ] as const) {
+      expect(copy?.className).toContain("flex-col");
+      expect(primary?.parentElement).toBe(copy);
+      expect(metadata?.parentElement).toBe(copy);
+    }
   });
 
   it("retains stale/reconnecting counts and labels the card as stale", async () => {
