@@ -28,11 +28,14 @@ Use the project `+` action to create a worktree. The Create Worktree dialog has 
 project selector, Smart/GitHub/Branch/Name modes, an agent picker, advanced
 options, a Create more toggle, and Ctrl+Enter submit.
 
-Use Add Project to select a connected host, open one existing project folder,
-clone a Git URL, or create a new Git repository. Local and mapped WSL hosts use
-the native folder picker; remote and browser-only hosts accept an explicit host
-path. Selecting a folder adds that folder as one project and does not scan for
-nested repositories.
+Use Add Project to open one existing project folder, clone a Git URL, or create
+a new Git repository. On macOS and Linux desktop, Add Project uses this device
+and omits a redundant location selector. On Windows, it shows **Location** when
+a mapped WSL backend is available, offering **This device** and the usable WSL
+locations. Browser clients retain connected-host selection. Local and mapped
+WSL locations use the native folder picker; browser-only remote hosts accept an
+explicit host path. Selecting a folder adds that folder as one project and does
+not scan for nested repositories.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
 delete worktree for worktree rows and remove project for primary rows. On the
@@ -53,8 +56,11 @@ rows grouped by connected environment and project.
 Adding a discovered row adopts that exact server-observed candidate as an
 ordinary workspace. It does not create a Git worktree and does not run the
 project's worktree-creation script. Concurrent clicks converge on the same
-workspace. Candidate rows expose the full host path in their tooltip and
-accessible name, but the client submits only the project, opaque catalog key,
+workspace. Discovered rows are grouped beneath their parent directory and use
+compact branch or detached-HEAD labels. When labels would otherwise duplicate,
+the row adds its final path component as a discriminator. The full host path is
+available in a tooltip and accessible name; the compact row copy is separately
+keyboard-focusable. The client submits only the project, opaque catalog key,
 generation, and command data; the server rechecks the path and repository.
 
 Catalog controls are absent for servers without the capability. Active
@@ -202,8 +208,8 @@ Activity combines provider-attributed observation with capability-gated
 control. The dock shows one provider icon for the active scope; each Subagents
 row shows one provider icon for its actor. Active and Done counts are the only
 multiplicity signal: they are primary row content, while elapsed time is
-secondary metadata. The same Activity presentation is used in the inline right
-panel and its responsive sheet.
+secondary metadata aligned beneath the section title. The same Activity
+presentation is used in the inline right panel and its responsive sheet.
 
 Subagents follow the canonical actor hierarchy, using indentation and a
 connector for a visible parent. Missing, invalid, cyclic, or otherwise unusable
