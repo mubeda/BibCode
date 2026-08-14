@@ -331,6 +331,7 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::TestSandbox;
 
     fn tunnel_config() -> Value {

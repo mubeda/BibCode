@@ -5,6 +5,8 @@ import {
   GitCommandError,
   GitManagerError,
   GitManagerServiceError,
+  VcsCreateWorktreeInput,
+  VcsRemoveWorktreeInput,
   GitPreparePullRequestThreadInput,
   GitPullRequestMaterializationError,
   GitRunStackedActionResult,
@@ -19,6 +21,8 @@ import {
   makeInvalidClassInstance,
 } from "./test/schemaAssertions.ts";
 
+const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
+const decodeRemoveWorktreeInput = Schema.decodeUnknownSync(VcsRemoveWorktreeInput);
 const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
   GitPreparePullRequestThreadInput,
 );
@@ -27,6 +31,75 @@ const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActio
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
+
+describe("VcsCreateWorktreeInput", () => {
+  it("accepts omitted newRefName for existing-refName worktrees", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "feature/existing",
+      path: "/tmp/worktree",
+    });
+
+    expect(parsed.newRefName).toBeUndefined();
+    expect(parsed.refName).toBe("feature/existing");
+  });
+
+  it("accepts explicit null refs for existing-ref worktrees", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "feature/existing",
+      newRefName: null,
+      baseRefName: null,
+      path: null,
+    });
+
+    expect(parsed.newRefName).toBeNull();
+    expect(parsed.baseRefName).toBeNull();
+  });
+
+  it("accepts baseRefName metadata for a new worktree ref", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "0123456789abcdef",
+      newRefName: "feature/new",
+      baseRefName: "origin/main",
+      path: "/tmp/worktree",
+    });
+
+    expect(parsed.baseRefName).toBe("origin/main");
+  });
+});
+
+describe("VcsRemoveWorktreeInput", () => {
+  it("requires every terminal-owning thread to be fenced by the server", () => {
+    const parsed = decodeRemoveWorktreeInput({
+      cwd: "/repo",
+      path: "/repo-worktrees/feature",
+      force: true,
+      ownerThreadId: "workspace-thread",
+      threadIds: ["workspace-thread", "panel-thread"],
+    });
+
+    expect(parsed.ownerThreadId).toBe("workspace-thread");
+    expect(parsed.threadIds).toEqual(["workspace-thread", "panel-thread"]);
+    expect(() =>
+      decodeRemoveWorktreeInput({
+        cwd: "/repo",
+        path: "/repo-worktrees/feature",
+        force: true,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRemoveWorktreeInput({
+        cwd: "/repo",
+        path: "/repo-worktrees/feature",
+        force: true,
+        ownerThreadId: "workspace-thread",
+        threadIds: [],
+      }),
+    ).toThrow();
+  });
+});
 
 describe("GitPreparePullRequestThreadInput", () => {
   it("accepts only local preparation without client-directed owner identity", () => {

@@ -6,6 +6,7 @@ use bibcode_server::persistence::{
     ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
     ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
     WorktreeRepositoryPinOutcome, run_migrations,
+    WorktreeRemovalReceipt, run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -315,6 +316,7 @@ fn public_repository_api_inventory_is_explicit() {
         "get_thread",
         "get_thread_session",
         "get_turn_by_id",
+        "get_worktree_removal_receipt",
         "list_active_auth_pairing_links",
         "list_active_auth_sessions",
         "list_activities_by_thread",
@@ -341,6 +343,7 @@ fn public_repository_api_inventory_is_explicit() {
         "reserve_command_receipt",
         "replace_pending_provider_turn_payload",
         "replace_pending_turn_start",
+        "prepare_worktree_removal_receipt",
         "revoke_auth_pairing_link",
         "revoke_auth_session",
         "revoke_other_auth_sessions",
@@ -359,6 +362,7 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_thread_session",
         "upsert_turn_by_id",
         "verify_prepared_command_receipt",
+        "complete_worktree_removal_receipt",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -409,6 +413,50 @@ async fn worktree_catalog_projection_read_is_consistent_filtered_and_bounded() {
         ["workspace-1", "workspace-2"]
     );
     assert!(projection.truncated);
+async fn worktree_removal_receipts_are_insert_only_until_marked_removed() {
+    let repositories = migrated_repositories().await;
+    let receipt = WorktreeRemovalReceipt {
+        owner_thread_id: "workspace-1".to_owned(),
+        project_cwd: "C:/repo".to_owned(),
+        worktree_path: "C:/worktrees/feature".to_owned(),
+        identity_nonce: "identity-1".to_owned(),
+        state: "prepared".to_owned(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let inserted = repositories
+        .prepare_worktree_removal_receipt(receipt.clone())
+        .await
+        .expect("receipt insert");
+    assert_eq!(inserted.owner_thread_id, receipt.owner_thread_id);
+    assert_eq!(inserted.identity_nonce, receipt.identity_nonce);
+    assert_eq!(inserted.state, "prepared");
+
+    let conflicting = repositories
+        .prepare_worktree_removal_receipt(WorktreeRemovalReceipt {
+            identity_nonce: "identity-2".to_owned(),
+            ..receipt.clone()
+        })
+        .await
+        .expect("duplicate receipt read");
+    assert_eq!(conflicting.identity_nonce, "identity-1");
+
+    repositories
+        .complete_worktree_removal_receipt(
+            receipt.owner_thread_id.clone(),
+            receipt.identity_nonce.clone(),
+        )
+        .await
+        .expect("receipt completion");
+    assert_eq!(
+        repositories
+            .get_worktree_removal_receipt(receipt.owner_thread_id)
+            .await
+            .expect("receipt lookup")
+            .expect("receipt exists")
+            .state,
+        "removed"
+    );
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     SubprocessInspection, TerminalAttachment, TerminalError, TerminalManager,
     TerminalManagerOptions, TerminalMetadataAttachment, TerminalSubprocessInspector,
+    WorktreeRemovalGuard,
 };
 pub use model::{
     ProviderTerminalActivityLaunch, TerminalAttachInput, TerminalConsoleTheme, TerminalEvent,

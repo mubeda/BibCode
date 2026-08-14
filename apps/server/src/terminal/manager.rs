@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, LazyLock, mpsc},
     time::Duration,
@@ -174,6 +174,8 @@ pub enum TerminalError {
     Io(String),
     #[error("terminal processes did not exit before cleanup timed out")]
     Close,
+    #[error("worktree removal is in progress for terminal thread: {thread_id}")]
+    WorktreeRemovalInProgress { thread_id: String },
 }
 
 struct Session {
@@ -1194,6 +1196,194 @@ struct SessionOperationRegistry {
     operations: std::sync::Mutex<HashMap<SessionKey, std::sync::Weak<Mutex<()>>>>,
 }
 
+#[derive(Debug, Default)]
+struct WorktreeRemovalRegistry {
+    threads: std::sync::Mutex<HashSet<String>>,
+    paths: std::sync::Mutex<HashSet<String>>,
+}
+
+impl WorktreeRemovalRegistry {
+    fn acquire(
+        self: &Arc<Self>,
+        thread_ids: &[String],
+        worktree_path: &Path,
+    ) -> Result<WorktreeRemovalGuard, TerminalError> {
+        let mut unique = thread_ids
+            .iter()
+            .filter(|thread_id| !thread_id.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        unique.sort();
+        unique.dedup();
+        let path_keys = terminal_path_keys(worktree_path);
+        let mut threads = self.threads.lock().expect("worktree removal registry lock");
+        let mut paths = self
+            .paths
+            .lock()
+            .expect("worktree removal path registry lock");
+        if let Some(thread_id) = unique
+            .iter()
+            .find(|thread_id| threads.contains(thread_id.as_str()))
+        {
+            return Err(TerminalError::WorktreeRemovalInProgress {
+                thread_id: thread_id.clone(),
+            });
+        }
+        if path_keys.iter().any(|candidate| {
+            paths.iter().any(|root| {
+                terminal_path_is_within(candidate, root) || terminal_path_is_within(root, candidate)
+            })
+        }) {
+            return Err(TerminalError::WorktreeRemovalInProgress {
+                thread_id: unique
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| display_terminal_path(worktree_path)),
+            });
+        }
+        threads.extend(unique.iter().cloned());
+        paths.extend(path_keys.iter().cloned());
+        drop(paths);
+        drop(threads);
+        Ok(WorktreeRemovalGuard {
+            registry: self.clone(),
+            thread_ids: unique,
+            path_keys,
+        })
+    }
+
+    fn ensure_available(
+        &self,
+        thread_id: &str,
+        cwd: Option<&Path>,
+        worktree_path: Option<&Path>,
+    ) -> Result<(), TerminalError> {
+        let thread_blocked = self
+            .threads
+            .lock()
+            .expect("worktree removal registry lock")
+            .contains(thread_id);
+        let path_blocked = {
+            let paths = self
+                .paths
+                .lock()
+                .expect("worktree removal path registry lock");
+            [cwd, worktree_path]
+                .into_iter()
+                .flatten()
+                .flat_map(terminal_path_keys)
+                .any(|candidate| {
+                    paths
+                        .iter()
+                        .any(|root| terminal_path_is_within(&candidate, root))
+                })
+        };
+        if thread_blocked || path_blocked {
+            return Err(TerminalError::WorktreeRemovalInProgress {
+                thread_id: thread_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct WorktreeRemovalGuard {
+    registry: Arc<WorktreeRemovalRegistry>,
+    thread_ids: Vec<String>,
+    path_keys: Vec<String>,
+}
+
+impl Drop for WorktreeRemovalGuard {
+    fn drop(&mut self) {
+        let mut threads = self
+            .registry
+            .threads
+            .lock()
+            .expect("worktree removal registry lock");
+        for thread_id in &self.thread_ids {
+            threads.remove(thread_id);
+        }
+        drop(threads);
+        let mut paths = self
+            .registry
+            .paths
+            .lock()
+            .expect("worktree removal path registry lock");
+        for path_key in &self.path_keys {
+            paths.remove(path_key);
+        }
+    }
+}
+
+fn display_terminal_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn terminal_path_keys(path: &Path) -> Vec<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let lexical = normalize_terminal_path_lexically(&absolute);
+    let mut keys = vec![terminal_path_key_from_absolute(&lexical)];
+    if let Ok(canonical) = std::fs::canonicalize(&lexical) {
+        keys.push(terminal_path_key_from_absolute(&canonical));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn normalize_terminal_path_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn terminal_path_key_from_absolute(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(value) = key.strip_prefix("//?/UNC/") {
+            key = format!("//{value}");
+        } else if let Some(value) = key.strip_prefix("//?/") {
+            key = value.to_owned();
+        }
+    }
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    key
+}
+
+fn terminal_path_is_within(candidate: &str, root: &str) -> bool {
+    candidate == root
+        || candidate
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 impl SessionOperationRegistry {
     fn for_key(&self, key: &SessionKey) -> Arc<Mutex<()>> {
         let mut operations = self
@@ -1313,6 +1503,7 @@ struct Inner {
     callback_isolation: ObserverCallbackIsolation,
     lifecycle: Mutex<()>,
     operations: SessionOperationRegistry,
+    worktree_removals: Arc<WorktreeRemovalRegistry>,
     generations: SessionGenerationRegistry,
     sessions: RwLock<HashMap<SessionKey, SharedSession>>,
     events: broadcast::Sender<TerminalEvent>,
@@ -1370,6 +1561,7 @@ impl TerminalManager {
                 callback_isolation: ObserverCallbackIsolation::default(),
                 lifecycle: Mutex::new(()),
                 operations: SessionOperationRegistry::default(),
+                worktree_removals: Arc::new(WorktreeRemovalRegistry::default()),
                 generations: SessionGenerationRegistry::new(
                     tokio::runtime::Handle::try_current().ok(),
                 ),
@@ -1448,6 +1640,11 @@ impl TerminalManager {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let generation = {
             let _lifecycle = self.inner.lifecycle.lock().await;
+            self.inner.worktree_removals.ensure_available(
+                &input.thread_id,
+                Some(&input.cwd),
+                input.worktree_path.as_deref(),
+            )?;
             if self.inner.cancellation.is_cancelled() {
                 return Err(TerminalError::Shutdown);
             }
@@ -1488,6 +1685,11 @@ impl TerminalManager {
         let _operation = operation.lock_owned().await;
         let (displaced, generation, _startup) = {
             let _lifecycle = self.inner.lifecycle.lock().await;
+            self.inner.worktree_removals.ensure_available(
+                &input.thread_id,
+                Some(&input.cwd),
+                input.worktree_path.as_deref(),
+            )?;
             if self.inner.cancellation.is_cancelled() {
                 return Err(TerminalError::Shutdown);
             }
@@ -1572,6 +1774,11 @@ impl TerminalManager {
         initial_input: Option<String>,
         publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.inner.worktree_removals.ensure_available(
+            &input.thread_id,
+            Some(&input.cwd),
+            input.worktree_path.as_deref(),
+        )?;
         if generation.is_invalidated() {
             return Err(invalidated_creation_error(&input));
         }
@@ -1934,6 +2141,11 @@ impl TerminalManager {
                 .await;
             return Err(TerminalError::PublicationCancelled);
         }
+        self.inner.worktree_removals.ensure_available(
+            &input.thread_id,
+            Some(&input.cwd),
+            input.worktree_path.as_deref(),
+        )?;
         if self.inner.cancellation.is_cancelled() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::Shutdown)
@@ -2312,6 +2524,11 @@ impl TerminalManager {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let request_generation = {
             let _lifecycle = self.inner.lifecycle.lock().await;
+            self.inner.worktree_removals.ensure_available(
+                &input.thread_id,
+                input.cwd.as_deref(),
+                input.worktree_path.as_deref(),
+            )?;
             if self.inner.cancellation.is_cancelled() {
                 return Err(TerminalError::Shutdown);
             }
@@ -2561,6 +2778,48 @@ impl TerminalManager {
             return Err(TerminalError::Close);
         }
         Ok(())
+    }
+
+    pub async fn begin_worktree_removal(
+        &self,
+        thread_ids: &[String],
+        worktree_path: &Path,
+    ) -> Result<WorktreeRemovalGuard, TerminalError> {
+        let guard = {
+            let _lifecycle = self.inner.lifecycle.lock().await;
+            if self.inner.cancellation.is_cancelled() {
+                return Err(TerminalError::Shutdown);
+            }
+            let path_keys = terminal_path_keys(worktree_path);
+            let sessions = self.inner.sessions.read().await;
+            let mut fenced_thread_ids = thread_ids.to_vec();
+            for session in sessions.values() {
+                let session = session.lock().await;
+                let belongs_to_worktree = [
+                    session.cwd.as_str(),
+                    session.worktree_path.as_deref().unwrap_or(""),
+                ]
+                .into_iter()
+                .filter(|path| !path.is_empty())
+                .flat_map(|path| terminal_path_keys(Path::new(path)))
+                .any(|candidate| {
+                    path_keys
+                        .iter()
+                        .any(|root| terminal_path_is_within(&candidate, root))
+                });
+                if belongs_to_worktree {
+                    fenced_thread_ids.push(session.thread_id.clone());
+                }
+            }
+            drop(sessions);
+            self.inner
+                .worktree_removals
+                .acquire(&fenced_thread_ids, worktree_path)?
+        };
+        for thread_id in &guard.thread_ids {
+            self.close(thread_id, None).await?;
+        }
+        Ok(guard)
     }
 
     /// Stops every live terminal process for a thread while retaining the
@@ -2867,6 +3126,7 @@ async fn wait_for_terminal_process_tree_exit(
     process: Arc<dyn PtyProcess>,
     mut root_exit: tokio::sync::watch::Receiver<Option<PtyExit>>,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + TERMINAL_CLOSE_WAIT_TIMEOUT;
     let tree_process = Arc::clone(&process);
     let tree_exit = tokio::task::spawn_blocking(move || {
         tree_process.wait_for_process_tree_exit(TERMINAL_CLOSE_WAIT_TIMEOUT)
@@ -2875,25 +3135,22 @@ async fn wait_for_terminal_process_tree_exit(
     .map_err(|error| format!("process-tree wait task failed: {error}"))??;
 
     match tree_exit {
-        Some(true) => Ok(()),
+        Some(true) => {
+            if wait_for_terminal_root_exit(&mut root_exit, deadline).await {
+                Ok(())
+            } else {
+                Err(format!(
+                    "process did not finish reaping within {} ms",
+                    TERMINAL_CLOSE_WAIT_TIMEOUT.as_millis()
+                ))
+            }
+        }
         Some(false) => Err(format!(
             "process tree did not exit within {} ms",
             TERMINAL_CLOSE_WAIT_TIMEOUT.as_millis()
         )),
         None => {
-            let already_exited = root_exit.borrow().is_some();
-            let exited = already_exited
-                || tokio::time::timeout(TERMINAL_CLOSE_WAIT_TIMEOUT, async {
-                    while root_exit.borrow().is_none() {
-                        root_exit.changed().await.map_err(|_| ())?;
-                    }
-                    Ok::<(), ()>(())
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .is_some();
-            if exited {
+            if wait_for_terminal_root_exit(&mut root_exit, deadline).await {
                 Ok(())
             } else {
                 Err(format!(
@@ -2903,6 +3160,23 @@ async fn wait_for_terminal_process_tree_exit(
             }
         }
     }
+}
+
+async fn wait_for_terminal_root_exit(
+    root_exit: &mut tokio::sync::watch::Receiver<Option<PtyExit>>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    root_exit.borrow().is_some()
+        || tokio::time::timeout_at(deadline, async {
+            while root_exit.borrow().is_none() {
+                root_exit.changed().await.map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some()
 }
 
 fn log_terminal_cleanup(operation: &'static str, report: &ProcessCleanupReport) {
@@ -3502,6 +3776,13 @@ mod tests {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
 
+        fn report_process_tree_exited(&self) {
+            self.tree_exit_supported
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.tree_exited
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         fn keep_process_tree_running(&self) {
             self.tree_exit_supported
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3828,6 +4109,48 @@ mod tests {
         assert!(
             !close.is_finished(),
             "close returned before the killed process released its resources"
+        );
+
+        process.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), close)
+            .await
+            .expect("terminal close timed out")
+            .expect("terminal close task");
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_root_reaping_after_the_process_tree_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-tree-reaping",
+                "term-tree-reaping",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let process = backend.latest();
+        process.delay_exit_on_kill();
+        process.report_process_tree_exited();
+        let close_manager = manager.clone();
+        let close = tokio::spawn(async move {
+            close_manager
+                .close("thread-tree-reaping", Some("term-tree-reaping"))
+                .await
+                .unwrap();
+        });
+
+        while !process.is_killed() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !close.is_finished(),
+            "close returned after the process tree exited but before root reaping completed"
         );
 
         process.exit(0);
@@ -4233,6 +4556,203 @@ mod tests {
                 .is_err(),
             "invalidated process published terminal metadata"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_removal_fence_invalidates_inflight_spawn_and_rejects_late_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let (first_started, first_started_rx) = std::sync::mpsc::channel();
+        let (first_release, first_release_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(FirstSpawnBlockingBackend {
+            processes: std::sync::Mutex::new(Vec::new()),
+            spawn_count: std::sync::atomic::AtomicUsize::new(0),
+            first_started: std::sync::Mutex::new(Some(first_started)),
+            first_release: std::sync::Mutex::new(first_release_rx),
+            second_spawned: tokio::sync::Semaphore::new(0),
+        });
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let opening_manager = manager.clone();
+        let opening_root = root.path().to_path_buf();
+        let opening = tokio::spawn(async move {
+            opening_manager
+                .open(TerminalOpenInput::new(
+                    "thread-worktree-removal",
+                    "terminal-inflight",
+                    opening_root,
+                    80,
+                    24,
+                ))
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            first_started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first spawn did not start");
+        })
+        .await
+        .expect("spawn-start wait");
+
+        let removal = manager
+            .begin_worktree_removal(&["unrelated-client-thread".to_owned()], root.path())
+            .await
+            .expect("worktree removal fence");
+        let late_open = manager
+            .open(TerminalOpenInput::new(
+                "another-unlisted-thread",
+                "terminal-late",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+        assert!(
+            matches!(
+                late_open,
+                Err(TerminalError::WorktreeRemovalInProgress { .. })
+            ),
+            "late terminal launch bypassed the worktree-removal fence"
+        );
+
+        first_release.send(()).expect("release first spawn");
+        assert!(
+            matches!(
+                opening.await.expect("opening task"),
+                Err(TerminalError::NotFound { .. })
+                    | Err(TerminalError::WorktreeRemovalInProgress { .. })
+            ),
+            "in-flight terminal launch survived the path-scoped removal fence"
+        );
+        assert!(
+            backend
+                .processes
+                .lock()
+                .expect("processes lock")
+                .first()
+                .is_some_and(|process| process.is_killed()),
+            "invalidated terminal process was not killed"
+        );
+
+        drop(removal);
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-worktree-removal",
+                "terminal-after-failure",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("dropping a failed-removal fence permits an explicit later launch");
+        assert_eq!(
+            backend
+                .spawn_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_removal_path_fence_rejects_late_attach_and_restart_without_client_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::default();
+        manager
+            .open(TerminalOpenInput::new(
+                "server-known-thread",
+                "terminal-existing",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("initial terminal");
+
+        let removal = manager
+            .begin_worktree_removal(&["unrelated-client-thread".to_owned()], root.path())
+            .await
+            .expect("path-scoped worktree removal fence");
+
+        let attach = manager
+            .attach(TerminalAttachInput {
+                thread_id: "server-known-thread".to_owned(),
+                terminal_id: "terminal-existing".to_owned(),
+                cwd: None,
+                worktree_path: None,
+                cols: None,
+                rows: None,
+                env: std::collections::BTreeMap::new(),
+                restart_if_not_running: false,
+                command: None,
+            })
+            .await;
+        assert!(matches!(
+            attach,
+            Err(TerminalError::WorktreeRemovalInProgress { .. })
+        ));
+
+        let restart = manager
+            .restart(TerminalOpenInput::new(
+                "different-thread-id",
+                "terminal-restart",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+        assert!(matches!(
+            restart,
+            Err(TerminalError::WorktreeRemovalInProgress { .. })
+        ));
+
+        drop(removal);
+    }
+
+    #[test]
+    fn worktree_removal_registry_collapses_parent_directory_aliases() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let worktree = root.path().join("worktree");
+        let child = worktree.join("child");
+        std::fs::create_dir_all(&child).expect("worktree fixture");
+        let aliased_worktree = child.join("..");
+        let registry = Arc::new(WorktreeRemovalRegistry::default());
+        let _guard = registry
+            .acquire(&[], &worktree)
+            .expect("worktree removal fence");
+
+        assert!(matches!(
+            registry.ensure_available("unlisted-thread", Some(&aliased_worktree), None),
+            Err(TerminalError::WorktreeRemovalInProgress { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_removal_registry_resolves_windows_junction_aliases() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let worktree = root.path().join("worktree");
+        let alias = root.path().join("worktree-alias");
+        std::fs::create_dir(&worktree).expect("worktree fixture");
+        if let Err(error) = junction::create(&worktree, &alias) {
+            eprintln!("skipping junction assertion: Windows denied junction creation: {error}");
+            return;
+        }
+        let registry = Arc::new(WorktreeRemovalRegistry::default());
+        let guard = registry
+            .acquire(&[], &worktree)
+            .expect("worktree removal fence");
+
+        assert!(matches!(
+            registry.ensure_available("unlisted-thread", Some(&alias), None),
+            Err(TerminalError::WorktreeRemovalInProgress { .. })
+        ));
+
+        drop(guard);
+        junction::delete(&alias).expect("remove fixture junction");
     }
 
     #[tokio::test]

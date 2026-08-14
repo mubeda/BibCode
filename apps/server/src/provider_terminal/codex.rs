@@ -2045,7 +2045,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                     .stderr(Stdio::null());
             });
             configure_supervised_background_command_wrap(&mut command);
-            let child = command
+            let mut child = command
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
             #[cfg(test)]
@@ -2317,7 +2317,7 @@ impl CodexHelperSupervisor {
 
     fn supervise(
         &self,
-        child: Box<dyn ChildWrapper>,
+        mut child: Box<dyn ChildWrapper>,
         socket_path: PathBuf,
         ownership: CodexHelperSupervisionOwnership,
         readiness_timeout: Duration,
