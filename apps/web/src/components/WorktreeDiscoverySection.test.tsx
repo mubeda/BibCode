@@ -388,6 +388,76 @@ describe("WorktreeDiscoverySection", () => {
     expect(document.querySelector("script")).toBeNull();
   });
 
+  it.each([
+    ["initial card", "hidden"],
+    ["shown rows", "shown"],
+  ] as const)(
+    "renders parent-once compact candidates with stable trailing actions in the %s",
+    async (_mode, visibility) => {
+      const hotfixPath = "/Users/admin/conductor/workspaces/pathfinder-hotfix";
+      const reviewPath = "/Users/admin/conductor/workspaces/pathfinder-review";
+      const alphaPath = "/Users/admin/orca/workspaces/alpha";
+      const candidates = [
+        candidate(reviewPath, "hotfix/PFS-1817"),
+        candidate(alphaPath, "alpha"),
+        candidate(hotfixPath, "hotfix/PFS-1817"),
+      ];
+      testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot(candidates));
+
+      await mount(
+        <WorktreeDiscoverySection
+          project={project(visibility)}
+          serverConfigs={serverConfigs(true)}
+          onNavigateToThread={testState.navigate}
+        />,
+      );
+
+      const parentRows = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-worktree-parent-directory]"),
+      );
+      expect(parentRows.map((row) => row.textContent)).toEqual([
+        "/Users/admin/conductor/workspaces",
+        "/Users/admin/orca/workspaces",
+      ]);
+
+      const candidateRows = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-worktree-candidate-row]"),
+      );
+      expect(candidateRows).toHaveLength(3);
+      const expectedCopy = [
+        ["hotfix/PFS-1817pathfinder-hotfix", hotfixPath],
+        ["hotfix/PFS-1817pathfinder-review", reviewPath],
+        ["alpha", alphaPath],
+      ] as const;
+
+      for (const [index, [visibleCopy, path]] of expectedCopy.entries()) {
+        const candidateRow = candidateRows[index]!;
+        const copy = candidateRow.querySelector<HTMLElement>("[data-worktree-candidate-copy]");
+        expect(copy?.textContent).toBe(visibleCopy);
+        expect(copy?.textContent).not.toContain(path);
+        expect(copy?.className).toContain("min-w-0");
+        expect(copy?.className).toContain("overflow-hidden");
+        expect(copy?.tabIndex).toBe(0);
+        expect(copy?.getAttribute("aria-label")).toBe(
+          `Full worktree path for ${index < 2 ? "hotfix/PFS-1817" : "alpha"} in ${LOCAL_ACCESSIBLE_SCOPE}: ${path}`,
+        );
+        expect(copy?.querySelector<HTMLElement>("span")?.className.split(/\s+/)).toEqual(
+          expect.arrayContaining(["block", "max-w-full", "truncate"]),
+        );
+        expect(
+          Array.from(candidateRow.querySelectorAll<HTMLElement>("[data-mock='tooltip-popup']"))
+            .map((popup) => popup.textContent)
+            .filter((text) => text === path),
+        ).toHaveLength(1);
+
+        const addAction = candidateRow.lastElementChild as HTMLButtonElement | null;
+        expect(addAction?.getAttribute("data-worktree-add-action")).toBe("true");
+        expect(addAction?.className).toContain("shrink-0");
+        expect(addAction?.getAttribute("aria-label")).toContain(` at ${path} to BiBCode`);
+      }
+    },
+  );
+
   it("adds one candidate and navigates to the returned scoped workspace", async () => {
     const discovered = candidate("/worktrees/one", "feature/one");
     testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot([discovered]));

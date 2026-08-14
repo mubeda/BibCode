@@ -16,6 +16,7 @@ export interface WorktreeDiscoverySource {
 export interface WorktreeDiscoveryCandidatePresentation {
   readonly candidate: VcsWorktreeDescriptor;
   readonly label: string;
+  readonly discriminator: string | null;
 }
 
 export interface WorktreeDiscoveryParentGroup {
@@ -50,6 +51,11 @@ function getParentDirectoryForDisplay(path: string): string {
   return path.slice(0, separatorIndex);
 }
 
+function getFinalPathComponentForDisplay(path: string): string {
+  const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return separatorIndex < 0 ? path : path.slice(separatorIndex + 1);
+}
+
 export function getWorktreeCandidateLabel(candidate: VcsWorktreeDescriptor): string {
   if (candidate.branch !== null) {
     return candidate.branch;
@@ -67,6 +73,7 @@ export function buildWorktreeDiscoveryGroups(
         const parentDirectory = getParentDirectoryForDisplay(candidate.path);
         const presentation = {
           candidate,
+          discriminator: null,
           label: getWorktreeCandidateLabel(candidate),
         };
         const existing = candidatesByParent.get(parentDirectory);
@@ -83,14 +90,27 @@ export function buildWorktreeDiscoveryGroups(
         projectId: source.projectId,
         parentGroups: [...candidatesByParent]
           .sort(([left], [right]) => compareSidebarDisplayText(left, right))
-          .map(([parentDirectory, candidates]) => ({
-            parentDirectory,
-            candidates: candidates.sort(
+          .map(([parentDirectory, candidates]) => {
+            candidates.sort(
               (left, right) =>
                 compareSidebarDisplayText(left.label, right.label) ||
                 compareSidebarDisplayText(left.candidate.path, right.candidate.path),
-            ),
-          })),
+            );
+            const labelCounts = new Map<string, number>();
+            for (const item of candidates) {
+              labelCounts.set(item.label, (labelCounts.get(item.label) ?? 0) + 1);
+            }
+            return {
+              parentDirectory,
+              candidates: candidates.map((item) => ({
+                ...item,
+                discriminator:
+                  (labelCounts.get(item.label) ?? 0) > 1
+                    ? getFinalPathComponentForDisplay(item.candidate.path)
+                    : null,
+              })),
+            };
+          }),
       };
     })
     .sort(
