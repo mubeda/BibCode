@@ -246,6 +246,44 @@ afterEach(async () => {
 });
 
 describe("LocalEnvironmentSettings", () => {
+  it("renders an accessible unavailable row when the desktop bridge is missing", async () => {
+    const container = await mount();
+
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert).not.toBeNull();
+    expect(alert!.textContent).toContain("Desktop bridge unavailable");
+    expect(container.textContent).toContain("WSL backend unavailable");
+    expect(container.textContent).toContain(
+      "Desktop integration is unavailable. Restart BiBCode to manage the local WSL backend.",
+    );
+    expect(container.textContent).not.toContain("Add environment");
+  });
+
+  it("renders an accessible loading row while WSL state is pending", async () => {
+    installDesktopBridge();
+    h.wslQuery = { data: null, error: null, isPending: true };
+    const container = await mount();
+
+    const status = container.querySelector('[role="status"]');
+    expect(status).not.toBeNull();
+    expect(status!.textContent).toContain("Loading WSL backend settings");
+    expect(container.textContent).toContain("WSL backend");
+    expect(findControls("button", "Retry")).toHaveLength(0);
+  });
+
+  it("renders a retryable accessible unavailable row when no WSL state is returned", async () => {
+    installDesktopBridge();
+    h.wslQuery = { data: null, error: null, isPending: false };
+    const container = await mount();
+
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert).not.toBeNull();
+    expect(alert!.textContent).toContain("WSL backend state unavailable");
+    expect(container.textContent).toContain("Couldn't load the WSL backend state.");
+    await act(async () => invoke(control("button", "Retry"), "onClick"));
+    expect(h.refreshDesktopWslState).toHaveBeenCalledTimes(1);
+  });
+
   it("renders only Windows-local WSL settings and no remote controls", async () => {
     installDesktopBridge();
     h.environments = [{ entry: { target: { _tag: "DesktopLocalConnectionTarget" } } }];
