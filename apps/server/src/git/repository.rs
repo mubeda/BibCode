@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fmt, fs,
     future::Future,
-    io,
+    io::{self, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -11,6 +11,7 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::diagnostics::redact_sensitive_text;
 
@@ -30,6 +31,9 @@ const CLONE_OPERATION: &str = "GitVcsDriver.clone";
 const MAX_AUTOMATIC_WORKTREE_SUFFIX_ATTEMPTS: usize = 100;
 const WORKTREE_REMOVE_RETRY_ATTEMPTS: usize = 20;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const WORKTREE_REMOVAL_IDENTITY_FILE: &str = "bibcode-removal-identity";
+const WORKTREE_REMOVAL_ROOT_IDENTITY_FILE: &str = ".bibcode-removal-identity";
+const WORKTREE_REMOVAL_TOMBSTONE_FILE: &str = ".bibcode-removal-tombstone";
 
 pub type BoxWorktreeBaseDirectoryFuture<'a> =
     Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>>;
@@ -1130,43 +1134,27 @@ impl GitRepository {
         owned_path: &OwnedWorktreePath,
     ) -> Result<(), GitCommandError> {
         let cleanup_token = CancellationToken::new();
-        let removal_error = self
-            .remove_worktree(cwd, owned_path.path(), true, &cleanup_token)
-            .await
-            .err();
-        let filesystem_error = match tokio::fs::remove_dir_all(owned_path.path()).await {
-            Ok(()) => None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => Some(error),
-        };
-        let still_registered = self
-            .worktree_paths(cwd, &cleanup_token)
-            .await?
-            .iter()
-            .any(|registered| same_worktree_path(registered, owned_path.path()));
-        if still_registered {
-            return Err(removal_error.unwrap_or_else(|| {
-                simple_error(
-                    "GitVcsDriver.createWorktree.cleanup",
-                    cwd,
-                    &format!(
-                        "The owned worktree '{}' is still registered after cleanup.",
-                        display_path(owned_path.path())
-                    ),
-                )
-            }));
-        }
-        if let Some(error) = filesystem_error {
-            return Err(simple_error(
+        self.remove_worktree(cwd, owned_path.path(), true, &cleanup_token)
+            .await?;
+        match tokio::fs::symlink_metadata(owned_path.path()).await {
+            Ok(_) => Err(simple_error(
                 "GitVcsDriver.createWorktree.cleanup",
                 cwd,
                 &format!(
-                    "The owned worktree path '{}' could not be removed: {error}",
+                    "The owned worktree path '{}' still exists after protected cleanup.",
                     display_path(owned_path.path())
                 ),
-            ));
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(simple_error(
+                "GitVcsDriver.createWorktree.cleanup",
+                cwd,
+                &format!(
+                    "The owned worktree path '{}' could not be inspected after protected cleanup: {error}",
+                    display_path(owned_path.path())
+                ),
+            )),
         }
-        Ok(())
     }
 
     async fn local_branch_exists(
@@ -1234,15 +1222,20 @@ impl GitRepository {
             .position(|registered| same_worktree_path(registered, path));
         let was_registered = registered_index.is_some();
         if force && registered_index.is_some_and(|index| index > 0) {
-            if !self
-                .is_registered_linked_worktree_path(cwd, path, cancellation)
-                .await
-            {
-                return Err(registered_worktree_identity_error(cwd, path));
-            }
-            remove_worktree_contents(path, cancellation)
-                .await
-                .map_err(|error| worktree_cleanup_error(cwd, path, &error))?;
+            let nonce = self
+                .prepare_worktree_removal_identity(cwd, path, cancellation)
+                .await?;
+            return self
+                .remove_worktree_with_identity(cwd, path, true, &nonce, cancellation)
+                .await;
+        }
+        if force && !was_registered && self.is_managed_orphaned_worktree_path(cwd, path).await {
+            let nonce = self
+                .prepare_worktree_removal_identity(cwd, path, cancellation)
+                .await?;
+            return self
+                .remove_worktree_with_identity(cwd, path, true, &nonce, cancellation)
+                .await;
         }
         let mut args = strings(&["worktree", "remove"]);
         if force {
@@ -1269,17 +1262,9 @@ impl GitRepository {
             return Ok(());
         }
         if !was_registered {
-            if force && self.is_managed_orphaned_worktree_path(cwd, path).await {
-                return remove_directory_with_retries(path, cancellation)
-                    .await
-                    .map_err(|error| orphaned_worktree_cleanup_error(cwd, path, &error));
-            }
             return Err(error);
         }
-        if let Err(filesystem_error) = remove_directory_with_retries(path, cancellation).await {
-            return Err(with_filesystem_cleanup_error(error, &filesystem_error));
-        }
-        Ok(())
+        Err(with_filesystem_cleanup_deferred(error, path))
     }
 
     async fn is_managed_orphaned_worktree_path(&self, cwd: &Path, path: &Path) -> bool {
@@ -1308,28 +1293,380 @@ impl GitRepository {
         canonical_path.parent() == Some(canonical_expected_parent.as_path())
     }
 
-    async fn is_registered_linked_worktree_path(
+    pub async fn prepare_worktree_removal_identity(
         &self,
         cwd: &Path,
         path: &Path,
         cancellation: &CancellationToken,
-    ) -> bool {
+    ) -> Result<String, GitCommandError> {
+        if cancellation.is_cancelled() {
+            return Err(worktree_identity_marker_error(
+                cwd,
+                path,
+                "removal was cancelled before identity preparation",
+            ));
+        }
+        let admin_path = self
+            .registered_linked_worktree_admin_path(cwd, path, cancellation)
+            .await;
+        if admin_path.is_none() && !self.is_managed_orphaned_worktree_path(cwd, path).await {
+            return Err(registered_worktree_identity_error(cwd, path));
+        }
+
+        let admin_marker = admin_path
+            .as_ref()
+            .map(|admin_path| admin_path.join(WORKTREE_REMOVAL_IDENTITY_FILE));
+        let root_marker = path.join(WORKTREE_REMOVAL_ROOT_IDENTITY_FILE);
+        let admin_nonce = match &admin_marker {
+            Some(marker) => read_optional_identity_marker(marker)
+                .await
+                .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?,
+            None => None,
+        };
+        let root_nonce = read_optional_identity_marker(&root_marker)
+            .await
+            .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+        if let (Some(admin_nonce), Some(root_nonce)) = (&admin_nonce, &root_nonce)
+            && admin_nonce != root_nonce
+        {
+            return Err(worktree_identity_marker_error(
+                cwd,
+                path,
+                "the Git administration and worktree identity markers disagree",
+            ));
+        }
+        let nonce = admin_nonce
+            .or(root_nonce)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        if Uuid::parse_str(&nonce).is_err() {
+            return Err(worktree_identity_marker_error(
+                cwd,
+                path,
+                "the existing identity marker is not a valid removal nonce",
+            ));
+        }
+        if let Some(marker) = admin_marker
+            && !tokio::fs::try_exists(&marker).await.unwrap_or(false)
+        {
+            write_durable_identity_marker(marker, nonce.clone())
+                .await
+                .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+        }
+        if !tokio::fs::try_exists(&root_marker).await.unwrap_or(false) {
+            write_durable_identity_marker(root_marker, nonce.clone())
+                .await
+                .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+        }
+        Ok(nonce)
+    }
+
+    pub async fn verify_worktree_removal_identity(
+        &self,
+        cwd: &Path,
+        path: &Path,
+        expected_nonce: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        verify_identity_marker(
+            cwd,
+            path,
+            &path.join(WORKTREE_REMOVAL_ROOT_IDENTITY_FILE),
+            expected_nonce,
+        )
+        .await?;
+        if let Some(admin_path) = self
+            .registered_linked_worktree_admin_path(cwd, path, cancellation)
+            .await
+        {
+            verify_identity_marker(
+                cwd,
+                path,
+                &admin_path.join(WORKTREE_REMOVAL_IDENTITY_FILE),
+                expected_nonce,
+            )
+            .await
+        } else if self.is_managed_orphaned_worktree_path(cwd, path).await {
+            Ok(())
+        } else {
+            Err(registered_worktree_identity_error(cwd, path))
+        }
+    }
+
+    pub async fn remove_worktree_with_identity(
+        &self,
+        cwd: &Path,
+        path: &Path,
+        force: bool,
+        expected_nonce: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        if !force {
+            return Err(simple_error(
+                "GitVcsDriver.removeWorktree",
+                cwd,
+                "Protected worktree removal requires explicit force confirmation.",
+            ));
+        }
+        let quarantine = worktree_removal_quarantine_path(path, expected_nonce)
+            .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+        let admin_quarantine = self
+            .worktree_removal_admin_quarantine_path(cwd, expected_nonce, cancellation)
+            .await?;
+        let registered_paths = self.worktree_paths(cwd, cancellation).await?;
+        let was_registered = registered_paths
+            .iter()
+            .any(|registered| same_worktree_path(registered, path));
+        let path_exists = tokio::fs::symlink_metadata(path).await.is_ok();
+        let quarantine_exists = tokio::fs::symlink_metadata(&quarantine).await.is_ok();
+
+        if !quarantine_exists && !path_exists {
+            if was_registered {
+                return Err(worktree_identity_marker_error(
+                    cwd,
+                    path,
+                    "Git still registers the worktree, but neither its directory nor its durable quarantine exists",
+                ));
+            }
+            if tokio::fs::symlink_metadata(&admin_quarantine).await.is_ok() {
+                let admin_lease = open_removal_directory_lease_async(&admin_quarantine)
+                    .await
+                    .map_err(|error| worktree_cleanup_error(cwd, &admin_quarantine, &error))?;
+                remove_bound_identity_directory_with_lease(
+                    &admin_quarantine,
+                    WORKTREE_REMOVAL_IDENTITY_FILE,
+                    expected_nonce,
+                    cancellation,
+                    admin_lease,
+                )
+                .await
+                .map_err(|error| worktree_cleanup_error(cwd, &admin_quarantine, &error))?;
+            }
+            return Ok(());
+        }
+
+        if quarantine_exists
+            && tokio::fs::symlink_metadata(quarantine.join(WORKTREE_REMOVAL_ROOT_IDENTITY_FILE))
+                .await
+                .is_err()
+        {
+            if was_registered {
+                return Err(worktree_identity_marker_error(
+                    cwd,
+                    path,
+                    "Git still registers the worktree, but its durable quarantine has no removal identity",
+                ));
+            }
+            let quarantine_lease = open_removal_directory_lease_async(&quarantine)
+                .await
+                .map_err(|error| worktree_cleanup_error(cwd, &quarantine, &error))?;
+            remove_bound_identity_directory_with_lease(
+                &quarantine,
+                WORKTREE_REMOVAL_ROOT_IDENTITY_FILE,
+                expected_nonce,
+                cancellation,
+                quarantine_lease,
+            )
+            .await
+            .map_err(|error| worktree_cleanup_error(cwd, &quarantine, &error))?;
+            if tokio::fs::symlink_metadata(&admin_quarantine).await.is_ok() {
+                let admin_lease = open_removal_directory_lease_async(&admin_quarantine)
+                    .await
+                    .map_err(|error| worktree_cleanup_error(cwd, &admin_quarantine, &error))?;
+                remove_bound_identity_directory_with_lease(
+                    &admin_quarantine,
+                    WORKTREE_REMOVAL_IDENTITY_FILE,
+                    expected_nonce,
+                    cancellation,
+                    admin_lease,
+                )
+                .await
+                .map_err(|error| worktree_cleanup_error(cwd, &admin_quarantine, &error))?;
+            }
+            return Ok(());
+        }
+
+        let (quarantine_lease, tombstone_lease) = if !quarantine_exists {
+            self.verify_worktree_removal_identity(cwd, path, expected_nonce, cancellation)
+                .await?;
+            quarantine_worktree_with_tombstone(path, &quarantine, expected_nonce, cancellation)
+                .await
+                .map_err(|error| worktree_removal_admission_error(cwd, path, &error))?
+        } else {
+            let quarantine_lease = open_removal_directory_lease_async(&quarantine)
+                .await
+                .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+            verify_identity_marker(
+                cwd,
+                path,
+                &quarantine.join(WORKTREE_REMOVAL_ROOT_IDENTITY_FILE),
+                expected_nonce,
+            )
+            .await?;
+            let tombstone_lease =
+                ensure_worktree_removal_tombstone(path, &quarantine, expected_nonce)
+                    .await
+                    .map_err(|error| {
+                        worktree_identity_marker_error(cwd, path, &error.to_string())
+                    })?;
+            (quarantine_lease, tombstone_lease)
+        };
+
+        verify_identity_marker(
+            cwd,
+            path,
+            &quarantine.join(WORKTREE_REMOVAL_ROOT_IDENTITY_FILE),
+            expected_nonce,
+        )
+        .await?;
+        let admin_quarantine_lease = if tokio::fs::symlink_metadata(&admin_quarantine).await.is_ok()
+        {
+            Some(
+                open_removal_directory_lease_async(&admin_quarantine)
+                    .await
+                    .map_err(|error| {
+                        worktree_identity_marker_error(cwd, path, &error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let admin_source = if admin_quarantine_lease.is_some() {
+            None
+        } else {
+            self.linked_worktree_admin_path_from_quarantine(cwd, &quarantine, cancellation)
+                .await
+        };
+        let admin_source_lease = if admin_quarantine_lease.is_none() && was_registered {
+            let admin_source = admin_source
+                .as_deref()
+                .ok_or_else(|| registered_worktree_identity_error(cwd, path))?;
+            Some(
+                open_removal_directory_lease_async(admin_source)
+                    .await
+                    .map_err(|error| {
+                        worktree_identity_marker_error(cwd, path, &error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let (quarantine_lease, admin_quarantine_lease) =
+            deregister_worktree_admin_and_remove_tombstone(
+                path,
+                &quarantine,
+                admin_source.as_deref(),
+                &admin_quarantine,
+                expected_nonce,
+                WorktreeDeregistrationLeases {
+                    quarantine: quarantine_lease,
+                    tombstone: tombstone_lease,
+                    admin_quarantine: admin_quarantine_lease,
+                    admin_source: admin_source_lease,
+                },
+            )
+            .await
+            .map_err(|error| worktree_identity_marker_error(cwd, path, &error.to_string()))?;
+
+        remove_bound_identity_directory_with_lease(
+            &quarantine,
+            WORKTREE_REMOVAL_ROOT_IDENTITY_FILE,
+            expected_nonce,
+            cancellation,
+            quarantine_lease,
+        )
+        .await
+        .map_err(|error| worktree_cleanup_error(cwd, &quarantine, &error))?;
+        if let Some(admin_lease) = admin_quarantine_lease {
+            remove_bound_identity_directory_with_lease(
+                &admin_quarantine,
+                WORKTREE_REMOVAL_IDENTITY_FILE,
+                expected_nonce,
+                cancellation,
+                admin_lease,
+            )
+            .await
+            .map_err(|error| worktree_cleanup_error(cwd, &admin_quarantine, &error))?;
+        }
+        Ok(())
+    }
+
+    async fn worktree_removal_admin_quarantine_path(
+        &self,
+        cwd: &Path,
+        nonce: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        let output = self
+            .run(
+                "GitVcsDriver.removeWorktree.commonDir",
+                cwd,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                cancellation,
+            )
+            .await?;
+        let common_dir = resolve_git_metadata_path(cwd, output.stdout.trim());
+        let common_dir = tokio::fs::canonicalize(&common_dir)
+            .await
+            .unwrap_or(common_dir);
+        Ok(common_dir.join("bibcode-worktree-removals").join(nonce))
+    }
+
+    async fn linked_worktree_admin_path_from_quarantine(
+        &self,
+        cwd: &Path,
+        quarantine: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<PathBuf> {
+        let git_file = quarantine.join(".git");
+        let metadata = tokio::fs::symlink_metadata(&git_file).await.ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        let contents = tokio::fs::read_to_string(&git_file).await.ok()?;
+        let raw_admin_path = contents.trim().strip_prefix("gitdir: ")?;
+        let canonical_admin_path =
+            tokio::fs::canonicalize(resolve_git_metadata_path(quarantine, raw_admin_path))
+                .await
+                .ok()?;
+        let output = self
+            .run(
+                "GitVcsDriver.removeWorktree.commonDir",
+                cwd,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                cancellation,
+            )
+            .await
+            .ok()?;
+        let common_dir = resolve_git_metadata_path(cwd, output.stdout.trim());
+        let canonical_worktrees_dir = tokio::fs::canonicalize(common_dir.join("worktrees"))
+            .await
+            .ok()?;
+        canonical_admin_path
+            .parent()
+            .is_some_and(|parent| same_path(parent, &canonical_worktrees_dir))
+            .then_some(canonical_admin_path)
+    }
+
+    async fn registered_linked_worktree_admin_path(
+        &self,
+        cwd: &Path,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<PathBuf> {
         let git_file = path.join(".git");
         let Ok(metadata) = tokio::fs::symlink_metadata(&git_file).await else {
-            return false;
+            return None;
         };
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return false;
+            return None;
         }
         let Ok(contents) = tokio::fs::read_to_string(&git_file).await else {
-            return false;
+            return None;
         };
-        let Some(raw_admin_path) = contents.trim().strip_prefix("gitdir: ") else {
-            return false;
-        };
+        let raw_admin_path = contents.trim().strip_prefix("gitdir: ")?;
         let admin_path = resolve_git_metadata_path(path, raw_admin_path);
         let Ok(canonical_admin_path) = tokio::fs::canonicalize(&admin_path).await else {
-            return false;
+            return None;
         };
         let Ok(common_dir_output) = self
             .run(
@@ -1340,32 +1677,32 @@ impl GitRepository {
             )
             .await
         else {
-            return false;
+            return None;
         };
         let common_dir = resolve_git_metadata_path(cwd, common_dir_output.stdout.trim());
         let Ok(canonical_worktrees_dir) =
             tokio::fs::canonicalize(common_dir.join("worktrees")).await
         else {
-            return false;
+            return None;
         };
         if !canonical_admin_path
             .parent()
             .is_some_and(|parent| same_path(parent, &canonical_worktrees_dir))
         {
-            return false;
+            return None;
         }
         let Ok(backlink) = tokio::fs::read_to_string(canonical_admin_path.join("gitdir")).await
         else {
-            return false;
+            return None;
         };
         let backlink_path = resolve_git_metadata_path(&canonical_admin_path, backlink.trim());
         let (Ok(canonical_backlink), Ok(canonical_git_file)) = (
             tokio::fs::canonicalize(backlink_path).await,
             tokio::fs::canonicalize(git_file).await,
         ) else {
-            return false;
+            return None;
         };
-        same_path(&canonical_backlink, &canonical_git_file)
+        same_path(&canonical_backlink, &canonical_git_file).then_some(canonical_admin_path)
     }
 
     pub async fn create_ref(
@@ -1884,73 +2221,1282 @@ impl GitRepository {
     }
 }
 
-async fn remove_worktree_contents(
-    path: &Path,
-    cancellation: &CancellationToken,
-) -> Result<(), io::Error> {
-    remove_worktree_path_with_retries(path, true, cancellation).await
+async fn read_optional_identity_marker(path: &Path) -> Result<Option<String>, io::Error> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) if value.trim().is_empty() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the identity marker is empty",
+        )),
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
-async fn remove_directory_with_retries(
-    path: &Path,
-    cancellation: &CancellationToken,
-) -> Result<(), io::Error> {
-    remove_worktree_path_with_retries(path, false, cancellation).await
+async fn verify_identity_marker(
+    cwd: &Path,
+    worktree_path: &Path,
+    marker_path: &Path,
+    expected_nonce: &str,
+) -> Result<(), GitCommandError> {
+    let marker = read_optional_identity_marker(marker_path)
+        .await
+        .map_err(|error| worktree_identity_marker_error(cwd, worktree_path, &error.to_string()))?;
+    if marker.as_deref() != Some(expected_nonce) {
+        return Err(worktree_identity_marker_error(
+            cwd,
+            worktree_path,
+            "the current directory has a different removal identity",
+        ));
+    }
+    Ok(())
 }
 
-async fn remove_worktree_path_with_retries(
-    path: &Path,
-    preserve_git_link: bool,
-    cancellation: &CancellationToken,
+async fn write_durable_identity_marker(path: PathBuf, nonce: String) -> Result<(), io::Error> {
+    tokio::task::spawn_blocking(move || {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "identity marker has no parent")
+        })?;
+        let staged = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bibcode-removal-identity"),
+            Uuid::new_v4()
+        ));
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(nonce.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            rename_path_blocking(&staged, &path)?;
+            sync_directory_blocking(parent)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&staged);
+        }
+        result
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("identity marker task failed: {error}")))?
+}
+
+fn sync_directory_blocking(path: &Path) -> Result<(), io::Error> {
+    #[cfg(windows)]
+    {
+        // Windows directory handles do not reliably support FlushFileBuffers. File contents are
+        // synced before publication and every safety-critical rename uses MOVEFILE_WRITE_THROUGH.
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+#[cfg(windows)]
+fn rename_path_blocking(source: &Path, destination: &Path) -> Result<(), io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: Both paths are valid NUL-terminated UTF-16 strings and remain alive for the call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_path_blocking(source: &Path, destination: &Path) -> Result<(), io::Error> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn rename_bound_directory_blocking(
+    lease: &RemovalDirectoryLease,
+    source: &Path,
+    destination: &Path,
 ) -> Result<(), io::Error> {
-    let mut last_error = None;
-    for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::{ffi::OsStrExt, io::AsRawHandle},
+    };
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    verify_removal_directory_lease(lease, source)?;
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the bound rename destination already exists",
+            ));
+        }
+    }
+    let destination = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(destination)
+    };
+    let destination_name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    if destination_name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination contains an interior NUL",
+        ));
+    }
+    let header_size = offset_of!(FILE_RENAME_INFO, FileName);
+    let information_size =
+        size_of::<FILE_RENAME_INFO>() + destination_name.len() * size_of::<u16>();
+    let mut information = vec![0usize; information_size.div_ceil(size_of::<usize>())];
+    let information_ptr = information.as_mut_ptr().cast::<u8>();
+    // SAFETY: information is pointer-aligned, sized for the FILE_RENAME_INFO header plus the
+    // UTF-16 name, and all referenced handles and buffers remain alive through the system call.
+    unsafe {
+        let rename = information_ptr.cast::<FILE_RENAME_INFO>();
+        (*rename).Anonymous.ReplaceIfExists = false;
+        (*rename).RootDirectory = std::ptr::null_mut();
+        (*rename).FileNameLength = (destination_name.len() * size_of::<u16>()) as u32;
+        std::ptr::copy_nonoverlapping(
+            destination_name.as_ptr(),
+            information_ptr.add(header_size).cast::<u16>(),
+            destination_name.len(),
+        );
+        if SetFileInformationByHandle(
+            lease.handle.as_raw_handle(),
+            FileRenameInfo,
+            information_ptr.cast(),
+            information_size as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    verify_removal_directory_lease(lease, &destination)
+}
+
+#[cfg(not(windows))]
+fn rename_bound_directory_blocking(
+    lease: &RemovalDirectoryLease,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), io::Error> {
+    verify_removal_directory_lease(lease, source)?;
+    fs::rename(source, destination)?;
+    verify_removal_directory_lease(lease, destination)
+}
+
+fn worktree_removal_quarantine_path(path: &Path, nonce: &str) -> Result<PathBuf, io::Error> {
+    Uuid::parse_str(nonce).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the removal identity is not a valid UUID",
+        )
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worktree path has no file name",
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".{}.bibcode-removal-{nonce}",
+        file_name.to_string_lossy()
+    )))
+}
+
+async fn quarantine_worktree_with_tombstone(
+    source: &Path,
+    quarantine: &Path,
+    nonce: &str,
+    cancellation: &CancellationToken,
+) -> Result<(RemovalDirectoryLease, RemovalDirectoryLease), io::Error> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "worktree removal was cancelled",
+        ));
+    }
+    let source = source.to_path_buf();
+    let quarantine = quarantine.to_path_buf();
+    let nonce = nonce.to_owned();
+    let cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        let lease = open_removal_directory_lease(&source)?;
+        verify_identity_marker_blocking(
+            &source,
+            WORKTREE_REMOVAL_ROOT_IDENTITY_FILE,
+            &nonce,
+        )?;
+        verify_removal_directory_lease(&lease, &source)?;
         if cancellation.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "worktree removal was cancelled",
             ));
         }
-        let result = if preserve_git_link {
-            remove_worktree_contents_once(path).await
-        } else {
-            tokio::fs::remove_dir_all(path).await
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => last_error = Some(error),
+        rename_bound_directory_blocking(&lease, &source, &quarantine)?;
+        let parent = source.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "worktree path has no parent")
+        })?;
+        if let Err(error) = verify_identity_marker_blocking(
+            &quarantine,
+            WORKTREE_REMOVAL_ROOT_IDENTITY_FILE,
+            &nonce,
+        ) {
+            let rollback = rename_bound_directory_blocking(&lease, &quarantine, &source);
+            let _ = sync_directory_blocking(parent);
+            return match rollback {
+                Ok(()) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "the directory moved into worktree quarantine did not have the admitted identity: {error}"
+                    ),
+                )),
+                Err(rollback_error) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "the directory moved into worktree quarantine did not have the admitted identity: {error}; rollback retained it at '{}': {rollback_error}",
+                        display_path(&quarantine)
+                    ),
+                )),
+            };
         }
-        if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
-            tokio::select! {
-                () = cancellation.cancelled() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "worktree removal was cancelled",
-                    ));
-                }
-                () = tokio::time::sleep(WORKTREE_REMOVE_RETRY_DELAY) => {}
+        let tombstone_lease = match sync_directory_blocking(parent).and_then(|()| {
+            create_worktree_removal_tombstone_blocking(&source, &quarantine, &nonce)
+        }) {
+            Ok(lease) => lease,
+            Err(error) => {
+            let rollback = rename_bound_directory_blocking(&lease, &quarantine, &source);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "worktree quarantine admission failed: {error}; rollback retained the worktree at '{}': {rollback_error}",
+                        display_path(&quarantine)
+                    ),
+                )),
+            };
+            }
+        };
+        sync_directory_blocking(parent)?;
+        Ok((lease, tombstone_lease))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("worktree quarantine task failed: {error}")))?
+}
+
+async fn ensure_worktree_removal_tombstone(
+    path: &Path,
+    quarantine: &Path,
+    nonce: &str,
+) -> Result<RemovalDirectoryLease, io::Error> {
+    let path = path.to_path_buf();
+    let quarantine = quarantine.to_path_buf();
+    let nonce = nonce.to_owned();
+    tokio::task::spawn_blocking(move || {
+        match open_removal_directory_lease(&path) {
+            Ok(lease) => {
+                verify_or_repair_worktree_removal_tombstone_blocking(&path, &quarantine, &nonce)?;
+                verify_removal_directory_lease(&lease, &path)?;
+                return Ok(lease);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let lease = create_worktree_removal_tombstone_blocking(&path, &quarantine, &nonce)?;
+        if let Some(parent) = path.parent() {
+            sync_directory_blocking(parent)?;
+        }
+        Ok(lease)
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("worktree tombstone task failed: {error}")))?
+}
+
+fn create_worktree_removal_tombstone_blocking(
+    path: &Path,
+    quarantine: &Path,
+    nonce: &str,
+) -> Result<RemovalDirectoryLease, io::Error> {
+    let lease = create_removal_directory_lease(path)?;
+    let mut marker_created = false;
+    let mut git_file_created = false;
+    let result = (|| {
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join(WORKTREE_REMOVAL_TOMBSTONE_FILE))?;
+        marker_created = true;
+        marker.write_all(nonce.as_bytes())?;
+        marker.sync_all()?;
+        drop(marker);
+        let quarantined_git_file = quarantine.join(".git");
+        if quarantined_git_file.is_file() {
+            let contents = fs::read(&quarantined_git_file)?;
+            let mut git_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(".git"))?;
+            git_file_created = true;
+            git_file.write_all(&contents)?;
+            git_file.sync_all()?;
+        }
+        sync_directory_blocking(path)
+    })();
+    if let Err(error) = result {
+        if git_file_created {
+            let _ = remove_bound_regular_file(&lease, path, ".git", None);
+        }
+        if marker_created {
+            let _ = remove_bound_regular_file(&lease, path, WORKTREE_REMOVAL_TOMBSTONE_FILE, None);
+        }
+        if bound_directory_is_empty(&lease, path).unwrap_or(false) {
+            let _ = delete_bound_directory_root_blocking(lease, path);
+        }
+        return Err(error);
+    }
+    Ok(lease)
+}
+
+fn verify_or_repair_worktree_removal_tombstone_blocking(
+    path: &Path,
+    quarantine: &Path,
+    expected_nonce: &str,
+) -> Result<(), io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "the removal tombstone is not a real directory",
+        ));
+    }
+    let marker = fs::read_to_string(path.join(WORKTREE_REMOVAL_TOMBSTONE_FILE))?;
+    if marker.trim() != expected_nonce {
+        return Err(io::Error::other(
+            "the removal tombstone identity does not match",
+        ));
+    }
+    let mut has_git_file = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != WORKTREE_REMOVAL_TOMBSTONE_FILE && name != ".git" {
+            return Err(io::Error::other(
+                "the removal tombstone contains unexpected files",
+            ));
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(io::Error::other(
+                "the removal tombstone contains an unsafe entry",
+            ));
+        }
+        has_git_file |= name == ".git";
+    }
+    let quarantined_git_file = quarantine.join(".git");
+    let quarantine_has_git_file = quarantined_git_file.is_file();
+    if has_git_file && !quarantine_has_git_file {
+        return Err(io::Error::other(
+            "an orphan-removal tombstone unexpectedly contains a Git link",
+        ));
+    }
+    if quarantine_has_git_file && !has_git_file {
+        let contents = fs::read(quarantined_git_file)?;
+        let mut git_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join(".git"))?;
+        git_file.write_all(&contents)?;
+        git_file.sync_all()?;
+        sync_directory_blocking(path)?;
+    }
+    Ok(())
+}
+
+struct RemovalDirectoryLease {
+    handle: fs::File,
+    #[cfg(windows)]
+    _parent_handle: Option<fs::File>,
+}
+
+struct WorktreeDeregistrationLeases {
+    quarantine: RemovalDirectoryLease,
+    tombstone: RemovalDirectoryLease,
+    admin_quarantine: Option<RemovalDirectoryLease>,
+    admin_source: Option<RemovalDirectoryLease>,
+}
+
+#[cfg(windows)]
+fn create_removal_directory_lease(path: &Path) -> Result<RemovalDirectoryLease, io::Error> {
+    use std::{
+        mem::size_of,
+        os::windows::{
+            ffi::OsStrExt,
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, FromRawHandle},
+        },
+    };
+
+    use windows_sys::Wdk::{
+        Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::{
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        },
+    };
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING},
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        },
+        System::IO::IO_STATUS_BLOCK,
+    };
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "removal directory has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "removal directory has no file name",
+        )
+    })?;
+    let parent = fs::OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?;
+    let mut name = name.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory name is too long"))?;
+    if name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "removal directory name contains an interior NUL",
+        ));
+    }
+    let unicode_name = UNICODE_STRING {
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: name.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: std::ptr::from_ref(&unicode_name),
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // SAFETY: every pointer references initialized storage that remains alive for the call;
+    // NtCreateFile initializes handle on success and the returned handle is adopted exactly once.
+    let status = unsafe {
+        NtCreateFile(
+            std::ptr::from_mut(&mut handle),
+            DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            std::ptr::from_ref(&attributes),
+            std::ptr::from_mut(&mut status_block),
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: status is the NTSTATUS returned directly by NtCreateFile.
+        let windows_error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(windows_error as i32));
+    }
+    // SAFETY: NtCreateFile succeeded and transferred one owned Windows handle.
+    let handle = unsafe { fs::File::from_raw_handle(handle) };
+    let lease = RemovalDirectoryLease {
+        handle,
+        _parent_handle: Some(parent),
+    };
+    verify_removal_directory_lease(&lease, path)?;
+    Ok(lease)
+}
+
+#[cfg(not(windows))]
+fn create_removal_directory_lease(path: &Path) -> Result<RemovalDirectoryLease, io::Error> {
+    fs::create_dir(path)?;
+    open_removal_directory_lease(path)
+}
+
+fn open_removal_directory_lease(path: &Path) -> Result<RemovalDirectoryLease, io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "the removal target is not a real directory",
+        ));
+    }
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(windows))]
+    let handle = fs::File::open(path)?;
+    let lease = RemovalDirectoryLease {
+        handle,
+        #[cfg(windows)]
+        _parent_handle: None,
+    };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        let identity = windows_file_identity(&lease.handle)?;
+        if identity.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::other(
+                "the removal target is a reparse point or not a directory",
+            ));
+        }
+    }
+    verify_removal_directory_lease(&lease, path)?;
+    Ok(lease)
+}
+
+fn verify_removal_directory_lease(
+    lease: &RemovalDirectoryLease,
+    path: &Path,
+) -> Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let leased = lease.handle.metadata()?;
+        let current = fs::symlink_metadata(path)?;
+        if leased.dev() != current.dev() || leased.ino() != current.ino() {
+            return Err(io::Error::other(
+                "the removal directory was rebound during cleanup",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // The directory handle omits FILE_SHARE_DELETE, so Windows cannot rename, replace, or
+        // delete this filesystem object until the lease is dropped.
+        let _ = (&lease.handle, path);
+    }
+    Ok(())
+}
+
+fn verify_identity_marker_blocking(
+    path: &Path,
+    marker_name: &str,
+    expected_nonce: &str,
+) -> Result<(), io::Error> {
+    let marker_path = path.join(marker_name);
+    let metadata = fs::symlink_metadata(&marker_path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "the bound removal directory identity marker is not a real file",
+        ));
+    }
+    let marker = fs::read_to_string(marker_path)?;
+    if marker.trim() != expected_nonce {
+        return Err(io::Error::other(
+            "the bound removal directory identity does not match",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_directory_entry_names(
+    directory_fd: std::os::fd::RawFd,
+) -> Result<Vec<OsString>, io::Error> {
+    use std::{ffi::CStr, os::unix::ffi::OsStringExt};
+
+    // SAFETY: dup returns a new owned descriptor or -1. fdopendir takes ownership only on success.
+    let duplicated = unsafe { libc::dup(directory_fd) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duplicated is a valid directory descriptor owned by this function.
+    let directory = unsafe { libc::fdopendir(duplicated) };
+    if directory.is_null() {
+        // SAFETY: fdopendir failed and did not take ownership of duplicated.
+        unsafe { libc::close(duplicated) };
+        return Err(io::Error::last_os_error());
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: directory remains valid until closed below.
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for the returned dirent.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    // SAFETY: directory was returned by fdopendir and is closed exactly once.
+    if unsafe { libc::closedir(directory) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn unix_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filesystem entry contains an interior NUL",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn clear_unix_directory_fd(
+    directory_fd: std::os::fd::RawFd,
+    preserved_name: Option<&std::ffi::OsStr>,
+) -> Result<(), io::Error> {
+    for name in unix_directory_entry_names(directory_fd)? {
+        if preserved_name.is_some_and(|preserved| preserved == name) {
+            continue;
+        }
+        let c_name = unix_name(&name)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: directory_fd is open, c_name is NUL-terminated, and metadata is writable.
+        if unsafe {
+            libc::fstatat(
+                directory_fd,
+                c_name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded and initialized metadata.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // SAFETY: arguments are valid; O_NOFOLLOW prevents traversing a substituted symlink.
+            let child_fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let child_result = clear_unix_directory_fd(child_fd, None);
+            // SAFETY: child_fd is owned by this scope and closed exactly once.
+            let close_result = unsafe { libc::close(child_fd) };
+            child_result?;
+            if close_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: directory_fd and c_name remain valid for unlinkat.
+            if unsafe { libc::unlinkat(directory_fd, c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        } else {
+            // SAFETY: directory_fd and c_name remain valid for unlinkat.
+            if unsafe { libc::unlinkat(directory_fd, c_name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| io::Error::other("worktree cleanup failed")))
+    Ok(())
 }
 
-async fn remove_worktree_contents_once(path: &Path) -> Result<(), io::Error> {
-    let mut entries = tokio::fs::read_dir(path).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_name() == ".git" {
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume: u64,
+    file: u64,
+    attributes: u32,
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &fs::File) -> Result<WindowsFileIdentity, io::Error> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: information points to writable storage and the file handle remains valid.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded and initialized information.
+    let information = unsafe { information.assume_init() };
+    Ok(WindowsFileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        attributes: information.dwFileAttributes,
+    })
+}
+
+#[cfg(windows)]
+fn open_windows_removal_entry(path: &Path) -> Result<fs::File, io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn delete_windows_entry_by_handle(file: &fs::File) -> Result<(), io::Error> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: file is valid and disposition points to the declared structure for the call.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    let fallback = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: file is valid and fallback points to the declared structure for the call.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&fallback).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+struct WindowsRemovalEntry {
+    path: PathBuf,
+    identity: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+fn collect_windows_removal_entries(
+    path: &Path,
+    preserved_name: Option<&str>,
+    entries: &mut Vec<WindowsRemovalEntry>,
+) -> Result<(), io::Error> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if preserved_name.is_some_and(|preserved| entry.file_name() == preserved) {
             continue;
         }
         let entry_path = entry.path();
-        let file_type = entry.file_type().await?;
-        if file_type.is_dir() {
-            tokio::fs::remove_dir_all(entry_path).await?;
-        } else {
-            tokio::fs::remove_file(entry_path).await?;
+        let handle = open_windows_removal_entry(&entry_path)?;
+        let identity = windows_file_identity(&handle)?;
+        let directory = identity.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        let traversable_directory =
+            directory && identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+        if traversable_directory {
+            collect_windows_removal_entries(&entry_path, None, entries)?;
         }
+        entries.push(WindowsRemovalEntry {
+            path: entry_path,
+            identity,
+        });
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn clear_windows_directory_bound(
+    path: &Path,
+    preserved_name: Option<&str>,
+) -> Result<(), io::Error> {
+    clear_windows_directory_bound_after_snapshot(path, preserved_name, || {})
+}
+
+#[cfg(windows)]
+fn clear_windows_directory_bound_after_snapshot(
+    path: &Path,
+    preserved_name: Option<&str>,
+    after_snapshot: impl FnOnce(),
+) -> Result<(), io::Error> {
+    let mut entries = Vec::new();
+    collect_windows_removal_entries(path, preserved_name, &mut entries)?;
+    after_snapshot();
+    for entry in entries {
+        let handle = open_windows_removal_entry(&entry.path)?;
+        if windows_file_identity(&handle)? != entry.identity {
+            return Err(io::Error::other(
+                "a removal descendant was rebound before deletion",
+            ));
+        }
+        delete_windows_entry_by_handle(&handle)?;
+        drop(handle);
+    }
+    Ok(())
+}
+
+fn clear_bound_directory_contents(
+    lease: &RemovalDirectoryLease,
+    path: &Path,
+    preserved_name: Option<&str>,
+) -> Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let _ = path;
+        clear_unix_directory_fd(
+            lease.handle.as_raw_fd(),
+            preserved_name.map(std::ffi::OsStr::new),
+        )
+    }
+    #[cfg(windows)]
+    {
+        verify_removal_directory_lease(lease, path)?;
+        clear_windows_directory_bound(path, preserved_name)
+    }
+}
+
+fn remove_bound_regular_file(
+    lease: &RemovalDirectoryLease,
+    path: &Path,
+    name: &str,
+    expected_contents: Option<&str>,
+) -> Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let _ = path;
+        let name = unix_name(std::ffi::OsStr::new(name))?;
+        // SAFETY: the leased directory fd is open and name is NUL-terminated. O_NOFOLLOW
+        // prevents opening a substituted symlink.
+        let file_fd = unsafe {
+            libc::openat(
+                lease.handle.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if file_fd < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: file_fd is owned by this scope and transferred exactly once.
+        let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::other(
+                "a protected removal file became an unsafe entry",
+            ));
+        }
+        if let Some(expected) = expected_contents {
+            use io::Read;
+
+            let mut actual = String::new();
+            file.read_to_string(&mut actual)?;
+            if actual.trim() != expected {
+                return Err(io::Error::other(
+                    "a protected removal file identity does not match",
+                ));
+            }
+        }
+        // SAFETY: the leased directory fd and NUL-terminated name remain valid.
+        if unsafe { libc::unlinkat(lease.handle.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(file);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::{io::Read, os::windows::fs::OpenOptionsExt};
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        verify_removal_directory_lease(lease, path)?;
+        let entry_path = path.join(name);
+        let mut file = match fs::OpenOptions::new()
+            .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(entry_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let identity = windows_file_identity(&file)?;
+        if identity.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(io::Error::other(
+                "a protected removal file became an unsafe entry",
+            ));
+        }
+        if let Some(expected) = expected_contents {
+            let mut actual = String::new();
+            file.read_to_string(&mut actual)?;
+            if actual.trim() != expected {
+                return Err(io::Error::other(
+                    "a protected removal file identity does not match",
+                ));
+            }
+        }
+        delete_windows_entry_by_handle(&file)?;
+        drop(file);
+        Ok(())
+    }
+}
+
+fn bound_directory_is_empty(lease: &RemovalDirectoryLease, path: &Path) -> Result<bool, io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let _ = path;
+        Ok(unix_directory_entry_names(lease.handle.as_raw_fd())?.is_empty())
+    }
+    #[cfg(windows)]
+    {
+        let _ = lease;
+        Ok(fs::read_dir(path)?.next().transpose()?.is_none())
+    }
+}
+
+fn delete_bound_directory_root_blocking(
+    lease: RemovalDirectoryLease,
+    path: &Path,
+) -> Result<(), io::Error> {
+    if !bound_directory_is_empty(&lease, path)? {
+        return Err(io::Error::other(
+            "a bound removal directory gained unexpected data before root deletion",
+        ));
+    }
+    verify_removal_directory_lease(&lease, path)?;
+    #[cfg(windows)]
+    {
+        delete_windows_entry_by_handle(&lease.handle)?;
+        drop(lease);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir(path)?;
+        drop(lease);
+        Ok(())
+    }
+}
+
+async fn deregister_worktree_admin_and_remove_tombstone(
+    path: &Path,
+    quarantine: &Path,
+    admin_source: Option<&Path>,
+    admin_quarantine: &Path,
+    nonce: &str,
+    leases: WorktreeDeregistrationLeases,
+) -> Result<(RemovalDirectoryLease, Option<RemovalDirectoryLease>), io::Error> {
+    let path = path.to_path_buf();
+    let quarantine = quarantine.to_path_buf();
+    let admin_source = admin_source.map(Path::to_path_buf);
+    let admin_quarantine = admin_quarantine.to_path_buf();
+    let nonce = nonce.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let WorktreeDeregistrationLeases {
+            quarantine: quarantine_lease,
+            tombstone: tombstone_lease,
+            admin_quarantine: admin_quarantine_lease,
+            admin_source: admin_source_lease,
+        } = leases;
+        verify_removal_directory_lease(&quarantine_lease, &quarantine)?;
+        verify_or_repair_worktree_removal_tombstone_blocking(&path, &quarantine, &nonce)?;
+        verify_removal_directory_lease(&tombstone_lease, &path)?;
+
+        let mut admin_quarantine_lease = admin_quarantine_lease;
+        if let Some(admin_lease) = admin_quarantine_lease.as_ref() {
+            verify_removal_directory_lease(admin_lease, &admin_quarantine)?;
+            verify_identity_marker_blocking(
+                &admin_quarantine,
+                WORKTREE_REMOVAL_IDENTITY_FILE,
+                &nonce,
+            )?;
+        } else if let Some(admin_lease) = admin_source_lease {
+            let admin_source = admin_source.as_deref().ok_or_else(|| {
+                io::Error::other("the registered worktree admin path disappeared")
+            })?;
+            verify_identity_marker_blocking(admin_source, WORKTREE_REMOVAL_IDENTITY_FILE, &nonce)?;
+            verify_removal_directory_lease(&admin_lease, admin_source)?;
+            let admin_parent = admin_quarantine.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "admin quarantine has no parent",
+                )
+            })?;
+            fs::create_dir_all(admin_parent)?;
+            sync_directory_blocking(admin_parent)?;
+            rename_bound_directory_blocking(&admin_lease, admin_source, &admin_quarantine)?;
+            if let Err(error) = verify_identity_marker_blocking(
+                &admin_quarantine,
+                WORKTREE_REMOVAL_IDENTITY_FILE,
+                &nonce,
+            ) {
+                let _ =
+                    rename_bound_directory_blocking(&admin_lease, &admin_quarantine, admin_source);
+                return Err(error);
+            }
+            if let Some(source_parent) = admin_source.parent() {
+                sync_directory_blocking(source_parent)?;
+            }
+            sync_directory_blocking(admin_parent)?;
+            admin_quarantine_lease = Some(admin_lease);
+        }
+
+        verify_removal_directory_lease(&quarantine_lease, &quarantine)?;
+        verify_or_repair_worktree_removal_tombstone_blocking(&path, &quarantine, &nonce)?;
+        verify_removal_directory_lease(&tombstone_lease, &path)?;
+        remove_bound_regular_file(&tombstone_lease, &path, ".git", None)?;
+        remove_bound_regular_file(
+            &tombstone_lease,
+            &path,
+            WORKTREE_REMOVAL_TOMBSTONE_FILE,
+            Some(&nonce),
+        )?;
+        if !bound_directory_is_empty(&tombstone_lease, &path)? {
+            return Err(io::Error::other(
+                "the removal tombstone gained unexpected contents",
+            ));
+        }
+        delete_bound_directory_root_blocking(tombstone_lease, &path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory_blocking(parent)?;
+        }
+        Ok((quarantine_lease, admin_quarantine_lease))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("worktree deregistration task failed: {error}")))?
+}
+
+async fn open_removal_directory_lease_async(
+    path: &Path,
+) -> Result<RemovalDirectoryLease, io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || open_removal_directory_lease(&path))
+        .await
+        .map_err(|error| io::Error::other(format!("directory lease task failed: {error}")))?
+}
+
+async fn remove_bound_identity_directory_with_lease(
+    path: &Path,
+    marker_name: &str,
+    expected_nonce: &str,
+    cancellation: &CancellationToken,
+    lease: RemovalDirectoryLease,
+) -> Result<(), io::Error> {
+    let path = path.to_path_buf();
+    let marker_name = marker_name.to_owned();
+    let expected_nonce = expected_nonce.to_owned();
+    let cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut last_error = None;
+        for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "worktree removal was cancelled",
+                ));
+            }
+            match clear_bound_identity_directory_once(&lease, &path, &marker_name, &expected_nonce)
+            {
+                Ok(()) => return delete_bound_directory_root_blocking(lease, &path),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
+                std::thread::sleep(WORKTREE_REMOVE_RETRY_DELAY);
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("bound directory cleanup failed")))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("bound directory cleanup task failed: {error}")))?
+}
+
+fn clear_bound_identity_directory_once(
+    lease: &RemovalDirectoryLease,
+    path: &Path,
+    marker_name: &str,
+    expected_nonce: &str,
+) -> Result<(), io::Error> {
+    match verify_identity_marker_blocking(path, marker_name, expected_nonce) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if bound_directory_is_empty(lease, path)? {
+                return Ok(());
+            }
+            return Err(io::Error::other(
+                "the removal marker disappeared while the directory still contains data",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    verify_removal_directory_lease(lease, path)?;
+    clear_bound_directory_contents(lease, path, Some(marker_name))?;
+    verify_removal_directory_lease(lease, path)?;
+    remove_bound_regular_file(lease, path, marker_name, Some(expected_nonce))?;
+    if !bound_directory_is_empty(lease, path)? {
+        return Err(io::Error::other(
+            "the bound removal directory gained new contents during cleanup",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_worktree_removal_probe_blocking(
+    source: &Path,
+    probe: &Path,
+    cancellation: &CancellationToken,
+    after_probe_rename: impl FnOnce(),
+) -> Result<(), io::Error> {
+    rename_worktree_path_with_retries_blocking(source, probe, Some(cancellation))?;
+    after_probe_rename();
+    rename_worktree_path_with_retries_blocking(probe, source, None).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the safety probe retained the worktree at '{}': {error}",
+                display_path(probe)
+            ),
+        )
+    })
+}
+
+#[cfg(test)]
+fn rename_worktree_path_with_retries_blocking(
+    source: &Path,
+    destination: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), io::Error> {
+    let mut last_error = None;
+    for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "worktree removal was cancelled",
+            ));
+        }
+        match rename_path_blocking(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "worktree removal was cancelled",
+                ));
+            }
+            std::thread::sleep(WORKTREE_REMOVE_RETRY_DELAY);
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("worktree rename failed")))
 }
 
 fn git_environment() -> Vec<(OsString, OsString)> {
@@ -2248,6 +3794,17 @@ fn worktree_cleanup_error(cwd: &Path, path: &Path, error: &io::Error) -> GitComm
     )
 }
 
+fn worktree_removal_admission_error(cwd: &Path, path: &Path, error: &io::Error) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.removeWorktree",
+        cwd,
+        &format!(
+            "The registered worktree path '{}' is still in use, so removal stopped before deleting any files: {error}",
+            display_path(path)
+        ),
+    )
+}
+
 fn registered_worktree_identity_error(cwd: &Path, path: &Path) -> GitCommandError {
     simple_error(
         "GitVcsDriver.removeWorktree",
@@ -2259,24 +3816,22 @@ fn registered_worktree_identity_error(cwd: &Path, path: &Path) -> GitCommandErro
     )
 }
 
-fn orphaned_worktree_cleanup_error(cwd: &Path, path: &Path, error: &io::Error) -> GitCommandError {
+fn worktree_identity_marker_error(cwd: &Path, path: &Path, detail: &str) -> GitCommandError {
     simple_error(
         "GitVcsDriver.removeWorktree",
         cwd,
         &format!(
-            "The managed orphaned worktree path '{}' could not be removed: {error}",
+            "The registered worktree path '{}' does not match the durable removal identity, so it was not deleted: {detail}",
             display_path(path)
         ),
     )
 }
 
-fn with_filesystem_cleanup_error(
-    mut error: GitCommandError,
-    filesystem_error: &io::Error,
-) -> GitCommandError {
+fn with_filesystem_cleanup_deferred(mut error: GitCommandError, path: &Path) -> GitCommandError {
     error.detail = format!(
-        "{}\nFilesystem cleanup also failed: {filesystem_error}",
-        error.detail
+        "{}\nGit deregistered the worktree, but the remaining directory '{}' was preserved because it no longer has a transaction-bound removal identity.",
+        error.detail,
+        display_path(path),
     )
     .into();
     error
@@ -2368,8 +3923,139 @@ mod worktree_ownership_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CreateWorktreeInput, GitRepository, OwnedWorktreePath, display_path, parse_branch_headers,
+        CreateWorktreeInput, GitRepository, OwnedWorktreePath, display_path,
+        open_removal_directory_lease, parse_branch_headers, run_worktree_removal_probe_blocking,
     };
+
+    #[cfg(windows)]
+    use super::{
+        clear_windows_directory_bound_after_snapshot, create_removal_directory_lease,
+        delete_bound_directory_root_blocking, rename_bound_directory_blocking,
+    };
+
+    #[test]
+    fn cancellation_after_probe_rename_still_restores_the_original_path() {
+        let parent = tempfile::tempdir().expect("probe parent");
+        let source = parent.path().join("worktree");
+        let probe = parent.path().join(".worktree.probe");
+        fs::create_dir(&source).expect("source worktree");
+        fs::write(source.join("sentinel.txt"), "preserve\n").expect("sentinel");
+        let cancellation = CancellationToken::new();
+
+        run_worktree_removal_probe_blocking(&source, &probe, &cancellation, || {
+            assert!(probe.exists(), "probe owns the directory between renames");
+            cancellation.cancel();
+        })
+        .expect("rollback ignores cancellation after the first rename");
+
+        assert!(source.join("sentinel.txt").exists());
+        assert!(!probe.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_directory_lease_prevents_windows_path_rebinding() {
+        let parent = tempfile::tempdir().expect("lease parent");
+        let source = parent.path().join("quarantine");
+        let replacement_name = parent.path().join("quarantine-moved");
+        fs::create_dir(&source).expect("quarantine fixture");
+        let lease = open_removal_directory_lease(&source).expect("bind quarantine object");
+
+        fs::rename(&source, &replacement_name)
+            .expect_err("a bound removal object must not be renamed or replaced");
+        assert!(source.exists());
+
+        drop(lease);
+        fs::rename(&source, &replacement_name).expect("dropping the lease releases the object");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_renames_and_deletes_the_bound_windows_directory_object() {
+        let parent = tempfile::tempdir().expect("lease parent");
+        let source = parent.path().join("source");
+        let destination = parent.path().join("destination");
+        let lease = create_removal_directory_lease(&source)
+            .expect("atomically create and bind source object");
+
+        rename_bound_directory_blocking(&lease, &source, &destination)
+            .expect("rename the exact leased object by handle");
+        assert!(!source.exists());
+        assert!(destination.exists());
+
+        delete_bound_directory_root_blocking(lease, &destination)
+            .expect("delete the exact leased root by handle");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_rejects_a_child_rebound_after_its_identity_snapshot() {
+        let parent = tempfile::tempdir().expect("cleanup parent");
+        let quarantine = parent.path().join("quarantine");
+        let child = quarantine.join("child");
+        let moved_child = quarantine.join("original-child");
+        let sibling = parent.path().join("sibling");
+        fs::create_dir_all(&child).expect("quarantined child");
+        fs::write(child.join("original.txt"), "original\n").expect("original file");
+        fs::create_dir(&sibling).expect("sibling directory");
+        fs::write(sibling.join("sibling.txt"), "must survive\n").expect("sibling sentinel");
+
+        clear_windows_directory_bound_after_snapshot(&quarantine, None, || {
+            fs::rename(&child, &moved_child).expect("move snapshotted child aside");
+            fs::rename(&sibling, &child).expect("rebind child name to sibling");
+        })
+        .expect_err("the rebound child identity must stop cleanup");
+
+        assert_eq!(
+            fs::read_to_string(child.join("sibling.txt")).expect("sibling survives"),
+            "must survive\n"
+        );
+        assert!(moved_child.join("original.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_deletes_a_junction_without_traversing_its_target() {
+        let parent = tempfile::tempdir().expect("cleanup parent");
+        let quarantine = parent.path().join("quarantine");
+        let outside = parent.path().join("outside");
+        let linked = quarantine.join("linked-outside");
+        fs::create_dir(&quarantine).expect("quarantine directory");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("sentinel.txt"), "must survive\n").expect("outside sentinel");
+        junction::create(&outside, &linked).expect("junction fixture");
+
+        clear_windows_directory_bound_after_snapshot(&quarantine, None, || {})
+            .expect("cleanup deletes only the junction object");
+
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel.txt")).expect("outside target survives"),
+            "must survive\n"
+        );
+        assert!(!linked.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_rejects_a_root_junction_without_traversing_its_target() {
+        let parent = tempfile::tempdir().expect("cleanup parent");
+        let outside = parent.path().join("outside");
+        let quarantine = parent.path().join("quarantine-junction");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("sentinel.txt"), "must survive\n").expect("outside sentinel");
+        junction::create(&outside, &quarantine).expect("root junction fixture");
+
+        assert!(
+            open_removal_directory_lease(&quarantine).is_err(),
+            "a root reparse point must never be admitted for recursive cleanup"
+        );
+
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel.txt")).expect("outside target survives"),
+            "must survive\n"
+        );
+    }
 
     #[test]
     fn branch_headers_require_an_actual_upstream_comparison() {

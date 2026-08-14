@@ -62,7 +62,14 @@ async fn admission_gate_drains_existing_mutations_and_rejects_new_ones() {
         "the admitted mutation still owns its permit"
     );
 
+    let retained_by_protected_task = permit.clone();
     drop(permit);
+    tokio::task::yield_now().await;
+    assert!(
+        !drain.is_finished(),
+        "a protected task's cloned permit must keep maintenance draining"
+    );
+    drop(retained_by_protected_task);
     assert_eq!(drain.await.expect("drain task").expect("drained"), 1);
 }
 

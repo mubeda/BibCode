@@ -6,6 +6,7 @@ import {
   GitManagerError,
   GitManagerServiceError,
   VcsCreateWorktreeInput,
+  VcsRemoveWorktreeInput,
   GitPreparePullRequestThreadInput,
   GitPullRequestMaterializationError,
   GitRunStackedActionResult,
@@ -21,6 +22,7 @@ import {
 } from "./test/schemaAssertions.ts";
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
+const decodeRemoveWorktreeInput = Schema.decodeUnknownSync(VcsRemoveWorktreeInput);
 const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
   GitPreparePullRequestThreadInput,
 );
@@ -65,6 +67,37 @@ describe("VcsCreateWorktreeInput", () => {
     });
 
     expect(parsed.baseRefName).toBe("origin/main");
+  });
+});
+
+describe("VcsRemoveWorktreeInput", () => {
+  it("requires every terminal-owning thread to be fenced by the server", () => {
+    const parsed = decodeRemoveWorktreeInput({
+      cwd: "/repo",
+      path: "/repo-worktrees/feature",
+      force: true,
+      ownerThreadId: "workspace-thread",
+      threadIds: ["workspace-thread", "panel-thread"],
+    });
+
+    expect(parsed.ownerThreadId).toBe("workspace-thread");
+    expect(parsed.threadIds).toEqual(["workspace-thread", "panel-thread"]);
+    expect(() =>
+      decodeRemoveWorktreeInput({
+        cwd: "/repo",
+        path: "/repo-worktrees/feature",
+        force: true,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRemoveWorktreeInput({
+        cwd: "/repo",
+        path: "/repo-worktrees/feature",
+        force: true,
+        ownerThreadId: "workspace-thread",
+        threadIds: [],
+      }),
+    ).toThrow();
   });
 });
 

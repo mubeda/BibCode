@@ -150,7 +150,7 @@ impl RpcAdmissionGate {
 
     pub fn admit(&self, mutability: RpcMutability) -> Result<RpcPermit, MaintenanceError> {
         if mutability == RpcMutability::Read {
-            return Ok(RpcPermit { gate: None });
+            return Ok(RpcPermit { _lease: None });
         }
         let mut state = self
             .inner
@@ -162,7 +162,7 @@ impl RpcAdmissionGate {
         }
         state.in_flight = state.in_flight.saturating_add(1);
         Ok(RpcPermit {
-            gate: Some(self.clone()),
+            _lease: Some(Arc::new(RpcPermitLease { gate: self.clone() })),
         })
     }
 
@@ -227,15 +227,18 @@ impl RpcAdmissionGate {
     }
 }
 
+#[derive(Clone)]
 pub struct RpcPermit {
-    gate: Option<RpcAdmissionGate>,
+    _lease: Option<Arc<RpcPermitLease>>,
 }
 
-impl Drop for RpcPermit {
+struct RpcPermitLease {
+    gate: RpcAdmissionGate,
+}
+
+impl Drop for RpcPermitLease {
     fn drop(&mut self) {
-        if let Some(gate) = self.gate.take() {
-            gate.permit_released();
-        }
+        self.gate.permit_released();
     }
 }
 
