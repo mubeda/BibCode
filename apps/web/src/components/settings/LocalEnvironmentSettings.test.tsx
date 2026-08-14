@@ -284,6 +284,41 @@ describe("LocalEnvironmentSettings", () => {
     expect(h.refreshDesktopWslState).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an unavailable disabled WSL backend discoverable and retryable", async () => {
+    const bridge = installDesktopBridge();
+    h.wslQuery.data = wslState({
+      enabled: false,
+      distro: null,
+      available: false,
+      wslOnly: false,
+      distros: [],
+    });
+    const container = await mount();
+
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert).not.toBeNull();
+    expect(alert!.textContent).toContain("WSL backend unavailable");
+    expect(container.textContent).toContain("WSL backend");
+
+    await act(async () => invoke(control("button", "Retry"), "onClick"));
+    expect(h.refreshDesktopWslState).toHaveBeenCalledTimes(1);
+    expect(bridge.setWslBackendEnabled).not.toHaveBeenCalled();
+    expect(bridge.setWslDistro).not.toHaveBeenCalled();
+    expect(bridge.setWslOnly).not.toHaveBeenCalled();
+
+    for (const hiddenText of [
+      "Network access",
+      "Tailscale HTTPS",
+      "Authorized clients",
+      "BiBCode Connect",
+      "Remote environments",
+      "Add environment",
+      "SSH",
+    ]) {
+      expect(container.textContent).not.toContain(hiddenText);
+    }
+  });
+
   it("renders only Windows-local WSL settings and no remote controls", async () => {
     installDesktopBridge();
     h.environments = [{ entry: { target: { _tag: "DesktopLocalConnectionTarget" } } }];
