@@ -28,7 +28,7 @@ import {
   MonitorIcon,
   PlusIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { newCommandId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
@@ -40,6 +40,8 @@ import {
   buildWorktreeDiscoveryGroups,
   formatDiscoveredWorktreeCount,
   formatWorktreeAddAllSummary,
+  type WorktreeDiscoveryCandidatePresentation,
+  type WorktreeDiscoveryParentGroup,
 } from "./WorktreeDiscoverySection.logic";
 import { Button } from "./ui/button";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -133,47 +135,77 @@ function EnvironmentBadge(props: {
 
 function CandidateDetails(props: {
   readonly label: string;
+  readonly discriminator: string | null;
   readonly path: string;
   readonly accessiblePhysicalScope: string;
-  readonly discoveredBadge?: boolean;
-  readonly pathTooltip: "self" | "parent";
 }) {
-  const pathText = (
-    <span className="max-w-full truncate font-mono text-[9px] text-muted-foreground/75">
-      {props.path}
-    </span>
-  );
+  const fullPathName = `Full worktree path for ${props.label} in ${props.accessiblePhysicalScope}: ${props.path}`;
   return (
-    <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left">
-      <span className="flex min-w-0 max-w-full items-center gap-1.5">
-        <span className="truncate text-[11px] font-medium text-foreground/90">{props.label}</span>
-        {props.discoveredBadge ? (
-          <span className="shrink-0 rounded bg-info/10 px-1 py-px text-[8px] font-medium uppercase tracking-wide text-info">
-            Discovered
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            aria-label={fullPathName}
+            className="flex min-w-0 flex-1 flex-col items-start overflow-hidden rounded-sm text-left outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+            data-worktree-candidate-copy
+            tabIndex={0}
+          />
+        }
+      >
+        <span className="block max-w-full truncate text-[11px] font-medium text-foreground/90">
+          {props.label}
+        </span>
+        {props.discriminator ? (
+          <span className="block max-w-full truncate font-mono text-[9px] text-muted-foreground">
+            {props.discriminator}
           </span>
         ) : null}
-      </span>
-      {props.pathTooltip === "self" ? (
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <span
-                aria-label={`Full worktree path for ${props.label} in ${props.accessiblePhysicalScope}: ${props.path}`}
-                className="max-w-full outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-                tabIndex={0}
-              />
-            }
-          >
-            {pathText}
-          </TooltipTrigger>
-          <TooltipPopup side="top">
-            <span className="font-mono">{props.path}</span>
-          </TooltipPopup>
-        </Tooltip>
-      ) : (
-        pathText
-      )}
-    </span>
+      </TooltipTrigger>
+      <TooltipPopup side="top">
+        <span className="font-mono">{props.path}</span>
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
+function CandidateParentGroup(props: {
+  readonly accessiblePhysicalScope: string;
+  readonly candidateRowClassName: string;
+  readonly discoveredBadge?: boolean;
+  readonly parentGroup: WorktreeDiscoveryParentGroup;
+  readonly renderBeforeAction?: (presentation: WorktreeDiscoveryCandidatePresentation) => ReactNode;
+  readonly renderAction: (presentation: WorktreeDiscoveryCandidatePresentation) => ReactNode;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5" data-worktree-parent-group>
+      <div
+        className="block max-w-full truncate px-1 font-mono text-[8px] text-muted-foreground/65"
+        data-worktree-parent-directory
+      >
+        {props.parentGroup.parentDirectory}
+      </div>
+      {props.parentGroup.candidates.map((presentation) => (
+        <div
+          key={presentation.candidate.worktreeKey}
+          className={props.candidateRowClassName}
+          data-worktree-candidate-row
+        >
+          <CandidateDetails
+            accessiblePhysicalScope={props.accessiblePhysicalScope}
+            discriminator={presentation.discriminator}
+            label={presentation.label}
+            path={presentation.candidate.path}
+          />
+          {props.discoveredBadge ? (
+            <span className="shrink-0 rounded bg-info/10 px-1 py-px text-[8px] font-medium uppercase tracking-wide text-info">
+              Discovered
+            </span>
+          ) : null}
+          {props.renderBeforeAction?.(presentation)}
+          {props.renderAction(presentation)}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -409,38 +441,29 @@ function PhysicalWorktreeDiscoverySection(props: {
 
           <div className="flex flex-col gap-1.5">
             {groupsFor(cardCandidates).map((parentGroup) => (
-              <div key={parentGroup.parentDirectory} className="flex flex-col gap-0.5">
-                <div className="truncate px-1 font-mono text-[8px] text-muted-foreground/65">
-                  {parentGroup.parentDirectory}
-                </div>
-                {parentGroup.candidates.map(({ candidate, label }) => {
+              <CandidateParentGroup
+                key={parentGroup.parentDirectory}
+                accessiblePhysicalScope={accessiblePhysicalScope}
+                candidateRowClassName="flex min-w-0 items-center gap-1 rounded-md bg-background/65 px-1.5 py-1"
+                parentGroup={parentGroup}
+                renderAction={({ candidate, label }) => {
                   const pending = pendingWorktreeKeys.has(candidate.worktreeKey);
                   return (
-                    <div
-                      key={candidate.worktreeKey}
-                      className="flex min-w-0 items-center gap-1 rounded-md bg-background/65 px-1.5 py-1"
+                    <Button
+                      aria-label={`Add ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
+                      className="h-5 shrink-0 px-1.5 text-[9px]"
+                      data-worktree-add-action="true"
+                      disabled={pending || addAllPendingCount > 0}
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => void handleAddOne(candidate)}
                     >
-                      <CandidateDetails
-                        accessiblePhysicalScope={accessiblePhysicalScope}
-                        label={label}
-                        path={candidate.path}
-                        pathTooltip="self"
-                      />
-                      <Button
-                        aria-label={`Add ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
-                        className="h-5 shrink-0 px-1.5 text-[9px]"
-                        disabled={pending || addAllPendingCount > 0}
-                        size="xs"
-                        variant="ghost"
-                        onClick={() => void handleAddOne(candidate)}
-                      >
-                        {pending ? <LoaderIcon className="size-3 animate-spin" /> : <PlusIcon />}
-                        Add
-                      </Button>
-                    </div>
+                      {pending ? <LoaderIcon className="size-3 animate-spin" /> : <PlusIcon />}
+                      Add
+                    </Button>
                   );
-                })}
-              </div>
+                }}
+              />
             ))}
           </div>
 
@@ -491,44 +514,39 @@ function PhysicalWorktreeDiscoverySection(props: {
       ) : null}
 
       {shownCandidates.length > 0
-        ? groupsFor(shownCandidates).flatMap((parentGroup) =>
-            parentGroup.candidates.map(({ candidate, label }) => {
-              const pending = pendingWorktreeKeys.has(candidate.worktreeKey);
-              return (
-                <Tooltip key={candidate.worktreeKey}>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        aria-label={`Add discovered worktree ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
-                        className="h-auto w-full justify-start rounded-md border border-dashed border-info/25 bg-info/5 px-2 py-1.5"
-                        disabled={pending || addAllPendingCount > 0}
-                        size="content"
-                        variant="ghost"
-                        onClick={() => void handleAddOne(candidate)}
-                      />
-                    }
+        ? groupsFor(shownCandidates).map((parentGroup) => (
+            <CandidateParentGroup
+              key={parentGroup.parentDirectory}
+              accessiblePhysicalScope={accessiblePhysicalScope}
+              candidateRowClassName="flex min-w-0 items-center gap-1 rounded-md border border-dashed border-info/25 bg-info/5 px-2 py-1.5"
+              discoveredBadge
+              parentGroup={parentGroup}
+              renderBeforeAction={() => (
+                <EnvironmentBadge environmentLabel={environmentLabel} isRemote={isRemote} />
+              )}
+              renderAction={({ candidate, label }) => {
+                const pending = pendingWorktreeKeys.has(candidate.worktreeKey);
+                return (
+                  <Button
+                    aria-label={`Add discovered worktree ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
+                    className="h-5 shrink-0 px-1.5 text-[9px]"
+                    data-worktree-add-action="true"
+                    disabled={pending || addAllPendingCount > 0}
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => void handleAddOne(candidate)}
                   >
                     {pending ? (
-                      <LoaderIcon className="size-3 shrink-0 animate-spin" />
+                      <LoaderIcon className="size-3 animate-spin" />
                     ) : (
-                      <PlusIcon className="size-3 shrink-0 text-info" />
+                      <PlusIcon className="size-3" />
                     )}
-                    <CandidateDetails
-                      discoveredBadge
-                      accessiblePhysicalScope={accessiblePhysicalScope}
-                      label={label}
-                      path={candidate.path}
-                      pathTooltip="parent"
-                    />
-                    <EnvironmentBadge environmentLabel={environmentLabel} isRemote={isRemote} />
-                  </TooltipTrigger>
-                  <TooltipPopup side="top">
-                    <span className="font-mono">{candidate.path}</span>
-                  </TooltipPopup>
-                </Tooltip>
-              );
-            }),
-          )
+                    Add
+                  </Button>
+                );
+              }}
+            />
+          ))
         : null}
     </div>
   );

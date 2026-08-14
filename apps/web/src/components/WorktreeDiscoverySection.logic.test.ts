@@ -83,10 +83,12 @@ describe("WorktreeDiscoverySection presentation logic", () => {
         candidates: [
           {
             candidate: expect.objectContaining({ path: "C:\\worktrees\\repo\\alpha" }),
+            discriminator: null,
             label: "feature/alpha",
           },
           {
             candidate: expect.objectContaining({ path: "C:\\worktrees\\repo\\beta" }),
+            discriminator: null,
             label: "feature/beta",
           },
         ],
@@ -117,6 +119,63 @@ describe("WorktreeDiscoverySection presentation logic", () => {
     expect(groups[0]?.parentGroups[0]?.candidates.map((candidate) => candidate.label)).toEqual([
       "Feature",
       "feature",
+    ]);
+  });
+
+  it("adds final-component discriminators only for exact duplicate labels in one parent", () => {
+    const groups = buildWorktreeDiscoveryGroups([
+      {
+        environmentId: EnvironmentId.make("environment-main"),
+        environmentLabel: "This device",
+        projectId: ProjectId.make("project-main"),
+        candidates: [
+          candidate(
+            "/Users/admin/conductor/workspaces/sample-review",
+            "hotfix/ABC-1817",
+            "1111111",
+          ),
+          candidate("/Users/admin/orca/workspaces/alpha", "alpha", "2222222"),
+          candidate(
+            "/Users/admin/conductor/workspaces/sample-hotfix",
+            "hotfix/ABC-1817",
+            "3333333",
+          ),
+        ],
+      },
+    ]);
+
+    expect(groups[0]?.parentGroups).toMatchObject([
+      {
+        parentDirectory: "/Users/admin/conductor/workspaces",
+        candidates: [
+          { label: "hotfix/ABC-1817", discriminator: "sample-hotfix" },
+          { label: "hotfix/ABC-1817", discriminator: "sample-review" },
+        ],
+      },
+      {
+        parentDirectory: "/Users/admin/orca/workspaces",
+        candidates: [{ label: "alpha", discriminator: null }],
+      },
+    ]);
+  });
+
+  it("derives a duplicate discriminator from Windows separators without changing the path", () => {
+    const reviewPath = "C:\\Users\\admin\\workspaces\\sample-review";
+    const groups = buildWorktreeDiscoveryGroups([
+      {
+        environmentId: EnvironmentId.make("environment-main"),
+        environmentLabel: "This device",
+        projectId: ProjectId.make("project-main"),
+        candidates: [
+          candidate("C:\\Users\\admin\\workspaces\\sample-hotfix", "hotfix/ABC-1817", null),
+          candidate(reviewPath, "hotfix/ABC-1817", null),
+        ],
+      },
+    ]);
+
+    expect(groups[0]?.parentGroups[0]?.candidates).toMatchObject([
+      { discriminator: "sample-hotfix" },
+      { candidate: { path: reviewPath }, discriminator: "sample-review" },
     ]);
   });
 
