@@ -50,6 +50,7 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
           {workflow.step === "start" ? (
             <AddProjectStartStep
               hosts={workflow.hosts}
+              locationLabel={workflow.locationLabel}
               selectedEnvironmentId={workflow.selectedHost.environmentId}
               busy={workflow.busy}
               error={workflow.error}
