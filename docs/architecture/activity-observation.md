@@ -299,6 +299,14 @@ nested recovery repairs reconnect topology. An empty successful list neither
 erases known actors nor suppresses hinted actors and their direct reads.
 Malformed, out-of-scope, self-referential, or cyclic hints are ignored.
 
+The official `thread/backgroundTerminals/list` response does not provide a
+background terminal start time. For each successfully decoded reconciliation
+batch, the server therefore samples one canonical RFC 3339 observation
+timestamp and uses it for that batch's background-work mutations. An unchanged
+tracker entry retains its first observation time across later batches. A server
+restart or other new tracker generation may begin that elapsed interval at its
+first new observation because no earlier provider timestamp exists to recover.
+
 For structured chat only, a verified descendant becomes cancellable while the
 tracker can prove one current active turn for that native child thread. Live
 `turn/started` and bounded child-history reconciliation install the same private

@@ -3315,9 +3315,13 @@ fn method_is_incompatible(error: &ProtocolError) -> bool {
 }
 
 fn current_timestamp() -> String {
-    OffsetDateTime::now_utc()
+    format_observation_timestamp(OffsetDateTime::now_utc())
+}
+
+fn format_observation_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
         .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+        .expect("current UTC observation time must format as RFC 3339")
 }
 
 fn request_type(kind: PendingRequestKind) -> &'static str {
@@ -6214,6 +6218,17 @@ mod tests {
         let mut activity = runtime.inner.activity.lock().await;
         activity.install_root_thread_id("provider-root");
         activity.tracker.begin_detail_baseline();
+    }
+
+    #[test]
+    fn background_observation_timestamp_format_is_canonical() {
+        let observed_at = OffsetDateTime::from_unix_timestamp_nanos(1_786_710_896_789_000_000)
+            .expect("fixed observation timestamp");
+
+        assert_eq!(
+            format_observation_timestamp(observed_at),
+            "2026-08-14T12:34:56.789Z"
+        );
     }
 
     #[tokio::test]
