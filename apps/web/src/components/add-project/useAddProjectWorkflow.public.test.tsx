@@ -10,13 +10,27 @@ import {
   type ServerProvider,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { EnvironmentPresentationPolicy } from "~/connection/environmentPresentationPolicy";
+
+type AddProjectPresentation = Pick<
+  EnvironmentPresentationPolicy,
+  "surface" | "platform" | "presentsTarget"
+>;
+
 const harness = vi.hoisted(() => ({
   environments: [] as unknown[],
+  desktopLocalBootstraps: [] as Array<{ readonly id: string; readonly httpBaseUrl: string }>,
+  presentation: {
+    surface: "browser" as const,
+    platform: "unknown" as const,
+    presentsTarget: (_target: ConnectionTarget) => true,
+  } as AddProjectPresentation,
   projects: [] as unknown[],
   createProject: vi.fn(),
   cloneRepository: vi.fn(),
@@ -29,7 +43,11 @@ const harness = vi.hoisted(() => ({
 }));
 
 vi.mock("~/connection/useDesktopLocalBootstraps", () => ({
-  useDesktopLocalBootstraps: () => [],
+  useDesktopLocalBootstraps: () => harness.desktopLocalBootstraps,
+}));
+
+vi.mock("~/connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => harness.presentation,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -94,6 +112,10 @@ vi.mock("~/state/use-atom-command", () => ({
 import { useAddProjectWorkflow, type AddProjectWorkflow } from "./useAddProjectWorkflow";
 
 const environmentId = EnvironmentId.make("public-workflow");
+const wslEnvironmentId = EnvironmentId.make("wsl-workflow");
+const sshEnvironmentId = EnvironmentId.make("ssh-workflow");
+const relayEnvironmentId = EnvironmentId.make("relay-workflow");
+const bearerEnvironmentId = EnvironmentId.make("bearer-workflow");
 const defaultThreadId = ThreadId.make("canonical-main");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
@@ -164,6 +186,67 @@ const claudeProvider: ServerProvider = {
   ],
 };
 
+function environment(
+  environmentId: EnvironmentId,
+  label: string,
+  target: Record<string, unknown>,
+  os: "darwin" | "linux" = "linux",
+) {
+  const displayUrl = `http://${environmentId}.test:4317`;
+  return {
+    environmentId,
+    label,
+    displayUrl,
+    relayManaged: false,
+    entry: {
+      target: {
+        environmentId,
+        label,
+        ...target,
+      },
+    },
+    connection: { phase: "connected", error: null, traceId: null },
+    serverConfig: {
+      environment: {
+        environmentId,
+        label,
+        platform: { os, arch: "arm64" },
+        serverVersion: "0.2.3",
+        capabilities: { repositoryIdentity: true },
+      },
+      providers: [provider, claudeProvider],
+      settings: {
+        ...DEFAULT_SERVER_SETTINGS,
+        addProjectBaseDirectory: "/code/",
+        defaultAgent: { kind: "chat", instanceId: claudeInstanceId },
+        providerSessionDefaults: {
+          ...DEFAULT_SERVER_SETTINGS.providerSessionDefaults,
+          codex: { model: expectedSelection.model, options: expectedSelection.options },
+          claudeAgent: { model: "claude-opus-4-1", options: [] },
+        },
+      },
+    },
+  };
+}
+
+function presentation(
+  surface: "browser" | "desktop",
+  platform: "macos" | "windows",
+): AddProjectPresentation {
+  return {
+    surface,
+    platform,
+    presentsTarget: (target) => {
+      if (surface === "browser" || target._tag === "PrimaryConnectionTarget") return true;
+      return (
+        platform === "windows" &&
+        "connectionId" in target &&
+        target.connectionId.startsWith("local:")
+      );
+    },
+  };
+}
+
 let currentWorkflow: AddProjectWorkflow;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
@@ -187,43 +270,19 @@ async function mountWorkflow(): Promise<AddProjectWorkflow> {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   harness.environments = [
-    {
+    environment(
       environmentId,
-      label: "Local",
-      displayUrl: "http://localhost:4317",
-      relayManaged: false,
-      entry: {
-        target: {
-          _tag: "PrimaryConnectionTarget",
-          environmentId,
-          label: "Local",
-          httpBaseUrl: "http://localhost:4317",
-          wsBaseUrl: "ws://localhost:4317",
-        },
+      "Local",
+      {
+        _tag: "PrimaryConnectionTarget",
+        httpBaseUrl: "http://public-workflow.test:4317",
+        wsBaseUrl: "ws://public-workflow.test:4317",
       },
-      connection: { phase: "connected", error: null, traceId: null },
-      serverConfig: {
-        environment: {
-          environmentId,
-          label: "Local",
-          platform: { os: "darwin", arch: "arm64" },
-          serverVersion: "0.2.3",
-          capabilities: { repositoryIdentity: true },
-        },
-        providers: [provider, claudeProvider],
-        settings: {
-          ...DEFAULT_SERVER_SETTINGS,
-          addProjectBaseDirectory: "/code/",
-          defaultAgent: { kind: "chat", instanceId: claudeInstanceId },
-          providerSessionDefaults: {
-            ...DEFAULT_SERVER_SETTINGS.providerSessionDefaults,
-            codex: { model: expectedSelection.model, options: expectedSelection.options },
-            claudeAgent: { model: "claude-opus-4-1", options: [] },
-          },
-        },
-      },
-    },
+      "darwin",
+    ),
   ];
+  harness.desktopLocalBootstraps = [];
+  harness.presentation = presentation("browser", "macos");
   harness.projects = [];
   harness.createProject.mockReset().mockImplementation(async (command) => {
     const input = command as { readonly input: { readonly projectId: string } };
@@ -252,6 +311,91 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflow public adapter", () => {
+  it("presents only this device without a location selector on macOS desktop", async () => {
+    harness.environments = [
+      ...harness.environments,
+      environment(wslEnvironmentId, "Ubuntu (WSL)", {
+        _tag: "BearerConnectionTarget",
+        connectionId: "local:wsl:Ubuntu",
+      }),
+      environment(sshEnvironmentId, "Build server", {
+        _tag: "SshConnectionTarget",
+        connectionId: "ssh:build-server",
+      }),
+      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
+      environment(bearerEnvironmentId, "Remote server", {
+        _tag: "BearerConnectionTarget",
+        connectionId: "remote:server",
+      }),
+    ];
+    harness.presentation = presentation("desktop", "macos");
+
+    await mountWorkflow();
+
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual(["This device"]);
+    expect(currentWorkflow).toHaveProperty("locationLabel", null);
+  });
+
+  it("presents primary and WSL locations on Windows desktop", async () => {
+    const wsl = environment(wslEnvironmentId, "Ubuntu (WSL)", {
+      _tag: "BearerConnectionTarget",
+      connectionId: "local:wsl:Ubuntu",
+    });
+    harness.environments = [
+      ...harness.environments,
+      wsl,
+      environment(sshEnvironmentId, "Build server", {
+        _tag: "SshConnectionTarget",
+        connectionId: "ssh:build-server",
+      }),
+      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
+      environment(bearerEnvironmentId, "Remote server", {
+        _tag: "BearerConnectionTarget",
+        connectionId: "remote:server",
+      }),
+    ];
+    harness.desktopLocalBootstraps = [{ id: "wsl:Ubuntu", httpBaseUrl: wsl.displayUrl }];
+    harness.presentation = presentation("desktop", "windows");
+
+    await mountWorkflow();
+
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
+      "This device",
+      "Ubuntu (WSL)",
+    ]);
+    expect(currentWorkflow).toHaveProperty("locationLabel", "Location");
+  });
+
+  it("preserves every host and the Host selector in browser mode", async () => {
+    harness.environments = [
+      ...harness.environments,
+      environment(wslEnvironmentId, "Ubuntu (WSL)", {
+        _tag: "BearerConnectionTarget",
+        connectionId: "local:wsl:Ubuntu",
+      }),
+      environment(sshEnvironmentId, "Build server", {
+        _tag: "SshConnectionTarget",
+        connectionId: "ssh:build-server",
+      }),
+      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
+      environment(bearerEnvironmentId, "Remote server", {
+        _tag: "BearerConnectionTarget",
+        connectionId: "remote:server",
+      }),
+    ];
+
+    await mountWorkflow();
+
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
+      "This device",
+      "Ubuntu (WSL)",
+      "Build server",
+      "Relay server",
+      "Remote server",
+    ]);
+    expect(currentWorkflow).toHaveProperty("locationLabel", "Host");
+  });
+
   it.each(["add", "clone", "create"] as const)(
     "opens canonical Main with the selected chat default for the %s flow",
     async (flow) => {

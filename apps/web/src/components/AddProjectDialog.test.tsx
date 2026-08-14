@@ -103,6 +103,7 @@ beforeEach(() => {
   } as const;
   testState.workflow = {
     hosts: [selectedHost],
+    locationLabel: null,
     selectedHost,
     step: "start",
     busy: false,
@@ -193,6 +194,14 @@ describe("AddProjectDialog mounted interactions", () => {
     expect(document.body.textContent).not.toContain("Repositories found");
     expect(document.body.textContent).not.toContain("Import selected");
     expect(document.querySelector('input[type="checkbox"]')).toBeNull();
+  });
+
+  it("does not render a redundant host selector for one desktop location", async () => {
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    expect(document.querySelector('[role="combobox"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Host");
+    expect(document.body.textContent).not.toContain("Location");
   });
 
   it("prevents dismissal while a mutation is pending", async () => {

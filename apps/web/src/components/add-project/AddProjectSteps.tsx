@@ -14,6 +14,7 @@ import {
   validateProjectName,
   type AddProjectHostOption,
 } from "./AddProjectDialog.logic";
+import type { AddProjectLocationLabel } from "./useAddProjectWorkflow";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Kbd } from "../ui/kbd";
@@ -21,6 +22,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 
 export interface AddProjectStartStepProps {
   readonly hosts: ReadonlyArray<AddProjectHostOption>;
+  readonly locationLabel: AddProjectLocationLabel;
   readonly selectedEnvironmentId: EnvironmentId;
   readonly busy: boolean;
   readonly error: string | null;
@@ -185,6 +187,7 @@ function ActionRow({
 
 export function AddProjectStartStep({
   hosts,
+  locationLabel,
   selectedEnvironmentId,
   busy,
   error,
@@ -237,29 +240,31 @@ export function AddProjectStartStep({
         }}
         onKeyDown={handleArrowNavigation}
       >
-        <label className="flex items-center gap-3">
-          <span className="font-medium text-muted-foreground text-sm">Host</span>
-          <Select
-            disabled={busy || hosts.length <= 1}
-            items={hostItems}
-            modal={false}
-            onValueChange={(value) => {
-              if (value !== null) onSelectHost(value as EnvironmentId);
-            }}
-            value={selectedEnvironmentId}
-          >
-            <SelectTrigger aria-label="Host" className="w-auto min-w-40" size="sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectPopup>
-              {hosts.map((host) => (
-                <SelectItem key={host.environmentId} value={host.environmentId}>
-                  {host.label}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-        </label>
+        {locationLabel === null ? null : (
+          <label className="flex items-center gap-3">
+            <span className="font-medium text-muted-foreground text-sm">{locationLabel}</span>
+            <Select
+              disabled={busy}
+              items={hostItems}
+              modal={false}
+              onValueChange={(value) => {
+                if (value !== null) onSelectHost(value as EnvironmentId);
+              }}
+              value={selectedEnvironmentId}
+            >
+              <SelectTrigger aria-label={locationLabel} className="w-auto min-w-40" size="sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectPopup>
+                {hosts.map((host) => (
+                  <SelectItem key={host.environmentId} value={host.environmentId}>
+                    {host.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          </label>
+        )}
         {error ? <ErrorMessage>{error}</ErrorMessage> : null}
 
         <ActionRow
