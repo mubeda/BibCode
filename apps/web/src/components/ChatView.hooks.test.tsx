@@ -36,10 +36,17 @@ import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
 import {
+  BearerConnectionTarget,
+  PrimaryConnectionTarget,
+  type ConnectionTarget,
+} from "@bibcode/client-runtime/connection";
+import {
   scopeProjectRef,
   scopeThreadRef,
   scopedThreadKey,
 } from "@bibcode/client-runtime/environment";
+import { desktopLocalConnectionId } from "../connection/desktopLocal";
+import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
 
 const h = vi.hoisted(() => {
   const state = {
@@ -100,6 +107,7 @@ const h = vi.hoisted(() => {
     refSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     effects: [] as Array<() => void | (() => void)>,
     centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
+    presentationPolicy: null as unknown as ReturnType<typeof createEnvironmentPresentationPolicy>,
   };
   return state;
 });
@@ -268,6 +276,10 @@ vi.mock("../state/environments", () => ({
     environments: h.environments,
   }),
   usePrimaryEnvironment: () => h.primaryEnvironment,
+}));
+
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => h.presentationPolicy,
 }));
 
 vi.mock("../state/terminalSessions", () => ({
@@ -799,6 +811,7 @@ interface TestEnvironmentPresentation {
   readonly label: string;
   readonly displayUrl: string | null;
   readonly relayManaged: boolean;
+  readonly entry: { readonly target: ConnectionTarget };
   readonly connection: TestConnectionPresentation;
   readonly serverConfig: {
     readonly providers: ReadonlyArray<ServerProvider>;
@@ -814,6 +827,14 @@ function makeEnvironmentPresentation(
     label: "Local",
     displayUrl: null,
     relayManaged: false,
+    entry: {
+      target: new PrimaryConnectionTarget({
+        environmentId,
+        httpBaseUrl: "http://127.0.0.1:3773",
+        label: "Local",
+        wsBaseUrl: "ws://127.0.0.1:3773",
+      }),
+    },
     connection: { phase: "connected", error: null, traceId: null },
     serverConfig: {
       providers: [codexProvider],
@@ -1393,6 +1414,10 @@ beforeEach(() => {
   h.refSeeds.clear();
   h.effects.length = 0;
   h.centerHeaderDensityByGroupId.clear();
+  h.presentationPolicy = createEnvironmentPresentationPolicy({
+    surface: "browser",
+    platform: "unknown",
+  });
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -5311,6 +5336,67 @@ describe("ChatView banners and dialogs", () => {
     }
     return found;
   }
+
+  function unavailableBannerActions(input: {
+    readonly surface: "browser" | "desktop";
+    readonly platform: "macos" | "windows";
+    readonly target: ConnectionTarget;
+  }): string {
+    h.presentationPolicy = createEnvironmentPresentationPolicy({
+      surface: input.surface,
+      platform: input.platform,
+    });
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        entry: { target: input.target },
+        connection: { phase: "error", error: "socket closed", traceId: null },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    renderServerRoute();
+
+    const bannerStack = capturedProps<{ items: ComposerBannerStackItem[] }>("composerBannerStack");
+    return renderToStaticMarkup(<>{bannerStack.items[0]!.actions}</>);
+  }
+
+  it("gates unavailable environment actions by desktop target while preserving browser recovery", () => {
+    const remoteTarget = new BearerConnectionTarget({
+      connectionId: "remote:server",
+      environmentId,
+      label: "Remote server",
+    });
+    const wslTarget = new BearerConnectionTarget({
+      connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+      environmentId,
+      label: "WSL: Ubuntu",
+    });
+
+    const macRemoteBanner = unavailableBannerActions({
+      surface: "desktop",
+      platform: "macos",
+      target: remoteTarget,
+    });
+    expect(macRemoteBanner).not.toContain("Reconnect");
+    expect(macRemoteBanner).not.toContain("Connections");
+
+    const windowsWslBanner = unavailableBannerActions({
+      surface: "desktop",
+      platform: "windows",
+      target: wslTarget,
+    });
+    expect(windowsWslBanner).toContain("Reconnect");
+    expect(windowsWslBanner).not.toContain("Connections");
+
+    const browserRemoteBanner = unavailableBannerActions({
+      surface: "browser",
+      platform: "macos",
+      target: remoteTarget,
+    });
+    expect(browserRemoteBanner).toContain("Reconnect");
+    expect(browserRemoteBanner).toContain("Connections");
+  });
 
   it("reconnects the environment from the unavailable banner and toasts failures", async () => {
     seedEnvironment(

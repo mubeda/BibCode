@@ -30,6 +30,7 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
+import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
 import { derivePhysicalProjectKey } from "../logicalProject";
 import type {
   EnvironmentProject,
@@ -98,6 +99,7 @@ const h = vi.hoisted(() => {
     shortcutLabelOptions: [] as unknown[],
     showJumpHintModifiers: false,
     terminalSurfaceOpen: false,
+    presentationPolicy: null as unknown,
     // mock stores
     ui: null,
     selection: null,
@@ -329,6 +331,10 @@ vi.mock("../env", () => ({
   get isDesktopHost() {
     return h.state.isDesktopHost as boolean;
   },
+}));
+
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => h.state.presentationPolicy,
 }));
 
 vi.mock("../state/entities", () => ({
@@ -1077,6 +1083,10 @@ beforeEach(() => {
   h.state.shortcutLabelOptions = [];
   h.state.showJumpHintModifiers = false;
   h.state.terminalSurfaceOpen = false;
+  h.state.presentationPolicy = createEnvironmentPresentationPolicy({
+    surface: "browser",
+    platform: "unknown",
+  });
   h.spies.contextMenuShow.mockResolvedValue(null);
   h.spies.dialogConfirm.mockResolvedValue(true);
   h.spies.toastAdd.mockReturnValue("toast-1");
@@ -1324,6 +1334,50 @@ staticDescribe("Sidebar full render", () => {
     const markup = render(<Sidebar />);
     expect(markup).toContain("Project data is still loading");
     expect(markup).not.toContain("No projects yet");
+  });
+
+  it("keeps a saved remote project row while hiding desktop remote recovery controls", () => {
+    h.state.presentationPolicy = createEnvironmentPresentationPolicy({
+      surface: "desktop",
+      platform: "macos",
+    });
+    const savedRemoteProject = makeProject("saved-remote", {
+      environmentId: ENV_REMOTE,
+      title: "Saved remote repository",
+      workspaceRoot: "/srv/saved-remote",
+    });
+    h.state.projects = [savedRemoteProject];
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "Remote Box",
+        connectionId: "remote:box",
+        phase: "error",
+        error: "Remote host is offline.",
+      }),
+    ];
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_REMOTE,
+          status: "unavailable",
+          hasSnapshot: true,
+          error: "Remote host is offline.",
+        },
+      ],
+      hasSnapshot: true,
+      hasCachedShell: true,
+    };
+
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Saved remote repository");
+    const availabilityActions = captured("Button").map((entry) => entry.props["children"]);
+    expect(availabilityActions).toContain("Diagnostics");
+    expect(availabilityActions).not.toContain("Retry");
+    expect(availabilityActions).not.toContain("Settings");
   });
 
   it("wires storage-change actions and confirms storage adoption through the local dialog", async () => {

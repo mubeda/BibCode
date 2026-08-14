@@ -47,6 +47,7 @@ import {
   primaryServerWelcomeAtom,
 } from "../state/server";
 import { readProject, setActiveEnvironmentId, useActiveEnvironmentId } from "../state/entities";
+import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import {
   createKeybindingsUpdateToastController,
   type KeybindingsUpdateToastController,
@@ -83,6 +84,7 @@ export const Route = createRootRoute({
 });
 
 function RootRouteView() {
+  const presentation = readCurrentEnvironmentPresentationPolicy();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
   const primaryEnvironmentAuthenticated = authGateState.status === "authenticated";
@@ -131,7 +133,7 @@ function RootRouteView() {
     <ToastProvider>
       <AnchoredToastProvider>
         <DocumentTitleSync />
-        <RelayClientInstallDialog />
+        {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
         <SshPasswordPromptDialog />
         <SlowRpcRequestToastCoordinator />
         <HostedStaticEnvironmentBootstrap />
