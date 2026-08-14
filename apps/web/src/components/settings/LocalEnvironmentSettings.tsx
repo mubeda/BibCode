@@ -241,7 +241,24 @@ export function LocalEnvironmentSettings(): ReactElement {
       !desktopWslState.available ||
       desktopWslState.preflightError?.kind === "wsl-secondary-unavailable"
     ) {
-      if (!desktopWslState.enabled && !desktopWslState.wslOnly) return null;
+      if (!desktopWslState.enabled && !desktopWslState.wslOnly) {
+        return (
+          <SettingsRow
+            title="WSL backend"
+            description="WSL is unavailable. Install or enable WSL and a Linux distribution, then retry."
+            status={
+              <span role="alert" className="block text-destructive">
+                WSL backend unavailable
+              </span>
+            }
+            control={
+              <Button size="xs" variant="outline" onClick={loadWslState}>
+                Retry
+              </Button>
+            }
+          />
+        );
+      }
       const isPrimaryWslFailure =
         desktopWslState.wslOnly ||
         desktopWslState.preflightError?.kind === "wsl-primary-unavailable";
