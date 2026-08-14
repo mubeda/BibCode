@@ -171,6 +171,20 @@ export function LocalEnvironmentSettings(): ReactElement {
   }, [applyWslSettingChange, desktopBridge, pendingWslChange]);
 
   const renderWslRow = () => {
+    if (!desktopBridge) {
+      return (
+        <SettingsRow
+          title="WSL backend unavailable"
+          description="Desktop integration is unavailable. Restart BiBCode to manage the local WSL backend."
+          status={
+            <span role="alert" className="block text-destructive">
+              Desktop bridge unavailable
+            </span>
+          }
+        />
+      );
+    }
+
     if (!desktopWslState) {
       if (desktopWslError) {
         return (
@@ -191,7 +205,36 @@ export function LocalEnvironmentSettings(): ReactElement {
           />
         );
       }
-      return null;
+      if (isLoadingWslState) {
+        return (
+          <SettingsRow
+            title="WSL backend"
+            description="Loading local WSL backend configuration."
+            status={
+              <span role="status" aria-live="polite" className="flex items-center gap-1.5">
+                <Spinner className="size-3.5" />
+                Loading WSL backend settings…
+              </span>
+            }
+          />
+        );
+      }
+      return (
+        <SettingsRow
+          title="WSL backend"
+          description="Couldn't load the WSL backend state."
+          status={
+            <span role="alert" className="block text-destructive">
+              WSL backend state unavailable
+            </span>
+          }
+          control={
+            <Button size="xs" variant="outline" onClick={loadWslState}>
+              Retry
+            </Button>
+          }
+        />
+      );
     }
 
     if (
