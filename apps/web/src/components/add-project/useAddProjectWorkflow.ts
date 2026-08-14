@@ -592,7 +592,11 @@ export function useAddProjectWorkflow(input: {
         nativePickerAvailable: typeof window !== "undefined" && window.desktopBridge !== undefined,
       };
     });
-    return catalogHosts.length > 0 ? catalogHosts : [fallbackHost(primaryEnvironmentId)];
+    const usableHosts = catalogHosts.filter(
+      (host) =>
+        presentation.surface === "browser" || host.isPrimary || host.desktopInstanceId !== null,
+    );
+    return usableHosts.length > 0 ? usableHosts : [fallbackHost(primaryEnvironmentId)];
   }, [
     desktopLocalBootstraps,
     environments,
