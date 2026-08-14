@@ -257,6 +257,13 @@ export function useThreadActions() {
             cwd: threadProject.workspaceRoot,
             path: orphanedWorktreePath,
             force: true,
+            ownerThreadId: thread.id,
+            threadIds: [
+              thread.id,
+              ...threadsToTeardown
+                .filter((threadToTeardown) => threadToTeardown.id !== thread.id)
+                .map((threadToTeardown) => threadToTeardown.id),
+            ],
           },
         });
         if (removeResult._tag === "Failure") {

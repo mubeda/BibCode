@@ -40,6 +40,14 @@ local desktop environment, **Open in → File Explorer** opens the repository
 folder for a primary row or the worktree folder for a worktree row. The action
 is omitted for remote environments and browser mode.
 
+Deleting a worktree closes its workspace and linked-panel terminals under a
+server-held fence before filesystem cleanup begins. Selecting a stale row while
+deletion is in progress cannot reopen a terminal into that checkout. If an
+external process still uses the worktree as its current directory, deletion
+fails before removing files; close that process and retry the same row. If Git
+removal succeeds but deleting the sidebar row fails, retrying that stale row is
+safe even when a new worktree has since reused the old folder.
+
 ## Center Panel
 
 The active thread's main chat starts as the first center tab. It can be reordered,

@@ -1,7 +1,8 @@
 use std::{
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(not(windows))]
 use tokio::process::Command;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,11 +22,14 @@ use crate::{
         ProcessRunner, StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult,
         VcsStatusStreamEvent,
     },
-    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
+    maintenance::RpcPermit,
+    persistence::{Repositories, WorktreeRemovalReceipt},
+    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcSessionContext, RpcStreamChunk},
     source_control::{
         ChangeRequestState, CreatePullRequestInput, ProviderKind, PullRequestService,
         ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
     },
+    terminal::TerminalManager,
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
 };
 
@@ -34,6 +38,133 @@ use super::host_paths::resolve_host_directory;
 const STREAM_CAPACITY: usize = 8;
 const REF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const LOCAL_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Default)]
+pub(crate) struct WorktreeRemovalTaskTracker {
+    inner: Arc<WorktreeRemovalTaskTrackerInner>,
+}
+
+#[derive(Default)]
+struct WorktreeRemovalTaskTrackerInner {
+    state: Mutex<WorktreeRemovalTaskState>,
+    drained: Notify,
+}
+
+#[derive(Default)]
+struct WorktreeRemovalTaskState {
+    closed: bool,
+    active: usize,
+}
+
+struct WorktreeRemovalTaskGuard {
+    tracker: WorktreeRemovalTaskTracker,
+}
+
+impl Drop for WorktreeRemovalTaskGuard {
+    fn drop(&mut self) {
+        let notify = {
+            let mut state = self
+                .tracker
+                .inner
+                .state
+                .lock()
+                .expect("worktree removal task mutex poisoned");
+            debug_assert!(state.active > 0);
+            state.active = state.active.saturating_sub(1);
+            state.active == 0
+        };
+        if notify {
+            self.tracker.inner.drained.notify_waiters();
+        }
+    }
+}
+
+impl WorktreeRemovalTaskTracker {
+    fn spawn<F, T>(&self, operation: F) -> Result<tokio::task::JoinHandle<T>, String>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let guard = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("worktree removal task mutex poisoned");
+            if state.closed {
+                return Err("the server is shutting down".to_owned());
+            }
+            state.active = state.active.saturating_add(1);
+            WorktreeRemovalTaskGuard {
+                tracker: self.clone(),
+            }
+        };
+        Ok(tokio::spawn(async move {
+            let _guard = guard;
+            operation.await
+        }))
+    }
+
+    pub(crate) async fn close_and_drain(&self) {
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("worktree removal task mutex poisoned");
+            state.closed = true;
+        }
+        loop {
+            let notified = self.inner.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .inner
+                .state
+                .lock()
+                .expect("worktree removal task mutex poisoned")
+                .active
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod worktree_removal_task_tracker_tests {
+    use super::WorktreeRemovalTaskTracker;
+
+    #[tokio::test]
+    async fn runtime_drain_waits_for_protected_removal_and_rejects_late_tasks() {
+        let tracker = WorktreeRemovalTaskTracker::default();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let operation = tracker
+            .spawn(async move {
+                let _ = released.await;
+            })
+            .expect("protected task admitted");
+        let draining_tracker = tracker.clone();
+        let drain = tokio::spawn(async move {
+            draining_tracker.close_and_drain().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain returned before removal finished"
+        );
+
+        release.send(()).expect("release protected task");
+        operation.await.expect("protected task completed");
+        drain.await.expect("runtime drain completed");
+        assert!(
+            tracker.spawn(async {}).is_err(),
+            "shutdown admitted a late removal task"
+        );
+    }
+}
 
 pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "shell.openInEditor",
@@ -67,6 +198,9 @@ pub struct GitVcsRpcServices {
     broadcaster: StatusBroadcaster,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
+    terminal: Option<TerminalManager>,
+    repositories: Option<Repositories>,
+    worktree_removal_tasks: WorktreeRemovalTaskTracker,
 }
 
 impl Default for GitVcsRpcServices {
@@ -88,6 +222,60 @@ impl GitVcsRpcServices {
         repository: Arc<GitRepository>,
         automatic_remote_refresh_interval: watch::Sender<Duration>,
     ) -> Self {
+        Self::with_repository_dependencies(
+            repository,
+            automatic_remote_refresh_interval,
+            None,
+            None,
+        )
+    }
+
+    pub fn with_repository_and_terminal(
+        repository: Arc<GitRepository>,
+        terminal: TerminalManager,
+    ) -> Self {
+        let (automatic_remote_refresh_interval, _) = watch::channel(LOCAL_STATUS_REFRESH_INTERVAL);
+        Self::with_repository_dependencies(
+            repository,
+            automatic_remote_refresh_interval,
+            Some(terminal),
+            None,
+        )
+    }
+
+    pub fn with_repository_terminal_and_automatic_fetch_interval(
+        repository: Arc<GitRepository>,
+        terminal: TerminalManager,
+        automatic_remote_refresh_interval: watch::Sender<Duration>,
+    ) -> Self {
+        Self::with_repository_dependencies(
+            repository,
+            automatic_remote_refresh_interval,
+            Some(terminal),
+            None,
+        )
+    }
+
+    pub fn with_production_dependencies(
+        repository: Arc<GitRepository>,
+        terminal: TerminalManager,
+        repositories: Repositories,
+        automatic_remote_refresh_interval: watch::Sender<Duration>,
+    ) -> Self {
+        Self::with_repository_dependencies(
+            repository,
+            automatic_remote_refresh_interval,
+            Some(terminal),
+            Some(repositories),
+        )
+    }
+
+    fn with_repository_dependencies(
+        repository: Arc<GitRepository>,
+        automatic_remote_refresh_interval: watch::Sender<Duration>,
+        terminal: Option<TerminalManager>,
+        repositories: Option<Repositories>,
+    ) -> Self {
         Self {
             broadcaster: StatusBroadcaster::with_automatic_remote_refresh_interval(
                 Arc::clone(&repository),
@@ -99,7 +287,14 @@ impl GitVcsRpcServices {
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
+            terminal,
+            repositories,
+            worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
         }
+    }
+
+    pub(crate) fn worktree_removal_tasks(&self) -> WorktreeRemovalTaskTracker {
+        self.worktree_removal_tasks.clone()
     }
 }
 
@@ -114,9 +309,13 @@ impl WorkspaceMutationObserver for GitVcsRpcServices {
 pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, services: GitVcsRpcServices) {
     for method in GIT_VCS_UNARY_METHODS {
         let services = services.clone();
-        registry.register_unary(*method, move |request, cancellation| {
+        registry.register_unary_with_context(*method, move |request, context, cancellation| {
             let services = services.clone();
-            async move { services.handle_unary(request, cancellation).await }
+            async move {
+                services
+                    .handle_unary_with_context(request, context, cancellation)
+                    .await
+            }
         });
     }
 
@@ -130,9 +329,10 @@ pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, services: GitVcsRpcServi
 }
 
 impl GitVcsRpcServices {
-    async fn handle_unary(
+    async fn handle_unary_with_context(
         &self,
         request: RpcRequest,
+        context: RpcSessionContext,
         cancellation: CancellationToken,
     ) -> RpcResult {
         match request.tag.as_str() {
@@ -211,6 +411,40 @@ impl GitVcsRpcServices {
             }
             "vcs.removeWorktree" => {
                 let input: RemoveWorktree = decode(request.payload, "vcs.removeWorktree")?;
+                if let Some(repositories) = &self.repositories {
+                    return self
+                        .remove_worktree_with_durable_admission(
+                            input,
+                            repositories.clone(),
+                            context.admission_permit(),
+                            cancellation,
+                        )
+                        .await;
+                }
+                let _terminal_removal = match &self.terminal {
+                    Some(_) if input.thread_ids.is_empty() => {
+                        return Err(vcs_error(
+                            "vcs.removeWorktree",
+                            &input.cwd,
+                            "Worktree removal requires the owning terminal thread IDs.",
+                        ));
+                    }
+                    Some(terminal) => Some(
+                        terminal
+                            .begin_worktree_removal(&input.thread_ids, &input.path)
+                            .await
+                            .map_err(|error| {
+                                vcs_error(
+                                    "vcs.removeWorktree",
+                                    &input.cwd,
+                                    &format!(
+                                        "Could not fence worktree terminal activity before removal: {error}"
+                                    ),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
                 encode_null(
                     self.repository
                         .remove_worktree(
@@ -342,6 +576,261 @@ impl GitVcsRpcServices {
                 "RPC method is not registered here.",
             )),
         }
+    }
+
+    async fn remove_worktree_with_durable_admission(
+        &self,
+        input: RemoveWorktree,
+        repositories: Repositories,
+        admission: Option<RpcPermit>,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        let Some(owner_thread_id) = input.owner_thread_id.clone() else {
+            return Err(vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "Worktree removal requires its owning workspace thread ID.",
+            ));
+        };
+        if !input
+            .thread_ids
+            .iter()
+            .any(|thread_id| thread_id == &owner_thread_id)
+        {
+            return Err(vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "The terminal fence must include the owning workspace thread ID.",
+            ));
+        }
+        let existing_receipt = repositories
+            .get_worktree_removal_receipt(owner_thread_id.clone())
+            .await
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    &format!("Could not read the durable worktree removal receipt: {error}"),
+                )
+            })?;
+        if let Some(receipt) = &existing_receipt {
+            ensure_receipt_matches_request(receipt, &input)?;
+            if receipt.state == "removed" {
+                return Ok(Value::Null);
+            }
+        }
+
+        let owner = repositories
+            .get_thread(owner_thread_id.clone())
+            .await
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    &format!("Could not verify the owning workspace thread: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    "The owning workspace thread no longer exists.",
+                )
+            })?;
+        if owner.kind == "panel"
+            || owner.deleted_at.is_some()
+            || owner
+                .worktree_path
+                .as_deref()
+                .is_none_or(|path| !same_removal_path(Path::new(path), &input.path))
+        {
+            return Err(vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "The supplied workspace thread does not own this worktree path.",
+            ));
+        }
+        let project = repositories
+            .get_project(owner.project_id.clone())
+            .await
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    &format!("Could not verify the worktree project: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    "The worktree project no longer exists.",
+                )
+            })?;
+        if project.deleted_at.is_some()
+            || !same_removal_path(Path::new(&project.workspace_root), &input.cwd)
+        {
+            return Err(vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "The supplied repository path does not own this workspace thread.",
+            ));
+        }
+        let project_threads = repositories
+            .list_threads_by_project(owner.project_id)
+            .await
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    &format!("Could not verify worktree path ownership: {error}"),
+                )
+            })?;
+        for thread in project_threads.iter().filter(|thread| {
+            thread.thread_id != owner_thread_id
+                && thread.kind != "panel"
+                && thread.deleted_at.is_none()
+                && thread
+                    .worktree_path
+                    .as_deref()
+                    .is_some_and(|path| same_removal_path(Path::new(path), &input.path))
+        }) {
+            let superseded = repositories
+                .get_worktree_removal_receipt(thread.thread_id.clone())
+                .await
+                .map_err(|error| {
+                    vcs_error(
+                        "vcs.removeWorktree",
+                        &input.cwd,
+                        &format!("Could not verify competing worktree ownership: {error}"),
+                    )
+                })?
+                .is_some_and(|receipt| receipt.state == "removed");
+            if !superseded {
+                return Err(vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    "Another workspace thread now owns this path, so the stale removal was rejected.",
+                ));
+            }
+        }
+
+        if cancellation.is_cancelled() {
+            return Err(vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "Worktree removal was interrupted before safety admission.",
+            ));
+        }
+        let terminal = self.terminal.as_ref().ok_or_else(|| {
+            vcs_error(
+                "vcs.removeWorktree",
+                &input.cwd,
+                "The production terminal safety coordinator is unavailable.",
+            )
+        })?;
+        let terminal_removal = terminal
+            .begin_worktree_removal(&input.thread_ids, &input.path)
+            .await
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &input.cwd,
+                    &format!("Could not fence worktree terminal activity before removal: {error}"),
+                )
+            })?;
+
+        let receipt = match existing_receipt {
+            Some(receipt) => receipt,
+            None => {
+                let nonce = self
+                    .repository
+                    .prepare_worktree_removal_identity(&input.cwd, &input.path, &cancellation)
+                    .await
+                    .map_err(serialize_error)?;
+                let receipt = repositories
+                    .prepare_worktree_removal_receipt(WorktreeRemovalReceipt {
+                        owner_thread_id: owner_thread_id.clone(),
+                        project_cwd: display_path(&input.cwd),
+                        worktree_path: display_path(&input.path),
+                        identity_nonce: nonce.clone(),
+                        state: "prepared".to_owned(),
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        vcs_error(
+                            "vcs.removeWorktree",
+                            &input.cwd,
+                            &format!("Could not persist the worktree removal receipt: {error}"),
+                        )
+                    })?;
+                ensure_receipt_matches_request(&receipt, &input)?;
+                if receipt.identity_nonce != nonce || receipt.state != "prepared" {
+                    return Err(vcs_error(
+                        "vcs.removeWorktree",
+                        &input.cwd,
+                        "A conflicting durable worktree removal receipt already exists.",
+                    ));
+                }
+                receipt
+            }
+        };
+
+        let repository = Arc::clone(&self.repository);
+        let cwd = input.cwd;
+        let error_cwd = cwd.clone();
+        let path = input.path;
+        let force = input.force.unwrap_or(false);
+        let operation = self
+            .worktree_removal_tasks
+            .spawn(async move {
+                let _admission = admission;
+                let _terminal_removal = terminal_removal;
+                let safety_token = CancellationToken::new();
+                repository
+                    .remove_worktree_with_identity(
+                        &cwd,
+                        &path,
+                        force,
+                        &receipt.identity_nonce,
+                        &safety_token,
+                    )
+                    .await
+                    .map_err(serialize_error)?;
+                repositories
+                    .complete_worktree_removal_receipt(
+                        receipt.owner_thread_id,
+                        receipt.identity_nonce,
+                    )
+                    .await
+                    .map_err(|error| {
+                        vcs_error(
+                            "vcs.removeWorktree",
+                            &cwd,
+                            &format!(
+                                "Git removed the worktree, but its durable receipt failed: {error}"
+                            ),
+                        )
+                    })?;
+                Ok::<(), Value>(())
+            })
+            .map_err(|error| {
+                vcs_error(
+                    "vcs.removeWorktree",
+                    &error_cwd,
+                    &format!("The protected worktree removal task was not admitted: {error}"),
+                )
+            })?;
+        operation.await.map_err(|error| {
+            vcs_error(
+                "vcs.removeWorktree",
+                &error_cwd,
+                &format!("The protected worktree removal task failed: {error}"),
+            )
+        })??;
+        Ok(Value::Null)
     }
 
     fn status_stream(
@@ -852,10 +1341,15 @@ struct CreateWorktree {
     path: Option<PathBuf>,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoveWorktree {
     cwd: PathBuf,
     path: PathBuf,
     force: Option<bool>,
+    #[serde(default)]
+    owner_thread_id: Option<String>,
+    #[serde(default)]
+    thread_ids: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1395,6 +1889,39 @@ fn request_error(method: &str, detail: &str) -> Value {
 fn vcs_error(operation: &str, cwd: &std::path::Path, detail: &str) -> Value {
     json!({ "_tag": "GitCommandError", "operation": operation, "command": "git", "cwd": display_path(cwd), "detail": detail })
 }
+fn ensure_receipt_matches_request(
+    receipt: &WorktreeRemovalReceipt,
+    input: &RemoveWorktree,
+) -> Result<(), Value> {
+    if !same_removal_path(Path::new(&receipt.project_cwd), &input.cwd)
+        || !same_removal_path(Path::new(&receipt.worktree_path), &input.path)
+    {
+        return Err(vcs_error(
+            "vcs.removeWorktree",
+            &input.cwd,
+            "The removal request does not match the durable receipt for this workspace thread.",
+        ));
+    }
+    Ok(())
+}
+
+fn same_removal_path(left: &Path, right: &Path) -> bool {
+    fn key(path: &Path) -> String {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        };
+        let mut value = absolute.to_string_lossy().replace('\\', "/");
+        while value.len() > 1 && value.ends_with('/') {
+            value.pop();
+        }
+        #[cfg(windows)]
+        value.make_ascii_lowercase();
+        value
+    }
+    key(left) == key(right)
+}
 fn source_control_error(provider: &str, operation: &str, detail: &str) -> Value {
     json!({ "_tag": "SourceControlRepositoryError", "provider": provider, "operation": operation, "detail": detail })
 }
@@ -1564,7 +2091,11 @@ mod tests {
 
     async fn unary(services: &GitVcsRpcServices, tag: &str, payload: Value) -> RpcResult {
         services
-            .handle_unary(rpc_request(tag, payload), CancellationToken::new())
+            .handle_unary_with_context(
+                rpc_request(tag, payload),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
             .await
     }
 
@@ -2098,8 +2629,9 @@ esac
         let services = GitVcsRpcServices::default();
         for method in GIT_VCS_UNARY_METHODS {
             let result = services
-                .handle_unary(
+                .handle_unary_with_context(
                     rpc_request(method, json!("not-an-object")),
+                    RpcSessionContext::unauthenticated(),
                     CancellationToken::new(),
                 )
                 .await;

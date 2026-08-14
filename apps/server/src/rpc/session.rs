@@ -68,6 +68,7 @@ impl RpcUnaryResult {
 pub(crate) struct RpcSessionContext {
     principal: Option<Principal>,
     auth: Option<AuthService>,
+    admission: Option<RpcPermit>,
 }
 
 impl RpcSessionContext {
@@ -81,7 +82,19 @@ impl RpcSessionContext {
         Self {
             principal: Some(principal),
             auth: Some(auth),
+            admission: None,
         }
+    }
+
+    #[must_use]
+    fn with_admission(mut self, admission: RpcPermit) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn admission_permit(&self) -> Option<RpcPermit> {
+        self.admission.clone()
     }
 
     #[must_use]
@@ -142,6 +155,21 @@ impl RpcRegistry {
     {
         let handler = Arc::new(move |request, _context, cancellation| {
             let future = handler(request, cancellation);
+            Box::pin(async move { RpcUnaryResult::plain(future.await) }) as UnaryFuture
+        });
+        self.register_unary_handler(name.into(), handler);
+    }
+
+    pub(crate) fn register_unary_with_context<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(RpcRequest, RpcSessionContext, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RpcResult> + Send + 'static,
+    {
+        let handler = Arc::new(move |request, context, cancellation| {
+            let future = handler(request, context, cancellation);
             Box::pin(async move { RpcUnaryResult::plain(future.await) }) as UnaryFuture
         });
         self.register_unary_handler(name.into(), handler);
@@ -536,7 +564,7 @@ fn spawn_request(
     let request_id = request.id.clone();
     let cancellation = CancellationToken::new();
     let request_cancellation = cancellation.clone();
-    let context = dispatch.session.clone();
+    let context = dispatch.session.clone().with_admission(admission.clone());
     let outbound = dispatch.outbound.clone();
     let completed = dispatch.completed.clone();
     let session_shutdown = dispatch.shutdown.clone();

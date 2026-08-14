@@ -209,6 +209,56 @@ one cycle late. Background status-bar polling is single-flighted separately
 from a forced manual request; repeated manual activation still shares one
 manual request per environment.
 
+## Worktree removal flow
+
+`vcs.removeWorktree` is a server-held terminal, persistence, and filesystem
+critical section. `ownerThreadId` identifies the workspace owner, and the
+production server verifies its persisted project and worktree path. `threadIds`
+must include that owner and helps invalidate known generations, while the authoritative fence
+is also keyed by lexical and canonical target paths (including Windows junction
+aliases) and discovers every server-known terminal under it. The server installs
+the fence before closing terminals, invalidates
+an open already in flight, rejects later open, attach, and restart operations,
+and retains the fence until Git removal and its durable receipt settle. Once
+admitted, that owned task finishes even if its initiating RPC is interrupted or
+disconnected: it retains a clone of the RPC mutation permit, is tracked by the
+production runtime, and is drained before maintenance or shutdown can complete.
+A failed operation drops the fence so an explicit retry can launch terminals
+again.
+
+The server writes a random identity durably into the linked worktree's Git
+administrative directory and root, then persists a
+`worktree_removal_receipts` row keyed by the owner thread. The repository
+revalidates that identity and the exact linked-worktree `.git` backlink inside
+the removal transaction. On Windows it atomically moves the admitted directory
+through its delete-capable filesystem handle, rather than resolving the source
+name a second time, to a
+deterministic nonce-bound quarantine and creates a minimal identity-checked
+tombstone at the registered path. On Windows tombstone creation atomically
+returns the same delete-capable directory handle used by the transaction; there
+is no create-then-reopen gap, and its no-delete parent handle remains held while
+the marker and Git backlink are initialized. The checkout quarantine,
+tombstone, and administrative quarantine handles remain owned continuously
+through deregistration and final deletion; path absence after admission is
+never accepted as cleanup success. While a no-delete filesystem handle pins that
+tombstone, the server atomically moves the nonce-verified administrative
+directory out of Git's `worktrees` namespace; it never issues a path-based Git
+delete that could target a replacement. Recursive cleanup pins each verified
+directory object against name rebinding, verifies every Windows descendant by
+file identity before deleting it, never follows reparse points such as
+junctions at either the root or descendant level, and deletes the now-empty root
+through its bound handle. An empty
+registered path without the transaction marker fails closed instead of being
+treated as a recoverable tombstone. Durable marker publication still uses a
+write-through rename. A terminal or external process that still owns the
+checkout as its current directory makes quarantine admission fail without
+deleting checkout contents or changing Git registration. Interrupted attempts
+recover the deterministic quarantine rather than treating path absence as
+success. The browser still performs thread deletion after the VCS result. After
+cleanup succeeds, the receipt moves to `removed`; a later retry after a
+thread-deletion failure returns success without inspecting or deleting a
+replacement that now occupies the old path.
+
 ## Invariants
 
 - Contracts define the wire; server and client fixtures guard compatibility.
@@ -218,5 +268,8 @@ manual request per environment.
   successful authentication alone.
 - Cancellation flows from client interrupt or socket closure into registered
   handlers and supervised processes.
+- Worktree removal holds one server terminal-admission fence from terminal
+  shutdown through filesystem and Git settlement; client-side teardown alone
+  is never the deletion safety boundary.
 - Durable orchestration state, not a WebSocket connection, is the recovery
   boundary.

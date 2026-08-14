@@ -596,9 +596,19 @@ describe("deleteThread", () => {
       commandKeys().indexOf("thread.delete"),
     );
     const removeCall = h.commandCalls.find((call) => call.key === "vcs.removeWorktree");
-    expect((removeCall!.input as { input: { path: string; force: boolean } }).input.path).toBe(
-      "C:/wt/x",
-    );
+    const removeInput = (
+      removeCall!.input as {
+        input: {
+          path: string;
+          force: boolean;
+          ownerThreadId: ThreadId;
+          threadIds: ReadonlyArray<ThreadId>;
+        };
+      }
+    ).input;
+    expect(removeInput.path).toBe("C:/wt/x");
+    expect(removeInput.ownerThreadId).toBe(shell.id);
+    expect(removeInput.threadIds).toEqual([shell.id]);
   });
 
   it("tears down dependent panel threads before removing their workspace", async () => {
@@ -625,6 +635,17 @@ describe("deleteThread", () => {
       .filter((call) => call.key === "terminal.close")
       .map((call) => (call.input as { input: { threadId: ThreadId } }).input.threadId);
     expect(closeThreadIds).toEqual([workspace.id, panel.id]);
+    const removeCall = h.commandCalls.find((call) => call.key === "vcs.removeWorktree");
+    expect(
+      (
+        removeCall!.input as {
+          input: { ownerThreadId: ThreadId; threadIds: ReadonlyArray<ThreadId> };
+        }
+      ).input,
+    ).toMatchObject({
+      ownerThreadId: workspace.id,
+      threadIds: [workspace.id, panel.id],
+    });
     const deletedThreadIds = h.commandCalls
       .filter((call) => call.key === "thread.delete")
       .map((call) => (call.input as { input: { threadId: ThreadId } }).input.threadId);

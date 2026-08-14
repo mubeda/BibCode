@@ -37,7 +37,7 @@ use crate::{
         agent_activity::ProductionAgentActivity,
         connect_mcp::ConnectMcpService,
         control::{NativeServerControl, ProviderUpdateCheckTask},
-        git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
+        git_vcs::{GitVcsRpcServices, WorktreeRemovalTaskTracker, register_git_vcs_rpc},
         http_routes::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
             JsonRouteResponse, RouteContext,
@@ -89,6 +89,7 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    worktree_removal_tasks: WorktreeRemovalTaskTracker,
     _resource_sampler: Arc<NativeResourceSampler>,
     update_quiesced: tokio::sync::Mutex<bool>,
 }
@@ -250,10 +251,13 @@ impl ProductionRuntime {
             .await;
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
-        let git_vcs = GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
+        let git_vcs = GitVcsRpcServices::with_production_dependencies(
             git_repository.clone(),
+            terminal_manager.clone(),
+            repositories.clone(),
             control.automatic_git_fetch_interval_signal(),
         );
+        let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
@@ -346,6 +350,7 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            worktree_removal_tasks,
             _resource_sampler: resource_sampler,
             update_quiesced: tokio::sync::Mutex::new(false),
         })
@@ -469,6 +474,7 @@ impl ProductionRuntime {
             return Ok(());
         }
         let mut first_error = None;
+        self.worktree_removal_tasks.close_and_drain().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;

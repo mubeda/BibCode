@@ -165,6 +165,78 @@ impl Repositories {
             [command_id], decode_command_receipt).optional().map_err(Into::into)).await
     }
 
+    pub async fn prepare_worktree_removal_receipt(
+        &self,
+        row: WorktreeRemovalReceipt,
+    ) -> Result<WorktreeRemovalReceipt> {
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT OR IGNORE INTO worktree_removal_receipts (\
+                       owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at\
+                     ) VALUES (?, ?, ?, ?, 'prepared', \
+                       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    params![
+                        &row.owner_thread_id,
+                        &row.project_cwd,
+                        &row.worktree_path,
+                        &row.identity_nonce,
+                    ],
+                )?;
+                connection
+                    .query_row(
+                        "SELECT owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at \
+                         FROM worktree_removal_receipts WHERE owner_thread_id = ?",
+                        [row.owner_thread_id],
+                        decode_worktree_removal_receipt,
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn get_worktree_removal_receipt(
+        &self,
+        owner_thread_id: String,
+    ) -> Result<Option<WorktreeRemovalReceipt>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at \
+                         FROM worktree_removal_receipts WHERE owner_thread_id = ?",
+                        [owner_thread_id],
+                        decode_worktree_removal_receipt,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn complete_worktree_removal_receipt(
+        &self,
+        owner_thread_id: String,
+        identity_nonce: String,
+    ) -> Result<()> {
+        self.database
+            .call(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE worktree_removal_receipts SET state = 'removed', \
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE owner_thread_id = ? AND identity_nonce = ? AND state = 'prepared'",
+                    params![owner_thread_id, identity_nonce],
+                )?;
+                if updated != 1 {
+                    return Err(PersistenceError::Corrupt(
+                        "worktree removal receipt changed before completion".to_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn upsert_checkpoint_diff_blob(&self, row: CheckpointDiffBlob) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
@@ -936,6 +1008,16 @@ pub struct CommandReceipt {
     pub payload_digest: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorktreeRemovalReceipt {
+    pub owner_thread_id: String,
+    pub project_cwd: String,
+    pub worktree_path: String,
+    pub identity_nonce: String,
+    pub state: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointDiffBlob {
     pub thread_id: String,
     pub from_turn_count: i64,
@@ -1233,6 +1315,17 @@ fn decode_command_receipt(row: &Row<'_>) -> rusqlite::Result<CommandReceipt> {
         status: row.get(5)?,
         error: row.get(6)?,
         payload_digest: row.get(7)?,
+    })
+}
+fn decode_worktree_removal_receipt(row: &Row<'_>) -> rusqlite::Result<WorktreeRemovalReceipt> {
+    Ok(WorktreeRemovalReceipt {
+        owner_thread_id: row.get(0)?,
+        project_cwd: row.get(1)?,
+        worktree_path: row.get(2)?,
+        identity_nonce: row.get(3)?,
+        state: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 fn decode_checkpoint_diff_blob(row: &Row<'_>) -> rusqlite::Result<CheckpointDiffBlob> {

@@ -51,6 +51,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (38, "activity_record_retention_counts"),
     (39, "provider_turn_outbox"),
     (39, "orchestration_attachment_refs"),
+    (40, "worktree_removal_receipts"),
 ];
 
 #[derive(Debug, Error)]
@@ -665,6 +666,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(37, "ActivityEntryRetentionOwners", migration_037),
     Migration::new(38, "ActivityRecordRetentionCounts", migration_038),
     Migration::new(39, "DurableProviderTurnDelivery", migration_039),
+    Migration::new(40, "DurableWorktreeRemovalReceipts", migration_040),
 ];
 
 impl Migration {
@@ -2255,10 +2257,28 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_040(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE worktree_removal_receipts (
+          owner_thread_id TEXT PRIMARY KEY,
+          project_cwd TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          identity_nonce TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('prepared', 'removed')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_worktree_removal_receipts_path
+          ON worktree_removal_receipts(project_cwd, worktree_path, state);
+        "#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar,
+        MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar, table_exists,
         validate_existing_bibcode_store, validate_existing_bibcode_store_with_barrier,
         validate_existing_bibcode_store_with_control,
         validate_existing_bibcode_store_with_inspection_control,
@@ -2775,7 +2795,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=39).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=40).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2783,6 +2803,7 @@ mod tests {
         assert_eq!(MIGRATIONS[36].name, "ActivityEntryRetentionOwners");
         assert_eq!(MIGRATIONS[37].name, "ActivityRecordRetentionCounts");
         assert_eq!(MIGRATIONS[38].name, "DurableProviderTurnDelivery");
+        assert_eq!(MIGRATIONS[39].name, "DurableWorktreeRemovalReceipts");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -2872,9 +2893,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 23);
+        assert_eq!(second.len(), 24);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[22].id, 39);
+        assert_eq!(second[23].id, 40);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -2886,7 +2907,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 24);
+        assert_eq!(application_table_count, 25);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -2986,6 +3007,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_40_adds_durable_worktree_removal_receipts() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(39))?;
+        assert!(!table_exists(&connection, "worktree_removal_receipts")?);
+
+        run_migrations(&mut connection, None)?;
+
+        assert!(table_exists(&connection, "worktree_removal_receipts")?);
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO worktree_removal_receipts (owner_thread_id, project_cwd, worktree_path, identity_nonce, state, created_at, updated_at) \
+                     VALUES ('thread-1', 'C:/repo', 'C:/worktree', 'nonce', 'invalid', '2026-08-14T00:00:00Z', '2026-08-14T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn trusts_an_existing_current_effect_ledger_without_rebuilding_data() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         connection.execute_batch(
@@ -3001,13 +3043,14 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 6);
+        assert_eq!(applied.len(), 7);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
         assert_eq!(applied[3].id, 37);
         assert_eq!(applied[4].id, 38);
         assert_eq!(applied[5].id, 39);
+        assert_eq!(applied[6].id, 40);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;
