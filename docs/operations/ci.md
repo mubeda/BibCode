@@ -40,3 +40,7 @@ runtime or TypeScript server.
 
 When changing a workflow, update its focused workflow-contract tests and run
 the repository gates documented in [Scripts](../reference/scripts.md).
+Repeatable native manual and packaged validation follows the
+[shared cross-platform runbook](../testing/cross-platform-validation.md) plus
+the matching Windows, Linux, or macOS page in the
+[testing runbook index](../testing/README.md).
