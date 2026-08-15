@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-desktop-e2e-lifecycle"
+description = "Allows the packaged desktop E2E harness to stop owned runtime processes before teardown."
+commands.allow = ["desktop_e2e_prepare_for_exit"]

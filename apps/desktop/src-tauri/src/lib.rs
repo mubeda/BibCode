@@ -179,32 +179,46 @@ pub fn run() {
         preview::commands::desktop_preview_clear_data,
         preview::commands::desktop_preview_capture_screenshot,
         preview::commands::desktop_preview_reveal_artifact,
+        #[cfg(feature = "desktop-e2e")]
+        desktop_e2e_prepare_for_exit,
     ]);
     builder
         .build(desktop_context())
         .expect("error while building BiBCode Tauri application")
         .run(|app_handle, event| {
-            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-                use tauri::Manager as _;
-
-                if let Err(error) = window::persist_main_window_state(app_handle) {
-                    tracing::warn!(
-                        "failed to persist Tauri main window state during exit: {error}"
-                    );
-                }
-                let backend = app_handle
-                    .state::<backend::BackendSupervisor>()
-                    .inner()
-                    .clone();
-                if let Err(error) = tauri::async_runtime::block_on(
-                    backend.stop_for_exit(backend::BackendShutdownConfig::default()),
-                ) {
-                    tracing::warn!("failed to stop Tauri desktop backend during exit: {error}");
-                }
-                let ssh = app_handle.state::<ssh::SshEnvironmentManager>();
-                tauri::async_runtime::block_on(ssh.shutdown());
+            if matches!(event, tauri::RunEvent::ExitRequested { .. })
+                && let Err(error) =
+                    tauri::async_runtime::block_on(prepare_desktop_runtime_for_exit(app_handle))
+            {
+                tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
             }
         });
+}
+
+async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<(), String> {
+    if let Err(error) = window::persist_main_window_state(app_handle) {
+        tracing::warn!("failed to persist Tauri main window state during exit: {error}");
+    }
+    let backend = app_handle
+        .state::<backend::BackendSupervisor>()
+        .inner()
+        .clone();
+    let backend_result = backend
+        .stop_for_exit(backend::BackendShutdownConfig::default())
+        .await;
+    let ssh = app_handle.state::<ssh::SshEnvironmentManager>();
+    ssh.shutdown().await;
+    backend_result
+}
+
+#[cfg(feature = "desktop-e2e")]
+#[tauri::command]
+async fn desktop_e2e_prepare_for_exit(
+    app_handle: tauri::AppHandle<bridge::DesktopRuntime>,
+) -> Result<(), String> {
+    prepare_desktop_runtime_for_exit(&app_handle).await
 }
 
 fn desktop_context<R: tauri::Runtime>() -> tauri::Context<R> {
@@ -302,6 +316,33 @@ mod tests {
         let capability = &config["app"]["security"]["capabilities"][0];
 
         assert_main_webview_only(capability);
+        assert_eq!(
+            capability.get("permissions"),
+            Some(&serde_json::json!([
+                "allow-desktop-bridge",
+                "core:default",
+                "wdio:default",
+                "allow-desktop-e2e-lifecycle"
+            ]))
+        );
+    }
+
+    #[test]
+    fn desktop_e2e_lifecycle_permission_only_allows_runtime_shutdown() {
+        let permissions: PermissionsFile =
+            toml::from_str(include_str!("../permissions/desktop-e2e-lifecycle.toml"))
+                .expect("desktop E2E lifecycle permission TOML should parse");
+
+        let lifecycle_permission = permissions
+            .permission
+            .iter()
+            .find(|permission| permission.identifier == "allow-desktop-e2e-lifecycle")
+            .expect("desktop E2E lifecycle permission should exist");
+
+        assert_eq!(
+            lifecycle_permission.commands.allow,
+            ["desktop_e2e_prepare_for_exit"]
+        );
     }
 
     #[test]
