@@ -1,0 +1,213 @@
+# Windows E2E Host Gating Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Keep simulated Windows fixture construction portable while executing the generated Cursor `.cmd` action shim only on native Windows.
+
+**Architecture:** The parameterized inventory test remains host-independent and continues to verify `mac`, `linux`, and `win` environment/filesystem contracts everywhere. A dedicated `it.runIf(process.platform === "win32")` test owns the real `cmd.exe` execution and action-log assertion, making the native boundary explicit without mocks or production changes.
+
+**Tech Stack:** TypeScript, Vite+ Test/Vitest-compatible `it.runIf`, Node.js child processes and filesystem fixtures.
+
+## Global Constraints
+
+- Do not change packaged desktop behavior or provider launch behavior.
+- Do not emulate or install a Windows command processor on macOS or Linux.
+- Do not replace the native execution assertion with a mocked `spawnSync`.
+- Do not skip the portable Windows environment and filesystem assertions.
+- Do not change CI concurrency, timeouts, platform matrices, dependencies, or lockfiles.
+- Stop broad verification on the first distinct failure and diagnose that exact failure before any rerun or repair.
+
+---
+
+### Task 1: Separate portable fixture assertions from native Windows execution
+
+**Files:**
+
+- Modify: `apps/desktop/e2e/support/test-project.test.ts:173-217`
+- Test: `apps/desktop/e2e/support/test-project.test.ts`
+
+**Interfaces:**
+
+- Consumes: `prepareDesktopUiTestContext(environment: NodeJS.ProcessEnv): DesktopUiTestContext` and `archiveAndCleanupDesktopUiTestContext(context)`.
+- Produces: one host-independent inventory contract and one native-Windows-only Cursor `.cmd` execution contract.
+
+- [ ] **Step 1: Preserve the observed RED evidence**
+
+Run on macOS:
+
+```bash
+vp test run apps/desktop/e2e/support/test-project.test.ts \
+  -t "isolates provider user inventory inside the disposable run root"
+```
+
+Expected RED on the pre-fix revision: the simulated `win` case calls
+`C:\Windows\System32\cmd.exe`, fails with `spawnSync ... ENOENT`, and reports
+one failed test. This RED was observed at pulled HEAD `4972a0dc`.
+
+- [ ] **Step 2: Keep the parameterized test portable**
+
+In `isolates provider user inventory inside the disposable run root`, retain
+the Windows `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`,
+`PSModuleAnalysisCachePath`, and directory assertions. Remove only the block
+that constructs `editorShimPath`, invokes `NodeChildProcess.spawnSync`, and
+reads `nativeActionLogPath`.
+
+The Windows branch must end after these portable assertions:
+
+```ts
+expect(environment.USERPROFILE).toBe(expectedFixtureUserHome);
+expect(environment.HOME).toBe(expectedFixtureUserHome);
+expect(environment.APPDATA).toBe(expectedAppData);
+expect(environment.LOCALAPPDATA).toBe(expectedLocalAppData);
+expect(environment.PSModuleAnalysisCachePath).toBe(expectedPowerShellModuleCache);
+expect(NodeFS.statSync(expectedAppData).isDirectory()).toBe(true);
+expect(NodeFS.statSync(expectedLocalAppData).isDirectory()).toBe(true);
+expect(NodeFS.statSync(NodePath.dirname(expectedPowerShellModuleCache)).isDirectory()).toBe(true);
+```
+
+- [ ] **Step 3: Add the native Windows action-shim test**
+
+Immediately after the parameterized `describe.each` block, add:
+
+```ts
+it.runIf(process.platform === "win32")(
+  "executes the Cursor action shim through the native Windows command processor",
+  () => {
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "win" };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const editorShimPath = NodePath.join(context.shimDirectory, "cursor.cmd");
+    const editorTarget = String.raw`C:\fixture\userdata\logs`;
+    const editorLaunch = NodeChildProcess.spawnSync(
+      process.env.ComSpec ?? "cmd.exe",
+      ["/d", "/c", `${editorShimPath} ${editorTarget}`],
+      {
+        env: { ...process.env, ...environment },
+        encoding: "utf8",
+        shell: false,
+      },
+    );
+
+    expect(editorLaunch.error).toBeUndefined();
+    expect(editorLaunch.status, editorLaunch.stderr).toBe(0);
+    expect(JSON.parse(NodeFS.readFileSync(context.nativeActionLogPath, "utf8").trim())).toEqual({
+      action: "openInEditor",
+      args: [editorTarget],
+    });
+  },
+);
+```
+
+This is real native execution on Windows and an explicit skip on macOS/Linux.
+
+- [ ] **Step 4: Run the exact test file to verify GREEN**
+
+Run:
+
+```bash
+vp test run apps/desktop/e2e/support/test-project.test.ts
+```
+
+Expected on macOS/Linux: every portable test passes and the dedicated native
+Windows test is skipped. Expected on Windows: every test passes, including the
+real `.cmd` execution and exact action-log assertion.
+
+- [ ] **Step 5: Run the changed desktop/script focused matrix**
+
+Run:
+
+```bash
+vp test run \
+  apps/desktop/e2e/support/activity-session.test.ts \
+  apps/desktop/e2e/support/app-lifecycle.test.ts \
+  apps/desktop/e2e/support/build-packaged-app.test.ts \
+  apps/desktop/e2e/support/test-project.test.ts \
+  apps/desktop/e2e/support/ui-state.test.ts \
+  apps/desktop/e2e/support/window-size.test.ts \
+  scripts/coverage-config.test.ts \
+  scripts/run-tauri-build.test.mjs \
+  scripts/tauri-hardening.test.ts \
+  scripts/toolchain-contract.test.ts
+```
+
+Expected: all enabled tests pass; only the native Windows action-shim test is
+skipped on a non-Windows host.
+
+- [ ] **Step 6: Commit the test-boundary repair**
+
+```bash
+git add apps/desktop/e2e/support/test-project.test.ts
+git commit -m "test(desktop): gate Windows action shim natively"
+```
+
+---
+
+### Task 2: Verify the complete pulled revision plus repair
+
+**Files:**
+
+- Review: `apps/desktop/e2e/support/test-project.test.ts`
+- Review: `docs/superpowers/specs/2026-08-15-windows-e2e-host-gating-design.md`
+- Review: `docs/superpowers/plans/2026-08-15-windows-e2e-host-gating.md`
+
+**Interfaces:**
+
+- Consumes: Task 1's host-independent and native-Windows test split.
+- Produces: fresh package, workspace, Rust, and static verification evidence for the current branch.
+
+- [ ] **Step 1: Run the workspace package graph**
+
+Run as the only broad test owner:
+
+```bash
+vp run test
+```
+
+Expected: every package test task passes. If a different failure appears, stop
+without a blind broad rerun and diagnose the smallest exact owner.
+
+- [ ] **Step 2: Run the complete Rust workspace**
+
+After the package graph exits, run:
+
+```bash
+cargo test --workspace -j 2
+```
+
+Expected: all Rust library, integration, binary, and doc tests pass.
+
+- [ ] **Step 3: Run formatting and static gates sequentially**
+
+Run:
+
+```bash
+vp check
+vp run typecheck
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Expected: every command exits zero. Report existing nonfatal diagnostics
+separately; do not classify them as passes for a command that failed.
+
+- [ ] **Step 4: Audit the final branch**
+
+Run:
+
+```bash
+git diff --check
+git status --short
+git log --oneline -10
+```
+
+Confirm the repair changes only the test boundary and planning artifacts, no
+generated files or debug output are tracked, and the branch contains no
+uncommitted changes.
+
+- [ ] **Step 5: Report native evidence accurately**
+
+Report the exact focused and broad command outcomes. On macOS/Linux, classify
+the Windows `.cmd` execution as unavailable native evidence while reporting
+the simulated Windows environment/filesystem checks as compatibility evidence.
+Do not claim the `.cmd` assertion passed without a native Windows run or CI
+result that executed it.
