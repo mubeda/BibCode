@@ -15,7 +15,6 @@ use crate::git::{
     GitWorktreeInventory, GitWorktreeRecord, host_path_platform, worktree_repository_key,
 };
 
-#[cfg(unix)]
 use super::service::TokioCatalogFileSystem;
 use super::service::{
     CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
@@ -1735,7 +1734,6 @@ async fn joins_active_archived_panel_deleted_missing_and_conflicting_threads_on_
     assert_eq!(retained.worktrees, snapshot.worktrees);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_identity() {
     let root = tempfile::tempdir().expect("catalog identity root");
@@ -1746,7 +1744,10 @@ async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_ident
     std::fs::create_dir(&physical).expect("physical worktree");
     std::fs::create_dir(&common_dir).expect("common Git directory");
     let alias = root.path().join("worktree-alias");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&physical, &alias).expect("worktree alias");
+    #[cfg(windows)]
+    junction::create(&physical, &alias).expect("worktree junction alias");
     let projections = Arc::new(FakeProjectionSource::new([(
         "project-1".to_owned(),
         CatalogProject {
@@ -1755,7 +1756,7 @@ async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_ident
             threads: vec![CatalogThread {
                 thread_id: "owner".to_owned(),
                 kind: "workspace".to_owned(),
-                worktree_path: Some(alias),
+                worktree_path: Some(alias.clone()),
                 branch: Some("feature".to_owned()),
                 archived: false,
                 deleted: false,
@@ -1811,6 +1812,8 @@ async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_ident
     assert_eq!(descriptor.path, physical.to_string_lossy());
     assert_eq!(descriptor.adopted_thread_id.as_deref(), Some("owner"));
     assert!(!descriptor.eligible_for_adoption);
+    #[cfg(windows)]
+    junction::delete(&alias).expect("remove worktree junction alias");
 }
 
 #[tokio::test]
