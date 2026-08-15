@@ -6885,15 +6885,18 @@ mod tests {
                 .expect("thread");
         }
 
-        #[cfg(unix)]
         #[tokio::test]
-        async fn adoption_joins_the_same_physical_workspace_through_a_symlink_alias() {
+        async fn adoption_joins_the_same_physical_workspace_through_a_filesystem_alias() {
             let engine = adoption_engine(TestHooks::default()).await;
             let root = tempfile::tempdir().expect("physical workspace parent");
             let physical = root.path().join("physical-worktree");
             std::fs::create_dir(&physical).expect("physical worktree");
             let alias = root.path().join("worktree-alias");
+            #[cfg(unix)]
             std::os::unix::fs::symlink(&physical, &alias).expect("worktree alias");
+            #[cfg(windows)]
+            junction::create(&physical, &alias).expect("worktree junction alias");
+            let alias_path = alias.clone();
             let physical = physical.to_string_lossy().into_owned();
             let alias = alias.to_string_lossy().into_owned();
             create_thread_at(
@@ -6957,6 +6960,8 @@ mod tests {
                 "one physical checkout must have one durable workspace owner"
             );
             engine.shutdown().await;
+            #[cfg(windows)]
+            junction::delete(&alias_path).expect("remove worktree junction alias");
         }
 
         async fn replace_adoption_result_metadata(

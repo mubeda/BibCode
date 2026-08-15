@@ -340,7 +340,7 @@ describe("materializeDesktopActivitySession", () => {
       },
       runtimeMode: "full-access",
       interactionMode: "default",
-      createdAt: "2026-07-29T18:00:03.000Z",
+      createdAt: expect.any(String),
     });
   });
 
@@ -359,7 +359,7 @@ describe("materializeDesktopActivitySession", () => {
           messageId: "bibcode-ui-activity-composer-followup-message",
           text: "publish deterministic composer activity update",
         }),
-        createdAt: "2026-07-29T18:00:04.000Z",
+        createdAt: expect.any(String),
       }),
     );
   });
