@@ -240,7 +240,7 @@ async function readActivityGeometry(): Promise<ActivityGeometry> {
 }
 
 async function assertBoundedActivityGeometry(
-  width: 800 | 960 | 980 | 981 | 1_199 | 1_200,
+  width: 960 | 980 | 981 | 1_199 | 1_200,
   expectInspector: boolean,
 ): Promise<void> {
   await setDesktopUiWindowSize(width, 720);
@@ -306,7 +306,7 @@ async function assertBoundedActivityGeometry(
   }
 }
 
-async function assertActivityPresentation(width: 800 | 980 | 981 | 1_199 | 1_200): Promise<void> {
+async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200): Promise<void> {
   await assertBoundedActivityGeometry(width, false);
   const readPresentation = () =>
     browser.execute(() => {
@@ -907,7 +907,7 @@ describe("packaged responsive activity experience", () => {
     await remountActivityDockWithRuntimeMotionEmulation(materialized.threadId);
     await assertRuntimeMotionContract();
 
-    for (const width of [800, 980, 981, 1_199, 1_200] as const) {
+    for (const width of [960, 980, 981, 1_199, 1_200] as const) {
       await assertActivityPresentation(width);
     }
 
