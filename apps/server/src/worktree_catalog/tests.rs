@@ -1799,12 +1799,16 @@ async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_ident
     );
 
     let subscription = service.subscribe("project-1").await.expect("catalog");
-    let canonical = std::fs::canonicalize(&physical)
-        .expect("canonical physical worktree")
-        .to_string_lossy()
-        .into_owned();
+    let canonical = std::fs::canonicalize(&physical).expect("canonical physical worktree");
     let snapshot = subscription.latest();
-    let descriptor = descriptor(&snapshot, &canonical);
+    let descriptor = snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| {
+            std::fs::canonicalize(&worktree.path).is_ok_and(|candidate| candidate == canonical)
+        })
+        .expect("physical worktree descriptor");
+    assert_eq!(descriptor.path, physical.to_string_lossy());
     assert_eq!(descriptor.adopted_thread_id.as_deref(), Some("owner"));
     assert!(!descriptor.eligible_for_adoption);
 }

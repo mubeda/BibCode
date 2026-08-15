@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -175,28 +176,51 @@ fn linked_worktree_record(
     inventory: &bibcode_server::git::GitWorktreeInventory,
     path: &Path,
 ) -> GitWorktreeRecord {
-    let identity = normalize_worktree_path_key(path, bibcode_server::git::host_path_platform());
+    let identity = test_worktree_identity_key(path);
     inventory
         .records
         .iter()
-        .find(|record| {
-            normalize_worktree_path_key(&record.path, bibcode_server::git::host_path_platform())
-                == identity
-        })
+        .find(|record| test_worktree_identity_key(&record.path) == identity)
         .cloned()
         .expect("linked worktree record")
 }
 
 fn has_registered_worktree(cwd: &Path, expected: &Path) -> bool {
-    let expected = normalize_worktree_path_key(expected, bibcode_server::git::host_path_platform());
+    let expected = test_worktree_identity_key(expected);
     git(cwd, &["worktree", "list", "--porcelain"])
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
-        .any(|path| {
-            normalize_worktree_path_key(&path, bibcode_server::git::host_path_platform())
-                == expected
-        })
+        .any(|path| test_worktree_identity_key(&path) == expected)
+}
+
+fn test_worktree_identity_key(path: &Path) -> String {
+    let mut ancestor = path;
+    let mut missing = Vec::<OsString>::new();
+    let canonical = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                break canonical;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor
+                    .file_name()
+                    .unwrap_or_else(|| panic!("missing worktree path has no existing ancestor"));
+                missing.push(component.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .unwrap_or_else(|| panic!("missing worktree path has no parent"));
+            }
+            Err(error) => panic!(
+                "worktree identity path '{}' could not be canonicalized: {error}",
+                path.display()
+            ),
+        }
+    };
+    normalize_worktree_path_key(&canonical, bibcode_server::git::host_path_platform())
 }
 
 fn local_file_url(path: &Path) -> String {

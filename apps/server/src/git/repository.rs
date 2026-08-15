@@ -1904,9 +1904,13 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<(), GitCommandError> {
         let registered_paths = self.worktree_paths(cwd, cancellation).await?;
-        let registered_index = registered_paths
-            .iter()
-            .position(|registered| same_worktree_path(registered, path));
+        let registered_index = registered_worktree_path_index(
+            "GitVcsDriver.removeWorktree.identity",
+            cwd,
+            &registered_paths,
+            path,
+        )
+        .await?;
         let was_registered = registered_index.is_some();
         if force && registered_index.is_some_and(|index| index > 0) {
             let nonce = self
@@ -1939,10 +1943,16 @@ impl GitRepository {
         let Ok(paths) = self.worktree_paths(cwd, cancellation).await else {
             return Err(error);
         };
-        if paths
-            .iter()
-            .any(|registered| same_worktree_path(registered, path))
-        {
+        if !matches!(
+            registered_worktree_path_index(
+                "GitVcsDriver.removeWorktree.verifyIdentity",
+                cwd,
+                &paths,
+                path,
+            )
+            .await,
+            Ok(None)
+        ) {
             return Err(error);
         }
         if !path.exists() {
@@ -2100,9 +2110,14 @@ impl GitRepository {
             .worktree_removal_admin_quarantine_path(cwd, expected_nonce, cancellation)
             .await?;
         let registered_paths = self.worktree_paths(cwd, cancellation).await?;
-        let was_registered = registered_paths
-            .iter()
-            .any(|registered| same_worktree_path(registered, path));
+        let was_registered = registered_worktree_path_index(
+            "GitVcsDriver.removeWorktree.identity",
+            cwd,
+            &registered_paths,
+            path,
+        )
+        .await?
+        .is_some();
         let path_exists = tokio::fs::symlink_metadata(path).await.is_ok();
         let quarantine_exists = tokio::fs::symlink_metadata(&quarantine).await.is_ok();
 
@@ -4307,6 +4322,43 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     }
 }
 
+async fn registered_worktree_path_index(
+    operation: &str,
+    cwd: &Path,
+    registered_paths: &[String],
+    path: &Path,
+) -> Result<Option<usize>, GitCommandError> {
+    let expected = canonical_worktree_path_key(path).await.map_err(|error| {
+        simple_error(
+            operation,
+            cwd,
+            &format!(
+                "The requested worktree path '{}' could not be resolved to a physical identity: {error}",
+                display_path(path)
+            ),
+        )
+    })?;
+    for (index, registered) in registered_paths.iter().enumerate() {
+        let registered_path = Path::new(registered);
+        let candidate = canonical_worktree_path_key(registered_path)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    operation,
+                    cwd,
+                    &format!(
+                        "The registered worktree path '{}' could not be resolved to a physical identity: {error}",
+                        display_path(registered_path)
+                    ),
+                )
+            })?;
+        if candidate == expected {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
 fn exact_worktree_record<'a>(
     inventory: &'a GitWorktreeInventory,
     expected: &GitWorktreeRecord,
@@ -5074,8 +5126,8 @@ mod worktree_ownership_tests {
         CreateWorktreeInput, GitProcessRunner, GitPrunableWorktree, GitRepository,
         GitWorktreeRecord, OutputPolicy, OwnedWorktreePath, ProcessOutput, ProcessRequest,
         WORKTREE_INVENTORY_OUTPUT_LIMIT, display_path, ensure_authoritative_inventory_output,
-        git_output_line, is_unsupported_porcelain_z_diagnostic, open_removal_directory_lease,
-        parse_branch_headers, run_worktree_removal_probe_blocking,
+        git_output_line, is_unsupported_porcelain_z_diagnostic, parse_branch_headers,
+        run_worktree_removal_probe_blocking,
     };
     #[cfg(unix)]
     use super::{
@@ -5086,7 +5138,8 @@ mod worktree_ownership_tests {
     #[cfg(windows)]
     use super::{
         clear_windows_directory_bound_after_snapshot, create_removal_directory_lease,
-        delete_bound_directory_root_blocking, rename_bound_directory_blocking,
+        delete_bound_directory_root_blocking, open_removal_directory_lease,
+        rename_bound_directory_blocking,
     };
 
     #[test]
