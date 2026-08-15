@@ -169,6 +169,17 @@ describe("cross-platform CI contract", () => {
     expect(commands).not.toMatch(/gh release|softprops\/action-gh-release/);
   });
 
+  it("runs the native desktop E2E support contracts on Windows", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const nativeSteps = requireJob(workflow, "native_desktop").steps ?? [];
+    const windowsE2eStep = nativeSteps.find(
+      (step) => step.name === "Test Windows desktop E2E support contracts",
+    );
+
+    expect(windowsE2eStep?.if).toBe("matrix.platform == 'win'");
+    expect(windowsE2eStep?.run).toBe("vp test run apps/desktop/e2e/support/test-project.test.ts");
+  });
+
   it("installs the full official Linux Tauri prerequisite set", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
     const commands = allStepCommands(requireJob(workflow, "native_desktop"));

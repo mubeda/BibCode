@@ -212,6 +212,10 @@ jobs:
       - name: Test desktop Rust host
         run: vp run --filter @bibcode/desktop test
 
+      - name: Test Windows desktop E2E support contracts
+        if: matrix.platform == 'win'
+        run: vp test run apps/desktop/e2e/support/test-project.test.ts
+
       - name: Build native bundle without publishing
         run: >
           node scripts/build-desktop-artifact.ts
