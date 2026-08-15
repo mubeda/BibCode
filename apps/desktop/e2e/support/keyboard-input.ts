@@ -411,12 +411,32 @@ export async function sendFocusedKeyboardKey(
             .map(({ candidate }) => candidate);
           const currentIndex = ordered.indexOf(initialTarget);
           const offset = shiftKey ? -1 : 1;
+          const documentRelativeCandidate =
+            currentIndex >= 0
+              ? undefined
+              : shiftKey
+                ? candidates
+                    .toReversed()
+                    .find(
+                      (candidate) =>
+                        (candidate.compareDocumentPosition(initialTarget) &
+                          Node.DOCUMENT_POSITION_FOLLOWING) !==
+                        0,
+                    )
+                : candidates.find(
+                    (candidate) =>
+                      (initialTarget.compareDocumentPosition(candidate) &
+                        Node.DOCUMENT_POSITION_FOLLOWING) !==
+                      0,
+                  );
           const nextIndex =
-            currentIndex < 0
-              ? shiftKey
-                ? ordered.length - 1
-                : 0
-              : (currentIndex + offset + ordered.length) % ordered.length;
+            currentIndex >= 0
+              ? (currentIndex + offset + ordered.length) % ordered.length
+              : documentRelativeCandidate
+                ? ordered.indexOf(documentRelativeCandidate)
+                : shiftKey
+                  ? ordered.length - 1
+                  : 0;
           const next = ordered[nextIndex];
           tabOrder = {
             candidateCount: ordered.length,

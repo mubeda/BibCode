@@ -1073,7 +1073,8 @@ describe("packaged responsive activity experience", () => {
       document.addEventListener("focusin", state.onFocusIn, true);
     });
     await startDesktopActivityComposerFollowupTurn();
-    const composerUpdateAnnouncement = "Activity update: 2 active subagents, 0 done subagents";
+    const composerUpdateAnnouncement =
+      "Activity update: 2 active subagents, 0 done subagents, 0 active background tasks, 1 done background task";
     await browser.waitUntil(
       async () =>
         browser.execute((announcement: string) => {
