@@ -44,8 +44,14 @@ the host `ComSpec`, requires a successful exit, and verifies that the fixture
 recorded the exact `openInEditor` action and Windows path argument. This keeps
 the native assertion real on Windows and makes its host requirement explicit.
 
-No production source changes. The repair is confined to desktop E2E test
-coverage.
+The native desktop CI job adds one Windows-only step that runs
+`test-project.test.ts`. A parsed workflow contract test requires the exact
+platform condition and command, so the native assertion cannot silently drop
+out of Windows validation. The matrix, concurrency, and existing Rust and
+bundle steps remain unchanged.
+
+No production source changes. The repair is confined to desktop E2E test and
+CI coverage.
 
 ## Alternatives
 
@@ -78,15 +84,16 @@ The already observed focused and exact macOS failures are the RED evidence.
 After the test split:
 
 1. run the exact `test-project.test.ts` inventory coverage;
-2. run the complete changed desktop/script focused matrix;
-3. run `vp run test` and `cargo test --workspace -j 2` sequentially;
-4. run `vp check`, `vp run typecheck`, `cargo fmt --all --check`, and workspace
+2. run the parsed CI workflow contract that requires the Windows-only step;
+3. run the complete changed desktop/script focused matrix;
+4. run `vp run test` and `cargo test --workspace -j 2` sequentially;
+5. run `vp check`, `vp run typecheck`, `cargo fmt --all --check`, and workspace
    Clippy with warnings denied; and
-5. review `git diff --check` and `git status --short`.
+6. review `git diff --check` and `git status --short`.
 
 Native execution of the `.cmd` assertion remains Windows evidence and cannot be
-claimed from a macOS run. Current Windows CI will execute it through the normal
-desktop/package test graph.
+claimed from a macOS run. The explicit Windows-only native CI step owns that
+evidence after the workflow runs successfully.
 
 ## Documentation Impact
 

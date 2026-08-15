@@ -4,7 +4,7 @@
 
 **Goal:** Keep simulated Windows fixture construction portable while executing the generated Cursor `.cmd` action shim only on native Windows.
 
-**Architecture:** The parameterized inventory test remains host-independent and continues to verify `mac`, `linux`, and `win` environment/filesystem contracts everywhere. A dedicated `it.runIf(process.platform === "win32")` test owns the real `cmd.exe` execution and action-log assertion, making the native boundary explicit without mocks or production changes.
+**Architecture:** The parameterized inventory test remains host-independent and continues to verify `mac`, `linux`, and `win` environment/filesystem contracts everywhere. A dedicated `it.runIf(process.platform === "win32")` test owns the real `cmd.exe` execution and action-log assertion, while an explicit Windows-only native CI step and parsed workflow contract keep that test in the supported validation path.
 
 **Tech Stack:** TypeScript, Vite+ Test/Vitest-compatible `it.runIf`, Node.js child processes and filesystem fixtures.
 
@@ -19,17 +19,20 @@
 
 ---
 
-### Task 1: Separate portable fixture assertions from native Windows execution
+### Task 1: Separate portable fixture assertions and retain native Windows CI execution
 
 **Files:**
 
 - Modify: `apps/desktop/e2e/support/test-project.test.ts:173-217`
+- Modify: `scripts/ci-platform-contract.test.ts:126-162`
+- Modify: `.github/workflows/ci.yml:207-216`
 - Test: `apps/desktop/e2e/support/test-project.test.ts`
+- Test: `scripts/ci-platform-contract.test.ts`
 
 **Interfaces:**
 
 - Consumes: `prepareDesktopUiTestContext(environment: NodeJS.ProcessEnv): DesktopUiTestContext` and `archiveAndCleanupDesktopUiTestContext(context)`.
-- Produces: one host-independent inventory contract and one native-Windows-only Cursor `.cmd` execution contract.
+- Produces: one host-independent inventory contract, one native-Windows-only Cursor `.cmd` execution contract, and one Windows CI workflow contract that runs it.
 
 - [ ] **Step 1: Preserve the observed RED evidence**
 
@@ -112,7 +115,65 @@ Expected on macOS/Linux: every portable test passes and the dedicated native
 Windows test is skipped. Expected on Windows: every test passes, including the
 real `.cmd` execution and exact action-log assertion.
 
-- [ ] **Step 5: Run the changed desktop/script focused matrix**
+- [ ] **Step 5: Write and verify the failing Windows CI contract**
+
+In `scripts/ci-platform-contract.test.ts`, add this test inside
+`describe("cross-platform CI contract", ...)`:
+
+```ts
+it("runs the native desktop E2E support contracts on Windows", () => {
+  const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+  const nativeSteps = requireJob(workflow, "native_desktop").steps ?? [];
+  const windowsE2eStep = nativeSteps.find(
+    (step) => step.name === "Test Windows desktop E2E support contracts",
+  );
+
+  expect(windowsE2eStep?.if).toBe("matrix.platform == 'win'");
+  expect(windowsE2eStep?.run).toBe(
+    "vp test run apps/desktop/e2e/support/test-project.test.ts",
+  );
+});
+```
+
+Run:
+
+```bash
+vp test run scripts/ci-platform-contract.test.ts \
+  -t "runs the native desktop E2E support contracts on Windows"
+```
+
+Expected RED before the workflow edit: `windowsE2eStep` is absent, so the
+condition assertion receives `undefined`.
+
+- [ ] **Step 6: Add the native Windows CI step**
+
+In `.github/workflows/ci.yml`, immediately after `Test desktop Rust host`, add:
+
+```yaml
+      - name: Test Windows desktop E2E support contracts
+        if: matrix.platform == 'win'
+        run: vp test run apps/desktop/e2e/support/test-project.test.ts
+```
+
+This does not change the platform matrix or concurrency. Linux and macOS skip
+the step; Windows runs the real `.cmd` assertion after the frozen dependency
+install.
+
+- [ ] **Step 7: Run the exact fixture and CI contracts to verify GREEN**
+
+Run:
+
+```bash
+vp test run \
+  apps/desktop/e2e/support/test-project.test.ts \
+  scripts/ci-platform-contract.test.ts
+```
+
+Expected on macOS/Linux: portable fixture tests and the CI contract pass; the
+native Windows action-shim test is skipped. Expected on Windows: all tests pass,
+including the real `.cmd` execution.
+
+- [ ] **Step 8: Run the changed desktop/script focused matrix**
 
 Run:
 
@@ -125,6 +186,7 @@ vp test run \
   apps/desktop/e2e/support/ui-state.test.ts \
   apps/desktop/e2e/support/window-size.test.ts \
   scripts/coverage-config.test.ts \
+  scripts/ci-platform-contract.test.ts \
   scripts/run-tauri-build.test.mjs \
   scripts/tauri-hardening.test.ts \
   scripts/toolchain-contract.test.ts
@@ -133,10 +195,11 @@ vp test run \
 Expected: all enabled tests pass; only the native Windows action-shim test is
 skipped on a non-Windows host.
 
-- [ ] **Step 6: Commit the test-boundary repair**
+- [ ] **Step 9: Commit the test-boundary and CI repair**
 
 ```bash
-git add apps/desktop/e2e/support/test-project.test.ts
+git add apps/desktop/e2e/support/test-project.test.ts \
+  scripts/ci-platform-contract.test.ts .github/workflows/ci.yml
 git commit -m "test(desktop): gate Windows action shim natively"
 ```
 
@@ -147,6 +210,8 @@ git commit -m "test(desktop): gate Windows action shim natively"
 **Files:**
 
 - Review: `apps/desktop/e2e/support/test-project.test.ts`
+- Review: `scripts/ci-platform-contract.test.ts`
+- Review: `.github/workflows/ci.yml`
 - Review: `docs/superpowers/specs/2026-08-15-windows-e2e-host-gating-design.md`
 - Review: `docs/superpowers/plans/2026-08-15-windows-e2e-host-gating.md`
 
@@ -200,9 +265,9 @@ git status --short
 git log --oneline -10
 ```
 
-Confirm the repair changes only the test boundary and planning artifacts, no
-generated files or debug output are tracked, and the branch contains no
-uncommitted changes.
+Confirm the repair changes only the test boundary, parsed CI contract, one
+Windows-only native CI step, and planning artifacts; no generated files or
+debug output are tracked, and the branch contains no uncommitted changes.
 
 - [ ] **Step 5: Report native evidence accurately**
 
