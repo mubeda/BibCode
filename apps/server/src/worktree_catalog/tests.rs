@@ -2785,7 +2785,7 @@ async fn immediate_lifecycle_tasks_cannot_finish_before_registration() {
     service.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn shutdown_serializes_with_final_release_eviction_registration() {
     let service = WorktreeCatalogService::with_dependencies(
         Arc::new(FakeProjectionSource::new([project(
@@ -2805,28 +2805,39 @@ async fn shutdown_serializes_with_final_release_eviction_registration() {
     );
     let subscription = service.subscribe("project-1").await.expect("subscription");
     let (entered, resume) = service.pause_next_eviction_registration_for_test();
-    let dropping = tokio::spawn(async move { drop(subscription) });
+    let dropping = std::thread::spawn(move || drop(subscription));
     tokio::task::spawn_blocking(move || entered.wait())
         .await
         .expect("release reaches eviction registration");
 
-    let shutting_down = {
-        let service = service.clone();
-        tokio::spawn(async move { service.shutdown().await })
-    };
-    for _ in 0..10_000 {
-        if service.shutdown_started_for_test() {
-            break;
-        }
-        tokio::task::yield_now().await;
+    let (runtime_probe, runtime_observed) = std::sync::mpsc::sync_channel(1);
+    tokio::spawn(async move {
+        let _ = runtime_probe.send(());
+    });
+    if runtime_observed
+        .recv_timeout(Duration::from_secs(1))
+        .is_err()
+    {
+        resume.wait();
+        dropping.join().expect("subscription drop thread");
+        panic!("a paused subscription release must not consume the only Tokio worker");
     }
+
+    let mut shutting_down = Box::pin(service.shutdown());
+    let first_shutdown_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(shutting_down.as_mut().poll(context))
+    })
+    .await;
+    let shutdown_pending = first_shutdown_poll.is_pending();
     assert!(
         service.shutdown_started_for_test(),
         "shutdown must reach its terminal transition before release resumes"
     );
     resume.wait();
-    dropping.await.expect("subscription drop task");
-    shutting_down.await.expect("shutdown task");
+    dropping.join().expect("subscription drop thread");
+    if shutdown_pending {
+        shutting_down.await;
+    }
     service.shutdown().await;
     for _ in 0..100 {
         tokio::task::yield_now().await;

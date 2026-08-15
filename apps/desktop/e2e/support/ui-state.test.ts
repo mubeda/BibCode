@@ -75,10 +75,25 @@ describe("packaged composer acceptance contract", () => {
   it("checks every visible model row through semantic provider and model attributes", () => {
     const source = readComposerSpec();
 
-    expect(source).toContain("[data-model-picker-instance-id][data-model-picker-model-slug]");
+    expect(source).toContain('[data-model-picker-content="true"] [data-slot="combobox-item"]');
+    expect(source).toContain("element.dataset.modelPickerInstanceId");
+    expect(source).toContain("element.dataset.modelPickerModelSlug");
     expect(source).toContain("row.instanceId === scenario.provider");
     expect(source).toContain("row.modelSlug.length > 0");
     expect(source).not.toContain("foreignModels");
+  });
+
+  it("uses browser visibility semantics before clicking portal-backed composer items", () => {
+    const source = readComposerSpec();
+
+    expect(source).toContain("element.checkVisibility({");
+    expect(source).toContain("opacityProperty: true");
+    expect(source).toContain("visibilityProperty: true");
+    expect(source).toContain("const candidate = browser.$(selector)");
+    expect(source).toContain("await candidate.waitForExist({");
+    expect(source).toContain("await candidate.waitForDisplayed({");
+    expect(source).toContain("await candidate.waitForEnabled({");
+    expect(source).not.toContain("for (const candidate of await browser.$$(selector))");
   });
 
   it("restarts the packaged session and compares the complete native provider payload sequence", () => {
@@ -90,7 +105,7 @@ describe("packaged composer acceptance contract", () => {
       "const composerLogBaseline = readProviderInputLog(preparedProviderInputLogPath).length",
     );
     expect(source).toContain(".slice(composerLogBaseline)");
-    expect(source.match(/await activateProviderPanel\("Main"\)/g)).toHaveLength(2);
+    expect(source.match(/await activateProviderPanel\("Codex"\)/g)).toHaveLength(2);
     expect(source.match(/await appendAndSelectComposerItem/g)).toHaveLength(3);
     expect(source).not.toContain("await waitForComposerValue(expectedValue)");
     expect(source).toContain('await composerEditor().addValue("$refactor ")');
@@ -102,9 +117,26 @@ describe("packaged composer acceptance contract", () => {
       '"/docs"',
       '"/review"',
       '"@reviewer"',
-      '"/skills"',
     ]) {
       expect(source).toContain(prompt);
     }
+    expect(source).not.toContain('provider: "grok"');
+    expect(source).not.toContain('prompt: "/skills"');
+  });
+});
+
+describe("packaged activity viewport contract", () => {
+  it("starts responsive coverage at the native window minimum", () => {
+    const configuration = JSON.parse(
+      NodeFS.readFileSync(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+    ) as { app: { windows: Array<{ minWidth: number }> } };
+    const source = NodeFS.readFileSync(
+      new URL("../specs/chat-activity-panel.e2e.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(configuration.app.windows[0]?.minWidth).toBe(960);
+    expect(source).toContain("for (const width of [960, 980, 981, 1_199, 1_200] as const)");
+    expect(source).not.toContain("for (const width of [800,");
   });
 });
