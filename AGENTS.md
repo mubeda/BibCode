@@ -55,6 +55,29 @@ Investigate disagreements by tracing the relevant call path and tests. Either
 align living documentation in the same change or report the unresolved
 discrepancy.
 
+## Testing Runbook Maintenance
+
+`docs/testing/` contains the living procedures for repeatable native Windows,
+Linux, and macOS validation. Review and update the affected runbooks in the same
+change whenever work modifies:
+
+- test commands, package scripts, test targets, or CI/static gates;
+- desktop build, packaging, signing, or artifact-discovery procedures;
+- supported operating-system or environment presentation;
+- provider visibility or availability;
+- worktree discovery, adoption, identity, persistence, or removal;
+- process admission, ownership, cancellation, shutdown, reaping, or cleanup;
+- packaged UI flows included in native visual validation; or
+- required validation evidence or the execution-report schema.
+
+Verify procedures against current source, manifests, scripts, tests, CI, and
+release workflows. Historical plans and prior reports are not current command
+sources without that verification. Execution-specific SHAs, versions, test
+counts, timings, screenshots, logs, and machine paths belong in reports created
+from the template, not in living runbooks. When affected runbooks need no
+change, state in the final report that they were **reviewed and remain
+accurate**.
+
 ## Architectural Decision Standards
 
 Before editing, identify:
