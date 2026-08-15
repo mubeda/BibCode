@@ -103,6 +103,10 @@ async function visibleComposerItemIds(): Promise<string[]> {
         const style = window.getComputedStyle(element);
         const rectangle = element.getBoundingClientRect();
         return (
+          element.checkVisibility({
+            opacityProperty: true,
+            visibilityProperty: true,
+          }) &&
           style.display !== "none" &&
           style.visibility !== "hidden" &&
           rectangle.width > 0 &&
@@ -157,13 +161,11 @@ async function waitForComposerItem(id: string): Promise<void> {
 async function clickVisibleComposerItem(id: string): Promise<void> {
   const selector = `[data-composer-item-id="${id}"]`;
   await waitForComposerItem(id);
-  for (const candidate of await browser.$$(selector)) {
-    if ((await candidate.isDisplayed()) && (await candidate.isEnabled())) {
-      await candidate.click();
-      return;
-    }
-  }
-  throw new Error(`The visible composer item was not clickable: ${id}`);
+  const candidate = browser.$(selector);
+  await candidate.waitForExist({ timeoutMsg: `The composer item disappeared: ${id}` });
+  await candidate.waitForDisplayed({ timeoutMsg: `The composer item remained hidden: ${id}` });
+  await candidate.waitForEnabled({ timeoutMsg: `The composer item remained disabled: ${id}` });
+  await candidate.click();
 }
 
 async function waitForComposerItemsToClose(): Promise<void> {
