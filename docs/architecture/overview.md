@@ -473,11 +473,31 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - WSL-only desktop startup never falls back to a native Windows backend.
   Planning and primary-start failures remain tagged through the desktop bridge;
   only an explicit settings action switches the primary runtime to Windows.
-- Forced linked-worktree deletion cleans the registered worktree contents before
-  asking Git to deregister it, but only after the candidate's administrative
-  `.git` file and backlink verify against the repository's common worktree
-  metadata. The link remains until filesystem cleanup succeeds, so a blocked
-  cleanup is safely retryable across client and server restarts. Compatibility cleanup of a
+- Forced linked-worktree deletion is admitted only after the server verifies
+  the persisted workspace-thread owner, fences the canonical target path plus
+  every server-known terminal under it, closes their current processes, and
+  blocks open, attach, and restart for the duration of the VCS operation. The
+  server persists a removal receipt keyed by the workspace thread and binds it
+  to a random identity stored durably in both the linked worktree's Git
+  administrative directory and its root. The repository revalidates that
+  administrative `.git` file, backlink, and identity inside the removal
+  transaction, then atomically renames that exact checkout through its bound
+  filesystem handle on Windows to a deterministic nonce-bound quarantine. A
+  tiny verified tombstone, atomically created with its bound handle on Windows,
+  occupies the registered
+  path while the server atomically moves the nonce-verified administrative
+  directory out of Git's `worktrees` namespace. No path-based Git delete can
+  race with a replacement. Recursive cleanup begins only after deregistration,
+  holds the checkout, tombstone, and Git-administration leases continuously,
+  pins the verified filesystem object against rebinding, verifies descendant
+  identities, rejects Windows reparse points at the root and descendants, and deletes the empty
+  root through its handle. An empty registered path without the transaction
+  marker fails closed. A Windows process that still owns the checkout as its
+  current directory therefore makes the initial rename fail before any file is
+  deleted. The receipt and deterministic quarantine make interrupted cleanup
+  safely retryable across client and server restarts. Once cleanup completes,
+  the receipt makes a stale retry a no-op even if another worktree later reuses
+  that path. Compatibility cleanup of a
   previously deregistered directory is limited to a normal directory without a
   `.git` entry whose canonical parent is exactly BiBCode's computed
   per-repository worktree namespace; primary checkouts and arbitrary paths are

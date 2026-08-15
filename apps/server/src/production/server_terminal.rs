@@ -1428,6 +1428,10 @@ fn terminal_error(error: TerminalError) -> Value {
             "_tag": "TerminalCloseError",
             "reason": "Terminal processes did not exit before cleanup timed out.",
         }),
+        TerminalError::WorktreeRemovalInProgress { .. } => json!({
+            "_tag": "TerminalSpawnError",
+            "reason": "The worktree is being removed.",
+        }),
     }
 }
 
@@ -1588,10 +1592,94 @@ mod tests {
 
     fn write_probe_command(value: &str) -> String {
         if cfg!(windows) {
-            format!("Write-Output ''; Write-Output '{value}'\r\n")
+            format!("echo.\recho {value}\r")
         } else {
             format!("printf '\\n%s\\n' '{value}'\n")
         }
+    }
+
+    fn strip_terminal_control_sequences(input: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum State {
+            Text,
+            Escape,
+            Csi,
+            Osc,
+            OscEscape,
+        }
+
+        let mut state = State::Text;
+        let mut stripped = String::with_capacity(input.len());
+        for character in input.chars() {
+            state = match state {
+                State::Text if character == '\u{1b}' => State::Escape,
+                State::Text => {
+                    stripped.push(character);
+                    State::Text
+                }
+                State::Escape if character == '[' => State::Csi,
+                State::Escape if character == ']' => State::Osc,
+                State::Escape => State::Text,
+                State::Csi if ('@'..='~').contains(&character) => State::Text,
+                State::Csi => State::Csi,
+                State::Osc if character == '\u{7}' => State::Text,
+                State::Osc if character == '\u{1b}' => State::OscEscape,
+                State::Osc => State::Osc,
+                State::OscEscape if character == '\\' => State::Text,
+                State::OscEscape if character == '\u{1b}' => State::OscEscape,
+                State::OscEscape => State::Osc,
+            };
+        }
+        stripped
+    }
+
+    fn probe_output_contains_exact_line(output: &str, value: &str) -> bool {
+        strip_terminal_control_sequences(output)
+            .lines()
+            .any(|line| line.trim() == value)
+    }
+
+    #[test]
+    fn terminal_probe_ignores_windows_vt_sequences_without_accepting_the_echoed_command() {
+        let observed = concat!(
+            "\u{1b}[?25lecho still-alive-b\n",
+            "\u{1b}[?25lstill-alive-b\u{1b}[8;1H \u{1b}[?25h",
+        );
+
+        assert!(probe_output_contains_exact_line(observed, "still-alive-b"));
+        assert!(!probe_output_contains_exact_line(
+            "\u{1b}[?25lecho still-alive-b\u{1b}[?25h",
+            "still-alive-b",
+        ));
+    }
+
+    fn real_terminal_input(
+        thread_id: &str,
+        terminal_id: &str,
+        cwd: &std::path::Path,
+    ) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new(thread_id, terminal_id, cwd.to_path_buf(), 80, 24);
+        if cfg!(windows) {
+            input.command = Some(TerminalLaunchCommand {
+                executable: "cmd.exe".to_owned(),
+                args: vec![
+                    "/d".to_owned(),
+                    "/q".to_owned(),
+                    "/k".to_owned(),
+                    "prompt $H".to_owned(),
+                ],
+                label: None,
+                activity: None,
+            });
+        } else {
+            input.command = Some(TerminalLaunchCommand {
+                executable: "/bin/sh".to_owned(),
+                args: Vec::new(),
+                label: None,
+                activity: None,
+            });
+        }
+        input
     }
 
     async fn wait_for_probe(
@@ -1600,8 +1688,8 @@ mod tests {
         terminal_id: &str,
         value: &str,
     ) -> Result<(), String> {
+        let mut output = String::new();
         tokio::time::timeout(Duration::from_secs(5), async {
-            let mut output = String::new();
             loop {
                 match events.recv().await {
                     Ok(TerminalEvent::Output {
@@ -1611,7 +1699,7 @@ mod tests {
                         ..
                     }) if event_thread == thread_id && event_terminal == terminal_id => {
                         output.push_str(&data.replace('\r', ""));
-                        if output.lines().any(|line| line.trim() == value) {
+                        if probe_output_contains_exact_line(&output, value) {
                             return Ok(());
                         }
                         if output.len() > 16 * 1024 {
@@ -1630,7 +1718,11 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| format!("timed out waiting for terminal {terminal_id} probe"))?
+        .map_err(|_| {
+            format!(
+                "timed out waiting for terminal {terminal_id} probe; observed output: {output:?}"
+            )
+        })?
     }
 
     fn exact_process_exited(identity: ProcessIdentity) -> Result<(), String> {
@@ -1654,23 +1746,18 @@ mod tests {
             real_terminal_services(root_a.path()),
             real_terminal_services(root_b.path())
         );
-        let mut events_a = services_a.terminal.subscribe_events();
         let mut events_b = services_b.terminal.subscribe_events();
         let outcome = AssertUnwindSafe(async {
             let (opened_a, opened_b) = tokio::join!(
-                services_a.terminal.open(TerminalOpenInput::new(
+                services_a.terminal.open(real_terminal_input(
                     "thread-a",
                     "terminal-a",
-                    root_a.path().to_path_buf(),
-                    80,
-                    24,
+                    root_a.path()
                 )),
-                services_b.terminal.open(TerminalOpenInput::new(
+                services_b.terminal.open(real_terminal_input(
                     "thread-b",
                     "terminal-b",
-                    root_b.path().to_path_buf(),
-                    80,
-                    24,
+                    root_b.path()
                 ))
             );
             let pid_a = opened_a
@@ -1685,25 +1772,6 @@ mod tests {
                 .map_err(|error| format!("A identity: {error}"))?;
             let identity_b = NativeProcessSampler::process_identity(pid_b)
                 .map_err(|error| format!("B identity: {error}"))?;
-            let ready_a_command = write_probe_command("ready-a");
-            let ready_b_command = write_probe_command("ready-b");
-            let (written_a, written_b) = tokio::join!(
-                services_a
-                    .terminal
-                    .write("thread-a", "terminal-a", &ready_a_command,),
-                services_b
-                    .terminal
-                    .write("thread-b", "terminal-b", &ready_b_command,)
-            );
-            written_a.map_err(|error| error.to_string())?;
-            written_b.map_err(|error| error.to_string())?;
-            let (ready_a, ready_b) = tokio::join!(
-                wait_for_probe(&mut events_a, "thread-a", "terminal-a", "ready-a"),
-                wait_for_probe(&mut events_b, "thread-b", "terminal-b", "ready-b")
-            );
-            ready_a?;
-            ready_b?;
-
             services_a.shutdown().await;
             exact_process_exited(identity_a)?;
             let current_b = NativeProcessSampler::process_identity(pid_b)

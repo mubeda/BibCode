@@ -92,7 +92,7 @@ impl ManagedEndpointRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_fixture(
         executable: PathBuf,
         process_attribution: ProcessAttributionRegistry,
@@ -331,8 +331,10 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::TestSandbox;
 
+    #[cfg(unix)]
     fn tunnel_config() -> Value {
         json!({"providerKind":"cloudflare_tunnel","connectorToken":"fixture-token"})
     }

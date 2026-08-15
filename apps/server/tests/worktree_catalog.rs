@@ -10,7 +10,7 @@ use std::{
 };
 
 use bibcode_server::{
-    git::GitRepository,
+    git::{GitRepository, host_path_platform, normalize_worktree_path_key},
     persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
     worktree_catalog::{
         AdoptedWorktreeAvailability, AdoptionValidationErrorReason, CatalogRefreshTrigger,
@@ -104,7 +104,7 @@ async fn runtime_loss_guards_real_missing_worktree_and_exact_recovery_clears_it(
         .guard_thread("thread-external")
         .await
         .expect_err("authoritative loss installs a guard");
-    assert_eq!(guarded.path, external_path);
+    assert_same_worktree_path(&guarded.path, &external_path);
 
     let external_argument = fixture.external.to_string_lossy().into_owned();
     git(
@@ -287,7 +287,7 @@ async fn real_repository_tracks_external_create_delete_prune_and_exact_path_reco
     let discovered_external = discovered
         .worktrees
         .iter()
-        .find(|worktree| worktree.path == external_path)
+        .find(|worktree| same_worktree_path(&worktree.path, &external_path))
         .expect("external descriptor");
     assert!(discovered_external.eligible_for_adoption);
 
@@ -314,7 +314,7 @@ async fn real_repository_tracks_external_create_delete_prune_and_exact_path_reco
         missing_registered
             .worktrees
             .iter()
-            .find(|worktree| worktree.path == external_path)
+            .find(|worktree| same_worktree_path(&worktree.path, &external_path))
             .expect("stale registered descriptor")
             .directory_state,
         WorktreeDirectoryState::Missing
@@ -337,7 +337,7 @@ async fn real_repository_tracks_external_create_delete_prune_and_exact_path_reco
         missing_unregistered
             .worktrees
             .iter()
-            .all(|worktree| worktree.path != external_path)
+            .all(|worktree| !same_worktree_path(&worktree.path, &external_path))
     );
     assert_eq!(
         adopted_status(&missing_unregistered, "thread-external").availability,
@@ -446,7 +446,7 @@ async fn adoption_revalidation_proves_presence_and_repository_membership_with_re
         .resolve_adoption_candidate("project-1", &candidate.worktree_key)
         .await
         .expect("fresh candidate");
-    assert_eq!(resolved.path, canonical_string(&fixture.external));
+    assert_same_worktree_path(&resolved.path, canonical_string(&fixture.external));
     assert_eq!(resolved.branch.as_deref(), Some("feature/adoption"));
 
     fs::remove_dir_all(&fixture.external).expect("external checkout disappears");
@@ -622,6 +622,21 @@ fn canonical_string(path: &Path) -> String {
         .expect("canonical fixture path")
         .to_string_lossy()
         .into_owned()
+}
+
+fn assert_same_worktree_path(left: impl AsRef<Path>, right: impl AsRef<Path>) {
+    assert!(
+        same_worktree_path(left.as_ref(), right.as_ref()),
+        "worktree paths do not identify the same location: left={:?}, right={:?}",
+        left.as_ref(),
+        right.as_ref()
+    );
+}
+
+fn same_worktree_path(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool {
+    let platform = host_path_platform();
+    normalize_worktree_path_key(left.as_ref(), platform)
+        == normalize_worktree_path_key(right.as_ref(), platform)
 }
 
 fn git(cwd: &Path, args: &[&str], final_path: Option<&Path>) {

@@ -676,6 +676,7 @@ fn run_loss_reaper_job(
             return;
         }
         let _permit = tokio::select! {
+            biased;
             () = shutdown.cancelled() => return,
             () = job.ownership.cancelled() => return,
             permit = permits.clone().acquire_owned() => match permit {
@@ -700,6 +701,7 @@ fn run_loss_reaper_job(
             .await
         };
         let result = tokio::select! {
+            biased;
             () = shutdown.cancelled() => return,
             () = job.ownership.cancelled() => return,
             result = tokio::time::timeout_at(deadline, attempt) => result,

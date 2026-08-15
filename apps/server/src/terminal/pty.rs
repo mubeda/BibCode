@@ -182,7 +182,7 @@ struct SpawnedChildGuard {
     #[cfg(unix)]
     process_group: Option<i32>,
     #[cfg(windows)]
-    job: Option<WindowsJob>,
+    job: Option<Arc<WindowsJob>>,
     #[cfg(test)]
     tree_cleanup_observer: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -262,11 +262,19 @@ impl SpawnedChildGuard {
     #[cfg(windows)]
     fn own_job(&mut self, job: WindowsJob) {
         debug_assert!(self.job.is_none(), "PTY child job already attached");
-        self.job = Some(job);
+        self.job = Some(Arc::new(job));
     }
 
     #[cfg(windows)]
-    fn commit_job(mut self) -> Result<WindowsJob, String> {
+    fn clone_job_for_waiter(&self) -> Result<Arc<WindowsJob>, String> {
+        self.job
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "PTY child job was not retained during setup".to_owned())
+    }
+
+    #[cfg(windows)]
+    fn commit_job(mut self) -> Result<Arc<WindowsJob>, String> {
         let job = self
             .job
             .take()
@@ -421,9 +429,7 @@ impl PortablePtyBackend {
         }
         let exit_sender = exit.clone();
         #[cfg(windows)]
-        let job = Arc::new(child.commit_job()?);
-        #[cfg(windows)]
-        let waiter_job = Arc::clone(&job);
+        let waiter_job = child.clone_job_for_waiter()?;
         #[cfg(unix)]
         let process_group = child.process_group;
         #[cfg(unix)]
@@ -477,6 +483,11 @@ impl PortablePtyBackend {
                         Ok(false) => tracing::warn!("PTY Job did not exit before ownership release"),
                         Err(error) => tracing::warn!(%error, "failed waiting for PTY Job cleanup"),
                     }
+                    // `portable_pty::WinChild` owns the root process handle. Release it
+                    // before publishing the exit notification so shutdown callers cannot
+                    // observe a completed Job while the exited PID is still queryable.
+                    drop(child);
+                    drop(waiter_job);
                 }
                 let _ = exit_sender.send(Some(event));
             }),
@@ -484,6 +495,8 @@ impl PortablePtyBackend {
         .map_err(|error| error.to_string())?;
         #[cfg(unix)]
         let process_group = child.commit_process_group();
+        #[cfg(windows)]
+        let job = child.commit_job()?;
         Ok(Arc::new(PortablePtyProcess {
             pid,
             process_identity,
@@ -499,7 +512,7 @@ impl PortablePtyBackend {
             #[cfg(unix)]
             process_group_ownership,
             #[cfg(windows)]
-            job,
+            job: Mutex::new(Some(job)),
         }))
     }
 }
@@ -777,7 +790,7 @@ struct PortablePtyProcess {
     #[cfg(unix)]
     process_group_ownership: Arc<Mutex<UnixProcessGroupOwnership>>,
     #[cfg(windows)]
-    job: Arc<WindowsJob>,
+    job: Mutex<Option<Arc<WindowsJob>>>,
 }
 
 impl fmt::Debug for PortablePtyProcess {
@@ -846,7 +859,16 @@ impl PtyProcess for PortablePtyProcess {
         }
         #[cfg(windows)]
         {
-            if let Err(error) = self.job.terminate() {
+            let job = self
+                .job
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                .cloned();
+            let Some(job) = job else {
+                return Ok(());
+            };
+            if let Err(error) = job.terminate() {
                 return Err(error.to_string());
             }
             Ok(())
@@ -863,10 +885,22 @@ impl PtyProcess for PortablePtyProcess {
 
     #[cfg(windows)]
     fn wait_for_process_tree_exit(&self, timeout: Duration) -> Result<Option<bool>, String> {
-        self.job
+        let job = self
+            .job
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .cloned();
+        let Some(job) = job else {
+            return Ok(Some(true));
+        };
+        let exited = job
             .wait_for_exit(timeout)
-            .map(Some)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if exited {
+            self.job.lock().map_err(|error| error.to_string())?.take();
+        }
+        Ok(Some(exited))
     }
 
     fn subscribe_output(&self) -> broadcast::Receiver<String> {
@@ -1298,6 +1332,25 @@ mod tests {
             let process_group = guard.commit_process_group();
             drop(child);
             assert!(process_group.is_none());
+            assert!(!committed_killed.load(std::sync::atomic::Ordering::Acquire));
+        }
+
+        #[cfg(windows)]
+        {
+            let committed_killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut guard = SpawnedChildGuard::new(Box::new(SetupTestChild {
+                killed: committed_killed.clone(),
+                panic_on_clone: false,
+            }));
+            guard.own_job(WindowsJob::new().expect("create committed PTY test job"));
+            let waiter_job = guard
+                .clone_job_for_waiter()
+                .expect("clone waiter PTY job ownership");
+            let child = guard.handoff_child_to_waiter();
+            let job = guard.commit_job().expect("commit PTY job ownership");
+
+            assert!(Arc::ptr_eq(&job, &waiter_job));
+            drop(child);
             assert!(!committed_killed.load(std::sync::atomic::Ordering::Acquire));
         }
     }

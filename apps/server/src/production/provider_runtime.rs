@@ -5089,6 +5089,11 @@ where
         provider: provider.clone(),
         detail: format!("provider executable was not found: {}", request.binary_path),
     })?;
+    let executable = if provider == "opencode" {
+        crate::provider::opencode::resolve_owned_executable(Platform::current(), &executable)
+    } else {
+        executable
+    };
     let launch = prepare_provider_launch(&executable, args).map_err(|detail| {
         ProviderRuntimeError::Spawn {
             provider: provider.clone(),

@@ -306,6 +306,9 @@ timestamp and uses it for that batch's background-work mutations. An unchanged
 tracker entry retains its first observation time across later batches. A server
 restart or other new tracker generation may begin that elapsed interval at its
 first new observation because no earlier provider timestamp exists to recover.
+Live root `commandExecution` start and completion notifications wake that
+bounded reconciliation path; the notifications remain hints, while the
+official background-terminal list stays authoritative for work-item state.
 
 For structured chat only, a verified descendant becomes cancellable while the
 tracker can prove one current active turn for that native child thread. Live

@@ -3290,6 +3290,10 @@ function LocalSecondaryStatus() {
   const connecting: string[] = [];
   const failed: Array<{ label: string; error: string | null }> = [];
   for (const bootstrap of secondaries) {
+    if (bootstrap.preflightError) {
+      failed.push({ label: bootstrap.label, error: bootstrap.preflightError.detail });
+      continue;
+    }
     const env =
       bootstrap.httpBaseUrl !== null ? localEnvByUrl.get(bootstrap.httpBaseUrl) : undefined;
     if (env?.phase === "connected") {
@@ -3323,7 +3327,7 @@ function LocalSecondaryStatus() {
         <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
           <TriangleAlertIcon />
           <AlertTitle>Couldn't connect {failed.map((entry) => entry.label).join(", ")}</AlertTitle>
-          <AlertDescription>
+          <AlertDescription className="min-w-0 wrap-anywhere">
             {failed
               .map((entry) => entry.error)
               .filter(Boolean)

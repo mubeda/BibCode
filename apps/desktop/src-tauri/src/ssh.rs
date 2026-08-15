@@ -2239,12 +2239,12 @@ mod tests {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "[Console]::Out.WriteLine('ready'); Start-Sleep -Seconds 60",
+                "[Console]::Out.Write('ready!'); Start-Sleep -Seconds 60",
             ]);
             command
         } else {
             let mut command = Command::new("sh");
-            command.args(["-c", "printf 'ready\\n'; exec sleep 60"]);
+            command.args(["-c", "printf 'ready!'; exec sleep 60"]);
             command
         };
         command
@@ -2267,7 +2267,7 @@ mod tests {
             .read_exact(&mut readiness)
             .await
             .expect("active SSH child readiness");
-        assert_eq!(&readiness, b"ready\n");
+        assert_eq!(&readiness, b"ready!");
 
         let owner = tokio::spawn(async move {
             let _child = child;
@@ -2319,12 +2319,12 @@ mod tests {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "[Console]::Out.WriteLine('ready'); Start-Sleep -Seconds 60",
+                "[Console]::Out.Write('ready!'); Start-Sleep -Seconds 60",
             ]);
             command
         } else {
             let mut command = Command::new("sh");
-            command.args(["-c", "printf 'ready\\n'; exec sleep 60"]);
+            command.args(["-c", "printf 'ready!'; exec sleep 60"]);
             command
         };
         command
@@ -2347,7 +2347,7 @@ mod tests {
             .read_exact(&mut readiness)
             .await
             .expect("active SSH child readiness");
-        assert_eq!(&readiness, b"ready\n");
+        assert_eq!(&readiness, b"ready!");
         let owner = tokio::spawn(async move { child.wait_with_output().await });
 
         if tokio::time::timeout(Duration::from_secs(3), async {

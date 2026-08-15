@@ -121,6 +121,7 @@ describe("run-msvc-x64", () => {
     const mkdirSync = vi.fn();
     const realpathSync = vi.fn(() => "/private/tmp/bibcode-task9f-target");
     const spawnSync = vi.fn(() => ({ status: 0 }));
+    const resolvedTarget = NodePath.resolve("/tmp/bibcode-task9f-target");
 
     expect(
       runMsvcX64(["cargo", "test", "-p", "bibcode-desktop"], {
@@ -132,10 +133,10 @@ describe("run-msvc-x64", () => {
       }),
     ).toBe(0);
 
-    expect(mkdirSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target", {
+    expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, {
       recursive: true,
     });
-    expect(realpathSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target");
+    expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
     expect(spawnSync).toHaveBeenCalledWith(
       "cargo",
       ["test", "-p", "bibcode-desktop"],
@@ -148,6 +149,7 @@ describe("run-msvc-x64", () => {
   });
 
   it("uses the native canonical target identity on every platform", () => {
+    const resolvedTarget = NodePath.resolve("/tmp/bibcode-task9f-target");
     for (const canonicalTarget of [
       "/private/tmp/bibcode-task9f-target",
       "/tmp/bibcode-task9f-target",
@@ -166,10 +168,10 @@ describe("run-msvc-x64", () => {
           realpathSync,
         }),
       ).toEqual({ CARGO_TARGET_DIR: canonicalTarget, SENTINEL: "kept" });
-      expect(mkdirSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target", {
+      expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, {
         recursive: true,
       });
-      expect(realpathSync).toHaveBeenCalledWith("/tmp/bibcode-task9f-target");
+      expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
       expect(configured.CARGO_TARGET_DIR).toBe("/tmp/bibcode-task9f-target");
     }
   });
@@ -195,6 +197,7 @@ describe("run-msvc-x64", () => {
     const mkdirSync = vi.fn();
     const realpathSync = vi.fn(() => "/canonical/repo/isolated-target");
     const configured = { CARGO_TARGET_DIR: "isolated-target", SENTINEL: "kept" };
+    const resolvedTarget = NodePath.resolve("/repo", "isolated-target");
 
     const canonical = canonicalizeCargoTestTarget(["cargo", "test"], configured, {
       cwd: "/repo",
@@ -202,8 +205,8 @@ describe("run-msvc-x64", () => {
       realpathSync,
     });
 
-    expect(mkdirSync).toHaveBeenCalledWith("/repo/isolated-target", { recursive: true });
-    expect(realpathSync).toHaveBeenCalledWith("/repo/isolated-target");
+    expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, { recursive: true });
+    expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
     expect(canonical).toEqual({
       CARGO_TARGET_DIR: "/canonical/repo/isolated-target",
       SENTINEL: "kept",

@@ -14,7 +14,7 @@ use git::{
     BoxWorktreeBaseDirectoryFuture, CreateWorktreeInput, GitRepository, OutputPolicy, ProcessError,
     ProcessRequest, ProcessRunner, StatusBroadcaster, VcsStagingArea, VcsStatusStreamEvent,
     VcsWorkingTreeFileStatus, WorktreeBaseDirectoryProvider, git_worktree_prune_impact_digest,
-    parse_porcelain_v2_line,
+    normalize_worktree_path_key, parse_porcelain_v2_line,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -53,12 +53,16 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 }
 
 fn has_registered_worktree(cwd: &Path, expected: &Path) -> bool {
-    let expected = fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
     git(cwd, &["worktree", "list", "--porcelain"])
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
-        .any(|path| fs::canonicalize(&path).unwrap_or(path) == expected)
+        .any(|path| same_worktree_identity(&path, expected))
+}
+
+fn same_worktree_identity(left: &Path, right: &Path) -> bool {
+    normalize_worktree_path_key(left, git::host_path_platform())
+        == normalize_worktree_path_key(right, git::host_path_platform())
 }
 
 fn init_repo() -> TempDir {
@@ -462,13 +466,13 @@ async fn worktree_verified_targeted_cleanup_removes_only_the_missing_registratio
         .expect("stale inventory")
         .records
         .into_iter()
-        .find(|record| record.path == registered_path)
+        .find(|record| same_worktree_identity(&record.path, &registered_path))
         .expect("stale target record");
     assert!(
         registered
             .records
             .iter()
-            .any(|record| record.path == stale.path)
+            .any(|record| same_worktree_identity(&record.path, &stale.path))
     );
 
     let inspection = repository
@@ -522,7 +526,7 @@ async fn worktree_repository_wide_prune_requires_the_exact_public_preview_digest
         .expect("stale inventory")
         .records
         .into_iter()
-        .find(|record| record.path == registered_path)
+        .find(|record| same_worktree_identity(&record.path, &registered_path))
         .expect("stale target record");
     let impact = repository
         .preview_worktree_prune(repo.path(), &cancellation())
