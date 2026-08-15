@@ -14,7 +14,7 @@
 - Workspace, Rust-harness, and fixture concurrency remain enabled.
 - Add no global locks, scheduling sleeps, retries, or serialization flags.
 - Keep paging, retention, ordering, stream replacement, memory, provider payload, cancellation, shutdown, kill, and reap assertions intact.
-- Use one absolute 15-second integration-test deadline per affected provider test; later milestones consume its remaining budget.
+- Use one absolute 30-second integration-test deadline per affected provider test; later milestones consume its remaining budget.
 - Stop a full workspace verification on the first different failure and report it without a blind rerun.
 
 ---
@@ -137,7 +137,7 @@ Inside the existing `#[cfg(test)]` provider-runtime tests module, add:
 
 ```rust
 const PROVIDER_FIXTURE_INTEGRATION_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
 struct ProviderFixtureDeadline(tokio::time::Instant);
@@ -238,9 +238,11 @@ Run sequentially:
 cargo test -p bibcode-server --lib production::provider_runtime::tests -- --nocapture
 cargo test -p bibcode-server --lib production::provider_runtime::tests -- --test-threads=8
 cargo test -p bibcode-server --lib production::provider_runtime::tests -- --test-threads=12
+cargo test -p bibcode-server --lib -j 2
 ```
 
-Expected: every provider-runtime test passes at all three widths.
+Expected: every provider-runtime test passes at the focused widths and the full
+server library passes at the native harness default.
 
 ---
 

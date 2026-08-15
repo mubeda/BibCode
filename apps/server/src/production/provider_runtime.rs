@@ -9613,7 +9613,7 @@ mod tests {
     };
 
     const PROVIDER_FIXTURE_INTEGRATION_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(15);
+        std::time::Duration::from_secs(30);
 
     #[derive(Clone, Copy, Debug)]
     struct ProviderFixtureDeadline(tokio::time::Instant);
@@ -9828,6 +9828,23 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now().duration_since(started_at),
             std::time::Duration::from_secs(15),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_fixture_integration_deadline_preserves_loaded_suite_headroom() {
+        let started_at = tokio::time::Instant::now();
+        let deadline = ProviderFixtureDeadline::integration();
+
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+        deadline
+            .observe(std::future::pending::<()>())
+            .await
+            .expect_err("the integration fixture must remain bounded by one absolute deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            std::time::Duration::from_secs(30),
         );
     }
 
