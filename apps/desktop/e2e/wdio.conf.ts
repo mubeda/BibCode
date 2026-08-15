@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
+import { isFinalDesktopUiSpec, requestDesktopUiApplicationExit } from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
   prepareDesktopUiTestContext,
@@ -28,6 +29,17 @@ const appBinaryPath = resolveDesktopAppPath({
   environment: process.env,
 });
 const requestedSpec = process.env.BIBCODE_E2E_SPEC?.trim();
+const desktopUiSpecs =
+  requestedSpec && requestedSpec.length > 0
+    ? [requestedSpec]
+    : [
+        "./specs/main-window.e2e.ts",
+        "./specs/project-session-terminal.e2e.ts",
+        "./specs/platform-capabilities.e2e.ts",
+        "./specs/terminal-font.e2e.ts",
+        "./specs/composer-native-triggers.e2e.ts",
+        "./specs/chat-activity-panel.e2e.ts",
+      ];
 
 if (!NodeFS.existsSync(appBinaryPath)) {
   throw new Error(`Packaged BiBCode application does not exist: ${appBinaryPath}`);
@@ -84,17 +96,7 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
 
 export const config = {
   runner: "local",
-  specs:
-    requestedSpec && requestedSpec.length > 0
-      ? [requestedSpec]
-      : [
-          "./specs/main-window.e2e.ts",
-          "./specs/project-session-terminal.e2e.ts",
-          "./specs/platform-capabilities.e2e.ts",
-          "./specs/terminal-font.e2e.ts",
-          "./specs/composer-native-triggers.e2e.ts",
-          "./specs/chat-activity-panel.e2e.ts",
-        ],
+  specs: desktopUiSpecs,
   maxInstances: 1,
   services: [
     [
@@ -191,6 +193,12 @@ export const config = {
         await browser.getPageSource(),
       );
     }
+  },
+  after: async (_result: unknown, _capabilities: unknown, currentSpecs: ReadonlyArray<string>) => {
+    if (!isFinalDesktopUiSpec(currentSpecs, desktopUiSpecs)) return;
+    // Ask Tauri to run its normal ExitRequested path so the in-process backend and provider
+    // children release Windows filesystem handles before the launcher service stops the driver.
+    await requestDesktopUiApplicationExit();
   },
   onComplete: () => {
     // WDIO invokes configuration hooks before launcher service hooks. Defer shared fixture cleanup

@@ -30,10 +30,9 @@ if (!artifactDirectory || !projectPath || !shimDirectory) {
 }
 const preparedArtifactDirectory: string = artifactDirectory;
 const preparedProjectPath: string = projectPath;
-const preparedCodexExecutable = NodePath.join(
-  shimDirectory,
-  process.env.BIBCODE_E2E_PLATFORM === "win" ? "codex.cmd" : "codex",
-);
+const isWindowsE2e = process.env.BIBCODE_E2E_PLATFORM === "win";
+const supportsCodexTerminalActivity = !isWindowsE2e;
+const preparedCodexExecutable = NodePath.join(shimDirectory, isWindowsE2e ? "codex.cmd" : "codex");
 
 afterEach(async () => {
   try {
@@ -395,11 +394,14 @@ async function openCodexProviderTerminal(): Promise<string> {
     return null;
   }, terminalId);
   expect(requestedExecutable).toBe(preparedCodexExecutable);
-  await browser
-    .$(`[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`)
-    .waitForDisplayed({
+  const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
+  if (supportsCodexTerminalActivity) {
+    await browser.$(terminalDock).waitForDisplayed({
       timeoutMsg: "The live Codex terminal activity dock did not become visible.",
     });
+  } else {
+    await expectMissing(terminalDock);
+  }
   return terminalId;
 }
 
@@ -1011,7 +1013,9 @@ describe("packaged responsive activity experience", () => {
 
     await setDesktopUiWindowSize(1_200, 720);
     const terminalId = await openCodexProviderTerminal();
-    await assertProviderTerminalGeometry(terminalId);
+    if (supportsCodexTerminalActivity) {
+      await assertProviderTerminalGeometry(terminalId);
+    }
     const terminalInput =
       '[data-terminal-owner="center-panel"] .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea';
     expect(await focusDesktopUiElement(terminalInput)).toEqual(
@@ -1035,16 +1039,16 @@ describe("packaged responsive activity experience", () => {
     });
     const updatedAnnouncement =
       "Activity update: 1 active subagent, 0 done subagents, 0 active background tasks, 1 done background task";
+    const updatedAnnouncementSelector = supportsCodexTerminalActivity
+      ? `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"] [role="status"][aria-live="polite"]`
+      : '[data-testid="activity-dock"] [role="status"][aria-live="polite"]';
     await browser.waitUntil(
-      async () =>
-        (await browser
-          .$(
-            `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"] [role="status"][aria-live="polite"]`,
-          )
-          .getText()) === updatedAnnouncement,
+      async () => (await browser.$(updatedAnnouncementSelector).getText()) === updatedAnnouncement,
       { timeoutMsg: "The coalesced live announcement did not publish updated exact status." },
     );
-    await assertProviderTerminalGeometry(terminalId);
+    if (supportsCodexTerminalActivity) {
+      await assertProviderTerminalGeometry(terminalId);
+    }
     const mainPanel = browser.$(
       '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
     );
