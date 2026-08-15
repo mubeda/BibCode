@@ -61,6 +61,34 @@ pub struct TurnDeliveryService {
     force_cancel: CancellationToken,
     wake: Arc<Notify>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    retry_probe: Arc<DeliveryRetryProbe>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DeliveryRetryProbe {
+    scheduled: std::sync::atomic::AtomicUsize,
+    changed: Notify,
+}
+
+#[cfg(test)]
+impl DeliveryRetryProbe {
+    fn record(&self) {
+        self.scheduled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+
+    async fn wait_for(&self, expected: usize) {
+        loop {
+            let changed = self.changed.notified();
+            if self.scheduled.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl TurnDeliveryService {
@@ -230,6 +258,8 @@ impl TurnDeliveryService {
         let force_cancel = CancellationToken::new();
         let wake = Arc::new(Notify::new());
         let permits = Arc::new(Semaphore::new(capacity));
+        #[cfg(test)]
+        let retry_probe = Arc::new(DeliveryRetryProbe::default());
         let worker = tokio::spawn(run(
             engine,
             router,
@@ -240,13 +270,22 @@ impl TurnDeliveryService {
             force_cancel.clone(),
             shutdown_grace,
             wake.clone(),
+            #[cfg(test)]
+            retry_probe.clone(),
         ));
         Self {
             shutdown,
             force_cancel,
             wake,
             worker: Mutex::new(Some(worker)),
+            #[cfg(test)]
+            retry_probe,
         }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_retries_scheduled(&self, expected: usize) {
+        self.retry_probe.wait_for(expected).await;
     }
 
     pub(crate) fn wake(&self) {
@@ -389,6 +428,7 @@ async fn run(
     force_cancel: CancellationToken,
     shutdown_grace: Duration,
     wake: Arc<Notify>,
+    #[cfg(test)] retry_probe: Arc<DeliveryRetryProbe>,
 ) {
     let mut tasks = JoinSet::new();
     let mut recovery_task = None;
@@ -487,10 +527,14 @@ async fn run(
                         }
                         Ok(DeliveryTaskOutcome::DefinitelyNotSent) => {
                             schedule_retry(&mut retry_backoffs, command_id);
+                            #[cfg(test)]
+                            retry_probe.record();
                         }
                         Err(error) => {
                             tracing::warn!(%error, "provider delivery transition failed");
                             schedule_retry(&mut retry_backoffs, command_id);
+                            #[cfg(test)]
+                            retry_probe.record();
                         }
                     }
                 }
@@ -1211,6 +1255,18 @@ mod tests {
             },
             "createdAt": "2026-08-01T00:00:00Z"
         })
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, changed: &Notify, expected: usize) {
+        loop {
+            let notified = changed.notified();
+            let actual = counter.load(Ordering::SeqCst);
+            if actual >= expected {
+                assert_eq!(actual, expected);
+                return;
+            }
+            notified.await;
+        }
     }
 
     #[tokio::test]
@@ -2332,6 +2388,7 @@ mod tests {
     async fn permanent_bootstrap_failure_retains_backoff_across_respawns() {
         struct FailingBootstrapEffects {
             attempts: AtomicUsize,
+            attempted: Notify,
         }
 
         impl ThreadTurnBootstrapEffects for FailingBootstrapEffects {
@@ -2341,6 +2398,7 @@ mod tests {
                 _cancellation: &'a CancellationToken,
             ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
                 self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.attempted.notify_one();
                 Box::pin(async { Err("permanent worktree failure".to_owned()) })
             }
 
@@ -2384,37 +2442,25 @@ mod tests {
             .expect("engine");
         let effects = Arc::new(FailingBootstrapEffects {
             attempts: AtomicUsize::new(0),
+            attempted: Notify::new(),
         });
         engine.set_bootstrap_effects(effects.clone());
         let router: DeliveryRouter = Arc::new(|_| Box::pin(async { Ok(()) }));
         let service = TurnDeliveryService::start_with_router(engine.clone(), 1, router.clone());
 
-        for expected in [1, 2] {
-            for _ in 0..1_000 {
-                if effects.attempts.load(Ordering::SeqCst) >= expected {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(effects.attempts.load(Ordering::SeqCst), expected);
-            tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        }
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_count(&effects.attempts, &effects.attempted, 1).await;
+        service.wait_for_retries_scheduled(1).await;
+        tokio::time::advance(RETRY_BACKOFF_MIN).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 2).await;
+        service.wait_for_retries_scheduled(2).await;
+        tokio::time::advance(RETRY_BACKOFF_MIN).await;
         assert_eq!(
             effects.attempts.load(Ordering::SeqCst),
             2,
             "the second failure must retain the 100ms delay instead of resetting to 50ms"
         );
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        for _ in 0..1_000 {
-            if effects.attempts.load(Ordering::SeqCst) >= 3 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(effects.attempts.load(Ordering::SeqCst), 3);
+        wait_for_count(&effects.attempts, &effects.attempted, 3).await;
 
         service.shutdown().await;
         engine.shutdown().await;
@@ -2436,7 +2482,7 @@ mod tests {
             ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
                 Box::pin(async move {
                     self.attempts.fetch_add(1, Ordering::SeqCst);
-                    self.attempted.notify_waiters();
+                    self.attempted.notify_one();
                     self.releases
                         .acquire()
                         .await
@@ -2452,16 +2498,6 @@ mod tests {
             ) -> BoxBootstrapFuture<'a, BootstrapSetupResult> {
                 Box::pin(async { Ok(BootstrapSetupResult::NoScript) })
             }
-        }
-
-        async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
-            for _ in 0..1_000 {
-                if counter.load(Ordering::SeqCst) >= expected {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(counter.load(Ordering::SeqCst), expected);
         }
 
         let database = Database::open_in_memory().await.expect("database");
@@ -2522,7 +2558,7 @@ mod tests {
                 let healthy_releases = healthy_releases.clone();
                 Box::pin(async move {
                     healthy_routes.fetch_add(1, Ordering::SeqCst);
-                    healthy_started.notify_waiters();
+                    healthy_started.notify_one();
                     healthy_releases
                         .acquire()
                         .await
@@ -2534,28 +2570,21 @@ mod tests {
         });
         let service = TurnDeliveryService::start_with_router(engine.clone(), 2, router);
 
-        wait_for_count(&effects.attempts, 1).await;
-        wait_for_count(&healthy_routes, 1).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 1).await;
+        wait_for_count(&healthy_routes, &healthy_started, 1).await;
+        healthy_releases.add_permits(1);
+        wait_for_count(&healthy_routes, &healthy_started, 2).await;
+        healthy_releases.add_permits(1);
+        wait_for_count(&healthy_routes, &healthy_started, 3).await;
+        healthy_releases.add_permits(1);
         effects.releases.add_permits(1);
-        wait_for_count(&healthy_routes, 2).await;
-        healthy_releases.add_permits(1);
-        wait_for_count(&healthy_routes, 3).await;
-        healthy_releases.add_permits(1);
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
-        }
+        service.wait_for_retries_scheduled(1).await;
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        wait_for_count(&effects.attempts, 2).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 2).await;
 
         effects.releases.add_permits(1);
-        healthy_releases.add_permits(1);
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
-        }
+        service.wait_for_retries_scheduled(2).await;
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
         assert_eq!(
             effects.attempts.load(Ordering::SeqCst),
             2,
@@ -2563,7 +2592,7 @@ mod tests {
         );
 
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        wait_for_count(&effects.attempts, 3).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 3).await;
         effects.releases.add_permits(8);
         healthy_releases.add_permits(8);
         service.shutdown().await;
