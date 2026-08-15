@@ -88,7 +88,7 @@ Expected: all eight tests pass and both high-volume diagnostics remain present.
 **Interfaces:**
 
 - Consumes: Tokio `Instant`, `timeout_at`, the existing fixture capture files, real provider driver futures, and existing `FixtureEvent` milestones.
-- Produces: private test-only `ProviderFixtureDeadline` with `after(Duration) -> Self`, `instant() -> tokio::time::Instant`, and `observe(Future) -> Result<Output, Elapsed>`; `captured_request` receives this deadline explicitly.
+- Produces: private test-only `ProviderFixtureDeadline` with `after(Duration) -> Self`, `instant() -> tokio::time::Instant`, and `observe(Future) -> Result<Output, Elapsed>`; `captured_request` receives this deadline explicitly and returns its deadline error to the cleanup-owning call site.
 
 - [ ] **Step 1: Write the failing absolute-deadline regression**
 
@@ -181,7 +181,7 @@ async fn captured_request(
     deadline: ProviderFixtureDeadline,
     path: &std::path::Path,
     predicate: impl Fn(&Value) -> bool,
-) -> Value {
+) -> Result<Value, tokio::time::error::Elapsed> {
     deadline
         .observe(async {
             loop {
@@ -197,11 +197,10 @@ async fn captured_request(
             }
         })
         .await
-        .expect("provider request capture deadline")
 }
 ```
 
-Create one `ProviderFixtureDeadline::integration()` before the first observed operation in each test that calls `captured_request`, and pass that same value to every capture and related owner wait in that test. For Unix-only FIFO coverage, keep the FIFO readiness milestone; Windows capture uses the same absolute deadline.
+Create one `ProviderFixtureDeadline::integration()` before the first observed operation in each test that calls `captured_request`, and pass that same value to every capture and related owner wait in that test. Every deadline error must be handled at the call site (or by a call-site guard): abort and join any retained spawned owner, await the exact driver's shutdown/reap path, and only then convert the error into a stage-specific test panic. For Unix-only FIFO coverage, keep the FIFO readiness milestone; Windows capture uses the same absolute deadline.
 
 - [ ] **Step 6: Route the three observed provider failures through the same owner**
 
@@ -211,7 +210,7 @@ In these tests:
 - `claude_completion_queries_order_stream_usage_mcp_status_then_completion`
 - `native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands`
 
-replace the local two-second fixture observers with `deadline.observe(...)` and stage-specific `expect` messages. In the native-adapter test, reuse `deadline.instant()` for the existing Codex startup milestone rather than creating a second 15-second window. Keep dedicated production-timeout regressions unchanged.
+replace the local two-second fixture observers with `deadline.observe(...)` and stage-specific failure handling that performs owner abort/join and driver shutdown/reap before panicking. In the native-adapter test, reuse `deadline.instant()` for the existing Codex startup milestone rather than creating a second 15-second window. Keep dedicated production-timeout regressions unchanged.
 
 - [ ] **Step 7: Run exact provider tests**
 

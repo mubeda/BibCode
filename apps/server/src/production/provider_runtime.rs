@@ -9599,7 +9599,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex as StdMutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::{Duration, Instant},
@@ -9828,6 +9828,73 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now().duration_since(started_at),
             std::time::Duration::from_secs(15),
+        );
+    }
+
+    struct ProviderFixtureOwnerAbortProbe(Arc<AtomicBool>);
+
+    impl Drop for ProviderFixtureOwnerAbortProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_fixture_deadline_failure_aborts_owner_and_reaps_driver_before_panicking() {
+        // Mutation caught: restoring an internal capture expect, or converting its deadline
+        // error before cleanup, detaches the retained owner and leaves the fixture process live.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("missing-capture.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
+        driver.start().await.expect("Cursor fixture should start");
+
+        let owner_aborted = Arc::new(AtomicBool::new(false));
+        let (owner_started, owner_started_receiver) = tokio::sync::oneshot::channel();
+        let owner_probe = owner_aborted.clone();
+        let owner = tokio::spawn(async move {
+            let _probe = ProviderFixtureOwnerAbortProbe(owner_probe);
+            owner_started.send(()).expect("owner start observation");
+            std::future::pending::<()>().await;
+        });
+        owner_started_receiver
+            .await
+            .expect("retained owner should start");
+
+        let deadline = ProviderFixtureDeadline::after(std::time::Duration::ZERO);
+        let capture_error = captured_request(deadline, &capture_path, |_| false)
+            .await
+            .expect_err("expired capture returns its deadline error to the cleanup owner");
+        let cleanup_driver = driver.clone();
+        let failure = tokio::spawn(async move {
+            fixture_deadline_failure_with_owner(
+                cleanup_driver.as_ref(),
+                owner,
+                "provider request capture",
+                capture_error,
+            )
+            .await;
+        });
+
+        assert!(
+            failure
+                .await
+                .expect_err("cleanup owner converts the deadline into the test failure")
+                .is_panic(),
+            "the deadline remains a test failure after cleanup"
+        );
+        assert!(
+            owner_aborted.load(Ordering::SeqCst),
+            "cleanup aborts and joins the retained owner before failing"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped fixture status")
+                .is_some(),
+            "cleanup shuts down and reaps the real fixture driver before failing"
         );
     }
 
@@ -11098,7 +11165,7 @@ done
                 .await
         });
         #[cfg(unix)]
-        deadline
+        if let Err(error) = deadline
             .observe(async {
                 use std::io::Read;
 
@@ -11119,9 +11186,27 @@ done
                 }
             })
             .await
-            .expect("Claude delivery request reaches the fixture deadline");
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery FIFO readiness",
+                error,
+            )
+            .await;
+        }
         #[cfg(windows)]
-        captured_request(deadline, &capture_path, |value| value["type"] == "user").await;
+        if let Err(error) =
+            captured_request(deadline, &capture_path, |value| value["type"] == "user").await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery request capture",
+                error,
+            )
+            .await;
+        }
 
         let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
         let was_pending = premature.is_err();
@@ -11136,11 +11221,18 @@ done
         std::fs::write(&acknowledgement_gate, b"release").expect("release acknowledgement");
         let outcome = match premature {
             Ok(outcome) => outcome.expect("delivery task should join"),
-            Err(_) => deadline
-                .observe(delivery)
-                .await
-                .expect("replayed user message should acknowledge before the fixture deadline")
-                .expect("delivery task should join"),
+            Err(_) => match deadline.observe(&mut delivery).await {
+                Ok(outcome) => outcome.expect("delivery task should join"),
+                Err(error) => {
+                    fixture_deadline_failure_with_owner(
+                        driver.as_ref(),
+                        delivery,
+                        "Claude replay acknowledgement",
+                        error,
+                    )
+                    .await
+                }
+            },
         };
         driver.shutdown().await.expect("Claude fixture shutdown");
 
@@ -11170,7 +11262,7 @@ done
         driver.start().await.expect("Claude fixture should start");
         let deadline = ProviderFixtureDeadline::integration();
         let delivery_driver = driver.clone();
-        let delivery = tokio::spawn(async move {
+        let mut delivery = tokio::spawn(async move {
             delivery_driver
                 .deliver(
                     "hello".to_owned(),
@@ -11180,12 +11272,29 @@ done
                 )
                 .await
         });
-        captured_request(deadline, &capture_path, |value| value["type"] == "user").await;
-        let outcome = deadline
-            .observe(delivery)
-            .await
-            .expect("provider disconnect should resolve before the fixture deadline")
-            .expect("delivery task should join");
+        if let Err(error) =
+            captured_request(deadline, &capture_path, |value| value["type"] == "user").await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery request capture",
+                error,
+            )
+            .await;
+        }
+        let outcome = match deadline.observe(&mut delivery).await {
+            Ok(outcome) => outcome.expect("delivery task should join"),
+            Err(error) => {
+                fixture_deadline_failure_with_owner(
+                    driver.as_ref(),
+                    delivery,
+                    "Claude delivery disconnect outcome",
+                    error,
+                )
+                .await
+            }
+        };
         driver.shutdown().await.expect("Claude fixture shutdown");
 
         assert!(matches!(
@@ -11211,7 +11320,7 @@ done
         driver.start().await.expect("Claude fixture should start");
         let deadline = ProviderFixtureDeadline::integration();
 
-        let outcome = deadline
+        let outcome = match deadline
             .observe(driver.deliver(
                 "measure context".to_owned(),
                 Vec::new(),
@@ -11219,32 +11328,48 @@ done
                 "unused-no-id-key".to_owned(),
             ))
             .await
-            .expect("Claude delivery should resolve before the fixture deadline");
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "Claude delivery outcome", error)
+                    .await
+            }
+        };
         assert!(matches!(
             outcome,
             super::ProviderDeliveryOutcome::Accepted { .. }
         ));
 
-        let stream_usage = deadline
-            .observe(driver.next_event())
-            .await
-            .expect("stream usage should arrive before the fixture deadline")
-            .expect("stream usage event");
-        let authoritative_usage = deadline
-            .observe(driver.next_event())
-            .await
-            .expect("authoritative usage should arrive before the fixture deadline")
-            .expect("authoritative usage event");
-        let mcp_status = deadline
-            .observe(driver.next_event())
-            .await
-            .expect("MCP status should arrive before the fixture deadline")
-            .expect("MCP status event");
-        let completion = deadline
-            .observe(driver.next_event())
-            .await
-            .expect("completion should arrive before the fixture deadline")
-            .expect("completion event");
+        let stream_usage = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("stream usage event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "stream usage event", error)
+                    .await
+            }
+        };
+        let authoritative_usage = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("authoritative usage event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "authoritative usage event",
+                    error,
+                )
+                .await
+            }
+        };
+        let mcp_status = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("MCP status event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "MCP status event", error).await
+            }
+        };
+        let completion = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("completion event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "completion event", error).await
+            }
+        };
 
         assert_eq!(stream_usage.event_type, "thread.token-usage.updated");
         assert_eq!(stream_usage.payload["usage"]["usedTokens"], 1_550);
@@ -11256,10 +11381,21 @@ done
         assert_eq!(completion.event_type, "turn.completed");
         assert_eq!(completion.payload["state"], "completed");
 
-        let query = captured_request(deadline, &capture_path, |value| {
+        let query = match captured_request(deadline, &capture_path, |value| {
             value["request"]["subtype"] == "get_context_usage"
         })
-        .await;
+        .await
+        {
+            Ok(query) => query,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Claude context-usage capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             query,
             json!({
@@ -11268,10 +11404,21 @@ done
                 "request": { "subtype": "get_context_usage" }
             })
         );
-        let mcp_query = captured_request(deadline, &capture_path, |value| {
+        let mcp_query = match captured_request(deadline, &capture_path, |value| {
             value["request"]["subtype"] == "mcp_status"
         })
-        .await;
+        .await
+        {
+            Ok(query) => query,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Claude MCP-status capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             mcp_query,
             json!({
@@ -12227,21 +12374,37 @@ done
                 )
                 .await
         });
-        captured_request(deadline, &capture_path, |value| {
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
             value["method"] == "session/prompt"
         })
-        .await;
+        .await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
 
         let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
         let was_pending = premature.is_err();
         std::fs::write(&acknowledgement_gate, b"release").expect("release response");
         let outcome = match premature {
             Ok(outcome) => outcome.expect("delivery task should join"),
-            Err(_) => deadline
-                .observe(delivery)
-                .await
-                .expect("prompt response should acknowledge before the fixture deadline")
-                .expect("delivery task should join"),
+            Err(_) => match deadline.observe(&mut delivery).await {
+                Ok(outcome) => outcome.expect("delivery task should join"),
+                Err(error) => {
+                    fixture_deadline_failure_with_owner(
+                        driver.as_ref(),
+                        delivery,
+                        "Cursor session/prompt acknowledgement",
+                        error,
+                    )
+                    .await
+                }
+            },
         };
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
@@ -12262,7 +12425,7 @@ done
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, true, false).await;
         driver.start().await.expect("Cursor fixture should start");
         let deadline = ProviderFixtureDeadline::integration();
-        let outcome = deadline
+        let outcome = match deadline
             .observe(driver.deliver(
                 "hello".to_owned(),
                 Vec::new(),
@@ -12270,11 +12433,29 @@ done
                 "unused-no-id-key".to_owned(),
             ))
             .await
-            .expect("provider disconnect should resolve before the fixture deadline");
-        captured_request(deadline, &capture_path, |value| {
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Cursor delivery disconnect outcome",
+                    error,
+                )
+                .await
+            }
+        };
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
             value["method"] == "session/prompt"
         })
-        .await;
+        .await
+        {
+            provider_fixture_deadline_failure(
+                driver.as_ref(),
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
         assert!(matches!(
@@ -12299,10 +12480,18 @@ done
                 "unused-no-id-key".to_owned(),
             )
             .await;
-        captured_request(deadline, &capture_path, |value| {
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
             value["method"] == "session/prompt"
         })
-        .await;
+        .await
+        {
+            provider_fixture_deadline_failure(
+                driver.as_ref(),
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
         assert!(matches!(
@@ -12588,11 +12777,39 @@ done
         }
     }
 
+    async fn provider_fixture_deadline_failure<D>(
+        driver: &D,
+        stage: &str,
+        elapsed: tokio::time::error::Elapsed,
+    ) -> !
+    where
+        D: ProviderDriver + ?Sized,
+    {
+        let shutdown = driver.shutdown().await;
+        panic!(
+            "{stage} exceeded the fixture deadline after driver shutdown: {shutdown:?}; {elapsed}"
+        );
+    }
+
+    async fn fixture_deadline_failure_with_owner<T, D>(
+        driver: &D,
+        owner: tokio::task::JoinHandle<T>,
+        stage: &str,
+        elapsed: tokio::time::error::Elapsed,
+    ) -> !
+    where
+        D: ProviderDriver + ?Sized,
+    {
+        owner.abort();
+        let _ = owner.await;
+        provider_fixture_deadline_failure(driver, stage, elapsed).await
+    }
+
     async fn captured_request(
         deadline: ProviderFixtureDeadline,
         path: &std::path::Path,
         predicate: impl Fn(&Value) -> bool,
-    ) -> Value {
+    ) -> Result<Value, tokio::time::error::Elapsed> {
         deadline
             .observe(async {
                 loop {
@@ -12608,7 +12825,6 @@ done
                 }
             })
             .await
-            .expect("provider request capture deadline")
     }
 
     async fn prepared_attachment_pair(factory: &super::NativeProviderDriverFactory) -> Vec<Value> {
@@ -15504,10 +15720,21 @@ done
                 .expect("Claude turn should send")
                 .is_some()
         );
-        let claude_user = captured_request(deadline, &capture_path, |request| {
+        let claude_user = match captured_request(deadline, &capture_path, |request| {
             request["type"] == "user" && request["session_id"] == "claude-session"
         })
-        .await;
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    &claude,
+                    "native Claude user-message capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             claude_user["message"],
             json!({
@@ -15555,12 +15782,14 @@ done
         assert!(claude.set_model("other".to_owned()).await.is_err());
         assert!(claude.rollback(1).await.is_err());
         assert_eq!(
-            deadline
-                .observe(claude.next_event())
-                .await
-                .expect("Claude stderr event should arrive before the fixture deadline")
-                .expect("Claude stderr event")
-                .event_type,
+            match deadline.observe(claude.next_event()).await {
+                Ok(event) => event.expect("Claude stderr event"),
+                Err(error) => {
+                    provider_fixture_deadline_failure(&claude, "native Claude stderr event", error)
+                        .await
+                }
+            }
+            .event_type,
             "session.stderr",
         );
         claude.shutdown().await.expect("Claude should shut down");
@@ -15662,13 +15891,19 @@ done
             Some(json!({"threadId":"native-codex-thread"})),
         );
         assert!(
-            !deadline
-                .observe(codex.next_event())
-                .await
-                .expect("Codex startup event should arrive before the fixture deadline")
-                .expect("Codex startup event")
-                .event_type
-                .is_empty()
+            !match deadline.observe(codex.next_event()).await {
+                Ok(event) => event.expect("Codex startup event"),
+                Err(error) => {
+                    provider_fixture_deadline_failure(
+                        codex.as_ref(),
+                        "native Codex startup event",
+                        error,
+                    )
+                    .await
+                }
+            }
+            .event_type
+            .is_empty()
         );
         codex
             .set_interaction_mode("plan".to_owned())
@@ -15685,10 +15920,21 @@ done
                 .expect("Codex turn should send")
                 .is_some()
         );
-        let codex_turn = captured_request(deadline, &capture_path, |request| {
+        let codex_turn = match captured_request(deadline, &capture_path, |request| {
             request["method"] == "turn/start"
         })
-        .await;
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex turn/start capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             codex_turn["params"]["input"],
             json!([
@@ -15752,13 +15998,19 @@ done
                     .is_some()
             );
             assert!(
-                !deadline
-                    .observe(driver.next_event())
-                    .await
-                    .expect("ACP startup event should arrive before the fixture deadline")
-                    .expect("ACP startup event")
-                    .event_type
-                    .is_empty()
+                !match deadline.observe(driver.next_event()).await {
+                    Ok(event) => event.expect("ACP startup event"),
+                    Err(error) => {
+                        provider_fixture_deadline_failure(
+                            driver.as_ref(),
+                            "native ACP startup event",
+                            error,
+                        )
+                        .await
+                    }
+                }
+                .event_type
+                .is_empty()
             );
             let turn = driver
                 .send(
@@ -15774,11 +16026,22 @@ done
             } else {
                 "grok-session"
             };
-            let prompt = captured_request(deadline, &capture_path, |request| {
+            let prompt = match captured_request(deadline, &capture_path, |request| {
                 request["method"] == "session/prompt"
                     && request["params"]["sessionId"] == session_id
             })
-            .await;
+            .await
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    provider_fixture_deadline_failure(
+                        driver.as_ref(),
+                        "native ACP session/prompt capture",
+                        error,
+                    )
+                    .await
+                }
+            };
             assert_eq!(
                 prompt["params"]["prompt"],
                 json!([
