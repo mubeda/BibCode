@@ -5558,9 +5558,10 @@ exit /b 9
     #[tokio::test]
     async fn termination_waits_for_in_process_backend_cleanup_before_exit() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let (handle, config) = start_test_server(temp.path()).await;
+        let (handle, _config) = start_test_server(temp.path()).await;
         let backend = BackendSupervisor::new();
         let runtime = ManagedBackendRuntime::new(42, handle);
+        let runtime_probe = runtime.clone();
         {
             let mut state = backend
                 .state
@@ -5613,10 +5614,12 @@ exit /b 9
                 .is_empty(),
             "backend state must be drained before exit"
         );
-        let address = format!("{}:{}", config.local_host, config.port);
         assert!(
-            tokio::net::TcpStream::connect(address).await.is_err(),
-            "in-process server must stop before exit is requested"
+            matches!(
+                runtime_probe.join_result.lock().await.as_ref(),
+                Some(Ok(()))
+            ),
+            "in-process server must join before exit is requested"
         );
     }
 

@@ -6896,6 +6896,7 @@ mod tests {
             std::os::unix::fs::symlink(&physical, &alias).expect("worktree alias");
             #[cfg(windows)]
             junction::create(&physical, &alias).expect("worktree junction alias");
+            #[cfg(windows)]
             let alias_path = alias.clone();
             let physical = physical.to_string_lossy().into_owned();
             let alias = alias.to_string_lossy().into_owned();
