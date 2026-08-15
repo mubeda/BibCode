@@ -191,30 +191,40 @@ describe.each([
       expect(NodeFS.statSync(NodePath.dirname(expectedPowerShellModuleCache)).isDirectory()).toBe(
         true,
       );
-
-      const editorShimPath = NodePath.join(context.shimDirectory, "cursor.cmd");
-      const editorTarget = String.raw`C:\fixture\userdata\logs`;
-      const editorLaunch = NodeChildProcess.spawnSync(
-        process.env.ComSpec ?? String.raw`C:\Windows\System32\cmd.exe`,
-        ["/d", "/c", `${editorShimPath} ${editorTarget}`],
-        {
-          env: { ...process.env, ...environment },
-          encoding: "utf8",
-          shell: false,
-        },
-      );
-      expect(editorLaunch.error).toBeUndefined();
-      expect(editorLaunch.status, editorLaunch.stderr).toBe(0);
-      expect(JSON.parse(NodeFS.readFileSync(context.nativeActionLogPath, "utf8").trim())).toEqual({
-        action: "openInEditor",
-        args: [editorTarget],
-      });
     } else {
       expect(environment.HOME).toBe(expectedFixtureUserHome);
       expect(environment.USERPROFILE).toBe(String.raw`C:\Users\host-must-not-be-used`);
     }
   });
 });
+
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- This contract must execute only on the native Windows host.
+it.runIf(process.platform === "win32")(
+  "executes the Cursor action shim through the native Windows command processor",
+  () => {
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "win" };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const editorShimPath = NodePath.join(context.shimDirectory, "cursor.cmd");
+    const editorTarget = String.raw`C:\fixture\userdata\logs`;
+    const editorLaunch = NodeChildProcess.spawnSync(
+      process.env.ComSpec ?? "cmd.exe",
+      ["/d", "/c", `${editorShimPath} ${editorTarget}`],
+      {
+        env: { ...process.env, ...environment },
+        encoding: "utf8",
+        shell: false,
+      },
+    );
+
+    expect(editorLaunch.error).toBeUndefined();
+    expect(editorLaunch.status, editorLaunch.stderr).toBe(0);
+    expect(JSON.parse(NodeFS.readFileSync(context.nativeActionLogPath, "utf8").trim())).toEqual({
+      action: "openInEditor",
+      args: [editorTarget],
+    });
+  },
+);
 
 describe.each(["mac", "linux"])("prepareDesktopUiTestContext on %s", (platform) => {
   it("keeps the canonical Codex helper socket below the Unix path limit", () => {
