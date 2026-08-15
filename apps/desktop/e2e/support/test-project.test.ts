@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - Desktop UI fixture tests inspect host temp files.
 // @effect-diagnostics globalTimers:off - Native fixture protocol tests use bounded child-process watchdogs.
+// @effect-diagnostics globalDate:off - Native fixture timestamp assertions bracket a real child process outside an Effect runtime.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -120,7 +121,10 @@ describe.each([
   it("isolates provider user inventory inside the disposable run root", () => {
     const environment: NodeJS.ProcessEnv = {
       BIBCODE_E2E_PLATFORM: platform,
+      APPDATA: String.raw`C:\Users\host-must-not-be-used\AppData\Roaming`,
       HOME: "/host/home-must-not-be-used",
+      LOCALAPPDATA: String.raw`C:\Users\host-must-not-be-used\AppData\Local`,
+      PSModuleAnalysisCachePath: String.raw`C:\Users\host-must-not-be-used\ModuleAnalysisCache`,
       USERPROFILE: String.raw`C:\Users\host-must-not-be-used`,
     };
     const context = prepareDesktopUiTestContext(environment);
@@ -167,8 +171,44 @@ describe.each([
       ],
     });
     if (platform === "win") {
+      const expectedAppData = NodePath.join(context.runRoot, "fixture-appdata", "Roaming");
+      const expectedLocalAppData = NodePath.join(context.runRoot, "fixture-appdata", "Local");
+      const expectedPowerShellModuleCache = NodePath.join(
+        expectedLocalAppData,
+        "Microsoft",
+        "Windows",
+        "PowerShell",
+        "ModuleAnalysisCache",
+      );
+
       expect(environment.USERPROFILE).toBe(expectedFixtureUserHome);
       expect(environment.HOME).toBe(expectedFixtureUserHome);
+      expect(environment.APPDATA).toBe(expectedAppData);
+      expect(environment.LOCALAPPDATA).toBe(expectedLocalAppData);
+      expect(environment.PSModuleAnalysisCachePath).toBe(expectedPowerShellModuleCache);
+      expect(NodeFS.statSync(expectedAppData).isDirectory()).toBe(true);
+      expect(NodeFS.statSync(expectedLocalAppData).isDirectory()).toBe(true);
+      expect(NodeFS.statSync(NodePath.dirname(expectedPowerShellModuleCache)).isDirectory()).toBe(
+        true,
+      );
+
+      const editorShimPath = NodePath.join(context.shimDirectory, "cursor.cmd");
+      const editorTarget = String.raw`C:\fixture\userdata\logs`;
+      const editorLaunch = NodeChildProcess.spawnSync(
+        process.env.ComSpec ?? String.raw`C:\Windows\System32\cmd.exe`,
+        ["/d", "/c", `${editorShimPath} ${editorTarget}`],
+        {
+          env: { ...process.env, ...environment },
+          encoding: "utf8",
+          shell: false,
+        },
+      );
+      expect(editorLaunch.error).toBeUndefined();
+      expect(editorLaunch.status, editorLaunch.stderr).toBe(0);
+      expect(JSON.parse(NodeFS.readFileSync(context.nativeActionLogPath, "utf8").trim())).toEqual({
+        action: "openInEditor",
+        args: [editorTarget],
+      });
     } else {
       expect(environment.HOME).toBe(expectedFixtureUserHome);
       expect(environment.USERPROFILE).toBe(String.raw`C:\Users\host-must-not-be-used`);
@@ -202,11 +242,15 @@ describe("packaged provider composer fixture", () => {
     };
     const context = prepareDesktopUiTestContext(environment);
     contexts.push(context);
-    const executable = NodePath.join(context.shimDirectory, "claude");
-    const child = NodeChildProcess.spawn(executable, ["--print", "--replay-user-messages"], {
-      env: { ...process.env, ...environment },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const executable = NodePath.join(context.shimDirectory, "claude-fixture.mjs");
+    const child = NodeChildProcess.spawn(
+      process.execPath,
+      [executable, "--print", "--replay-user-messages"],
+      {
+        env: { ...process.env, ...environment },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
     const lines = NodeReadline.createInterface({ input: child.stdout });
     const messages: Array<Record<string, unknown>> = [];
     const completed = new Promise<void>((resolve, reject) => {
@@ -431,7 +475,9 @@ describe("packaged provider composer fixture", () => {
   });
 
   it("builds the canonical project, thread, and provider-session command sequence", () => {
-    expect(desktopActivitySessionCommands("/fixture/project")).toEqual([
+    expect(
+      desktopActivitySessionCommands("/fixture/project", Date.parse("2026-07-29T18:00:02.000Z")),
+    ).toEqual([
       {
         type: "project.create",
         commandId: "bibcode-ui-activity-project-create",
@@ -483,6 +529,44 @@ describe("packaged provider composer fixture", () => {
       },
     ]);
     expect(desktopActivityFixture.thread.id).toBe("bibcode-ui-activity-thread");
+  });
+
+  it("uses observation-time timestamps for a newly materialized activity fixture", async () => {
+    const environment: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      BIBCODE_E2E_PLATFORM: "mac",
+    };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const executable = NodePath.join(context.shimDirectory, "codex-fixture.mjs");
+    const fixture = startCodexFixture(executable, environment);
+    const earliestEpochSeconds = Math.floor(Date.now() / 1_000) - 1;
+
+    try {
+      await fixture.request("turn/start", {
+        input: [{ type: "text", text: "load deterministic activity" }],
+      });
+      const active = (await fixture.request("thread/list")) as {
+        readonly data: ReadonlyArray<{ readonly createdAt: number; readonly updatedAt: number }>;
+      };
+      const latestEpochSeconds = Math.floor(Date.now() / 1_000) + 1;
+      expect(active.data).toHaveLength(1);
+      expect(active.data[0]!.createdAt).toBeGreaterThanOrEqual(earliestEpochSeconds);
+      expect(active.data[0]!.createdAt).toBeLessThanOrEqual(latestEpochSeconds);
+      expect(active.data[0]!.updatedAt).toBeGreaterThanOrEqual(active.data[0]!.createdAt);
+      expect(active.data[0]!.updatedAt).toBeLessThanOrEqual(latestEpochSeconds + 1);
+    } finally {
+      await fixture.close();
+    }
+
+    const earliestCommandTime = Date.now() - 2_001;
+    const commands = desktopActivitySessionCommands("/fixture/project");
+    const latestCommandTime = Date.now() + 2_001;
+    for (const command of commands) {
+      const createdAt = Date.parse(command.createdAt);
+      expect(createdAt).toBeGreaterThanOrEqual(earliestCommandTime);
+      expect(createdAt).toBeLessThanOrEqual(latestCommandTime);
+    }
   });
 
   it("exports the real normalized inline capability profiles", () => {
@@ -555,6 +639,9 @@ describe("packaged provider composer fixture", () => {
     }
     expect(NodePath.isAbsolute(context.providerInputLogPath)).toBe(true);
     expect(environment.BIBCODE_E2E_PROVIDER_INPUT_LOG).toBe(context.providerInputLogPath);
+    expect(NodePath.isAbsolute(context.nativeActionLogPath)).toBe(true);
+    expect(environment.BIBCODE_E2E_NATIVE_ACTION_LOG).toBe(context.nativeActionLogPath);
+    expect(NodeFS.readFileSync(context.nativeActionLogPath, "utf8")).toBe("");
   });
 
   it("generates native protocol fixtures while keeping hidden and prose-only agents inline-inert", () => {
@@ -599,6 +686,7 @@ describe("archiveAndCleanupDesktopUiTestContext", () => {
       shimDirectory: NodePath.join(runRoot, "shims"),
       artifactDirectory,
       fixtureUserHomePath: NodePath.join(runRoot, "fixture-user-home"),
+      nativeActionLogPath: NodePath.join(artifactDirectory, "native-actions.jsonl"),
       providerInputLogPath: NodePath.join(runRoot, "provider-input.jsonl"),
     };
     let removalOptions: Parameters<DesktopUiDirectoryRemover>[1] | undefined;

@@ -50,6 +50,14 @@ export const coverageProbeEntrypoints = [
   "packages/client-runtime/vite.config.runtime.ts",
 ] as const;
 
+const testExclude = [
+  "**/.repos/**",
+  "**/.worktrees/**",
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/.{idea,git,cache,output,temp}/**",
+] as const;
+
 export default defineConfig({
   resolve: {
     alias: {
@@ -58,12 +66,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    exclude: [
-      "**/.repos/**",
-      "**/node_modules/**",
-      "**/dist/**",
-      "**/.{idea,git,cache,output,temp}/**",
-    ],
+    exclude: testExclude,
     coverage: {
       provider: "v8",
       include: coverageInclude,

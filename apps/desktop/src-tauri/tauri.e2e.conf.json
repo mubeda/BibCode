@@ -8,7 +8,12 @@
           "identifier": "desktop-e2e",
           "description": "Test-only packaged desktop automation capability.",
           "webviews": ["main"],
-          "permissions": ["allow-desktop-bridge", "core:default", "wdio:default"]
+          "permissions": [
+            "allow-desktop-bridge",
+            "core:default",
+            "wdio:default",
+            "allow-desktop-e2e-lifecycle"
+          ]
         }
       ]
     }
