@@ -37,32 +37,32 @@ Delete the unused result values above. Do not leave an ambiguous status.
 ## Focused validation
 
 | Command | Result/exit code | Duration | Evidence and warnings |
-| --- | --- | --- | --- |
-|  |  |  |  |
+| ------- | ---------------- | -------- | --------------------- |
+|         |                  |          |                       |
 
 ## Workspace and static gates
 
-| Command | Result/exit code | Duration | Test totals or warning summary |
-| --- | --- | --- | --- |
-| `vp run test` |  |  |  |
-| `cargo test --workspace -j 2` or documented native equivalent |  |  |  |
-| `vp check` |  |  |  |
-| `vp run typecheck` |  |  |  |
-| `cargo fmt --all --check` |  |  |  |
-| Relevant Clippy with `-D warnings` |  |  |  |
-| `git diff --check` |  |  |  |
+| Command                                                       | Result/exit code | Duration | Test totals or warning summary |
+| ------------------------------------------------------------- | ---------------- | -------- | ------------------------------ |
+| `vp run test`                                                 |                  |          |                                |
+| `cargo test --workspace -j 2` or documented native equivalent |                  |          |                                |
+| `vp check`                                                    |                  |          |                                |
+| `vp run typecheck`                                            |                  |          |                                |
+| `cargo fmt --all --check`                                     |                  |          |                                |
+| Relevant Clippy with `-D warnings`                            |                  |          |                                |
+| `git diff --check`                                            |                  |          |                                |
 
 ## Native package artifacts
 
 | Artifact | Absolute path | Version/architecture | Identity/trust verification |
-| --- | --- | --- | --- |
-|  |  |  |  |
+| -------- | ------------- | -------------------- | --------------------------- |
+|          |               |                      |                             |
 
 ## Packaged UI and visual evidence
 
 | Scenario | Screenshot absolute path | State | Pixel-review finding |
-| --- | --- | --- | --- |
-|  |  |  |  |
+| -------- | ------------------------ | ----- | -------------------- |
+|          |                          |       |                      |
 
 - Exact executable launched:
 - Exact PID/start identity:
@@ -111,8 +111,8 @@ Repeat the subsection for every non-native supported platform.
 ## Commands not run
 
 | Command or scenario | Reason | Required follow-up owner |
-| --- | --- | --- |
-|  |  |  |
+| ------------------- | ------ | ------------------------ |
+|                     |        |                          |
 
 ## Residual risks
 
