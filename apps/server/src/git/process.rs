@@ -271,7 +271,7 @@ mod tests {
             let script = sandbox.executable_script(
                 "print-label",
                 "printf '%s' \"$FIXTURE_LABEL\"",
-                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%",
+                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%\r\nexit /b 0",
             );
             let mut request = fixture_request(&sandbox, "fixture-label", script);
             request.env = sandbox

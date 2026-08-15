@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     git::{OutputPolicy, ProcessRequest, ProcessRunner},
     process::{
-        configure_supervised_background_command_wrap,
+        Platform, configure_supervised_background_command_wrap,
         supervised::{log_cleanup_failures, terminate_and_wait},
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
@@ -1349,13 +1349,14 @@ async fn probe_local_opencode(
     custom_models: &[String],
     environment: &[(OsString, OsString)],
 ) -> Option<opencode::OpenCodeInventorySnapshot> {
+    let executable = opencode::resolve_owned_executable(Platform::current(), executable);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let port = listener.local_addr().ok()?.port();
     drop(listener);
     let endpoint = format!("http://127.0.0.1:{port}");
     let port_argument = format!("--port={port}");
     let launch = prepare_provider_launch(
-        executable,
+        &executable,
         ["serve", "--hostname=127.0.0.1", port_argument.as_str()],
     )
     .ok()?;
@@ -1603,6 +1604,7 @@ fn is_builtin_driver(driver: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use crate::test_support::TestSandbox;
     use axum::{Json, Router, routing::get};
 

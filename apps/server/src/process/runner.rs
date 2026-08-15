@@ -348,11 +348,8 @@ fn resolve_command(input: &ProcessRunInput) -> ResolvedCommand {
 mod tests {
     use super::*;
     use crate::test_support::TestSandbox;
-    use tokio::{io::AsyncReadExt, net::TcpListener};
 
-    const CANCELLATION_FIXTURE_READY_ADDRESS: &str = "BIBCODE_RUNNER_FIXTURE_READY_ADDRESS";
-    const CANCELLATION_FIXTURE_TEST: &str =
-        "process::runner::tests::runner_cancellation_fixture_child_emits_readiness";
+    const CANCELLATION_FIXTURE_READY_FILE: &str = "BIBCODE_RUNNER_FIXTURE_READY_FILE";
     const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -362,7 +359,7 @@ mod tests {
             let script = sandbox.executable_script(
                 "print-label",
                 "printf '%s' \"$FIXTURE_LABEL\"",
-                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%",
+                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%\r\nexit /b 0",
             );
             let mut input = sandbox.process_input(script, Vec::<String>::new());
             input.env = Some(sandbox.environment([("FIXTURE_LABEL", label)]));
@@ -384,7 +381,7 @@ mod tests {
             let script = sandbox.executable_script(
                 "print-output",
                 "printf 1234567",
-                "@echo off\r\n<nul set /p =1234567",
+                "@echo off\r\n<nul set /p =1234567\r\nexit /b 0",
             );
             ProcessRunner
                 .run(
@@ -408,33 +405,32 @@ mod tests {
     async fn runner_cancels_parallel_fixture_children_after_spawn() {
         async fn run(label: &str) -> ProcessError {
             let sandbox = TestSandbox::new(label);
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind fixture readiness listener");
-            let address = listener
-                .local_addr()
-                .expect("fixture readiness listener address");
+            let ready_file = sandbox.path("ready");
+            let script = sandbox.executable_script(
+                "cancellation-child",
+                "printf R > \"$BIBCODE_RUNNER_FIXTURE_READY_FILE\"\nwhile :; do sleep 1; done",
+                "@echo off\r\n>\"%BIBCODE_RUNNER_FIXTURE_READY_FILE%\" <nul set /p =R\r\n:wait\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait",
+            );
             let cancellation = CancellationToken::new();
-            let mut input = sandbox.process_input(
-                std::env::current_exe().expect("current test executable"),
-                ["--exact", CANCELLATION_FIXTURE_TEST, "--nocapture"],
-            );
-            input.env = Some(
-                sandbox.environment([(CANCELLATION_FIXTURE_READY_ADDRESS, address.to_string())]),
-            );
+            let mut input = sandbox.process_input(script, Vec::<String>::new());
+            input.env = Some(sandbox.environment([(
+                CANCELLATION_FIXTURE_READY_FILE,
+                ready_file.to_string_lossy().into_owned(),
+            )]));
             let running =
                 tokio::spawn(ProcessRunner.run_with_cancellation(input, cancellation.clone()));
 
             let readiness = tokio::time::timeout(FIXTURE_READY_TIMEOUT, async {
-                let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
-                let mut ready = [0_u8; 1];
-                stream
-                    .read_exact(&mut ready)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                (ready == *b"R")
-                    .then_some(())
-                    .ok_or_else(|| "unexpected fixture readiness payload".to_owned())
+                loop {
+                    match tokio::fs::read(&ready_file).await {
+                        Ok(ready) if ready == b"R" => return Ok(()),
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
             })
             .await;
             if !matches!(readiness, Ok(Ok(()))) {
@@ -455,18 +451,6 @@ mod tests {
         let (left, right) = tokio::join!(run("cancel-left"), run("cancel-right"));
         assert!(left.is_cancelled());
         assert!(right.is_cancelled());
-    }
-
-    #[test]
-    fn runner_cancellation_fixture_child_emits_readiness() {
-        let Ok(address) = std::env::var(CANCELLATION_FIXTURE_READY_ADDRESS) else {
-            return;
-        };
-        let mut stream = std::net::TcpStream::connect(address)
-            .expect("fixture child should connect its readiness handshake");
-        std::io::Write::write_all(&mut stream, b"R")
-            .expect("fixture child should emit its readiness handshake");
-        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

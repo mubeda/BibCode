@@ -1,15 +1,15 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{fs, path::Path, process::Command, time::Duration};
 
+#[cfg(unix)]
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use bibcode_server::persistence::Repositories;
 use bibcode_server::{
     RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     git::GitRepository,
     orchestration::{EngineOptions, OrchestrationEngine},
-    persistence::{Database, Repositories, run_migrations},
+    persistence::{Database, run_migrations},
     production::{
         orchestration_rpc::register_orchestration_rpc,
         worktree_catalog_rpc::{
@@ -989,6 +989,7 @@ fn git(cwd: &Path, args: &[&str], path: Option<&Path>) {
     );
 }
 
+#[cfg(unix)]
 fn git_output(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -999,6 +1000,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("Git UTF-8")
 }
 
+#[cfg(unix)]
 fn canonical(path: &Path) -> String {
     fs::canonicalize(path)
         .expect("canonical fixture path")
@@ -1040,6 +1042,7 @@ async fn next(socket: &mut TestSocket) -> ServerMessage {
     serde_json::from_str(&text).expect("valid server message")
 }
 
+#[cfg(unix)]
 async fn chunk(socket: &mut TestSocket, request_id: &str) -> Value {
     loop {
         match next(socket).await {
@@ -1068,6 +1071,7 @@ async fn success(socket: &mut TestSocket, request_id: &str) -> Value {
     }
 }
 
+#[cfg(unix)]
 async fn failure_tag(socket: &mut TestSocket, request_id: &str, tag: &str) {
     loop {
         match next(socket).await {

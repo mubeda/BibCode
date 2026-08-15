@@ -726,10 +726,17 @@ describe("ActivityDock", () => {
     observer.disconnect();
   });
 
-  it("uses the compact prop for icon/count rows at a 700px viewport without a viewport listener", async () => {
+  it("keeps expanded labels and elapsed metadata readable when the collapsed dock is compact", async () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 700 });
     const addEventListener = vi.spyOn(window, "addEventListener");
-    const compactProps = props({ compact: true, expanded: true });
+    const compactProps = props({
+      compact: true,
+      expanded: true,
+      snapshot: snapshot({
+        actors: [actor("actor-1")],
+        workItems: [workItem("work-1")],
+      }),
+    });
     const container = await mount(<ActivityDock {...compactProps} />);
     const sectionButtons = Array.from(
       container.querySelectorAll<HTMLButtonElement>("button[data-activity-section]"),
@@ -739,18 +746,19 @@ describe("ActivityDock", () => {
     expect(sectionButtons.every((button) => button.className.includes("min-h-9"))).toBe(true);
     expect(sectionButtons.every((button) => button.className.includes("sm:min-h-8"))).toBe(true);
     expect(sectionButtons.every((button) => !button.className.includes("sm:h-7"))).toBe(true);
-    expect(sectionButtons[0]?.textContent).not.toContain("Subagents");
-    expect(sectionButtons[0]?.textContent).not.toContain("Active");
-    expect(sectionButtons[0]?.textContent).not.toContain("Done");
-    expect(sectionButtons[0]?.querySelectorAll("[data-activity-count]")).toHaveLength(2);
-    expect(sectionButtons[1]?.textContent).not.toContain("Background tasks");
-    expect(container.querySelectorAll("[data-activity-section-metadata]")).toHaveLength(0);
-    expect(addEventListener.mock.calls.some(([type]) => type === "resize")).toBe(false);
-
-    await rerender(container, <ActivityDock {...compactProps} compact={false} />);
     expect(
-      container.querySelector('button[data-activity-section="subagents"]')?.textContent,
-    ).toContain("Subagents");
+      container.querySelector('button[aria-label^="Collapse activity summary"]')?.textContent,
+    ).toContain("Activity");
+    expect(sectionButtons[0]?.textContent).toContain("Subagents");
+    expect(sectionButtons[0]?.textContent).toContain("Active 2");
+    expect(sectionButtons[0]?.textContent).toContain("Done 1");
+    expect(sectionButtons[0]?.textContent).toContain("10m");
+    expect(sectionButtons[1]?.textContent).toContain("Background tasks");
+    expect(sectionButtons[1]?.textContent).toContain("Active 1");
+    expect(sectionButtons[1]?.textContent).toContain("Done 1");
+    expect(sectionButtons[1]?.textContent).toContain("5m");
+    expect(container.querySelectorAll("[data-activity-section-metadata]")).toHaveLength(2);
+    expect(addEventListener.mock.calls.some(([type]) => type === "resize")).toBe(false);
 
     const collapsed = await mount(<ActivityDock {...props({ compact: true, expanded: false })} />);
     const toggle = collapsed.querySelector<HTMLButtonElement>(

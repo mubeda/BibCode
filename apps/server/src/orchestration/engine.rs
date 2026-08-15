@@ -3151,7 +3151,7 @@ async fn canonicalize_command_worktree_path(
     command_id: &str,
     path: &mut String,
 ) -> Result<(), OrchestrationError> {
-    *path = canonical_worktree_path_key(Path::new(path))
+    let _identity_key = canonical_worktree_path_key(Path::new(path))
         .await
         .map_err(|error| OrchestrationError::WorkspaceOwnershipIdentity {
             command_id: command_id.to_owned(),
@@ -9374,10 +9374,7 @@ mod tests {
             .await
             .expect("second retarget joins")
             .expect("second retarget");
-        let expected_final_path = std::fs::canonicalize(&final_path)
-            .expect("canonical final owner path")
-            .to_string_lossy()
-            .into_owned();
+        let expected_final_path = final_path.to_string_lossy().into_owned();
         assert_eq!(
             engine
                 .repositories()

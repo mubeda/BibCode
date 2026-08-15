@@ -18,6 +18,7 @@ pub(crate) use repository::{BoxGitProcessFuture, GitProcessRunner};
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitRepository, WorktreeBaseDirectoryProvider,
 };
+pub(crate) use worktree::uses_foreign_posix_identity;
 pub use worktree::{
     HostPathPlatform, WorktreeIdentityError, WorktreeKey, WorktreeParseError,
     WorktreeRepositoryKey, canonical_worktree_path_key, git_worktree_prune_impact_digest,

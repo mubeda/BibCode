@@ -2048,6 +2048,8 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
             let child = command
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
+            #[cfg(not(unix))]
+            let mut child = child;
             #[cfg(test)]
             if let Some(events) = self.fixture_events.as_ref()
                 && let Some(race) = events.admission_race.as_ref()
@@ -2341,6 +2343,8 @@ impl CodexHelperSupervisor {
             watchdog_spawn_race: fixture_watchdog_spawn_race,
         } = fixture;
         self.runtime.spawn(async move {
+            #[cfg(not(unix))]
+            let mut child = child;
             let _registration = registration;
             let _owned_task = owned_task;
             let ready_deadline = {

@@ -198,7 +198,7 @@ fn executable_name() -> &'static str {
 
 fn native_fixture() -> PathBuf {
     if cfg!(windows) {
-        PathBuf::from(std::env::var_os("COMSPEC").expect("COMSPEC"))
+        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32/curl.exe")
     } else if cfg!(target_os = "macos") {
         PathBuf::from("/usr/bin/true")
     } else {

@@ -38,11 +38,18 @@ missing suffix, so a symlinked parent, macOS `/var` alias, or lexical `.`/`..`
 spelling cannot create a second owner or bypass `Removing`. POSIX comparison
 remains case-sensitive. Windows drive and UNC comparison normalizes separators
 and uses the native invariant uppercase mapping compatible with Windows ordinal
-caseless identity, including non-ASCII and special folds such as Greek
-sigma/final sigma. Only `NotFound` may trigger nearest-existing-ancestor
-resolution. Permission, symlink-loop, and all other identity failures return a
-typed `WorkspaceIdentityError` and abort the authority-changing transition
-rather than falling back to a second lexical owner.
+caseless identity, including non-ASCII folds such as capital and small Greek
+sigma. Win32 verbatim drive and UNC prefixes normalize to their ordinary path
+forms, while foreign POSIX absolute paths retain POSIX case-sensitive identity.
+Only `NotFound` may trigger nearest-existing-ancestor resolution. Permission,
+symlink-loop, and all other identity failures return a typed
+`WorkspaceIdentityError` and abort the authority-changing transition rather
+than falling back to a second lexical owner.
+
+Physical identity keys are comparison and arbitration data; they do not replace
+the persisted display path. Adoption and ordinary thread mutations preserve the
+exact server-resolved checkout path and its separator/casing spelling for the
+workspace record and UI.
 
 The first authoritative scan through the configured primary checkout is the
 only operation that may establish the durable repository pin. Once pinned, a
@@ -118,7 +125,8 @@ command ID, and ordinary thread defaults. The handler:
 
 Adoption is read-only with respect to Git. It does not create or repair a Git
 worktree, and it does not run the project's worktree-creation script.
-Concurrent matching adoption requests converge on one canonical thread.
+Concurrent matching adoption requests converge on one canonical thread while
+the adopted workspace retains the exact path reported by the catalog.
 
 Accepted retries replay the immutable `created`, `existing`, or `restored`
 result. Modern receipts must contain consistent result metadata. The accepted
@@ -142,10 +150,13 @@ The same authority boundary covers every worktree-bearing owner mutation:
   performs Git creation, and persists the workspace owner. Its private rollback
   carries the exact path and actual branch returned by Git, including an
   automatically suffixed branch, and removes only state created by that
-  operation when owner persistence fails. It is not a public raw-path
-  primitive. Pull-request worktree creation resolves the PR first, then uses
-  this same atomic owner-creation RPC; the legacy PR preparation RPC is
-  local-checkout-only.
+  operation when owner persistence fails. Directory reservation records the
+  physical object identity, releases its handle while Git populates the
+  checkout, then reopens a deletion-fenced handle and verifies the Windows file
+  identity or POSIX device/inode before rollback. A replacement at the same
+  path is never removed. This is not a public raw-path primitive. Pull-request
+  worktree creation resolves the PR first, then uses this same atomic
+  owner-creation RPC; the legacy PR preparation RPC is local-checkout-only.
 - `worktree.createPanel` accepts a host thread and derives project, kind,
   branch, and path from that persisted host.
 - `worktree.retarget` accepts an opaque worktree key and expected generation;

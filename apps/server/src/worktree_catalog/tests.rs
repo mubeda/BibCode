@@ -15,10 +15,12 @@ use crate::git::{
     GitWorktreeInventory, GitWorktreeRecord, host_path_platform, worktree_repository_key,
 };
 
+#[cfg(unix)]
+use super::service::TokioCatalogFileSystem;
 use super::service::{
     CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
     CatalogServiceOptions, CatalogShallowSignature, CatalogThread, DirectoryProbeState,
-    InventorySource, ScanFailure, TokioCatalogFileSystem,
+    InventorySource, ScanFailure,
 };
 use super::{
     CatalogRefreshTrigger, CatalogWorkspaceLossObserver, WorkspaceAvailabilityRegistry,

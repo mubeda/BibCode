@@ -179,7 +179,7 @@ async fn all_contract_commands_persist_canonical_events_and_project_atomically()
     );
     assert_eq!(
         events[2].event.payload["worktreeDiscovery"],
-        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/REPO-WORKTREES"]})
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
     );
 
     let snapshot = load_snapshot(&engine.repositories())
@@ -188,7 +188,7 @@ async fn all_contract_commands_persist_canonical_events_and_project_atomically()
     assert_eq!(snapshot.projects[0].title, "Renamed");
     assert_eq!(
         snapshot.projects[0].worktree_discovery,
-        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/REPO-WORKTREES"]})
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
     );
     assert!(snapshot.projects[0].deleted_at.is_some());
     let thread = snapshot
@@ -249,7 +249,7 @@ async fn all_contract_commands_persist_canonical_events_and_project_atomically()
     assert_eq!(replayed.projects[0].title, "Renamed");
     assert_eq!(
         replayed.projects[0].worktree_discovery,
-        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/REPO-WORKTREES"]})
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
     );
     assert!(replayed.projects[0].deleted_at.is_some());
     assert_eq!(replayed.messages.len(), 1);
@@ -269,10 +269,10 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
         "initialPromptDismissedAt": "2026-07-10T10:00:00.000Z",
         "baselinePaths": ["C:/policy-worktree"]
     });
-    let normalized_policy = json!({
+    let expected_policy = json!({
         "visibility": "shown",
         "initialPromptDismissedAt": "2026-07-10T10:00:00.000Z",
-        "baselinePaths": ["C:/POLICY-WORKTREE"]
+        "baselinePaths": ["C:/policy-worktree"]
     });
     engine
         .dispatch(decode(json!({
@@ -312,7 +312,7 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
     );
     assert_eq!(
         events[2].event.payload["worktreeDiscovery"],
-        normalized_policy
+        expected_policy
     );
     assert!(events[3].event.payload.get("worktreeDiscovery").is_none());
     assert_eq!(
@@ -321,7 +321,7 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
             .expect("snapshot")
             .projects[0]
             .worktree_discovery,
-        normalized_policy
+        expected_policy
     );
     engine.shutdown().await;
 
@@ -347,7 +347,7 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
             .expect("replayed snapshot")
             .projects[0]
             .worktree_discovery,
-        normalized_policy
+        expected_policy
     );
     restarted.shutdown().await;
 }
@@ -426,10 +426,10 @@ async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_thro
         "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
         "baselinePaths": ["C:/custom-policy-worktree"]
     });
-    let normalized_custom_policy = json!({
+    let expected_custom_policy = json!({
         "visibility": "shown",
         "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
-        "baselinePaths": ["C:/CUSTOM-POLICY-WORKTREE"]
+        "baselinePaths": ["C:/custom-policy-worktree"]
     });
     engine
         .dispatch(decode(json!({
@@ -469,7 +469,7 @@ async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_thro
             .expect("project projection")
             .projects[0]
             .worktree_discovery,
-        normalized_custom_policy
+        expected_custom_policy
     );
     engine.shutdown().await;
 
@@ -495,7 +495,7 @@ async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_thro
             .expect("replayed project projection")
             .projects[0]
             .worktree_discovery,
-        normalized_custom_policy
+        expected_custom_policy
     );
     restarted.shutdown().await;
 }

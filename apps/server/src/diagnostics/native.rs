@@ -105,6 +105,9 @@ impl NativeProcessSampler {
         &self,
         roots: Vec<ProcessIdentity>,
     ) -> Result<RuntimeProcessOwnership, SamplingError> {
+        if roots.is_empty() {
+            return Ok(RuntimeProcessOwnership::roots_only(roots));
+        }
         let rows = self.sample().await?;
         Ok(RuntimeProcessOwnership::capture(&rows, roots))
     }
@@ -113,6 +116,9 @@ impl NativeProcessSampler {
         &self,
         ownership: RuntimeProcessOwnership,
     ) -> Result<ProcessCleanupReport, SignalError> {
+        if ownership.roots.is_empty() && ownership.captured.is_empty() {
+            return Ok(ProcessCleanupReport::default());
+        }
         let rows = self
             .sample()
             .await
@@ -461,8 +467,8 @@ fn macos_process_creation_identity(seconds: u64, microseconds: u64) -> std::io::
 #[cfg(windows)]
 fn platform_process_record(pid: u32) -> std::io::Result<PlatformProcessRecord> {
     use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION},
+        Foundation::{CloseHandle, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION},
     };
 
     // SAFETY: the requested access is query-only and the returned owned handle
@@ -471,7 +477,21 @@ fn platform_process_record(pid: u32) -> std::io::Result<PlatformProcessRecord> {
     if handle.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let record = windows_process_record(handle);
+    let record = (|| {
+        let mut exit_code = 0_u32;
+        // SAFETY: `handle` is a live query handle and `exit_code` is valid
+        // writable storage for the duration of the call.
+        if unsafe { GetExitCodeProcess(handle, &mut exit_code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if exit_code != u32::try_from(STILL_ACTIVE).expect("STILL_ACTIVE fits u32") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("process {pid} has exited"),
+            ));
+        }
+        windows_process_record(handle)
+    })();
     // SAFETY: `handle` was opened successfully above and is closed once.
     unsafe { CloseHandle(handle) };
     record
@@ -819,7 +839,10 @@ pub enum SignalError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    };
 
     use super::*;
     use crate::diagnostics::ProcessIdentity;
@@ -843,6 +866,68 @@ mod tests {
                 .store(self.bound_identity, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    fn locked_native_process_sampler() -> (
+        NativeProcessSampler,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let system = Arc::new(Mutex::new(System::new()));
+        let system_to_lock = system.clone();
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = system_to_lock
+                .lock()
+                .expect("fresh process sampler mutex should lock");
+            locked_tx
+                .send(())
+                .expect("sampler lock publication should succeed");
+            release_rx
+                .recv()
+                .expect("sampler lock release should arrive");
+        });
+        locked_rx
+            .recv()
+            .expect("sampler lock publication should arrive");
+        (NativeProcessSampler { system }, release_tx, blocker)
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_ownership_capture_does_not_require_native_sampling() {
+        let (sampler, release, blocker) = locked_native_process_sampler();
+        let ownership = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sampler.capture_runtime_process_ownership(Vec::new()),
+        )
+        .await;
+        release.send(()).expect("sampler lock release should send");
+        blocker.join().expect("sampler lock holder should join");
+        let ownership = ownership
+            .expect("empty ownership capture should not wait for native sampling")
+            .expect("empty ownership should not sample the native process table");
+
+        assert!(ownership.roots.is_empty());
+        assert!(ownership.captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_ownership_cleanup_does_not_require_native_sampling() {
+        let (sampler, release, blocker) = locked_native_process_sampler();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sampler
+                .cleanup_runtime_process_ownership(RuntimeProcessOwnership::roots_only(Vec::new())),
+        )
+        .await;
+        release.send(()).expect("sampler lock release should send");
+        blocker.join().expect("sampler lock holder should join");
+        let report = report
+            .expect("empty ownership cleanup should not wait for native sampling")
+            .expect("empty ownership should not sample the native process table");
+
+        assert_eq!(report, ProcessCleanupReport::default());
     }
 
     #[tokio::test]
@@ -886,6 +971,27 @@ mod tests {
 
         assert_eq!(identity.pid, std::process::id());
         assert_eq!(identity.started_at, platform.started_at);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_identity_rejects_an_exited_process_with_a_retained_handle() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit", "0"])
+            .spawn()
+            .expect("spawn exited-process identity fixture");
+        let pid = child.id();
+        assert!(
+            child
+                .wait()
+                .expect("wait for exited-process identity fixture")
+                .success()
+        );
+
+        assert!(
+            NativeProcessSampler::process_identity(pid).is_err(),
+            "an exited Windows process must not be reported as a live identity"
+        );
     }
 
     #[cfg(target_os = "linux")]
