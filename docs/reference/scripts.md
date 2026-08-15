@@ -35,6 +35,10 @@ state kind.
 
 - `vp run build`: build application, package, lint-plugin, and script outputs.
 - `vp run build:desktop`: build the React assets, Rust backend, and Tauri app.
+  On Linux, the desktop build launcher scopes `NO_STRIP=1` to the Tauri child
+  process so linuxdeploy does not invoke its older bundled `strip` against
+  modern RELR-enabled system libraries; Windows and macOS inherit the caller's
+  environment unchanged.
 - `vp run build:marketing`: build the Astro marketing site.
 - `vp run build:contracts`: build the schema-only contracts package.
 - `vp check`: run the Vite+ formatting and lint checks.

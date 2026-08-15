@@ -397,7 +397,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
         false,
       );
       const desktopPackageJson = yield* decodeDesktopPackageConfiguration(desktopPackage);
-      assert.match(desktopPackageJson.scripts.build, /pnpm exec tauri build$/);
+      assert.equal(desktopPackageJson.scripts.build, "node ../../scripts/run-tauri-build.mjs");
+      assert.equal(yield* fs.exists(path.join(repoRoot, "scripts/run-tauri-build.mjs")), true);
       assert.notMatch(desktopPackage, /pnpm dlx/);
       assert.notMatch(desktopLib, /if\s*!cfg!\(debug_assertions\)[\s\S]*?backend\.start_default/);
       assert.match(desktopLib, /backend\.start_default\(app_handle\)\.await/);
