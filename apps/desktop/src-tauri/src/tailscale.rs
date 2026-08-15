@@ -113,6 +113,10 @@ async fn read_tailscale_status_with(
 
     let output = wait_for_tailscale_output(child, timeout).await?;
 
+    decode_tailscale_status_output(output)
+}
+
+fn decode_tailscale_status_output(output: std::process::Output) -> Result<TailscaleStatus, String> {
     if !output.status.success() {
         return Err(format!(
             "tailscale status exited with code {}.",
@@ -208,6 +212,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(code as u32)
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TAILSCALE_STATUS_JSON: &str = r#"{"Self":{"DNSName":"desktop.tail.ts.net.","TailscaleIPs":["100.100.100.100","fd7a:115c:a1e0::1","192.168.1.20"]}}"#;
@@ -360,25 +378,24 @@ mod tests {
             Some("desktop.tail.ts.net")
         );
 
-        let failed = executable_script(directory.path(), "failed", "exit 7", "exit /b 7");
         assert_eq!(
-            read_tailscale_status_with(&failed, Duration::from_secs(5))
-                .await
-                .unwrap_err(),
+            decode_tailscale_status_output(std::process::Output {
+                status: exit_status(7),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+            .unwrap_err(),
             "tailscale status exited with code 7."
         );
 
-        let invalid_utf8 = executable_script(
-            directory.path(),
-            "invalid-utf8",
-            "printf '\\377'",
-            "powershell.exe -NoLogo -NoProfile -Command \"[Console]::OpenStandardOutput().WriteByte(255)\"",
-        );
         assert!(
-            read_tailscale_status_with(&invalid_utf8, Duration::from_secs(5))
-                .await
-                .unwrap_err()
-                .contains("non-UTF-8")
+            decode_tailscale_status_output(std::process::Output {
+                status: exit_status(0),
+                stdout: vec![0xff],
+                stderr: Vec::new(),
+            })
+            .unwrap_err()
+            .contains("non-UTF-8")
         );
 
         assert!(

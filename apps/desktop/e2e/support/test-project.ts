@@ -9,6 +9,19 @@ import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activit
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
 
+const nativeActionLogFixtureSource = String.raw`
+import fs from "node:fs";
+
+const path = process.env.BIBCODE_E2E_NATIVE_ACTION_LOG;
+if (!path) {
+  throw new Error("BIBCODE_E2E_NATIVE_ACTION_LOG is required.");
+}
+fs.appendFileSync(path, JSON.stringify({
+  action: "openInEditor",
+  args: process.argv.slice(2),
+}) + "\n");
+`.trimStart();
+
 export const composerProviderProfiles = {
   codex: {
     commands: ["goal"],
@@ -67,6 +80,7 @@ export interface DesktopUiTestContext {
   readonly shimDirectory: string;
   readonly artifactDirectory: string;
   readonly fixtureUserHomePath: string;
+  readonly nativeActionLogPath: string;
   readonly providerInputLogPath: string;
 }
 
@@ -101,13 +115,15 @@ if (process.argv.includes("--help")) {
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
 const activity = ${JSON.stringify(desktopActivityFixture)};
+const activityStartedAt = Math.floor(Date.now() / 1000);
+const activityObservedAt = () => Math.max(activityStartedAt, Math.floor(Date.now() / 1000));
 const activityActor = (revision) => ({
   id: activity.actor.id,
   parentThreadId: activity.rootThreadId,
   agentNickname: activity.actor.name,
   agentRole: activity.actor.role,
-  createdAt: activity.timestamps.createdAt,
-  updatedAt: activity.timestamps.updatedAt + revision,
+  createdAt: activityStartedAt,
+  updatedAt: activityObservedAt(),
   status: revision > 1 ? { type: "idle" } : { type: "active", activeFlags: [] },
 });
 const composerActivityActor = (revision) => ({
@@ -115,8 +131,8 @@ const composerActivityActor = (revision) => ({
   parentThreadId: activity.rootThreadId,
   agentNickname: "Composer focus observer",
   agentRole: "observer",
-  createdAt: activity.timestamps.createdAt,
-  updatedAt: activity.timestamps.updatedAt + revision,
+  createdAt: activityStartedAt,
+  updatedAt: activityObservedAt(),
   status: { type: "active", activeFlags: [] },
 });
 const fixtureProjectPath = process.env.BIBCODE_E2E_PROJECT_PATH ?? process.cwd();
@@ -288,8 +304,8 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
         turn: {
           id: "bibcode-ui-reviewer-followup-turn",
           status: "completed",
-          startedAt: activity.timestamps.createdAt,
-          completedAt: activity.timestamps.updatedAt + revision,
+          startedAt: activityStartedAt,
+          completedAt: activityObservedAt(),
         },
       },
       emittedAtMs: Date.now(),
@@ -874,11 +890,19 @@ function createProviderShims(shimDirectory: string, isWindows: boolean): void {
     NodePath.join(shimDirectory, "provider-input-log-fixture.mjs"),
     providerInputLogFixtureSource,
   );
+  NodeFS.writeFileSync(
+    NodePath.join(shimDirectory, "native-action-log-fixture.mjs"),
+    nativeActionLogFixtureSource,
+  );
   for (const [provider, source] of Object.entries(fixtureSources)) {
     NodeFS.writeFileSync(NodePath.join(shimDirectory, `${provider}-fixture.mjs`), source);
   }
 
   if (isWindows) {
+    NodeFS.writeFileSync(
+      NodePath.join(shimDirectory, "cursor.cmd"),
+      `@"${process.execPath}" "%~dp0\\native-action-log-fixture.mjs" %*\r\n`,
+    );
     for (const provider of Object.keys(fixtureSources)) {
       const probeCommands =
         provider === "codex"
@@ -906,6 +930,12 @@ function createProviderShims(shimDirectory: string, isWindows: boolean): void {
     }
     return;
   }
+
+  writeExecutable(
+    NodePath.join(shimDirectory, "cursor"),
+    '#!/bin/sh\nexec node "$(dirname "$0")/native-action-log-fixture.mjs" "$@"\n',
+    false,
+  );
 
   for (const provider of Object.keys(fixtureSources)) {
     const probeCommands =
@@ -1068,12 +1098,29 @@ export function prepareDesktopUiTestContext(
   const projectPath = NodePath.join(runRoot, "projects with spaces", FIXTURE_PROJECT_NAME);
   const shimDirectory = NodePath.join(runRoot, "provider-shims");
   const fixtureUserHomePath = NodePath.join(runRoot, "fixture-user-home");
+  const fixtureAppDataPath = NodePath.join(runRoot, "fixture-appdata", "Roaming");
+  const fixtureLocalAppDataPath = NodePath.join(runRoot, "fixture-appdata", "Local");
+  const powerShellModuleAnalysisCachePath = NodePath.join(
+    fixtureLocalAppDataPath,
+    "Microsoft",
+    "Windows",
+    "PowerShell",
+    "ModuleAnalysisCache",
+  );
+  const nativeActionLogPath = NodePath.join(artifactDirectory, "native-actions.jsonl");
   const providerInputLogPath = NodePath.join(runRoot, "provider-input.jsonl");
 
   NodeFS.mkdirSync(stateRoot, { recursive: true });
   NodeFS.mkdirSync(shimDirectory, { recursive: true });
   NodeFS.mkdirSync(fixtureUserHomePath, { recursive: true });
+  if (isWindows) {
+    NodeFS.mkdirSync(fixtureAppDataPath, { recursive: true });
+    NodeFS.mkdirSync(NodePath.dirname(powerShellModuleAnalysisCachePath), { recursive: true });
+  }
   NodeFS.mkdirSync(artifactDirectory, { recursive: true });
+  if (!NodeFS.existsSync(nativeActionLogPath)) {
+    NodeFS.writeFileSync(nativeActionLogPath, "");
+  }
   NodeFS.writeFileSync(providerInputLogPath, "");
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
@@ -1085,9 +1132,13 @@ export function prepareDesktopUiTestContext(
   environment.BIBCODE_E2E_PROJECT_PATH = projectPath;
   environment.BIBCODE_E2E_SHIM_DIRECTORY = shimDirectory;
   environment.BIBCODE_E2E_USER_HOME = fixtureUserHomePath;
+  environment.BIBCODE_E2E_NATIVE_ACTION_LOG = nativeActionLogPath;
   environment.BIBCODE_E2E_PROVIDER_INPUT_LOG = providerInputLogPath;
   environment.BIBCODE_HOME = stateRoot;
   if (isWindows) {
+    environment.APPDATA = fixtureAppDataPath;
+    environment.LOCALAPPDATA = fixtureLocalAppDataPath;
+    environment.PSModuleAnalysisCachePath = powerShellModuleAnalysisCachePath;
     environment.USERPROFILE = fixtureUserHomePath;
     environment.HOME = fixtureUserHomePath;
   } else {
@@ -1103,6 +1154,7 @@ export function prepareDesktopUiTestContext(
     shimDirectory,
     artifactDirectory,
     fixtureUserHomePath,
+    nativeActionLogPath,
     providerInputLogPath,
   };
 }
