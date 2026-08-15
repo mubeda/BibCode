@@ -10417,7 +10417,10 @@ impl Default for OpenCodeActivityTransitionProbe {
 }
 
 impl OpenCodeActivityTransitionProbe {
-    async fn wait_for_first_poll_while<F>(&self, transition: Pin<&mut F>)
+    async fn wait_for_first_poll_while<F>(
+        &self,
+        transition: Pin<&mut F>,
+    ) -> Option<TerminalAgentActivityTransition>
     where
         F: Future<Output = TerminalAgentActivityTransition> + ?Sized,
     {
@@ -10430,14 +10433,39 @@ impl OpenCodeActivityTransitionProbe {
                 permit
                     .expect("OpenCode activity transition probe")
                     .forget();
+                None
             }
             completed = transition => {
+                if let Ok(permit) = self.first_polls.try_acquire() {
+                    permit.forget();
+                    return Some(completed);
+                }
                 panic!(
                     "OpenCode activity transition completed before reaching the provider: {completed:?}"
                 );
             }
         }
     }
+}
+
+#[tokio::test]
+async fn opencode_activity_transition_probe_accepts_provider_completion_on_first_poll() {
+    let activity_transition = Arc::new(OpenCodeActivityTransitionProbe::default());
+    let provider_entry = activity_transition.clone();
+    let mut transition = Box::pin(async move {
+        provider_entry.first_polls.add_permits(1);
+        TerminalAgentActivityTransition {
+            stopped: 1,
+            dormant: 1,
+            ..TerminalAgentActivityTransition::default()
+        }
+    });
+
+    let completed = activity_transition
+        .wait_for_first_poll_while(transition.as_mut())
+        .await
+        .expect("provider completed on its first poll");
+    assert_eq!((completed.stopped, completed.dormant), (1, 1));
 }
 
 struct ProbedOpenCodeObserverFactory {
@@ -12094,10 +12122,15 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
         ])
         .await;
     let mut initial_disabling = Box::pin(fixture.manager.set_agent_activity_enabled(false));
-    activity_transition
+    let initially_disabled = if let Some(completed) = activity_transition
         .wait_for_first_poll_while(initial_disabling.as_mut())
-        .await;
-    let initially_disabled = initial_disabling.await;
+        .await
+    {
+        completed
+    } else {
+        initial_disabling.as_mut().await
+    };
+    drop(initial_disabling);
     assert_eq!(
         (
             initially_disabled.stopped,
@@ -12115,9 +12148,13 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
         .expect("OpenCode replacement pause") = Some(pause.clone());
 
     let mut first_enabling = Box::pin(fixture.manager.set_agent_activity_enabled(true));
-    activity_transition
-        .wait_for_first_poll_while(first_enabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(first_enabling.as_mut())
+            .await
+            .is_none(),
+        "OpenCode enable completed before the paused replacement"
+    );
     tokio::select! {
         biased;
         () = pause.entered.notified() => {}
@@ -12127,13 +12164,21 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
     }
 
     let mut disabling = Box::pin(fixture.manager.set_agent_activity_enabled(false));
-    activity_transition
-        .wait_for_first_poll_while(disabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(disabling.as_mut())
+            .await
+            .is_none(),
+        "OpenCode disable completed before superseding the paused replacement"
+    );
     let mut latest_enabling = Box::pin(fixture.manager.set_agent_activity_enabled(true));
-    activity_transition
-        .wait_for_first_poll_while(latest_enabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(latest_enabling.as_mut())
+            .await
+            .is_none(),
+        "latest OpenCode enable completed before the paused replacement was released"
+    );
     drop(first_enabling);
     drop(disabling);
 
