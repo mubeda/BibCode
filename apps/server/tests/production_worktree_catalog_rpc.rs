@@ -5283,8 +5283,10 @@ async fn wait_for_mutation_and_catalog_count(
 }
 
 fn same_worktree_identity(left: &Path, right: &Path) -> bool {
-    normalize_worktree_path_key(left, host_path_platform())
-        == normalize_worktree_path_key(right, host_path_platform())
+    let left = fs::canonicalize(left).expect("canonical left worktree identity");
+    let right = fs::canonicalize(right).expect("canonical right worktree identity");
+    normalize_worktree_path_key(&left, host_path_platform())
+        == normalize_worktree_path_key(&right, host_path_platform())
 }
 
 fn git(cwd: &Path, args: &[&str], final_path: Option<&Path>) {

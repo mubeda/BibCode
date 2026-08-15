@@ -1030,14 +1030,13 @@ fn canonical_default_thread_id(model: &CommandModel, project_id: &str) -> Option
 fn canonical_worktree_owners<'a>(
     model: &'a CommandModel,
     project_id: &'a str,
-    path: &'a str,
+    path_key: &'a str,
 ) -> impl Iterator<Item = (&'a String, &'a ThreadState)> {
-    let path_key = normalized_worktree_path_key(path);
     model.threads.iter().filter(move |(_, thread)| {
         thread.project_id == project_id
             && thread.kind == "workspace"
             && thread.deleted_at.is_none()
-            && thread.worktree_path_key.as_deref() == Some(path_key.as_str())
+            && thread.worktree_path_key.as_deref() == Some(path_key)
     })
 }
 
@@ -2846,7 +2845,7 @@ async fn process_envelope(
     }
 
     canonicalize_project_command(model, &mut command, project_command_effects).await?;
-    canonicalize_worktree_command(&mut command).await?;
+    let prepared_worktree = canonicalize_worktree_command(&mut command).await?;
     let project_create_identity = match &command {
         OrchestrationCommand::ProjectCreate {
             project_id,
@@ -2900,7 +2899,15 @@ async fn process_envelope(
     } else {
         ProjectionMode::Legacy
     };
-    let mut planned = match plan_command(repositories, model, &command, &occurred_at).await {
+    let mut planned = match plan_command(
+        repositories,
+        model,
+        &command,
+        &prepared_worktree,
+        &occurred_at,
+    )
+    .await
+    {
         Ok(planned) => planned,
         Err(error) => {
             ensure_command_active(cancellation)?;
@@ -2973,12 +2980,18 @@ async fn process_envelope(
         projection_mode,
     )
     .await?;
+    let adoption_result = worktree_adoption_result(&command, &persisted.committed)?;
     apply_to_model(model, &persisted.committed);
+    apply_prepared_worktree_identity(
+        model,
+        &command,
+        &prepared_worktree,
+        adoption_result.as_ref(),
+    );
     for event in &persisted.committed {
         let _ = events.send(event.clone());
     }
     let project_id = project_create_identity.map(|(project_id, _)| project_id);
-    let adoption_result = worktree_adoption_result(&command, &persisted.committed)?;
     Ok(ProcessEnvelopeOutcome {
         result: DispatchResult {
             sequence: persisted.result_sequence,
@@ -3109,23 +3122,42 @@ async fn canonicalize_project_command_with_historical_timeout(
     Ok(())
 }
 
+#[derive(Default)]
+struct PreparedWorktreeCommand {
+    path_key: Option<String>,
+}
+
+impl PreparedWorktreeCommand {
+    fn path_key<'a>(
+        &'a self,
+        command: &OrchestrationCommand,
+    ) -> Result<&'a str, OrchestrationError> {
+        self.path_key
+            .as_deref()
+            .ok_or_else(|| OrchestrationError::Invariant {
+                command_type: command.command_type().to_owned(),
+                detail: "The worktree command has no prepared physical path identity.".to_owned(),
+            })
+    }
+}
+
 async fn canonicalize_worktree_command(
     command: &mut OrchestrationCommand,
-) -> Result<(), OrchestrationError> {
+) -> Result<PreparedWorktreeCommand, OrchestrationError> {
     let command_id = command.command_id().to_owned();
-    match command {
+    let path_key = match command {
         OrchestrationCommand::WorktreeAdoptResolved { path, .. }
         | OrchestrationCommand::WorktreeDetachResolved { path, .. } => {
-            canonicalize_command_worktree_path(&command_id, path).await?;
+            Some(canonicalize_command_worktree_path(&command_id, path).await?)
         }
         OrchestrationCommand::ThreadCreate {
             worktree_path: Some(path),
             ..
-        } => canonicalize_command_worktree_path(&command_id, path).await?,
+        } => Some(canonicalize_command_worktree_path(&command_id, path).await?),
         OrchestrationCommand::ThreadMetaUpdate {
             worktree_path: OptionalNullable::Present(Some(path)),
             ..
-        } => canonicalize_command_worktree_path(&command_id, path).await?,
+        } => Some(canonicalize_command_worktree_path(&command_id, path).await?),
         OrchestrationCommand::ThreadTurnStart {
             bootstrap: Some(bootstrap),
             ..
@@ -3135,30 +3167,34 @@ async fn canonicalize_worktree_command(
                 .as_mut()
                 .and_then(|create| create.worktree_path.as_mut())
             {
-                canonicalize_command_worktree_path(&command_id, path).await?;
+                Some(canonicalize_command_worktree_path(&command_id, path).await?)
+            } else {
+                None
             }
         }
         OrchestrationCommand::ProjectMetaUpdate {
             worktree_discovery: Some(policy),
             ..
-        } => canonicalize_policy_baseline(&command_id, policy).await?,
-        _ => {}
-    }
-    Ok(())
+        } => {
+            canonicalize_policy_baseline(&command_id, policy).await?;
+            None
+        }
+        _ => None,
+    };
+    Ok(PreparedWorktreeCommand { path_key })
 }
 
 async fn canonicalize_command_worktree_path(
     command_id: &str,
-    path: &mut String,
-) -> Result<(), OrchestrationError> {
-    let _identity_key = canonical_worktree_path_key(Path::new(path))
+    path: &str,
+) -> Result<String, OrchestrationError> {
+    canonical_worktree_path_key(Path::new(path))
         .await
         .map_err(|error| OrchestrationError::WorkspaceOwnershipIdentity {
             command_id: command_id.to_owned(),
-            path: path.clone(),
+            path: path.to_owned(),
             detail: error.to_string(),
-        })?;
-    Ok(())
+        })
 }
 
 async fn canonicalize_policy_baseline(
@@ -3176,11 +3212,46 @@ async fn canonicalize_policy_baseline(
         let Some(value) = path.as_str() else {
             continue;
         };
-        let mut canonical = value.to_owned();
-        canonicalize_command_worktree_path(command_id, &mut canonical).await?;
-        *path = Value::String(canonical);
+        let _identity_key = canonicalize_command_worktree_path(command_id, value).await?;
     }
     Ok(())
+}
+
+fn apply_prepared_worktree_identity(
+    model: &mut CommandModel,
+    command: &OrchestrationCommand,
+    prepared: &PreparedWorktreeCommand,
+    adoption_result: Option<&(String, String)>,
+) {
+    let Some(path_key) = prepared.path_key.as_ref() else {
+        return;
+    };
+    let thread_id = match command {
+        OrchestrationCommand::WorktreeAdoptResolved { .. } => {
+            adoption_result.map(|(thread_id, _)| thread_id.as_str())
+        }
+        OrchestrationCommand::ThreadCreate {
+            thread_id,
+            worktree_path: Some(_),
+            ..
+        }
+        | OrchestrationCommand::ThreadMetaUpdate { thread_id, .. } => Some(thread_id.as_str()),
+        OrchestrationCommand::ThreadTurnStart {
+            thread_id,
+            bootstrap: Some(bootstrap),
+            ..
+        } if bootstrap
+            .create_thread
+            .as_ref()
+            .is_some_and(|create| create.worktree_path.is_some()) =>
+        {
+            Some(thread_id.as_str())
+        }
+        _ => None,
+    };
+    if let Some(thread) = thread_id.and_then(|thread_id| model.threads.get_mut(thread_id)) {
+        thread.worktree_path_key = Some(path_key.clone());
+    }
 }
 
 async fn prepare_project_create(
@@ -3260,6 +3331,7 @@ async fn plan_command(
     repositories: &Repositories,
     model: &CommandModel,
     command: &OrchestrationCommand,
+    prepared_worktree: &PreparedWorktreeCommand,
     occurred_at: &str,
 ) -> Result<Vec<NewOrchestrationEvent>, OrchestrationError> {
     let metadata = Value::Object(Default::default());
@@ -3434,7 +3506,8 @@ async fn plan_command(
             interaction_mode,
         } => {
             let project = require_project(model, command, project_id)?;
-            let owners = canonical_worktree_owners(model, project_id, path).collect::<Vec<_>>();
+            let path_key = prepared_worktree.path_key(command)?;
+            let owners = canonical_worktree_owners(model, project_id, path_key).collect::<Vec<_>>();
             if owners.len() > 1 {
                 return Err(OrchestrationError::WorktreeOwnershipConflict {
                     project_id: project_id.clone(),
@@ -3483,7 +3556,8 @@ async fn plan_command(
                 ));
                 (thread_id, "created")
             };
-            let policy = compact_adoption_policy(command, &project.worktree_discovery, path)?;
+            let policy =
+                compact_adoption_policy(command, &project.worktree_discovery, path_key).await?;
             planned.push(make_event(
                 "project.meta-updated",
                 "project",
@@ -3509,17 +3583,17 @@ async fn plan_command(
             command_id,
             project_id,
             thread_id,
-            path,
+            path: _,
             git_outcome,
             detail,
             orphan_cleanup_pending,
         } => {
             let project = require_project(model, command, project_id)?;
             let thread = require_thread(model, command, thread_id)?;
-            let path_key = normalized_worktree_path_key(path);
+            let path_key = prepared_worktree.path_key(command)?;
             if thread.project_id != *project_id
                 || thread.kind != "workspace"
-                || thread.worktree_path_key.as_deref() != Some(path_key.as_str())
+                || thread.worktree_path_key.as_deref() != Some(path_key)
             {
                 return invariant(
                     command,
@@ -3528,7 +3602,7 @@ async fn plan_command(
                     ),
                 );
             }
-            let owners = canonical_worktree_owners(model, project_id, path).collect::<Vec<_>>();
+            let owners = canonical_worktree_owners(model, project_id, path_key).collect::<Vec<_>>();
             if owners.len() != 1 || owners[0].0.as_str() != thread_id {
                 return Err(OrchestrationError::WorktreeOwnershipConflict {
                     project_id: project_id.clone(),
@@ -3542,7 +3616,7 @@ async fn plan_command(
                     candidate.project_id == *project_id
                         && candidate.kind == "panel"
                         && candidate.deleted_at.is_none()
-                        && candidate.worktree_path_key.as_deref() == Some(path_key.as_str())
+                        && candidate.worktree_path_key.as_deref() == Some(path_key)
                 })
                 .map(|(panel_id, _)| panel_id)
                 .collect::<Vec<_>>();
@@ -3570,7 +3644,8 @@ async fn plan_command(
                 metadata.clone(),
                 json!({"threadId":thread_id,"deletedAt":occurred_at}),
             ));
-            let policy = compact_detach_policy(command, &project.worktree_discovery, path)?;
+            let policy =
+                compact_detach_policy(command, &project.worktree_discovery, path_key).await?;
             planned.push(make_event(
                 "project.meta-updated",
                 "project",
@@ -3758,15 +3833,15 @@ async fn plan_command(
         } => {
             let thread = require_thread(model, command, thread_id)?;
             if thread.kind == "workspace"
-                && let OptionalNullable::Present(Some(path)) = worktree_path
+                && let OptionalNullable::Present(Some(_)) = worktree_path
             {
-                let path_key = normalized_worktree_path_key(path);
+                let path_key = prepared_worktree.path_key(command)?;
                 if model.threads.iter().any(|(candidate_id, candidate)| {
                     candidate_id != thread_id
                         && candidate.project_id == thread.project_id
                         && candidate.kind == "workspace"
                         && candidate.deleted_at.is_none()
-                        && candidate.worktree_path_key.as_deref() == Some(path_key.as_str())
+                        && candidate.worktree_path_key.as_deref() == Some(path_key)
                 }) {
                     return Err(OrchestrationError::WorktreeOwnershipConflict {
                         project_id: thread.project_id.clone(),
@@ -3893,10 +3968,7 @@ async fn plan_command(
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
                             worktree_path: create.worktree_path.clone(),
-                            worktree_path_key: create
-                                .worktree_path
-                                .as_deref()
-                                .map(normalized_worktree_path_key),
+                            worktree_path_key: prepared_worktree.path_key.clone(),
                             archived_at: None,
                             deleted_at: None,
                         },
@@ -4186,10 +4258,10 @@ fn resolved_worktree_title(branch: Option<&str>, head: Option<&str>, path: &str)
         .unwrap_or_else(|| path.to_owned())
 }
 
-fn compact_adoption_policy(
+async fn compact_adoption_policy(
     command: &OrchestrationCommand,
     current: &Value,
-    adopted_path: &str,
+    adopted_path_key: &str,
 ) -> Result<Value, OrchestrationError> {
     let mut policy = current.clone();
     let baseline = policy
@@ -4200,16 +4272,15 @@ fn compact_adoption_policy(
             command_type: command.command_type().to_owned(),
             detail: "Persisted worktree discovery policy has no baselinePaths array.".to_owned(),
         })?;
-    baseline.retain(|path| path.as_str() != Some(adopted_path));
+    compact_policy_baseline(command, baseline, adopted_path_key).await?;
     Ok(policy)
 }
 
-fn compact_detach_policy(
+async fn compact_detach_policy(
     command: &OrchestrationCommand,
     current: &Value,
-    detached_path: &str,
+    detached_path_key: &str,
 ) -> Result<Value, OrchestrationError> {
-    let detached_key = normalized_worktree_path_key(detached_path);
     let mut policy = current.clone();
     let baseline = policy
         .as_object_mut()
@@ -4219,11 +4290,28 @@ fn compact_detach_policy(
             command_type: command.command_type().to_owned(),
             detail: "Persisted worktree discovery policy has no baselinePaths array.".to_owned(),
         })?;
-    baseline.retain(|path| {
-        path.as_str()
-            .is_none_or(|path| normalized_worktree_path_key(path) != detached_key)
-    });
+    compact_policy_baseline(command, baseline, detached_path_key).await?;
     Ok(policy)
+}
+
+async fn compact_policy_baseline(
+    command: &OrchestrationCommand,
+    baseline: &mut Vec<Value>,
+    removed_path_key: &str,
+) -> Result<(), OrchestrationError> {
+    let mut retained = Vec::with_capacity(baseline.len());
+    for path in std::mem::take(baseline) {
+        let Some(value) = path.as_str() else {
+            retained.push(path);
+            continue;
+        };
+        let path_key = canonicalize_command_worktree_path(command.command_id(), value).await?;
+        if path_key != removed_path_key {
+            retained.push(path);
+        }
+    }
+    *baseline = retained;
+    Ok(())
 }
 
 fn invariant<T>(command: &OrchestrationCommand, detail: String) -> Result<T, OrchestrationError> {
@@ -6850,13 +6938,19 @@ mod tests {
 
             assert_eq!(result.thread_id.as_deref(), Some("physical-owner"));
             assert_eq!(result.disposition.as_deref(), Some("existing"));
+            let threads = engine
+                .repositories()
+                .list_threads_by_project(PROJECT_ID.to_owned())
+                .await
+                .expect("threads");
+            let owner = threads
+                .iter()
+                .find(|thread| thread.thread_id == "physical-owner")
+                .expect("physical owner");
+            assert_eq!(owner.worktree_path.as_deref(), Some(physical.as_str()));
             assert_eq!(
-                engine
-                    .repositories()
-                    .list_threads_by_project(PROJECT_ID.to_owned())
-                    .await
-                    .expect("threads")
-                    .into_iter()
+                threads
+                    .iter()
                     .filter(|thread| thread.kind == "workspace" && thread.deleted_at.is_none())
                     .count(),
                 1,
