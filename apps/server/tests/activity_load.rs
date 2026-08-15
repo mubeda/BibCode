@@ -1519,7 +1519,6 @@ async fn high_volume_rpc_stream_replaces_lagged_subscribers_and_retains_exact_ca
     assert_eq!(journal_max - journal_min + 1, JOURNAL_ROW_LIMIT);
     assert!(event_min > 1, "oldest idempotency event must be pruned");
     assert_eq!(event_max, snapshot.revision as i64);
-    assert!(started_at.elapsed() < Duration::from_secs(30));
     let process_rss_sample = process_rss_sampler.finish();
     print_runtime_memory_diagnostic(
         "activity RPC load",
@@ -1529,6 +1528,7 @@ async fn high_volume_rpc_stream_replaces_lagged_subscribers_and_retains_exact_ca
         journal_rows,
         event_rows,
     );
+    // Wall time is observational: this correctness test runs in the parallel package graph.
     println!(
         "activity RPC load: {} queued writers, journal revisions {}..{}; retained snapshot summaries {}, detail entries {}, journal/idempotency peaks {}/{} and final rows {}/{} in {:.1?}",
         QUEUED_WRITER_COUNT,

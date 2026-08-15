@@ -48,6 +48,7 @@ current behavior.
 
 ## Operations and reference
 
+- [Testing runbooks](./testing/README.md)
 - [Continuous integration](./operations/ci.md)
 - [Release process](./operations/release.md)
 - [Observability](./operations/observability.md)
