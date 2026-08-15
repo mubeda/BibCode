@@ -334,4 +334,4 @@ Report:
 - static gate outcomes;
 - unchanged production deadlines and concurrency;
 - whether testing runbooks were updated or reviewed and remain accurate; and
-- native Windows execution as CI-owned residual evidence if it could not run on macOS.
+- native Windows execution as unverified residual evidence if it could not run on macOS; it must be covered by a future explicit server-test CI step or a native Windows run.
