@@ -44,13 +44,14 @@ use crate::{
         RegistrationSource,
     },
     process::{
-        configure_supervised_background_command_wrap,
+        Platform, configure_supervised_background_command_wrap,
         supervised::{SupervisedOverflow, SupervisedRunRequest, run_supervised},
     },
-    provider::opencode::activity::{
-        MAX_RECONCILED_CHILDREN, OpenCodeActivityOutput, OpenCodeActivityTracker,
-    },
     provider::opencode::sse::OpenCodeSseDecoder,
+    provider::opencode::{
+        self,
+        activity::{MAX_RECONCILED_CHILDREN, OpenCodeActivityOutput, OpenCodeActivityTracker},
+    },
 };
 
 const OPENCODE_PROBE_OUTPUT_LIMIT: usize = 128 * 1024;
@@ -513,6 +514,12 @@ impl OpenCodeTerminalObserverFactory {
     ) -> Option<PreparedTerminalLaunch> {
         let model = opencode_model_arg(&input.launch.args)?;
         validate_opencode_config(input.launch.launch_env.get("OPENCODE_CONFIG_CONTENT"))?;
+        let executable = opencode::resolve_owned_executable(
+            Platform::current(),
+            Path::new(&input.launch.executable),
+        )
+        .to_string_lossy()
+        .into_owned();
         let password = random_secret()?;
         let mut helper_env = input.launch.launch_env.clone();
         helper_env.insert(
@@ -521,7 +528,7 @@ impl OpenCodeTerminalObserverFactory {
         );
         helper_env.insert("OPENCODE_SERVER_PASSWORD".to_owned(), password.clone());
         let helper_launch = OpenCodeHelperLaunch {
-            executable: input.launch.executable.clone(),
+            executable: executable.clone(),
             args: vec![
                 "serve".to_owned(),
                 "--hostname".to_owned(),
@@ -560,10 +567,7 @@ impl OpenCodeTerminalObserverFactory {
             }
             Ok((ready.endpoint, resources))
         };
-        let (capabilities, ready) = tokio::join!(
-            self.probe.probe(Path::new(&input.launch.executable)),
-            helper,
-        );
+        let (capabilities, ready) = tokio::join!(self.probe.probe(Path::new(&executable)), helper,);
         let (endpoint, resources) = ready.ok()?;
         let capabilities = capabilities?;
         if !capabilities.serve || !capabilities.attach {
@@ -612,7 +616,7 @@ impl OpenCodeTerminalObserverFactory {
             }),
         };
         Some(PreparedTerminalLaunch {
-            executable: input.launch.executable,
+            executable,
             args: vec![
                 "attach".to_owned(),
                 endpoint,
@@ -1904,7 +1908,7 @@ impl Default for SystemOpenCodeHelperLauncher {
 }
 
 impl SystemOpenCodeHelperLauncher {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_fixture_events(
         readiness_timeout: Duration,
         fixture_events: OpenCodeHelperFixtureEvents,

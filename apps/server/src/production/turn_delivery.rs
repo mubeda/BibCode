@@ -3440,7 +3440,7 @@ mod tests {
         assert_eq!(thread.branch.as_deref(), Some("bibcode/bootstrap"));
         assert_eq!(
             thread.worktree_path.as_deref(),
-            Some("C:/REPO/.WORKTREES/BOOTSTRAP")
+            Some("C:/repo/.worktrees/bootstrap")
         );
 
         service.shutdown().await;

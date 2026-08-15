@@ -5,8 +5,7 @@ use bibcode_server::persistence::{
     ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
     ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
     ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
-    WorktreeRepositoryPinOutcome, run_migrations,
-    WorktreeRemovalReceipt, run_migrations,
+    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -413,6 +412,9 @@ async fn worktree_catalog_projection_read_is_consistent_filtered_and_bounded() {
         ["workspace-1", "workspace-2"]
     );
     assert!(projection.truncated);
+}
+
+#[tokio::test]
 async fn worktree_removal_receipts_are_insert_only_until_marked_removed() {
     let repositories = migrated_repositories().await;
     let receipt = WorktreeRemovalReceipt {

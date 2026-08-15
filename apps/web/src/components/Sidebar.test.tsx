@@ -1745,6 +1745,29 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("boot failed");
   });
 
+  it("renders an unavailable local secondary as failed instead of connecting", () => {
+    baseScenario();
+    h.state.desktopBootstraps = [
+      {
+        id: "wsl:ubuntu-20.04",
+        label: "WSL (Ubuntu-20.04)",
+        httpBaseUrl: null,
+        wsBaseUrl: null,
+        preflightError: {
+          kind: "wsl-secondary-unavailable",
+          detail: "Could not find a Linux bibcode server binary for WSL.",
+        },
+      },
+    ];
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("Couldn&#x27;t connect WSL (Ubuntu-20.04)");
+    expect(markup).toContain("Could not find a Linux bibcode server binary for WSL.");
+    expect(markup).toMatch(/data-mock="AlertDescription"[^>]*class="[^"]*wrap-anywhere[^"]*"/);
+    expect(markup).not.toContain("Connecting WSL (Ubuntu-20.04)");
+  });
+
   it("falls back to a generic error when a failed backend reports no error text", () => {
     baseScenario();
     h.state.environments = [

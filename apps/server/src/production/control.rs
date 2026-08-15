@@ -209,6 +209,8 @@ pub struct NativeServerControl {
     #[cfg(test)]
     next_provider_capabilities_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
+    next_provider_update_running_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
@@ -308,6 +310,8 @@ impl NativeServerControl {
             next_settings_persisted_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_provider_capabilities_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_provider_update_running_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -528,6 +532,13 @@ impl NativeServerControl {
     async fn install_next_provider_capabilities_pause(&self) -> ProviderProbePause {
         let pause = ProviderProbePause::new();
         *self.next_provider_capabilities_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn install_next_provider_update_running_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_provider_update_running_pause.lock().await = Some(pause.clone());
         pause
     }
 
@@ -817,6 +828,11 @@ impl NativeServerControl {
             drop(command_guard);
             let providers = self.providers.read().await.clone();
             return Ok(json!({ "providers": providers }));
+        }
+        #[cfg(test)]
+        if let Some(pause) = self.next_provider_update_running_pause.lock().await.take() {
+            pause.entered.notify_one();
+            pause.release.notified().await;
         }
         let command_result = match self
             .provider_maintenance
@@ -2150,6 +2166,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::OnceCell,
     };
     use url::Url;
     use uuid::Uuid;
@@ -2332,6 +2349,46 @@ mod tests {
         }
     }
 
+    struct CompiledCursorUpdateFixture {
+        _root: tempfile::TempDir,
+        executable: PathBuf,
+    }
+
+    static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
+        OnceCell::const_new();
+
+    async fn compiled_cursor_update_fixture() -> &'static CompiledCursorUpdateFixture {
+        COMPILED_CURSOR_UPDATE_FIXTURE
+            .get_or_init(|| async {
+                let root = tempfile::tempdir().expect("compiled Cursor fixture directory");
+                let executable = root
+                    .path()
+                    .join(cursor_update_fixture_executable_name(cfg!(windows)));
+                let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/cursor_update_fixture.rs");
+                let output = tokio::process::Command::new(
+                    std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+                )
+                .arg("--edition=2024")
+                .arg(source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .await
+                .expect("compile Cursor update fixture");
+                assert!(
+                    output.status.success(),
+                    "compile Cursor update fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                CompiledCursorUpdateFixture {
+                    _root: root,
+                    executable,
+                }
+            })
+            .await
+    }
+
     async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
         let release_directory =
             directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
@@ -2343,23 +2400,10 @@ mod tests {
             .expect("write Cursor version state");
         let executable =
             release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor_update_fixture.rs");
-        let output = tokio::process::Command::new(
-            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
-        .arg("--edition=2024")
-        .arg(source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .await
-        .expect("compile Cursor update fixture");
-        assert!(
-            output.status.success(),
-            "compile Cursor update fixture: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let fixture = compiled_cursor_update_fixture().await;
+        tokio::fs::copy(&fixture.executable, &executable)
+            .await
+            .expect("copy compiled Cursor update fixture");
         executable
     }
 
@@ -3435,6 +3479,7 @@ mod tests {
         .await;
         let mut events = control.config_events.subscribe();
         let cancellation = CancellationToken::new();
+        let running_pause = control.install_next_provider_update_running_pause().await;
         let updating = {
             let control = control.clone();
             let cancellation = cancellation.clone();
@@ -3447,26 +3492,26 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("provider update event");
-                if event["type"] == "providerStatuses"
-                    && event["payload"]["providers"]
-                        .as_array()
-                        .is_some_and(|providers| {
-                            providers.iter().any(|provider| {
-                                provider["instanceId"] == "cursor-work"
-                                    && provider["updateState"]["status"] == "running"
-                            })
+        tokio::time::timeout(Duration::from_secs(10), running_pause.wait_until_entered())
+            .await
+            .expect("provider update reached its running-state publication barrier");
+        let running_published = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            event["type"] == "providerStatuses"
+                && event["payload"]["providers"]
+                    .as_array()
+                    .is_some_and(|providers| {
+                        providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
                         })
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("running state published");
+                    })
+        });
+        assert!(
+            running_published,
+            "running state was not published before the barrier"
+        );
         cancellation.cancel();
+        running_pause.release();
 
         let result = updating
             .await

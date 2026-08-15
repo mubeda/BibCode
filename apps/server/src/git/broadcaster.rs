@@ -456,7 +456,8 @@ fn publish(entry: &mut RepositoryState, event: VcsStatusStreamEvent) {
 mod tests {
     use super::*;
     use crate::git::{
-        BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessRequest, ProcessRunner,
+        BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessOutput, ProcessRequest,
+        ProcessRunner,
     };
     use crate::test_support::TestSandbox;
     use std::{collections::BTreeMap, ffi::OsString, fs, process::Command};
@@ -495,8 +496,56 @@ mod tests {
                 )
             }));
             Box::pin(async move {
-                if request.operation == "GitVcsDriver.statusDetailsLocal.status" {
-                    let _ = self.local_status_started.send(());
+                let output = |exit_code: i32, stdout: String| ProcessOutput {
+                    exit_code,
+                    stdout,
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                };
+                match request.operation.as_str() {
+                    "GitVcsDriver.detectRepository" => {
+                        return Ok(output(0, "true\n".to_owned()));
+                    }
+                    "GitVcsDriver.statusDetailsLocal.status" => {
+                        let _ = self.local_status_started.send(());
+                        let dirty = fs::read_to_string(request.cwd.join("tracked.txt"))
+                            .is_ok_and(|contents| contents != "base\n");
+                        let mut stdout = "# branch.head main\n".to_owned();
+                        if dirty {
+                            stdout.push_str(
+                                "1 .M N... 100644 100644 100644 deadbeef deadbeef tracked.txt\n",
+                            );
+                        }
+                        return Ok(output(0, stdout));
+                    }
+                    "GitVcsDriver.statusDetailsLocal.stagedNumstat"
+                    | "GitVcsDriver.statusDetailsLocal.remotes" => {
+                        return Ok(output(0, String::new()));
+                    }
+                    "GitVcsDriver.statusDetailsLocal.unstagedNumstat" => {
+                        let dirty = fs::read_to_string(request.cwd.join("tracked.txt"))
+                            .is_ok_and(|contents| contents != "base\n");
+                        return Ok(output(
+                            0,
+                            if dirty {
+                                "1\t1\ttracked.txt\n".to_owned()
+                            } else {
+                                String::new()
+                            },
+                        ));
+                    }
+                    "GitVcsDriver.defaultRef.originHead" => {
+                        return Ok(output(1, String::new()));
+                    }
+                    "GitVcsDriver.defaultRef.candidate" => {
+                        let is_main = request
+                            .args
+                            .last()
+                            .is_some_and(|value| value == "refs/heads/main");
+                        return Ok(output(i32::from(!is_main), String::new()));
+                    }
+                    _ => {}
                 }
                 if request.operation == "GitVcsDriver.statusDetailsRemote.status" {
                     let _ = self.remote_started.send(());

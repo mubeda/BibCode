@@ -1,13 +1,17 @@
 use std::{
     collections::BTreeMap,
-    ffi::{OsStr, OsString},
-    io::Read,
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+};
+#[cfg(unix)]
+use std::{
+    ffi::OsStr,
+    io::Read,
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -105,6 +109,7 @@ impl TestSandbox {
             .unwrap_or_else(|| panic!("{name} executable was not found on captured PATH"))
     }
 
+    #[cfg(unix)]
     pub(crate) fn run_isolated_case(
         &self,
         case: &str,
@@ -164,6 +169,7 @@ impl TestSandbox {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn is_isolated_case(case: &str, test_name: &str) -> bool {
         let arguments = std::env::args_os().collect::<Vec<_>>();
         std::env::var_os("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Some(OsStr::new(case))

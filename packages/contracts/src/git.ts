@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
 import { VcsDriverKind } from "./vcs.ts";
 
@@ -152,6 +152,15 @@ export const VcsListRefsInput = Schema.Struct({
   ),
 });
 export type VcsListRefsInput = typeof VcsListRefsInput.Type;
+
+export const VcsCreateWorktreeInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  refName: TrimmedNonEmptyStringSchema,
+  newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  path: Schema.NullOr(TrimmedNonEmptyStringSchema),
+});
+export type VcsCreateWorktreeInput = typeof VcsCreateWorktreeInput.Type;
 
 export const GitCloneInput = Schema.Struct({
   url: TrimmedNonEmptyStringSchema,
