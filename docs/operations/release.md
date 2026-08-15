@@ -242,6 +242,12 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 
 ## Local Verification
 
+The commands below remain release-specific checks. Use the
+[testing runbooks](../testing/README.md) for repeatable native platform,
+packaged UI, external-worktree, visual, process-cleanup, and compatibility
+evidence. This release checklist owns publication and release-asset approval;
+the runbooks own validation procedure and reporting.
+
 Run the repository gates:
 
 ```powershell

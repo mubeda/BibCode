@@ -1528,6 +1528,7 @@ async fn high_volume_rpc_stream_replaces_lagged_subscribers_and_retains_exact_ca
         journal_rows,
         event_rows,
     );
+    // Wall time is observational: this correctness test runs in the parallel package graph.
     println!(
         "activity RPC load: {} queued writers, journal revisions {}..{}; retained snapshot summaries {}, detail entries {}, journal/idempotency peaks {}/{} and final rows {}/{} in {:.1?}",
         QUEUED_WRITER_COUNT,
