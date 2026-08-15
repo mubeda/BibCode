@@ -104,10 +104,16 @@ pub enum WorktreeIdentityError {
 
 #[must_use]
 pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> String {
-    let source = match platform {
+    let mut source = match platform {
         HostPathPlatform::Posix => path.to_string_lossy().into_owned(),
         HostPathPlatform::Windows => path.to_string_lossy().replace('\\', "/"),
     };
+    if platform == HostPathPlatform::Windows {
+        source = strip_windows_verbatim_prefix(source);
+        if looks_like_posix_absolute_path(&source) {
+            return normalize_lexical_components(&source, HostPathPlatform::Posix);
+        }
+    }
     let normalized = normalize_lexical_components(&source, platform);
     match platform {
         HostPathPlatform::Posix => normalized,
@@ -183,6 +189,9 @@ pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
             HostPathPlatform::Windows,
         ));
     }
+    if uses_foreign_posix_identity(path, platform) {
+        return Ok(normalize_worktree_path_key(path, HostPathPlatform::Windows));
+    }
     let lexical = PathBuf::from(normalize_worktree_path_key(path, platform));
     let absolute = if lexical.is_absolute() {
         lexical
@@ -226,6 +235,22 @@ pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
             Err(error) => return Err(error),
         }
     }
+}
+
+fn strip_windows_verbatim_prefix(path: String) -> String {
+    if let Some(remainder) = path.strip_prefix("//?/UNC/") {
+        return format!("//{remainder}");
+    }
+    path.strip_prefix("//?/").unwrap_or(&path).to_owned()
+}
+
+fn looks_like_posix_absolute_path(path: &str) -> bool {
+    path.starts_with('/') && !path.starts_with("//")
+}
+
+pub(crate) fn uses_foreign_posix_identity(path: &Path, platform: HostPathPlatform) -> bool {
+    platform == HostPathPlatform::Windows
+        && looks_like_posix_absolute_path(&path.to_string_lossy().replace('\\', "/"))
 }
 
 fn looks_like_windows_absolute_path(path: &str) -> bool {
@@ -822,6 +847,24 @@ mod tests {
             normalize_worktree_path_key(Path::new("c:/repo/work"), HostPathPlatform::Windows)
         );
         assert_eq!(
+            normalize_worktree_path_key(Path::new(r"\\?\C:\Repo\Work"), HostPathPlatform::Windows,),
+            "C:/REPO/WORK",
+            "Win32 verbatim drive prefixes are not part of path identity",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\?\UNC\Server\Share\Repo"),
+                HostPathPlatform::Windows,
+            ),
+            "//SERVER/SHARE/REPO",
+            "Win32 verbatim UNC prefixes normalize to ordinary UNC identity",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new("/repo/Feature"), HostPathPlatform::Windows),
+            "/repo/Feature",
+            "foreign POSIX paths retain their case-sensitive identity on Windows",
+        );
+        assert_eq!(
             normalize_worktree_path_key(
                 Path::new(r"\\Server\Share\Repo"),
                 HostPathPlatform::Windows
@@ -951,8 +994,8 @@ mod tests {
         );
         assert_eq!(
             normalize_worktree_path_key(Path::new(r"C:\RÉPO\Σ\Feature"), HostPathPlatform::Windows,),
-            normalize_worktree_path_key(Path::new(r"c:/répo/ς/feature"), HostPathPlatform::Windows,),
-            "Windows ordinal caseless identity treats sigma and final sigma as one path"
+            normalize_worktree_path_key(Path::new(r"c:/répo/σ/feature"), HostPathPlatform::Windows,),
+            "Windows ordinal caseless identity treats capital and small sigma as one path"
         );
     }
 
@@ -962,7 +1005,7 @@ mod tests {
         let root = tempfile::tempdir().expect("Windows identity root");
         let present = root.path().join("RÉPO").join("Σ");
         std::fs::create_dir_all(&present).expect("present Unicode path");
-        let present_alias = root.path().join("répo").join("ς");
+        let present_alias = root.path().join("répo").join("σ");
         assert_eq!(
             canonical_worktree_path_key(&present)
                 .await
@@ -973,7 +1016,7 @@ mod tests {
         );
 
         let missing = present.join("MISSING").join("Σ");
-        let missing_alias = present_alias.join("missing").join("ς");
+        let missing_alias = present_alias.join("missing").join("σ");
         assert_eq!(
             canonical_worktree_path_key(&missing)
                 .await

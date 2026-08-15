@@ -3776,18 +3776,18 @@ mod tests {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
 
-        fn report_process_tree_exited(&self) {
-            self.tree_exit_supported
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.tree_exited
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-
         fn keep_process_tree_running(&self) {
             self.tree_exit_supported
                 .store(true, std::sync::atomic::Ordering::Release);
             self.tree_exited
                 .store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        fn report_process_tree_exited(&self) {
+            self.tree_exit_supported
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.tree_exited
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         fn fail_kill(&self, error: impl Into<String>) {

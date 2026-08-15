@@ -556,37 +556,6 @@ describe("deleteThread", () => {
   });
 
   it("leaves worktree runtime quiescing to the server and clears dependent panel state", async () => {
-  it("prompts, removes the orphaned worktree, and refreshes vcs status", async () => {
-    const shell = makeShell("t-del", { worktreePath: "C:/wt/x" });
-    const ref = registerShell(shell);
-    h.orphanedWorktreePath = "C:/wt/x";
-    h.localApi = { dialogs: { confirm: vi.fn(() => Promise.resolve(true)) } };
-    const actions = renderActions();
-
-    const result = await actions.deleteThread(ref);
-    expect(result._tag).toBe("Success");
-    expect(commandKeys()).toContain("vcs.removeWorktree");
-    expect(commandKeys()).toContain("vcs.refreshStatus");
-    expect(commandKeys().indexOf("vcs.removeWorktree")).toBeLessThan(
-      commandKeys().indexOf("thread.delete"),
-    );
-    const removeCall = h.commandCalls.find((call) => call.key === "vcs.removeWorktree");
-    const removeInput = (
-      removeCall!.input as {
-        input: {
-          path: string;
-          force: boolean;
-          ownerThreadId: ThreadId;
-          threadIds: ReadonlyArray<ThreadId>;
-        };
-      }
-    ).input;
-    expect(removeInput.path).toBe("C:/wt/x");
-    expect(removeInput.ownerThreadId).toBe(shell.id);
-    expect(removeInput.threadIds).toEqual([shell.id]);
-  });
-
-  it("tears down dependent panel threads before removing their workspace", async () => {
     const workspace = makeShell("t-workspace", {
       kind: "workspace",
       worktreePath: "C:/wt/x",
@@ -604,25 +573,6 @@ describe("deleteThread", () => {
 
     expect(result._tag).toBe("Success");
     expect(commandKeys()).toEqual(["worktree.removeFromBibCode"]);
-    const closeThreadIds = h.commandCalls
-      .filter((call) => call.key === "terminal.close")
-      .map((call) => (call.input as { input: { threadId: ThreadId } }).input.threadId);
-    expect(closeThreadIds).toEqual([workspace.id, panel.id]);
-    const removeCall = h.commandCalls.find((call) => call.key === "vcs.removeWorktree");
-    expect(
-      (
-        removeCall!.input as {
-          input: { ownerThreadId: ThreadId; threadIds: ReadonlyArray<ThreadId> };
-        }
-      ).input,
-    ).toMatchObject({
-      ownerThreadId: workspace.id,
-      threadIds: [workspace.id, panel.id],
-    });
-    const deletedThreadIds = h.commandCalls
-      .filter((call) => call.key === "thread.delete")
-      .map((call) => (call.input as { input: { threadId: ThreadId } }).input.threadId);
-    expect(deletedThreadIds).toEqual([panel.id, workspace.id]);
     const panelRef = scopeThreadRef(ENV, panel.id);
     expect(useCenterPanelStore.getState().removeThread).toHaveBeenNthCalledWith(1, workspaceRef);
     expect(useCenterPanelStore.getState().removeThread).toHaveBeenNthCalledWith(2, panelRef);

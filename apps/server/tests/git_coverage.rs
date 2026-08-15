@@ -2112,7 +2112,9 @@ async fn worktree_removal_remains_retryable_after_cleanup_outlives_the_retry_win
     assert!(
         first_error
             .detail
-            .contains("could not be cleaned before Git removal")
+            .contains("is still in use, so removal stopped before deleting any files"),
+        "unexpected protected-removal failure: {}",
+        first_error.detail
     );
     assert!(worktree_path.exists());
     let registered_path = worktree_path.to_string_lossy().replace('\\', "/");

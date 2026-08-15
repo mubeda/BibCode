@@ -378,34 +378,6 @@ export function useThreadActions() {
         }
       }
 
-      if (shouldDeleteWorktree && orphanedWorktreePath && threadProject) {
-        const removeResult = await removeWorktree({
-          environmentId: threadRef.environmentId,
-          input: {
-            cwd: threadProject.workspaceRoot,
-            path: orphanedWorktreePath,
-            force: true,
-            ownerThreadId: thread.id,
-            threadIds: [
-              thread.id,
-              ...threadsToTeardown
-                .filter((threadToTeardown) => threadToTeardown.id !== thread.id)
-                .map((threadToTeardown) => threadToTeardown.id),
-            ],
-          },
-        });
-        if (removeResult._tag === "Failure") {
-          const error = squashAtomCommandFailure(removeResult);
-          console.error("Failed to remove orphaned worktree before thread deletion", {
-            threadId: threadRef.threadId,
-            projectCwd: threadProject.workspaceRoot,
-            worktreePath: orphanedWorktreePath,
-            error,
-          });
-          return removeResult;
-        }
-      }
-
       const deletedThreadIds = new Set(deletedIds ?? []);
       for (const dependentPanelThread of dependentPanelThreads) {
         deletedThreadIds.add(dependentPanelThread.id);

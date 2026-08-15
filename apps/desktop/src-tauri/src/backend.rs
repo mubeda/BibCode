@@ -1738,6 +1738,8 @@ async fn start_managed_backend(
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
+            #[cfg(test)]
+            prepare_isolated_test_server_settings(&data_root.effective)?;
             let server_config = server_config_for_launch(data_root.clone(), &plan.config);
             let handle =
                 ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
@@ -1805,6 +1807,51 @@ async fn start_managed_backend(
             ))
         }
     }
+}
+
+#[cfg(test)]
+fn prepare_isolated_test_server_settings(base_dir: &Path) -> Result<(), String> {
+    let state_dir = base_dir.join("userdata");
+    fs::create_dir_all(&state_dir).map_err(|error| {
+        format!(
+            "failed to create isolated desktop test state at {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let settings_path = state_dir.join("settings.json");
+    let mut settings = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&settings_path)
+    {
+        Ok(settings) => settings,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to create isolated desktop test settings at {}: {error}",
+                settings_path.display()
+            ));
+        }
+    };
+    serde_json::to_writer(
+        &mut settings,
+        &json!({
+            "enableProviderUpdateChecks": false,
+            "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            }
+        }),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write isolated desktop test settings at {}: {error}",
+            settings_path.display()
+        )
+    })
 }
 
 fn server_config_for_launch(
@@ -2850,6 +2897,8 @@ mod tests {
         _root: tempfile::TempDir,
         command_path: PathBuf,
         server_binary: PathBuf,
+        #[cfg(windows)]
+        missing_command: bool,
     }
 
     impl TestWslCommandResolver {
@@ -2942,12 +2991,15 @@ exit /b 9
                 _root: root,
                 command_path,
                 server_binary,
+                #[cfg(windows)]
+                missing_command: false,
             }
         }
 
         #[cfg(windows)]
         fn with_missing_command(mut self) -> Self {
             self.command_path = self._root.path().join("missing-wsl.exe");
+            self.missing_command = true;
             self
         }
     }
@@ -2956,6 +3008,9 @@ exit /b 9
         fn command(&self) -> std::process::Command {
             #[cfg(windows)]
             {
+                if self.missing_command {
+                    return std::process::Command::new(&self.command_path);
+                }
                 let mut command = std::process::Command::new("cmd.exe");
                 command.args(["/d", "/s", "/c"]).arg(&self.command_path);
                 command
@@ -3094,7 +3149,7 @@ exit /b 9
             .expect("initial in-process backend should stop");
 
         supervisor.schedule_restart(plan, readiness, restart, "test restart".to_string());
-        let restarted = wait_for_restart_config(&supervisor).await;
+        let restarted = wait_for_restart_config(&supervisor, readiness.timeout).await;
         request_process_diagnostics(&restarted).await;
         assert_eq!(observer.observation_count(), 2);
 
@@ -3262,6 +3317,8 @@ exit /b 9
     async fn start_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+        prepare_isolated_test_server_settings(base_dir)
+            .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
         let handle = ServerRuntime::start_with_ui_process_observer(
             server_config_for_launch(test_cli_data_root(base_dir), &config),
@@ -3276,6 +3333,8 @@ exit /b 9
     async fn start_rpc_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+        prepare_isolated_test_server_settings(base_dir)
+            .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
         let server_config =
             server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
@@ -3375,8 +3434,11 @@ exit /b 9
         socket.close(None).await.expect("RPC socket should close");
     }
 
-    async fn wait_for_restart_config(supervisor: &BackendSupervisor) -> BackendRunConfig {
-        tokio::time::timeout(Duration::from_secs(5), async {
+    async fn wait_for_restart_config(
+        supervisor: &BackendSupervisor,
+        readiness_timeout: Duration,
+    ) -> BackendRunConfig {
+        tokio::time::timeout(readiness_timeout, async {
             loop {
                 let checkpoint = supervisor.runtime_published.checkpoint();
                 let config = {
@@ -3439,6 +3501,27 @@ exit /b 9
             advertised_host: None,
             tailscale_serve_enabled: false,
             tailscale_serve_port: 443,
+        }
+    }
+
+    #[test]
+    fn isolated_test_server_settings_disable_host_provider_probes() {
+        let root = tempfile::tempdir().expect("isolated state tempdir should open");
+
+        prepare_isolated_test_server_settings(root.path())
+            .expect("isolated desktop test settings should write");
+
+        let settings: Value = serde_json::from_slice(
+            &fs::read(root.path().join("userdata/settings.json"))
+                .expect("isolated desktop test settings should read"),
+        )
+        .expect("isolated desktop test settings should decode");
+        assert_eq!(settings["enableProviderUpdateChecks"], false);
+        for provider in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+            assert_eq!(
+                settings["providers"][provider]["enabled"], false,
+                "{provider} must not probe the developer host during desktop tests"
+            );
         }
     }
 

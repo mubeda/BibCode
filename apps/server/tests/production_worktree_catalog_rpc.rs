@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Condvar, Mutex as StdMutex,
+        Arc, Condvar, Mutex as StdMutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -13,7 +13,8 @@ use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     git::{
         GitCommandError, GitPrunableWorktree, GitRepository, GitWorktreeInventory,
-        GitWorktreeRecord, GitWorktreeRemovalInspection,
+        GitWorktreeRecord, GitWorktreeRemovalInspection, host_path_platform,
+        normalize_worktree_path_key,
     },
     orchestration::{
         EngineOptions, OrchestrationCommand, OrchestrationEngine, canonical_command_digest,
@@ -43,7 +44,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::timeout,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -190,13 +191,20 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
     )
     .await;
     let snapshot = success_value(fixture.socket(), "9903").await;
-    let target_path = canonical_string(&target);
     let descriptor = snapshot["worktrees"]
         .as_array()
         .expect("worktrees")
         .iter()
-        .find(|descriptor| descriptor["path"] == target_path)
+        .find(|descriptor| {
+            descriptor["path"]
+                .as_str()
+                .is_some_and(|path| same_worktree_identity(Path::new(path), &target))
+        })
         .expect("retarget descriptor");
+    let target_path = descriptor["path"]
+        .as_str()
+        .expect("retarget descriptor path")
+        .to_owned();
     request(
         fixture.socket(),
         "9904",
@@ -1262,7 +1270,11 @@ async fn adoption_interrupt_after_engine_handoff_retains_catalog_lifecycle_until
     assert!(owners.iter().any(|thread| {
         thread.kind == "workspace"
             && thread.deleted_at.is_none()
-            && thread.worktree_path.as_deref() == candidate["path"].as_str()
+            && thread.worktree_path.as_deref().is_some_and(|path| {
+                candidate["path"].as_str().is_some_and(|candidate| {
+                    same_worktree_identity(Path::new(path), Path::new(candidate))
+                })
+            })
     }));
     fixture.shutdown().await;
 }
@@ -1354,15 +1366,16 @@ async fn detach_interrupt_after_engine_handoff_retains_removal_lifecycle_until_t
     fixture.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destructive_remove_socket_close_after_engine_handoff_retains_lifecycle_until_terminal_receipt()
  {
     let hooks = TestHooks::default();
     let quiescer = Arc::new(RecordingPendingQuiescer::default());
+    let removal_git = Arc::new(ImmediateFilesystemRemovalGit::default());
     let mut fixture = CatalogRpcFixture::new_with_removal_services_and_options(
         true,
         quiescer.clone(),
-        None,
+        Some(removal_git.clone()),
         EngineOptions {
             queue_capacity: 16,
             test_hooks: hooks.clone(),
@@ -1384,9 +1397,20 @@ async fn destructive_remove_socket_close_after_engine_handoff_retains_lifecycle_
         ),
     )
     .await;
-    timeout(Duration::from_secs(5), pause.wait_until_entered())
+    if timeout(Duration::from_secs(5), pause.wait_until_entered())
         .await
-        .expect("removal reaches the engine after Git mutation");
+        .is_err()
+    {
+        let response = timeout(
+            Duration::from_millis(250),
+            next_server_message(fixture.socket()),
+        )
+        .await;
+        panic!(
+            "removal did not reach the engine after Git mutation; Git stages: {:?}; response: {response:?}",
+            removal_git.call_counts()
+        );
+    }
     assert!(
         !fixture.external.exists(),
         "Git mutation completed before the pause"
@@ -1859,7 +1883,6 @@ async fn adopt_race_converges_to_one_thread_without_creating_a_git_worktree() {
         .collect::<Vec<_>>();
     dispositions.sort_unstable();
     assert_eq!(dispositions, vec!["created", "existing"]);
-    let external_path = canonical_string(&fixture.external);
     let threads = fixture
         .repositories
         .list_threads_by_project("project-1".to_owned())
@@ -1871,7 +1894,9 @@ async fn adopt_race_converges_to_one_thread_without_creating_a_git_worktree() {
             .filter(|thread| {
                 thread.kind == "workspace"
                     && thread.deleted_at.is_none()
-                    && thread.worktree_path.as_deref() == Some(external_path.as_str())
+                    && thread.worktree_path.as_deref().is_some_and(|path| {
+                        same_worktree_identity(Path::new(path), &fixture.external)
+                    })
             })
             .count(),
         1
@@ -1963,7 +1988,10 @@ async fn adopt_public_admission_replays_exactly_and_conflicts_on_changed_payload
         ("thread-defaults", changed_defaults),
     ];
     let mut outcomes = Vec::new();
-    let external_path = canonical_string(&fixture.external);
+    let external_path = candidate["path"]
+        .as_str()
+        .expect("candidate path")
+        .to_owned();
     for (index, (field, changed_payload)) in mutations.into_iter().enumerate() {
         let request_id = (905 + index).to_string();
         request(
@@ -2247,7 +2275,7 @@ async fn adopted_branch_reconciliation_is_deterministic_and_healthy_only() {
         reconciliation_events[0].event.command_id.as_deref(),
         Some(expected_command_id.as_str())
     );
-    assert!(!expected_command_id.contains(&canonical_string(&fixture.external)));
+    assert!(!expected_command_id.contains(candidate["path"].as_str().expect("candidate path")));
 
     request(
         fixture.socket(),
@@ -3528,14 +3556,21 @@ async fn removal_reselects_a_same_repository_trusted_anchor_after_quiesce() {
     )
     .await;
     let snapshot = success_value(fixture.socket(), "1212").await;
-    let sibling_path = canonical_string(&sibling);
     let sibling_descriptor = snapshot["worktrees"]
         .as_array()
         .expect("worktrees")
         .iter()
-        .find(|descriptor| descriptor["path"] == sibling_path)
+        .find(|descriptor| {
+            descriptor["path"]
+                .as_str()
+                .is_some_and(|path| same_worktree_identity(Path::new(path), &sibling))
+        })
         .expect("trusted sibling descriptor")
         .clone();
+    let sibling_path = sibling_descriptor["path"]
+        .as_str()
+        .expect("trusted sibling path")
+        .to_owned();
     request(
         fixture.socket(),
         "1213",
@@ -3689,6 +3724,42 @@ async fn reserved_removal_resumes_after_git_succeeded_before_detach() {
 
     request(fixture.socket(), "1272", "worktree.remove", payload).await;
     assert_eq!(success_value(fixture.socket(), "1272").await, result);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_removal_retry_preserves_a_replacement_at_the_same_path() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id =
+        adopt_external_for_removal(&mut fixture, "remove-adopt-replacement-retry").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1273").await;
+    let payload = removal_payload("remove-replacement-retry", "project-1", &thread_id, &plan);
+
+    request(fixture.socket(), "1274", "worktree.remove", payload.clone()).await;
+    let result = success_value(fixture.socket(), "1274").await;
+    assert_eq!(result["gitOutcome"], "removed");
+    assert!(!fixture.external.exists(), "original worktree was removed");
+
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/replacement-after-removal"],
+        Some(&fixture.external),
+    );
+    let replacement = fixture.external.join("replacement-sentinel.txt");
+    fs::write(&replacement, "replacement must survive\n").expect("replacement sentinel");
+
+    request(fixture.socket(), "1275", "worktree.remove", payload).await;
+    assert_eq!(success_value(fixture.socket(), "1275").await, result);
+    assert_eq!(
+        fs::read_to_string(&replacement).expect("stale retry preserves replacement"),
+        "replacement must survive\n"
+    );
+    assert!(
+        git_output(&fixture.main, &["worktree", "list", "--porcelain"])
+            .replace('\\', "/")
+            .contains(&fixture.external.to_string_lossy().replace('\\', "/")),
+        "replacement remains registered as a Git worktree"
+    );
     fixture.shutdown().await;
 }
 
@@ -4111,6 +4182,7 @@ impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
 }
 
 struct CatalogRpcFixture {
+    _parallelism_permit: OwnedSemaphorePermit,
     root: TempDir,
     main: PathBuf,
     external: PathBuf,
@@ -4173,6 +4245,10 @@ impl CatalogRpcFixture {
         removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
         engine_options: EngineOptions,
     ) -> Self {
+        let parallelism_permit = catalog_rpc_fixture_parallelism()
+            .acquire_owned()
+            .await
+            .expect("catalog RPC fixture parallelism remains open");
         let root = tempfile::tempdir().expect("fixture root");
         let main = root.path().join("main");
         let external = root.path().join("external");
@@ -4254,6 +4330,7 @@ impl CatalogRpcFixture {
             .expect("WebSocket")
             .0;
         Self {
+            _parallelism_permit: parallelism_permit,
             root,
             main,
             external,
@@ -4348,6 +4425,12 @@ impl CatalogRpcFixture {
     }
 }
 
+fn catalog_rpc_fixture_parallelism() -> Arc<Semaphore> {
+    const MAX_PARALLEL_FIXTURES: usize = 4;
+    static PARALLELISM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(PARALLELISM.get_or_init(|| Arc::new(Semaphore::new(MAX_PARALLEL_FIXTURES))))
+}
+
 struct TestNoopQuiescer;
 
 impl WorktreeRemovalQuiescer for TestNoopQuiescer {
@@ -4386,6 +4469,126 @@ impl WorktreeRemovalQuiescer for SwitchingAnchorQuiescer {
 struct RecordingAnchorRemovalGit {
     inner: GitRepository,
     anchors: Arc<StdMutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+#[derive(Clone, Default)]
+struct ImmediateFilesystemRemovalGit {
+    inventory_calls: Arc<AtomicUsize>,
+    inspect_calls: Arc<AtomicUsize>,
+    remove_calls: Arc<AtomicUsize>,
+}
+
+impl ImmediateFilesystemRemovalGit {
+    fn call_counts(&self) -> (usize, usize, usize) {
+        (
+            self.inventory_calls.load(Ordering::SeqCst),
+            self.inspect_calls.load(Ordering::SeqCst),
+            self.remove_calls.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl WorktreeRemovalGit for ImmediateFilesystemRemovalGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        self.inventory_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let external = anchor
+                .parent()
+                .expect("test repository parent")
+                .join("external");
+            Ok(GitWorktreeInventory {
+                common_dir: anchor.join(".git"),
+                records: vec![
+                    GitWorktreeRecord {
+                        path: anchor,
+                        head: None,
+                        branch: Some("refs/heads/main".to_owned()),
+                        is_primary: true,
+                        is_bare: false,
+                        locked: false,
+                        lock_reason: None,
+                        is_prunable: false,
+                        prunable_reason: None,
+                    },
+                    GitWorktreeRecord {
+                        path: external,
+                        head: None,
+                        branch: Some("refs/heads/feature/external".to_owned()),
+                        is_primary: false,
+                        is_bare: false,
+                        locked: false,
+                        lock_reason: None,
+                        is_prunable: false,
+                        prunable_reason: None,
+                    },
+                ],
+                nul_delimited: true,
+            })
+        })
+    }
+
+    fn inspect(
+        &self,
+        _anchor: PathBuf,
+        _record: GitWorktreeRecord,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(GitWorktreeRemovalInspection::default()) })
+    }
+
+    fn preview_prune(
+        &self,
+        _anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn remove(
+        &self,
+        _anchor: PathBuf,
+        record: GitWorktreeRecord,
+        _force_dirty: bool,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        self.remove_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::fs::remove_dir_all(&record.path)
+                .await
+                .map_err(|error| GitCommandError {
+                    tag: "GitCommandError",
+                    operation: "test.removeWorktree".into(),
+                    command: "test filesystem removal".into(),
+                    cwd: record.path.to_string_lossy().into_owned().into(),
+                    diagnostics: None,
+                    detail: error.to_string().into(),
+                })
+        })
+    }
+
+    fn prune(
+        &self,
+        _anchor: PathBuf,
+        _record: GitWorktreeRecord,
+        _expected_impact_digest: String,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        Box::pin(async {
+            Err(GitCommandError {
+                tag: "GitCommandError",
+                operation: "test.pruneWorktrees".into(),
+                command: "unexpected test prune".into(),
+                cwd: "<test>".into(),
+                diagnostics: None,
+                detail: "the immediate removal fixture does not support pruning".into(),
+            })
+        })
+    }
 }
 
 impl RecordingAnchorRemovalGit {
@@ -5079,11 +5282,9 @@ async fn wait_for_mutation_and_catalog_count(
     catalog.expect("catalog mutation result")
 }
 
-fn canonical_string(path: &Path) -> String {
-    fs::canonicalize(path)
-        .expect("canonical path")
-        .to_string_lossy()
-        .into_owned()
+fn same_worktree_identity(left: &Path, right: &Path) -> bool {
+    normalize_worktree_path_key(left, host_path_platform())
+        == normalize_worktree_path_key(right, host_path_platform())
 }
 
 fn git(cwd: &Path, args: &[&str], final_path: Option<&Path>) {

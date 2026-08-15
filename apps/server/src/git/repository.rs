@@ -136,9 +136,28 @@ impl WorktreePathPolicy {
     }
 }
 
-#[derive(Debug)]
 struct OwnedWorktreePath {
     path: PathBuf,
+    identity: OwnedWorktreePathIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedWorktreePathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+type OwnedWorktreePathIdentity = WindowsFileIdentity;
+
+impl fmt::Debug for OwnedWorktreePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedWorktreePath")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,15 +191,32 @@ impl OwnedWorktreePath {
                 source,
             })?;
         }
-        fs::create_dir(&path).map_err(|source| WorktreePathReservationError {
-            stage: WorktreePathReservationStage::Destination,
-            source,
+        let lease = create_removal_directory_lease(&path).map_err(|source| {
+            WorktreePathReservationError {
+                stage: WorktreePathReservationStage::Destination,
+                source,
+            }
         })?;
-        Ok(Self { path })
+        let identity = match owned_worktree_path_identity(&lease) {
+            Ok(identity) => identity,
+            Err(source) => {
+                let _ = delete_bound_directory_root_blocking(lease, &path);
+                return Err(WorktreePathReservationError {
+                    stage: WorktreePathReservationStage::Destination,
+                    source,
+                });
+            }
+        };
+        drop(lease);
+        Ok(Self { path, identity })
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn identity(&self) -> OwnedWorktreePathIdentity {
+        self.identity
     }
 }
 
@@ -492,35 +528,54 @@ impl GitRepository {
             worktree_record_mismatch_error("GitVcsDriver.removeWorktreeVerified", anchor, record)
         })?;
         let target_path = fresh.path.clone();
-        let args = vec![
-            "worktree".into(),
-            "remove".into(),
-            "--force".into(),
-            "--".into(),
-            display_path(&target_path),
-        ];
-        let mutation = self
-            .run(
-                "GitVcsDriver.removeWorktreeVerified",
-                anchor,
-                &args,
-                cancellation,
-            )
-            .await;
+        match tokio::fs::symlink_metadata(&target_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let impact = self
+                    .worktree_prune_impact(anchor, &inventory, cancellation)
+                    .await?;
+                let exact_target_only = matches!(
+                    impact.as_slice(),
+                    [entry]
+                        if normalized_worktree_path(&entry.path)
+                            == normalized_worktree_path(&target_path)
+                );
+                if !exact_target_only {
+                    return Err(simple_error(
+                        "GitVcsDriver.removeWorktreeVerified",
+                        anchor,
+                        "The missing worktree registration cannot be cleaned without pruning additional registrations.",
+                    ));
+                }
+                let impact_digest = git_worktree_prune_impact_digest(&impact);
+                return self
+                    .prune_worktrees_verified(anchor, fresh, &impact_digest, cancellation)
+                    .await;
+            }
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.removeWorktreeVerified",
+                    anchor,
+                    &format!(
+                        "The registered worktree path '{}' could not be inspected before protected removal: {error}",
+                        display_path(&target_path)
+                    ),
+                ));
+            }
+        }
+        self.remove_worktree(anchor, &target_path, true, cancellation)
+            .await?;
         let verification = self
             .worktree_inventory(anchor, &CancellationToken::new())
             .await?;
         if !inventory_contains_path(&verification, &target_path) {
             return Ok(());
         }
-        match mutation {
-            Ok(_) => Err(simple_error(
-                "GitVcsDriver.removeWorktreeVerified.verify",
-                anchor,
-                "Git reported successful worktree removal, but the exact target registration survived verification.",
-            )),
-            Err(error) => Err(error),
-        }
+        Err(simple_error(
+            "GitVcsDriver.removeWorktreeVerified.verify",
+            anchor,
+            "Protected Git worktree removal completed, but the exact target registration survived verification.",
+        ))
     }
 
     pub async fn preview_worktree_prune(
@@ -1657,27 +1712,82 @@ impl GitRepository {
         owned_path: &OwnedWorktreePath,
     ) -> Result<(), GitCommandError> {
         let cleanup_token = CancellationToken::new();
-        self.remove_worktree(cwd, owned_path.path(), true, &cleanup_token)
-            .await?;
-        match tokio::fs::symlink_metadata(owned_path.path()).await {
-            Ok(_) => Err(simple_error(
+        let mut args = strings(&["worktree", "remove", "--force", "--"]);
+        args.push(display_path(owned_path.path()));
+        let removal_error = self
+            .run(
                 "GitVcsDriver.createWorktree.cleanup",
                 cwd,
-                &format!(
-                    "The owned worktree path '{}' still exists after protected cleanup.",
-                    display_path(owned_path.path())
-                ),
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(simple_error(
-                "GitVcsDriver.createWorktree.cleanup",
-                cwd,
-                &format!(
-                    "The owned worktree path '{}' could not be inspected after protected cleanup: {error}",
-                    display_path(owned_path.path())
-                ),
-            )),
+                &args,
+                &cleanup_token,
+            )
+            .await
+            .err();
+        let still_registered = self
+            .worktree_paths(cwd, &cleanup_token)
+            .await?
+            .iter()
+            .any(|registered| same_worktree_path(registered, owned_path.path()));
+        if still_registered {
+            return Err(removal_error.unwrap_or_else(|| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree '{}' is still registered after cleanup.",
+                        display_path(owned_path.path())
+                    ),
+                )
+            }));
         }
+        match tokio::fs::symlink_metadata(owned_path.path()).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be inspected after Git cleanup: {error}",
+                        display_path(owned_path.path())
+                    ),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let lease = open_removal_directory_lease_async(owned_path.path())
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be bound for cleanup: {error}",
+                        display_path(owned_path.path())
+                    ),
+                )
+            })?;
+        verify_owned_worktree_path_identity(&lease, owned_path.identity()).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.createWorktree.cleanup",
+                cwd,
+                &format!(
+                    "The owned worktree path '{}' was replaced before cleanup: {error}",
+                    display_path(owned_path.path())
+                ),
+            )
+        })?;
+        remove_bound_owned_directory_with_lease(owned_path.path(), lease)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be removed: {error}",
+                        display_path(owned_path.path())
+                    ),
+                )
+            })
     }
 
     pub(crate) async fn rollback_managed_worktree_creation(
@@ -3419,6 +3529,38 @@ fn verify_removal_directory_lease(
     Ok(())
 }
 
+#[cfg(unix)]
+fn owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+) -> Result<OwnedWorktreePathIdentity, io::Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = lease.handle.metadata()?;
+    Ok(OwnedWorktreePathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+) -> Result<OwnedWorktreePathIdentity, io::Error> {
+    windows_file_identity(&lease.handle)
+}
+
+fn verify_owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+    expected: OwnedWorktreePathIdentity,
+) -> Result<(), io::Error> {
+    if owned_worktree_path_identity(lease)? != expected {
+        return Err(io::Error::other(
+            "the reserved worktree directory identity changed",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_identity_marker_blocking(
     path: &Path,
     marker_name: &str,
@@ -3993,6 +4135,28 @@ async fn remove_bound_identity_directory_with_lease(
     })
     .await
     .map_err(|error| io::Error::other(format!("bound directory cleanup task failed: {error}")))?
+}
+
+async fn remove_bound_owned_directory_with_lease(
+    path: &Path,
+    lease: RemovalDirectoryLease,
+) -> Result<(), io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut last_error = None;
+        for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+            match clear_bound_directory_contents(&lease, &path, None) {
+                Ok(()) => return delete_bound_directory_root_blocking(lease, &path),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
+                std::thread::sleep(WORKTREE_REMOVE_RETRY_DELAY);
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("owned directory cleanup failed")))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("owned directory cleanup task failed: {error}")))?
 }
 
 fn clear_bound_identity_directory_once(

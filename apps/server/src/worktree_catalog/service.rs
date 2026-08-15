@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     git::{
         GitRepository, GitWorktreeInventory, host_path_platform, normalize_worktree_path_key,
-        worktree_key, worktree_repository_key,
+        uses_foreign_posix_identity, worktree_key, worktree_repository_key,
     },
     persistence::{ProjectionThread, Repositories, WorktreeRepositoryPinOutcome},
 };
@@ -1212,7 +1212,7 @@ impl WorktreeCatalogService {
         }
         Ok(ResolvedAdoptionCandidate {
             worktree_key: candidate_key.to_owned(),
-            path: normalize_worktree_path_key(&canonical_record, platform),
+            path: record.path.to_string_lossy().into_owned(),
             branch: record.branch.clone(),
             head: record.head.clone(),
             generation,
@@ -2125,6 +2125,9 @@ impl WorktreeCatalogService {
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, ScanError> {
+        if uses_foreign_posix_identity(path, host_path_platform()) {
+            return Ok(normalize_worktree_path_key(path, host_path_platform()));
+        }
         let lexical = PathBuf::from(normalize_worktree_path_key(path, host_path_platform()));
         let absolute = if lexical.is_absolute() {
             lexical
@@ -2286,7 +2289,7 @@ impl WorktreeCatalogService {
                 && !suppressions.contains(&normalized_path);
             worktrees.push(WorktreeDescriptor {
                 worktree_key: record_worktree_key,
-                path: normalized_path,
+                path: record.path.to_string_lossy().into_owned(),
                 branch: record.branch.clone(),
                 head: record.head.clone(),
                 is_primary: record.is_primary,
@@ -2306,10 +2309,8 @@ impl WorktreeCatalogService {
             let Some(path) = &thread.worktree_path else {
                 continue;
             };
-            let normalized = self.physical_path_key(path, cancellation).await?;
             let descriptor = worktrees.iter().find(|descriptor| {
                 descriptor.adopted_thread_id.as_deref() == Some(thread.thread_id.as_str())
-                    || descriptor.path == normalized
             });
             let status = if let Some(descriptor) = descriptor {
                 AdoptedWorktreeStatus {
@@ -2342,7 +2343,7 @@ impl WorktreeCatalogService {
                 AdoptedWorktreeStatus {
                     thread_id: thread.thread_id.clone(),
                     worktree_key: None,
-                    path: normalized,
+                    path: path.to_string_lossy().into_owned(),
                     branch: thread.branch.clone(),
                     availability: AdoptedWorktreeAvailability::MissingUnregistered,
                     registration_state: None,

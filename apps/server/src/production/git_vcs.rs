@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     git::{
         ChangeRequest, CreateWorktreeInput, GitRepository, OutputPolicy, ProcessRequest,
-        ProcessRunner,
-        StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusStreamEvent,
+        ProcessRunner, StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult,
+        VcsStatusStreamEvent,
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},

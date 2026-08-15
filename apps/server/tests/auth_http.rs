@@ -1423,8 +1423,10 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
     drop(setup);
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stop = Arc::clone(&stop);
-    let startup_in_progress = Arc::new(AtomicBool::new(false));
-    let writer_startup_in_progress = Arc::clone(&startup_in_progress);
+    let startup_started = Arc::new(AtomicBool::new(false));
+    let writer_startup_started = Arc::clone(&startup_started);
+    let startup_finished = Arc::new(AtomicBool::new(false));
+    let writer_startup_finished = Arc::clone(&startup_finished);
     let checkpoints_during_startup = Arc::new(AtomicUsize::new(0));
     let writer_checkpoints_during_startup = Arc::clone(&checkpoints_during_startup);
     let (checkpoint_ready, checkpoint_observed) = std::sync::mpsc::sync_channel(1);
@@ -1438,6 +1440,8 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
         let mut successful_checkpoints = 0_usize;
         let mut ordinal = 0_i64;
         while !writer_stop.load(Ordering::Acquire) || ordinal < 2 {
+            let cycle_started_before_startup_finished =
+                !writer_startup_finished.load(Ordering::Acquire);
             checkpoint
                 .execute(
                     "UPDATE validation_startup_churn SET revision = ?1 WHERE singleton = 1",
@@ -1451,7 +1455,12 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
                 .expect("live-store checkpoint");
             if checkpoint_result == 0 {
                 successful_checkpoints += 1;
-                if writer_startup_in_progress.load(Ordering::Acquire) {
+                // Compare interval boundaries instead of sampling one in-progress flag here.
+                // A checkpoint may begin before startup and finish after a fast startup has
+                // completed; that cycle still overlaps startup and must not be missed.
+                if cycle_started_before_startup_finished
+                    && writer_startup_started.load(Ordering::Acquire)
+                {
                     writer_checkpoints_during_startup.fetch_add(1, Ordering::AcqRel);
                 }
                 if let Some(ready) = checkpoint_ready.take() {
@@ -1467,9 +1476,9 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
         .recv_timeout(Duration::from_secs(5))
         .expect("initial checkpoint signal");
 
-    startup_in_progress.store(true, Ordering::Release);
+    startup_started.store(true, Ordering::Release);
     let second = start_desktop_server(&temp).await;
-    startup_in_progress.store(false, Ordering::Release);
+    startup_finished.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let successful_checkpoints = writer.join().expect("live-store writer thread");
     assert!(
