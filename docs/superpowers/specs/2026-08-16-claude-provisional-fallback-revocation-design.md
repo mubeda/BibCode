@@ -160,6 +160,14 @@ On deadline or stream failure, the test reports the last authoritative snapshot
 and fixture capture, closes all three WebSockets, and shuts down and joins the
 server owner before failing.
 
+Every unary RPC issued after the observer sockets are owned uses a fallible
+helper with that same absolute deadline. The helper bounds both send and
+response receipt, validates the request ID and frame without panicking, and
+keeps application failures distinct from transport/protocol failures. Setup,
+authoritative snapshot reads, and the two expected cancellation failures feed
+their errors into the same owner-cleanup path; no legacy relative RPC timeout or
+hidden helper panic may bypass socket closure and awaited server join.
+
 ## Data and Concurrency Flow
 
 1. Claude stream and authenticated hook facts enter one session-generation
