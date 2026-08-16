@@ -57,4 +57,3 @@ falls back to the source value rather than becoming blank or throwing.
   timestamp preference and formatter behavior.
 - **Server-formatted timestamps:** crosses the server/UI ownership boundary,
   loses client locale preferences, and weakens canonical protocol data.
-
