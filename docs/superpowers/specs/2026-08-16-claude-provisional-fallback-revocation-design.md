@@ -105,7 +105,7 @@ reconciliation revokes every provisional fallback in that set before returning:
 The actors therefore remain visible and `running`, while the Activity control
 overlay becomes `unsupported`. No stop request or root interrupt is emitted.
 The revocation is idempotent, generation-owned, and bounded by the existing
-200-correlation limit.
+correlation limits plus a separate 200-entry ambiguity-memory cap.
 
 Affirmative competing evidence is retained as bounded parent-level ambiguity
 for the rest of the runtime generation. A parent becomes fallback-ambiguous
@@ -116,6 +116,17 @@ stays disabled for that parent until generation reset. This prevents exact
 resolution of one sibling from making an unresolved sibling appear newly
 unique by elimination. Exact PostToolUse evidence remains authoritative and
 can still resolve every named child independently.
+
+Ambiguous parent identities are retained even after their terminal task facts
+are cleaned up, because terminal cleanup must not make fallback eligible again
+within the same generation. The correlator retains at most 200 distinct parent
+identities. Reaching 200 entries alone preserves the per-parent deny set; if a
+further distinct-parent ambiguity is affirmatively observed while the set is at
+capacity, a generation-owned overflow latch disables every provisional
+fallback admission until generation reset. Exact PostToolUse resolution does
+not consult the deny set or overflow latch and remains authoritative. This
+fail-closed boundary prevents eviction or omission from reopening an ambiguous
+parent while keeping retained memory bounded.
 
 The neighboring public selected-subtree regression must establish exact nested
 identity before it introduces an unrelated parentless actor. Its authenticated
@@ -186,8 +197,10 @@ There is no new task, timer, queue, mutex, or cross-runtime state.
 
 ## Failure and Cleanup Semantics
 
-- Malformed, conflicting, saturated, stale-generation, and duplicate identity
-  facts continue to fail closed.
+- Malformed, conflicting, stale-generation, and duplicate identity facts
+  continue to fail closed. At 200 retained ambiguous parents, the next
+  affirmative distinct-parent ambiguity latches all provisional fallback
+  admission closed for the generation; exact evidence remains available.
 - Partial revocation is not observable: all effects are computed within the
   correlator call and published through the existing provider event batch.
 - Replayed provisional facts cannot reinstall a target while the complete
@@ -220,6 +233,12 @@ SubagentStart.
 
 Add a follow-up exact-evidence case proving a matching PostToolUse can resolve
 one child after provisional ambiguity without reopening the other.
+
+Add a bounded-overflow case that creates and terminally cleans 201 distinct
+affirmatively ambiguous parents. Require the first 200 identities to remain
+retained, the 201st distinct-parent ambiguity attempt to set the overflow latch,
+a fresh unique fallback to remain unsupported, and matching exact PostToolUse
+evidence for that fresh child to install normally.
 
 ### Public integration regression
 

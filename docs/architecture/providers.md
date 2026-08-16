@@ -252,8 +252,10 @@ and retains the actors and task facts as unresolved evidence. Exact targets are 
 revoked by sibling ambiguity, and exact evidence may later resolve one named child.
 Affirmative parent-level ambiguity disables further fallback for that parent until
 generation reset, so resolving one sibling exactly cannot reopen another by elimination.
-At most 200 ambiguous parent identities are retained; saturation disables all fallback
-admission until generation reset while exact PostToolUse identity remains authoritative.
+At most 200 ambiguous parent identities are retained across terminal cleanup. Reaching
+capacity preserves those parent-specific denials; a further affirmative ambiguity for a
+distinct parent latches all fallback admission closed until generation reset, while exact
+PostToolUse identity remains authoritative.
 
 | Provider | Structured chat | Structured activity                                                                                                                                                                                                                   | Provider-terminal observation                                                                                      | Downgrade behavior                                                                                                                                                                              |
 | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
