@@ -28,9 +28,7 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
     >
       <DialogPopup className="max-w-lg overflow-hidden" showCloseButton={!workflow.busy}>
         <DialogTitle className="sr-only">Add a project</DialogTitle>
-        <DialogDescription className="sr-only">
-          Choose how to add a project and which connected host should own it.
-        </DialogDescription>
+        <DialogDescription className="sr-only">Choose how to add a project.</DialogDescription>
         <div
           className="max-h-[min(80vh,40rem)] overflow-y-auto px-6 py-5"
           data-add-project-content="true"
