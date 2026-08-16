@@ -1076,7 +1076,12 @@ describe("ActivityPanel detail", () => {
     const firstEntryTime = container.querySelector<HTMLTimeElement>(
       '[data-activity-entry-id="entry-1"] time[datetime="2026-07-22T20:01:00.000Z"]',
     );
+    expect(firstEntryTime?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:01:00.000Z", "24-hour"),
+    );
+    expect(firstEntryTime?.dateTime).toBe("2026-07-22T20:01:00.000Z");
     expect(firstEntryTime?.title).toBe("2026-07-22T20:01:00.000Z");
+    expect(firstEntryTime?.textContent).not.toBe(firstEntryTime?.dateTime);
     expect(new Set(entries.map((row) => row.dataset.activityEntryKind)).size).toBe(5);
     expect(container.textContent).toContain(command);
     expect(container.textContent).not.toContain("stale duplicate title");
@@ -1094,7 +1099,9 @@ describe("ActivityPanel detail", () => {
             selectedRecordKind: "actor",
             selectedRecordId: "child",
           },
-          detail: detailQuery("actor", "child", [detailPage(child, [])]),
+          detail: detailQuery("actor", "child", [
+            detailPage(child, [entry("bad-entry", "command", "not-a-date")]),
+          ]),
         })}
       />,
     );
@@ -1103,6 +1110,45 @@ describe("ActivityPanel detail", () => {
     expect(started?.textContent).toBe("not-a-date");
     expect(started?.dateTime).toBe("not-a-date");
     expect(started?.title).toBe("not-a-date");
+    const entryTimestamp = container.querySelector<HTMLTimeElement>(
+      '[data-activity-entry-id="bad-entry"] time[datetime="not-a-date"]',
+    );
+    expect(entryTimestamp?.textContent).toBe("not-a-date");
+    expect(entryTimestamp?.dateTime).toBe("not-a-date");
+    expect(entryTimestamp?.title).toBe("not-a-date");
+  });
+
+  it("formats event timestamps in a narrow detail row while retaining canonical metadata", async () => {
+    const createdAt = "2026-07-22T20:01:02.123456789Z";
+    const child = actor("child");
+    const container = await mount(
+      <div style={{ width: "12rem" }}>
+        <ActivityPanel
+          {...props({
+            route: {
+              section: "subagents",
+              selectedRecordKind: "actor",
+              selectedRecordId: "child",
+            },
+            detail: detailQuery("actor", "child", [
+              detailPage(child, [
+                entry("narrow-command", "command", createdAt, null, {
+                  title: "A command title that uses the remaining narrow row space",
+                }),
+              ]),
+            ]),
+          })}
+        />
+      </div>,
+    );
+
+    const timestamp = container.querySelector<HTMLTimeElement>(
+      `[data-activity-entry-id="narrow-command"] time[datetime="${createdAt}"]`,
+    );
+    expect(timestamp?.textContent).toBe(formatChatTimestampTooltip(createdAt, "24-hour"));
+    expect(timestamp?.dateTime).toBe(createdAt);
+    expect(timestamp?.title).toBe(createdAt);
+    expect(timestamp?.textContent).not.toBe(timestamp?.dateTime);
   });
 
   it("filters entries whose owner does not match the keyed record", async () => {

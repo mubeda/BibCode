@@ -270,7 +270,7 @@ export function ActivityRecordDetail({
               key={window[0]?.id}
             >
               {window.map((entry) => (
-                <ActivityEntryRow entry={entry} key={entry.id} />
+                <ActivityEntryRow entry={entry} key={entry.id} timestampFormat={timestampFormat} />
               ))}
             </div>
           ))
