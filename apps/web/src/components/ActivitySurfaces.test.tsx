@@ -109,6 +109,7 @@ function panelProps(
     nextCursor: null,
   } as ActivityRosterPageData;
   return {
+    timestampFormat: "24-hour",
     route: {
       section: "subagents",
       selectedRecordKind: null,

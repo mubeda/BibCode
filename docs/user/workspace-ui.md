@@ -218,6 +218,10 @@ multiplicity signal: they are primary row content, while elapsed time is
 secondary metadata aligned beneath the section title. The same Activity
 presentation is used in the inline right panel and its responsive sheet.
 
+Activity record details format Started and Ended instants using the user's
+timestamp preference. The exact canonical RFC 3339 value remains available in
+the semantic time metadata and hover tooltip.
+
 Subagents follow the canonical actor hierarchy, using indentation and a
 connector for a visible parent. Missing, invalid, cyclic, or otherwise unusable
 parentage safely renders the actor as a root rather than inventing a hierarchy.

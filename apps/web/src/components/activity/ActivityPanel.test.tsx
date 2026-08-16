@@ -18,6 +18,7 @@ import {
   type ActivityQueryResult,
   type ActivityRosterPageData,
 } from "./ActivityPanel";
+import { formatChatTimestampTooltip } from "~/timestampFormat";
 
 const FIXED_NOW = "2026-07-22T20:20:00.000Z";
 const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }> = [];
@@ -186,6 +187,7 @@ function props(overrides: Partial<ActivityPanelProps> = {}): ActivityPanelProps 
     onLoadMoreDetail: vi.fn(),
     onRefreshSnapshot: vi.fn(),
     now: FIXED_NOW,
+    timestampFormat: "24-hour",
     ...overrides,
   };
 }
@@ -1040,8 +1042,21 @@ describe("ActivityPanel detail", () => {
     expect(container.textContent).toContain("Actor");
     expect(container.textContent).toContain("Completed");
     expect(container.textContent).toContain("codex");
-    expect(container.textContent).toContain("2026-07-22T20:00:00.000Z");
-    expect(container.textContent).toContain("2026-07-22T20:15:00.000Z");
+    const started = container.querySelector<HTMLTimeElement>(
+      'time[datetime="2026-07-22T20:00:00.000Z"]',
+    );
+    const ended = container.querySelector<HTMLTimeElement>(
+      'time[datetime="2026-07-22T20:15:00.000Z"]',
+    );
+    expect(started?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:00:00.000Z", "24-hour"),
+    );
+    expect(ended?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:15:00.000Z", "24-hour"),
+    );
+    expect(started?.title).toBe("2026-07-22T20:00:00.000Z");
+    expect(ended?.title).toBe("2026-07-22T20:15:00.000Z");
+    expect(started?.textContent).not.toBe(started?.dateTime);
     const parentButton = container.querySelector<HTMLButtonElement>(
       'button[data-activity-relation="parent"]',
     );
@@ -1063,6 +1078,27 @@ describe("ActivityPanel detail", () => {
     expect(container.textContent).not.toContain("stale duplicate title");
     expect(container.querySelector("script")).toBeNull();
     expect(Reflect.get(globalThis, "pwned")).toBeUndefined();
+  });
+
+  it("preserves malformed activity timestamps in visible and semantic metadata", async () => {
+    const child = actor("child", { startedAt: "not-a-date" });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          route: {
+            section: "subagents",
+            selectedRecordKind: "actor",
+            selectedRecordId: "child",
+          },
+          detail: detailQuery("actor", "child", [detailPage(child, [])]),
+        })}
+      />,
+    );
+
+    const started = container.querySelector<HTMLTimeElement>('time[datetime="not-a-date"]');
+    expect(started?.textContent).toBe("not-a-date");
+    expect(started?.dateTime).toBe("not-a-date");
+    expect(started?.title).toBe("not-a-date");
   });
 
   it("filters entries whose owner does not match the keyed record", async () => {

@@ -26,6 +26,7 @@ import {
   PROVIDER_DISPLAY_NAMES,
   RuntimeMode,
 } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   connectionStatusText,
   type EnvironmentConnectionPresentation,
@@ -547,10 +548,12 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   target,
   threadRef,
   surface,
+  timestampFormat,
 }: {
   readonly target: ActivityStateTarget;
   readonly threadRef: ScopedThreadRef;
   readonly surface: ActivityRightPanelSurface;
+  readonly timestampFormat: TimestampFormat;
 }) {
   const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const stateSourceAtom = useMemo(() => environmentActivity.stateAtom(target), [target]);
@@ -834,6 +837,7 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   }
   return (
     <ActivityPanel
+      timestampFormat={timestampFormat}
       route={surface}
       snapshot={snapshot}
       roster={roster}
@@ -5845,6 +5849,7 @@ function ChatViewContent(props: ChatViewProps) {
         target={activityStateTarget}
         threadRef={activeThreadRef}
         surface={activeActivitySurface}
+        timestampFormat={timestampFormat}
       />
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
