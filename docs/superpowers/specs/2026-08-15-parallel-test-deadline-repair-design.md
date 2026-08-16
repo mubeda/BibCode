@@ -65,10 +65,14 @@ deadline is created once before the operation begins and is passed to
 `timeout_at`; later stages consume the remaining budget instead of receiving a
 fresh timeout.
 
-The integration deadline is 15 seconds, matching the existing loaded provider
-startup milestone coverage in the same module. It governs test observation
-only. Provider production timeouts and the dedicated tests that prove those
-production timeout/kill/reap contracts remain unchanged.
+The integration deadline is 30 seconds. Native Windows verification of the
+full 1,304-test server library at the 32-thread harness default measured the
+combined Claude, Codex, Cursor, and Grok fixture at 16.66 seconds under load,
+while the same test completed in 0.94 seconds alone. The earlier 15-second
+budget therefore expired before Cursor could publish its prompt even though
+the provider sequence remained healthy. The deadline remains one absolute
+test-only bound; provider production timeouts and the dedicated tests that
+prove those production timeout/kill/reap contracts remain unchanged.
 
 The affected tests must still observe their real boundary events:
 
@@ -127,8 +131,9 @@ Implementation uses strict RED to GREEN evidence:
 2. Add or adjust focused coverage so an absolute provider fixture deadline is
    shared rather than reset between milestones.
 3. Run the activity load exact test and full integration binary.
-4. Run each affected provider exact test, then the provider-runtime test module
-   at default, 8, and 12 harness threads.
+4. Run each affected provider exact test, the provider-runtime test module at
+   8 and 12 harness threads, and the full server library at the native harness
+   default.
 5. Run `cargo fmt --all --check`, server Clippy with warnings denied,
    `vp check`, and `vp run typecheck`.
 6. Run one fresh `vp run test` graph. A different failure stops verification
