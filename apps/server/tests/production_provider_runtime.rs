@@ -1436,6 +1436,66 @@ where
     rpc_response(socket, id).await
 }
 
+async fn try_tagged_rpc_request_until<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    tag: &str,
+    payload: Value,
+    deadline: tokio::time::Instant,
+) -> Result<Result<Value, Value>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let expected_request_id = RequestId::try_from(id)
+        .map_err(|error| format!("invalid unary RPC request ID {id:?}: {error}"))?;
+    timeout_at(
+        deadline,
+        socket.send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        )),
+    )
+    .await
+    .map_err(|_| format!("unary RPC {tag} send deadline elapsed"))?
+    .map_err(|error| format!("failed to send unary RPC {tag}: {error}"))?;
+
+    let frame = timeout_at(deadline, socket.next())
+        .await
+        .map_err(|_| format!("unary RPC {tag} response deadline elapsed"))?
+        .ok_or_else(|| format!("unary RPC {tag} WebSocket closed before response"))?
+        .map_err(|error| format!("invalid unary RPC {tag} frame: {error}"))?;
+    let Message::Text(text) = frame else {
+        return Err(format!(
+            "expected text unary RPC {tag} frame, got {frame:?}"
+        ));
+    };
+    let message = serde_json::from_str::<ServerMessage>(&text)
+        .map_err(|error| format!("invalid unary RPC {tag} message: {error}"))?;
+    match message {
+        ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Success { value },
+        } if request_id == expected_request_id => Ok(Ok(value.unwrap_or(Value::Null))),
+        ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Failure { cause },
+        } if request_id == expected_request_id => serde_json::to_value(cause)
+            .map(Err)
+            .map_err(|error| format!("failed to encode unary RPC {tag} failure: {error}")),
+        ServerMessage::Exit { request_id, .. } => Err(format!(
+            "unary RPC {tag} response ID mismatch: expected {expected_request_id}, got {request_id}"
+        )),
+        message => Err(format!("unexpected unary RPC {tag} response: {message:?}")),
+    }
+}
+
 async fn stream_rpc_request<S>(socket: &mut WebSocketStream<S>, id: &str, tag: &str, payload: Value)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -13900,7 +13960,7 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
             ))
             .await
             .map_err(|error| format!("failed to ACK initial thread snapshot: {error}"))?;
-        tagged_rpc_request(
+        try_tagged_rpc_request_until(
             &mut socket,
             "9603",
             "orchestration.dispatchCommand",
@@ -13911,8 +13971,10 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
                 "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
                 "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
             }),
+            deadline,
         )
         .await
+        .map_err(|error| format!("ambiguous Claude turn transport failed: {error}"))?
         .map_err(|error| format!("ambiguous Claude turn admission failed: {error}"))?;
         loop {
             let message = stream_rpc_message_until(&mut thread_stream, deadline).await?;
@@ -14058,13 +14120,15 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
                 .map_err(|error| format!("failed to ACK Activity stream: {error}"))?;
 
             request_id += 1;
-            let snapshot = tagged_rpc_request(
+            let snapshot = try_tagged_rpc_request_until(
                 &mut socket,
                 &request_id.to_string(),
                 "activity.getSnapshot",
                 json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
+                deadline,
             )
             .await
+            .map_err(|error| format!("authoritative Activity snapshot transport failed: {error}"))?
             .map_err(|error| format!("authoritative Activity snapshot failed: {error}"))?;
             last_snapshot = Some(snapshot.clone());
             if ambiguous_claude_children_are_observable_and_unsupported(&snapshot) {
@@ -14093,65 +14157,144 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         }
     };
 
-    let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
-    let before = captured_complete_ndjson_with_bytes(&capture).await;
-    assert!(claude_stop_task_targets(&before.1).is_empty());
-    assert_eq!(claude_root_interrupt_count(&before.1), 0);
-    for (index, agent_id) in ["agent-child-one", "agent-child-two"].iter().enumerate() {
-        let actor_id = format!("claude:agent:{agent_id}");
-        let control = snapshot["control"]["actors"]
-            .as_array()
-            .and_then(|controls| {
-                controls
-                    .iter()
-                    .find(|control| control["actorId"] == actor_id)
-            })
-            .expect("unsupported child control");
-        let error = tagged_rpc_request(
-            &mut socket,
-            &(9_800 + index).to_string(),
-            "activity.cancelSubtree",
-            json!({
-                "scope":{"_tag":"thread","threadId":"claude-ambiguous-thread"},
-                "scopeId":"thread:claude-ambiguous-thread",
-                "actorId":actor_id,
-                "expectedControlRevision":control["controlRevision"]
-            }),
-        )
-        .await
-        .expect_err("ambiguous child cancellation must fail through public RPC");
-        assert_eq!(
-            error,
-            json!([{
-                "_tag":"Fail",
-                "error":{
-                    "_tag":"ActivityError",
-                    "message":"The provider cancellation target is no longer available.",
-                    "reason":"targetUnavailable"
+    let verification = timeout_at(deadline, async {
+        loop {
+            let content = std::fs::read_to_string(&capture).unwrap_or_default();
+            let user_request_complete = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|request| request["type"] == "user");
+            if user_request_complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let before = loop {
+            let bytes = std::fs::read(&capture).unwrap_or_default();
+            if (bytes.is_empty() || bytes.ends_with(b"\n"))
+                && let Ok(content) = std::str::from_utf8(&bytes)
+                && let Some(values) = content
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                break (bytes, values);
+            }
+            tokio::task::yield_now().await;
+        };
+        if !claude_stop_task_targets(&before.1).is_empty() {
+            return Err("provider capture contained a stop_task before cancellation".to_owned());
+        }
+        if claude_root_interrupt_count(&before.1) != 0 {
+            return Err("provider capture contained a root interrupt before cancellation".to_owned());
+        }
+
+        let expected_error = json!([{
+            "_tag":"Fail",
+            "error":{
+                "_tag":"ActivityError",
+                "message":"The provider cancellation target is no longer available.",
+                "reason":"targetUnavailable"
+            }
+        }]);
+        for (index, agent_id) in ["agent-child-one", "agent-child-two"].iter().enumerate() {
+            let actor_id = format!("claude:agent:{agent_id}");
+            let control = snapshot["control"]["actors"]
+                .as_array()
+                .and_then(|controls| {
+                    controls
+                        .iter()
+                        .find(|control| control["actorId"] == actor_id)
+                })
+                .ok_or_else(|| format!("missing unsupported child control for {actor_id}"))?;
+            let cancellation = try_tagged_rpc_request_until(
+                &mut socket,
+                &(9_800 + index).to_string(),
+                "activity.cancelSubtree",
+                json!({
+                    "scope":{"_tag":"thread","threadId":"claude-ambiguous-thread"},
+                    "scopeId":"thread:claude-ambiguous-thread",
+                    "actorId":actor_id,
+                    "expectedControlRevision":control["controlRevision"]
+                }),
+                deadline,
+            )
+            .await?;
+            let error = match cancellation {
+                Ok(value) => {
+                    return Err(format!(
+                        "ambiguous child cancellation unexpectedly succeeded for {actor_id}: {value}"
+                    ));
                 }
-            }])
+                Err(error) => error,
+            };
+            if error != expected_error {
+                return Err(format!(
+                    "ambiguous child cancellation returned the wrong error for {actor_id}: {error}"
+                ));
+            }
+        }
+
+        let after = loop {
+            let bytes = std::fs::read(&capture).unwrap_or_default();
+            if (bytes.is_empty() || bytes.ends_with(b"\n"))
+                && let Ok(content) = std::str::from_utf8(&bytes)
+                && let Some(values) = content
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                break (bytes, values);
+            }
+            tokio::task::yield_now().await;
+        };
+        if after.0 != before.0 {
+            return Err("ambiguous child cancellation added provider request bytes".to_owned());
+        }
+        if after.1 != before.1 {
+            return Err("ambiguous child cancellation changed parsed provider requests".to_owned());
+        }
+        if !claude_stop_task_targets(&after.1).is_empty() {
+            return Err("ambiguous child cancellation emitted a stop_task request".to_owned());
+        }
+        if claude_root_interrupt_count(&after.1) != 0 {
+            return Err("ambiguous child cancellation emitted a root interrupt".to_owned());
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "shared 30-second Claude Activity verification deadline elapsed".to_owned())
+    .and_then(std::convert::identity);
+    if let Err(error) = verification {
+        let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+        let _ = activity_stream.close(None).await;
+        let _ = thread_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "ambiguous Claude Activity verification failed: {error}; \
+             snapshot={snapshot}; provider_capture={diagnostic_capture:?}; \
+             server_join={join_result:?}"
         );
     }
-    let after = captured_complete_ndjson_with_bytes(&capture).await;
-    assert_eq!(
-        after.0, before.0,
-        "ambiguous child cancellation must add no provider request bytes"
-    );
-    assert_eq!(after.1, before.1);
-    assert!(claude_stop_task_targets(&after.1).is_empty());
-    assert_eq!(claude_root_interrupt_count(&after.1), 0);
 
-    activity_stream
-        .close(None)
-        .await
-        .expect("close Activity stream");
-    thread_stream
-        .close(None)
-        .await
-        .expect("close thread stream");
-    socket.close(None).await.expect("close WebSocket");
+    let activity_close = activity_stream.close(None).await;
+    let thread_close = thread_stream.close(None).await;
+    let socket_close = socket.close(None).await;
     handle.shutdown();
-    handle.join().await.expect("RPC server joins");
+    let join_result = handle.join().await;
+    if activity_close.is_err()
+        || thread_close.is_err()
+        || socket_close.is_err()
+        || join_result.is_err()
+    {
+        panic!(
+            "ambiguous Claude Activity cleanup failed: activity_close={activity_close:?}; \
+             thread_close={thread_close:?}; socket_close={socket_close:?}; \
+             server_join={join_result:?}"
+        );
+    }
 }
 
 #[tokio::test]
