@@ -134,14 +134,30 @@ assert_eq!(
     retired_actor_targets(&child_two_outputs),
     ["claude:agent:agent-child-one".to_owned()],
 );
-assert!(runtime.task_control_correlator.actor_target_by_agent.is_empty());
-assert!(runtime.task_control_correlator.agent_by_task.is_empty());
+assert_eq!(runtime.task_control_correlator.actor_target_by_agent.len(), 1);
+assert_eq!(
+    runtime
+        .task_control_correlator
+        .actor_target_by_agent
+        .get("agent-parent")
+        .map(String::as_str),
+    Some("task-parent"),
+);
+assert_eq!(runtime.task_control_correlator.agent_by_task.len(), 1);
+assert_eq!(
+    runtime
+        .task_control_correlator
+        .agent_by_task
+        .get("task-parent")
+        .map(String::as_str),
+    Some("agent-parent"),
+);
 assert!(runtime.task_control_correlator.state_is_bounded());
 ```
 
 Replay all four facts for both children and assert no new target is installed while the complete set remains ambiguous. In the same test, build a second runtime and deliver both children through task/PreToolUse before either parentless `SubagentStart`. Complete both starts afterward and assert the same target-free final maps. This is the order-invariance assertion, not a timing assertion.
 
-Add `targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback` with the same sequence but retain the fixture's explicit `parent_agent_id` fields. Require child one's initial fallback install, its later retirement, no target for child two, empty active maps, and bounded retained state. This prevents the fix from covering only the documented parentless hook shape while leaving explicit verified lineage order-dependent.
+Add `targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback` with the same sequence but retain the fixture's explicit `parent_agent_id` fields. Require child one's initial fallback install, its later retirement, no target for child two, the exact parent as the sole remaining actor/task mapping, and bounded retained state. This prevents the fix from covering only the documented parentless hook shape while leaving explicit verified lineage order-dependent.
 
 - [ ] **Step 3: Write the exact-evidence-after-revocation regression**
 
@@ -186,13 +202,13 @@ Run sequentially:
 
 ```bash
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_late_sibling_revokes_provisional_parentless_fallback \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_late_sibling_revokes_provisional_parentless_fallback \
   -- --exact --nocapture
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback \
   -- --exact --nocapture
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity \
   -- --exact --nocapture
 ```
 
@@ -347,17 +363,17 @@ Run sequentially:
 
 ```bash
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_late_sibling_revokes_provisional_parentless_fallback \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_late_sibling_revokes_provisional_parentless_fallback \
   -- --exact --nocapture
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback \
   -- --exact --nocapture
 cargo test -p bibcode-server --lib \
-  provider::claude::runtime::tests::targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity \
   -- --exact --nocapture
-cargo test -p bibcode-server --lib provider::claude::runtime::tests -- --nocapture
-cargo test -p bibcode-server --lib provider::claude::runtime::tests -- --test-threads=8
-cargo test -p bibcode-server --lib provider::claude::runtime::tests -- --test-threads=12
+cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --nocapture
+cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --test-threads=8
+cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --test-threads=12
 ```
 
 Expected: the three new regressions and every existing exact/fallback/conflict/terminal/bounded-state test pass at all requested widths.
