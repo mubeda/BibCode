@@ -1073,6 +1073,10 @@ describe("ActivityPanel detail", () => {
     expect(
       entries.map((row) => row.querySelector("[data-activity-entry-label]")?.textContent),
     ).toEqual(["Commentary", "Command", "State", "Tool", "Error"]);
+    const firstEntryTime = container.querySelector<HTMLTimeElement>(
+      '[data-activity-entry-id="entry-1"] time[datetime="2026-07-22T20:01:00.000Z"]',
+    );
+    expect(firstEntryTime?.title).toBe("2026-07-22T20:01:00.000Z");
     expect(new Set(entries.map((row) => row.dataset.activityEntryKind)).size).toBe(5);
     expect(container.textContent).toContain(command);
     expect(container.textContent).not.toContain("stale duplicate title");

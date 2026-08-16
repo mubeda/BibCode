@@ -75,7 +75,11 @@ export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
           {presentation.label}
         </span>
         <span className="min-w-0 flex-1 truncate text-sm">{entry.title}</span>
-        <time className="shrink-0 text-[11px] text-muted-foreground" dateTime={entry.createdAt}>
+        <time
+          className="shrink-0 text-[11px] text-muted-foreground"
+          dateTime={entry.createdAt}
+          title={entry.createdAt}
+        >
           {entry.createdAt}
         </time>
       </div>
