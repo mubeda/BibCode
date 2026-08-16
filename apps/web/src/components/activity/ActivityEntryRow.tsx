@@ -1,4 +1,5 @@
 import type { ActivityEntry } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   ActivityIcon,
   CheckCircle2Icon,
@@ -11,6 +12,7 @@ import {
 import type { ComponentType } from "react";
 
 import { cn } from "~/lib/utils";
+import { formatChatTimestampTooltip } from "~/timestampFormat";
 
 const COLLAPSIBLE_DETAIL_LENGTH = 4_096;
 
@@ -29,9 +31,14 @@ const ENTRY_PRESENTATION: Record<
 
 export interface ActivityEntryRowProps {
   readonly entry: ActivityEntry;
+  readonly timestampFormat: TimestampFormat;
 }
 
-function EntryDetail({ entry }: ActivityEntryRowProps) {
+function formatActivityEntryTimestamp(value: string, timestampFormat: TimestampFormat): string {
+  return formatChatTimestampTooltip(value, timestampFormat) || value;
+}
+
+function EntryDetail({ entry }: Pick<ActivityEntryRowProps, "entry">) {
   if (entry.detail === null) {
     return null;
   }
@@ -53,7 +60,7 @@ function EntryDetail({ entry }: ActivityEntryRowProps) {
   );
 }
 
-export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
+export function ActivityEntryRow({ entry, timestampFormat }: ActivityEntryRowProps) {
   const presentation = ENTRY_PRESENTATION[entry.kind];
   const Icon = presentation.icon;
 
@@ -80,7 +87,7 @@ export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
           dateTime={entry.createdAt}
           title={entry.createdAt}
         >
-          {entry.createdAt}
+          {formatActivityEntryTimestamp(entry.createdAt, timestampFormat)}
         </time>
       </div>
       <EntryDetail entry={entry} />
