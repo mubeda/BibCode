@@ -274,4 +274,3 @@ git diff --check HEAD~2..HEAD
 
 Confirm no generated, manifest, lockfile, dependency, provider, server, desktop,
 or unrelated source drift.
-
