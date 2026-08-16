@@ -3445,8 +3445,8 @@ mod tests {
             pid_path,
             watchdog_spawn_race: None,
         };
-        let launcher = SystemCodexHelperLauncher::with_fixture_events(
-            CODEX_HELPER_READY_TIMEOUT,
+        let launcher = SystemCodexHelperLauncher::with_integration_fixture_events(
+            tokio::time::Instant::now() + Duration::from_secs(15),
             events.clone(),
         );
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
