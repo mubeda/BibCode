@@ -22,6 +22,7 @@ import {
 } from "./test-project.ts";
 
 const contexts: DesktopUiTestContext[] = [];
+const hostTemporaryDirectories: string[] = [];
 
 interface FixtureProtocol {
   readonly close: () => Promise<void>;
@@ -80,6 +81,9 @@ afterEach(() => {
   for (const context of contexts.splice(0)) {
     archiveAndCleanupDesktopUiTestContext(context);
   }
+  for (const directory of hostTemporaryDirectories.splice(0)) {
+    NodeFS.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe.each([
@@ -87,6 +91,18 @@ describe.each([
   { platform: "linux", executableSuffix: "" },
   { platform: "win", executableSuffix: ".cmd" },
 ])("prepareDesktopUiTestContext on $platform", ({ platform, executableSuffix }) => {
+  it("allocates its automatic run root beneath the host temporary directory", () => {
+    const hostTemporaryDirectory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-e2e-host-temp-"),
+    );
+    hostTemporaryDirectories.push(hostTemporaryDirectory);
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
+    const context = prepareDesktopUiTestContext(environment, hostTemporaryDirectory);
+    contexts.push(context);
+
+    expect(NodePath.dirname(context.runRoot)).toBe(hostTemporaryDirectory);
+  });
+
   it("pins every provider to an absolute fixture executable", () => {
     const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
     const context = prepareDesktopUiTestContext(environment);

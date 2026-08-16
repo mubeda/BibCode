@@ -145,6 +145,19 @@ node scripts/run-msvc-x64.mjs cargo test --workspace -j 2
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Run the desktop E2E support contract natively on Windows:
+
+```powershell
+vp test run apps/desktop/e2e/support/test-project.test.ts
+```
+
+The `native_desktop` Windows CI row runs this exact command after the desktop
+Rust host tests. A native pass includes real execution of the generated Cursor
+`.cmd` shim through the Windows command processor and verification of its exact
+action-log record. The same file's simulated macOS/Linux/Windows fixture and
+filesystem assertions on a non-Windows host are compatibility evidence; the
+guarded `.cmd` case is unavailable there and must not be reported as passed.
+
 Keep `vp run test`, `vp check`, `vp run typecheck`, `cargo fmt --all --check`,
 and `git diff --check` in the recorded gate set. Do not run separate broad
 Cargo commands concurrently.

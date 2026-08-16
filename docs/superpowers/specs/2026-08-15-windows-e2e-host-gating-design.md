@@ -17,12 +17,17 @@ The environment, path, directory, and generated-file assertions are portable.
 Executing a `.cmd` wrapper is native Windows behavior and requires a real
 Windows command processor.
 
+Final review also found that automatic run-root allocation selected `/tmp` or
+the Node host temporary directory from the simulated target. On a Windows host,
+simulating macOS or Linux therefore selected the non-native literal `/tmp`.
+
 ## Goal
 
 Keep portable Windows fixture construction covered on every host while running
 the generated `.cmd` wrapper only on native Windows. Preserve the Windows
 action-log assertion and restore the shared macOS/Linux test graph without
-weakening Windows coverage.
+weakening Windows coverage. Automatic run-root allocation must remain owned by
+the actual host, independent of the simulated target.
 
 ## Non-Goals
 
@@ -38,6 +43,14 @@ The existing parameterized inventory test continues to create `mac`, `linux`,
 and `win` contexts on every host and assert their portable environment and
 filesystem contracts. The Windows branch no longer launches `cursor.cmd`.
 
+`prepareDesktopUiTestContext` receives an injectable host temporary-directory
+parent. Its default is selected from the actual host: the native Windows temp
+directory on Windows and short `/tmp` on Unix, preserving the Unix provider
+socket-path budget. `BIBCODE_E2E_PLATFORM` continues to select only generated
+shims, paths, settings, and environment presentation. Parameterized coverage
+injects one test-owned parent and proves every simulated target allocates its
+automatic run root directly beneath it.
+
 A separate Windows-native test creates the same `win` context and is enabled
 only when `process.platform === "win32"`. It launches the generated wrapper via
 the host `ComSpec`, requires a successful exit, and verifies that the fixture
@@ -50,8 +63,8 @@ platform condition and command, so the native assertion cannot silently drop
 out of Windows validation. The matrix, concurrency, and existing Rust and
 bundle steps remain unchanged.
 
-No production source changes. The repair is confined to desktop E2E test and
-CI coverage.
+No production source changes. The repair is confined to desktop E2E support,
+tests, CI coverage, and the affected living testing documentation.
 
 ## Alternatives
 
@@ -98,6 +111,6 @@ evidence after the workflow runs successfully.
 ## Documentation Impact
 
 This is a test-host classification correction. Runtime architecture and user
-documentation are unchanged. The shared cross-platform runbook already
-requires native, compatibility, and unavailable evidence to be reported
-separately, so no living runbook change is needed.
+documentation are unchanged. The CI and Windows desktop testing pages record
+the exact Windows-only support-contract command and distinguish its native
+`.cmd` execution from simulated compatibility evidence.
