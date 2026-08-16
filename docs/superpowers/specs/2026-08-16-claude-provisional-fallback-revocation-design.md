@@ -124,11 +124,16 @@ named child through the existing authoritative path.
 
 ### Positive integration observer
 
-The public integration test subscribes to `subscribeActivity` before starting
-the provider turn, so no actor/control transition can be missed. The fixture
-ready marker, authenticated hook requests, Activity stream notifications, and
-final authoritative snapshot share one absolute 30-second test-only deadline,
-matching the already approved provider-fixture deadline policy.
+The public integration test opens its dedicated Activity WebSocket before
+starting the provider turn. The Activity scope does not exist until provider
+launch, so it starts and awaits turn admission, then subscribes immediately
+before waiting for the fixture-ready marker or sending any authenticated hook.
+The fixture cannot publish a child actor/control transition before that ready
+marker, so no relevant transition can be missed. Turn admission, subscription,
+the fixture ready marker, authenticated hook requests, Activity stream
+notifications, and the final authoritative snapshot share one absolute
+30-second test-only deadline, matching the already approved provider-fixture
+deadline policy.
 
 The test ACKs each stream chunk. A stream notification triggers an
 authoritative `activity.getSnapshot` read; the test does not issue another
