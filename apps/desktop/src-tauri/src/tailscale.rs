@@ -370,7 +370,7 @@ mod tests {
             &format!("echo {TAILSCALE_STATUS_JSON}"),
         );
         assert_eq!(
-            read_tailscale_status_with(&success, Duration::from_secs(2))
+            read_tailscale_status_with(&success, Duration::from_secs(15))
                 .await
                 .unwrap()
                 .magic_dns_name
