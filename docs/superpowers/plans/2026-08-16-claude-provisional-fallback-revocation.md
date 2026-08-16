@@ -252,7 +252,7 @@ impl ClaudeTaskCorrelation {
 
 Update the exact-launch conflict check to compare `fact.agent_id` with `provisional_fallback.agent_id`. On accepted exact evidence, set `launched_agent_id` and clear the whole `provisional_fallback` value atomically. Do not change exact source, task, lineage, tombstone, or generation checks.
 
-Add `fallback_ambiguous_parents: BTreeSet<String>` to `ClaudeTaskControlCorrelator`, initialize it empty in `new`, include its count in `Debug`, and require it to remain at or below `ACTIVITY_PAGE_MAX_LENGTH` in `state_is_bounded`. `reset` already replaces the correlator through `Self::new`, so it is the only operation that clears this generation-owned ambiguity memory. Exact launch and terminal cleanup must not remove an entry.
+Add `fallback_ambiguous_parents: BTreeSet<String>` and `fallback_ambiguity_overflowed: bool` to `ClaudeTaskControlCorrelator`, initialize them empty/false in `new`, include both in `Debug`, and require the set to remain at or below `ACTIVITY_PAGE_MAX_LENGTH` in `state_is_bounded`. `reset` already replaces the correlator through `Self::new`, so it is the only operation that clears this generation-owned ambiguity memory and latch. Exact launch and terminal cleanup must not remove an entry. Insert distinct affirmative ambiguity identities until the set contains 200 entries. Reaching 200 entries alone preserves the per-parent deny set; the next affirmative ambiguity for a different parent sets `fallback_ambiguity_overflowed = true` without growing the set. Once latched, every provisional fallback admission remains disabled until generation reset, while exact launch remains authoritative and bypasses both the set and latch.
 
 - [ ] **Step 6: Add reversible fallback cleanup**
 
@@ -312,24 +312,35 @@ Rewrite `reconcile_parent_local_fallbacks` in four explicit phases:
 Use these exact ambiguity predicates:
 
 ```rust
+let mut ambiguous_parent_ids = BTreeSet::new();
 for (parent_agent_id, tool_use_ids) in &candidates_by_parent {
     let child_count = children_by_parent
         .get(parent_agent_id)
         .map_or(0, Vec::len);
     if tool_use_ids.len() > 1 || child_count > 1 {
-        self.fallback_ambiguous_parents
-            .insert(parent_agent_id.clone());
+        ambiguous_parent_ids.insert(parent_agent_id.clone());
     }
 }
 let parentless_competition = !parentless_children.is_empty()
     && (nested_candidate_count > 1 || parentless_children.len() > 1);
 if parentless_competition {
-    self.fallback_ambiguous_parents
-        .extend(candidates_by_parent.keys().cloned());
+    ambiguous_parent_ids.extend(candidates_by_parent.keys().cloned());
+}
+for parent_agent_id in ambiguous_parent_ids {
+    if self.fallback_ambiguity_overflowed
+        || self.fallback_ambiguous_parents.contains(&parent_agent_id)
+    {
+        continue;
+    }
+    if self.fallback_ambiguous_parents.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+        self.fallback_ambiguity_overflowed = true;
+        break;
+    }
+    self.fallback_ambiguous_parents.insert(parent_agent_id);
 }
 ```
 
-The set is bounded because its members come only from the already bounded active candidate map. Do not mark a parent merely because evidence is missing or an unresolved root launch temporarily blocks admission; ambiguity memory requires affirmative multiple candidates or children.
+The retained set is independently bounded to 200 even though it outlives terminal cleanup of active candidate facts. A further distinct-parent ambiguity attempt at capacity latches all fallback closed instead of evicting or omitting an identity and accidentally reopening it. Do not mark a parent merely because evidence is missing or an unresolved root launch temporarily blocks admission; ambiguity memory requires affirmative multiple candidates or children.
 
 Use these literal validity predicates:
 
@@ -371,7 +382,8 @@ and changes verified lineage from `Root` to `Parent(parent_agent_id)`. New expli
 Both parentless and explicit admission branches must first require:
 
 ```rust
-!self.fallback_ambiguous_parents.contains(parent_agent_id)
+!self.fallback_ambiguity_overflowed
+    && !self.fallback_ambiguous_parents.contains(parent_agent_id)
 ```
 
 Exact `launched_agent_id` records continue through the existing exact reconciliation path and never consult or clear this set.
@@ -389,6 +401,10 @@ and retains the actors and task facts as unresolved evidence. Exact targets are 
 revoked by sibling ambiguity, and exact evidence may later resolve one named child.
 Affirmative parent-level ambiguity disables further fallback for that parent until
 generation reset, so resolving one sibling exactly cannot reopen another by elimination.
+At most 200 ambiguous parent identities are retained after terminal cleanup. Reaching
+capacity alone preserves those parent-specific denials; a further affirmative ambiguity
+for a distinct parent latches all fallback admission closed until generation reset, while
+exact PostToolUse identity remains authoritative.
 ```
 
 Keep the existing statement that ambiguous control performs zero provider I/O and that order/timing are not correlation inputs.
@@ -407,12 +423,15 @@ cargo test -p bibcode-server --lib \
 cargo test -p bibcode-server --lib \
   provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity \
   -- --exact --nocapture
+cargo test -p bibcode-server --lib \
+  provider::claude::runtime::targeted_task_correlation_tests::targeted_task_correlation_ambiguity_memory_saturates_fail_closed_without_blocking_exact_evidence \
+  -- --exact --nocapture
 cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --nocapture
 cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --test-threads=8
 cargo test -p bibcode-server --lib provider::claude::runtime::targeted_task_correlation_tests -- --test-threads=12
 ```
 
-Expected: the three new regressions and every existing exact/fallback/conflict/terminal/bounded-state test pass at all requested widths.
+Expected: the four new regressions, including the 201st-distinct-parent overflow attempt and exact-evidence bypass, and every existing exact/fallback/conflict/terminal/bounded-state test pass at all requested widths.
 
 - [ ] **Step 10: Review and commit the owner repair**
 
