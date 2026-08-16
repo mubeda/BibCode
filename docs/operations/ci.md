@@ -18,7 +18,13 @@ four job groups:
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux x64, Windows x64, macOS
   arm64, and macOS x64 runners. Windows ARM is intentionally excluded while
-  `scripts/run-msvc-x64.mjs` remains x64-specific.
+  `scripts/run-msvc-x64.mjs` remains x64-specific. After the Rust host tests,
+  the Windows row alone runs
+  `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
+  supported native proof that the generated Cursor `.cmd` shim executes through
+  the Windows command processor and writes its exact action record. Simulated
+  target fixture assertions on other hosts are compatibility evidence, not a
+  native Windows pass.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's

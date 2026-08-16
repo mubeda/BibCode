@@ -4,7 +4,7 @@
 
 **Goal:** Keep simulated Windows fixture construction portable while executing the generated Cursor `.cmd` action shim only on native Windows.
 
-**Architecture:** The parameterized inventory test remains host-independent and continues to verify `mac`, `linux`, and `win` environment/filesystem contracts everywhere. A dedicated `it.runIf(process.platform === "win32")` test owns the real `cmd.exe` execution and action-log assertion, while an explicit Windows-only native CI step and parsed workflow contract keep that test in the supported validation path.
+**Architecture:** The parameterized inventory test remains host-independent and continues to verify `mac`, `linux`, and `win` environment/filesystem contracts everywhere. Automatic run-root allocation takes an injectable parent selected by the actual host, never by `BIBCODE_E2E_PLATFORM`; target simulation still owns generated paths and settings. A dedicated `it.runIf(process.platform === "win32")` test owns the real `cmd.exe` execution and action-log assertion, while an explicit Windows-only native CI step and parsed workflow contract keep that test in the supported validation path.
 
 **Tech Stack:** TypeScript, Vite+ Test/Vitest-compatible `it.runIf`, Node.js child processes and filesystem fixtures.
 
@@ -14,6 +14,7 @@
 - Do not emulate or install a Windows command processor on macOS or Linux.
 - Do not replace the native execution assertion with a mocked `spawnSync`.
 - Do not skip the portable Windows environment and filesystem assertions.
+- Do not use the simulated target to choose the host filesystem's automatic run-root parent.
 - Do not change CI concurrency, timeouts, platform matrices, dependencies, or lockfiles.
 - Stop broad verification on the first distinct failure and diagnose that exact failure before any rerun or repair.
 
@@ -24,6 +25,7 @@
 **Files:**
 
 - Modify: `apps/desktop/e2e/support/test-project.test.ts:173-217`
+- Modify: `apps/desktop/e2e/support/test-project.ts:1085-1095`
 - Modify: `scripts/ci-platform-contract.test.ts:126-162`
 - Modify: `.github/workflows/ci.yml:207-216`
 - Test: `apps/desktop/e2e/support/test-project.test.ts`
@@ -31,8 +33,15 @@
 
 **Interfaces:**
 
-- Consumes: `prepareDesktopUiTestContext(environment: NodeJS.ProcessEnv): DesktopUiTestContext` and `archiveAndCleanupDesktopUiTestContext(context)`.
-- Produces: one host-independent inventory contract, one native-Windows-only Cursor `.cmd` execution contract, and one Windows CI workflow contract that runs it.
+- Consumes: `prepareDesktopUiTestContext(environment, hostTemporaryDirectory)`, `archiveAndCleanupDesktopUiTestContext(context)`, and actual-host temporary-directory selection.
+- Produces: one host-independent allocation/inventory contract, one native-Windows-only Cursor `.cmd` execution contract, and one Windows CI workflow contract that runs it.
+
+Final-review amendment: add a parameterized RED proving simulated `mac`,
+`linux`, and `win` contexts all allocate an automatic run root beneath one
+injected, test-owned host temporary parent. Then make the parent injectable and
+default it from the actual host (`%TEMP%` on Windows, short `/tmp` on Unix for
+the provider socket-path budget). Keep `BIBCODE_E2E_PLATFORM` responsible only
+for generated target paths, settings, shims, and environment presentation.
 
 - [ ] **Step 1: Preserve the observed RED evidence**
 

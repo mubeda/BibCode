@@ -40,10 +40,11 @@ the real dirty local Git-status event before the 30-second fallback poller.
 ## Chosen Design
 
 The public integration test creates one absolute 15-second Tokio deadline
-immediately before sending `projects.writeFile`. The existing successful-write
-assertion and subsequent subscribed-message loop share that operation window;
-the event wait uses `timeout_at`, so later milestones cannot restart the
-budget.
+immediately before sending `subscribeVcsStatus`, before that request can create
+the broadcaster owner. Subscription setup, the initial clean snapshot, the
+initial `remoteUpdated` event, the `projects.writeFile` response, and the real
+dirty `localUpdated` event share that operation window. One outer `timeout_at`
+governs the complete sequence, so no later milestone can restart the budget.
 
 Success still requires the real `localUpdated` event for request `703`, a dirty
 working tree, and `tracked.txt`. The test prints elapsed publication time as
@@ -82,10 +83,11 @@ violate the repository's parallel-test requirements.
 
 ## Failure and Cleanup Semantics
 
-If the write response or positive dirty status does not arrive before the one
-absolute deadline, the test fails with stage-specific context. WebSockets and
-the server runtime retain their existing explicit close, shutdown, and join
-paths. No fallback success, retry, or extra deadline is introduced.
+If subscription setup, either initial event, the write response, or the positive
+dirty status does not arrive before the one absolute deadline, the test fails
+with stage-specific context. WebSockets and the server runtime retain their
+existing explicit close, shutdown, and join paths. No fallback success, retry,
+or extra operation deadline is introduced.
 
 ## Verification
 

@@ -4,7 +4,7 @@
 
 **Goal:** Make the public project-write Git-status integration test deterministic under the parallel workspace graph while proving real event-driven publication before the unchanged 30-second fallback.
 
-**Architecture:** The public integration test begins one absolute 15-second Tokio deadline before sending `projects.writeFile`; the successful response and positive dirty-status event consume the same operation window. The existing deterministic `StatusBroadcaster` owner test remains the concurrency/cancellation contract, and production Git behavior is unchanged.
+**Architecture:** The public integration test begins one absolute 15-second Tokio deadline before sending `subscribeVcsStatus`; subscription setup, both initial status events, the successful write response, and the positive dirty-status event consume the same operation window. The existing deterministic `StatusBroadcaster` owner test remains the concurrency/cancellation contract, and production Git behavior is unchanged.
 
 **Tech Stack:** Rust 2024, Tokio `Instant`/`timeout_at`, Axum/WebSocket RPC integration tests, real Git fixtures.
 
@@ -12,7 +12,7 @@
 
 - Do not change production Git scheduling, polling, process execution, cancellation, publication, queues, or timeouts.
 - Keep `LOCAL_STATUS_REFRESH_INTERVAL` exactly 30 seconds.
-- Use one absolute 15-second test-only deadline beginning before `projects.writeFile`; later milestones must not restart it.
+- Use one absolute 15-second test-only deadline beginning before `subscribeVcsStatus` can create the broadcaster owner; the initial clean snapshot, initial `remoteUpdated`, `projects.writeFile` response, and dirty `localUpdated` event must all consume it without a restart.
 - Preserve the exact `localUpdated`, request ID `703`, dirty working-tree, and `tracked.txt` assertions.
 - Retain the deterministic owner test proving local invalidation starts and publishes while remote refresh is blocked and final subscriber drop cancels the remote owner.
 - Do not serialize package tests or Rust harness threads.
@@ -32,7 +32,7 @@
 **Interfaces:**
 
 - Consumes: `projects.writeFile`, `subscribeVcsStatus`, production `StatusBroadcaster::notify_local_change`, and the unchanged 30-second `LOCAL_STATUS_REFRESH_INTERVAL`.
-- Produces: a single `GIT_STATUS_INTEGRATION_DEADLINE: Duration` and one public operation window ending in the real dirty `localUpdated` event.
+- Produces: a single `GIT_STATUS_INTEGRATION_DEADLINE: Duration` and one public operation window beginning before subscription owner creation and ending in the real dirty `localUpdated` event.
 
 - [ ] **Step 1: Preserve the observed RED evidence**
 
@@ -66,51 +66,47 @@ const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
 This constant is integration-test-only and remains below the production
 30-second fallback.
 
-- [ ] **Step 3: Start the deadline before the public write request**
+- [ ] **Step 3: Start the deadline before the public subscription request**
 
-Immediately before `request(&mut write_socket, "704", ...)`, add:
+Immediately before `request(&mut status_socket, "703", ...)`, start the fixed
+operation window through a test-only helper:
 
 ```rust
-let publication_started = Instant::now();
-let publication_deadline = publication_started + GIT_STATUS_INTEGRATION_DEADLINE;
+let (publication_started, publication_deadline) = start_git_status_integration_deadline();
 ```
 
-Keep the request payload and `assert_success_eq_for` assertion unchanged.
+Keep request IDs `703` and `704`, payloads, ACKs, and assertions unchanged.
 
-- [ ] **Step 4: Consume the remaining operation budget for the positive event**
+- [ ] **Step 4: Consume the fixed budget through every public milestone**
 
-Replace only the outer two-second timeout with:
+Wrap subscription, the initial clean snapshot and ACK, the initial
+`remoteUpdated` event and ACK, the write request and response, and the dirty
+event loop in one `timeout_at(publication_deadline, async { ... })`. Return the
+dirty event values from that future. Per-stage receive diagnostics may remain,
+but no stage may own or restart the operation budget.
+
+The dirty event loop remains:
 
 ```rust
-let local_update = timeout_at(publication_deadline, async {
-    loop {
-        let message = next_server_message_for(
-            &mut status_socket,
-            "event-driven dirty local VCS status after project file save",
-        )
-        .await;
-        if let ServerMessage::Chunk { request_id, values } = message
-            && request_id.as_str() == "703"
-            && values[0]["_tag"] == "localUpdated"
-            && values[0]["local"]["hasWorkingTreeChanges"] == true
-        {
-            break values;
-        }
-        send_json(
-            &mut status_socket,
-            json!({ "_tag": "Ack", "requestId": "703" }),
-        )
-        .await;
+loop {
+    let message = next_server_message_for(
+        &mut status_socket,
+        "event-driven dirty local VCS status after project file save",
+    )
+    .await;
+    if let ServerMessage::Chunk { request_id, values } = message
+        && request_id.as_str() == "703"
+        && values[0]["_tag"] == "localUpdated"
+        && values[0]["local"]["hasWorkingTreeChanges"] == true
+    {
+        break values;
     }
-})
-.await
-.expect(
-    "a successful project file save should publish Git status within the integration deadline before the 30-second fallback",
-);
-eprintln!(
-    "event-driven project file Git status published in {:?}",
-    publication_started.elapsed()
-);
+    send_json(
+        &mut status_socket,
+        json!({ "_tag": "Ack", "requestId": "703" }),
+    )
+    .await;
+}
 ```
 
 Retain the existing `tracked.txt` assertion and all WebSocket/server cleanup.

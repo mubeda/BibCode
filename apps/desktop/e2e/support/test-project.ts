@@ -1082,15 +1082,21 @@ export function clearDesktopActivityMarker(projectPath: string): void {
   NodeFS.rmSync(NodePath.join(projectPath, desktopActivityMarkerFileName), { force: true });
 }
 
+function desktopUiHostTemporaryDirectory(): string {
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone WDIO fixture selects its automatic run root from the actual host, not the simulated target.
+  return NodeOS.platform() === "win32" ? NodeOS.tmpdir() : "/tmp";
+}
+
 export function prepareDesktopUiTestContext(
   environment: NodeJS.ProcessEnv = process.env,
+  hostTemporaryDirectory: string = desktopUiHostTemporaryDirectory(),
 ): DesktopUiTestContext {
   // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone WDIO fixture injects the detected host into its adapters.
   const hostPlatform = environment.BIBCODE_E2E_PLATFORM ?? process.platform;
   const isWindows = hostPlatform === "win" || hostPlatform === "win32";
   const runRoot =
     environment.BIBCODE_E2E_RUN_ROOT ??
-    NodeFS.mkdtempSync(NodePath.join(isWindows ? NodeOS.tmpdir() : "/tmp", "t4ui-"));
+    NodeFS.mkdtempSync(NodePath.join(hostTemporaryDirectory, "t4ui-"));
   const artifactDirectory =
     environment.BIBCODE_E2E_ARTIFACT_DIR ??
     NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-desktop-ui-artifacts-"));

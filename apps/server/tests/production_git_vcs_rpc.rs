@@ -26,6 +26,11 @@ const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
 
+fn start_git_status_integration_deadline() -> (Instant, Instant) {
+    let started = Instant::now();
+    (started, started + GIT_STATUS_INTEGRATION_DEADLINE)
+}
+
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct GitServerHarness {
@@ -524,70 +529,69 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         .await
         .expect("write WebSocket connects");
     let cwd = repository.path().to_string_lossy();
-
-    request(
-        &mut status_socket,
-        "703",
-        "subscribeVcsStatus",
-        json!({ "cwd": cwd }),
-    )
-    .await;
-    let snapshot = next_server_message_for(
-        &mut status_socket,
-        "initial clean VCS status snapshot after subscription",
-    )
-    .await;
-    assert!(matches!(
-        snapshot,
-        ServerMessage::Chunk { request_id, values }
-            if request_id.as_str() == "703"
-                && values[0]["_tag"] == "snapshot"
-                && values[0]["local"]["hasWorkingTreeChanges"] == false
-    ));
-    send_json(
-        &mut status_socket,
-        json!({ "_tag": "Ack", "requestId": "703" }),
-    )
-    .await;
-
-    let initial_remote = next_server_message_for(
-        &mut status_socket,
-        "initial remote VCS status after subscription",
-    )
-    .await;
-    assert!(matches!(
-        initial_remote,
-        ServerMessage::Chunk { request_id, values }
-            if request_id.as_str() == "703" && values[0]["_tag"] == "remoteUpdated"
-    ));
-    send_json(
-        &mut status_socket,
-        json!({ "_tag": "Ack", "requestId": "703" }),
-    )
-    .await;
-
-    let publication_started = Instant::now();
-    let publication_deadline = publication_started + GIT_STATUS_INTEGRATION_DEADLINE;
-    request(
-        &mut write_socket,
-        "704",
-        "projects.writeFile",
-        json!({
-            "cwd": cwd,
-            "relativePath": "tracked.txt",
-            "contents": "changed in editor\n"
-        }),
-    )
-    .await;
-    assert_success_eq_for(
-        &mut write_socket,
-        "704",
-        json!({ "relativePath": "tracked.txt" }),
-        "projects.writeFile success after mutation notification",
-    )
-    .await;
+    let (publication_started, publication_deadline) = start_git_status_integration_deadline();
 
     let local_update = timeout_at(publication_deadline, async {
+        request(
+            &mut status_socket,
+            "703",
+            "subscribeVcsStatus",
+            json!({ "cwd": cwd }),
+        )
+        .await;
+        let snapshot = next_server_message_for(
+            &mut status_socket,
+            "initial clean VCS status snapshot after subscription",
+        )
+        .await;
+        assert!(matches!(
+            snapshot,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == "703"
+                    && values[0]["_tag"] == "snapshot"
+                    && values[0]["local"]["hasWorkingTreeChanges"] == false
+        ));
+        send_json(
+            &mut status_socket,
+            json!({ "_tag": "Ack", "requestId": "703" }),
+        )
+        .await;
+
+        let initial_remote = next_server_message_for(
+            &mut status_socket,
+            "initial remote VCS status after subscription",
+        )
+        .await;
+        assert!(matches!(
+            initial_remote,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == "703" && values[0]["_tag"] == "remoteUpdated"
+        ));
+        send_json(
+            &mut status_socket,
+            json!({ "_tag": "Ack", "requestId": "703" }),
+        )
+        .await;
+
+        request(
+            &mut write_socket,
+            "704",
+            "projects.writeFile",
+            json!({
+                "cwd": cwd,
+                "relativePath": "tracked.txt",
+                "contents": "changed in editor\n"
+            }),
+        )
+        .await;
+        assert_success_eq_for(
+            &mut write_socket,
+            "704",
+            json!({ "relativePath": "tracked.txt" }),
+            "projects.writeFile success after mutation notification",
+        )
+        .await;
+
         loop {
             let message = next_server_message_for(
                 &mut status_socket,
@@ -610,7 +614,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     })
     .await
     .expect(
-        "a successful project file save should publish Git status within the integration deadline before the 30-second fallback",
+        "subscription setup and a successful project file save should publish Git status within one integration deadline before the 30-second fallback",
     );
     eprintln!(
         "event-driven project file Git status published in {:?}",
