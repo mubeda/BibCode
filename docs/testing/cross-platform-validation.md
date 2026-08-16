@@ -232,10 +232,18 @@ On the first distinct failure:
    proportion to the boundary; and
 10. update living architecture and these runbooks when their contract changes.
 
-Do not repair tests with sleeps, yields, broad serialization, timeout widening,
-global locks, global process mutation, retry loops that hide the failure, or
-weakened assertions. Distinguish honest load-sensitive contract failures from
-environment starvation with positive owner/readiness/cleanup evidence.
+Do not repair a tested latency contract with sleeps, yields, broad
+serialization, timeout widening, global locks, global process mutation, retry
+loops that hide the failure, or weakened assertions. Distinguish honest
+load-sensitive contract failures from environment starvation with positive
+owner/readiness/cleanup evidence.
+
+An integration test whose contract is ownership, output, or cleanup rather than
+product latency may use one fixed, absolute, test-only observation deadline.
+That deadline must bound the complete test owner, retain positive
+readiness/output/reap assertions, and leave both the production deadline and a
+dedicated production-deadline regression unchanged. Do not extend a deadline
+that is itself the behavior under test.
 
 ## Cleanup
 
