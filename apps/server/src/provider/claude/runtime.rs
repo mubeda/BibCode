@@ -389,6 +389,7 @@ struct ClaudeTaskControlCorrelator {
     actor_target_by_agent: BTreeMap<String, String>,
     agent_by_task: BTreeMap<String, String>,
     fallback_ambiguous_parents: BTreeSet<String>,
+    fallback_ambiguity_overflowed: bool,
     retired_agent_by_task: BTreeMap<String, String>,
     pending_terminal_by_task: BTreeMap<String, ActivityLifecycle>,
     terminal_overflowed: bool,
@@ -410,6 +411,10 @@ impl std::fmt::Debug for ClaudeTaskControlCorrelator {
                 "fallback_ambiguous_parent_count",
                 &self.fallback_ambiguous_parents.len(),
             )
+            .field(
+                "fallback_ambiguity_overflowed",
+                &self.fallback_ambiguity_overflowed,
+            )
             .field("retired_task_count", &self.retired_agent_by_task.len())
             .field(
                 "pending_terminal_count",
@@ -430,6 +435,7 @@ impl ClaudeTaskControlCorrelator {
             actor_target_by_agent: BTreeMap::new(),
             agent_by_task: BTreeMap::new(),
             fallback_ambiguous_parents: BTreeSet::new(),
+            fallback_ambiguity_overflowed: false,
             retired_agent_by_task: BTreeMap::new(),
             pending_terminal_by_task: BTreeMap::new(),
             terminal_overflowed: false,
@@ -1183,18 +1189,29 @@ impl ClaudeTaskControlCorrelator {
         let (candidates_by_parent, children_by_parent, parentless_children, unresolved_root_launch) =
             build_snapshot(self);
         let nested_candidate_count = candidates_by_parent.values().map(Vec::len).sum::<usize>();
+        let mut ambiguous_parent_ids = BTreeSet::new();
         for (parent_agent_id, tool_use_ids) in &candidates_by_parent {
             let child_count = children_by_parent.get(parent_agent_id).map_or(0, Vec::len);
             if tool_use_ids.len() > 1 || child_count > 1 {
-                self.fallback_ambiguous_parents
-                    .insert(parent_agent_id.clone());
+                ambiguous_parent_ids.insert(parent_agent_id.clone());
             }
         }
         let parentless_competition = !parentless_children.is_empty()
             && (nested_candidate_count > 1 || parentless_children.len() > 1);
         if parentless_competition {
-            self.fallback_ambiguous_parents
-                .extend(candidates_by_parent.keys().cloned());
+            ambiguous_parent_ids.extend(candidates_by_parent.keys().cloned());
+        }
+        for parent_agent_id in ambiguous_parent_ids {
+            if self.fallback_ambiguity_overflowed
+                || self.fallback_ambiguous_parents.contains(&parent_agent_id)
+            {
+                continue;
+            }
+            if self.fallback_ambiguous_parents.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+                self.fallback_ambiguity_overflowed = true;
+                break;
+            }
+            self.fallback_ambiguous_parents.insert(parent_agent_id);
         }
         let invalid_tool_use_ids = self
             .correlations_by_tool_use
@@ -1241,6 +1258,7 @@ impl ClaudeTaskControlCorrelator {
         if nested_candidate_count == 1
             && parentless_children.len() == 1
             && !unresolved_root_launch
+            && !self.fallback_ambiguity_overflowed
             && let Some((parent_agent_id, tool_use_ids)) = candidates_by_parent
                 .iter()
                 .find(|(_, tool_use_ids)| tool_use_ids.len() == 1)
@@ -1262,7 +1280,9 @@ impl ClaudeTaskControlCorrelator {
         }
 
         for (parent_agent_id, tool_use_ids) in candidates_by_parent {
-            if self.fallback_ambiguous_parents.contains(&parent_agent_id) {
+            if self.fallback_ambiguity_overflowed
+                || self.fallback_ambiguous_parents.contains(&parent_agent_id)
+            {
                 continue;
             }
             let Some(child_agent_ids) = children_by_parent.get(&parent_agent_id) else {
@@ -4055,6 +4075,148 @@ mod targeted_task_correlation_tests {
                 "claude:agent:agent-child-two".to_owned(),
                 "task-child-two".to_owned()
             )],
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_ambiguity_memory_saturates_fail_closed_without_blocking_exact_evidence()
+     {
+        // Mutation caught: retaining every completed parent's ambiguity ID grows state beyond the
+        // Activity bound and lets a fresh parent regain fallback by omission or eviction.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        let mut at = 0_u64;
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let parent_tool_id = format!("tool-parent-{index}");
+            let parent_agent_id = format!("agent-parent-{index}");
+            let parent_task_id = format!("task-parent-{index}");
+            let child_one = nested_fallback_facts(
+                "session",
+                &parent_tool_id,
+                &parent_agent_id,
+                &format!("tool-child-one-{index}"),
+                &format!("agent-child-one-{index}"),
+                &format!("task-child-one-{index}"),
+            );
+            let child_two = nested_fallback_facts(
+                "session",
+                &parent_tool_id,
+                &parent_agent_id,
+                &format!("tool-child-two-{index}"),
+                &format!("agent-child-two-{index}"),
+                &format!("task-child-two-{index}"),
+            );
+            for fact in facts(
+                "session",
+                &parent_tool_id,
+                &parent_agent_id,
+                &parent_task_id,
+            )
+            .iter()
+            .chain(child_one.iter())
+            .chain(child_two.iter())
+            {
+                let _ = handle_fact(&mut runtime, fact, true, at);
+                at += 1;
+            }
+            let cleanup = json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": "session",
+                "task_id": parent_task_id,
+                "status": "stopped"
+            });
+            let _ = handle_fact(&mut runtime, &cleanup, true, at);
+            at += 1;
+            for child_agent_id in [
+                format!("agent-child-one-{index}"),
+                format!("agent-child-two-{index}"),
+            ] {
+                let child_stop = json!({
+                    "hook_event_name": "SubagentStop",
+                    "session_id": "session",
+                    "agent_id": child_agent_id
+                });
+                let _ = handle_fact(&mut runtime, &child_stop, true, at);
+                at += 1;
+            }
+            assert!(
+                runtime
+                    .task_control_correlator
+                    .active_identity_maps_are_empty(),
+                "cleanup {index}: {:?}",
+                runtime.task_control_correlator
+            );
+        }
+
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .fallback_ambiguous_parents
+                .len(),
+            ACTIVITY_PAGE_MAX_LENGTH
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let fresh_parent = facts(
+            "session",
+            "tool-parent-fresh",
+            "agent-parent-fresh",
+            "task-parent-fresh",
+        );
+        for fact in &fresh_parent {
+            let _ = handle_fact(&mut runtime, fact, true, at);
+            at += 1;
+        }
+        let fresh_child = nested_fallback_facts(
+            "session",
+            "tool-parent-fresh",
+            "agent-parent-fresh",
+            "tool-child-fresh",
+            "agent-child-fresh",
+            "task-child-fresh",
+        );
+        let fallback_outputs = fresh_child
+            .iter()
+            .map(|fact| {
+                let output = handle_fact(&mut runtime, fact, true, at);
+                at += 1;
+                output
+            })
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&fallback_outputs).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child-fresh")
+        );
+
+        let exact_child = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "session",
+            "agent_id": "agent-parent-fresh",
+            "tool_name": "Agent",
+            "tool_use_id": "tool-child-fresh",
+            "tool_response": {
+                "status": "async_launched",
+                "agentId": "agent-child-fresh"
+            }
+        });
+        let exact_output = handle_fact(&mut runtime, &exact_child, true, at);
+        assert_eq!(
+            mapped_targets(&[exact_output]),
+            [(
+                "claude:agent:agent-child-fresh".to_owned(),
+                "task-child-fresh".to_owned()
+            )]
+        );
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .fallback_ambiguous_parents
+                .len(),
+            ACTIVITY_PAGE_MAX_LENGTH
         );
         assert!(runtime.task_control_correlator.state_is_bounded());
     }
