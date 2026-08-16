@@ -124,14 +124,20 @@ named child through the existing authoritative path.
 
 ### Positive integration observer
 
-The public integration test opens its dedicated Activity WebSocket before
-starting the provider turn. The Activity scope does not exist until provider
-launch, so it starts and awaits turn admission, then subscribes immediately
-before waiting for the fixture-ready marker or sending any authenticated hook.
-The fixture cannot publish a child actor/control transition before that ready
-marker, so no relevant transition can be missed. Turn admission, subscription,
-the fixture ready marker, authenticated hook requests, Activity stream
-notifications, and the final authoritative snapshot share one absolute
+The public integration test opens dedicated thread and Activity WebSockets
+before starting the provider turn. Dispatch admission is asynchronous and does
+not prove that provider launch has created the Activity scope, so the test
+subscribes to `orchestration.subscribeThread` first, ACKs every chunk, starts
+the turn, and waits for a thread snapshot whose session status is `ready` or
+`running`. Production publishes either status only after
+`ensure_live_activity_scope` has returned, making that public thread event the
+causal readiness boundary for the test's single `subscribeActivity` request.
+The test then ACKs the initial Activity snapshot before observing the positive
+fixture-ready marker or sending authenticated hooks. The fixture cannot publish
+a child actor/control transition before that marker, so no relevant Activity
+transition can be missed. Turn admission, thread readiness, the single Activity
+subscription, the fixture ready marker, authenticated hook requests, Activity
+stream notifications, and the final authoritative snapshot share one absolute
 30-second test-only deadline, matching the already approved provider-fixture
 deadline policy.
 
@@ -143,8 +149,8 @@ children `running`, both controls `unsupported`, and the parent control
 `targetUnavailable` and that the provider capture is byte-for-byte unchanged.
 
 On deadline or stream failure, the test reports the last authoritative snapshot
-and fixture capture, closes both WebSockets, and shuts down and joins the server
-owner before failing.
+and fixture capture, closes all three WebSockets, and shuts down and joins the
+server owner before failing.
 
 ## Data and Concurrency Flow
 

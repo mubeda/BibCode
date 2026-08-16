@@ -501,9 +501,9 @@ where
 
 Do not change the existing infallible stream helpers used by unrelated tests.
 
-- [ ] **Step 2: Connect before the provider turn and subscribe after admission**
+- [ ] **Step 2: Connect before the provider turn and subscribe after public runtime readiness**
 
-After project/thread creation and before `thread.turn.start`, create one deadline and connect the dedicated stream WebSocket. Connection failure must close the main socket and join the server before panicking. Do not send `subscribeActivity` yet because production creates the Activity scope during provider launch:
+After project/thread creation and before `thread.turn.start`, create one deadline and connect dedicated Activity and thread-stream WebSockets. Connection failure must close every socket already owned and join the server before panicking. Do not send `subscribeActivity` yet because `thread.turn.start` acknowledges asynchronous admission before production creates the Activity scope. Subscribe the thread socket with request ID `9680` before dispatching the turn, require its initial snapshot, and ACK it:
 
 ```rust
 const CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -534,8 +534,57 @@ let (mut activity_stream, _) = match activity_connection {
         );
     }
 };
+let thread_connection = timeout_at(
+    deadline,
+    connect_async(format!("ws://{}/ws", handle.local_addr())),
+)
+.await;
+let (mut thread_stream, _) = match thread_connection {
+    Ok(Ok(connection)) => connection,
+    Ok(Err(error)) => {
+        let _ = activity_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "thread stream connection failed before provider launch: \
+             error={error}; server_join={join_result:?}"
+        );
+    }
+    Err(_) => {
+        let _ = activity_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "thread stream connection deadline elapsed before provider launch; \
+             server_join={join_result:?}"
+        );
+    }
+};
 let mut last_snapshot = None::<Value>;
 let setup_result = timeout_at(deadline, async {
+    try_stream_rpc_request(
+        &mut thread_stream,
+        "9680",
+        "orchestration.subscribeThread",
+        json!({"threadId":"claude-ambiguous-thread"}),
+    )
+    .await?;
+    let initial_thread = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+    if !matches!(initial_thread, ServerMessage::Chunk { ref values, .. }
+        if values[0]["kind"] == "snapshot")
+    {
+        return Err(format!("initial thread message was not a snapshot: {initial_thread:?}"));
+    }
+    thread_stream
+        .send(Message::Text(
+            json!({"_tag":"Ack","requestId":"9680"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|error| format!("failed to ACK initial thread snapshot: {error}"))?;
     tagged_rpc_request(
         &mut socket,
         "9603",
@@ -555,6 +604,29 @@ let setup_result = timeout_at(deadline, async {
     )
     .await
     .map_err(|error| format!("ambiguous Claude turn admission failed: {error}"))?;
+    loop {
+        let message = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+        let ready = matches!(
+            message,
+            ServerMessage::Chunk { ref values, .. }
+                if values[0]["kind"] == "snapshot"
+                    && matches!(
+                        values[0]["snapshot"]["thread"]["session"]["status"].as_str(),
+                        Some("ready" | "running")
+                    )
+        );
+        thread_stream
+            .send(Message::Text(
+                json!({"_tag":"Ack","requestId":"9680"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| format!("failed to ACK thread readiness snapshot: {error}"))?;
+        if ready {
+            break;
+        }
+    }
     try_stream_rpc_request(
         &mut activity_stream,
         "9690",
@@ -584,7 +656,7 @@ let setup_result = timeout_at(deadline, async {
 
 Before the final `Ok(())`, move the existing ready-marker wait and unchanged literal array of six authenticated hook POSTs into this setup block, after the initial Activity snapshot is ACKed. Replace each panicking `.expect` call inside the block with a stage-specific `map_err` call. The outer `timeout_at` uses the one shared absolute deadline; do not construct a new timeout duration at any later milestone. Handle `setup_result` with the owner-cleanup branch from Step 4 before entering the convergence loop.
 
-The required order is therefore: connect stream socket, admit turn and create the scope, subscribe and ACK the initial snapshot, observe the positive fixture-ready marker, then send hooks. The clean pre-amendment RED for awaiting subscription before turn admission is `ActivityError(notFound)` followed by `server_join=Ok(())`; preserve it in the task report.
+The required order is therefore: connect both observer sockets, subscribe and ACK the initial thread snapshot, admit the turn, consume and ACK thread snapshots until public session status is `ready` or `running`, issue the single Activity subscription and ACK its initial snapshot, observe the positive fixture-ready marker, then send hooks. `ready` and `running` are safe because production persists and dispatches them only after `ensure_live_activity_scope` returns. Preserve both clean sequencing REDs in the task report: subscription before turn admission and subscription immediately after dispatch admission each returned `ActivityError(notFound)` followed by `server_join=Ok(())`.
 
 - [ ] **Step 3: Replace the snapshot hammer with notification-driven reads**
 
