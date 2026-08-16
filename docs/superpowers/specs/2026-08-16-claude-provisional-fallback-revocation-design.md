@@ -117,6 +117,14 @@ resolution of one sibling from making an unresolved sibling appear newly
 unique by elimination. Exact PostToolUse evidence remains authoritative and
 can still resolve every named child independently.
 
+The neighboring public selected-subtree regression must establish exact nested
+identity before it introduces an unrelated parentless actor. Its authenticated
+hook sequence therefore includes the child's matching `PostToolUse` response
+after `PreToolUse` and `SubagentStart`. That test is intended to prove exact
+subtree cancellation, not to preserve a provisional fallback after affirmative
+sibling ambiguity; the later unrelated actor must leave the exact child target
+available.
+
 An explicit parent lineage is never erased by fallback cleanup. Exact
 PostToolUse identity is never revoked merely because other unresolved siblings
 exist. Exact evidence arriving after revocation can resolve and install its
