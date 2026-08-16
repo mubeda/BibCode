@@ -244,6 +244,15 @@ timeout, and connection closure do not. Revocation clears all exact and
 fallback handles before later clicks are admitted and never falls back to the
 root interrupt path.
 
+A fallback target is provisional until matching exact PostToolUse evidence promotes it.
+It remains part of its parent's complete candidate set after installation. If later
+same-generation evidence makes that set non-unique, the correlator synchronously
+removes only the inferred target and inferred lineage, publishes unsupported control,
+and retains the actors and task facts as unresolved evidence. Exact targets are not
+revoked by sibling ambiguity, and exact evidence may later resolve one named child.
+Affirmative parent-level ambiguity disables further fallback for that parent until
+generation reset, so resolving one sibling exactly cannot reopen another by elimination.
+
 | Provider | Structured chat | Structured activity                                                                                                                                                                                                                   | Provider-terminal observation                                                                                      | Downgrade behavior                                                                                                                                                                              |
 | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Codex    | Supported       | Actors, attributed entries, and version-gated background tasks.                                                                                                                                                                       | Supported when the executable advertises the required App Server listener and remote-TUI features.                 | Incompatible recovery or background methods reduce capabilities without disabling ordinary provider use.                                                                                        |
