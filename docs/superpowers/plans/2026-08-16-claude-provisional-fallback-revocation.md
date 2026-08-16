@@ -499,6 +499,14 @@ where
 }
 ```
 
+Also add a private `try_tagged_rpc_request_until` helper for unary calls made
+after observer ownership begins. It must accept the same absolute
+`tokio::time::Instant`, wrap both `socket.send` and `socket.next` with
+`timeout_at`, parse and validate the exact `RequestId` without `unwrap` or
+`panic`, and return `Result<Result<Value, Value>, String>` so transport/protocol
+failures remain distinct from RPC application failures. Do not change the
+legacy infallible unary helper used by unrelated tests.
+
 Do not change the existing infallible stream helpers used by unrelated tests.
 
 - [ ] **Step 2: Connect before the provider turn and subscribe after public runtime readiness**
@@ -764,6 +772,16 @@ let snapshot = match observation {
 ```
 
 On success, keep both public `activity.cancelSubtree` assertions, the exact `targetUnavailable` payload, unchanged capture bytes, zero `stop_task` targets, and zero root interrupts. Close `activity_stream` before the main socket, then call `handle.shutdown()` and await `handle.join()`.
+
+Use `try_tagged_rpc_request_until` for the post-connection turn dispatch, every
+authoritative Activity snapshot, and both cancellation requests. Fold the
+cancellation payload and provider-capture invariants into a fallible
+deadline-bound verification result. A send timeout, response timeout, closed or
+invalid frame, mismatched request ID, unexpected application success/failure,
+or invariant mismatch must close Activity, thread, and main sockets, then
+shutdown and join the server before the final panic. No call on this owned path
+may reach the legacy `tagged_rpc_request` helper's relative ten-second timeout
+or panicking send/response parser.
 
 - [ ] **Step 5: Run the exact public regression**
 
