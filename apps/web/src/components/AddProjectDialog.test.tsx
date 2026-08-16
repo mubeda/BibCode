@@ -180,9 +180,9 @@ describe("AddProjectDialog mounted interactions", () => {
     expect(labelledBy).not.toBeNull();
     expect(describedBy).not.toBeNull();
     expect(document.getElementById(labelledBy!)?.textContent).toBe("Add a project");
-    expect(document.getElementById(describedBy!)?.textContent).toContain(
-      "Choose how to add a project",
-    );
+    const description = document.getElementById(describedBy!);
+    expect(description?.textContent).toBe("Choose how to add a project.");
+    expect(description?.textContent).not.toMatch(/host/i);
 
     const content = dialog.querySelector('[data-add-project-content="true"]');
     expect(content?.classList.contains("overflow-y-auto")).toBe(true);
