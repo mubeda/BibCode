@@ -1145,10 +1145,15 @@ describe("ActivityPanel detail", () => {
     const timestamp = container.querySelector<HTMLTimeElement>(
       `[data-activity-entry-id="narrow-command"] time[datetime="${createdAt}"]`,
     );
+    const row = timestamp?.parentElement;
+    const title = timestamp?.previousElementSibling;
     expect(timestamp?.textContent).toBe(formatChatTimestampTooltip(createdAt, "24-hour"));
     expect(timestamp?.dateTime).toBe(createdAt);
     expect(timestamp?.title).toBe(createdAt);
     expect(timestamp?.textContent).not.toBe(timestamp?.dateTime);
+    expect(row?.className).toContain("flex-wrap");
+    expect(title?.className).toContain("min-w-16");
+    expect(timestamp?.className).toContain("ml-auto");
   });
 
   it("filters entries whose owner does not match the keyed record", async () => {
