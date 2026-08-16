@@ -1118,6 +1118,36 @@ describe("ActivityPanel detail", () => {
     expect(entryTimestamp?.title).toBe("not-a-date");
   });
 
+  it("formats record and event timestamps with the selected 12-hour preference", async () => {
+    const startedAt = "2026-07-22T20:00:00.000Z";
+    const createdAt = "2026-07-22T20:01:00.000Z";
+    const child = actor("child", { startedAt });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          timestampFormat: "12-hour",
+          route: {
+            section: "subagents",
+            selectedRecordKind: "actor",
+            selectedRecordId: "child",
+          },
+          detail: detailQuery("actor", "child", [
+            detailPage(child, [entry("twelve-hour-entry", "command", createdAt)]),
+          ]),
+        })}
+      />,
+    );
+
+    expect(
+      container.querySelector<HTMLTimeElement>(`time[datetime="${startedAt}"]`)?.textContent,
+    ).toBe(formatChatTimestampTooltip(startedAt, "12-hour"));
+    expect(
+      container.querySelector<HTMLTimeElement>(
+        `[data-activity-entry-id="twelve-hour-entry"] time[datetime="${createdAt}"]`,
+      )?.textContent,
+    ).toBe(formatChatTimestampTooltip(createdAt, "12-hour"));
+  });
+
   it("formats event timestamps in a narrow detail row while retaining canonical metadata", async () => {
     const createdAt = "2026-07-22T20:01:02.123456789Z";
     const child = actor("child");
