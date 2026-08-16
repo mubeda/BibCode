@@ -387,6 +387,8 @@ and retains the actors and task facts as unresolved evidence. Exact targets are 
 revoked by sibling ambiguity, and exact evidence may later resolve one named child.
 Affirmative parent-level ambiguity disables further fallback for that parent until
 generation reset, so resolving one sibling exactly cannot reopen another by elimination.
+At most 200 ambiguous parent identities are retained; saturation disables all fallback
+admission until generation reset while exact PostToolUse identity remains authoritative.
 Pending state is generation-owned and bounded to 200 correlations. Terminal
 events, runtime replacement, and Activity disablement retire or clear pending
 and installed fallback state.
