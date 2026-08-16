@@ -6,6 +6,7 @@ import {
   type ActivityRecordSummary,
   type ActivitySnapshot,
 } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import { RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -37,6 +38,7 @@ export interface ActivityDetailQueryResult extends ActivityQueryResult<ActivityD
 }
 
 export interface ActivityPanelProps {
+  readonly timestampFormat: TimestampFormat;
   readonly route: ActivityPanelRoute;
   readonly snapshot: ActivitySnapshot;
   readonly roster: {
@@ -110,6 +112,7 @@ function RetryBanner({
 }
 
 export function ActivityPanel({
+  timestampFormat,
   route,
   snapshot,
   roster,
@@ -324,6 +327,7 @@ export function ActivityPanel({
             rosterRecords={rosterRecords}
             section={route.section}
             snapshot={snapshot}
+            timestampFormat={timestampFormat}
           />
         ) : (
           rosterContent
