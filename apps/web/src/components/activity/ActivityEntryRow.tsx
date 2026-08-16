@@ -73,7 +73,7 @@ export function ActivityEntryRow({ entry, timestampFormat }: ActivityEntryRowPro
       data-activity-entry-id={entry.id}
       data-activity-entry-kind={entry.kind}
     >
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
         <span
           className="shrink-0 text-xs font-medium text-muted-foreground"
@@ -81,9 +81,9 @@ export function ActivityEntryRow({ entry, timestampFormat }: ActivityEntryRowPro
         >
           {presentation.label}
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm">{entry.title}</span>
+        <span className="min-w-16 flex-1 truncate text-sm">{entry.title}</span>
         <time
-          className="shrink-0 text-[11px] text-muted-foreground"
+          className="ml-auto shrink-0 text-[11px] text-muted-foreground"
           dateTime={entry.createdAt}
           title={entry.createdAt}
         >
