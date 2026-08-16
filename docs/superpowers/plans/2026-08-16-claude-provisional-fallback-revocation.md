@@ -501,9 +501,9 @@ where
 
 Do not change the existing infallible stream helpers used by unrelated tests.
 
-- [ ] **Step 2: Subscribe before the provider turn and create one deadline**
+- [ ] **Step 2: Connect before the provider turn and subscribe after admission**
 
-After project/thread creation and before `thread.turn.start`, create one deadline and connect the stream. Connection failure must close the main socket and join the server before panicking:
+After project/thread creation and before `thread.turn.start`, create one deadline and connect the dedicated stream WebSocket. Connection failure must close the main socket and join the server before panicking. Do not send `subscribeActivity` yet because production creates the Activity scope during provider launch:
 
 ```rust
 const CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -536,6 +536,25 @@ let (mut activity_stream, _) = match activity_connection {
 };
 let mut last_snapshot = None::<Value>;
 let setup_result = timeout_at(deadline, async {
+    tagged_rpc_request(
+        &mut socket,
+        "9603",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
+            "threadId":"claude-ambiguous-thread",
+            "message":{
+                "messageId":"claude-ambiguous-message","role":"user",
+                "text":"start","attachments":[]
+            },
+            "modelSelection":{
+                "instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"
+            },
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .map_err(|error| format!("ambiguous Claude turn admission failed: {error}"))?;
     try_stream_rpc_request(
         &mut activity_stream,
         "9690",
@@ -563,7 +582,9 @@ let setup_result = timeout_at(deadline, async {
 .await;
 ```
 
-Before the final `Ok(())`, move the existing `thread.turn.start`, ready-marker wait, and unchanged literal array of six authenticated hook POSTs into this setup block. Replace each panicking `.expect` call inside the block with a stage-specific `map_err` call. The outer `timeout_at` uses the one shared absolute deadline; do not construct a new timeout duration at any later milestone. Handle `setup_result` with the owner-cleanup branch from Step 4 before entering the convergence loop.
+Before the final `Ok(())`, move the existing ready-marker wait and unchanged literal array of six authenticated hook POSTs into this setup block, after the initial Activity snapshot is ACKed. Replace each panicking `.expect` call inside the block with a stage-specific `map_err` call. The outer `timeout_at` uses the one shared absolute deadline; do not construct a new timeout duration at any later milestone. Handle `setup_result` with the owner-cleanup branch from Step 4 before entering the convergence loop.
+
+The required order is therefore: connect stream socket, admit turn and create the scope, subscribe and ACK the initial snapshot, observe the positive fixture-ready marker, then send hooks. The clean pre-amendment RED for awaiting subscription before turn admission is `ActivityError(notFound)` followed by `server_join=Ok(())`; preserve it in the task report.
 
 - [ ] **Step 3: Replace the snapshot hammer with notification-driven reads**
 
