@@ -379,6 +379,14 @@ same exact active source parent. Present explicit lineage must still agree.
 Ambiguity is observable but unsupported and performs zero provider I/O;
 semantic text, timing, order, proximity, transcript reads, polling, and timers
 are never correlation inputs.
+A fallback target is provisional until matching exact PostToolUse evidence promotes it.
+It remains part of its parent's complete candidate set after installation. If later
+same-generation evidence makes that set non-unique, the correlator synchronously
+removes only the inferred target and inferred lineage, publishes unsupported control,
+and retains the actors and task facts as unresolved evidence. Exact targets are not
+revoked by sibling ambiguity, and exact evidence may later resolve one named child.
+Affirmative parent-level ambiguity disables further fallback for that parent until
+generation reset, so resolving one sibling exactly cannot reopen another by elimination.
 Pending state is generation-owned and bounded to 200 correlations. Terminal
 events, runtime replacement, and Activity disablement retire or clear pending
 and installed fallback state.

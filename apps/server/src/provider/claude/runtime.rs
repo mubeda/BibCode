@@ -271,6 +271,13 @@ struct PendingUserInput {
     raw: Value,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ClaudeProvisionalFallback {
+    agent_id: String,
+    parent_agent_id: String,
+    promoted_parentless_lineage: bool,
+}
+
 #[derive(Debug, Default)]
 struct ClaudeTaskCorrelation {
     invocation_is_agent: Option<bool>,
@@ -278,16 +285,18 @@ struct ClaudeTaskCorrelation {
     pre_tool_source: Option<ClaudeHookSource>,
     hook_source: Option<ClaudeHookSource>,
     launched_agent_id: Option<String>,
-    fallback_agent_id: Option<String>,
+    provisional_fallback: Option<ClaudeProvisionalFallback>,
     task_id: Option<String>,
     conflicted: bool,
 }
 
 impl ClaudeTaskCorrelation {
     fn effective_agent_id(&self) -> Option<&str> {
-        self.launched_agent_id
-            .as_deref()
-            .or(self.fallback_agent_id.as_deref())
+        self.launched_agent_id.as_deref().or_else(|| {
+            self.provisional_fallback
+                .as_ref()
+                .map(|fallback| fallback.agent_id.as_str())
+        })
     }
 }
 
@@ -379,6 +388,7 @@ struct ClaudeTaskControlCorrelator {
     verified_agents: BTreeMap<String, ClaudeVerifiedLineage>,
     actor_target_by_agent: BTreeMap<String, String>,
     agent_by_task: BTreeMap<String, String>,
+    fallback_ambiguous_parents: BTreeSet<String>,
     retired_agent_by_task: BTreeMap<String, String>,
     pending_terminal_by_task: BTreeMap<String, ActivityLifecycle>,
     terminal_overflowed: bool,
@@ -396,6 +406,10 @@ impl std::fmt::Debug for ClaudeTaskControlCorrelator {
             .field("verified_agent_count", &self.verified_agents.len())
             .field("active_target_count", &self.actor_target_by_agent.len())
             .field("task_count", &self.agent_by_task.len())
+            .field(
+                "fallback_ambiguous_parent_count",
+                &self.fallback_ambiguous_parents.len(),
+            )
             .field("retired_task_count", &self.retired_agent_by_task.len())
             .field(
                 "pending_terminal_count",
@@ -415,6 +429,7 @@ impl ClaudeTaskControlCorrelator {
             verified_agents: BTreeMap::new(),
             actor_target_by_agent: BTreeMap::new(),
             agent_by_task: BTreeMap::new(),
+            fallback_ambiguous_parents: BTreeSet::new(),
             retired_agent_by_task: BTreeMap::new(),
             pending_terminal_by_task: BTreeMap::new(),
             terminal_overflowed: false,
@@ -527,9 +542,9 @@ impl ClaudeTaskControlCorrelator {
                     .as_deref()
                     .is_some_and(|existing| existing != fact.agent_id)
                 || record
-                    .fallback_agent_id
-                    .as_deref()
-                    .is_some_and(|existing| existing != fact.agent_id);
+                    .provisional_fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.agent_id != fact.agent_id);
             let pre_source_conflict = record
                 .pre_tool_source
                 .as_ref()
@@ -545,7 +560,7 @@ impl ClaudeTaskControlCorrelator {
             let conflict = launch_conflict || pre_source_conflict || source_conflict;
             if !conflict && record.launched_agent_id.is_none() {
                 record.launched_agent_id = Some(fact.agent_id.to_owned());
-                record.fallback_agent_id = None;
+                record.provisional_fallback = None;
             }
             conflict
         };
@@ -826,6 +841,46 @@ impl ClaudeTaskControlCorrelator {
             .collect()
     }
 
+    fn revoke_provisional_fallback(
+        &mut self,
+        tool_use_id: &str,
+    ) -> Option<ClaudeTaskControlEffect> {
+        let (fallback, task_id) = {
+            let record = self.correlations_by_tool_use.get(tool_use_id)?;
+            (record.provisional_fallback.clone()?, record.task_id.clone())
+        };
+        self.correlations_by_tool_use
+            .get_mut(tool_use_id)
+            .expect("provisional correlation remains present")
+            .provisional_fallback = None;
+
+        if fallback.promoted_parentless_lineage
+            && self.verified_agents.get(&fallback.agent_id)
+                == Some(&ClaudeVerifiedLineage::Parent(
+                    fallback.parent_agent_id.clone(),
+                ))
+        {
+            self.verified_agents
+                .insert(fallback.agent_id.clone(), ClaudeVerifiedLineage::Root);
+        }
+
+        let owned_target = task_id.as_ref().is_some_and(|task_id| {
+            self.actor_target_by_agent.get(&fallback.agent_id) == Some(task_id)
+        });
+        if owned_target {
+            self.actor_target_by_agent.remove(&fallback.agent_id);
+        }
+        if let Some(task_id) = task_id
+            && self.agent_by_task.get(&task_id) == Some(&fallback.agent_id)
+        {
+            self.agent_by_task.remove(&task_id);
+        }
+
+        owned_target.then_some(ClaudeTaskControlEffect::Retire {
+            agent_id: fallback.agent_id,
+        })
+    }
+
     fn reconcile_all(&mut self) -> Vec<ClaudeTaskControlEffect> {
         let tool_use_ids = self
             .correlations_by_tool_use
@@ -1025,84 +1080,171 @@ impl ClaudeTaskControlCorrelator {
     }
 
     fn reconcile_parent_local_fallbacks(&mut self) -> Vec<ClaudeTaskControlEffect> {
-        let mut candidates_by_parent = BTreeMap::<String, Vec<String>>::new();
-        for (tool_use_id, record) in &self.correlations_by_tool_use {
-            let Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)) =
-                record.invocation_source.as_ref()
-            else {
-                continue;
-            };
-            let Some(ClaudeHookSource::Agent(parent_agent_id)) = record.pre_tool_source.as_ref()
-            else {
-                continue;
-            };
-            let parent_is_active =
-                self.exact_parent_owns_current_target(parent_tool_use_id, parent_agent_id);
-            if parent_is_active
-                && record.invocation_is_agent == Some(true)
-                && record.launched_agent_id.is_none()
-                && record.fallback_agent_id.is_none()
-                && record.task_id.is_some()
-                && !record.conflicted
-            {
-                candidates_by_parent
-                    .entry(parent_agent_id.clone())
-                    .or_default()
-                    .push(tool_use_id.clone());
-            }
-        }
-
-        let assigned_agents = self
-            .correlations_by_tool_use
-            .values()
-            .filter_map(ClaudeTaskCorrelation::effective_agent_id)
-            .collect::<BTreeSet<_>>();
-        let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
-        let mut parentless_children = Vec::new();
-        for (agent_id, lineage) in &self.verified_agents {
-            if !self.actor_target_by_agent.contains_key(agent_id)
-                && !self
-                    .agent_by_task
-                    .values()
-                    .any(|assigned| assigned == agent_id)
-                && !assigned_agents.contains(agent_id.as_str())
-                && !self.tombstoned_agents.contains(agent_id)
-            {
-                match lineage {
-                    ClaudeVerifiedLineage::Parent(parent_agent_id) => {
-                        children_by_parent
-                            .entry(parent_agent_id.clone())
-                            .or_default()
-                            .push(agent_id.clone());
-                    }
-                    ClaudeVerifiedLineage::Root => parentless_children.push(agent_id.clone()),
+        let build_snapshot = |correlator: &ClaudeTaskControlCorrelator| {
+            let mut candidates_by_parent = BTreeMap::<String, Vec<String>>::new();
+            for (tool_use_id, record) in &correlator.correlations_by_tool_use {
+                let Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)) =
+                    record.invocation_source.as_ref()
+                else {
+                    continue;
+                };
+                let Some(ClaudeHookSource::Agent(parent_agent_id)) =
+                    record.pre_tool_source.as_ref()
+                else {
+                    continue;
+                };
+                if correlator.exact_parent_owns_current_target(parent_tool_use_id, parent_agent_id)
+                    && record.invocation_is_agent == Some(true)
+                    && record.launched_agent_id.is_none()
+                    && record.task_id.is_some()
+                    && !record.conflicted
+                {
+                    candidates_by_parent
+                        .entry(parent_agent_id.clone())
+                        .or_default()
+                        .push(tool_use_id.clone());
                 }
             }
+
+            let exact_agents = correlator
+                .correlations_by_tool_use
+                .values()
+                .filter_map(|record| record.launched_agent_id.as_deref())
+                .collect::<BTreeSet<_>>();
+            let mut provisional_agents = BTreeSet::new();
+            let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+            let mut parentless_children = Vec::new();
+            for tool_use_ids in candidates_by_parent.values() {
+                for tool_use_id in tool_use_ids {
+                    let fallback = correlator
+                        .correlations_by_tool_use
+                        .get(tool_use_id)
+                        .and_then(|record| record.provisional_fallback.as_ref());
+                    let Some(fallback) = fallback else {
+                        continue;
+                    };
+                    provisional_agents.insert(fallback.agent_id.as_str());
+                    if fallback.promoted_parentless_lineage {
+                        parentless_children.push(fallback.agent_id.clone());
+                    } else {
+                        children_by_parent
+                            .entry(fallback.parent_agent_id.clone())
+                            .or_default()
+                            .push(fallback.agent_id.clone());
+                    }
+                }
+            }
+            for (agent_id, lineage) in &correlator.verified_agents {
+                if !correlator.actor_target_by_agent.contains_key(agent_id)
+                    && !correlator
+                        .agent_by_task
+                        .values()
+                        .any(|assigned| assigned == agent_id)
+                    && !exact_agents.contains(agent_id.as_str())
+                    && !provisional_agents.contains(agent_id.as_str())
+                    && !correlator.tombstoned_agents.contains(agent_id)
+                {
+                    match lineage {
+                        ClaudeVerifiedLineage::Parent(parent_agent_id) => {
+                            children_by_parent
+                                .entry(parent_agent_id.clone())
+                                .or_default()
+                                .push(agent_id.clone());
+                        }
+                        ClaudeVerifiedLineage::Root => {
+                            parentless_children.push(agent_id.clone());
+                        }
+                    }
+                }
+            }
+
+            let unresolved_root_launch =
+                correlator.correlations_by_tool_use.values().any(|record| {
+                    record.invocation_source == Some(ClaudeInvocationSource::Root)
+                        && record.invocation_is_agent == Some(true)
+                        && (!record.conflicted
+                            && (record.effective_agent_id().is_none()
+                                || record.task_id.is_none()
+                                || record.effective_agent_id().is_some_and(|agent_id| {
+                                    record.task_id.as_ref().is_none_or(|task_id| {
+                                        correlator.actor_target_by_agent.get(agent_id)
+                                            != Some(task_id)
+                                    })
+                                })))
+                });
+            (
+                candidates_by_parent,
+                children_by_parent,
+                parentless_children,
+                unresolved_root_launch,
+            )
+        };
+
+        let (candidates_by_parent, children_by_parent, parentless_children, unresolved_root_launch) =
+            build_snapshot(self);
+        let nested_candidate_count = candidates_by_parent.values().map(Vec::len).sum::<usize>();
+        for (parent_agent_id, tool_use_ids) in &candidates_by_parent {
+            let child_count = children_by_parent.get(parent_agent_id).map_or(0, Vec::len);
+            if tool_use_ids.len() > 1 || child_count > 1 {
+                self.fallback_ambiguous_parents
+                    .insert(parent_agent_id.clone());
+            }
         }
+        let parentless_competition = !parentless_children.is_empty()
+            && (nested_candidate_count > 1 || parentless_children.len() > 1);
+        if parentless_competition {
+            self.fallback_ambiguous_parents
+                .extend(candidates_by_parent.keys().cloned());
+        }
+        let invalid_tool_use_ids = self
+            .correlations_by_tool_use
+            .iter()
+            .filter_map(|(tool_use_id, record)| {
+                let fallback = record.provisional_fallback.as_ref()?;
+                let valid = if fallback.promoted_parentless_lineage {
+                    nested_candidate_count == 1
+                        && parentless_children.as_slice()
+                            == std::slice::from_ref(&fallback.agent_id)
+                        && !unresolved_root_launch
+                        && candidates_by_parent
+                            .get(&fallback.parent_agent_id)
+                            .is_some_and(|tools| {
+                                tools.as_slice() == std::slice::from_ref(tool_use_id)
+                            })
+                        && !children_by_parent.contains_key(&fallback.parent_agent_id)
+                } else {
+                    candidates_by_parent
+                        .get(&fallback.parent_agent_id)
+                        .is_some_and(|tools| tools.as_slice() == std::slice::from_ref(tool_use_id))
+                        && children_by_parent
+                            .get(&fallback.parent_agent_id)
+                            .is_some_and(|agents| {
+                                agents.as_slice() == std::slice::from_ref(&fallback.agent_id)
+                            })
+                };
+                (!valid).then(|| tool_use_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let effects = invalid_tool_use_ids
+            .iter()
+            .filter_map(|tool_use_id| self.revoke_provisional_fallback(tool_use_id))
+            .collect::<Vec<_>>();
+
+        let (candidates_by_parent, children_by_parent, parentless_children, unresolved_root_launch) =
+            build_snapshot(self);
+        let nested_candidate_count = candidates_by_parent.values().map(Vec::len).sum::<usize>();
 
         // Documented SubagentStart hooks do not carry parent_agent_id. Admit that real-world
         // shape only when it cannot be confused with a root launch: one nested candidate in the
         // whole generation, one unmatched verified actor, and no unresolved root Agent/Task
         // invocation. Any concurrent or missing evidence remains observable but unsupported.
-        let unresolved_root_launch = self.correlations_by_tool_use.values().any(|record| {
-            record.invocation_source == Some(ClaudeInvocationSource::Root)
-                && record.invocation_is_agent == Some(true)
-                && (!record.conflicted
-                    && (record.effective_agent_id().is_none()
-                        || record.task_id.is_none()
-                        || record.effective_agent_id().is_some_and(|agent_id| {
-                            record.task_id.as_ref().is_none_or(|task_id| {
-                                self.actor_target_by_agent.get(agent_id) != Some(task_id)
-                            })
-                        })))
-        });
-        let nested_candidate_count = candidates_by_parent.values().map(Vec::len).sum::<usize>();
         if nested_candidate_count == 1
             && parentless_children.len() == 1
             && !unresolved_root_launch
             && let Some((parent_agent_id, tool_use_ids)) = candidates_by_parent
                 .iter()
                 .find(|(_, tool_use_ids)| tool_use_ids.len() == 1)
+            && !self.fallback_ambiguous_parents.contains(parent_agent_id)
             && !children_by_parent.contains_key(parent_agent_id)
         {
             let child_agent_id = parentless_children[0].clone();
@@ -1111,11 +1253,18 @@ impl ClaudeTaskControlCorrelator {
                 ClaudeVerifiedLineage::Parent(parent_agent_id.clone()),
             );
             if let Some(record) = self.correlation_mut(&tool_use_ids[0]) {
-                record.fallback_agent_id = Some(child_agent_id);
+                record.provisional_fallback = Some(ClaudeProvisionalFallback {
+                    agent_id: child_agent_id,
+                    parent_agent_id: parent_agent_id.clone(),
+                    promoted_parentless_lineage: true,
+                });
             }
         }
 
         for (parent_agent_id, tool_use_ids) in candidates_by_parent {
+            if self.fallback_ambiguous_parents.contains(&parent_agent_id) {
+                continue;
+            }
             let Some(child_agent_ids) = children_by_parent.get(&parent_agent_id) else {
                 continue;
             };
@@ -1123,10 +1272,14 @@ impl ClaudeTaskControlCorrelator {
                 continue;
             }
             if let Some(record) = self.correlation_mut(&tool_use_ids[0]) {
-                record.fallback_agent_id = Some(child_agent_ids[0].clone());
+                record.provisional_fallback = Some(ClaudeProvisionalFallback {
+                    agent_id: child_agent_ids[0].clone(),
+                    parent_agent_id,
+                    promoted_parentless_lineage: false,
+                });
             }
         }
-        Vec::new()
+        effects
     }
 
     fn retire_identity_chain(
@@ -1228,6 +1381,7 @@ impl ClaudeTaskControlCorrelator {
             && self.verified_agents.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.actor_target_by_agent.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.agent_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.fallback_ambiguous_parents.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.retired_agent_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.pending_terminal_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
     }
@@ -3133,6 +3287,24 @@ mod targeted_task_correlation_tests {
             .collect()
     }
 
+    fn retired_actor_targets(outputs: &[ClaudeRuntimeOutput]) -> Vec<String> {
+        outputs
+            .iter()
+            .flat_map(|output| &output.activity_controls)
+            .filter_map(|update| match update {
+                crate::activity::ProviderActivityControlUpdate::ActorTarget {
+                    actor_id,
+                    target: None,
+                } => Some(actor_id.clone()),
+                crate::activity::ProviderActivityControlUpdate::ActorTarget {
+                    target: Some(_),
+                    ..
+                }
+                | crate::activity::ProviderActivityControlUpdate::WorkTarget { .. } => None,
+            })
+            .collect()
+    }
+
     fn assert_effects_are_keyed(outputs: &[ClaudeRuntimeOutput], case: &str) {
         for output in outputs {
             if !output.activity.is_empty() || !output.activity_controls.is_empty() {
@@ -3537,6 +3709,354 @@ mod targeted_task_correlation_tests {
                                 == Some("claude:agent:agent-parent")
                 ))
         );
+    }
+
+    #[test]
+    fn targeted_task_correlation_late_sibling_revokes_provisional_parentless_fallback() {
+        // Mutation caught: excluding an installed parentless fallback from the complete sibling
+        // candidate set leaves inferred targets dependent on fact arrival order.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let mut child_one = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-one",
+            "agent-child-one",
+            "task-child-one",
+        );
+        let mut child_two = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-two",
+            "agent-child-two",
+            "task-child-two",
+        );
+        for child in [&mut child_one, &mut child_two] {
+            child[3]
+                .as_object_mut()
+                .expect("SubagentStart object")
+                .remove("parent_agent_id");
+            child[3]["agent_type"] = json!("same-role");
+        }
+
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in parent.iter().enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let child_one_outputs = child_one
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped_targets(&child_one_outputs),
+            [(
+                "claude:agent:agent-child-one".to_owned(),
+                "task-child-one".to_owned()
+            )],
+        );
+
+        let child_two_outputs = child_two
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 20 + index as u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retired_actor_targets(&child_two_outputs),
+            ["claude:agent:agent-child-one".to_owned()],
+        );
+        assert_eq!(
+            runtime.task_control_correlator.actor_target_by_agent.len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .get("agent-parent")
+                .map(String::as_str),
+            Some("task-parent"),
+        );
+        assert_eq!(runtime.task_control_correlator.agent_by_task.len(), 1);
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .agent_by_task
+                .get("task-parent")
+                .map(String::as_str),
+            Some("agent-parent"),
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let replay = child_one
+            .iter()
+            .chain(child_two.iter())
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&replay).is_empty());
+        assert_eq!(
+            runtime.task_control_correlator.actor_target_by_agent.len(),
+            1
+        );
+        assert_eq!(runtime.task_control_correlator.agent_by_task.len(), 1);
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let mut reversed = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in parent.iter().enumerate() {
+            let _ = handle_fact(&mut reversed, fact, true, 40 + index as u64);
+        }
+        let reversed_outputs = child_one[..3]
+            .iter()
+            .chain(child_two[..3].iter())
+            .chain(std::iter::once(&child_one[3]))
+            .chain(std::iter::once(&child_two[3]))
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut reversed, fact, true, 50 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&reversed_outputs).is_empty());
+        assert_eq!(
+            reversed.task_control_correlator.actor_target_by_agent.len(),
+            1
+        );
+        assert_eq!(
+            reversed
+                .task_control_correlator
+                .actor_target_by_agent
+                .get("agent-parent")
+                .map(String::as_str),
+            Some("task-parent"),
+        );
+        assert_eq!(reversed.task_control_correlator.agent_by_task.len(), 1);
+        assert_eq!(
+            reversed
+                .task_control_correlator
+                .agent_by_task
+                .get("task-parent")
+                .map(String::as_str),
+            Some("agent-parent"),
+        );
+        assert!(reversed.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_late_explicit_sibling_revokes_provisional_fallback() {
+        // Mutation caught: treating explicit verified lineage as permanently assigned after a
+        // provisional cardinality-one fallback hides a later same-parent sibling.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let child_one = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-one",
+            "agent-child-one",
+            "task-child-one",
+        );
+        let child_two = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-two",
+            "agent-child-two",
+            "task-child-two",
+        );
+
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in parent.iter().enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let child_one_outputs = child_one
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped_targets(&child_one_outputs),
+            [(
+                "claude:agent:agent-child-one".to_owned(),
+                "task-child-one".to_owned()
+            )],
+        );
+
+        let child_two_outputs = child_two
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 20 + index as u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retired_actor_targets(&child_two_outputs),
+            ["claude:agent:agent-child-one".to_owned()],
+        );
+        assert!(mapped_targets(&child_two_outputs).is_empty());
+        assert_eq!(
+            runtime.task_control_correlator.actor_target_by_agent.len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .get("agent-parent")
+                .map(String::as_str),
+            Some("task-parent"),
+        );
+        assert_eq!(runtime.task_control_correlator.agent_by_task.len(), 1);
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .agent_by_task
+                .get("task-parent")
+                .map(String::as_str),
+            Some("agent-parent"),
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let replay = child_one
+            .iter()
+            .chain(child_two.iter())
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&replay).is_empty());
+        assert_eq!(
+            runtime.task_control_correlator.actor_target_by_agent.len(),
+            1
+        );
+        assert_eq!(runtime.task_control_correlator.agent_by_task.len(), 1);
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_exact_evidence_resolves_one_child_after_fallback_ambiguity() {
+        // Mutation caught: retaining provisional ownership after sibling ambiguity prevents later
+        // exact PostToolUse evidence from installing only its named child.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let mut child_one = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-one",
+            "agent-child-one",
+            "task-child-one",
+        );
+        let mut child_two = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-two",
+            "agent-child-two",
+            "task-child-two",
+        );
+        for child in [&mut child_one, &mut child_two] {
+            child[3]
+                .as_object_mut()
+                .expect("SubagentStart object")
+                .remove("parent_agent_id");
+            child[3]["agent_type"] = json!("same-role");
+        }
+
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in parent
+            .iter()
+            .chain(child_one.iter())
+            .chain(child_two.iter())
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+
+        let exact_child_one = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "session",
+            "agent_id": "agent-parent",
+            "tool_name": "Agent",
+            "tool_use_id": "tool-child-one",
+            "tool_response": {
+                "status": "async_launched",
+                "agentId": "agent-child-one"
+            }
+        });
+        let resolved = handle_fact(&mut runtime, &exact_child_one, true, 30);
+        assert_eq!(
+            mapped_targets(&[resolved]),
+            [(
+                "claude:agent:agent-child-one".to_owned(),
+                "task-child-one".to_owned()
+            )],
+        );
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .get("agent-child-one")
+                .map(String::as_str),
+            Some("task-child-one"),
+        );
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child-two")
+        );
+        let resolved_record = runtime
+            .task_control_correlator
+            .correlations_by_tool_use
+            .get("tool-child-one")
+            .expect("exactly resolved child correlation remains retained");
+        assert_eq!(
+            resolved_record.launched_agent_id.as_deref(),
+            Some("agent-child-one")
+        );
+        assert!(resolved_record.provisional_fallback.is_none());
+        let unresolved_record = runtime
+            .task_control_correlator
+            .correlations_by_tool_use
+            .get("tool-child-two")
+            .expect("ambiguous sibling correlation remains retained");
+        assert_eq!(unresolved_record.task_id.as_deref(), Some("task-child-two"));
+        assert!(unresolved_record.launched_agent_id.is_none());
+        assert!(unresolved_record.provisional_fallback.is_none());
+        assert!(
+            runtime
+                .task_control_correlator
+                .fallback_ambiguous_parents
+                .contains("agent-parent")
+        );
+
+        let replayed_child_two = child_two
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 40 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&replayed_child_two).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child-two")
+        );
+
+        let exact_child_two = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "session",
+            "agent_id": "agent-parent",
+            "tool_name": "Agent",
+            "tool_use_id": "tool-child-two",
+            "tool_response": {
+                "status": "async_launched",
+                "agentId": "agent-child-two"
+            }
+        });
+        let resolved_sibling = handle_fact(&mut runtime, &exact_child_two, true, 50);
+        assert_eq!(
+            mapped_targets(&[resolved_sibling]),
+            [(
+                "claude:agent:agent-child-two".to_owned(),
+                "task-child-two".to_owned()
+            )],
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
     }
 
     #[test]
@@ -4159,7 +4679,7 @@ mod targeted_task_correlation_tests {
                 .task_control_correlator
                 .correlations_by_tool_use
                 .get("tool-grandchild")
-                .is_some_and(|record| record.fallback_agent_id.is_none())
+                .is_some_and(|record| record.provisional_fallback.is_none())
         );
 
         let promotion = handle_fact(
@@ -4228,7 +4748,7 @@ mod targeted_task_correlation_tests {
                 .task_control_correlator
                 .correlations_by_tool_use
                 .get("tool-child")
-                .is_some_and(|record| record.fallback_agent_id.is_none())
+                .is_some_and(|record| record.provisional_fallback.is_none())
         );
         assert!(
             !runtime
@@ -4376,7 +4896,7 @@ mod targeted_task_correlation_tests {
             .get("tool-child")
             .expect("promoted correlation retained");
         assert_eq!(child.launched_agent_id.as_deref(), Some("agent-child"));
-        assert!(child.fallback_agent_id.is_none());
+        assert!(child.provisional_fallback.is_none());
     }
 
     #[test]
