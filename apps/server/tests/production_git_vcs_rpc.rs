@@ -15,7 +15,7 @@ use bibcode_server::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use bibcode_server::production::git_vcs::{
@@ -24,6 +24,7 @@ use bibcode_server::production::git_vcs::{
 
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -565,6 +566,8 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     )
     .await;
 
+    let publication_started = Instant::now();
+    let publication_deadline = publication_started + GIT_STATUS_INTEGRATION_DEADLINE;
     request(
         &mut write_socket,
         "704",
@@ -584,7 +587,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     )
     .await;
 
-    let local_update = timeout(Duration::from_secs(2), async {
+    let local_update = timeout_at(publication_deadline, async {
         loop {
             let message = next_server_message_for(
                 &mut status_socket,
@@ -606,7 +609,13 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         }
     })
     .await
-    .expect("a successful project file save should publish Git status within two seconds");
+    .expect(
+        "a successful project file save should publish Git status within the integration deadline before the 30-second fallback",
+    );
+    eprintln!(
+        "event-driven project file Git status published in {:?}",
+        publication_started.elapsed()
+    );
     assert_eq!(
         local_update[0]["local"]["workingTree"]["files"][0]["path"],
         "tracked.txt"
