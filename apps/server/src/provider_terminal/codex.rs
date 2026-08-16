@@ -3445,8 +3445,10 @@ mod tests {
             pid_path,
             watchdog_spawn_race: None,
         };
+        let reaped_checkpoint = events.reaped.checkpoint();
+        let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let launcher = SystemCodexHelperLauncher::with_integration_fixture_events(
-            tokio::time::Instant::now() + Duration::from_secs(15),
+            owner_deadline,
             events.clone(),
         );
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
@@ -3478,7 +3480,18 @@ mod tests {
         )
         .expect("capture late Codex descendant identity");
 
-        events.reaped.wait_after(0).await;
+        let owner_completed = tokio::time::timeout_at(owner_deadline, async {
+            events.reaped.wait_after(reaped_checkpoint).await;
+            launcher.shutdown().await;
+        })
+        .await;
+        if owner_completed.is_err() {
+            helper.terminate();
+            tokio::time::timeout(Duration::from_secs(10), launcher.shutdown())
+                .await
+                .expect("Codex helper deadline cleanup must join the retained owner");
+            panic!("Codex helper natural-exit owner exceeded its integration deadline");
+        }
         let descendant_is_live = NativeProcessSampler::default()
             .collect_rows()
             .await
