@@ -82,7 +82,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
@@ -1456,6 +1456,31 @@ where
         .expect("send stream RPC request");
 }
 
+async fn try_stream_rpc_request<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    tag: &str,
+    payload: Value,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| format!("failed to send Activity stream request: {error}"))
+}
+
 async fn stream_rpc_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1469,6 +1494,26 @@ where
         panic!("expected text stream WebSocket message, got {frame:?}");
     };
     serde_json::from_str(&text).expect("valid stream RPC message")
+}
+
+async fn stream_rpc_message_until<S>(
+    socket: &mut WebSocketStream<S>,
+    deadline: tokio::time::Instant,
+) -> Result<ServerMessage, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = timeout_at(deadline, socket.next())
+        .await
+        .map_err(|_| "Activity stream deadline elapsed".to_owned())?
+        .ok_or_else(|| "Activity stream closed before convergence".to_owned())?
+        .map_err(|error| format!("invalid Activity stream frame: {error}"))?;
+    let Message::Text(text) = frame else {
+        return Err(format!(
+            "expected text Activity stream frame, got {frame:?}"
+        ));
+    };
+    serde_json::from_str(&text).map_err(|error| format!("invalid Activity stream message: {error}"))
 }
 
 async fn ack_stream_rpc<S>(socket: &mut WebSocketStream<S>, id: &str)
@@ -13323,6 +13368,11 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
             "hook_event_name":"SubagentStart","session_id":session_id,
             "agent_id":"agent-child","agent_type":"same-role"
         }),
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "agent_id":"agent-a","tool_name":"Agent","tool_use_id":"tool-agent-child",
+            "tool_response":{"status":"async_launched","agentId":"agent-child"}
+        }),
     ] {
         assert_eq!(
             client
@@ -13673,6 +13723,37 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     handle.join().await.expect("RPC server joins");
 }
 
+fn ambiguous_claude_children_are_observable_and_unsupported(snapshot: &Value) -> bool {
+    let actors = snapshot["actors"].as_array();
+    let controls = snapshot["control"]["actors"].as_array();
+    let both_running = ["agent-child-one", "agent-child-two"]
+        .iter()
+        .all(|agent_id| {
+            actors.is_some_and(|actors| {
+                actors.iter().any(|actor| {
+                    actor["id"] == format!("claude:agent:{agent_id}")
+                        && actor["status"] == "running"
+                })
+            })
+        });
+    let both_unsupported = ["agent-child-one", "agent-child-two"]
+        .iter()
+        .all(|agent_id| {
+            controls.is_some_and(|controls| {
+                controls.iter().any(|control| {
+                    control["actorId"] == format!("claude:agent:{agent_id}")
+                        && control["state"] == "unsupported"
+                })
+            })
+        });
+    let parent_available = controls.is_some_and(|controls| {
+        controls.iter().any(|control| {
+            control["actorId"] == "claude:agent:agent-parent" && control["state"] == "available"
+        })
+    });
+    both_running && both_unsupported && parent_available
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_without_provider_io() {
@@ -13737,134 +13818,280 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
     )
     .await
     .expect("thread created through public RPC");
-    tagged_rpc_request(
-        &mut socket,
-        "9603",
-        "orchestration.dispatchCommand",
-        json!({
-            "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
-            "threadId":"claude-ambiguous-thread",
-            "message":{"messageId":"claude-ambiguous-message","role":"user","text":"start","attachments":[]},
-            "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
-            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
-        }),
-    )
-    .await
-    .expect("turn admitted");
 
-    timeout(Duration::from_secs(10), async {
+    const CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT;
+    let activity_connection = timeout_at(
+        deadline,
+        connect_async(format!("ws://{}/ws", handle.local_addr())),
+    )
+    .await;
+    let (mut activity_stream, _) = match activity_connection {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "Activity stream connection failed before provider launch: \
+                 error={error}; server_join={join_result:?}"
+            );
+        }
+        Err(_) => {
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "Activity stream connection deadline elapsed before provider launch; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
+    let thread_connection = timeout_at(
+        deadline,
+        connect_async(format!("ws://{}/ws", handle.local_addr())),
+    )
+    .await;
+    let (mut thread_stream, _) = match thread_connection {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            let _ = activity_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "thread stream connection failed before provider launch: \
+                 error={error}; server_join={join_result:?}"
+            );
+        }
+        Err(_) => {
+            let _ = activity_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "thread stream connection deadline elapsed before provider launch; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
+    let mut last_snapshot = None::<Value>;
+    let setup_result = timeout_at(deadline, async {
+        try_stream_rpc_request(
+            &mut thread_stream,
+            "9680",
+            "orchestration.subscribeThread",
+            json!({"threadId":"claude-ambiguous-thread"}),
+        )
+        .await?;
+        let initial_thread = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+        if !matches!(initial_thread, ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "snapshot")
+        {
+            return Err(format!(
+                "initial thread message was not a snapshot: {initial_thread:?}"
+            ));
+        }
+        thread_stream
+            .send(Message::Text(
+                json!({"_tag":"Ack","requestId":"9680"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| format!("failed to ACK initial thread snapshot: {error}"))?;
+        tagged_rpc_request(
+            &mut socket,
+            "9603",
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
+                "threadId":"claude-ambiguous-thread",
+                "message":{"messageId":"claude-ambiguous-message","role":"user","text":"start","attachments":[]},
+                "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
+                "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+            }),
+        )
+        .await
+        .map_err(|error| format!("ambiguous Claude turn admission failed: {error}"))?;
+        loop {
+            let message = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+            let ready = matches!(
+                message,
+                ServerMessage::Chunk { ref values, .. }
+                    if values[0]["kind"] == "snapshot"
+                        && matches!(
+                            values[0]["snapshot"]["thread"]["session"]["status"].as_str(),
+                            Some("ready" | "running")
+                        )
+            );
+            thread_stream
+                .send(Message::Text(
+                    json!({"_tag":"Ack","requestId":"9680"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .map_err(|error| format!("failed to ACK thread readiness snapshot: {error}"))?;
+            if ready {
+                break;
+            }
+        }
+        try_stream_rpc_request(
+            &mut activity_stream,
+            "9690",
+            "subscribeActivity",
+            json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
+        )
+        .await?;
+        let initial = stream_rpc_message_until(&mut activity_stream, deadline).await?;
+        if !matches!(initial, ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "snapshot")
+        {
+            return Err(format!(
+                "initial Activity message was not a snapshot: {initial:?}"
+            ));
+        }
+        activity_stream
+            .send(Message::Text(
+                json!({"_tag":"Ack","requestId":"9690"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| format!("failed to ACK initial Activity snapshot: {error}"))?;
+
         while !ready_capture.exists() {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "ambiguous Claude fixture did not reach launch-ready marker: ready={}, settings={:?}, token_bytes={}, session={:?}",
-            ready_capture.exists(),
-            std::fs::read_to_string(&settings_capture),
-            std::fs::read(&token_capture).map_or(0, |token| token.len()),
-            std::fs::read_to_string(&session_capture)
-        )
-    });
-    let settings: Value = serde_json::from_str(
-        &std::fs::read_to_string(&settings_capture).expect("Claude hook settings"),
-    )
-    .expect("valid Claude hook settings");
-    let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
-        .as_str()
-        .expect("Claude hook URL")
-        .to_owned();
-    let token = std::fs::read_to_string(&token_capture).expect("Claude hook token");
-    let session_id = std::fs::read_to_string(&session_capture).expect("Claude session ID");
-    let client = reqwest::Client::new();
-    for hook in [
-        json!({
-            "hook_event_name":"PostToolUse","session_id":session_id,
-            "tool_name":"Agent","tool_use_id":"tool-agent-parent",
-            "tool_response":{"status":"async_launched","agentId":"agent-parent"}
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-parent","agent_type":"same-role"
-        }),
-        json!({
-            "hook_event_name":"PreToolUse","session_id":session_id,
-            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-one"
-        }),
-        json!({
-            "hook_event_name":"PreToolUse","session_id":session_id,
-            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-two"
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-one","agent_type":"same-role"
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-two","agent_type":"same-role"
-        }),
-    ] {
-        assert_eq!(
-            client
+        let settings_json = std::fs::read_to_string(&settings_capture)
+            .map_err(|error| format!("failed to read Claude hook settings: {error}"))?;
+        let settings: Value = serde_json::from_str(&settings_json)
+            .map_err(|error| format!("invalid Claude hook settings: {error}"))?;
+        let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+            .as_str()
+            .ok_or_else(|| "Claude hook URL was absent from generated settings".to_owned())?
+            .to_owned();
+        let token = std::fs::read_to_string(&token_capture)
+            .map_err(|error| format!("failed to read Claude hook token: {error}"))?;
+        let session_id = std::fs::read_to_string(&session_capture)
+            .map_err(|error| format!("failed to read Claude session ID: {error}"))?;
+        let client = reqwest::Client::new();
+        for hook in [
+            json!({
+                "hook_event_name":"PostToolUse","session_id":session_id,
+                "tool_name":"Agent","tool_use_id":"tool-agent-parent",
+                "tool_response":{"status":"async_launched","agentId":"agent-parent"}
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-parent","agent_type":"same-role"
+            }),
+            json!({
+                "hook_event_name":"PreToolUse","session_id":session_id,
+                "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-one"
+            }),
+            json!({
+                "hook_event_name":"PreToolUse","session_id":session_id,
+                "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-two"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-child-one","agent_type":"same-role"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-child-two","agent_type":"same-role"
+            }),
+        ] {
+            let response = client
                 .post(&hook_url)
                 .header("Authorization", format!("Bearer {token}"))
                 .json(&hook)
                 .send()
                 .await
-                .expect("authenticated Claude hook")
-                .status(),
-            reqwest::StatusCode::NO_CONTENT
+                .map_err(|error| format!("authenticated Claude hook request failed: {error}"))?;
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err(format!(
+                    "authenticated Claude hook returned unexpected status: {}",
+                    response.status()
+                ));
+            }
+        }
+
+        Ok::<(), String>(())
+    })
+    .await;
+    let setup_result = setup_result
+        .map_err(|_| "shared 30-second Claude Activity setup deadline elapsed".to_owned())
+        .and_then(std::convert::identity);
+    if let Err(error) = setup_result {
+        let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+        let _ = activity_stream.close(None).await;
+        let _ = thread_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "ambiguous Claude Activity setup failed: {error}; ready={}; settings={:?}; \
+             token_bytes={}; session={:?}; provider_capture={diagnostic_capture:?}; \
+             server_join={join_result:?}",
+            ready_capture.exists(),
+            std::fs::read_to_string(&settings_capture),
+            std::fs::read(&token_capture).map_or(0, |token| token.len()),
+            std::fs::read_to_string(&session_capture)
         );
     }
 
-    let snapshot = timeout(Duration::from_secs(10), async {
-        let mut request_id = 9_700_u64;
+    let mut request_id = 9_700_u64;
+    let observation = timeout_at(deadline, async {
         loop {
+            let message = stream_rpc_message_until(&mut activity_stream, deadline).await?;
+            let ServerMessage::Chunk { .. } = message else {
+                return Err(format!("unexpected Activity stream message: {message:?}"));
+            };
+            activity_stream
+                .send(Message::Text(
+                    json!({"_tag":"Ack","requestId":"9690"}).to_string().into(),
+                ))
+                .await
+                .map_err(|error| format!("failed to ACK Activity stream: {error}"))?;
+
             request_id += 1;
-            let Ok(snapshot) = tagged_rpc_request(
+            let snapshot = tagged_rpc_request(
                 &mut socket,
                 &request_id.to_string(),
                 "activity.getSnapshot",
                 json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
             )
             .await
-            else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-            let actors = snapshot["actors"].as_array().cloned().unwrap_or_default();
-            let controls = snapshot["control"]["actors"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let both_running = ["agent-child-one", "agent-child-two"]
-                .iter()
-                .all(|agent_id| {
-                    actors.iter().any(|actor| {
-                        actor["id"] == format!("claude:agent:{agent_id}")
-                            && actor["status"] == "running"
-                    })
-                });
-            let both_unsupported = ["agent-child-one", "agent-child-two"]
-                .iter()
-                .all(|agent_id| {
-                    controls.iter().any(|control| {
-                        control["actorId"] == format!("claude:agent:{agent_id}")
-                            && control["state"] == "unsupported"
-                    })
-                });
-            let parent_available = controls.iter().any(|control| {
-                control["actorId"] == "claude:agent:agent-parent" && control["state"] == "available"
-            });
-            if both_running && both_unsupported && parent_available {
-                break snapshot;
+            .map_err(|error| format!("authoritative Activity snapshot failed: {error}"))?;
+            last_snapshot = Some(snapshot.clone());
+            if ambiguous_claude_children_are_observable_and_unsupported(&snapshot) {
+                break Ok::<Value, String>(snapshot);
             }
-            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("ambiguous children remain observable and unsupported");
+    .map_err(|_| "shared 30-second Claude Activity deadline elapsed".to_owned())
+    .and_then(std::convert::identity);
+    let snapshot = match observation {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let diagnostic_snapshot = last_snapshot.clone().unwrap_or(Value::Null);
+            let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+            let _ = activity_stream.close(None).await;
+            let _ = thread_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "ambiguous Claude Activity observation failed: {error}; \
+                 last_snapshot={diagnostic_snapshot}; provider_capture={diagnostic_capture:?}; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
 
     let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
     let before = captured_complete_ndjson_with_bytes(&capture).await;
@@ -13914,6 +14141,14 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
     assert!(claude_stop_task_targets(&after.1).is_empty());
     assert_eq!(claude_root_interrupt_count(&after.1), 0);
 
+    activity_stream
+        .close(None)
+        .await
+        .expect("close Activity stream");
+    thread_stream
+        .close(None)
+        .await
+        .expect("close thread stream");
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");
