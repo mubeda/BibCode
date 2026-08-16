@@ -185,6 +185,7 @@ describe("AddProjectDialog mounted interactions", () => {
     expect(description?.textContent).not.toMatch(/host/i);
 
     const content = dialog.querySelector('[data-add-project-content="true"]');
+    expect(content?.textContent).not.toMatch(/host/i);
     expect(content?.classList.contains("overflow-y-auto")).toBe(true);
     expect(content?.classList.contains("px-6")).toBe(true);
   });
