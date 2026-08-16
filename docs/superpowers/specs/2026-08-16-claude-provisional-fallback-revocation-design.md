@@ -107,6 +107,16 @@ overlay becomes `unsupported`. No stop request or root interrupt is emitted.
 The revocation is idempotent, generation-owned, and bounded by the existing
 200-correlation limit.
 
+Affirmative competing evidence is retained as bounded parent-level ambiguity
+for the rest of the runtime generation. A parent becomes fallback-ambiguous
+when its complete set has multiple eligible nested candidates or multiple
+compatible verified children, including the global parentless shape where
+multiple candidates or children compete. Parent-local fallback admission then
+stays disabled for that parent until generation reset. This prevents exact
+resolution of one sibling from making an unresolved sibling appear newly
+unique by elimination. Exact PostToolUse evidence remains authoritative and
+can still resolve every named child independently.
+
 An explicit parent lineage is never erased by fallback cleanup. Exact
 PostToolUse identity is never revoked merely because other unresolved siblings
 exist. Exact evidence arriving after revocation can resolve and install its
@@ -155,6 +165,9 @@ There is no new task, timer, queue, mutex, or cross-runtime state.
   correlator call and published through the existing provider event batch.
 - Replayed provisional facts cannot reinstall a target while the complete
   parent-local set remains ambiguous.
+- Exact resolution of one child cannot clear parent-level fallback ambiguity
+  or reopen fallback for its unresolved siblings; only generation reset clears
+  that bounded ambiguity memory.
 - Runtime replacement, Activity disablement, terminal observation, and session
   shutdown retain their existing retirement and bounded cleanup paths.
 - The integration deadline is test-only; production delivery, cancellation,

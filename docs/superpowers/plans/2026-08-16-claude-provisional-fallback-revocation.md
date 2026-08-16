@@ -47,7 +47,7 @@ No new module, public API, schema, dependency, task, queue, mutex, or timer is r
 **Interfaces:**
 
 - Consumes: `ClaudeTaskControlCorrelator`, `ClaudeTaskControlEffect::{Install,Retire}`, exact `launched_agent_id`, verified lineage, `actor_target_by_agent`, and `agent_by_task`.
-- Produces: private `ClaudeProvisionalFallback`, `ClaudeTaskCorrelation::provisional_fallback`, and `ClaudeTaskControlCorrelator::revoke_provisional_fallback(&str) -> Option<ClaudeTaskControlEffect>`.
+- Produces: private `ClaudeProvisionalFallback`, `ClaudeTaskCorrelation::provisional_fallback`, generation-owned `ClaudeTaskControlCorrelator::fallback_ambiguous_parents: BTreeSet<String>`, and `ClaudeTaskControlCorrelator::revoke_provisional_fallback(&str) -> Option<ClaudeTaskControlEffect>`.
 - Preserves: `ClaudeTaskCorrelation::effective_agent_id() -> Option<&str>` and all existing callers of `reconcile_all()`.
 
 - [ ] **Step 1: Preserve the diagnosed loaded RED evidence**
@@ -195,6 +195,7 @@ assert!(!runtime
 ```
 
 Also assert the resolved record has exact `launched_agent_id` and no provisional fallback, while the unresolved sibling remains retained and unsupported.
+Assert `fallback_ambiguous_parents` still contains `agent-parent` after exact child-one installation. Replay child two's facts and require it to remain unsupported; only its own exact PostToolUse may install it.
 
 - [ ] **Step 4: Run the owner regressions to verify RED**
 
@@ -251,6 +252,8 @@ impl ClaudeTaskCorrelation {
 
 Update the exact-launch conflict check to compare `fact.agent_id` with `provisional_fallback.agent_id`. On accepted exact evidence, set `launched_agent_id` and clear the whole `provisional_fallback` value atomically. Do not change exact source, task, lineage, tombstone, or generation checks.
 
+Add `fallback_ambiguous_parents: BTreeSet<String>` to `ClaudeTaskControlCorrelator`, initialize it empty in `new`, include its count in `Debug`, and require it to remain at or below `ACTIVITY_PAGE_MAX_LENGTH` in `state_is_bounded`. `reset` already replaces the correlator through `Self::new`, so it is the only operation that clears this generation-owned ambiguity memory. Exact launch and terminal cleanup must not remove an entry.
+
 - [ ] **Step 6: Add reversible fallback cleanup**
 
 Implement this private owner method, preserving conditional map removal so it cannot erase a newer exact association:
@@ -299,11 +302,34 @@ This method must not call `retire_identity_chain`: ambiguity is reversible and m
 
 - [ ] **Step 7: Reconcile from complete candidate sets and revoke before reassigning**
 
-Rewrite `reconcile_parent_local_fallbacks` in three explicit phases:
+Rewrite `reconcile_parent_local_fallbacks` in four explicit phases:
 
 1. Build `candidates_by_parent` from every active nested Agent/Task record with a task and no exact `launched_agent_id`, including records that already carry `provisional_fallback`.
 2. Build child pools by classifying provisional children first. A `promoted_parentless_lineage` child remains in the global parentless pool even though its temporary verified lineage is `Parent`; an explicit-lineage provisional remains in its recorded parent's pool. Only then add unassigned verified children, excluding exact assignments, tombstones, and provisional agents already included.
-3. Validate every existing provisional fallback against the complete snapshot, collect invalid tool IDs, revoke all of them, rebuild the snapshot, and admit only cardinality-one assignments.
+3. Record affirmative ambiguity before mutating provisional state. Insert a parent when it has multiple eligible candidates or multiple compatible explicit-lineage children. When the global parentless pool contains at least one child and either multiple nested candidates or multiple parentless children, insert every parent represented in `candidates_by_parent`.
+4. Validate every existing provisional fallback against the complete snapshot, collect invalid tool IDs, revoke all of them, rebuild the snapshot, and admit only cardinality-one assignments for parents absent from `fallback_ambiguous_parents`.
+
+Use these exact ambiguity predicates:
+
+```rust
+for (parent_agent_id, tool_use_ids) in &candidates_by_parent {
+    let child_count = children_by_parent
+        .get(parent_agent_id)
+        .map_or(0, Vec::len);
+    if tool_use_ids.len() > 1 || child_count > 1 {
+        self.fallback_ambiguous_parents
+            .insert(parent_agent_id.clone());
+    }
+}
+let parentless_competition = !parentless_children.is_empty()
+    && (nested_candidate_count > 1 || parentless_children.len() > 1);
+if parentless_competition {
+    self.fallback_ambiguous_parents
+        .extend(candidates_by_parent.keys().cloned());
+}
+```
+
+The set is bounded because its members come only from the already bounded active candidate map. Do not mark a parent merely because evidence is missing or an unresolved root launch temporarily blocks admission; ambiguity memory requires affirmative multiple candidates or children.
 
 Use these literal validity predicates:
 
@@ -342,6 +368,14 @@ ClaudeProvisionalFallback {
 
 and changes verified lineage from `Root` to `Parent(parent_agent_id)`. New explicit-lineage admission stores the same value with `promoted_parentless_lineage: false` and leaves verified lineage unchanged. Return the collected `Retire` effects; the existing `reconcile_all` loop then installs only still-valid/new unique targets through `reconcile`.
 
+Both parentless and explicit admission branches must first require:
+
+```rust
+!self.fallback_ambiguous_parents.contains(parent_agent_id)
+```
+
+Exact `launched_agent_id` records continue through the existing exact reconciliation path and never consult or clear this set.
+
 - [ ] **Step 8: Update living architecture invariants in the same change**
 
 In both living documents, extend the existing parent-local fallback paragraphs with this exact behavior:
@@ -353,6 +387,8 @@ same-generation evidence makes that set non-unique, the correlator synchronously
 removes only the inferred target and inferred lineage, publishes unsupported control,
 and retains the actors and task facts as unresolved evidence. Exact targets are not
 revoked by sibling ambiguity, and exact evidence may later resolve one named child.
+Affirmative parent-level ambiguity disables further fallback for that parent until
+generation reset, so resolving one sibling exactly cannot reopen another by elimination.
 ```
 
 Keep the existing statement that ambiguous control performs zero provider I/O and that order/timing are not correlation inputs.
