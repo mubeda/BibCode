@@ -7,7 +7,9 @@ const h = vi.hoisted(() => ({
   createPanel: vi.fn(),
   deleteThread: vi.fn(),
   addToast: vi.fn(),
-  openChatPanel: vi.fn(),
+  reserveChatPanel: vi.fn(),
+  releaseChatPanelReservation: vi.fn(),
+  removeThread: vi.fn(),
   activateSurface: vi.fn(),
   closeSurface: vi.fn(),
   closeOtherSurfaces: vi.fn(),
@@ -35,7 +37,9 @@ vi.mock("~/centerPanelStore", () => ({
   HOST_SURFACE_ID: "host",
   useCenterPanelStore: {
     getState: () => ({
-      openChatPanel: h.openChatPanel,
+      reserveChatPanel: h.reserveChatPanel,
+      releaseChatPanelReservation: h.releaseChatPanelReservation,
+      removeThread: h.removeThread,
       activateSurface: h.activateSurface,
       closeSurface: h.closeSurface,
       closeOtherSurfaces: h.closeOtherSurfaces,
@@ -90,6 +94,30 @@ afterEach(() => {
 });
 
 describe("center panel actions", () => {
+  it("registers a reserved chat panel before the server command settles", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    let resolveCreatePanel!: (value: unknown) => void;
+    const createPanelResult = new Promise<unknown>((resolve) => {
+      resolveCreatePanel = resolve;
+    });
+    h.createPanel.mockReturnValueOnce(createPanelResult);
+
+    const creation = actions.createChatPanel({
+      hostRef,
+      projectId: ProjectId.make("project-1"),
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("cursor"),
+        model: "cursor-fixture",
+      },
+      providerLabel: "Cursor",
+    });
+
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, "new-panel-thread", "Cursor");
+    resolveCreatePanel({ _tag: "Success", value: undefined });
+    await expect(creation).resolves.toBe("new-panel-thread");
+    expect(h.removeThread).not.toHaveBeenCalled();
+  });
+
   it("creates chat panels through the server-resolved panel API", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
     const modelSelection = {
@@ -131,7 +159,7 @@ describe("center panel actions", () => {
     expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("worktreePath");
     expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("branch");
     expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("kind");
-    expect(h.openChatPanel).toHaveBeenCalledWith(hostRef, threadId, "Codex");
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, threadId, "Codex");
 
     await actions.createChatPanel({
       hostRef,
@@ -145,7 +173,7 @@ describe("center panel actions", () => {
     expect(h.createPanel.mock.calls[1]?.[0].input).toEqual(h.createPanel.mock.calls[0]?.[0].input);
   });
 
-  it("returns null for interrupted creation and reports typed and untyped failures", async () => {
+  it("retains ambiguous interrupted creation and rolls back explicit failures", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
     const input = {
       hostRef,
@@ -158,11 +186,16 @@ describe("center panel actions", () => {
     };
 
     h.createResult = { _tag: "Failure", interrupted: true, cause: new Error("cancelled") };
-    await expect(actions.createChatPanel(input)).resolves.toBeNull();
+    await expect(actions.createChatPanel(input)).resolves.toBe("new-panel-thread");
     expect(h.addToast).not.toHaveBeenCalled();
+    expect(h.removeThread).not.toHaveBeenCalled();
 
     h.createResult = { _tag: "Failure", cause: new Error("server offline") };
     await expect(actions.createChatPanel(input)).resolves.toBeNull();
+    expect(h.removeThread).toHaveBeenLastCalledWith({
+      environmentId: hostRef.environmentId,
+      threadId: "new-panel-thread",
+    });
     expect(h.addToast).toHaveBeenLastCalledWith(
       expect.objectContaining({ description: "server offline" }),
     );

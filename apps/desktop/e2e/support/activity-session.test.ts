@@ -31,7 +31,9 @@ class FixtureWebSocket {
   readonly errorListeners = new Set<EventListener>();
   readonly openListeners = new Set<EventListener>();
   readonly url: string;
+  readonly controlTags: string[] = [];
   closeCalls = 0;
+  private pendingReadyPublisher: (() => void) | null = null;
   static instances: FixtureWebSocket[] = [];
   static responseMode:
     | "close"
@@ -88,7 +90,15 @@ class FixtureWebSocket {
     const request = JSON.parse(encoded) as (typeof sentRequests)[number] & {
       readonly requestId?: string;
     };
-    if (request._tag === "Eof" || request._tag === "Ack" || request._tag === "Interrupt") return;
+    if (request._tag === "Eof" || request._tag === "Ack" || request._tag === "Interrupt") {
+      this.controlTags.push(request._tag);
+      if (request._tag === "Ack" && this.pendingReadyPublisher !== null) {
+        const publishReady = this.pendingReadyPublisher;
+        this.pendingReadyPublisher = null;
+        queueMicrotask(publishReady);
+      }
+      return;
+    }
     sentRequests.push(request);
     if (FixtureWebSocket.responseMode === "silent") return;
     if (FixtureWebSocket.responseMode === "close") {
@@ -152,8 +162,8 @@ class FixtureWebSocket {
       };
       queueMicrotask(() => {
         if (FixtureWebSocket.responseMode === "pending-then-success") {
+          this.pendingReadyPublisher = () => publishSnapshot("server-resolved-codex");
           publishSnapshot(null);
-          queueMicrotask(() => publishSnapshot("server-resolved-codex"));
           return;
         }
         publishSnapshot("server-resolved-codex");
@@ -278,10 +288,13 @@ describe("materializeDesktopActivitySession", () => {
   });
 
   it("waits on the retained thread stream until provider ownership is projected", async () => {
+    vi.useFakeTimers();
     installHarness();
     FixtureWebSocket.responseMode = "pending-then-success";
 
-    await expect(materializeDesktopActivitySession("/fixture/project")).resolves.toEqual({
+    const materialization = materializeDesktopActivitySession("/fixture/project");
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(materialization).resolves.toEqual({
       projectId: "server-resolved-project",
       providerInstanceId: "server-resolved-codex",
       threadId: "server-resolved-thread",
@@ -290,6 +303,7 @@ describe("materializeDesktopActivitySession", () => {
     expect(sentRequests.filter(({ tag }) => tag === "orchestration.subscribeThread")).toHaveLength(
       1,
     );
+    expect(FixtureWebSocket.instances[0]?.controlTags).toEqual(["Ack", "Interrupt", "Eof"]);
   });
 
   it("can publish a later provider update without rebuilding project or thread state", async () => {

@@ -58,9 +58,16 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(e2eConfig.app.security.capabilities[0]?.permissions).toContain("wdio:default");
   });
 
-  it("resets the E2E connection cache before bootstrapping each app session", () => {
+  it("uses one embedded-driver session and resets connection state before each smoke test", () => {
     const wdioConfig = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
 
+    expect(wdioConfig).toContain("const desktopUiSpecFiles =");
+    expect(wdioConfig).toContain("[desktopUiSpecFiles]");
+    expect(wdioConfig).toContain("connectionRetryCount: 0");
+    expect(wdioConfig).toContain("beforeTest: async () =>");
+    expect(wdioConfig).toContain('document.readyState === "complete"');
+    expect(wdioConfig).toContain('window.addEventListener("load", done, { once: true })');
+    expect(wdioConfig).not.toContain("browser.waitUntil");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");
     expect(wdioConfig).toContain('indexedDB.open("bibcode:connection-runtime", 2)');

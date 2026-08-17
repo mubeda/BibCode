@@ -70,7 +70,10 @@ export interface ThreadCenterPanelState extends CenterPanelLayoutState {
 
 interface CenterPanelStoreState {
   byThreadKey: Record<string, ThreadCenterPanelState>;
+  readonly pendingChatPanelThreadKeys: ReadonlySet<string>;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  releaseChatPanelReservation: (ref: ScopedThreadRef) => void;
   validateTerminalPanelPlacement: (
     ref: ScopedThreadRef,
     placement: CenterTerminalPlacement,
@@ -333,12 +336,38 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
   persist(
     (set, get) => ({
       byThreadKey: {},
+      pendingChatPanelThreadKeys: new Set<string>(),
       openChatPanel: (ref, threadId, providerLabel) =>
         set((state) =>
           withUpdatedThread(state, ref, (current) =>
             insertSurface(current, chatSurface(threadId, providerLabel)),
           ),
         ),
+      reserveChatPanel: (ref, threadId, providerLabel) =>
+        set((state) => {
+          const panelKey = scopedThreadKey({ environmentId: ref.environmentId, threadId });
+          const updated = withUpdatedThread(state, ref, (current) =>
+            insertSurface(current, chatSurface(threadId, providerLabel)),
+          );
+          if (
+            updated.byThreadKey === state.byThreadKey &&
+            state.pendingChatPanelThreadKeys.has(panelKey)
+          ) {
+            return state;
+          }
+          return {
+            byThreadKey: updated.byThreadKey,
+            pendingChatPanelThreadKeys: new Set(state.pendingChatPanelThreadKeys).add(panelKey),
+          };
+        }),
+      releaseChatPanelReservation: (ref) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          if (!state.pendingChatPanelThreadKeys.has(threadKey)) return state;
+          const pendingChatPanelThreadKeys = new Set(state.pendingChatPanelThreadKeys);
+          pendingChatPanelThreadKeys.delete(threadKey);
+          return { pendingChatPanelThreadKeys };
+        }),
       validateTerminalPanelPlacement: (ref, placement) => {
         const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
         return validateTerminalPanelPlacement(current, placement);
@@ -522,6 +551,14 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           let byThreadKey = state.byThreadKey;
+          const pendingKeysToRemove = new Set([threadKey]);
+          for (const surface of state.byThreadKey[threadKey]?.surfaces ?? []) {
+            if (surface.kind === "chat") {
+              pendingKeysToRemove.add(
+                scopedThreadKey({ environmentId: ref.environmentId, threadId: surface.threadId }),
+              );
+            }
+          }
           if (threadKey in byThreadKey) {
             const { [threadKey]: _removed, ...rest } = byThreadKey;
             byThreadKey = rest;
@@ -542,7 +579,16 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
               (current) => applySurfaceRemoval(current, referencedSurfaceIds).state,
             );
           }
-          return byThreadKey === state.byThreadKey ? state : { byThreadKey };
+          const pendingChatPanelThreadKeys = new Set(
+            [...state.pendingChatPanelThreadKeys].filter((key) => !pendingKeysToRemove.has(key)),
+          );
+          if (
+            byThreadKey === state.byThreadKey &&
+            pendingChatPanelThreadKeys.size === state.pendingChatPanelThreadKeys.size
+          ) {
+            return state;
+          }
+          return { byThreadKey, pendingChatPanelThreadKeys };
         }),
     }),
     {

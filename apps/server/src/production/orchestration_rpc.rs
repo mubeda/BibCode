@@ -755,6 +755,9 @@ fn shell_stream(
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    // Subscribe before loading the initial snapshot so an event committed in
+    // between is queued for the stream instead of disappearing in that gap.
+    let mut events = engine.subscribe_events();
     tokio::spawn(async move {
         if send_snapshot(&sender, shell_snapshot(&engine, false).await)
             .await
@@ -762,7 +765,6 @@ fn shell_stream(
         {
             return;
         }
-        let mut events = engine.subscribe_events();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
@@ -786,21 +788,25 @@ fn thread_stream(
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
-    tokio::spawn(async move {
-        let input = match decode::<SubscribeThreadInput>(request) {
-            Ok(input) => input,
-            Err(error) => {
+    let input = match decode::<SubscribeThreadInput>(request) {
+        Ok(input) => input,
+        Err(error) => {
+            tokio::spawn(async move {
                 let _ = sender.send(Err(error)).await;
-                return;
-            }
-        };
+            });
+            return receiver;
+        }
+    };
+    // Match the shell stream's subscribe-before-snapshot ordering. Provider
+    // startup can publish a session update while this snapshot is loading.
+    let mut events = engine.subscribe_events();
+    tokio::spawn(async move {
         if send_snapshot(&sender, thread_snapshot(&engine, &input.thread_id).await)
             .await
             .is_err()
         {
             return;
         }
-        let mut events = engine.subscribe_events();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
@@ -3870,6 +3876,50 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         assert!(send_snapshot(&sender, Ok(json!({}))).await.is_err());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thread_stream_subscribes_before_returning_to_concurrent_dispatchers() {
+        let engine = migrated_engine().await;
+        engine
+            .dispatch(decode_command(json!({
+                "type": "project.create",
+                "commandId": "project",
+                "projectId": "project",
+                "title": "Project",
+                "workspaceRoot": "C:/repo",
+                "defaultModelSelection": null,
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("project created");
+        let thread_id = load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let cancellation = CancellationToken::new();
+
+        let stream = thread_stream(
+            engine.clone(),
+            request(
+                "orchestration.subscribeThread",
+                json!({ "threadId": thread_id }),
+            ),
+            cancellation.clone(),
+        );
+
+        assert_eq!(
+            engine.event_subscriber_count_for_test(),
+            1,
+            "the event receiver must exist before a concurrent post-snapshot update can publish",
+        );
+        cancellation.cancel();
+        drop(stream);
         engine.shutdown().await;
     }
 }

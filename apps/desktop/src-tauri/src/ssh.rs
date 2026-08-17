@@ -2304,7 +2304,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn manager_shutdown_terminates_child_owned_by_retained_waiter() {
         let temporary_base = tempfile::tempdir().expect("askpass temporary base");
         let manager =

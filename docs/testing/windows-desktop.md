@@ -55,7 +55,9 @@ Select focused tests from affected source and verify at least:
   worktree removal;
 - Windows handles remain live across validation and deletion where required;
 - late process admission during shutdown fails closed and the child is waited;
-- Windows Job ownership reaps descendants before shutdown returns;
+- Windows Job ownership reaps descendants before shutdown returns, and repeated
+  status probes after termination cannot consume or lose the terminal Job
+  state;
 - independent runtimes cannot terminate each other's process roots;
 - local Windows and WSL presentation follows current environment capability;
 - remote device, SSH, Tailscale, relay, and connection actions do not mount in
@@ -189,12 +191,14 @@ Build and run packaged E2E with the supported platform value
 ```powershell
 $env:BIBCODE_E2E_PLATFORM = 'win'
 vp run test:ui:desktop:build
+$env:BIBCODE_E2E_APP_PATH = (Resolve-Path 'target/release/bibcode-desktop.exe').Path
 vp run test:ui:desktop
 ```
 
 Use a unique test profile supported by the E2E harness. Do not launch an
 installed BiBCode executable or overwrite `%APPDATA%`/`%LOCALAPPDATA%` user
-data.
+data. `BIBCODE_E2E_APP_PATH` deliberately selects the executable produced by
+the E2E build in the current worktree, not an installed production copy.
 
 ## Packaged UI scenarios
 

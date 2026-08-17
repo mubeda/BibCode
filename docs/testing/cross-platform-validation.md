@@ -144,7 +144,9 @@ vp run test:ui:desktop
 ```
 
 Set only the native platform value documented by the selected platform page.
-Never use an installed BiBCode application as evidence for the worktree build.
+After the build, set `BIBCODE_E2E_APP_PATH` to the exact worktree-built
+application as documented by the selected platform page. Never use an installed
+BiBCode application as evidence for the worktree build.
 
 ## Disposable external-worktree scenario
 
@@ -188,6 +190,15 @@ sizes. Cover relevant:
 - responsive menus, overlays, narrow panels, and focus states; and
 - loaded interaction without stale ownership, duplicate events, or runaway
   process growth.
+
+The default packaged suite runs all of its spec files in one embedded-driver
+session, resets client connection state before every test, and disables
+WebDriver command retries. Treat reporter hook errors, retries, and timeouts as
+test failures even when the individual scenarios are reported as passing.
+
+At final packaged shutdown, inspect the raw worker and server logs. Provider and
+terminal owners, operational logs, orchestration, and the SQLite worker must all
+close without a retry, timeout, or dependency on stale cloned handles.
 
 For every screenshot record the absolute evidence path, UI state, and review
 finding. Inspect the full image and focused crops for clipping, overflow,

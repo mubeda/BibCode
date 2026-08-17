@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::supervised::{
     SupervisedOverflow, SupervisedRunError, SupervisedRunRequest, SupervisedStreamOutput,
-    run_supervised,
+    run_supervised_with_spawn_observer,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -188,6 +188,19 @@ impl ProcessRunner {
         input: ProcessRunInput,
         cancellation: CancellationToken,
     ) -> Result<ProcessRunOutput, ProcessError> {
+        self.run_with_cancellation_and_spawn_observer(input, cancellation, |_| {})
+            .await
+    }
+
+    async fn run_with_cancellation_and_spawn_observer<F>(
+        &self,
+        input: ProcessRunInput,
+        cancellation: CancellationToken,
+        observer: F,
+    ) -> Result<ProcessRunOutput, ProcessError>
+    where
+        F: FnOnce(Option<u32>) + Send,
+    {
         let resolved = resolve_command(&input);
         let mut command = Command::new(&resolved.command);
         command
@@ -206,7 +219,7 @@ impl ProcessRunner {
             command.env_clear().envs(env);
         }
 
-        let result = run_supervised(
+        let result = run_supervised_with_spawn_observer(
             SupervisedRunRequest {
                 command,
                 stdin: input.stdin.as_ref().map(|stdin| stdin.as_bytes().to_vec()),
@@ -219,6 +232,7 @@ impl ProcessRunner {
                 },
             },
             &cancellation,
+            observer,
         )
         .await;
 
@@ -349,9 +363,6 @@ mod tests {
     use super::*;
     use crate::test_support::TestSandbox;
 
-    const CANCELLATION_FIXTURE_READY_FILE: &str = "BIBCODE_RUNNER_FIXTURE_READY_FILE";
-    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn runner_uses_command_local_environment_for_parallel_children() {
         async fn run(label: &str) -> ProcessRunOutput {
@@ -405,41 +416,25 @@ mod tests {
     async fn runner_cancels_parallel_fixture_children_after_spawn() {
         async fn run(label: &str) -> ProcessError {
             let sandbox = TestSandbox::new(label);
-            let ready_file = sandbox.path("ready");
             let script = sandbox.executable_script(
                 "cancellation-child",
-                "printf R > \"$BIBCODE_RUNNER_FIXTURE_READY_FILE\"\nwhile :; do sleep 1; done",
-                "@echo off\r\n>\"%BIBCODE_RUNNER_FIXTURE_READY_FILE%\" <nul set /p =R\r\n:wait\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait",
+                "while :; do sleep 1; done",
+                "@echo off\r\n:wait\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait",
             );
             let cancellation = CancellationToken::new();
-            let mut input = sandbox.process_input(script, Vec::<String>::new());
-            input.env = Some(sandbox.environment([(
-                CANCELLATION_FIXTURE_READY_FILE,
-                ready_file.to_string_lossy().into_owned(),
-            )]));
-            let running =
-                tokio::spawn(ProcessRunner.run_with_cancellation(input, cancellation.clone()));
+            let input = sandbox.process_input(script, Vec::<String>::new());
+            let (spawned, spawned_rx) = tokio::sync::oneshot::channel();
+            let running = tokio::spawn(ProcessRunner.run_with_cancellation_and_spawn_observer(
+                input,
+                cancellation.clone(),
+                move |_| {
+                    let _ = spawned.send(());
+                },
+            ));
 
-            let readiness = tokio::time::timeout(FIXTURE_READY_TIMEOUT, async {
-                loop {
-                    match tokio::fs::read(&ready_file).await {
-                        Ok(ready) if ready == b"R" => return Ok(()),
-                        Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-            })
-            .await;
-            if !matches!(readiness, Ok(Ok(()))) {
-                cancellation.cancel();
-                let _ = running.await;
-                panic!(
-                    "fixture child did not emit readiness before the bounded timeout: {readiness:?}"
-                );
-            }
+            spawned_rx
+                .await
+                .expect("fixture child must finish spawning");
 
             cancellation.cancel();
             running
