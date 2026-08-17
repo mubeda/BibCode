@@ -122,13 +122,27 @@ Build and run packaged E2E with:
 ```sh
 export BIBCODE_E2E_PLATFORM=mac
 vp run test:ui:desktop:build
-export BIBCODE_E2E_APP_PATH="$PWD/target/release/bundle/macos/BiBCode.app"
+
+dmg=$(find "$PWD/target/release/bundle/dmg" -maxdepth 1 -type f -name 'BiBCode_*.dmg' -print -quit)
+test -n "$dmg"
+mount_dir=$(mktemp -d /private/tmp/bibcode-macos-e2e-mount.XXXXXX)
+cleanup_e2e_mount() {
+  hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
+  rmdir "$mount_dir" 2>/dev/null || true
+}
+trap cleanup_e2e_mount EXIT HUP INT TERM
+hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
+
+export BIBCODE_E2E_APP_PATH="$mount_dir/BiBCode.app"
 test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
 `BIBCODE_E2E_APP_PATH` deliberately selects the application bundle produced by
-the E2E build in the current worktree, not an installed production copy.
+the E2E build in the current worktree, not an installed production copy. The
+DMG-only bundler removes its transient staging `.app` after packaging, so mount
+the resulting DMG read-only instead of depending on that staging path. Keep the
+cleanup trap active until WebDriver and the packaged application have exited.
 
 ## Renderer-data isolation
 

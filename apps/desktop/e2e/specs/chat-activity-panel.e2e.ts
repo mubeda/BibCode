@@ -1039,11 +1039,18 @@ describe("packaged responsive activity experience", () => {
     });
     const updatedAnnouncement =
       "Activity update: 1 active subagent, 0 done subagents, 0 active background tasks, 1 done background task";
-    const updatedAnnouncementSelector = supportsCodexTerminalActivity
-      ? `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"] [role="status"][aria-live="polite"]`
-      : '[data-testid="activity-dock"] [role="status"][aria-live="polite"]';
     await browser.waitUntil(
-      async () => (await browser.$(updatedAnnouncementSelector).getText()) === updatedAnnouncement,
+      async () =>
+        browser.execute((announcement: string) => {
+          const liveRegions = document.querySelectorAll<HTMLElement>(
+            '[data-testid="activity-dock"] [role="status"][aria-live="polite"]',
+          );
+          return [...liveRegions].some(
+            (liveRegion) =>
+              liveRegion.closest("[data-provider-terminal-activity-host]") === null &&
+              liveRegion.textContent?.trim() === announcement,
+          );
+        }, updatedAnnouncement),
       { timeoutMsg: "The coalesced live announcement did not publish updated exact status." },
     );
     if (supportsCodexTerminalActivity) {

@@ -66,7 +66,13 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).toContain("connectionRetryCount: 0");
     expect(wdioConfig).toContain("beforeTest: async () =>");
     expect(wdioConfig).toContain('document.readyState === "complete"');
-    expect(wdioConfig).toContain('window.addEventListener("load", done, { once: true })');
+    expect(wdioConfig).toContain(
+      'window.addEventListener("load", () => done("ready"), { once: true })',
+    );
+    expect(wdioConfig).toContain("done({ error })");
+    expect(wdioConfig).toContain('done("ready")');
+    expect(wdioConfig).not.toContain("done(error)");
+    expect(wdioConfig).not.toContain("done()");
     expect(wdioConfig).not.toContain("browser.waitUntil");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");

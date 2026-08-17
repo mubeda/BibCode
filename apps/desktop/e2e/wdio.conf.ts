@@ -56,53 +56,55 @@ const screenshotPath = (title: string): string =>
   );
 
 async function resetDesktopUiConnectionCache(): Promise<void> {
-  const resetError = await browser.executeAsync((done: (error: string | null) => void) => {
-    window.localStorage.clear();
-    window.sessionStorage.clear();
-    let settled = false;
-    const finish = (error: string | null) => {
-      if (settled) return;
-      settled = true;
-      done(error);
-    };
-    const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
-    openRequest.addEventListener("error", () => {
-      finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
-    });
-    openRequest.addEventListener("upgradeneeded", () => {
-      finish("The E2E connection catalog schema was unexpectedly missing.");
-    });
-    openRequest.addEventListener("success", () => {
-      const database = openRequest.result;
-      const storeNames = ["catalog", "shell", "thread"];
-      const transaction = database.transaction(storeNames, "readwrite");
-      transaction.addEventListener("error", () => {
-        database.close();
-        finish(String(transaction.error ?? "Could not reset the E2E connection catalog."));
+  const resetResult = await browser.executeAsync(
+    (done: (result: { readonly error: string | null }) => void) => {
+      window.localStorage.clear();
+      window.sessionStorage.clear();
+      let settled = false;
+      const finish = (error: string | null) => {
+        if (settled) return;
+        settled = true;
+        done({ error });
+      };
+      const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
+      openRequest.addEventListener("error", () => {
+        finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
       });
-      transaction.addEventListener("complete", () => {
-        database.close();
-        finish(null);
+      openRequest.addEventListener("upgradeneeded", () => {
+        finish("The E2E connection catalog schema was unexpectedly missing.");
       });
-      for (const storeName of storeNames) {
-        transaction.objectStore(storeName).clear();
-      }
-    });
-  });
-  if (resetError !== null) {
-    throw new Error(resetError);
+      openRequest.addEventListener("success", () => {
+        const database = openRequest.result;
+        const storeNames = ["catalog", "shell", "thread"];
+        const transaction = database.transaction(storeNames, "readwrite");
+        transaction.addEventListener("error", () => {
+          database.close();
+          finish(String(transaction.error ?? "Could not reset the E2E connection catalog."));
+        });
+        transaction.addEventListener("complete", () => {
+          database.close();
+          finish(null);
+        });
+        for (const storeName of storeNames) {
+          transaction.objectStore(storeName).clear();
+        }
+      });
+    },
+  );
+  if (resetResult.error !== null) {
+    throw new Error(resetResult.error);
   }
   await browser.refresh();
   await waitForDesktopUiDocumentLoad();
 }
 
 async function waitForDesktopUiDocumentLoad(): Promise<void> {
-  await browser.executeAsync((done: () => void) => {
+  await browser.executeAsync((done: (result: string) => void) => {
     if (document.readyState === "complete") {
-      done();
+      done("ready");
       return;
     }
-    window.addEventListener("load", done, { once: true });
+    window.addEventListener("load", () => done("ready"), { once: true });
   });
 }
 
