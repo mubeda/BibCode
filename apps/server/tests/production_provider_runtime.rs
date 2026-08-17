@@ -100,8 +100,18 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   $id = [string]$request.id
   $response = $null
   switch ([string]$request.method) {
-    "initialize" { $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}' }
-    "thread/start" { $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}' }
+    "initialize" {
+      if ($env:BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER) {
+        [IO.File]::WriteAllText($env:BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER, "ready")
+      }
+      $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}'
+    }
+    "thread/start" {
+      if ($env:BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER) {
+        [IO.File]::WriteAllText($env:BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER, "ready")
+      }
+      $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}'
+    }
     "mcpServerStatus/list" { $response = '{"id":' + $id + ',"result":{"data":[],"nextCursor":null}}' }
     "thread/goal/set" { $response = '{"id":' + $id + ',"result":{"goal":{"status":"active"}}}' }
     "turn/start" { $response = '{"id":' + $id + ',"result":{"turn":{"id":"native-codex-turn"}}}' + [Environment]::NewLine + '{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"native-codex-thread","turnId":"native-codex-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"native-codex-thread","receiverThreadIds":["native-child"],"agentsStates":{"native-child":{"status":"running","message":null}}},"startedAtMs":1001}}' + [Environment]::NewLine + '{"method":"turn/started","emittedAtMs":1002,"params":{"threadId":"native-child","turn":{"id":"native-child-turn","status":"inProgress","startedAt":1}}}' }
@@ -12644,6 +12654,8 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
 #[tokio::test]
 async fn native_codex_driver_supports_session_turn_and_control_commands() {
     let temp = TempDir::new().unwrap();
+    let initialize_response_ready = temp.path().join("codex-initialize-response-ready");
+    let thread_response_ready = temp.path().join("codex-thread-response-ready");
     let executable = executable_fixture(
         &temp,
         "codex-fixture",
@@ -12651,8 +12663,14 @@ async fn native_codex_driver_supports_session_turn_and_control_commands() {
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      [ -z "$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER"
+      printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*)
+      [ -z "$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER"
+      printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id"
+      ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"native-codex-thread","turnId":"native-codex-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"native-codex-thread","receiverThreadIds":["native-child"],"agentsStates":{"native-child":{"status":"running","message":null}}},"startedAtMs":1001}}\n{"method":"turn/started","emittedAtMs":1002,"params":{"threadId":"native-child","turn":{"id":"native-child-turn","status":"inProgress","startedAt":1}}}\n' "$id" ;;
@@ -12670,12 +12688,41 @@ done
     request.provider = "codex".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
+    request.environment.insert(
+        "BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER".to_owned(),
+        initialize_response_ready.to_string_lossy().into_owned(),
+    );
+    request.environment.insert(
+        "BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER".to_owned(),
+        thread_response_ready.to_string_lossy().into_owned(),
+    );
     let driver = factory.create(request).await.unwrap();
+    let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
-    let started = timeout(Duration::from_secs(2), driver.start())
-        .await
-        .unwrap()
-        .unwrap();
+    let started = match timeout_at(owner_deadline, driver.start()).await {
+        Ok(Ok(started)) => started,
+        Ok(Err(error)) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("native Codex fixture failed to start: {error}; cleanup={cleanup:?}");
+        }
+        Err(_) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!(
+                "native Codex fixture exceeded its integration deadline during startup: \
+                 initialize_response_ready={}; thread_response_ready={}; cleanup={cleanup:?}",
+                initialize_response_ready.is_file(),
+                thread_response_ready.is_file(),
+            );
+        }
+    };
+    assert!(
+        initialize_response_ready.is_file(),
+        "Codex fixture must prepare its initialize response"
+    );
+    assert!(
+        thread_response_ready.is_file(),
+        "Codex fixture must prepare its thread/start response"
+    );
     assert_eq!(
         started.resume_cursor,
         Some(json!({"threadId":"native-codex-thread"}))
@@ -12702,7 +12749,7 @@ done
             .unwrap()
             .is_some()
     );
-    let activity_event = timeout(Duration::from_secs(2), async {
+    let activity_event = timeout_at(owner_deadline, async {
         loop {
             let event = driver.next_event().await.expect("Codex provider event");
             if !event.activity.is_empty() {
@@ -12710,8 +12757,14 @@ done
             }
         }
     })
-    .await
-    .expect("live Codex activity event");
+    .await;
+    let activity_event = match activity_event {
+        Ok(event) => event,
+        Err(error) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("live Codex activity event timed out: {error}; cleanup={cleanup:?}");
+        }
+    };
     assert_eq!(
         activity_event
             .native_event_id
@@ -12725,7 +12778,7 @@ done
         [ProviderActivityMutation::UpsertActor(actor)]
             if actor.id == "codex:thread:native-child"
     ));
-    let control_event = timeout(Duration::from_secs(2), async {
+    let control_event = timeout_at(owner_deadline, async {
         loop {
             let event = driver.next_event().await.expect("Codex control event");
             if !event.activity_controls.is_empty() {
@@ -12733,8 +12786,14 @@ done
             }
         }
     })
-    .await
-    .expect("live Codex child target");
+    .await;
+    let control_event = match control_event {
+        Ok(event) => event,
+        Err(error) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("live Codex child target timed out: {error}; cleanup={cleanup:?}");
+        }
+    };
     assert_eq!(control_event.event_type, "activity.native");
     assert_eq!(control_event.activity_controls.len(), 1);
     assert!(
@@ -12772,7 +12831,13 @@ done
         driver.answer("unknown".to_owned(), json!({})).await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "codex"
     ));
-    driver.shutdown().await.unwrap();
+    match timeout_at(owner_deadline, driver.shutdown()).await {
+        Ok(result) => result.expect("native Codex fixture should shut down"),
+        Err(_) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("native Codex fixture cleanup exceeded its integration deadline: {cleanup:?}");
+        }
+    }
 }
 
 #[cfg(unix)]

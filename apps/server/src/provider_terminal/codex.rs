@@ -3357,9 +3357,10 @@ mod tests {
         owned.events.admission_race = Some(admission_race.clone());
         let owned_registry = ProcessAttributionRegistry::new();
         let peer_registry = ProcessAttributionRegistry::new();
+        let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
-        let peer_launcher = SystemCodexHelperLauncher::with_fixture_events(
-            CODEX_HELPER_READY_TIMEOUT,
+        let peer_launcher = SystemCodexHelperLauncher::with_integration_fixture_events(
+            owner_deadline,
             peer.events.clone(),
         );
         let peer_helper = peer_launcher
@@ -3372,10 +3373,11 @@ mod tests {
         )
         .expect("peer helper identity");
 
-        let owned_launcher = SystemCodexHelperLauncher::with_fixture_events(
-            CODEX_HELPER_READY_TIMEOUT,
+        let owned_launcher = SystemCodexHelperLauncher::with_integration_fixture_events(
+            owner_deadline,
             owned.events.clone(),
         );
+        let owned_tasks = Arc::clone(&owned_launcher.owned_tasks);
         let owned_launch = owned.launch(owned_registry.clone());
         let owned_start = tokio::spawn(async move { owned_launcher.start(owned_launch).await });
         admission_race.spawned.wait_after(0).await;
@@ -3395,6 +3397,9 @@ mod tests {
             error.contains("closed for shutdown"),
             "unexpected error: {error}"
         );
+        tokio::time::timeout_at(owner_deadline, owned_tasks.drain())
+            .await
+            .expect("rejected helper owner must finish before the integration deadline");
         assert!(
             !matches!(
                 NativeProcessSampler::process_identity(owned_identity.pid),
@@ -3414,8 +3419,20 @@ mod tests {
         );
         assert_child_was_reaped(owned_pid, "rejected Codex helper");
 
+        let peer_reaped_checkpoint = peer.events.reaped.checkpoint();
         peer_helper.terminate();
-        peer.events.reaped.wait_after(0).await;
+        let peer_cleanup = tokio::time::timeout_at(owner_deadline, async {
+            peer.events.reaped.wait_after(peer_reaped_checkpoint).await;
+            peer_launcher.shutdown().await;
+        })
+        .await;
+        if peer_cleanup.is_err() {
+            peer_helper.terminate();
+            tokio::time::timeout(Duration::from_secs(10), peer_launcher.shutdown())
+                .await
+                .expect("peer helper cleanup must join the retained owner");
+            panic!("peer helper owner exceeded its integration deadline");
+        }
         assert!(
             !matches!(
                 NativeProcessSampler::process_identity(peer_identity.pid),

@@ -10598,6 +10598,7 @@ lines.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER) {
     fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER, request.method);
+    process.stderr.write("BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED\n");
   }
   if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE) return;
   let result;
@@ -12297,7 +12298,10 @@ while IFS= read -r line; do
   response_marker=
   case "$line" in
     *'"method":"initialize"'*)
-      [ -z "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER"
+      if [ -n "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER" ]; then
+        : > "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER"
+        printf '%s\n' 'BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED' >&2
+      fi
       [ -z "$BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE" ] || continue
       response_marker=$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER
       [ -z "$response_marker" ] || : > "$response_marker"
@@ -15779,12 +15783,40 @@ done
             result
         });
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            initialize_request_queued.wait_after(initialize_request_checkpoint),
-        )
-        .await
-        .expect("fixture start must queue initialize before the diagnostic deadline");
+        let diagnostic_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let observation = tokio::time::timeout_at(diagnostic_deadline, async {
+            initialize_request_queued
+                .wait_after(initialize_request_checkpoint)
+                .await;
+            loop {
+                let event = driver
+                    .runtime
+                    .next_event()
+                    .await
+                    .ok_or_else(|| "stalled Codex fixture event stream closed".to_owned())?;
+                if event.event_type == "runtime.warning"
+                    && event.payload["message"] == "BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED"
+                {
+                    return Ok::<(), String>(());
+                }
+            }
+        })
+        .await;
+        let observation_error = match observation {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!(
+                "fixture did not receive initialize before the diagnostic deadline: {error}"
+            )),
+        };
+        if let Some(error) = observation_error {
+            start_task.abort();
+            let _ = start_task.await;
+            let cleanup = driver
+                .shutdown_with_grace(std::time::Duration::from_secs(2))
+                .await;
+            panic!("{error}; cleanup={cleanup:?}");
+        }
         assert_eq!(
             initialize_response_ready.checkpoint(),
             milestones.initialize_checkpoint,
