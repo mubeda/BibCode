@@ -1,7 +1,10 @@
 use bibcode_server::process::configure_background_command;
 use serde_json::Value;
 use std::{path::Path, time::Duration};
-use tokio::process::Command;
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+};
 
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -100,6 +103,7 @@ async fn read_tailscale_status_with(
 ) -> Result<TailscaleStatus, String> {
     let mut command = Command::new(command_path);
     configure_background_command(&mut command);
+    command.kill_on_drop(true);
     let child = command
         .args(["status", "--json"])
         .stdout(std::process::Stdio::piped())
@@ -107,16 +111,12 @@ async fn read_tailscale_status_with(
         .spawn()
         .map_err(|error| format!("Failed to spawn tailscale status: {error}"))?;
 
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            format!(
-                "tailscale status timed out after {}ms.",
-                timeout.as_millis()
-            )
-        })?
-        .map_err(|error| format!("Failed to read tailscale status output: {error}"))?;
+    let output = wait_for_tailscale_output(child, timeout).await?;
 
+    decode_tailscale_status_output(output)
+}
+
+fn decode_tailscale_status_output(output: std::process::Output) -> Result<TailscaleStatus, String> {
     if !output.status.success() {
         return Err(format!(
             "tailscale status exited with code {}.",
@@ -130,6 +130,58 @@ async fn read_tailscale_status_with(
     let stdout = String::from_utf8(output.stdout)
         .map_err(|error| format!("tailscale status returned non-UTF-8 JSON: {error}"))?;
     parse_tailscale_status(&stdout)
+}
+
+async fn wait_for_tailscale_output(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("tailscale status stdout must remain piped");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("tailscale status stderr must remain piped");
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => {
+            result.map_err(|error| format!("Failed to read tailscale status output: {error}"))?
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            return Err(format!(
+                "tailscale status timed out after {}ms.",
+                timeout.as_millis()
+            ));
+        }
+    };
+    let stdout = stdout_reader
+        .await
+        .map_err(|error| format!("Failed to join tailscale stdout reader: {error}"))?
+        .map_err(|error| format!("Failed to read tailscale status stdout: {error}"))?;
+    let stderr = stderr_reader
+        .await
+        .map_err(|error| format!("Failed to join tailscale stderr reader: {error}"))?
+        .map_err(|error| format!("Failed to read tailscale status stderr: {error}"))?;
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub async fn probe_tailscale_https_endpoint(base_url: &str) -> bool {
@@ -160,6 +212,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(code as u32)
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TAILSCALE_STATUS_JSON: &str = r#"{"Self":{"DNSName":"desktop.tail.ts.net.","TailscaleIPs":["100.100.100.100","fd7a:115c:a1e0::1","192.168.1.20"]}}"#;
@@ -294,26 +360,6 @@ mod tests {
         }
     }
 
-    async fn read_status_fixture(
-        path: &Path,
-        timeout: Duration,
-    ) -> Result<TailscaleStatus, String> {
-        for _ in 0..10 {
-            let result = read_tailscale_status_with(path, timeout).await;
-            if result.as_ref().err().map(String::as_str)
-                != Some("tailscale status exited with code unknown.")
-            {
-                return result;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        Err(
-            "tailscale status fixture was repeatedly terminated by a concurrent process test."
-                .to_owned(),
-        )
-    }
-
     #[tokio::test]
     async fn status_command_reports_success_and_process_failures() {
         let directory = tempfile::tempdir().unwrap();
@@ -324,7 +370,7 @@ mod tests {
             &format!("echo {TAILSCALE_STATUS_JSON}"),
         );
         assert_eq!(
-            read_status_fixture(&success, Duration::from_secs(2))
+            read_tailscale_status_with(&success, Duration::from_secs(15))
                 .await
                 .unwrap()
                 .magic_dns_name
@@ -332,25 +378,24 @@ mod tests {
             Some("desktop.tail.ts.net")
         );
 
-        let failed = executable_script(directory.path(), "failed", "exit 7", "exit /b 7");
         assert_eq!(
-            read_status_fixture(&failed, Duration::from_secs(5))
-                .await
-                .unwrap_err(),
+            decode_tailscale_status_output(std::process::Output {
+                status: exit_status(7),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+            .unwrap_err(),
             "tailscale status exited with code 7."
         );
 
-        let invalid_utf8 = executable_script(
-            directory.path(),
-            "invalid-utf8",
-            "printf '\\377'",
-            "powershell.exe -NoLogo -NoProfile -Command \"[Console]::OpenStandardOutput().WriteByte(255)\"",
-        );
         assert!(
-            read_status_fixture(&invalid_utf8, Duration::from_secs(5))
-                .await
-                .unwrap_err()
-                .contains("non-UTF-8")
+            decode_tailscale_status_output(std::process::Output {
+                status: exit_status(0),
+                stdout: vec![0xff],
+                stderr: Vec::new(),
+            })
+            .unwrap_err()
+            .contains("non-UTF-8")
         );
 
         assert!(
@@ -366,17 +411,41 @@ mod tests {
             "%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul",
         );
         assert_eq!(
-            read_status_fixture(&slow, Duration::from_millis(10))
+            read_tailscale_status_with(&slow, Duration::from_millis(10))
                 .await
                 .unwrap_err(),
             "tailscale status timed out after 10ms."
         );
 
         assert!(
-            read_status_fixture(&directory.path().join("missing"), Duration::from_secs(1))
+            read_tailscale_status_with(&directory.path().join("missing"), Duration::from_secs(1))
                 .await
                 .unwrap_err()
                 .contains("Failed to spawn")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_status_child_is_killed_and_reaped_before_return() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("status fixture child should start");
+        let pid = child.id().expect("status fixture child should have a pid");
+
+        let error = wait_for_tailscale_output(child, Duration::from_millis(10))
+            .await
+            .expect_err("status fixture child should time out");
+
+        assert!(error.contains("timed out after 10ms"), "{error}");
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "timed-out status child must be reaped before returning"
         );
     }
 }

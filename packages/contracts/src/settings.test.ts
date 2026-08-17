@@ -40,6 +40,22 @@ describe("ServerSettings Grok defaults", () => {
   });
 });
 
+describe("ServerSettings supported provider defaults", () => {
+  it("enables Cursor for fresh settings while preserving an explicit disable", () => {
+    expect(decodeServerSettings({}).providers.cursor).toMatchObject({
+      enabled: true,
+      binaryPath: "cursor-agent",
+    });
+    expect(DEFAULT_SERVER_SETTINGS.providers.cursor).toMatchObject({
+      enabled: true,
+      binaryPath: "cursor-agent",
+    });
+    expect(
+      decodeServerSettings({ providers: { cursor: { enabled: false } } }).providers.cursor.enabled,
+    ).toBe(false);
+  });
+});
+
 describe("ServerSettings agent activity", () => {
   it("defaults Chat on and AI Terminal off", () => {
     expect(decodeServerSettings({})).toMatchObject({
@@ -545,8 +561,9 @@ describe("provider settings schema helpers", () => {
   });
 
   it("uses cursor-agent as the Cursor binary fallback", () => {
-    expect(decodeCursorSettings({}).binaryPath).toBe("cursor-agent");
+    expect(decodeCursorSettings({})).toMatchObject({ enabled: true, binaryPath: "cursor-agent" });
     expect(decodeCursorSettings({ binaryPath: "" }).binaryPath).toBe("cursor-agent");
+    expect(decodeCursorSettings({ enabled: false }).enabled).toBe(false);
   });
 
   it("omits ordering metadata when no order is configured", () => {

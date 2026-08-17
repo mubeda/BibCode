@@ -98,7 +98,11 @@ const PREPARED: PreparedConnection = {
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
     storageInstanceId: "store-test",
-    capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+    capabilities: {
+      repositoryIdentity: true,
+      worktreeCatalog: false,
+      activityProtocolVersion: null,
+    },
   },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws?wsTicket=test",
@@ -118,6 +122,7 @@ const SERVER_CONFIG: ServerConfigType = {
     storageInstanceId: null,
     capabilities: {
       repositoryIdentity: true,
+      worktreeCatalog: false,
       activityProtocolVersion: null,
     },
   },

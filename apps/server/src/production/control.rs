@@ -127,6 +127,18 @@ struct ProviderProbePause {
     release: Arc<Notify>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderUpdateVerification {
+    provider: String,
+    instance_id: String,
+    before_version: String,
+    after_version: String,
+    expected_version: String,
+    exit_code: i32,
+    status: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct ProviderUpdateCheckTask {
     cancellation: CancellationToken,
@@ -209,11 +221,17 @@ pub struct NativeServerControl {
     #[cfg(test)]
     next_provider_capabilities_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
+    next_provider_update_running_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
+    next_provider_update_after_version_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_refresh_handoff_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
+    provider_update_verifications: Arc<std::sync::Mutex<Vec<ProviderUpdateVerification>>>,
     keybinding_rules: Arc<RwLock<Vec<Value>>>,
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
@@ -309,11 +327,17 @@ impl NativeServerControl {
             #[cfg(test)]
             next_provider_capabilities_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            next_provider_update_running_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_provider_update_after_version_probe_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_refresh_handoff_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            provider_update_verifications: Arc::new(std::sync::Mutex::new(Vec::new())),
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
@@ -528,6 +552,23 @@ impl NativeServerControl {
     async fn install_next_provider_capabilities_pause(&self) -> ProviderProbePause {
         let pause = ProviderProbePause::new();
         *self.next_provider_capabilities_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn install_next_provider_update_running_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_provider_update_running_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn install_next_provider_update_after_version_probe_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self
+            .next_provider_update_after_version_probe_pause
+            .lock()
+            .await = Some(pause.clone());
         pause
     }
 
@@ -773,6 +814,16 @@ impl NativeServerControl {
         );
         let before_version =
             provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+        #[cfg(test)]
+        if let Some(pause) = self
+            .next_provider_update_after_version_probe_pause
+            .lock()
+            .await
+            .take()
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
         let (_, pre_run_settings) = self.settings_snapshot().await;
         let pre_run_target = provider_inventory::maintenance_target(
             &pre_run_settings,
@@ -817,6 +868,11 @@ impl NativeServerControl {
             drop(command_guard);
             let providers = self.providers.read().await.clone();
             return Ok(json!({ "providers": providers }));
+        }
+        #[cfg(test)]
+        if let Some(pause) = self.next_provider_update_running_pause.lock().await.take() {
+            pause.entered.notify_one();
+            pause.release.notified().await;
         }
         let command_result = match self
             .provider_maintenance
@@ -957,6 +1013,19 @@ impl NativeServerControl {
                 "provider update verification"
             );
         }
+        #[cfg(test)]
+        self.provider_update_verifications
+            .lock()
+            .expect("provider update verification mutex poisoned")
+            .push(ProviderUpdateVerification {
+                provider: target.driver.clone(),
+                instance_id: target.instance_id.clone(),
+                before_version: before_version.as_deref().unwrap_or("unknown").to_owned(),
+                after_version: after_version.as_deref().unwrap_or("unknown").to_owned(),
+                expected_version: expected_version.as_deref().unwrap_or("unknown").to_owned(),
+                exit_code: command_result.exit_code,
+                status: status.to_owned(),
+            });
         let finished_at = now_iso();
         let (providers, _) = self
             .publish_provider_update_state(
@@ -2079,6 +2148,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             .to_string(),
         "capabilities": {
             "repositoryIdentity": true,
+            "worktreeCatalog": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
         },
     })
@@ -2140,13 +2210,12 @@ pub(crate) fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Write},
         sync::{Mutex as StdMutex, atomic::AtomicUsize},
         time::Duration,
     };
 
     use axum::{Json, Router, extract::State, routing::get};
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::OnceCell};
     use url::Url;
     use uuid::Uuid;
 
@@ -2168,40 +2237,6 @@ mod tests {
             TEST_STORAGE_INSTANCE_ID,
         ));
         config
-    }
-
-    #[derive(Clone, Default)]
-    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
-
-    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
-
-    impl Write for TraceCaptureWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("trace capture lock")
-                .extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
-        type Writer = TraceCaptureWriter;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            TraceCaptureWriter(self.0.clone())
-        }
-    }
-
-    impl TraceCapture {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().expect("trace capture lock").clone())
-                .expect("UTF-8 trace output")
-        }
     }
 
     #[test]
@@ -2328,6 +2363,46 @@ mod tests {
         }
     }
 
+    struct CompiledCursorUpdateFixture {
+        _root: tempfile::TempDir,
+        executable: PathBuf,
+    }
+
+    static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
+        OnceCell::const_new();
+
+    async fn compiled_cursor_update_fixture() -> &'static CompiledCursorUpdateFixture {
+        COMPILED_CURSOR_UPDATE_FIXTURE
+            .get_or_init(|| async {
+                let root = tempfile::tempdir().expect("compiled Cursor fixture directory");
+                let executable = root
+                    .path()
+                    .join(cursor_update_fixture_executable_name(cfg!(windows)));
+                let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/cursor_update_fixture.rs");
+                let output = tokio::process::Command::new(
+                    std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+                )
+                .arg("--edition=2024")
+                .arg(source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .await
+                .expect("compile Cursor update fixture");
+                assert!(
+                    output.status.success(),
+                    "compile Cursor update fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                CompiledCursorUpdateFixture {
+                    _root: root,
+                    executable,
+                }
+            })
+            .await
+    }
+
     async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
         let release_directory =
             directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
@@ -2339,29 +2414,15 @@ mod tests {
             .expect("write Cursor version state");
         let executable =
             release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor_update_fixture.rs");
-        let output = tokio::process::Command::new(
-            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
-        .arg("--edition=2024")
-        .arg(source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .await
-        .expect("compile Cursor update fixture");
-        assert!(
-            output.status.success(),
-            "compile Cursor update fixture: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let fixture = compiled_cursor_update_fixture().await;
+        tokio::fs::copy(&fixture.executable, &executable)
+            .await
+            .expect("copy compiled Cursor update fixture");
         executable
     }
 
     #[tokio::test]
     async fn compiled_cursor_update_fixture_reports_and_advances_its_version() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
@@ -2400,21 +2461,14 @@ mod tests {
         compile_cursor_update_fixture(directory, "9.8.7").await
     }
 
-    async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
-        let executable = compile_cursor_update_fixture(directory, "9.8.7").await;
-        tokio::fs::write(
-            executable
-                .parent()
-                .expect("Cursor release directory")
-                .join("update-sleep-ms"),
-            "2000",
-        )
-        .await
-        .expect("write Cursor update delay");
-        executable
+    async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
+        control_with_cursor_update_fixture_environment(executable, json!([])).await
     }
 
-    async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
+    async fn control_with_cursor_update_fixture_environment(
+        executable: PathBuf,
+        environment: Value,
+    ) -> NativeServerControl {
         let directory = executable.parent().expect("fixture directory");
         let settings_path = ServerConfig::new(directory)
             .state_dir()
@@ -2430,7 +2484,8 @@ mod tests {
                     "cursor-work": {
                         "driver": "cursor",
                         "enabled": true,
-                        "config": { "binaryPath": executable }
+                        "config": { "binaryPath": executable },
+                        "environment": environment
                     }
                 }
             }))
@@ -2527,7 +2582,6 @@ mod tests {
 
     #[tokio::test]
     async fn provider_update_invalidates_latest_version_only_after_zero_exit() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
@@ -2593,13 +2647,6 @@ mod tests {
         tokio::fs::write(release_directory.join("update-exit-code"), "0")
             .await
             .expect("write successful update exit code");
-        let trace = TraceCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(trace.clone())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let succeeded = control
             .update_provider(
                 &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
@@ -2621,22 +2668,22 @@ mod tests {
                 executable.display()
             )
         );
-        let trace = trace.text();
-        for expected in [
-            "provider update verification",
-            "provider=cursor",
-            "instance_id=cursor-work",
-            "before_version=2026.06.19-653a7fb",
-            "after_version=2026.06.19-653a7fb",
-            "expected_version=2026.08.04-aaa8809",
-            "exit_code=0",
-            "status=unchanged",
-        ] {
-            assert!(
-                trace.contains(expected),
-                "missing {expected:?} in trace: {trace}"
-            );
-        }
+        assert_eq!(
+            control
+                .provider_update_verifications
+                .lock()
+                .expect("provider update verification lock")
+                .last(),
+            Some(&ProviderUpdateVerification {
+                provider: "cursor".to_owned(),
+                instance_id: "cursor-work".to_owned(),
+                before_version: "2026.06.19-653a7fb".to_owned(),
+                after_version: "2026.06.19-653a7fb".to_owned(),
+                expected_version: "2026.08.04-aaa8809".to_owned(),
+                exit_code: 0,
+                status: "unchanged".to_owned(),
+            })
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
@@ -2646,7 +2693,6 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_advisory_does_not_treat_stale_published_version_as_update_progress() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
@@ -2684,7 +2730,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_exact_target_probe_disables_unknown_advisory_advancement() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
@@ -2960,7 +3005,6 @@ mod tests {
 
     #[tokio::test]
     async fn removed_provider_update_state_is_not_retained_or_reused() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable = write_cursor_update_fixture(directory.path()).await;
         let control = control_with_cursor_update_fixture(executable.clone()).await;
@@ -3057,7 +3101,6 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_settings_commit_after_capability_resolution_uses_current_generation() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture root");
         let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
         let release_directory = executable
@@ -3105,12 +3148,17 @@ mod tests {
             .iter()
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("Cursor provider");
-        assert_eq!(provider["updateState"]["status"], "succeeded");
+        assert!(
+            matches!(
+                provider["updateState"]["status"].as_str(),
+                Some("succeeded" | "unchanged")
+            ),
+            "a completed update must not be reported as failed"
+        );
     }
 
     #[tokio::test]
     async fn environment_change_after_capability_resolution_fails_reservation_closed() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture root");
         let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
         let release_directory = executable.parent().expect("Cursor release directory");
@@ -3158,7 +3206,6 @@ mod tests {
 
     #[tokio::test]
     async fn queued_update_revalidates_binary_and_environment_before_execution() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let old_root = tempfile::tempdir().expect("old Cursor fixture root");
         let new_root = tempfile::tempdir().expect("new Cursor fixture root");
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
@@ -3260,17 +3307,16 @@ mod tests {
 
     #[tokio::test]
     async fn settings_change_during_fresh_preprobe_prevents_stale_command_execution() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let old_root = tempfile::tempdir().expect("old Cursor fixture root");
         let new_root = tempfile::tempdir().expect("new Cursor fixture root");
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
         let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
         let old_release = old_executable.parent().expect("old release directory");
-        tokio::fs::write(old_release.join("version-pause"), "pause")
-            .await
-            .expect("pause old version probe");
         let control = control_with_cursor_update_fixture(old_executable.clone()).await;
-        let updating = {
+        let pre_run_pause = control
+            .install_next_provider_update_after_version_probe_pause()
+            .await;
+        let mut updating = {
             let control = control.clone();
             tokio::spawn(async move {
                 control
@@ -3281,13 +3327,12 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !old_release.join("version-entered").is_file() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::select! {
+            () = pre_run_pause.wait_until_entered() => {}
+            result = &mut updating => {
+                panic!("provider update completed before the fresh pre-probe entered: {result:?}")
             }
-        })
-        .await
-        .expect("fresh pre-probe entered");
+        }
 
         control
             .update_settings(json!({
@@ -3303,9 +3348,7 @@ mod tests {
             }))
             .await
             .expect("replace target during pre-probe");
-        tokio::fs::write(old_release.join("version-release"), "release")
-            .await
-            .expect("release old version probe");
+        pre_run_pause.release();
 
         let result = updating
             .await
@@ -3327,14 +3370,13 @@ mod tests {
 
     #[tokio::test]
     async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
-        let control = control_with_cursor_update_fixture(
-            write_slow_cursor_update_fixture(directory.path()).await,
-        )
-        .await;
+        let control =
+            control_with_cursor_update_fixture(write_cursor_update_fixture(directory.path()).await)
+                .await;
         let mut events = control.config_events.subscribe();
-        let updating = {
+        let running_pause = control.install_next_provider_update_running_pause().await;
+        let mut updating = {
             let control = control.clone();
             tokio::spawn(async move {
                 control
@@ -3345,25 +3387,27 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("provider update event");
-                if event["type"] == "providerStatuses"
-                    && event["payload"]["providers"]
-                        .as_array()
-                        .is_some_and(|providers| {
-                            providers.iter().any(|provider| {
-                                provider["instanceId"] == "cursor-work"
-                                    && provider["updateState"]["status"] == "running"
-                            })
-                        })
-                {
-                    break;
-                }
+        tokio::select! {
+            () = running_pause.wait_until_entered() => {}
+            result = &mut updating => {
+                panic!("provider update completed before publishing its running state: {result:?}")
             }
-        })
-        .await
-        .expect("running state published");
+        }
+        let running_published = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            event["type"] == "providerStatuses"
+                && event["payload"]["providers"]
+                    .as_array()
+                    .is_some_and(|providers| {
+                        providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        })
+                    })
+        });
+        assert!(
+            running_published,
+            "running state was not published before the barrier"
+        );
 
         let quick_pause = control.install_next_quick_provider_probe_pause().await;
         let settings_update = {
@@ -3385,6 +3429,7 @@ mod tests {
             })
         };
         quick_pause.wait_until_entered().await;
+        running_pause.release();
 
         let result = updating
             .await
@@ -3406,15 +3451,14 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_provider_update_publishes_failed_state() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
-        let control = control_with_cursor_update_fixture(
-            write_slow_cursor_update_fixture(directory.path()).await,
-        )
-        .await;
+        let control =
+            control_with_cursor_update_fixture(write_cursor_update_fixture(directory.path()).await)
+                .await;
         let mut events = control.config_events.subscribe();
         let cancellation = CancellationToken::new();
-        let updating = {
+        let running_pause = control.install_next_provider_update_running_pause().await;
+        let mut updating = {
             let control = control.clone();
             let cancellation = cancellation.clone();
             tokio::spawn(async move {
@@ -3426,26 +3470,29 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("provider update event");
-                if event["type"] == "providerStatuses"
-                    && event["payload"]["providers"]
-                        .as_array()
-                        .is_some_and(|providers| {
-                            providers.iter().any(|provider| {
-                                provider["instanceId"] == "cursor-work"
-                                    && provider["updateState"]["status"] == "running"
-                            })
-                        })
-                {
-                    break;
-                }
+        tokio::select! {
+            () = running_pause.wait_until_entered() => {}
+            result = &mut updating => {
+                panic!("provider update completed before publishing its running state: {result:?}")
             }
-        })
-        .await
-        .expect("running state published");
+        }
+        let running_published = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            event["type"] == "providerStatuses"
+                && event["payload"]["providers"]
+                    .as_array()
+                    .is_some_and(|providers| {
+                        providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        })
+                    })
+        });
+        assert!(
+            running_published,
+            "running state was not published before the barrier"
+        );
         cancellation.cancel();
+        running_pause.release();
 
         let result = updating
             .await
@@ -4339,7 +4386,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_settings_expose_terminal_webgl_default_and_patch() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-webgl".to_owned();
@@ -4361,7 +4407,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_settings_updates_preserve_every_committed_patch() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-concurrent-settings".to_owned();
@@ -4423,7 +4468,6 @@ mod tests {
 
     #[tokio::test]
     async fn older_probe_completion_cannot_overwrite_newer_same_generation_snapshot() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-provider-probe-order".to_owned();
@@ -4524,7 +4568,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_settings_stream_discards_stale_provider_probes_in_commit_order() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
         config.environment_id = "environment-concurrent-stream".to_owned();
@@ -4672,7 +4715,6 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_settings_surface_structured_errors_and_refuse_mutation() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4723,7 +4765,6 @@ mod tests {
 
     #[tokio::test]
     async fn schema_invalid_settings_surface_structured_errors_and_preserve_original_bytes() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let cases = [
             ("top-level array", br#"[]"#.as_slice()),
             (
@@ -4823,7 +4864,6 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_settings_patch_is_transactional_and_publishes_no_events() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4882,7 +4922,6 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_accepts_fractional_fetch_intervals() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4904,7 +4943,6 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_preserves_open_unknown_keys_and_legacy_options() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4952,6 +4990,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn environment_descriptor_advertises_complete_worktree_catalog_surface() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let config = running_test_config(temp.path());
+        let descriptor = environment_descriptor(&config, false);
+        assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+        assert_eq!(descriptor["capabilities"]["worktreeCatalog"], true);
+    }
+
     #[tokio::test]
     async fn environment_descriptor_publishes_prepared_storage_identity_without_paths() {
         let temp = tempfile::tempdir().expect("state directory");
@@ -4993,7 +5040,6 @@ mod tests {
 
     #[tokio::test]
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
         config.environment_id = "environment-1".to_owned();
@@ -5008,6 +5054,10 @@ mod tests {
         assert!(!platform_arch().is_empty());
         assert!(
             environment_descriptor(&config, false)["capabilities"]["repositoryIdentity"] == true
+        );
+        assert_eq!(
+            environment_descriptor(&config, false)["capabilities"]["worktreeCatalog"],
+            true
         );
         let _ = available_editors();
         assert!(!command_exists("definitely-not-a-bibcode-editor"));

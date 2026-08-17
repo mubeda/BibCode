@@ -242,6 +242,11 @@ pub trait ProviderTerminalObserverFactory: Send + Sync {
         &self,
         input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>>;
+
+    #[doc(hidden)]
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1131,6 +1136,21 @@ impl TerminalLaunchPreparer for ProviderTerminalActivitySupervisor {
         input: TerminalLaunchPreparationInput,
     ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
         Box::pin(self.prepare_inner(input))
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            for factory in [
+                self.factories.codex.as_ref(),
+                self.factories.claude.as_ref(),
+                self.factories.opencode.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                factory.shutdown().await;
+            }
+        })
     }
 }
 

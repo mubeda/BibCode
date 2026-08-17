@@ -2,31 +2,39 @@ import {
   parseScopedThreadKey,
   scopeProjectRef,
   scopeThreadRef,
+  scopedThreadKey,
 } from "@bibcode/client-runtime/environment";
-import { settlePromise, squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
-import { EnvironmentId, type ScopedThreadRef, ThreadId } from "@bibcode/contracts";
+import { settlePromise } from "@bibcode/client-runtime/state/runtime";
+import {
+  EnvironmentId,
+  type ScopedProjectRef,
+  type ScopedThreadRef,
+  ThreadId,
+  type WorktreeRemovalResult,
+} from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useRouter } from "@tanstack/react-router";
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import { getFallbackThreadIdAfterDelete } from "../components/Sidebar.logic";
 import { useCenterPanelStore } from "../centerPanelStore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { terminalEnvironment } from "../state/terminal";
 import { threadEnvironment } from "../state/threads";
-import { vcsEnvironment } from "../state/vcs";
+import { worktreeEnvironment } from "../state/worktrees";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
+import { newCommandId } from "../lib/utils";
 import { readLocalApi } from "../localApi";
-import { readEnvironmentThreadRefs, readProject, readThreadShell } from "../state/entities";
+import { readEnvironmentThreadRefs, readThreadShell } from "../state/entities";
 import { useRightPanelStore } from "../rightPanelStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
-import { formatWorktreePathForDisplay, getWorktreeDeletionPlanForThread } from "../worktreeCleanup";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
+import type { WorktreeRemovalTarget } from "../components/WorktreeRemovalDialog";
 
 export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -45,7 +53,19 @@ function removeThreadPanelState(threadRef: ScopedThreadRef): void {
   useRightPanelStore.getState().removeThread(threadRef);
 }
 
+interface WorktreeRemovalCleanupContext {
+  readonly removed: ReadonlyArray<{
+    readonly threadRef: ScopedThreadRef;
+    readonly projectRef: ScopedProjectRef;
+  }>;
+  readonly removedIds: ReadonlySet<ThreadId>;
+  readonly fallbackThreadRef: ScopedThreadRef | null;
+}
+
 export function useThreadActions() {
+  const [worktreeRemovalTarget, setWorktreeRemovalTarget] = useState<WorktreeRemovalTarget | null>(
+    null,
+  );
   const closeTerminal = useAtomCommand(terminalEnvironment.close);
   const archiveThreadMutation = useAtomCommand(threadEnvironment.archive, {
     reportFailure: false,
@@ -57,10 +77,7 @@ export function useThreadActions() {
     reportFailure: false,
   });
   const stopThreadSession = useAtomCommand(threadEnvironment.stopSession);
-  const removeWorktree = useAtomCommand(vcsEnvironment.removeWorktree, {
-    reportFailure: false,
-  });
-  const refreshVcsStatus = useAtomCommand(vcsEnvironment.refreshStatus, {
+  const removeWorktreeFromBibCode = useAtomCommand(worktreeEnvironment.removeFromBibCode, {
     reportFailure: false,
   });
   const sidebarThreadSortOrder = useClientSettings((settings) => settings.sidebarThreadSortOrder);
@@ -76,6 +93,9 @@ export function useThreadActions() {
   // the projects list) and would otherwise cascade new references into every
   // sidebar row via archiveThread → attemptArchiveThread.
   const handleNewThreadRef = useRef(handleNewThread);
+  const worktreeRemovalCleanupByThreadKeyRef = useRef(
+    new Map<string, WorktreeRemovalCleanupContext>(),
+  );
   handleNewThreadRef.current = handleNewThread;
 
   const resolveThreadTarget = useCallback((target: ScopedThreadRef) => {
@@ -92,6 +112,129 @@ export function useThreadActions() {
     const currentRouteParams = router.state.matches[router.state.matches.length - 1]?.params ?? {};
     return resolveThreadRouteRef(currentRouteParams);
   }, [router]);
+
+  const captureWorktreeRemovalCleanup = useCallback(
+    (target: WorktreeRemovalTarget): WorktreeRemovalCleanupContext => {
+      const targetRef = scopeThreadRef(target.environmentId, target.threadId);
+      const thread = readThreadShell(targetRef);
+      const threads = readEnvironmentThreadRefs(target.environmentId).flatMap((ref) => {
+        const shell = readThreadShell(ref);
+        return shell === null ? [] : [shell];
+      });
+      const dependentPanels = thread
+        ? threads.filter(
+            (candidate) =>
+              candidate.kind === "panel" && candidate.worktreePath === thread.worktreePath,
+          )
+        : [];
+      const removed = [
+        {
+          threadRef: targetRef,
+          projectRef: scopeProjectRef(target.environmentId, target.projectId),
+        },
+        ...dependentPanels
+          .filter((candidate) => candidate.id !== target.threadId)
+          .map((candidate) => ({
+            threadRef: scopeThreadRef(target.environmentId, candidate.id),
+            projectRef: scopeProjectRef(target.environmentId, candidate.projectId),
+          })),
+      ];
+      const removedIds = new Set(removed.map(({ threadRef }) => threadRef.threadId));
+      const fallbackThreadId = thread
+        ? getFallbackThreadIdAfterDelete({
+            threads,
+            deletedThreadId: target.threadId,
+            deletedThreadIds: removedIds,
+            sortOrder: sidebarThreadSortOrder,
+          })
+        : null;
+      const fallbackThread = fallbackThreadId
+        ? threads.find((candidate) => candidate.id === fallbackThreadId)
+        : null;
+      const cleanup: WorktreeRemovalCleanupContext = {
+        removed,
+        removedIds,
+        fallbackThreadRef: fallbackThread
+          ? scopeThreadRef(fallbackThread.environmentId, fallbackThread.id)
+          : null,
+      };
+      worktreeRemovalCleanupByThreadKeyRef.current.set(scopedThreadKey(targetRef), cleanup);
+      return cleanup;
+    },
+    [sidebarThreadSortOrder],
+  );
+
+  const completeWorktreeRemoval = useCallback(
+    async (target: WorktreeRemovalTarget, result: WorktreeRemovalResult) => {
+      const targetRef = scopeThreadRef(target.environmentId, target.threadId);
+      const cleanupKey = scopedThreadKey(targetRef);
+      const cleanup =
+        worktreeRemovalCleanupByThreadKeyRef.current.get(cleanupKey) ??
+        captureWorktreeRemovalCleanup(target);
+      worktreeRemovalCleanupByThreadKeyRef.current.delete(cleanupKey);
+      const currentRouteThreadRef = getCurrentRouteThreadRef();
+      const shouldNavigateToFallback =
+        currentRouteThreadRef?.environmentId === target.environmentId &&
+        cleanup.removedIds.has(currentRouteThreadRef.threadId);
+
+      for (const removed of cleanup.removed) {
+        clearComposerDraftForThread(removed.threadRef);
+        clearProjectDraftThreadById(removed.projectRef, removed.threadRef);
+        removeThreadPanelState(removed.threadRef);
+      }
+      refreshArchivedThreadsForEnvironment(target.environmentId);
+
+      if (result.gitOutcome === "failed" || result.orphanCleanupPending) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: "Removed from BiBCode; Git cleanup remains",
+            description:
+              result.detail ??
+              "The workspace row was removed, but Git may still need manual cleanup.",
+          }),
+        );
+      }
+
+      if (!shouldNavigateToFallback) {
+        return AsyncResult.success(undefined);
+      }
+      return settlePromise(() =>
+        cleanup.fallbackThreadRef
+          ? router.navigate({
+              to: "/$environmentId/$threadId",
+              params: buildThreadRouteParams(cleanup.fallbackThreadRef),
+              replace: true,
+            })
+          : router.navigate({ to: "/", replace: true }),
+      );
+    },
+    [
+      clearComposerDraftForThread,
+      clearProjectDraftThreadById,
+      captureWorktreeRemovalCleanup,
+      getCurrentRouteThreadRef,
+      router,
+    ],
+  );
+
+  const requestWorktreeRemoval = useCallback(
+    (target: WorktreeRemovalTarget) => {
+      captureWorktreeRemovalCleanup(target);
+      setWorktreeRemovalTarget(target);
+    },
+    [captureWorktreeRemovalCleanup],
+  );
+  const closeWorktreeRemovalDialog = useCallback(() => {
+    setWorktreeRemovalTarget((current) => {
+      if (current) {
+        worktreeRemovalCleanupByThreadKeyRef.current.delete(
+          scopedThreadKey(scopeThreadRef(current.environmentId, current.threadId)),
+        );
+      }
+      return null;
+    });
+  }, []);
 
   const archiveThread = useCallback(
     async (target: ScopedThreadRef) => {
@@ -172,10 +315,38 @@ export function useThreadActions() {
         const shell = readThreadShell(ref);
         return shell === null ? [] : [shell];
       });
-      const threadProject = readProject({
-        environmentId: threadRef.environmentId,
-        projectId: thread.projectId,
-      });
+      if (thread.worktreePath && thread.kind !== "panel") {
+        const removalTarget: WorktreeRemovalTarget = {
+          environmentId: threadRef.environmentId,
+          projectId: thread.projectId,
+          threadId: threadRef.threadId,
+          title: thread.title,
+          path: thread.worktreePath,
+          branch: thread.branch,
+          availability: "verification-unavailable",
+          registrationState: null,
+          locked: false,
+        };
+        captureWorktreeRemovalCleanup(removalTarget);
+        const worktreeResult = await removeWorktreeFromBibCode({
+          environmentId: threadRef.environmentId,
+          input: {
+            commandId: newCommandId(),
+            projectId: thread.projectId,
+            threadId: threadRef.threadId,
+          },
+        });
+        if (worktreeResult._tag === "Failure") {
+          worktreeRemovalCleanupByThreadKeyRef.current.delete(scopedThreadKey(threadRef));
+          return worktreeResult;
+        }
+
+        const cleanupResult = await completeWorktreeRemoval(removalTarget, worktreeResult.value);
+        if (cleanupResult._tag === "Failure") {
+          return cleanupResult;
+        }
+        return worktreeResult;
+      }
       const deletedIds =
         opts.deletedThreadKeys && opts.deletedThreadKeys.size > 0
           ? new Set<ThreadId>(
@@ -185,50 +356,7 @@ export function useThreadActions() {
               }),
             )
           : undefined;
-      const survivingThreads =
-        deletedIds && deletedIds.size > 0
-          ? threads.filter((entry) => entry.id === threadRef.threadId || !deletedIds.has(entry.id))
-          : threads;
-      const worktreeDeletionPlan = getWorktreeDeletionPlanForThread(
-        survivingThreads,
-        threadRef.threadId,
-      );
-      const orphanedWorktreePath = worktreeDeletionPlan?.worktreePath ?? null;
-      const displayWorktreePath = orphanedWorktreePath
-        ? formatWorktreePathForDisplay(orphanedWorktreePath)
-        : null;
-      const localApi = readLocalApi();
-      let shouldDeleteWorktree = false;
-      if (worktreeDeletionPlan && threadProject && localApi) {
-        const confirmationResult = await settlePromise(() =>
-          localApi.dialogs.confirm(
-            [
-              "This thread is the only one linked to this worktree:",
-              displayWorktreePath ?? orphanedWorktreePath,
-              ...(worktreeDeletionPlan.dependentPanelThreadIds.length > 0
-                ? [
-                    "",
-                    `This also closes and deletes ${worktreeDeletionPlan.dependentPanelThreadIds.length} linked panel thread${worktreeDeletionPlan.dependentPanelThreadIds.length === 1 ? "" : "s"}.`,
-                  ]
-                : []),
-              "",
-              "Delete the worktree too?",
-            ].join("\n"),
-          ),
-        );
-        if (confirmationResult._tag === "Failure") {
-          return confirmationResult;
-        }
-        shouldDeleteWorktree = confirmationResult.value;
-      }
-
-      const dependentPanelThreads =
-        shouldDeleteWorktree && worktreeDeletionPlan
-          ? worktreeDeletionPlan.dependentPanelThreadIds.flatMap((threadId) => {
-              const dependent = threads.find((candidate) => candidate.id === threadId);
-              return dependent ? [dependent] : [];
-            })
-          : [];
+      const dependentPanelThreads: typeof threads = [];
       const threadsToTeardown = [thread, ...dependentPanelThreads];
       for (const threadToTeardown of threadsToTeardown) {
         if (threadToTeardown.session && threadToTeardown.session.status !== "stopped") {
@@ -247,34 +375,6 @@ export function useThreadActions() {
         });
         if (closeResult._tag === "Failure") {
           return closeResult;
-        }
-      }
-
-      if (shouldDeleteWorktree && orphanedWorktreePath && threadProject) {
-        const removeResult = await removeWorktree({
-          environmentId: threadRef.environmentId,
-          input: {
-            cwd: threadProject.workspaceRoot,
-            path: orphanedWorktreePath,
-            force: true,
-            ownerThreadId: thread.id,
-            threadIds: [
-              thread.id,
-              ...threadsToTeardown
-                .filter((threadToTeardown) => threadToTeardown.id !== thread.id)
-                .map((threadToTeardown) => threadToTeardown.id),
-            ],
-          },
-        });
-        if (removeResult._tag === "Failure") {
-          const error = squashAtomCommandFailure(removeResult);
-          console.error("Failed to remove orphaned worktree before thread deletion", {
-            threadId: threadRef.threadId,
-            projectCwd: threadProject.workspaceRoot,
-            worktreePath: orphanedWorktreePath,
-            error,
-          });
-          return removeResult;
         }
       }
 
@@ -360,43 +460,17 @@ export function useThreadActions() {
         }
       }
 
-      if (!shouldDeleteWorktree || !orphanedWorktreePath || !threadProject) {
-        return deleteResult;
-      }
-
-      const refreshResult = await refreshVcsStatus({
-        environmentId: threadRef.environmentId,
-        input: { cwd: threadProject.workspaceRoot },
-      });
-      if (refreshResult._tag === "Failure") {
-        const error = squashAtomCommandFailure(refreshResult);
-        const message =
-          error instanceof Error ? error.message : "Unknown error refreshing VCS status.";
-        console.error("Failed to refresh VCS status after thread and worktree deletion", {
-          threadId: threadRef.threadId,
-          projectCwd: threadProject.workspaceRoot,
-          worktreePath: orphanedWorktreePath,
-          error,
-        });
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Thread deleted, but VCS refresh failed",
-            description: `Removed ${displayWorktreePath ?? orphanedWorktreePath}, but could not refresh repository status. ${message}`,
-          }),
-        );
-        return deleteResult;
-      }
       return deleteResult;
     },
     [
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
+      captureWorktreeRemovalCleanup,
       closeTerminal,
+      completeWorktreeRemoval,
       deleteThreadMutation,
       getCurrentRouteThreadRef,
-      refreshVcsStatus,
-      removeWorktree,
+      removeWorktreeFromBibCode,
       router,
       resolveThreadTarget,
       sidebarThreadSortOrder,
@@ -438,7 +512,20 @@ export function useThreadActions() {
       unarchiveThread,
       deleteThread,
       confirmAndDeleteThread,
+      worktreeRemovalTarget,
+      requestWorktreeRemoval,
+      closeWorktreeRemovalDialog,
+      completeWorktreeRemoval,
     }),
-    [archiveThread, confirmAndDeleteThread, deleteThread, unarchiveThread],
+    [
+      archiveThread,
+      closeWorktreeRemovalDialog,
+      completeWorktreeRemoval,
+      confirmAndDeleteThread,
+      deleteThread,
+      requestWorktreeRemoval,
+      unarchiveThread,
+      worktreeRemovalTarget,
+    ],
   );
 }

@@ -18,6 +18,7 @@ import {
   type ActivityQueryResult,
   type ActivityRosterPageData,
 } from "./ActivityPanel";
+import { formatChatTimestampTooltip } from "~/timestampFormat";
 
 const FIXED_NOW = "2026-07-22T20:20:00.000Z";
 const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }> = [];
@@ -186,6 +187,7 @@ function props(overrides: Partial<ActivityPanelProps> = {}): ActivityPanelProps 
     onLoadMoreDetail: vi.fn(),
     onRefreshSnapshot: vi.fn(),
     now: FIXED_NOW,
+    timestampFormat: "24-hour",
     ...overrides,
   };
 }
@@ -1040,8 +1042,21 @@ describe("ActivityPanel detail", () => {
     expect(container.textContent).toContain("Actor");
     expect(container.textContent).toContain("Completed");
     expect(container.textContent).toContain("codex");
-    expect(container.textContent).toContain("2026-07-22T20:00:00.000Z");
-    expect(container.textContent).toContain("2026-07-22T20:15:00.000Z");
+    const started = container.querySelector<HTMLTimeElement>(
+      'time[datetime="2026-07-22T20:00:00.000Z"]',
+    );
+    const ended = container.querySelector<HTMLTimeElement>(
+      'time[datetime="2026-07-22T20:15:00.000Z"]',
+    );
+    expect(started?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:00:00.000Z", "24-hour"),
+    );
+    expect(ended?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:15:00.000Z", "24-hour"),
+    );
+    expect(started?.title).toBe("2026-07-22T20:00:00.000Z");
+    expect(ended?.title).toBe("2026-07-22T20:15:00.000Z");
+    expect(started?.textContent).not.toBe(started?.dateTime);
     const parentButton = container.querySelector<HTMLButtonElement>(
       'button[data-activity-relation="parent"]',
     );
@@ -1058,11 +1073,117 @@ describe("ActivityPanel detail", () => {
     expect(
       entries.map((row) => row.querySelector("[data-activity-entry-label]")?.textContent),
     ).toEqual(["Commentary", "Command", "State", "Tool", "Error"]);
+    const firstEntryTime = container.querySelector<HTMLTimeElement>(
+      '[data-activity-entry-id="entry-1"] time[datetime="2026-07-22T20:01:00.000Z"]',
+    );
+    expect(firstEntryTime?.textContent).toBe(
+      formatChatTimestampTooltip("2026-07-22T20:01:00.000Z", "24-hour"),
+    );
+    expect(firstEntryTime?.dateTime).toBe("2026-07-22T20:01:00.000Z");
+    expect(firstEntryTime?.title).toBe("2026-07-22T20:01:00.000Z");
+    expect(firstEntryTime?.textContent).not.toBe(firstEntryTime?.dateTime);
     expect(new Set(entries.map((row) => row.dataset.activityEntryKind)).size).toBe(5);
     expect(container.textContent).toContain(command);
     expect(container.textContent).not.toContain("stale duplicate title");
     expect(container.querySelector("script")).toBeNull();
     expect(Reflect.get(globalThis, "pwned")).toBeUndefined();
+  });
+
+  it("preserves malformed activity timestamps in visible and semantic metadata", async () => {
+    const child = actor("child", { startedAt: "not-a-date" });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          route: {
+            section: "subagents",
+            selectedRecordKind: "actor",
+            selectedRecordId: "child",
+          },
+          detail: detailQuery("actor", "child", [
+            detailPage(child, [entry("bad-entry", "command", "not-a-date")]),
+          ]),
+        })}
+      />,
+    );
+
+    const started = container.querySelector<HTMLTimeElement>('time[datetime="not-a-date"]');
+    expect(started?.textContent).toBe("not-a-date");
+    expect(started?.dateTime).toBe("not-a-date");
+    expect(started?.title).toBe("not-a-date");
+    const entryTimestamp = container.querySelector<HTMLTimeElement>(
+      '[data-activity-entry-id="bad-entry"] time[datetime="not-a-date"]',
+    );
+    expect(entryTimestamp?.textContent).toBe("not-a-date");
+    expect(entryTimestamp?.dateTime).toBe("not-a-date");
+    expect(entryTimestamp?.title).toBe("not-a-date");
+  });
+
+  it("formats record and event timestamps with the selected 12-hour preference", async () => {
+    const startedAt = "2026-07-22T20:00:00.000Z";
+    const createdAt = "2026-07-22T20:01:00.000Z";
+    const child = actor("child", { startedAt });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          timestampFormat: "12-hour",
+          route: {
+            section: "subagents",
+            selectedRecordKind: "actor",
+            selectedRecordId: "child",
+          },
+          detail: detailQuery("actor", "child", [
+            detailPage(child, [entry("twelve-hour-entry", "command", createdAt)]),
+          ]),
+        })}
+      />,
+    );
+
+    expect(
+      container.querySelector<HTMLTimeElement>(`time[datetime="${startedAt}"]`)?.textContent,
+    ).toBe(formatChatTimestampTooltip(startedAt, "12-hour"));
+    expect(
+      container.querySelector<HTMLTimeElement>(
+        `[data-activity-entry-id="twelve-hour-entry"] time[datetime="${createdAt}"]`,
+      )?.textContent,
+    ).toBe(formatChatTimestampTooltip(createdAt, "12-hour"));
+  });
+
+  it("formats event timestamps in a narrow detail row while retaining canonical metadata", async () => {
+    const createdAt = "2026-07-22T20:01:02.123456789Z";
+    const child = actor("child");
+    const container = await mount(
+      <div style={{ width: "12rem" }}>
+        <ActivityPanel
+          {...props({
+            route: {
+              section: "subagents",
+              selectedRecordKind: "actor",
+              selectedRecordId: "child",
+            },
+            detail: detailQuery("actor", "child", [
+              detailPage(child, [
+                entry("narrow-command", "command", createdAt, null, {
+                  title: "A command title that uses the remaining narrow row space",
+                }),
+              ]),
+            ]),
+          })}
+        />
+      </div>,
+    );
+
+    const timestamp = container.querySelector<HTMLTimeElement>(
+      `[data-activity-entry-id="narrow-command"] time[datetime="${createdAt}"]`,
+    );
+    const row = timestamp?.parentElement;
+    const title = timestamp?.previousElementSibling;
+    expect(timestamp?.textContent).toBe(formatChatTimestampTooltip(createdAt, "24-hour"));
+    expect(timestamp?.dateTime).toBe(createdAt);
+    expect(timestamp?.title).toBe(createdAt);
+    expect(timestamp?.textContent).not.toBe(timestamp?.dateTime);
+    expect(row?.className).toContain("flex-wrap");
+    expect(title?.className).toContain("min-w-16");
+    expect(timestamp?.className).toContain("ml-auto");
   });
 
   it("filters entries whose owner does not match the keyed record", async () => {

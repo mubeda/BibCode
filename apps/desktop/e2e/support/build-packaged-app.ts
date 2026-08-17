@@ -26,6 +26,7 @@ export function planPackagedDesktopUiBuild(
   return {
     environment: {
       VITE_BIBCODE_DESKTOP_E2E: "1",
+      ...(input.platform === "linux" ? { NO_STRIP: "1" } : {}),
     },
     args: [
       "../../scripts/run-msvc-x64.mjs",

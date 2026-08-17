@@ -62,30 +62,31 @@ use bibcode_server::{
         turn_delivery::TurnDeliveryService,
     },
     provider::{claude::ClaudeTranscriptReaderFixture, codex::resolve_codex_home_layout},
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use provider_runtime::{
-    BoxRuntimeFuture, ClaudeActivitySupport, NativeProviderDriverFactory, ProviderDeliveryOutcome,
-    ProviderDriver, ProviderDriverFactory, ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig,
-    ProviderNativeEventId, ProviderReconciliationOutcome, ProviderRuntimeError,
-    ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
-    build_claude_launch_arguments_for_test, build_claude_launch_arguments_with_settings_for_test,
-    claude_activity_probe_cache_len_for_test, claude_activity_probe_cache_paths_for_test,
+    BoxRuntimeFuture, ClaudeActivityProbeTestContext, ClaudeActivitySupport,
+    NativeProviderDriverFactory, ProviderDeliveryOutcome, ProviderDriver, ProviderDriverFactory,
+    ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig, ProviderNativeEventId,
+    ProviderReconciliationOutcome, ProviderRuntimeError, ProviderRuntimeSupervisor, StartedSession,
+    SupervisorOptions, build_claude_launch_arguments_for_test,
+    build_claude_launch_arguments_with_settings_for_test,
     claude_output_shutdown_with_open_stream_for_test, deliver_durable_orchestration_turn,
-    deliver_orchestration_turn, freeze_delivery_route, probe_claude_activity_support_for_test,
-    probe_claude_activity_support_with_resolution_delay_for_test,
-    reconcile_abandoned_provider_sessions, reconcile_orchestration_turn,
-    reset_claude_activity_probe_cache_for_test, route_orchestration_command,
-    seed_claude_activity_probe_cache_for_test,
+    deliver_orchestration_turn, freeze_delivery_route, reconcile_abandoned_provider_sessions,
+    reconcile_orchestration_turn, route_orchestration_command,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::time::timeout;
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::{timeout, timeout_at};
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
-static CLAUDE_ACTIVITY_PROBE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WINDOWS_CLAUDE_FIXTURE: &str = r#"
 [Console]::Out.WriteLine("ignored non-json output")
@@ -99,8 +100,18 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   $id = [string]$request.id
   $response = $null
   switch ([string]$request.method) {
-    "initialize" { $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}' }
-    "thread/start" { $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}' }
+    "initialize" {
+      if ($env:BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER) {
+        [IO.File]::WriteAllText($env:BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER, "ready")
+      }
+      $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}'
+    }
+    "thread/start" {
+      if ($env:BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER) {
+        [IO.File]::WriteAllText($env:BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER, "ready")
+      }
+      $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}'
+    }
     "mcpServerStatus/list" { $response = '{"id":' + $id + ',"result":{"data":[],"nextCursor":null}}' }
     "thread/goal/set" { $response = '{"id":' + $id + ',"result":{"goal":{"status":"active"}}}' }
     "turn/start" { $response = '{"id":' + $id + ',"result":{"turn":{"id":"native-codex-turn"}}}' + [Environment]::NewLine + '{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"native-codex-thread","turnId":"native-codex-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"native-codex-thread","receiverThreadIds":["native-child"],"agentsStates":{"native-child":{"status":"running","message":null}}},"startedAtMs":1001}}' + [Environment]::NewLine + '{"method":"turn/started","emittedAtMs":1002,"params":{"threadId":"native-child","turn":{"id":"native-child-turn","status":"inProgress","startedAt":1}}}' }
@@ -1100,7 +1111,13 @@ async fn captured_json_request(path: &Path, predicate: impl Fn(&Value) -> bool) 
         }
     })
     .await
-    .expect("captured provider request")
+    .unwrap_or_else(|_| {
+        panic!(
+            "captured provider request at {}; content={}",
+            path.display(),
+            std::fs::read_to_string(path).unwrap_or_default()
+        )
+    })
 }
 
 async fn captured_complete_ndjson_with_bytes(path: &Path) -> (Vec<u8>, Vec<Value>) {
@@ -1429,6 +1446,66 @@ where
     rpc_response(socket, id).await
 }
 
+async fn try_tagged_rpc_request_until<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    tag: &str,
+    payload: Value,
+    deadline: tokio::time::Instant,
+) -> Result<Result<Value, Value>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let expected_request_id = RequestId::try_from(id)
+        .map_err(|error| format!("invalid unary RPC request ID {id:?}: {error}"))?;
+    timeout_at(
+        deadline,
+        socket.send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        )),
+    )
+    .await
+    .map_err(|_| format!("unary RPC {tag} send deadline elapsed"))?
+    .map_err(|error| format!("failed to send unary RPC {tag}: {error}"))?;
+
+    let frame = timeout_at(deadline, socket.next())
+        .await
+        .map_err(|_| format!("unary RPC {tag} response deadline elapsed"))?
+        .ok_or_else(|| format!("unary RPC {tag} WebSocket closed before response"))?
+        .map_err(|error| format!("invalid unary RPC {tag} frame: {error}"))?;
+    let Message::Text(text) = frame else {
+        return Err(format!(
+            "expected text unary RPC {tag} frame, got {frame:?}"
+        ));
+    };
+    let message = serde_json::from_str::<ServerMessage>(&text)
+        .map_err(|error| format!("invalid unary RPC {tag} message: {error}"))?;
+    match message {
+        ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Success { value },
+        } if request_id == expected_request_id => Ok(Ok(value.unwrap_or(Value::Null))),
+        ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Failure { cause },
+        } if request_id == expected_request_id => serde_json::to_value(cause)
+            .map(Err)
+            .map_err(|error| format!("failed to encode unary RPC {tag} failure: {error}")),
+        ServerMessage::Exit { request_id, .. } => Err(format!(
+            "unary RPC {tag} response ID mismatch: expected {expected_request_id}, got {request_id}"
+        )),
+        message => Err(format!("unexpected unary RPC {tag} response: {message:?}")),
+    }
+}
+
 async fn stream_rpc_request<S>(socket: &mut WebSocketStream<S>, id: &str, tag: &str, payload: Value)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1449,6 +1526,31 @@ where
         .expect("send stream RPC request");
 }
 
+async fn try_stream_rpc_request<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    tag: &str,
+    payload: Value,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| format!("failed to send Activity stream request: {error}"))
+}
+
 async fn stream_rpc_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1462,6 +1564,26 @@ where
         panic!("expected text stream WebSocket message, got {frame:?}");
     };
     serde_json::from_str(&text).expect("valid stream RPC message")
+}
+
+async fn stream_rpc_message_until<S>(
+    socket: &mut WebSocketStream<S>,
+    deadline: tokio::time::Instant,
+) -> Result<ServerMessage, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = timeout_at(deadline, socket.next())
+        .await
+        .map_err(|_| "Activity stream deadline elapsed".to_owned())?
+        .ok_or_else(|| "Activity stream closed before convergence".to_owned())?
+        .map_err(|error| format!("invalid Activity stream frame: {error}"))?;
+    let Message::Text(text) = frame else {
+        return Err(format!(
+            "expected text Activity stream frame, got {frame:?}"
+        ));
+    };
+    serde_json::from_str(&text).map_err(|error| format!("invalid Activity stream message: {error}"))
 }
 
 async fn ack_stream_rpc<S>(socket: &mut WebSocketStream<S>, id: &str)
@@ -6488,6 +6610,129 @@ async fn routes_the_complete_live_session_lifecycle_and_stops_idempotently() {
     assert!(matches!(error, ProviderRuntimeError::Shutdown));
 }
 
+#[tokio::test]
+async fn workspace_loss_session_stop_shuts_driver_without_deleting_thread() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadSessionStop {
+            command_id: "workspace-loss:t1:provider-stop".to_owned(),
+            thread_id: "t1".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("workspace loss stops provider");
+
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+    assert!(
+        engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_provider_replacement_survives_a_paused_old_workspace_loss_stop() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_mode_results: VecDeque::from([Err(ProviderRuntimeError::UnsupportedCapability {
+            provider: "codex".to_owned(),
+            capability: "post-start runtime mode changes",
+        })]),
+        ..DriverState::default()
+    }));
+    let (_old_events_tx, old_events_rx) = mpsc::channel(1);
+    let (_replacement_events_tx, replacement_events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([old_events_rx, replacement_events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let transition = WorkspaceLossTransition {
+        thread_id: "t1".to_owned(),
+        repository_key: "repository-1".to_owned(),
+        generation: 1,
+        path: PathBuf::from("/repo/worktrees/t1"),
+        availability: AdoptedWorktreeAvailability::MissingRegistered,
+    };
+    assert!(
+        availability
+            .mark_unavailable(transition)
+            .await
+            .expect("physical identity resolves")
+    );
+    let old_identity = supervisor
+        .capture_session_identity("t1")
+        .await
+        .expect("old provider identity capture")
+        .expect("old provider is active");
+
+    availability
+        .clear_recovered_in_repository("t1", Path::new("/repo/worktrees/t1"), "repository-1")
+        .await
+        .expect("physical identity resolves");
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+            command_id: "recovery-restarts-provider".to_owned(),
+            thread_id: "t1".to_owned(),
+            runtime_mode: "approval-required".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("exact recovery starts a replacement provider");
+
+    supervisor
+        .stop_session_if_current(old_identity)
+        .await
+        .expect("paused old-session stop resumes as a no-op");
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadInteractionModeSet {
+            command_id: "replacement-remains-routable".to_owned(),
+            thread_id: "t1".to_owned(),
+            interaction_mode: "plan".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("replacement provider remains active");
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(state.lock().unwrap().shutdowns, 2);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn late_provider_events_after_thread_deletion_do_not_warn() {
     let capture = TraceCapture::default();
@@ -6968,7 +7213,7 @@ async fn rejected_unknown_option_keeps_the_existing_session() {
 }
 
 #[tokio::test]
-async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
+async fn rejected_metadata_rpc_keeps_selection_and_leaves_exact_receipt_resumable() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState {
         set_options_results: VecDeque::from([
@@ -7014,21 +7259,17 @@ async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
         .await
         .unwrap();
 
-    rpc_request(
-        &mut socket,
-        "901",
-        json!({
-            "type":"thread.meta.update",
-            "commandId":"reject-made-up-rpc",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex",
-                "model":"gpt-5",
-                "options":[{"id":"madeUpMode","value":true}]
-            }
-        }),
-    )
-    .await;
+    let command = json!({
+        "type":"thread.meta.update",
+        "commandId":"reject-made-up-rpc",
+        "threadId":"t1",
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"madeUpMode","value":true}]
+        }
+    });
+    rpc_request(&mut socket, "901", command.clone()).await;
     rpc_response(&mut socket, "901")
         .await
         .expect_err("rejected live option must reject the metadata RPC");
@@ -7043,15 +7284,27 @@ async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
         thread.model_selection,
         json!({"instanceId":"codex","model":"gpt-5"})
     );
-    assert!(
-        engine
-            .repositories()
-            .get_command_receipt("reject-made-up-rpc".to_owned())
-            .await
-            .unwrap()
-            .is_none(),
-        "a rejected live selection must not have an accepted receipt"
-    );
+    let reserved = engine
+        .repositories()
+        .get_command_receipt("reject-made-up-rpc".to_owned())
+        .await
+        .unwrap()
+        .expect("provider rejection leaves an exact reservation");
+    assert_eq!(reserved.status, "reserved");
+    assert!(reserved.payload_digest.is_some());
+
+    rpc_request(&mut socket, "902", command).await;
+    rpc_response(&mut socket, "902")
+        .await
+        .expect("same-payload retry resumes the provider mutation");
+    let accepted = engine
+        .repositories()
+        .get_command_receipt("reject-made-up-rpc".to_owned())
+        .await
+        .unwrap()
+        .expect("resumed command has a durable receipt");
+    assert_eq!(accepted.status, "accepted");
+    assert_eq!(accepted.payload_digest, reserved.payload_digest);
 
     socket.close(None).await.unwrap();
     handle.shutdown();
@@ -10785,8 +11038,7 @@ async fn claude_transcript_recovery_shutdown_cancels_idle_output_reads() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_transcript_recovery_shutdown_breaks_event_queue_backpressure() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let output_written_path = temp.path().join("output-written");
     let executable = executable_fixture(
@@ -10807,7 +11059,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -10846,8 +11098,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_transcript_recovery_worker_emits_bounded_activity_without_disclosing_paths() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("recovery-settings.json");
     let token_path = temp.path().join("recovery-token");
@@ -10882,7 +11133,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -11275,8 +11526,7 @@ fn claude_fast_mode_is_merged_into_session_settings() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_is_cached_by_executable_identity() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let script = format!(
@@ -11285,9 +11535,12 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
     );
     let executable = executable_fixture(&temp, "claude-probe", &script, "");
 
-    let first = probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
-    let second =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let first = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
+    let second = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(
         first,
@@ -11308,8 +11561,7 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_singleflights_concurrent_misses() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let script = format!(
@@ -11323,9 +11575,10 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
     for _ in 0..8 {
         let barrier = barrier.clone();
         let binary_path = binary_path.clone();
+        let probe_context = probe_context.clone();
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            probe_claude_activity_support_for_test(&binary_path).await
+            probe_context.probe(&binary_path).await
         }));
     }
     barrier.wait().await;
@@ -11348,9 +11601,138 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn claude_activity_probe_test_contexts_isolate_concurrent_cache_mutation() {
+    let temp = TempDir::new().unwrap();
+    let ready_fifo = temp.path().join("probe-ready.fifo");
+    let release_fifos = (0..8)
+        .map(|index| temp.path().join(format!("probe-release-{index}.fifo")))
+        .collect::<Vec<_>>();
+    let fifo_creation = Command::new("mkfifo")
+        .arg(&ready_fifo)
+        .args(&release_fifos)
+        .output()
+        .expect("create probe fixture FIFOs");
+    assert!(
+        fifo_creation.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&fifo_creation.stderr)
+    );
+    let ready_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&ready_fifo)
+        .expect("open probe readiness FIFO");
+    let mut ready_lines = BufReader::new(tokio::fs::File::from_std(ready_file)).lines();
+    let mut release_files = release_fifos
+        .iter()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open probe release FIFO")
+        })
+        .collect::<Vec<_>>();
+    let executables = (0..8)
+        .map(|index| {
+            executable_fixture(
+                &temp,
+                &format!("claude-isolated-probe-{index}"),
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{index}' > '{}'; IFS= read -r _ < '{}'; printf '%s\\n' '2.1.218';;\n  --help) printf '%s\\n' '--include-hook-events --forward-subagent-text';;\n  *) exit 1;;\nesac\n",
+                    ready_fifo.display(),
+                    release_fifos[index].display()
+                ),
+                "",
+            )
+        })
+        .collect::<Vec<_>>();
+    let probe_contexts = (0..8)
+        .map(|_| ClaudeActivityProbeTestContext::new())
+        .collect::<Vec<_>>();
+    let seed_context = ClaudeActivityProbeTestContext::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(probe_contexts.len() + 2));
+
+    let mut probes = tokio::task::JoinSet::new();
+    for (probe_context, executable) in probe_contexts.iter().cloned().zip(executables.iter()) {
+        let barrier = barrier.clone();
+        let binary_path = executable.to_string_lossy().into_owned();
+        probes.spawn(async move {
+            barrier.wait().await;
+            probe_context.probe(&binary_path).await
+        });
+    }
+    let seed = tokio::spawn({
+        let barrier = barrier.clone();
+        let seed_context = seed_context.clone();
+        async move {
+            barrier.wait().await;
+            seed_context.seed_cache(65);
+        }
+    });
+    barrier.wait().await;
+
+    let mut ready_indices = std::collections::HashSet::new();
+    while ready_indices.len() < probe_contexts.len() {
+        tokio::select! {
+            line = ready_lines.next_line() => {
+                let line = line
+                    .expect("read probe readiness FIFO")
+                    .expect("probe readiness FIFO remains open");
+                assert!(ready_indices.insert(line), "each probe child publishes readiness once");
+            }
+            result = probes.join_next() => {
+                panic!("probe child completed before all peers were ready: {result:?}");
+            }
+        }
+    }
+    assert_eq!(
+        ready_indices,
+        (0..probe_contexts.len())
+            .map(|index| index.to_string())
+            .collect(),
+        "every distinct probe child must overlap before release"
+    );
+    for release_file in &mut release_files {
+        std::io::Write::write_all(release_file, b"\n").expect("release probe child");
+    }
+
+    while let Some(probe) = probes.join_next().await {
+        let support = probe.unwrap();
+        assert_eq!(
+            support,
+            ClaudeActivitySupport {
+                include_hook_events: true,
+                forward_subagent_text: true,
+                transcript_recovery: false,
+            }
+        );
+    }
+    seed.await.unwrap();
+    for (probe_context, executable) in probe_contexts.into_iter().zip(executables) {
+        let expected_path = std::fs::canonicalize(&executable)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(probe_context.cache_len(), 1);
+        assert_eq!(
+            probe_context.cache_paths(),
+            std::slice::from_ref(&expected_path)
+        );
+    }
+    assert_eq!(seed_context.cache_len(), 64);
+    assert!(
+        seed_context
+            .cache_paths()
+            .iter()
+            .all(|path| path.starts_with("/bibcode-test/claude-cache-"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn claude_activity_probe_retries_transient_failures_without_poisoning_cache() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let marker_path = temp.path().join("failed-once");
     let count_path = temp.path().join("probe-count");
@@ -11363,11 +11745,15 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
     let executable = executable_fixture(&temp, "claude-retry-probe", &script, "");
 
     assert_eq!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await,
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
+            .await,
         ClaudeActivitySupport::default()
     );
     assert_eq!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await,
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
+            .await,
         ClaudeActivitySupport {
             include_hook_events: true,
             forward_subagent_text: true,
@@ -11379,14 +11765,13 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
         "xxx",
         "a failed version probe must be retried, then cache the successful version/help pair"
     );
-    assert_eq!(claude_activity_probe_cache_len_for_test().await, 1);
+    assert_eq!(probe_context.cache_len(), 1);
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_change() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let count_path = temp.path().join("probe-count");
     let first_script = format!(
@@ -11395,7 +11780,8 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
     );
     let executable = executable_fixture(&temp, "claude-changing-probe", &first_script, "");
     assert!(
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref())
+        probe_context
+            .probe(executable.to_string_lossy().as_ref())
             .await
             .include_hook_events
     );
@@ -11405,8 +11791,9 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
         count_path.display()
     );
     std::fs::write(&executable, second_script).expect("changed probe fixture should write");
-    let changed =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let changed = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(changed, ClaudeActivitySupport::default());
     assert_eq!(
@@ -11419,16 +11806,15 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_success_cache_is_lru_bounded() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
-    seed_claude_activity_probe_cache_for_test(65).await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    probe_context.seed_cache(65);
 
     assert_eq!(
-        claude_activity_probe_cache_len_for_test().await,
+        probe_context.cache_len(),
         64,
         "the ready cache must prune its least recently used entry"
     );
-    let cached_paths = claude_activity_probe_cache_paths_for_test().await;
+    let cached_paths = probe_context.cache_paths();
     assert!(
         !cached_paths
             .iter()
@@ -11446,8 +11832,7 @@ async fn claude_activity_probe_success_cache_is_lru_bounded() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let executable = executable_fixture(
         &temp,
@@ -11456,8 +11841,9 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
         "",
     );
     let started_at = Instant::now();
-    let support =
-        probe_claude_activity_support_for_test(executable.to_string_lossy().as_ref()).await;
+    let support = probe_context
+        .probe(executable.to_string_lossy().as_ref())
+        .await;
 
     assert_eq!(support, ClaudeActivitySupport::default());
     assert!(
@@ -11465,7 +11851,7 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
         "the complete probe must be bounded by its two-second timeout"
     );
 
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -11481,8 +11867,7 @@ async fn claude_activity_probe_timeout_downgrades_without_blocking_launch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let descendant_pid_path = temp.path().join("descendant-pid");
     let script = format!(
@@ -11494,11 +11879,9 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 
     let resolution_started = Instant::now();
     assert_eq!(
-        probe_claude_activity_support_with_resolution_delay_for_test(
-            &binary_path,
-            Duration::from_secs(5)
-        )
-        .await,
+        probe_context
+            .probe_with_resolution_delay(&binary_path, Duration::from_secs(5))
+            .await,
         ClaudeActivitySupport::default()
     );
     assert!(
@@ -11508,7 +11891,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 
     let probe_started = Instant::now();
     assert_eq!(
-        probe_claude_activity_support_for_test(&binary_path).await,
+        probe_context.probe(&binary_path).await,
         ClaudeActivitySupport::default()
     );
     assert!(
@@ -11538,8 +11921,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_targeted_activity_startup_capabilities_follow_hook_sink_availability() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let supported = executable_fixture(
         &temp,
@@ -11559,7 +11941,7 @@ cat >/dev/null
         "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.218'; exit 0;;\n  --help) exit 0;;\nesac\ncat >/dev/null\n",
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
 
     let mut supported_request = launch();
     supported_request.provider = "claudeAgent".to_owned();
@@ -11667,8 +12049,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_driver_captures_authenticated_http_hook_input_from_launch_settings() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("launch-settings.json");
     let token_path = temp.path().join("hook-token");
@@ -11695,7 +12076,7 @@ cat >/dev/null
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -11841,8 +12222,7 @@ cat >/dev/null
 #[cfg(unix)]
 #[tokio::test]
 async fn native_claude_driver_closes_hook_sink_and_event_channel_after_natural_exit() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
+    let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
     let settings_path = temp.path().join("natural-exit-settings.json");
     let token_path = temp.path().join("natural-exit-hook-token");
@@ -11868,7 +12248,7 @@ while [ ! -f "$BIBCODE_TEST_EXIT_RELEASE" ]; do sleep 0.01; done
 "#,
         "",
     );
-    let factory = NativeProviderDriverFactory::new(temp.path().join("attachments"));
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
     let mut request = launch();
     request.provider = "claudeAgent".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
@@ -12274,6 +12654,8 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
 #[tokio::test]
 async fn native_codex_driver_supports_session_turn_and_control_commands() {
     let temp = TempDir::new().unwrap();
+    let initialize_response_ready = temp.path().join("codex-initialize-response-ready");
+    let thread_response_ready = temp.path().join("codex-thread-response-ready");
     let executable = executable_fixture(
         &temp,
         "codex-fixture",
@@ -12281,8 +12663,14 @@ async fn native_codex_driver_supports_session_turn_and_control_commands() {
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      [ -z "$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER"
+      printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*)
+      [ -z "$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER"
+      printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id"
+      ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"native-codex-thread","turnId":"native-codex-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"native-codex-thread","receiverThreadIds":["native-child"],"agentsStates":{"native-child":{"status":"running","message":null}}},"startedAtMs":1001}}\n{"method":"turn/started","emittedAtMs":1002,"params":{"threadId":"native-child","turn":{"id":"native-child-turn","status":"inProgress","startedAt":1}}}\n' "$id" ;;
@@ -12300,12 +12688,41 @@ done
     request.provider = "codex".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
+    request.environment.insert(
+        "BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER".to_owned(),
+        initialize_response_ready.to_string_lossy().into_owned(),
+    );
+    request.environment.insert(
+        "BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER".to_owned(),
+        thread_response_ready.to_string_lossy().into_owned(),
+    );
     let driver = factory.create(request).await.unwrap();
+    let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
-    let started = timeout(Duration::from_secs(2), driver.start())
-        .await
-        .unwrap()
-        .unwrap();
+    let started = match timeout_at(owner_deadline, driver.start()).await {
+        Ok(Ok(started)) => started,
+        Ok(Err(error)) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("native Codex fixture failed to start: {error}; cleanup={cleanup:?}");
+        }
+        Err(_) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!(
+                "native Codex fixture exceeded its integration deadline during startup: \
+                 initialize_response_ready={}; thread_response_ready={}; cleanup={cleanup:?}",
+                initialize_response_ready.is_file(),
+                thread_response_ready.is_file(),
+            );
+        }
+    };
+    assert!(
+        initialize_response_ready.is_file(),
+        "Codex fixture must prepare its initialize response"
+    );
+    assert!(
+        thread_response_ready.is_file(),
+        "Codex fixture must prepare its thread/start response"
+    );
     assert_eq!(
         started.resume_cursor,
         Some(json!({"threadId":"native-codex-thread"}))
@@ -12332,7 +12749,7 @@ done
             .unwrap()
             .is_some()
     );
-    let activity_event = timeout(Duration::from_secs(2), async {
+    let activity_event = timeout_at(owner_deadline, async {
         loop {
             let event = driver.next_event().await.expect("Codex provider event");
             if !event.activity.is_empty() {
@@ -12340,8 +12757,14 @@ done
             }
         }
     })
-    .await
-    .expect("live Codex activity event");
+    .await;
+    let activity_event = match activity_event {
+        Ok(event) => event,
+        Err(error) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("live Codex activity event timed out: {error}; cleanup={cleanup:?}");
+        }
+    };
     assert_eq!(
         activity_event
             .native_event_id
@@ -12355,7 +12778,7 @@ done
         [ProviderActivityMutation::UpsertActor(actor)]
             if actor.id == "codex:thread:native-child"
     ));
-    let control_event = timeout(Duration::from_secs(2), async {
+    let control_event = timeout_at(owner_deadline, async {
         loop {
             let event = driver.next_event().await.expect("Codex control event");
             if !event.activity_controls.is_empty() {
@@ -12363,8 +12786,14 @@ done
             }
         }
     })
-    .await
-    .expect("live Codex child target");
+    .await;
+    let control_event = match control_event {
+        Ok(event) => event,
+        Err(error) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("live Codex child target timed out: {error}; cleanup={cleanup:?}");
+        }
+    };
     assert_eq!(control_event.event_type, "activity.native");
     assert_eq!(control_event.activity_controls.len(), 1);
     assert!(
@@ -12402,7 +12831,13 @@ done
         driver.answer("unknown".to_owned(), json!({})).await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "codex"
     ));
-    driver.shutdown().await.unwrap();
+    match timeout_at(owner_deadline, driver.shutdown()).await {
+        Ok(result) => result.expect("native Codex fixture should shut down"),
+        Err(_) => {
+            let cleanup = timeout(Duration::from_secs(10), driver.shutdown()).await;
+            panic!("native Codex fixture cleanup exceeded its integration deadline: {cleanup:?}");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -12517,7 +12952,7 @@ done
         "orchestration.dispatchCommand",
         json!({
             "type":"thread.create","commandId":"targeted-thread","threadId":"targeted-thread",
-            "projectId":"targeted-project","title":"Targeted thread","kind":"workspace",
+            "projectId":"targeted-project","title":"Targeted thread",
             "modelSelection":{"instanceId":"codex-targeted","model":"gpt-5"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
@@ -12927,21 +13362,18 @@ done
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
     let state = TempDir::new().expect("state");
-    let capture = state.path().join("claude-targeted-requests.ndjson");
-    let settings_capture = state.path().join("claude-targeted-settings.json");
-    let token_capture = state.path().join("claude-targeted-token");
-    let session_capture = state.path().join("claude-targeted-session");
-    let ready_capture = state.path().join("claude-targeted-ready");
-    let script = include_str!("fixtures/claude-provider/targeted-rpc.sh")
-        .replace("__CAPTURE__", &capture.to_string_lossy())
-        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
-        .replace("__TOKEN__", &token_capture.to_string_lossy())
-        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
-        .replace("__READY__", &ready_capture.to_string_lossy());
-    let executable = executable_fixture(&state, "claude-targeted-rpc", &script, "");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let capture = workspace.join(".bibcode-claude-targeted-requests.ndjson");
+    let settings_capture = workspace.join(".bibcode-claude-targeted-settings.json");
+    let token_capture = workspace.join(".bibcode-claude-targeted-token");
+    let session_capture = workspace.join(".bibcode-claude-targeted-session");
+    let ready_capture = workspace.join(".bibcode-claude-targeted-ready");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-provider/targeted-rpc.sh")
+        .canonicalize()
+        .expect("stable Claude targeted RPC fixture");
     let config = test_config(&state);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
     std::fs::write(
@@ -12958,8 +13390,6 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .expect("settings json"),
     )
     .expect("provider settings");
-    let workspace = state.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -12985,7 +13415,7 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         json!({
             "type":"thread.create","commandId":"claude-targeted-thread",
             "threadId":"claude-targeted-thread","projectId":"claude-targeted-project",
-            "title":"Claude targeted thread","kind":"workspace",
+            "title":"Claude targeted thread",
             "modelSelection":{"instanceId":"claude-targeted","model":"claude-sonnet"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
@@ -13062,6 +13492,11 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         json!({
             "hook_event_name":"SubagentStart","session_id":session_id,
             "agent_id":"agent-child","agent_type":"same-role"
+        }),
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "agent_id":"agent-a","tool_name":"Agent","tool_use_id":"tool-agent-child",
+            "tool_response":{"status":"async_launched","agentId":"agent-child"}
         }),
     ] {
         assert_eq!(
@@ -13240,10 +13675,6 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     ack_stream_rpc(&mut thread_stream, "9501").await;
 
     let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
-    let _ = captured_json_request(&capture, |request| {
-        request["request_id"] == "bibcode-inventory"
-    })
-    .await;
     let (before_unmapped_bytes, before_unmapped) =
         captured_complete_ndjson_with_bytes(&capture).await;
     let before_unmapped_stop_tasks = claude_stop_task_targets(&before_unmapped);
@@ -13417,26 +13848,52 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     handle.join().await.expect("RPC server joins");
 }
 
+fn ambiguous_claude_children_are_observable_and_unsupported(snapshot: &Value) -> bool {
+    let actors = snapshot["actors"].as_array();
+    let controls = snapshot["control"]["actors"].as_array();
+    let both_running = ["agent-child-one", "agent-child-two"]
+        .iter()
+        .all(|agent_id| {
+            actors.is_some_and(|actors| {
+                actors.iter().any(|actor| {
+                    actor["id"] == format!("claude:agent:{agent_id}")
+                        && actor["status"] == "running"
+                })
+            })
+        });
+    let both_unsupported = ["agent-child-one", "agent-child-two"]
+        .iter()
+        .all(|agent_id| {
+            controls.is_some_and(|controls| {
+                controls.iter().any(|control| {
+                    control["actorId"] == format!("claude:agent:{agent_id}")
+                        && control["state"] == "unsupported"
+                })
+            })
+        });
+    let parent_available = controls.is_some_and(|controls| {
+        controls.iter().any(|control| {
+            control["actorId"] == "claude:agent:agent-parent" && control["state"] == "available"
+        })
+    });
+    both_running && both_unsupported && parent_available
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_without_provider_io() {
-    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
-    reset_claude_activity_probe_cache_for_test().await;
     let state = TempDir::new().expect("state");
-    let capture = state
-        .path()
-        .join("claude-targeted-ambiguous-requests.ndjson");
-    let settings_capture = state.path().join("claude-targeted-ambiguous-settings.json");
-    let token_capture = state.path().join("claude-targeted-ambiguous-token");
-    let session_capture = state.path().join("claude-targeted-ambiguous-session");
-    let ready_capture = state.path().join("claude-targeted-ambiguous-ready");
-    let script = include_str!("fixtures/claude-provider/targeted-rpc-ambiguous.sh")
-        .replace("__CAPTURE__", &capture.to_string_lossy())
-        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
-        .replace("__TOKEN__", &token_capture.to_string_lossy())
-        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
-        .replace("__READY__", &ready_capture.to_string_lossy());
-    let executable = executable_fixture(&state, "claude-targeted-rpc-ambiguous", &script, "");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let capture = workspace.join(".bibcode-claude-targeted-ambiguous-requests.ndjson");
+    let settings_capture = workspace.join(".bibcode-claude-targeted-ambiguous-settings.json");
+    let token_capture = workspace.join(".bibcode-claude-targeted-ambiguous-token");
+    let session_capture = workspace.join(".bibcode-claude-targeted-ambiguous-session");
+    let ready_capture = workspace.join(".bibcode-claude-targeted-ambiguous-ready");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-provider/targeted-rpc-ambiguous.sh")
+        .canonicalize()
+        .expect("stable ambiguous Claude targeted RPC fixture");
     let config = test_config(&state);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
     std::fs::write(
@@ -13453,8 +13910,6 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         .expect("settings json"),
     )
     .expect("provider settings");
-    let workspace = state.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -13480,7 +13935,7 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         json!({
             "type":"thread.create","commandId":"claude-ambiguous-thread",
             "threadId":"claude-ambiguous-thread","projectId":"claude-ambiguous-project",
-            "title":"Claude ambiguous thread","kind":"workspace",
+            "title":"Claude ambiguous thread",
             "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
             "runtimeMode":"full-access","interactionMode":"default","branch":null,
             "worktreePath":null,"createdAt":NOW
@@ -13488,190 +13943,423 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
     )
     .await
     .expect("thread created through public RPC");
-    tagged_rpc_request(
-        &mut socket,
-        "9603",
-        "orchestration.dispatchCommand",
-        json!({
-            "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
-            "threadId":"claude-ambiguous-thread",
-            "message":{"messageId":"claude-ambiguous-message","role":"user","text":"start","attachments":[]},
-            "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
-            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
-        }),
-    )
-    .await
-    .expect("turn admitted");
 
-    timeout(Duration::from_secs(10), async {
+    const CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + CLAUDE_ACTIVITY_INTEGRATION_TIMEOUT;
+    let activity_connection = timeout_at(
+        deadline,
+        connect_async(format!("ws://{}/ws", handle.local_addr())),
+    )
+    .await;
+    let (mut activity_stream, _) = match activity_connection {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "Activity stream connection failed before provider launch: \
+                 error={error}; server_join={join_result:?}"
+            );
+        }
+        Err(_) => {
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "Activity stream connection deadline elapsed before provider launch; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
+    let thread_connection = timeout_at(
+        deadline,
+        connect_async(format!("ws://{}/ws", handle.local_addr())),
+    )
+    .await;
+    let (mut thread_stream, _) = match thread_connection {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            let _ = activity_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "thread stream connection failed before provider launch: \
+                 error={error}; server_join={join_result:?}"
+            );
+        }
+        Err(_) => {
+            let _ = activity_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "thread stream connection deadline elapsed before provider launch; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
+    let mut last_snapshot = None::<Value>;
+    let setup_result = timeout_at(deadline, async {
+        try_stream_rpc_request(
+            &mut thread_stream,
+            "9680",
+            "orchestration.subscribeThread",
+            json!({"threadId":"claude-ambiguous-thread"}),
+        )
+        .await?;
+        let initial_thread = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+        if !matches!(initial_thread, ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "snapshot")
+        {
+            return Err(format!(
+                "initial thread message was not a snapshot: {initial_thread:?}"
+            ));
+        }
+        thread_stream
+            .send(Message::Text(
+                json!({"_tag":"Ack","requestId":"9680"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| format!("failed to ACK initial thread snapshot: {error}"))?;
+        try_tagged_rpc_request_until(
+            &mut socket,
+            "9603",
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
+                "threadId":"claude-ambiguous-thread",
+                "message":{"messageId":"claude-ambiguous-message","role":"user","text":"start","attachments":[]},
+                "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
+                "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+            }),
+            deadline,
+        )
+        .await
+        .map_err(|error| format!("ambiguous Claude turn transport failed: {error}"))?
+        .map_err(|error| format!("ambiguous Claude turn admission failed: {error}"))?;
+        loop {
+            let message = stream_rpc_message_until(&mut thread_stream, deadline).await?;
+            let ready = matches!(
+                message,
+                ServerMessage::Chunk { ref values, .. }
+                    if values[0]["kind"] == "snapshot"
+                        && matches!(
+                            values[0]["snapshot"]["thread"]["session"]["status"].as_str(),
+                            Some("ready" | "running")
+                        )
+            );
+            thread_stream
+                .send(Message::Text(
+                    json!({"_tag":"Ack","requestId":"9680"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .map_err(|error| format!("failed to ACK thread readiness snapshot: {error}"))?;
+            if ready {
+                break;
+            }
+        }
+        try_stream_rpc_request(
+            &mut activity_stream,
+            "9690",
+            "subscribeActivity",
+            json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
+        )
+        .await?;
+        let initial = stream_rpc_message_until(&mut activity_stream, deadline).await?;
+        if !matches!(initial, ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "snapshot")
+        {
+            return Err(format!(
+                "initial Activity message was not a snapshot: {initial:?}"
+            ));
+        }
+        activity_stream
+            .send(Message::Text(
+                json!({"_tag":"Ack","requestId":"9690"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| format!("failed to ACK initial Activity snapshot: {error}"))?;
+
         while !ready_capture.exists() {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "ambiguous Claude fixture did not reach launch-ready marker: ready={}, settings={:?}, token_bytes={}, session={:?}",
-            ready_capture.exists(),
-            std::fs::read_to_string(&settings_capture),
-            std::fs::read(&token_capture).map_or(0, |token| token.len()),
-            std::fs::read_to_string(&session_capture)
-        )
-    });
-    let settings: Value = serde_json::from_str(
-        &std::fs::read_to_string(&settings_capture).expect("Claude hook settings"),
-    )
-    .expect("valid Claude hook settings");
-    let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
-        .as_str()
-        .expect("Claude hook URL")
-        .to_owned();
-    let token = std::fs::read_to_string(&token_capture).expect("Claude hook token");
-    let session_id = std::fs::read_to_string(&session_capture).expect("Claude session ID");
-    let client = reqwest::Client::new();
-    for hook in [
-        json!({
-            "hook_event_name":"PostToolUse","session_id":session_id,
-            "tool_name":"Agent","tool_use_id":"tool-agent-parent",
-            "tool_response":{"status":"async_launched","agentId":"agent-parent"}
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-parent","agent_type":"same-role"
-        }),
-        json!({
-            "hook_event_name":"PreToolUse","session_id":session_id,
-            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-one"
-        }),
-        json!({
-            "hook_event_name":"PreToolUse","session_id":session_id,
-            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-two"
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-one","agent_type":"same-role"
-        }),
-        json!({
-            "hook_event_name":"SubagentStart","session_id":session_id,
-            "agent_id":"agent-child-two","agent_type":"same-role"
-        }),
-    ] {
-        assert_eq!(
-            client
+        let settings_json = std::fs::read_to_string(&settings_capture)
+            .map_err(|error| format!("failed to read Claude hook settings: {error}"))?;
+        let settings: Value = serde_json::from_str(&settings_json)
+            .map_err(|error| format!("invalid Claude hook settings: {error}"))?;
+        let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+            .as_str()
+            .ok_or_else(|| "Claude hook URL was absent from generated settings".to_owned())?
+            .to_owned();
+        let token = std::fs::read_to_string(&token_capture)
+            .map_err(|error| format!("failed to read Claude hook token: {error}"))?;
+        let session_id = std::fs::read_to_string(&session_capture)
+            .map_err(|error| format!("failed to read Claude session ID: {error}"))?;
+        let client = reqwest::Client::new();
+        for hook in [
+            json!({
+                "hook_event_name":"PostToolUse","session_id":session_id,
+                "tool_name":"Agent","tool_use_id":"tool-agent-parent",
+                "tool_response":{"status":"async_launched","agentId":"agent-parent"}
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-parent","agent_type":"same-role"
+            }),
+            json!({
+                "hook_event_name":"PreToolUse","session_id":session_id,
+                "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-one"
+            }),
+            json!({
+                "hook_event_name":"PreToolUse","session_id":session_id,
+                "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-two"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-child-one","agent_type":"same-role"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-child-two","agent_type":"same-role"
+            }),
+        ] {
+            let response = client
                 .post(&hook_url)
                 .header("Authorization", format!("Bearer {token}"))
                 .json(&hook)
                 .send()
                 .await
-                .expect("authenticated Claude hook")
-                .status(),
-            reqwest::StatusCode::NO_CONTENT
+                .map_err(|error| format!("authenticated Claude hook request failed: {error}"))?;
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err(format!(
+                    "authenticated Claude hook returned unexpected status: {}",
+                    response.status()
+                ));
+            }
+        }
+
+        Ok::<(), String>(())
+    })
+    .await;
+    let setup_result = setup_result
+        .map_err(|_| "shared 30-second Claude Activity setup deadline elapsed".to_owned())
+        .and_then(std::convert::identity);
+    if let Err(error) = setup_result {
+        let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+        let _ = activity_stream.close(None).await;
+        let _ = thread_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "ambiguous Claude Activity setup failed: {error}; ready={}; settings={:?}; \
+             token_bytes={}; session={:?}; provider_capture={diagnostic_capture:?}; \
+             server_join={join_result:?}",
+            ready_capture.exists(),
+            std::fs::read_to_string(&settings_capture),
+            std::fs::read(&token_capture).map_or(0, |token| token.len()),
+            std::fs::read_to_string(&session_capture)
         );
     }
 
-    let snapshot = timeout(Duration::from_secs(10), async {
-        let mut request_id = 9_700_u64;
+    let mut request_id = 9_700_u64;
+    let observation = timeout_at(deadline, async {
         loop {
+            let message = stream_rpc_message_until(&mut activity_stream, deadline).await?;
+            let ServerMessage::Chunk { .. } = message else {
+                return Err(format!("unexpected Activity stream message: {message:?}"));
+            };
+            activity_stream
+                .send(Message::Text(
+                    json!({"_tag":"Ack","requestId":"9690"}).to_string().into(),
+                ))
+                .await
+                .map_err(|error| format!("failed to ACK Activity stream: {error}"))?;
+
             request_id += 1;
-            let Ok(snapshot) = tagged_rpc_request(
+            let snapshot = try_tagged_rpc_request_until(
                 &mut socket,
                 &request_id.to_string(),
                 "activity.getSnapshot",
                 json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
+                deadline,
             )
             .await
-            else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-            let actors = snapshot["actors"].as_array().cloned().unwrap_or_default();
-            let controls = snapshot["control"]["actors"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let both_running = ["agent-child-one", "agent-child-two"]
-                .iter()
-                .all(|agent_id| {
-                    actors.iter().any(|actor| {
-                        actor["id"] == format!("claude:agent:{agent_id}")
-                            && actor["status"] == "running"
-                    })
-                });
-            let both_unsupported = ["agent-child-one", "agent-child-two"]
-                .iter()
-                .all(|agent_id| {
-                    controls.iter().any(|control| {
-                        control["actorId"] == format!("claude:agent:{agent_id}")
-                            && control["state"] == "unsupported"
-                    })
-                });
-            let parent_available = controls.iter().any(|control| {
-                control["actorId"] == "claude:agent:agent-parent" && control["state"] == "available"
-            });
-            if both_running && both_unsupported && parent_available {
-                break snapshot;
+            .map_err(|error| format!("authoritative Activity snapshot transport failed: {error}"))?
+            .map_err(|error| format!("authoritative Activity snapshot failed: {error}"))?;
+            last_snapshot = Some(snapshot.clone());
+            if ambiguous_claude_children_are_observable_and_unsupported(&snapshot) {
+                break Ok::<Value, String>(snapshot);
             }
-            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("ambiguous children remain observable and unsupported");
+    .map_err(|_| "shared 30-second Claude Activity deadline elapsed".to_owned())
+    .and_then(std::convert::identity);
+    let snapshot = match observation {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let diagnostic_snapshot = last_snapshot.clone().unwrap_or(Value::Null);
+            let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+            let _ = activity_stream.close(None).await;
+            let _ = thread_stream.close(None).await;
+            let _ = socket.close(None).await;
+            handle.shutdown();
+            let join_result = handle.join().await;
+            panic!(
+                "ambiguous Claude Activity observation failed: {error}; \
+                 last_snapshot={diagnostic_snapshot}; provider_capture={diagnostic_capture:?}; \
+                 server_join={join_result:?}"
+            );
+        }
+    };
 
-    let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
-    let _ = captured_json_request(&capture, |request| {
-        request["request_id"] == "bibcode-inventory"
-    })
-    .await;
-    let before = captured_complete_ndjson_with_bytes(&capture).await;
-    assert!(claude_stop_task_targets(&before.1).is_empty());
-    assert_eq!(claude_root_interrupt_count(&before.1), 0);
-    for (index, agent_id) in ["agent-child-one", "agent-child-two"].iter().enumerate() {
-        let actor_id = format!("claude:agent:{agent_id}");
-        let control = snapshot["control"]["actors"]
-            .as_array()
-            .and_then(|controls| {
-                controls
-                    .iter()
-                    .find(|control| control["actorId"] == actor_id)
-            })
-            .expect("unsupported child control");
-        let error = tagged_rpc_request(
-            &mut socket,
-            &(9_800 + index).to_string(),
-            "activity.cancelSubtree",
-            json!({
-                "scope":{"_tag":"thread","threadId":"claude-ambiguous-thread"},
-                "scopeId":"thread:claude-ambiguous-thread",
-                "actorId":actor_id,
-                "expectedControlRevision":control["controlRevision"]
-            }),
-        )
-        .await
-        .expect_err("ambiguous child cancellation must fail through public RPC");
-        assert_eq!(
-            error,
-            json!([{
-                "_tag":"Fail",
-                "error":{
-                    "_tag":"ActivityError",
-                    "message":"The provider cancellation target is no longer available.",
-                    "reason":"targetUnavailable"
+    let verification = timeout_at(deadline, async {
+        loop {
+            let content = std::fs::read_to_string(&capture).unwrap_or_default();
+            let user_request_complete = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|request| request["type"] == "user");
+            if user_request_complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let before = loop {
+            let bytes = std::fs::read(&capture).unwrap_or_default();
+            if (bytes.is_empty() || bytes.ends_with(b"\n"))
+                && let Ok(content) = std::str::from_utf8(&bytes)
+                && let Some(values) = content
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                break (bytes, values);
+            }
+            tokio::task::yield_now().await;
+        };
+        if !claude_stop_task_targets(&before.1).is_empty() {
+            return Err("provider capture contained a stop_task before cancellation".to_owned());
+        }
+        if claude_root_interrupt_count(&before.1) != 0 {
+            return Err("provider capture contained a root interrupt before cancellation".to_owned());
+        }
+
+        let expected_error = json!([{
+            "_tag":"Fail",
+            "error":{
+                "_tag":"ActivityError",
+                "message":"The provider cancellation target is no longer available.",
+                "reason":"targetUnavailable"
+            }
+        }]);
+        for (index, agent_id) in ["agent-child-one", "agent-child-two"].iter().enumerate() {
+            let actor_id = format!("claude:agent:{agent_id}");
+            let control = snapshot["control"]["actors"]
+                .as_array()
+                .and_then(|controls| {
+                    controls
+                        .iter()
+                        .find(|control| control["actorId"] == actor_id)
+                })
+                .ok_or_else(|| format!("missing unsupported child control for {actor_id}"))?;
+            let cancellation = try_tagged_rpc_request_until(
+                &mut socket,
+                &(9_800 + index).to_string(),
+                "activity.cancelSubtree",
+                json!({
+                    "scope":{"_tag":"thread","threadId":"claude-ambiguous-thread"},
+                    "scopeId":"thread:claude-ambiguous-thread",
+                    "actorId":actor_id,
+                    "expectedControlRevision":control["controlRevision"]
+                }),
+                deadline,
+            )
+            .await?;
+            let error = match cancellation {
+                Ok(value) => {
+                    return Err(format!(
+                        "ambiguous child cancellation unexpectedly succeeded for {actor_id}: {value}"
+                    ));
                 }
-            }])
+                Err(error) => error,
+            };
+            if error != expected_error {
+                return Err(format!(
+                    "ambiguous child cancellation returned the wrong error for {actor_id}: {error}"
+                ));
+            }
+        }
+
+        let after = loop {
+            let bytes = std::fs::read(&capture).unwrap_or_default();
+            if (bytes.is_empty() || bytes.ends_with(b"\n"))
+                && let Ok(content) = std::str::from_utf8(&bytes)
+                && let Some(values) = content
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                break (bytes, values);
+            }
+            tokio::task::yield_now().await;
+        };
+        if after.0 != before.0 {
+            return Err("ambiguous child cancellation added provider request bytes".to_owned());
+        }
+        if after.1 != before.1 {
+            return Err("ambiguous child cancellation changed parsed provider requests".to_owned());
+        }
+        if !claude_stop_task_targets(&after.1).is_empty() {
+            return Err("ambiguous child cancellation emitted a stop_task request".to_owned());
+        }
+        if claude_root_interrupt_count(&after.1) != 0 {
+            return Err("ambiguous child cancellation emitted a root interrupt".to_owned());
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "shared 30-second Claude Activity verification deadline elapsed".to_owned())
+    .and_then(std::convert::identity);
+    if let Err(error) = verification {
+        let diagnostic_capture = std::fs::read_to_string(&capture).unwrap_or_default();
+        let _ = activity_stream.close(None).await;
+        let _ = thread_stream.close(None).await;
+        let _ = socket.close(None).await;
+        handle.shutdown();
+        let join_result = handle.join().await;
+        panic!(
+            "ambiguous Claude Activity verification failed: {error}; \
+             snapshot={snapshot}; provider_capture={diagnostic_capture:?}; \
+             server_join={join_result:?}"
         );
     }
-    let after = captured_complete_ndjson_with_bytes(&capture).await;
-    assert_eq!(
-        after.0, before.0,
-        "ambiguous child cancellation must add no provider request bytes"
-    );
-    assert_eq!(after.1, before.1);
-    assert!(claude_stop_task_targets(&after.1).is_empty());
-    assert_eq!(claude_root_interrupt_count(&after.1), 0);
 
-    socket.close(None).await.expect("close WebSocket");
+    let activity_close = activity_stream.close(None).await;
+    let thread_close = thread_stream.close(None).await;
+    let socket_close = socket.close(None).await;
     handle.shutdown();
-    handle.join().await.expect("RPC server joins");
+    let join_result = handle.join().await;
+    if activity_close.is_err()
+        || thread_close.is_err()
+        || socket_close.is_err()
+        || join_result.is_err()
+    {
+        panic!(
+            "ambiguous Claude Activity cleanup failed: activity_close={activity_close:?}; \
+             thread_close={thread_close:?}; socket_close={socket_close:?}; \
+             server_join={join_result:?}"
+        );
+    }
 }
 
 #[tokio::test]

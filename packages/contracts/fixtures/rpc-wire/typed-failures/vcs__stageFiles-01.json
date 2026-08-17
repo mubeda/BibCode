@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "has",
-          "requiredScope": "review:write"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "h",
+          "threadId": "Jv/0##jNIV.~",
+          "path": "$H",
+          "availability": "missing-registered"
         }
       }
     ]

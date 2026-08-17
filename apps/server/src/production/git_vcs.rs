@@ -31,6 +31,7 @@ use crate::{
     },
     terminal::TerminalManager,
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
+    worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
 use super::host_paths::resolve_host_directory;
@@ -172,8 +173,6 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "vcs.refreshStatus",
     "vcs.listRefs",
     "vcs.listCommits",
-    "vcs.createWorktree",
-    "vcs.removeWorktree",
     "vcs.clone",
     "vcs.createRef",
     "vcs.switchRef",
@@ -198,6 +197,8 @@ pub struct GitVcsRpcServices {
     broadcaster: StatusBroadcaster,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
+    github_command: PathBuf,
+    availability_registry: Option<WorkspaceAvailabilityRegistry>,
     terminal: Option<TerminalManager>,
     repositories: Option<Repositories>,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
@@ -287,10 +288,31 @@ impl GitVcsRpcServices {
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
+            github_command: PathBuf::from("gh"),
+            availability_registry: None,
             terminal,
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
         }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_repository_and_github_command(
+        repository: Arc<GitRepository>,
+        github_command: PathBuf,
+    ) -> Self {
+        let mut services = Self::with_repository(repository);
+        services.github_command = github_command;
+        services
+    }
+
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.availability_registry = Some(availability_registry);
+        self
     }
 
     pub(crate) fn worktree_removal_tasks(&self) -> WorktreeRemovalTaskTracker {
@@ -330,6 +352,22 @@ pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, services: GitVcsRpcServi
 
 impl GitVcsRpcServices {
     async fn handle_unary_with_context(
+        &self,
+        request: RpcRequest,
+        context: RpcSessionContext,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        let workspace_admission = self.guard_payload_cwd(&request.payload).await?;
+        let operation_cancellation = cancellation.child_token();
+        await_git_rpc_operation(
+            workspace_admission.as_ref(),
+            operation_cancellation.clone(),
+            self.handle_admitted_unary(request, context, operation_cancellation),
+        )
+        .await
+    }
+
+    async fn handle_admitted_unary(
         &self,
         request: RpcRequest,
         context: RpcSessionContext,
@@ -841,6 +879,7 @@ impl GitVcsRpcServices {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
+        let availability = self.availability_registry.clone();
         tokio::spawn(async move {
             let input = match decode::<CwdInput>(request.payload, "subscribeVcsStatus") {
                 Ok(input) => input,
@@ -849,19 +888,51 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let mut subscription = match broadcaster
-                .subscribe(input.cwd.clone(), cancellation.clone())
-                .await
+            let workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            let operation_cancellation = cancellation.child_token();
+            let loss = workspace_admission
+                .as_ref()
+                .map(WorkspaceAdmissionLease::loss_cancellation);
+            let loss_token = loss
+                .as_ref()
+                .map(|loss| loss.cancellation_token())
+                .unwrap_or_default();
+            let mut subscription = match await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                async {
+                    broadcaster
+                        .subscribe(input.cwd.clone(), operation_cancellation.clone())
+                        .await
+                        .map_err(serialize_error)
+                },
+            )
+            .await
             {
                 Ok(subscription) => subscription,
                 Err(error) => {
-                    let _ = sender.send(Err(serialize_error(error))).await;
+                    let _ = sender.send(Err(error)).await;
                     return;
                 }
             };
             let mut current_local = None;
             loop {
                 tokio::select! {
+                    biased;
+                    () = loss_token.cancelled() => {
+                        operation_cancellation.cancel();
+                        if let Some(error) = loss.as_ref().and_then(|loss| loss.unavailable()) {
+                            let _ = sender.send(Err(serialize_error(error))).await;
+                        }
+                        break;
+                    }
                     _ = cancellation.cancelled() => break,
                     event = subscription.recv() => {
                         let Some(mut event) = event else { break };
@@ -874,7 +945,7 @@ impl GitVcsRpcServices {
                                         &input.cwd,
                                         local,
                                         remote,
-                                        &cancellation,
+                                        &operation_cancellation,
                                     ).await;
                                 }
                             }
@@ -888,7 +959,7 @@ impl GitVcsRpcServices {
                                         &input.cwd,
                                         local,
                                         remote,
-                                        &cancellation,
+                                        &operation_cancellation,
                                     ).await;
                                 }
                             }
@@ -912,6 +983,7 @@ impl GitVcsRpcServices {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let repository = Arc::clone(&self.repository);
         let pull_requests = self.pull_requests.clone();
+        let availability = self.availability_registry.clone();
         tokio::spawn(async move {
             let input = match decode::<StackedActionInput>(request.payload, "git.runStackedAction")
             {
@@ -921,21 +993,50 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let phases = action_phases(&input.action, input.feature_branch.unwrap_or(false));
-            if send_event(
-                &sender,
-                json!({
-                    "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
-                    "kind": "action_started", "phases": phases,
-                }),
-            )
-            .await
-            .is_err()
+            let workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
             {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            let operation_cancellation = cancellation.child_token();
+            let phases = action_phases(&input.action, input.feature_branch.unwrap_or(false));
+            let action_started = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                async {
+                    send_event(
+                        &sender,
+                        json!({
+                            "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
+                            "kind": "action_started", "phases": phases,
+                        }),
+                    )
+                    .await
+                    .map_err(|()| request_error("git.runStackedAction", "stream receiver closed"))
+                },
+            )
+            .await;
+            if let Err(error) = action_started {
+                if is_workspace_unavailable(&error) {
+                    let _ = sender.send(Err(error)).await;
+                }
                 return;
             }
-            let result =
-                run_stacked_action(&repository, &pull_requests, &input, &cancellation).await;
+            let result = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                run_stacked_action(&repository, &pull_requests, &input, &operation_cancellation),
+            )
+            .await;
+            if let Err(error) = &result
+                && is_workspace_unavailable(error)
+            {
+                let _ = sender.send(Err(error.clone())).await;
+                return;
+            }
             let event = match result {
                 Ok(result) => json!({
                     "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
@@ -947,7 +1048,20 @@ impl GitVcsRpcServices {
                     "message": error.get("detail").and_then(Value::as_str).unwrap_or("Git action failed."),
                 }),
             };
-            let _ = send_event(&sender, event).await;
+            if let Err(error) = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation,
+                async {
+                    send_event(&sender, event).await.map_err(|()| {
+                        request_error("git.runStackedAction", "stream receiver closed")
+                    })
+                },
+            )
+            .await
+                && is_workspace_unavailable(&error)
+            {
+                let _ = sender.send(Err(error)).await;
+            }
         });
         receiver
     }
@@ -994,6 +1108,7 @@ impl GitVcsRpcServices {
         input: PreparePullRequestInput,
         cancellation: &CancellationToken,
     ) -> RpcResult {
+        let PreparePullRequestMode::Local = input.mode;
         let pull_request = self
             .resolve_pull_request(
                 &PullRequestInput {
@@ -1013,30 +1128,11 @@ impl GitVcsRpcServices {
                 "Pull request has no head branch.",
             ));
         }
-        let (branch, worktree_path) = if input.mode == "worktree" {
-            let created = self
-                .repository
-                .create_worktree(
-                    CreateWorktreeInput {
-                        cwd: input.cwd,
-                        ref_name: branch.clone(),
-                        new_ref_name: None,
-                        base_ref_name: None,
-                        path: None,
-                    },
-                    cancellation,
-                )
-                .await
-                .map_err(serialize_error)?;
-            prepared_worktree_response_fields(branch, created)
-        } else {
-            self.repository
-                .switch_ref(&input.cwd, &branch, cancellation)
-                .await
-                .map_err(serialize_error)?;
-            (branch, None)
-        };
-        Ok(json!({ "pullRequest": pull_request, "branch": branch, "worktreePath": worktree_path }))
+        self.repository
+            .switch_ref(&input.cwd, &branch, cancellation)
+            .await
+            .map_err(serialize_error)?;
+        Ok(json!({ "pullRequest": pull_request, "branch": branch }))
     }
 
     async fn lookup_repository(
@@ -1046,7 +1142,7 @@ impl GitVcsRpcServices {
     ) -> RpcResult {
         let (command, args) = match input.provider.as_str() {
             "github" => (
-                "gh",
+                self.github_command.as_path(),
                 vec![
                     "repo",
                     "view",
@@ -1056,7 +1152,7 @@ impl GitVcsRpcServices {
                 ],
             ),
             "gitlab" => (
-                "glab",
+                Path::new("glab"),
                 vec!["repo", "view", &input.repository, "--output", "json"],
             ),
             provider => {
@@ -1144,7 +1240,7 @@ impl GitVcsRpcServices {
             .run(
                 ProcessRequest {
                     operation: "source-control.publishRepository.create".into(),
-                    command: "gh".into(),
+                    command: self.github_command.clone(),
                     args: [
                         "repo",
                         "create",
@@ -1211,6 +1307,58 @@ impl GitVcsRpcServices {
     async fn open_in_editor(&self, payload: Value) -> RpcResult {
         open_in_editor_with(payload, launch_editor)
     }
+
+    async fn guard_payload_cwd(
+        &self,
+        payload: &Value,
+    ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+        let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        guard_git_path(self.availability_registry.as_ref(), Path::new(cwd)).await
+    }
+}
+
+async fn guard_git_path(
+    registry: Option<&WorkspaceAvailabilityRegistry>,
+    cwd: &Path,
+) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    registry
+        .acquire_path_admission([cwd])
+        .await
+        .map(Some)
+        .map_err(|error| {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        })
+}
+
+async fn await_git_rpc_operation<T>(
+    admission: Option<&WorkspaceAdmissionLease>,
+    operation_cancellation: CancellationToken,
+    operation: impl Future<Output = Result<T, Value>>,
+) -> Result<T, Value> {
+    let Some(admission) = admission else {
+        return operation.await;
+    };
+    let loss = admission.loss_cancellation();
+    tokio::select! {
+        biased;
+        () = loss.cancelled() => {
+            operation_cancellation.cancel();
+            Err(serialize_error(
+                loss.unavailable()
+                    .expect("workspace loss cancellation retains its exact error"),
+            ))
+        }
+        result = operation => result,
+    }
+}
+
+fn is_workspace_unavailable(error: &Value) -> bool {
+    error.get("_tag").and_then(Value::as_str) == Some("WorkspaceUnavailableError")
 }
 
 fn open_in_editor_with(
@@ -1394,13 +1542,16 @@ struct PullRequestInput {
     reference: String,
 }
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PreparePullRequestInput {
     cwd: PathBuf,
     reference: String,
-    mode: String,
-    #[allow(dead_code)]
-    thread_id: Option<String>,
+    mode: PreparePullRequestMode,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PreparePullRequestMode {
+    Local,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1827,7 +1978,7 @@ async fn send_event(sender: &mpsc::Sender<RpcStreamChunk>, event: Value) -> Resu
 }
 
 async fn run_provider_json(
-    command: &str,
+    command: &Path,
     args: &[&str],
     cwd: Option<&std::path::Path>,
     cancellation: CancellationToken,
@@ -1838,7 +1989,7 @@ async fn run_provider_json(
         .run(
             ProcessRequest {
                 operation: format!("source-control.{operation}"),
-                command: command.into(),
+                command: command.to_path_buf(),
                 args: args.iter().map(OsString::from).collect(),
                 cwd: cwd
                     .unwrap_or_else(|| std::path::Path::new("."))
@@ -1947,20 +2098,9 @@ fn summarize_commit_context(context: &str, paths: Option<&[String]>) -> String {
         )
 }
 
-fn prepared_worktree_response_fields(
-    _requested_branch: String,
-    created: crate::git::VcsCreateWorktreeResult,
-) -> (String, Option<String>) {
-    (created.worktree.ref_name, Some(created.worktree.path))
-}
-
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{
-        EditorLaunchStrategy, editor_launch_strategy, open_in_editor_with,
-        prepared_worktree_response_fields,
-    };
-    use crate::git::{VcsCreateWorktreeResult, VcsWorktree};
+    use super::{EditorLaunchStrategy, editor_launch_strategy, open_in_editor_with};
     use serde_json::json;
 
     #[test]
@@ -2003,66 +2143,13 @@ mod tests {
         assert_eq!(error["args"], json!(["C:\\repo"]));
         assert_eq!(error["cause"], "missing fixture editor");
     }
-
-    #[test]
-    fn pull_request_worktree_response_uses_the_repository_returned_ref() {
-        let (branch, worktree_path) = prepared_worktree_response_fields(
-            "feature".to_owned(),
-            VcsCreateWorktreeResult {
-                worktree: VcsWorktree {
-                    path: "C:/repo/.bibcode-worktrees/feature-2".to_owned(),
-                    ref_name: "feature-2".to_owned(),
-                },
-            },
-        );
-
-        assert_eq!(branch, "feature-2");
-        assert_eq!(
-            worktree_path.as_deref(),
-            Some("C:/repo/.bibcode-worktrees/feature-2")
-        );
-    }
 }
 
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use crate::RequestId;
-    use std::ffi::{OsStr, OsString};
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            }
-        }
-
-        fn set(key: &'static str, value: impl AsRef<OsStr>) {
-            // The external-process lock serializes environment-sensitive unit tests.
-            unsafe { std::env::set_var(key, value) };
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..) {
-                // Restore every environment value before releasing the process lock.
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
+    use std::{collections::VecDeque, sync::Mutex};
 
     fn rpc_request(tag: &str, payload: Value) -> RpcRequest {
         RpcRequest {
@@ -2076,17 +2163,115 @@ mod tests {
         }
     }
 
-    fn git(cwd: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("git should start");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
+    async fn git(sandbox: &crate::test_support::TestSandbox, cwd: &Path, args: &[&str]) {
+        ProcessRunner
+            .run(
+                ProcessRequest {
+                    operation: "test.gitVcs.git".to_owned(),
+                    command: sandbox.executable_on_path("git"),
+                    args: args.iter().map(OsString::from).collect(),
+                    cwd: cwd.to_path_buf(),
+                    env: sandbox
+                        .environment([("GIT_CONFIG_NOSYSTEM", "1")])
+                        .into_iter()
+                        .map(|(key, value)| (key.into(), value.into()))
+                        .collect(),
+                    stdin: None,
+                    timeout: Duration::from_secs(30),
+                    max_output_bytes: 128_000,
+                    output_policy: OutputPolicy::Error,
+                    append_truncation_marker: false,
+                    allow_non_zero_exit: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+    }
+
+    struct CapturedGitRunner {
+        command: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+    }
+
+    impl CapturedGitRunner {
+        fn new(sandbox: &crate::test_support::TestSandbox) -> Self {
+            Self {
+                command: sandbox.executable_on_path("git"),
+                environment: sandbox
+                    .environment([("GIT_CONFIG_NOSYSTEM", "1")])
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl crate::git::GitProcessRunner for CapturedGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> crate::git::BoxGitProcessFuture<'a> {
+            request.command.clone_from(&self.command);
+            let mut environment = self.environment.clone();
+            environment.extend(request.env);
+            request.env = environment;
+            Box::pin(async move { ProcessRunner.run(request, cancellation).await })
+        }
+    }
+
+    struct FixtureGitRunner {
+        outputs: Mutex<VecDeque<crate::git::ProcessOutput>>,
+    }
+
+    impl FixtureGitRunner {
+        fn main_branch_push() -> Self {
+            Self {
+                outputs: Mutex::new(
+                    [
+                        crate::git::ProcessOutput {
+                            exit_code: 0,
+                            stdout: "main\n".to_owned(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                        crate::git::ProcessOutput {
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                        crate::git::ProcessOutput {
+                            exit_code: 0,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                    ]
+                    .into(),
+                ),
+            }
+        }
+    }
+
+    impl crate::git::GitProcessRunner for FixtureGitRunner {
+        fn run<'a>(
+            &'a self,
+            _request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> crate::git::BoxGitProcessFuture<'a> {
+            let output = self
+                .outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("fixture Git output");
+            Box::pin(async move { Ok(output) })
+        }
     }
 
     async fn unary(services: &GitVcsRpcServices, tag: &str, payload: Value) -> RpcResult {
@@ -2100,15 +2285,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_loss_cancels_an_admitted_git_operation_with_the_exact_error() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let path = PathBuf::from("/repo/worktrees/git-guard");
+        let admission = registry
+            .acquire_path_admission([path.as_path()])
+            .await
+            .expect("Git operation should be admitted before loss");
+        let operation_cancellation = CancellationToken::new();
+        let operation_cancellation_probe = operation_cancellation.clone();
+        let task = tokio::spawn(async move {
+            await_git_rpc_operation(
+                Some(&admission),
+                operation_cancellation,
+                std::future::pending::<RpcResult>(),
+            )
+            .await
+        });
+
+        assert!(
+            registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-git".to_owned(),
+                    repository_key: "repository-git".to_owned(),
+                    generation: 1,
+                    path: path.clone(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+
+        let error = task
+            .await
+            .expect("Git admission task should join")
+            .expect_err("workspace loss must win over the admitted Git operation");
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-git");
+        assert!(operation_cancellation_probe.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn workspace_loss_ends_an_admitted_status_stream_with_the_exact_error() {
+        let sandbox = crate::test_support::TestSandbox::new("workspace-loss-status");
+        git(&sandbox, sandbox.root(), &["init", "-b", "main"]).await;
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository)
+            .with_availability_registry(registry.clone());
+        let mut stream = services.status_stream(
+            rpc_request("subscribeVcsStatus", json!({"cwd": sandbox.root()})),
+            CancellationToken::new(),
+        );
+        stream
+            .recv()
+            .await
+            .expect("initial status chunk")
+            .expect("initial status snapshot");
+
+        assert!(
+            registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-status".to_owned(),
+                    repository_key: "repository-status".to_owned(),
+                    generation: 1,
+                    path: sandbox.root().to_path_buf(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+
+        let error = stream
+            .recv()
+            .await
+            .expect("workspace loss error chunk")
+            .expect_err("workspace loss must end the admitted status stream");
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-status");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn github_cli_and_git_runner_fixtures_are_instance_owned_in_parallel() {
+        async fn publish(label: &str) -> (Value, Value) {
+            let sandbox = crate::test_support::TestSandbox::new(label);
+            let github_command = sandbox.executable_script(
+                "gh",
+                &format!(
+                    "case \"$1:$2\" in\n  repo:view) printf '%s\\n' '{{\"nameWithOwner\":\"owner/{label}\",\"url\":\"https://github.test/owner/{label}\",\"sshUrl\":\"git@github.test:owner/{label}.git\"}}' ;;\n  repo:create) exit 0 ;;\n  *) exit 64 ;;\nesac"
+                ),
+                "",
+            );
+            let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                FixtureGitRunner::main_branch_push(),
+            )));
+            let services =
+                GitVcsRpcServices::with_repository_and_github_command(repository, github_command);
+            let cwd = sandbox.root().to_path_buf();
+            let lookup = unary(
+                &services,
+                "sourceControl.lookupRepository",
+                json!({
+                    "provider":"github",
+                    "repository":format!("owner/{label}"),
+                    "cwd":cwd,
+                }),
+            )
+            .await
+            .expect("GitHub lookup fixture should resolve");
+            let published = unary(
+                &services,
+                "sourceControl.publishRepository",
+                json!({
+                    "cwd":sandbox.root(),
+                    "provider":"github",
+                    "repository":format!("owner/{label}"),
+                    "visibility":"private",
+                    "protocol":"ssh",
+                    "remoteName":"origin"
+                }),
+            )
+            .await
+            .expect("GitHub publish fixture should use its owned Git runner");
+            (lookup, published)
+        }
+
+        let ((left_lookup, left_published), (right_lookup, right_published)) =
+            tokio::join!(publish("left"), publish("right"));
+        assert_eq!(left_lookup["nameWithOwner"], "owner/left");
+        assert_eq!(right_lookup["nameWithOwner"], "owner/right");
+        assert_eq!(left_published["branch"], "main");
+        assert_eq!(right_published["branch"], "main");
+    }
+
+    #[tokio::test]
     async fn native_git_vcs_service_covers_repository_lifecycle_and_validation_paths() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("temporary repository parent");
-        let repository = temporary.path().join("repository");
+        let sandbox = crate::test_support::TestSandbox::new("native-git-vcs");
+        let repository = sandbox.root().join("repository");
         tokio::fs::create_dir_all(&repository)
             .await
             .expect("repository directory should create");
         let cwd = repository.to_string_lossy().into_owned();
-        let services = GitVcsRpcServices::default();
+        let git_repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let mut services = GitVcsRpcServices::with_repository(git_repository);
 
         assert!(
             unary(&services, "vcs.init", json!({"cwd":cwd,"kind":"mercurial"}),)
@@ -2121,11 +2447,18 @@ mod tests {
                 .expect("repository should initialize"),
             Value::Null,
         );
-        git(&repository, &["config", "user.name", "BiBCode Test"]);
         git(
+            &sandbox,
+            &repository,
+            &["config", "user.name", "BiBCode Test"],
+        )
+        .await;
+        git(
+            &sandbox,
             &repository,
             &["config", "user.email", "bibcode@example.test"],
-        );
+        )
+        .await;
 
         tokio::fs::write(repository.join("tracked.txt"), "first\n")
             .await
@@ -2158,8 +2491,13 @@ mod tests {
             .expect("file should stage"),
             Value::Null,
         );
-        git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        git(&repository, &["branch", "-M", "main"]);
+        git(
+            &sandbox,
+            &repository,
+            &["commit", "--quiet", "-m", "initial"],
+        )
+        .await;
+        git(&sandbox, &repository, &["branch", "-M", "main"]).await;
 
         let refs = unary(
             &services,
@@ -2239,29 +2577,7 @@ mod tests {
         .await
         .expect("changed file should discard");
 
-        let worktree = temporary.path().join("worktree");
-        unary(
-            &services,
-            "vcs.createWorktree",
-            json!({
-                "cwd":cwd,
-                "refName":"feature",
-                "newRefName":null,
-                "baseRefName":null,
-                "path":worktree,
-            }),
-        )
-        .await
-        .expect("worktree should create");
-        unary(
-            &services,
-            "vcs.removeWorktree",
-            json!({"cwd":cwd,"path":worktree,"force":true}),
-        )
-        .await
-        .expect("worktree should remove");
-
-        let clone_parent = temporary.path().join("clones");
+        let clone_parent = sandbox.root().join("clones");
         tokio::fs::create_dir_all(&clone_parent)
             .await
             .expect("clone parent should create");
@@ -2305,13 +2621,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(
-            unary(&services, "server.discoverSourceControl", json!({}))
-                .await
-                .expect("source control should discover")["versionControlSystems"]
-                .is_array()
-        );
-        let source_clone = temporary.path().join("source-clone");
+        let source_clone = sandbox.root().join("source-clone");
         assert!(
             unary(
                 &services,
@@ -2469,7 +2779,7 @@ mod tests {
 
         assert_eq!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "printf '{\"ok\":true}'"],
                 Some(&repository),
                 CancellationToken::new(),
@@ -2482,7 +2792,7 @@ mod tests {
         );
         assert!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "exit 1"],
                 None,
                 CancellationToken::new(),
@@ -2494,7 +2804,7 @@ mod tests {
         );
         assert!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "printf invalid"],
                 None,
                 CancellationToken::new(),
@@ -2507,47 +2817,37 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
-            let bare_remote = temporary.path().join("published.git");
+            let bare_remote = sandbox.root().join("published.git");
             tokio::fs::create_dir(&bare_remote)
                 .await
                 .expect("bare remote directory");
-            git(&bare_remote, &["init", "--bare"]);
+            git(&sandbox, &bare_remote, &["init", "--bare"]).await;
+            let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+            git(
+                &sandbox,
+                &repository,
+                &["remote", "add", "origin", bare_remote_text.as_str()],
+            )
+            .await;
 
-            let gh = temporary.path().join("gh");
-            tokio::fs::write(
-                &gh,
-                r#"#!/bin/sh
-case "$1:$2" in
+            let gh = sandbox.executable_script(
+                "gh",
+                r#"case "$1:$2" in
   repo:view)
     printf '%s\n' '{"nameWithOwner":"owner/name","url":"https://github.test/owner/name","sshUrl":"git@github.test:owner/name.git"}'
     ;;
   repo:create)
-    git remote add origin "$BIBCODE_TEST_REMOTE"
+    exit 0
     ;;
   *)
     exit 64
     ;;
 esac
 "#,
-            )
-            .await
-            .expect("gh fixture");
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))
-                .expect("gh fixture permissions");
-
-            let _environment = EnvGuard::new(&["PATH", "BIBCODE_TEST_REMOTE"]);
-            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-            EnvGuard::set(
-                "PATH",
-                std::env::join_paths(
-                    std::iter::once(temporary.path().to_path_buf())
-                        .chain(std::env::split_paths(&inherited_path)),
-                )
-                .expect("fixture PATH"),
+                "",
             );
-            EnvGuard::set("BIBCODE_TEST_REMOTE", &bare_remote);
+
+            services.github_command = gh;
 
             let lookup = unary(
                 &services,

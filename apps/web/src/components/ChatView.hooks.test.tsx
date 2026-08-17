@@ -36,10 +36,17 @@ import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
 import {
+  BearerConnectionTarget,
+  PrimaryConnectionTarget,
+  type ConnectionTarget,
+} from "@bibcode/client-runtime/connection";
+import {
   scopeProjectRef,
   scopeThreadRef,
   scopedThreadKey,
 } from "@bibcode/client-runtime/environment";
+import { desktopLocalConnectionId } from "../connection/desktopLocal";
+import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
 
 const h = vi.hoisted(() => {
   const state = {
@@ -100,6 +107,7 @@ const h = vi.hoisted(() => {
     refSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     effects: [] as Array<() => void | (() => void)>,
     centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
+    presentationPolicy: null as unknown as ReturnType<typeof createEnvironmentPresentationPolicy>,
   };
   return state;
 });
@@ -214,6 +222,14 @@ vi.mock("../state/vcs", () => ({
   },
 }));
 
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    catalog: () => ({ key: "worktree.catalog" }),
+    createManaged: { key: "worktree.createManaged" },
+    createPanel: { key: "worktree.createPanel" },
+  },
+}));
+
 vi.mock("../state/shell", () => ({
   environmentShell: {
     stateAtom: (environmentId: string) => ({ key: `shell:${environmentId}` }),
@@ -260,6 +276,10 @@ vi.mock("../state/environments", () => ({
     environments: h.environments,
   }),
   usePrimaryEnvironment: () => h.primaryEnvironment,
+}));
+
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => h.presentationPolicy,
 }));
 
 vi.mock("../state/terminalSessions", () => ({
@@ -708,6 +728,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repositoryIdentity: null,
     defaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     scripts: [],
+    worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -790,6 +811,7 @@ interface TestEnvironmentPresentation {
   readonly label: string;
   readonly displayUrl: string | null;
   readonly relayManaged: boolean;
+  readonly entry: { readonly target: ConnectionTarget };
   readonly connection: TestConnectionPresentation;
   readonly serverConfig: {
     readonly providers: ReadonlyArray<ServerProvider>;
@@ -805,6 +827,14 @@ function makeEnvironmentPresentation(
     label: "Local",
     displayUrl: null,
     relayManaged: false,
+    entry: {
+      target: new PrimaryConnectionTarget({
+        environmentId,
+        httpBaseUrl: "http://127.0.0.1:3773",
+        label: "Local",
+        wsBaseUrl: "ws://127.0.0.1:3773",
+      }),
+    },
     connection: { phase: "connected", error: null, traceId: null },
     serverConfig: {
       providers: [codexProvider],
@@ -876,7 +906,11 @@ function renderDraftRoute(draftId: ReturnType<typeof newDraftId>): string {
 function renderPanelRoute(): string {
   resetRenderCaptures();
   return renderToStaticMarkup(
-    <ChatView variant="panel" panelThreadRef={scopeThreadRef(environmentId, threadId)} />,
+    <ChatView
+      variant="panel"
+      panelThreadRef={scopeThreadRef(environmentId, threadId)}
+      workspaceUnavailable={null}
+    />,
   );
 }
 
@@ -1380,6 +1414,10 @@ beforeEach(() => {
   h.refSeeds.clear();
   h.effects.length = 0;
   h.centerHeaderDensityByGroupId.clear();
+  h.presentationPolicy = createEnvironmentPresentationPolicy({
+    surface: "browser",
+    platform: "unknown",
+  });
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -2833,17 +2871,17 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       environmentId,
       input: {
-        projectId,
-        branch: "feature/panels",
-        worktreePath: "X:/demo/worktrees/panels",
-        modelSelection: {
-          instanceId: codexInstanceId,
-          model: "gpt-configured",
-          options: [{ id: "reasoningEffort", value: "high" }],
+        hostThreadId: threadId,
+        threadDefaults: {
+          modelSelection: {
+            instanceId: codexInstanceId,
+            model: "gpt-configured",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
       },
     });
@@ -2897,12 +2935,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: claudeInstanceId,
-          model: "claude-sonnet-5",
-          options: [{ id: "effort", value: "ultrathink" }],
+        threadDefaults: {
+          modelSelection: {
+            instanceId: claudeInstanceId,
+            model: "claude-sonnet-5",
+            options: [{ id: "effort", value: "ultrathink" }],
+          },
         },
       },
     });
@@ -2938,12 +2978,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: codexInstanceId,
-          model: DEFAULT_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
-          options: [{ id: "reasoningEffort", value: "high" }],
+        threadDefaults: {
+          modelSelection: {
+            instanceId: codexInstanceId,
+            model: DEFAULT_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
       },
     });
@@ -3169,12 +3211,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: targetInstanceId,
-          model: "gpt-built-in",
+        threadDefaults: {
+          modelSelection: {
+            instanceId: targetInstanceId,
+            model: "gpt-built-in",
+          },
         },
       },
     });
@@ -3195,26 +3239,30 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    const createCalls = commandCallsFor("thread.create");
+    const createCalls = commandCallsFor("worktree.createPanel");
     expect(createCalls).toHaveLength(1);
     const createInput = createCalls[0]?.input as {
       environmentId: EnvironmentId;
       input: {
         threadId: ThreadId;
         title: string;
-        modelSelection: { instanceId: ProviderInstanceId; model: string };
-        kind: string;
+        hostThreadId: ThreadId;
+        threadDefaults: {
+          modelSelection: { instanceId: ProviderInstanceId; model: string };
+        };
       };
     };
     expect(createInput).toMatchObject({
       environmentId,
       input: {
         title: "Panel — Claude",
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          model: DEFAULT_MODEL_BY_PROVIDER[claudeDriver],
+        hostThreadId: threadId,
+        threadDefaults: {
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: DEFAULT_MODEL_BY_PROVIDER[claudeDriver],
+          },
         },
-        kind: "panel",
       },
     });
     expect(warn).toHaveBeenCalledWith(
@@ -4487,7 +4535,7 @@ describe("ChatView send flows", () => {
     const composer = capturedProps("chatComposer");
     await (composer["onImplementPlanInNewThread"] as () => Promise<void>)();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
     expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
     // Failure path deletes the freshly created thread and toasts.
     expect(commandCallsFor("thread.delete")).toHaveLength(1);
@@ -5289,6 +5337,67 @@ describe("ChatView banners and dialogs", () => {
     return found;
   }
 
+  function unavailableBannerActions(input: {
+    readonly surface: "browser" | "desktop";
+    readonly platform: "macos" | "windows";
+    readonly target: ConnectionTarget;
+  }): string {
+    h.presentationPolicy = createEnvironmentPresentationPolicy({
+      surface: input.surface,
+      platform: input.platform,
+    });
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        entry: { target: input.target },
+        connection: { phase: "error", error: "socket closed", traceId: null },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    renderServerRoute();
+
+    const bannerStack = capturedProps<{ items: ComposerBannerStackItem[] }>("composerBannerStack");
+    return renderToStaticMarkup(<>{bannerStack.items[0]!.actions}</>);
+  }
+
+  it("gates unavailable environment actions by desktop target while preserving browser recovery", () => {
+    const remoteTarget = new BearerConnectionTarget({
+      connectionId: "remote:server",
+      environmentId,
+      label: "Remote server",
+    });
+    const wslTarget = new BearerConnectionTarget({
+      connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+      environmentId,
+      label: "WSL: Ubuntu",
+    });
+
+    const macRemoteBanner = unavailableBannerActions({
+      surface: "desktop",
+      platform: "macos",
+      target: remoteTarget,
+    });
+    expect(macRemoteBanner).not.toContain("Reconnect");
+    expect(macRemoteBanner).not.toContain("Connections");
+
+    const windowsWslBanner = unavailableBannerActions({
+      surface: "desktop",
+      platform: "windows",
+      target: wslTarget,
+    });
+    expect(windowsWslBanner).toContain("Reconnect");
+    expect(windowsWslBanner).not.toContain("Connections");
+
+    const browserRemoteBanner = unavailableBannerActions({
+      surface: "browser",
+      platform: "macos",
+      target: remoteTarget,
+    });
+    expect(browserRemoteBanner).toContain("Reconnect");
+    expect(browserRemoteBanner).toContain("Connections");
+  });
+
   it("reconnects the environment from the unavailable banner and toasts failures", async () => {
     seedEnvironment(
       makeEnvironmentPresentation({
@@ -5466,9 +5575,9 @@ describe("ChatView banners and dialogs", () => {
     await (
       dialog["onPrepared"] as (input: {
         branch: string;
-        worktreePath: string | null;
+        mode: "local" | "worktree";
       }) => Promise<void>
-    )({ branch: "pr-branch", worktreePath: null });
+    )({ branch: "pr-branch", mode: "local" });
 
     expect(h.navigateCalls.length).toBeGreaterThanOrEqual(1);
     const navigateCall = h.navigateCalls[0] as {
@@ -5511,16 +5620,66 @@ describe("ChatView banners and dialogs", () => {
     await (
       dialog["onPrepared"] as (input: {
         branch: string;
-        worktreePath: string | null;
+        mode: "local" | "worktree";
       }) => Promise<void>
-    )({ branch: "pr-branch", worktreePath: "X:/wt" });
+    )({ branch: "pr-branch", mode: "local" });
 
     const session = useComposerDraftStore.getState().getDraftSession(draftId);
-    expect(session?.worktreePath).toBe("X:/wt");
-    expect(session?.envMode).toBe("worktree");
+    expect(session?.worktreePath).toBeNull();
+    expect(session?.envMode).toBe("local");
     expect(h.navigateCalls).toContainEqual({
       to: "/draft/$draftId",
       params: { draftId },
+    });
+  });
+
+  it("creates a pull request worktree through the dedicated atomic owner boundary", async () => {
+    seedConnectedServerThread();
+    seedHostState("pullRequestDialogState", { initialReference: null, key: 3 });
+    h.commandResults["worktree.createManaged"] = (raw) => {
+      const command = raw as {
+        input: { threadId: ThreadId; refName: string };
+      };
+      return AsyncResult.success({
+        threadId: command.input.threadId,
+        path: "X:/managed/pr-branch",
+        refName: command.input.refName,
+      });
+    };
+
+    renderServerRoute();
+    const dialog = capturedProps("pullRequestThreadDialog");
+    await (
+      dialog["onPrepared"] as (input: {
+        branch: string;
+        mode: "local" | "worktree";
+      }) => Promise<void>
+    )({ branch: "pr-branch", mode: "worktree" });
+
+    const [createCall] = commandCallsFor("worktree.createManaged");
+    expect(createCall?.input).toMatchObject({
+      environmentId,
+      input: {
+        projectId,
+        refName: "pr-branch",
+        newRefName: null,
+        baseRefName: null,
+      },
+    });
+    if (!createCall) {
+      throw new Error("expected one managed-worktree creation call");
+    }
+    const managedInput = (createCall.input as { input: Record<string, unknown> }).input;
+    expect(managedInput).not.toHaveProperty("cwd");
+    expect(managedInput).not.toHaveProperty("path");
+    expect(managedInput).not.toHaveProperty("worktreePath");
+    expect(managedInput).not.toHaveProperty("kind");
+    expect(h.navigateCalls).toContainEqual({
+      to: "/$environmentId/$threadId",
+      params: {
+        environmentId,
+        threadId: managedInput["threadId"],
+      },
     });
   });
 

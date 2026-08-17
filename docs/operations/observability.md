@@ -19,11 +19,37 @@ Native diagnostics remain local to each BiBCode installation.
 ## Logs
 
 Rust diagnostics are emitted with `tracing::debug!`, `tracing::warn!`, and
-`tracing::error!` at operational boundaries. Every server mode initializes the
-same native subscriber and appends to `userdata/logs/server.log` (or
-`dev/logs/server.log` for a source development environment) while retaining
-human-readable stderr output. `BIBCODE_LOG` controls the filter and falls back to
-the standard `RUST_LOG` behavior, then `info`.
+`tracing::error!` at operational boundaries. Native tracing is one
+process-wide stream with one subscriber. Each active server runtime owns an
+exact sink lease for `userdata/logs/server.log` (or `dev/logs/server.log` for a
+source development environment), while the subscriber also retains
+human-readable stderr output. Production normally has one active runtime and
+one file sink. When several embedded runtimes coexist in one process, every
+native tracing event is mirrored to every active runtime-owned sink; those log
+files are not runtime-isolated. Public initialization and runtime-owned
+initialization that resolve to the same physical log path share one writer,
+rotation state, and reference-counted registry entry, so a process event is
+written only once to that file. Existing final-component aliases use the
+filesystem's fully canonicalized physical target. An absent target is reserved
+by its canonical parent identity plus one opaque native filename component.
+Every unresolved component retains its exact native spelling on every
+platform; case aliases reconcile only after the filesystem opens and identifies
+them as one physical target. POSIX filename bytes are never interpreted as
+Windows separators, and no platform guesses pre-open case equivalence with a
+Unicode fold. Concurrent same-target initialization waits for the reservation
+and reuses the resulting writer, including across log rotation. Rotation
+advances the writer's identity generation, and the next registration refreshes
+the full physical-file index outside the registry mutex before resolving
+aliases. Descriptor/path identity checks share one registration-wide budget of
+three attempts; repeated target replacement fails startup, rolls the exact
+pending reservation back, and wakes same-target waiters. A lease-free entry
+stays discoverable while an in-flight event snapshot can still write; the exact
+entry is removed only after its last lease and last snapshot drop. A panicking
+or failed opener likewise rolls its pending reservation back and wakes
+same-target waiters. These guarantees prevent one runtime or in-flight event
+from retargeting or tearing down another runtime's logging without accumulating
+completed entries. `BIBCODE_LOG` controls the filter and falls back to the
+standard `RUST_LOG` behavior, then `info`.
 
 In headless mode, run the native server from a terminal or service manager to
 retain an additional stderr stream:
@@ -155,9 +181,10 @@ changed identities, permission failures, and unsupported process topologies
 remain unclaimed and produce bounded partial or unavailable coverage. The
 observer never claims a generic WebKit process by machine-wide name matching.
 
-Production provider and terminal launchers register their root PID, scope,
-kind, and bounded label. The schema reserves the `helper` kind, but no
-production helper launcher currently registers it. Descendants inherit the
+Production provider, terminal, provider-helper, and managed-endpoint tunnel
+launchers register their exact root identity, scope, kind, and bounded label.
+Independent Codex/OpenCode helpers and the tunnel use the `helper` kind and
+dedicated process groups or Windows Jobs. Descendants inherit the
 nearest registered root's attribution. A process with no registered provider or
 terminal ancestor that remains descended from the native server is visible as
 External Tooling with `unknown` kind and fallback confidence; missing

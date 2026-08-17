@@ -10,7 +10,7 @@
  * driving the returned `run`/`resetError` directly. `VcsActionUnavailableError`,
  * `AsyncResult`, `Cause`, and `Option` are kept real.
  */
-import { EnvironmentId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId } from "@bibcode/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
 import { describe, expect, it, vi, beforeEach } from "vite-plus/test";
@@ -190,7 +190,6 @@ describe("scope short-circuit (VcsActionUnavailableError)", () => {
     await expectUnavailable(
       await usePreparePullRequestThreadAction(nullScope).run({
         reference: "main",
-        mode: "local",
       }),
       "prepare_pull_request_thread",
     );
@@ -270,23 +269,11 @@ describe("command dispatch on a complete scope", () => {
     expect(h.refresh).toHaveBeenCalledTimes(1);
   });
 
-  it("prepare pull request thread includes an optional threadId only when present", async () => {
-    await usePreparePullRequestThreadAction(fullScope).run({ reference: "main", mode: "worktree" });
+  it("prepares pull requests only in safe local mode", async () => {
+    await usePreparePullRequestThreadAction(fullScope).run({ reference: "main" });
     expect(h.commandCalls[0]!.input).toEqual({
       environmentId,
-      input: { cwd: "/repo", reference: "main", mode: "worktree" },
-    });
-
-    h.commandCalls.length = 0;
-    const threadId = ThreadId.make("thread-1");
-    await usePreparePullRequestThreadAction(fullScope).run({
-      reference: "feature",
-      mode: "local",
-      threadId,
-    });
-    expect(h.commandCalls[0]!.input).toEqual({
-      environmentId,
-      input: { cwd: "/repo", reference: "feature", mode: "local", threadId },
+      input: { cwd: "/repo", reference: "main", mode: "local" },
     });
   });
 

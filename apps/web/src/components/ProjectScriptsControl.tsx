@@ -26,7 +26,10 @@ import React, {
   type ReactNode,
   type SetStateAction,
   useCallback,
+  useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -112,6 +115,7 @@ export interface ProjectScriptsControlProps {
   keybindings: ResolvedKeybindingsConfig;
   preferredScriptId?: string | null;
   enabled?: boolean;
+  disabledReason?: string | null;
   onRunScript: (script: ProjectScript) => void;
   onAddScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
   onUpdateScript: (
@@ -124,6 +128,7 @@ export interface ProjectScriptsControlProps {
 export interface ProjectScriptsController {
   readonly scripts: ReadonlyArray<ProjectScript>;
   readonly primaryScript: ProjectScript | null;
+  readonly disabledReason: string | null;
   readonly openAddDialog: () => void;
   readonly openEditDialog: (script: ProjectScript) => void;
   readonly runScript: (script: ProjectScript) => void;
@@ -166,6 +171,7 @@ export function useProjectScriptsController({
   keybindings,
   preferredScriptId = null,
   enabled = true,
+  disabledReason = null,
   onRunScript,
   onAddScript,
   onUpdateScript,
@@ -184,6 +190,25 @@ export function useProjectScriptsController({
   const [autoOpenPreview, setAutoOpenPreview] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const availabilityRef = useRef({ enabled, disabledReason });
+  useLayoutEffect(() => {
+    availabilityRef.current = { enabled, disabledReason };
+  }, [disabledReason, enabled]);
+  const currentDisabledReason = useCallback(() => {
+    const availability = availabilityRef.current;
+    return availability.enabled
+      ? null
+      : (availability.disabledReason ?? "Project actions are unavailable.");
+  }, []);
+
+  useEffect(() => {
+    const reason = currentDisabledReason();
+    if (reason === null) return;
+    setDialogOpen(false);
+    setIconPickerOpen(false);
+    setDeleteConfirmOpen(false);
+    setValidationError(reason);
+  }, [currentDisabledReason, disabledReason, enabled]);
 
   const primaryScript = useMemo(() => {
     if (preferredScriptId) {
@@ -207,6 +232,11 @@ export function useProjectScriptsController({
   const submitScript = useCallback(
     async (event: FormEvent) => {
       event.preventDefault();
+      const unavailableReason = currentDisabledReason();
+      if (unavailableReason !== null) {
+        setValidationError(unavailableReason);
+        return;
+      }
       const trimmedName = name.trim();
       const trimmedCommand = command.trim();
       if (trimmedName.length === 0) {
@@ -249,6 +279,11 @@ export function useProjectScriptsController({
       const result = editingScriptId
         ? await onUpdateScript(editingScriptId, payload)
         : await onAddScript(payload);
+      const lateUnavailableReason = currentDisabledReason();
+      if (lateUnavailableReason !== null) {
+        setValidationError(lateUnavailableReason);
+        return;
+      }
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
@@ -262,6 +297,7 @@ export function useProjectScriptsController({
     [
       autoOpenPreview,
       command,
+      currentDisabledReason,
       editingScriptId,
       icon,
       keybinding,
@@ -275,7 +311,7 @@ export function useProjectScriptsController({
   );
 
   const openAddDialog = useCallback(() => {
-    if (!enabled) return;
+    if (currentDisabledReason() !== null) return;
     setEditingScriptId(null);
     setName("");
     setCommand("");
@@ -287,11 +323,11 @@ export function useProjectScriptsController({
     setAutoOpenPreview(false);
     setValidationError(null);
     setDialogOpen(true);
-  }, [enabled]);
+  }, [currentDisabledReason]);
 
   const openEditDialog = useCallback(
     (script: ProjectScript) => {
-      if (!enabled) return;
+      if (currentDisabledReason() !== null) return;
       setEditingScriptId(script.id);
       setName(script.name);
       setCommand(script.command);
@@ -306,26 +342,32 @@ export function useProjectScriptsController({
       setValidationError(null);
       setDialogOpen(true);
     },
-    [enabled, keybindings],
+    [currentDisabledReason, keybindings],
   );
 
   const runScript = useCallback(
     (script: ProjectScript) => {
-      if (enabled) onRunScript(script);
+      if (currentDisabledReason() === null) onRunScript(script);
     },
-    [enabled, onRunScript],
+    [currentDisabledReason, onRunScript],
   );
 
   const confirmDeleteScript = useCallback(() => {
     if (!editingScriptId) return;
     setDeleteConfirmOpen(false);
     setDialogOpen(false);
+    const unavailableReason = currentDisabledReason();
+    if (unavailableReason !== null) {
+      setValidationError(unavailableReason);
+      return;
+    }
     void onDeleteScript(editingScriptId);
-  }, [editingScriptId, onDeleteScript]);
+  }, [currentDisabledReason, editingScriptId, onDeleteScript]);
 
   const controller: ProjectScriptsControllerState = {
     scripts,
     primaryScript,
+    disabledReason,
     openAddDialog,
     openEditDialog,
     runScript,
@@ -382,6 +424,8 @@ export function ProjectScriptsMenuItems({
           <MenuItem
             key={script.id}
             className={`group ${dropdownItemClassName}`}
+            disabled={controller.disabledReason !== null}
+            title={controller.disabledReason ?? undefined}
             onClick={() => controller.runScript(script)}
           >
             <ScriptIcon icon={script.icon} className="size-4" />
@@ -400,6 +444,8 @@ export function ProjectScriptsMenuItems({
                 size="icon-xs"
                 className="absolute right-0 top-1/2 size-6 -translate-y-1/2 opacity-0 pointer-events-none transition-opacity group-hover:opacity-100 group-hover:pointer-events-auto group-focus-visible:opacity-100 group-focus-visible:pointer-events-auto"
                 aria-label={`Edit ${script.name}`}
+                disabled={controller.disabledReason !== null}
+                title={controller.disabledReason ?? undefined}
                 onPointerDown={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
@@ -416,7 +462,12 @@ export function ProjectScriptsMenuItems({
           </MenuItem>
         );
       })}
-      <MenuItem className={dropdownItemClassName} onClick={controller.openAddDialog}>
+      <MenuItem
+        className={dropdownItemClassName}
+        disabled={controller.disabledReason !== null}
+        title={controller.disabledReason ?? undefined}
+        onClick={controller.openAddDialog}
+      >
         <PlusIcon className="size-4" />
         Add action
       </MenuItem>
@@ -441,6 +492,8 @@ export function ProjectScriptsExpandedActions({
               size="xs"
               variant="outline"
               aria-label={`Run ${primaryScript.name}`}
+              disabled={controller.disabledReason !== null}
+              title={controller.disabledReason ?? undefined}
               onClick={() => controller.runScript(primaryScript)}
             />
           }
@@ -450,12 +503,22 @@ export function ProjectScriptsExpandedActions({
             {primaryScript.name}
           </span>
         </TooltipTrigger>
-        <TooltipPopup side="top">Run {primaryScript.name}</TooltipPopup>
+        <TooltipPopup side="top">
+          {controller.disabledReason ?? `Run ${primaryScript.name}`}
+        </TooltipPopup>
       </Tooltip>
       <GroupSeparator className="hidden @3xl/header-actions:block" />
       <Menu highlightItemOnHover={false}>
         <MenuTrigger
-          render={<Button size="icon-xs" variant="outline" aria-label="Script actions" />}
+          render={
+            <Button
+              size="icon-xs"
+              variant="outline"
+              aria-label="Script actions"
+              disabled={controller.disabledReason !== null}
+              title={controller.disabledReason ?? undefined}
+            />
+          }
         >
           <ChevronDownIcon className="size-4" />
         </MenuTrigger>

@@ -35,8 +35,6 @@ import {
   GitCommandError,
   VcsCreateRefInput,
   VcsCreateRefResult,
-  VcsCreateWorktreeInput,
-  VcsCreateWorktreeResult,
   GitCloneInput,
   GitCloneResult,
   VcsDiscardFilesInput,
@@ -53,7 +51,6 @@ import {
   VcsPullInput,
   GitPullRequestRefInput,
   VcsPullResult,
-  VcsRemoveWorktreeInput,
   GitResolvePullRequestResult,
   GitRunStackedActionInput,
   VcsStageFilesInput,
@@ -70,6 +67,7 @@ import {
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
   ClientOrchestrationCommand,
+  ModelSelection,
   ORCHESTRATION_WS_METHODS,
   OrchestrationDispatchCommandError,
   OrchestrationGetFullThreadDiffError,
@@ -80,7 +78,16 @@ import {
   OrchestrationReplayEventsError,
   OrchestrationReplayEventsInput,
   OrchestrationRpcSchemas,
+  ProviderInteractionMode,
+  RuntimeMode,
 } from "./orchestration.ts";
+import {
+  CommandId,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -190,6 +197,111 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  ProjectWorktreeDiscoveryPolicy,
+  VcsWorktreeCatalogSnapshot,
+  WorktreeCatalogError,
+  WorktreeCatalogInput,
+  WorktreeCatalogRefreshInput,
+  WorktreeDiscoveryPolicyUpdateInput,
+  WorktreeAdoptResult,
+  WorktreeAdoptionError,
+  WorktreeKey,
+  WorktreeOperationError,
+  WorktreeRemovalError,
+  WorktreeRemovalMode,
+  WorktreeRemovalPlan,
+  WorktreeRemovalPlanToken,
+  WorktreeRemovalResult,
+  WorkspaceIdentityError,
+  WorkspaceUnavailableError,
+} from "./worktree.ts";
+
+export const WorktreeAdoptInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  worktreeKey: WorktreeKey,
+  expectedGeneration: NonNegativeInt,
+  threadDefaults: Schema.Struct({
+    modelSelection: ModelSelection,
+    runtimeMode: RuntimeMode,
+    interactionMode: ProviderInteractionMode,
+  }),
+});
+export type WorktreeAdoptInput = typeof WorktreeAdoptInput.Type;
+
+const WorktreeThreadDefaults = Schema.Struct({
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+
+export const WorktreeCreateManagedInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  title: TrimmedNonEmptyString,
+  refName: TrimmedNonEmptyString,
+  newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  threadDefaults: WorktreeThreadDefaults,
+});
+export type WorktreeCreateManagedInput = typeof WorktreeCreateManagedInput.Type;
+
+export const WorktreeCreatePanelInput = Schema.Struct({
+  commandId: CommandId,
+  hostThreadId: ThreadId,
+  threadId: ThreadId,
+  title: TrimmedNonEmptyString,
+  threadDefaults: WorktreeThreadDefaults,
+});
+export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
+
+export const WorktreeRetargetInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  worktreeKey: WorktreeKey,
+  expectedGeneration: NonNegativeInt,
+});
+export type WorktreeRetargetInput = typeof WorktreeRetargetInput.Type;
+
+export const WorktreeThreadResult = Schema.Struct({
+  threadId: ThreadId,
+});
+export type WorktreeThreadResult = typeof WorktreeThreadResult.Type;
+
+export const WorktreeManagedCreateResult = Schema.Struct({
+  threadId: ThreadId,
+  path: TrimmedNonEmptyString,
+  refName: TrimmedNonEmptyString,
+});
+export type WorktreeManagedCreateResult = typeof WorktreeManagedCreateResult.Type;
+
+export const WorktreeGetRemovalPlanInput = Schema.Struct({
+  projectId: ProjectId,
+  threadId: ThreadId,
+});
+export type WorktreeGetRemovalPlanInput = typeof WorktreeGetRemovalPlanInput.Type;
+
+export const WorktreeRemoveFromBibCodeInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+});
+export type WorktreeRemoveFromBibCodeInput = typeof WorktreeRemoveFromBibCodeInput.Type;
+
+export const WorktreeRemoveInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  mode: WorktreeRemovalMode,
+  expectedGeneration: NonNegativeInt,
+  planToken: WorktreeRemovalPlanToken,
+  forceDirty: Schema.Boolean,
+  confirmRepositoryWidePrune: Schema.Boolean,
+});
+export type WorktreeRemoveInput = typeof WorktreeRemoveInput.Type;
 
 export const WS_METHODS = {
   // Project registry methods
@@ -217,8 +329,6 @@ export const WS_METHODS = {
   vcsRefreshStatus: "vcs.refreshStatus",
   vcsListRefs: "vcs.listRefs",
   vcsListCommits: "vcs.listCommits",
-  vcsCreateWorktree: "vcs.createWorktree",
-  vcsRemoveWorktree: "vcs.removeWorktree",
   vcsClone: "vcs.clone",
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
@@ -227,6 +337,15 @@ export const WS_METHODS = {
   vcsUnstageFiles: "vcs.unstageFiles",
   vcsDiscardFiles: "vcs.discardFiles",
   vcsGenerateCommitMessage: "vcs.generateCommitMessage",
+  vcsRefreshWorktreeCatalog: "vcs.refreshWorktreeCatalog",
+  worktreeUpdateDiscoveryPolicy: "worktree.updateDiscoveryPolicy",
+  worktreeAdopt: "worktree.adopt",
+  worktreeCreateManaged: "worktree.createManaged",
+  worktreeCreatePanel: "worktree.createPanel",
+  worktreeRetarget: "worktree.retarget",
+  worktreeGetRemovalPlan: "worktree.getRemovalPlan",
+  worktreeRemoveFromBibCode: "worktree.removeFromBibCode",
+  worktreeRemove: "worktree.remove",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -300,6 +419,7 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeActivity: "subscribeActivity",
+  subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
 } as const;
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -424,7 +544,12 @@ export const WsSourceControlLookupRepositoryRpc = Rpc.make(
   {
     payload: SourceControlRepositoryLookupInput,
     success: SourceControlRepositoryInfo,
-    error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      SourceControlRepositoryError,
+      WorkspaceUnavailableError,
+      WorkspaceIdentityError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
@@ -439,178 +564,406 @@ export const WsSourceControlPublishRepositoryRpc = Rpc.make(
   {
     payload: SourceControlPublishRepositoryInput,
     success: SourceControlPublishRepositoryResult,
-    error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      SourceControlRepositoryError,
+      WorkspaceUnavailableError,
+      WorkspaceIdentityError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
 export const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
   payload: ProjectSearchEntriesInput,
   success: ProjectSearchEntriesResult,
-  error: Schema.Union([ProjectSearchEntriesError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectSearchEntriesError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsListEntriesRpc = Rpc.make(WS_METHODS.projectsListEntries, {
   payload: ProjectListEntriesInput,
   success: ProjectListEntriesResult,
-  error: Schema.Union([ProjectListEntriesError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectListEntriesError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   payload: ProjectReadFileInput,
   success: ProjectReadFileResult,
-  error: Schema.Union([ProjectReadFileError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectReadFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
-  error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectWriteFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsCreateEntryRpc = Rpc.make(WS_METHODS.projectsCreateEntry, {
   payload: ProjectCreateEntryInput,
   success: ProjectCreateEntryResult,
-  error: Schema.Union([ProjectCreateEntryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectCreateEntryError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsRenameEntryRpc = Rpc.make(WS_METHODS.projectsRenameEntry, {
   payload: ProjectRenameEntryInput,
   success: ProjectRenameEntryResult,
-  error: Schema.Union([ProjectRenameEntryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectRenameEntryError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsDeleteEntryRpc = Rpc.make(WS_METHODS.projectsDeleteEntry, {
   payload: ProjectDeleteEntryInput,
   success: ProjectDeleteEntryResult,
-  error: Schema.Union([ProjectDeleteEntryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectDeleteEntryError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsProjectsDuplicateEntryRpc = Rpc.make(WS_METHODS.projectsDuplicateEntry, {
   payload: ProjectDuplicateEntryInput,
   success: ProjectDuplicateEntryResult,
-  error: Schema.Union([ProjectDuplicateEntryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ProjectDuplicateEntryError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
-  error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ExternalLauncherError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
   payload: FilesystemBrowseInput,
   success: FilesystemBrowseResult,
-  error: Schema.Union([FilesystemBrowseError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    FilesystemBrowseError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
-  error: Schema.Union([AssetAccessError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    AssetAccessError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
   success: VcsStatusStreamEvent,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
   stream: true,
 });
 
 export const WsVcsPullRpc = Rpc.make(WS_METHODS.vcsPull, {
   payload: VcsPullInput,
   success: VcsPullResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
   payload: VcsStatusInput,
   success: VcsStatusResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   payload: GitRunStackedActionInput,
   success: GitActionProgressEvent,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
   stream: true,
 });
 
 export const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequest, {
   payload: GitPullRequestRefInput,
   success: GitResolvePullRequestResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsGitPreparePullRequestThreadRpc = Rpc.make(WS_METHODS.gitPreparePullRequestThread, {
   payload: GitPreparePullRequestThreadInput,
   success: GitPreparePullRequestThreadResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsListRefsRpc = Rpc.make(WS_METHODS.vcsListRefs, {
   payload: VcsListRefsInput,
   success: VcsListRefsResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsListCommitsRpc = Rpc.make(WS_METHODS.vcsListCommits, {
   payload: VcsListCommitsInput,
   success: VcsListCommitsResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
-});
-
-export const WsVcsCreateWorktreeRpc = Rpc.make(WS_METHODS.vcsCreateWorktree, {
-  payload: VcsCreateWorktreeInput,
-  success: VcsCreateWorktreeResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
-});
-
-export const WsVcsRemoveWorktreeRpc = Rpc.make(WS_METHODS.vcsRemoveWorktree, {
-  payload: VcsRemoveWorktreeInput,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsCloneRpc = Rpc.make(WS_METHODS.vcsClone, {
   payload: GitCloneInput,
   success: GitCloneResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsCreateRefRpc = Rpc.make(WS_METHODS.vcsCreateRef, {
   payload: VcsCreateRefInput,
   success: VcsCreateRefResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsSwitchRefRpc = Rpc.make(WS_METHODS.vcsSwitchRef, {
   payload: VcsSwitchRefInput,
   success: VcsSwitchRefResult,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsInitRpc = Rpc.make(WS_METHODS.vcsInit, {
   payload: VcsInitInput,
-  error: Schema.Union([VcsError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    VcsError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsStageFilesRpc = Rpc.make(WS_METHODS.vcsStageFiles, {
   payload: VcsStageFilesInput,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsUnstageFilesRpc = Rpc.make(WS_METHODS.vcsUnstageFiles, {
   payload: VcsUnstageFilesInput,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsDiscardFilesRpc = Rpc.make(WS_METHODS.vcsDiscardFiles, {
   payload: VcsDiscardFilesInput,
-  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsVcsGenerateCommitMessageRpc = Rpc.make(WS_METHODS.vcsGenerateCommitMessage, {
   payload: VcsGenerateCommitMessageInput,
   success: VcsGenerateCommitMessageResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsSubscribeWorktreeCatalogRpc = Rpc.make(WS_METHODS.subscribeWorktreeCatalog, {
+  payload: WorktreeCatalogInput,
+  success: VcsWorktreeCatalogSnapshot,
+  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsVcsRefreshWorktreeCatalogRpc = Rpc.make(WS_METHODS.vcsRefreshWorktreeCatalog, {
+  payload: WorktreeCatalogRefreshInput,
+  success: VcsWorktreeCatalogSnapshot,
+  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
+  WS_METHODS.worktreeUpdateDiscoveryPolicy,
+  {
+    payload: WorktreeDiscoveryPolicyUpdateInput,
+    success: ProjectWorktreeDiscoveryPolicy,
+    error: Schema.Union([
+      WorktreeCatalogError,
+      WorktreeOperationError,
+      EnvironmentAuthorizationError,
+    ]),
+  },
+);
+
+export const WsWorktreeAdoptRpc = Rpc.make(WS_METHODS.worktreeAdopt, {
+  payload: WorktreeAdoptInput,
+  success: WorktreeAdoptResult,
+  error: Schema.Union([
+    WorktreeAdoptionError,
+    WorktreeOperationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeCreateManagedRpc = Rpc.make(WS_METHODS.worktreeCreateManaged, {
+  payload: WorktreeCreateManagedInput,
+  success: WorktreeManagedCreateResult,
+  error: Schema.Union([
+    WorktreeAdoptionError,
+    WorktreeOperationError,
+    GitCommandError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeCreatePanelRpc = Rpc.make(WS_METHODS.worktreeCreatePanel, {
+  payload: WorktreeCreatePanelInput,
+  success: WorktreeThreadResult,
+  error: Schema.Union([
+    WorktreeAdoptionError,
+    WorktreeOperationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeRetargetRpc = Rpc.make(WS_METHODS.worktreeRetarget, {
+  payload: WorktreeRetargetInput,
+  success: WorktreeThreadResult,
+  error: Schema.Union([
+    WorktreeAdoptionError,
+    WorktreeOperationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeGetRemovalPlanRpc = Rpc.make(WS_METHODS.worktreeGetRemovalPlan, {
+  payload: WorktreeGetRemovalPlanInput,
+  success: WorktreeRemovalPlan,
+  error: Schema.Union([
+    WorktreeRemovalError,
+    WorktreeOperationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeRemoveFromBibCodeRpc = Rpc.make(WS_METHODS.worktreeRemoveFromBibCode, {
+  payload: WorktreeRemoveFromBibCodeInput,
+  success: WorktreeRemovalResult,
+  error: Schema.Union([
+    WorktreeRemovalError,
+    WorktreeOperationError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+export const WsWorktreeRemoveRpc = Rpc.make(WS_METHODS.worktreeRemove, {
+  payload: WorktreeRemoveInput,
+  success: WorktreeRemovalResult,
+  error: Schema.Union([
+    WorktreeRemovalError,
+    WorktreeOperationError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 /**
@@ -621,25 +974,45 @@ export const WsVcsGenerateCommitMessageRpc = Rpc.make(WS_METHODS.vcsGenerateComm
 export const WsReviewGetDiffPreviewRpc = Rpc.make(WS_METHODS.reviewGetDiffPreview, {
   payload: ReviewDiffPreviewInput,
   success: ReviewDiffPreviewResult,
-  error: Schema.Union([ReviewDiffPreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    ReviewDiffPreviewError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
   payload: TerminalOpenInput,
   success: TerminalSessionSnapshot,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    TerminalError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsTerminalAttachRpc = Rpc.make(WS_METHODS.terminalAttach, {
   payload: TerminalAttachInput,
   success: TerminalAttachStreamEvent,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    TerminalError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
   stream: true,
 });
 
 export const WsTerminalWriteRpc = Rpc.make(WS_METHODS.terminalWrite, {
   payload: TerminalWriteInput,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    TerminalError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
@@ -655,7 +1028,12 @@ export const WsTerminalClearRpc = Rpc.make(WS_METHODS.terminalClear, {
 export const WsTerminalRestartRpc = Rpc.make(WS_METHODS.terminalRestart, {
   payload: TerminalRestartInput,
   success: TerminalSessionSnapshot,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    TerminalError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsTerminalCloseRpc = Rpc.make(WS_METHODS.terminalClose, {
@@ -741,7 +1119,12 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
   {
     payload: ClientOrchestrationCommand,
     success: OrchestrationRpcSchemas.dispatchCommand.output,
-    error: Schema.Union([OrchestrationDispatchCommandError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      OrchestrationDispatchCommandError,
+      WorkspaceUnavailableError,
+      WorkspaceIdentityError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
@@ -907,8 +1290,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitPreparePullRequestThreadRpc,
   WsVcsListRefsRpc,
   WsVcsListCommitsRpc,
-  WsVcsCreateWorktreeRpc,
-  WsVcsRemoveWorktreeRpc,
   WsVcsCloneRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
@@ -917,6 +1298,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsUnstageFilesRpc,
   WsVcsDiscardFilesRpc,
   WsVcsGenerateCommitMessageRpc,
+  WsSubscribeWorktreeCatalogRpc,
+  WsVcsRefreshWorktreeCatalogRpc,
+  WsWorktreeUpdateDiscoveryPolicyRpc,
+  WsWorktreeAdoptRpc,
+  WsWorktreeCreateManagedRpc,
+  WsWorktreeCreatePanelRpc,
+  WsWorktreeRetargetRpc,
+  WsWorktreeGetRemovalPlanRpc,
+  WsWorktreeRemoveFromBibCodeRpc,
+  WsWorktreeRemoveRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

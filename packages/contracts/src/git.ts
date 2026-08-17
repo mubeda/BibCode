@@ -56,7 +56,7 @@ export const VcsWorkingTreeFileStatus = Schema.Literals([
 export type VcsWorkingTreeFileStatus = typeof VcsWorkingTreeFileStatus.Type;
 export const VcsStagingArea = Schema.Literals(["staged", "unstaged", "untracked"]);
 export type VcsStagingArea = typeof VcsStagingArea.Type;
-const GitPreparePullRequestThreadMode = Schema.Literals(["local", "worktree"]);
+const GitPreparePullRequestThreadMode = Schema.Literal("local");
 export const GitRunStackedActionToastRunAction = Schema.Struct({
   kind: GitStackedAction,
 });
@@ -94,10 +94,6 @@ export const VcsRef = Schema.Struct({
 });
 export type VcsRef = typeof VcsRef.Type;
 
-const VcsWorktree = Schema.Struct({
-  path: TrimmedNonEmptyStringSchema,
-  refName: TrimmedNonEmptyStringSchema,
-});
 const GitResolvedPullRequest = Schema.Struct({
   number: PositiveInt,
   title: TrimmedNonEmptyStringSchema,
@@ -183,8 +179,7 @@ export const GitPreparePullRequestThreadInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   reference: GitPullRequestReference,
   mode: GitPreparePullRequestThreadMode,
-  threadId: Schema.optional(ThreadId),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type GitPreparePullRequestThreadInput = typeof GitPreparePullRequestThreadInput.Type;
 
 export const VcsRemoveWorktreeInput = Schema.Struct({
@@ -306,11 +301,6 @@ export const VcsListRefsResult = Schema.Struct({
 });
 export type VcsListRefsResult = typeof VcsListRefsResult.Type;
 
-export const VcsCreateWorktreeResult = Schema.Struct({
-  worktree: VcsWorktree,
-});
-export type VcsCreateWorktreeResult = typeof VcsCreateWorktreeResult.Type;
-
 export const GitCloneResult = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
 });
@@ -324,7 +314,6 @@ export type GitResolvePullRequestResult = typeof GitResolvePullRequestResult.Typ
 export const GitPreparePullRequestThreadResult = Schema.Struct({
   pullRequest: GitResolvedPullRequest,
   branch: TrimmedNonEmptyStringSchema,
-  worktreePath: TrimmedNonEmptyStringSchema.pipe(Schema.NullOr),
 });
 export type GitPreparePullRequestThreadResult = typeof GitPreparePullRequestThreadResult.Type;
 

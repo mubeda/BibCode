@@ -61,8 +61,13 @@ const h = vi.hoisted(() => {
     updateState: null as unknown,
     primaryEnvironment: null as unknown,
     projects: [] as unknown[],
+    serverConfigs: new Map<string, unknown>(),
     unarchiveThread: vi.fn(),
+    deleteThread: vi.fn(),
     confirmAndDeleteThread: vi.fn(),
+    requestWorktreeRemoval: vi.fn(),
+    closeWorktreeRemovalDialog: vi.fn(),
+    completeWorktreeRemoval: vi.fn(),
     archive: {
       snapshots: [] as unknown[],
       error: null as string | null,
@@ -165,13 +170,26 @@ vi.mock("../../state/environments", () => ({
 
 vi.mock("../../state/entities", () => ({
   useProjects: () => h.projects,
+  useServerConfigs: () => h.serverConfigs,
 }));
 
 vi.mock("../../hooks/useThreadActions", () => ({
   useThreadActions: () => ({
     unarchiveThread: h.unarchiveThread,
+    deleteThread: h.deleteThread,
     confirmAndDeleteThread: h.confirmAndDeleteThread,
+    worktreeRemovalTarget: null,
+    requestWorktreeRemoval: h.requestWorktreeRemoval,
+    closeWorktreeRemovalDialog: h.closeWorktreeRemovalDialog,
+    completeWorktreeRemoval: h.completeWorktreeRemoval,
   }),
+}));
+
+vi.mock("../WorktreeRemovalDialog", () => ({
+  WorktreeRemovalDialog: (props: AnyProps) => {
+    h.controls.push({ kind: "dialog", label: "worktree-removal", props });
+    return null;
+  },
 }));
 
 vi.mock("../../lib/archivedThreadsState", () => ({
@@ -597,6 +615,10 @@ beforeEach(() => {
   h.unarchiveThread.mockResolvedValue({ _tag: "Success", value: undefined });
   h.confirmAndDeleteThread.mockReset();
   h.confirmAndDeleteThread.mockResolvedValue({ _tag: "Success", value: undefined });
+  h.requestWorktreeRemoval.mockReset();
+  h.closeWorktreeRemovalDialog.mockReset();
+  h.completeWorktreeRemoval.mockReset();
+  h.completeWorktreeRemoval.mockResolvedValue({ _tag: "Success", value: undefined });
   h.archive.snapshots = [];
   h.archive.error = null;
   h.archive.isLoading = false;
@@ -1304,9 +1326,19 @@ describe("ProviderSettingsPanel", () => {
     expect(control("button", "Add provider instance").props.hidden).toBe(true);
 
     const cardIds = h.instanceCards.map((card) => String(card.instanceId));
-    // Cursor's default slot is hidden (no live cursor provider), but the
-    // custom cursor instance still renders as an orphaned row.
-    expect(cardIds).toEqual(["codex", "codex_personal", "claudeAgent", "opencode", "cursor_alt"]);
+    expect(cardIds).toEqual([
+      "codex",
+      "codex_personal",
+      "claudeAgent",
+      "cursor",
+      "cursor_alt",
+      "opencode",
+    ]);
+
+    const cursorCard = h.instanceCards.find((card) => String(card.instanceId) === "cursor")!;
+    const opencodeCard = h.instanceCards.find((card) => String(card.instanceId) === "opencode")!;
+    expect((cursorCard.driverOption as { badgeLabel?: string }).badgeLabel).toBeUndefined();
+    expect((opencodeCard.driverOption as { badgeLabel?: string }).badgeLabel).toBeUndefined();
 
     const codexCard = h.instanceCards.find((card) => String(card.instanceId) === "codex")!;
     expect(codexCard.headerAction).not.toBeNull();
@@ -2025,6 +2057,26 @@ describe("ProviderSettingsPanel", () => {
 describe("ArchivedThreadsPanel", () => {
   const env1 = EnvironmentId.make("environment-one");
   const env2 = EnvironmentId.make("environment-two");
+  const removedTarget = {
+    environmentId: env1,
+    projectId: "project-a",
+    threadId: "thread-new",
+    title: "Newer thread",
+    path: "/work/alpha-worktrees/feature",
+    branch: "feature/archived",
+    availability: "missing-registered",
+    registrationState: "prunable",
+    locked: false,
+  } as const;
+  const removedResult = {
+    threadRemoved: true,
+    gitOutcome: "removed",
+    orphanCleanupPending: false,
+  } as const;
+
+  function reportRemoval(): void {
+    invoke(control("dialog", "worktree-removal"), "onRemoved", removedTarget, removedResult);
+  }
 
   function archivedSnapshots() {
     return [
@@ -2073,6 +2125,10 @@ describe("ArchivedThreadsPanel", () => {
 
   beforeEach(() => {
     h.projects = [{ environmentId: env1 }, { environmentId: env2 }];
+    h.serverConfigs = new Map([
+      [env1, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [env2, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
   });
 
   it("shows the loading state", () => {
@@ -2216,6 +2272,164 @@ describe("ArchivedThreadsPanel", () => {
         description: "menu exploded",
       }),
     );
+  });
+
+  it("opens the reusable removal dialog for an archived worktree without deleting by path", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    archivedThread.branch = "feature/archived";
+    h.archive.snapshots = snapshots;
+    const showSpy = vi.fn().mockResolvedValue("delete");
+    h.localApi = { contextMenu: { show: showSpy } };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    expect(row).toBeDefined();
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(h.requestWorktreeRemoval).toHaveBeenCalledWith({
+      environmentId: env1,
+      projectId: "project-a",
+      threadId: "thread-new",
+      title: "Newer thread",
+      path: "/work/alpha-worktrees/feature",
+      branch: "feature/archived",
+      availability: "verification-unavailable",
+      registrationState: null,
+      locked: false,
+    });
+    expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
+  });
+
+  it("uses generic detach-only deletion for an archived worktree on an unsupported server", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    archivedThread.branch = "feature/archived";
+    h.archive.snapshots = snapshots;
+    h.serverConfigs = new Map([
+      [env1, { environment: { capabilities: { worktreeCatalog: false } } }],
+      [env2, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    const confirm = vi.fn().mockResolvedValue(true);
+    h.localApi = {
+      contextMenu: { show: vi.fn().mockResolvedValue("delete") },
+      dialogs: { confirm },
+    };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("files will be left untouched"));
+    expect(h.deleteThread).toHaveBeenCalledWith({
+      environmentId: env1,
+      threadId: "thread-new",
+    });
+    expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
+    expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("keeps archived panel-thread deletion on the ordinary thread path", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.kind = "panel";
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    h.archive.snapshots = snapshots;
+    h.localApi = { contextMenu: { show: vi.fn().mockResolvedValue("delete") } };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(h.confirmAndDeleteThread).toHaveBeenCalledWith({
+      environmentId: env1,
+      threadId: "thread-new",
+    });
+    expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a post-removal navigation failure without refreshing the archive", async () => {
+    h.completeWorktreeRemoval.mockResolvedValueOnce({
+      _tag: "Failure",
+      cause: new Error("route unavailable"),
+    });
+    render(<ArchivedThreadsPanel />);
+
+    reportRemoval();
+    await flush();
+
+    expect(h.toastAdd).toHaveBeenCalledTimes(1);
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Worktree removed, but navigation failed",
+        description: "route unavailable",
+      }),
+    );
+    expect(h.archive.refresh).not.toHaveBeenCalled();
+  });
+
+  it("refreshes once after successful post-removal cleanup", async () => {
+    render(<ArchivedThreadsPanel />);
+
+    reportRemoval();
+    await flush();
+
+    expect(h.archive.refresh).toHaveBeenCalledTimes(1);
+    expect(h.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh or toast for interrupted cleanup after unmount", async () => {
+    const previousActEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean })
+      .IS_REACT_ACT_ENVIRONMENT;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const completion = deferred<unknown>();
+    h.completeWorktreeRemoval.mockReturnValueOnce(completion.promise);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<ArchivedThreadsPanel />));
+      reportRemoval();
+      await act(async () => root.unmount());
+      completion.resolve({ _tag: "Failure", interrupted: true });
+      await flush();
+
+      expect(h.archive.refresh).not.toHaveBeenCalled();
+      expect(h.toastAdd).not.toHaveBeenCalled();
+    } finally {
+      container.remove();
+      if (previousActEnvironment === undefined) {
+        Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+      } else {
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+          previousActEnvironment;
+      }
+    }
   });
 
   it("ignores context menus when no local API is present", async () => {

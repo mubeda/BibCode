@@ -1,0 +1,482 @@
+// @vitest-environment happy-dom
+
+import {
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  WorktreeRemovalPlanToken,
+  type WorktreeRemovalPlan,
+} from "@bibcode/contracts";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+const h = vi.hoisted(() => ({
+  commands: new Map<string, (input: unknown) => Promise<unknown>>(),
+  runners: new Map<string, (input: unknown) => Promise<unknown>>(),
+  calls: [] as Array<{ readonly label: string; readonly input: unknown }>,
+}));
+
+vi.mock("../state/use-atom-command", () => ({
+  useAtomCommand: (command: { label: string }) => h.runners.get(command.label),
+}));
+
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    getRemovalPlan: { label: "get-plan" },
+    removeFromBibCode: { label: "detach" },
+    remove: { label: "remove" },
+  },
+}));
+
+vi.mock("../lib/utils", () => ({
+  cn: (...values: unknown[]) => values.filter(Boolean).join(" "),
+  newCommandId: () => "command-test",
+}));
+
+vi.mock("./ui/dialog", () => ({
+  Dialog: ({ open, children }: { open: boolean; children: unknown }) =>
+    open ? <div role="presentation">{children as never}</div> : null,
+  DialogPopup: ({ children }: { children: unknown }) => (
+    <div role="dialog">{children as never}</div>
+  ),
+  DialogHeader: ({ children }: { children: unknown }) => <header>{children as never}</header>,
+  DialogTitle: ({ children }: { children: unknown }) => <h2>{children as never}</h2>,
+  DialogDescription: ({ children }: { children: unknown }) => <p>{children as never}</p>,
+  DialogPanel: ({ children }: { children: unknown }) => <div>{children as never}</div>,
+  DialogFooter: ({ children }: { children: unknown }) => <footer>{children as never}</footer>,
+}));
+
+import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
+
+const target: WorktreeRemovalTarget = {
+  environmentId: EnvironmentId.make("environment-one"),
+  projectId: ProjectId.make("project-one"),
+  threadId: ThreadId.make("thread-one"),
+  title: "Feature chat",
+  path: "/repo/worktrees/feature-one",
+  branch: "feature/one",
+  availability: "present",
+  registrationState: "registered",
+  locked: false,
+};
+
+function plan(overrides: Partial<WorktreeRemovalPlan> = {}): WorktreeRemovalPlan {
+  return {
+    planToken: WorktreeRemovalPlanToken.make("plan-one"),
+    generation: 7,
+    availability: "present",
+    registered: true,
+    locked: false,
+    trackedChangeCount: 0,
+    untrackedFileCount: 0,
+    pruneImpact: [],
+    ...overrides,
+  };
+}
+
+let root: Root;
+let container: HTMLDivElement;
+
+async function renderDialog(
+  overrides: Partial<React.ComponentProps<typeof WorktreeRemovalDialog>> = {},
+) {
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => {
+    root.render(
+      <WorktreeRemovalDialog
+        open
+        target={target}
+        onOpenChange={vi.fn()}
+        onRemoved={vi.fn()}
+        {...overrides}
+      />,
+    );
+    await Promise.resolve();
+  });
+}
+
+async function updateDialog(
+  overrides: Partial<React.ComponentProps<typeof WorktreeRemovalDialog>> = {},
+) {
+  await act(async () => {
+    root.render(
+      <WorktreeRemovalDialog
+        open
+        target={target}
+        onOpenChange={vi.fn()}
+        onRemoved={vi.fn()}
+        {...overrides}
+      />,
+    );
+    await Promise.resolve();
+  });
+}
+
+function button(name: string): HTMLButtonElement {
+  const match = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+    (candidate) => candidate.textContent?.trim() === name,
+  );
+  expect(match).toBeDefined();
+  return match!;
+}
+
+async function click(name: string): Promise<void> {
+  await act(async () => {
+    button(name).click();
+    await Promise.resolve();
+  });
+}
+
+beforeEach(() => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  h.calls = [];
+  h.commands.clear();
+  h.runners.clear();
+  for (const label of ["get-plan", "detach", "remove"]) {
+    h.runners.set(label, async (input: unknown) => {
+      h.calls.push({ label, input });
+      const command = h.commands.get(label);
+      if (!command) throw new Error(`Missing ${label} command mock`);
+      return command(input);
+    });
+  }
+  h.commands.set("get-plan", vi.fn().mockResolvedValue({ _tag: "Success", value: plan() }));
+  h.commands.set(
+    "detach",
+    vi.fn().mockResolvedValue({
+      _tag: "Success",
+      value: { threadRemoved: true, gitOutcome: "not-requested", orphanCleanupPending: false },
+    }),
+  );
+  h.commands.set(
+    "remove",
+    vi.fn().mockResolvedValue({
+      _tag: "Success",
+      value: {
+        _tag: "Removed",
+        result: { threadRemoved: true, gitOutcome: "removed", orphanCleanupPending: false },
+      },
+    }),
+  );
+});
+
+afterEach(async () => {
+  if (root) {
+    await act(async () => root.unmount());
+  }
+  container?.remove();
+});
+
+describe("WorktreeRemovalDialog", () => {
+  it("loads the plan and presents explicit present-worktree choices without a path payload", async () => {
+    await renderDialog();
+
+    expect(container.textContent).toContain("feature/one");
+    expect(container.textContent).toContain("/repo/worktrees/feature-one");
+    expect(button("Remove from BiBCode").disabled).toBe(false);
+    expect(button("Delete Git worktree and remove").disabled).toBe(false);
+    expect(button("Cancel").disabled).toBe(false);
+
+    await click("Delete Git worktree and remove");
+    const removal = h.calls.find((call) => call.label === "remove");
+    expect(removal?.input).toEqual({
+      environmentId: "environment-one",
+      input: {
+        commandId: "command-test",
+        projectId: "project-one",
+        threadId: "thread-one",
+        mode: "delete-git-worktree",
+        expectedGeneration: 7,
+        planToken: "plan-one",
+        forceDirty: false,
+        confirmRepositoryWidePrune: false,
+      },
+    });
+    expect(JSON.stringify(removal?.input)).not.toContain("/repo/worktrees/feature-one");
+  });
+
+  it("keeps detach enabled while loading and for missing-unregistered worktrees", async () => {
+    let resolvePlan!: (value: unknown) => void;
+    h.commands.set(
+      "get-plan",
+      vi.fn(() => new Promise((resolve) => (resolvePlan = resolve))),
+    );
+    await renderDialog({
+      target: {
+        ...target,
+        availability: "missing-unregistered",
+        registrationState: null,
+      },
+    });
+
+    expect(button("Remove from BiBCode").disabled).toBe(false);
+    expect(container.textContent).toContain("Loading removal details");
+    await act(async () => {
+      resolvePlan({
+        _tag: "Success",
+        value: plan({ availability: "missing-unregistered", registered: false }),
+      });
+      await Promise.resolve();
+    });
+    expect(container.textContent).not.toContain("Clean stale Git registration and remove");
+  });
+
+  it("uses the fresh plan for registration display and keeps verification failures detach-only", async () => {
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({ availability: "verification-unavailable", registered: true }),
+      }),
+    );
+    await renderDialog({
+      target: {
+        ...target,
+        availability: "verification-unavailable",
+        registrationState: null,
+      },
+    });
+
+    expect(container.textContent).toContain("Registration remains");
+    expect(button("Remove from BiBCode").disabled).toBe(false);
+    expect(container.textContent).not.toContain("Delete Git worktree and remove");
+    expect(container.textContent).not.toContain("Clean stale Git registration and remove");
+  });
+
+  it("offers stale cleanup only for an unlocked missing registration and explains locks", async () => {
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({ availability: "missing-registered", registered: true }),
+      }),
+    );
+    await renderDialog({ target: { ...target, availability: "missing-registered" } });
+    expect(button("Clean stale Git registration and remove").disabled).toBe(false);
+
+    await act(async () => root.unmount());
+    container.remove();
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({
+          availability: "missing-registered",
+          registered: true,
+          locked: true,
+          lockReason: "Kept by another tool",
+        }),
+      }),
+    );
+    await renderDialog({
+      target: {
+        ...target,
+        availability: "missing-registered",
+        locked: true,
+        lockReason: "Kept by another tool",
+      },
+    });
+    expect(container.textContent).toContain("Kept by another tool");
+    expect(container.textContent).not.toContain("Clean stale Git registration and remove");
+    expect(button("Remove from BiBCode").disabled).toBe(false);
+  });
+
+  it("requires separate dirty and repository-wide prune confirmations", async () => {
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({
+          trackedChangeCount: 2,
+          untrackedFileCount: 3,
+          pruneImpact: [
+            { path: "/repo/worktrees/old-one", pruneReason: "directory missing", locked: false },
+            { path: "/repo/worktrees/old-two", pruneReason: "gitdir invalid", locked: false },
+          ],
+        }),
+      }),
+    );
+    await renderDialog();
+
+    await click("Delete Git worktree and remove");
+    expect(container.textContent).toContain("2 tracked changes");
+    expect(container.textContent).toContain("3 untracked files");
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(0);
+
+    await click("Delete dirty worktree");
+    expect(container.textContent).toContain("/repo/worktrees/old-one");
+    expect(container.textContent).toContain("directory missing");
+    expect(container.textContent).toContain("/repo/worktrees/old-two");
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(0);
+
+    await click("Confirm repository-wide prune");
+    expect(h.calls.find((call) => call.label === "remove")?.input).toMatchObject({
+      input: { forceDirty: true, confirmRepositoryWidePrune: true },
+    });
+  });
+
+  it("returns to choices when a confirmation is canceled and closes from the primary cancel", async () => {
+    const onOpenChange = vi.fn();
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({ trackedChangeCount: 1 }),
+      }),
+    );
+    await renderDialog({ onOpenChange });
+    await click("Delete Git worktree and remove");
+    await click("Back");
+    expect(container.textContent).toContain("Delete Git worktree and remove");
+    await click("Cancel");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows a fresh stale-plan result for review and never automatically retries", async () => {
+    h.commands.set(
+      "remove",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: {
+          _tag: "PlanChanged",
+          plan: plan({
+            planToken: WorktreeRemovalPlanToken.make("plan-two"),
+            generation: 8,
+            trackedChangeCount: 1,
+          }),
+        },
+      }),
+    );
+    await renderDialog();
+    await click("Delete Git worktree and remove");
+
+    expect(container.textContent).toContain("Removal details changed");
+    expect(container.textContent).toContain("1 tracked change");
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(1);
+  });
+
+  it("ignores a late removal plan from the previously open target", async () => {
+    let resolveFirstPlan!: (value: unknown) => void;
+    h.commands.set(
+      "get-plan",
+      vi
+        .fn()
+        .mockImplementationOnce(() => new Promise((resolve) => (resolveFirstPlan = resolve)))
+        .mockResolvedValueOnce({
+          _tag: "Success",
+          value: plan({
+            planToken: WorktreeRemovalPlanToken.make("plan-two"),
+            generation: 8,
+          }),
+        }),
+    );
+    await renderDialog();
+    const secondTarget: WorktreeRemovalTarget = {
+      ...target,
+      threadId: ThreadId.make("thread-two"),
+      title: "Second worktree",
+      path: "/repo/worktrees/feature-two",
+      branch: "feature/two",
+    };
+    await updateDialog({ target: secondTarget });
+
+    await act(async () => {
+      resolveFirstPlan({
+        _tag: "Success",
+        value: plan({
+          availability: "missing-registered",
+          registered: true,
+          planToken: WorktreeRemovalPlanToken.make("plan-stale-target"),
+        }),
+      });
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Second worktree");
+    expect(container.textContent).toContain("Delete Git worktree and remove");
+    expect(container.textContent).not.toContain("Clean stale Git registration and remove");
+  });
+
+  it("reports late removal success for its initiating target without corrupting the next dialog", async () => {
+    let resolveRemoval!: (value: unknown) => void;
+    h.commands.set(
+      "remove",
+      vi.fn(() => new Promise((resolve) => (resolveRemoval = resolve))),
+    );
+    const onRemoved = vi.fn();
+    await renderDialog({ onRemoved });
+    await click("Delete Git worktree and remove");
+    const secondTarget: WorktreeRemovalTarget = {
+      ...target,
+      threadId: ThreadId.make("thread-two"),
+      title: "Second worktree",
+      path: "/repo/worktrees/feature-two",
+      branch: "feature/two",
+    };
+    await updateDialog({ target: secondTarget, onRemoved });
+
+    const removalResult = {
+      threadRemoved: true,
+      gitOutcome: "removed" as const,
+      orphanCleanupPending: false,
+    };
+    await act(async () => {
+      resolveRemoval({
+        _tag: "Success",
+        value: { _tag: "Removed", result: removalResult },
+      });
+      await Promise.resolve();
+    });
+
+    expect(onRemoved).toHaveBeenCalledWith(target, removalResult);
+    expect(container.textContent).toContain("Second worktree");
+    expect(container.textContent).not.toContain("Removed from BiBCode");
+  });
+
+  it("reports partial cleanup after the row is removed", async () => {
+    const onRemoved = vi.fn();
+    h.commands.set(
+      "get-plan",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: plan({ availability: "missing-registered", registered: true }),
+      }),
+    );
+    h.commands.set(
+      "remove",
+      vi.fn().mockResolvedValue({
+        _tag: "Success",
+        value: {
+          _tag: "Removed",
+          result: {
+            threadRemoved: true,
+            gitOutcome: "failed",
+            detail: "Run git worktree prune manually.",
+            orphanCleanupPending: true,
+          },
+        },
+      }),
+    );
+    await renderDialog({
+      target: { ...target, availability: "missing-registered" },
+      onRemoved,
+    });
+    await click("Clean stale Git registration and remove");
+
+    expect(onRemoved).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "thread-one" }),
+      expect.objectContaining({ threadRemoved: true, gitOutcome: "failed" }),
+    );
+    expect(container.textContent).toContain("Removed from BiBCode");
+    expect(container.textContent).toContain("Run git worktree prune manually.");
+  });
+
+  it("disables mutation while removal is already in progress", async () => {
+    await renderDialog({ target: { ...target, availability: "removing" } });
+    expect(container.textContent).toContain("Removal is already in progress");
+    expect(button("Remove from BiBCode").disabled).toBe(true);
+  });
+});

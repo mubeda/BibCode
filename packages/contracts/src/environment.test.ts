@@ -41,6 +41,24 @@ const legacyClientDecoders = {
 } as const;
 
 describe("execution environment contracts", () => {
+  it("defaults worktree catalog support to false for an old descriptor", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true },
+      }).capabilities.worktreeCatalog,
+    ).toBe(false);
+  });
+
+  it("decodes an advertised complete worktree catalog surface", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true, worktreeCatalog: true },
+      }).capabilities.worktreeCatalog,
+    ).toBe(true);
+  });
+
   it("defaults storage identity to null for an older remote descriptor", () => {
     const decoded = decodeExecutionEnvironmentDescriptor({
       ...descriptor,

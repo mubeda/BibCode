@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "",
-          "requiredScope": "relay:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "|",
+          "threadId": "2G'|T",
+          "path": "2(#|2",
+          "availability": "verification-unavailable"
         }
       }
     ]

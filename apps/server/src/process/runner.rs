@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::supervised::{
     SupervisedOverflow, SupervisedRunError, SupervisedRunRequest, SupervisedStreamOutput,
-    run_supervised,
+    run_supervised_with_spawn_observer,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -188,6 +188,19 @@ impl ProcessRunner {
         input: ProcessRunInput,
         cancellation: CancellationToken,
     ) -> Result<ProcessRunOutput, ProcessError> {
+        self.run_with_cancellation_and_spawn_observer(input, cancellation, |_| {})
+            .await
+    }
+
+    async fn run_with_cancellation_and_spawn_observer<F>(
+        &self,
+        input: ProcessRunInput,
+        cancellation: CancellationToken,
+        observer: F,
+    ) -> Result<ProcessRunOutput, ProcessError>
+    where
+        F: FnOnce(Option<u32>) + Send,
+    {
         let resolved = resolve_command(&input);
         let mut command = Command::new(&resolved.command);
         command
@@ -206,7 +219,7 @@ impl ProcessRunner {
             command.env_clear().envs(env);
         }
 
-        let result = run_supervised(
+        let result = run_supervised_with_spawn_observer(
             SupervisedRunRequest {
                 command,
                 stdin: input.stdin.as_ref().map(|stdin| stdin.as_bytes().to_vec()),
@@ -219,6 +232,7 @@ impl ProcessRunner {
                 },
             },
             &cancellation,
+            observer,
         )
         .await;
 
@@ -347,51 +361,126 @@ fn resolve_command(input: &ProcessRunInput) -> ResolvedCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestSandbox;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runner_uses_command_local_environment_for_parallel_children() {
+        async fn run(label: &str) -> ProcessRunOutput {
+            let sandbox = TestSandbox::new(label);
+            let script = sandbox.executable_script(
+                "print-label",
+                "printf '%s' \"$FIXTURE_LABEL\"",
+                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%\r\nexit /b 0",
+            );
+            let mut input = sandbox.process_input(script, Vec::<String>::new());
+            input.env = Some(sandbox.environment([("FIXTURE_LABEL", label)]));
+            ProcessRunner
+                .run(input)
+                .await
+                .expect("parallel fixture process")
+        }
+
+        let (left, right) = tokio::join!(run("left"), run("right"));
+        assert_eq!(left.stdout, "left");
+        assert_eq!(right.stdout, "right");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runner_bounds_output_for_parallel_fixture_children() {
+        async fn run(label: &str) -> ProcessRunOutput {
+            let sandbox = TestSandbox::new(label);
+            let script = sandbox.executable_script(
+                "print-output",
+                "printf 1234567",
+                "@echo off\r\n<nul set /p =1234567\r\nexit /b 0",
+            );
+            ProcessRunner
+                .run(
+                    sandbox
+                        .process_input(script, Vec::<String>::new())
+                        .with_max_output_bytes(5)
+                        .with_output_mode(OutputMode::Truncate),
+                )
+                .await
+                .expect("bounded parallel fixture process")
+        }
+
+        let (left, right) = tokio::join!(run("bounded-left"), run("bounded-right"));
+        assert_eq!(left.stdout, "12345");
+        assert!(left.stdout_truncated);
+        assert_eq!(right.stdout, "12345");
+        assert!(right.stdout_truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runner_cancels_parallel_fixture_children_after_spawn() {
+        async fn run(label: &str) -> ProcessError {
+            let sandbox = TestSandbox::new(label);
+            let script = sandbox.executable_script(
+                "cancellation-child",
+                "while :; do sleep 1; done",
+                "@echo off\r\n:wait\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait",
+            );
+            let cancellation = CancellationToken::new();
+            let input = sandbox.process_input(script, Vec::<String>::new());
+            let (spawned, spawned_rx) = tokio::sync::oneshot::channel();
+            let running = tokio::spawn(ProcessRunner.run_with_cancellation_and_spawn_observer(
+                input,
+                cancellation.clone(),
+                move |_| {
+                    let _ = spawned.send(());
+                },
+            ));
+
+            spawned_rx
+                .await
+                .expect("fixture child must finish spawning");
+
+            cancellation.cancel();
+            running
+                .await
+                .expect("runner task should join")
+                .expect_err("cancellation must terminate the ready fixture child")
+        }
+
+        let (left, right) = tokio::join!(run("cancel-left"), run("cancel-right"));
+        assert!(left.is_cancelled());
+        assert!(right.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runner_returns_timeout_results_after_reaping_parallel_fixture_children() {
+        async fn run(label: &str) -> ProcessRunOutput {
+            let sandbox = TestSandbox::new(label);
+            let script = sandbox.executable_script(
+                "wait-for-timeout",
+                "sleep 30",
+                "@echo off\r\nping -n 31 127.0.0.1 >nul",
+            );
+            ProcessRunner
+                .run(
+                    sandbox
+                        .process_input(script, Vec::<String>::new())
+                        .with_timeout(Duration::ZERO)
+                        .with_timeout_behavior(TimeoutBehavior::TimedOutResult),
+                )
+                .await
+                .expect("timed out fixture child should return a timeout result")
+        }
+
+        let (left, right) = tokio::join!(run("timeout-left"), run("timeout-right"));
+        assert!(left.timed_out);
+        assert!(right.timed_out);
+    }
 
     #[tokio::test]
-    async fn runner_covers_unit_build_success_spawn_timeout_and_cancellation() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let runner = ProcessRunner;
-        let output = runner
-            .run(
-                ProcessRunInput::for_test_output(7)
-                    .with_max_output_bytes(5)
-                    .with_output_mode(OutputMode::Truncate),
-            )
+    async fn runner_reports_spawn_error_for_a_missing_sandbox_executable() {
+        let sandbox = TestSandbox::new("missing-executable");
+        let error = ProcessRunner
+            .run(sandbox.process_input(sandbox.path("missing-command"), Vec::<String>::new()))
             .await
-            .unwrap();
-        assert_eq!(output.stdout, "xxxxx");
-        assert!(output.stdout_truncated);
-
-        let spawn = runner
-            .run(ProcessRunInput::new(
-                "definitely-not-a-real-bibcode-command",
-                Vec::<String>::new(),
-            ))
-            .await
-            .unwrap_err();
-        assert!(matches!(spawn, ProcessError::Spawn { .. }));
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let cancelled = runner
-            .run_with_cancellation(
-                ProcessRunInput::for_test_sleep(Duration::from_secs(1)),
-                cancellation,
-            )
-            .await
-            .unwrap_err();
-        assert!(cancelled.is_cancelled());
-
-        let timed_out = runner
-            .run(
-                ProcessRunInput::for_test_sleep(Duration::from_secs(1))
-                    .with_timeout(Duration::ZERO)
-                    .with_timeout_behavior(TimeoutBehavior::TimedOutResult),
-            )
-            .await
-            .unwrap();
-        assert!(timed_out.timed_out);
+            .expect_err("missing explicit executable should fail to spawn");
+        assert!(matches!(error, ProcessError::Spawn { .. }));
     }
 
     #[test]

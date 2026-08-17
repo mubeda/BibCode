@@ -19,10 +19,16 @@ const harness = vi.hoisted(() => {
     stateSeeds: [] as Array<{ match: Matcher; value: unknown }>,
     setStateCalls: [] as Array<{ initial: unknown; next: unknown; applied: unknown }>,
     effects: [] as Array<() => void | (() => void)>,
+    refs: [] as Array<{ current: unknown }>,
+    refIndex: 0,
+    persistRefs: false,
     reset() {
       state.stateSeeds.length = 0;
       state.setStateCalls.length = 0;
       state.effects.length = 0;
+      state.refs.length = 0;
+      state.refIndex = 0;
+      state.persistRefs = false;
     },
     seedState(match: Matcher, value: unknown) {
       state.stateSeeds.push({ match, value });
@@ -113,10 +119,20 @@ vi.mock("react", async (importOriginal) => {
   const useEffect = (effect: () => void | (() => void)) => {
     harness.effects.push(effect);
   };
+  const useRef = (initial: unknown) => {
+    if (!harness.persistRefs) return actual.useRef(initial);
+    const index = harness.refIndex++;
+    const existing = harness.refs[index];
+    if (existing) return existing;
+    const created = { current: initial };
+    harness.refs[index] = created;
+    return created;
+  };
   return {
     ...actual,
     useState: useState as typeof actual.useState,
     useEffect: useEffect as typeof actual.useEffect,
+    useRef: useRef as typeof actual.useRef,
   };
 });
 
@@ -325,6 +341,7 @@ function renderPanel(props: PanelProps = baseProps()): string {
   ui.reset();
   harness.setStateCalls.length = 0;
   harness.effects.length = 0;
+  harness.refIndex = 0;
   return renderToStaticMarkup(<FileBrowserPanel {...props} />);
 }
 
@@ -713,6 +730,25 @@ describe("create entry", () => {
     });
     expect(refresh).toHaveBeenCalled();
     expect(onOpenFile).toHaveBeenCalledWith("src/created.ts");
+  });
+
+  it("closes an open mutation dialog and rejects its stale submit after workspace loss", async () => {
+    harness.persistRefs = true;
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    renderPanel();
+
+    rowActionsFor("src", "directory").onNewFile();
+    const staleSubmit = lastDialogRequest()["onSubmit"] as (name: string) => void;
+
+    renderPanel(baseProps({ workspaceUnavailable: reason }));
+    harness.runEffects();
+    expect(harness.setStateCalls).toEqual(
+      expect.arrayContaining([expect.objectContaining({ applied: null })]),
+    );
+
+    staleSubmit("blocked.ts");
+    await flushPromises();
+    expect(testState.commandCalls.some((call) => call.label === "createEntry")).toBe(false);
   });
 
   it("creates a folder without opening a file", async () => {
@@ -1470,5 +1506,20 @@ describe("background context menu", () => {
     await flushPromises();
     const call = testState.commandCalls.find((entry) => entry.label === "createEntry");
     expect((call!.input as { input: { relativePath: string } }).input.relativePath).toBe("a.ts");
+  });
+
+  it("keeps copy and refresh while removing every file mutation action", () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    harness.seedState((initial) => initial === null, null);
+    harness.seedState((initial) => initial === null, { x: 5, y: 6 });
+    renderPanel(baseProps({ workspaceUnavailable: reason }));
+
+    const menus = ui.filter("FileTreeContextMenu");
+    const background = menus[menus.length - 1]!;
+    const actions = background["actions"] as Record<string, unknown>;
+    expect(actions["onCopyPath"]).toEqual(expect.any(Function));
+    expect(actions["onRefresh"]).toEqual(expect.any(Function));
+    expect(actions["onNewFile"]).toBeUndefined();
+    expect(actions["onNewFolder"]).toBeUndefined();
   });
 });

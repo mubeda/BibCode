@@ -435,6 +435,7 @@ describe("shared controller presentations", () => {
     const controller = {
       scripts,
       primaryScript: scripts[0]!,
+      disabledReason: null,
       openAddDialog: vi.fn(),
       openEditDialog,
       runScript,
@@ -467,6 +468,7 @@ describe("shared controller presentations", () => {
     const controller = {
       scripts,
       primaryScript: scripts[0]!,
+      disabledReason: null,
       openAddDialog: vi.fn(),
       openEditDialog: vi.fn(),
       runScript: vi.fn(),

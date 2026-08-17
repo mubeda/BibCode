@@ -20,6 +20,8 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  WorktreeKey,
+  WorktreeRepositoryKey,
 } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { createModelSelection } from "@bibcode/shared/model";
@@ -28,6 +30,7 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
+import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
 import { derivePhysicalProjectKey } from "../logicalProject";
 import type {
   EnvironmentProject,
@@ -60,6 +63,9 @@ const h = vi.hoisted(() => {
     clientSettings: null,
     atomValues: {},
     vcsStatusByCwd: {},
+    worktreeCatalogs: new Map<string, unknown>(),
+    discoveryCatalogSubscriptions: [] as Array<unknown>,
+    discoveryFocusRefreshCalls: [] as Array<ReadonlyArray<unknown>>,
     runningTerminalIds: [],
     discoveredPortsByThreadId: {},
     desktopBootstraps: [],
@@ -93,6 +99,7 @@ const h = vi.hoisted(() => {
     shortcutLabelOptions: [] as unknown[],
     showJumpHintModifiers: false,
     terminalSurfaceOpen: false,
+    presentationPolicy: null as unknown,
     // mock stores
     ui: null,
     selection: null,
@@ -174,6 +181,9 @@ const h = vi.hoisted(() => {
     updateSettings: vi.fn(),
     archiveThread: vi.fn(),
     deleteThread: vi.fn(),
+    requestWorktreeRemoval: vi.fn(),
+    closeWorktreeRemovalDialog: vi.fn(),
+    completeWorktreeRemoval: vi.fn(),
     contextMenuShow: vi.fn(),
     dialogConfirm: vi.fn(),
     toastAdd: vi.fn(),
@@ -323,6 +333,10 @@ vi.mock("../env", () => ({
   },
 }));
 
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => h.state.presentationPolicy,
+}));
+
 vi.mock("../state/entities", () => ({
   useProjects: () => h.state.projects,
   useThreadShells: () => h.state.threads,
@@ -354,8 +368,20 @@ vi.mock("../state/environments", () => ({
 }));
 
 vi.mock("../state/query", () => ({
-  useEnvironmentQuery: (atom: { args?: { input?: { cwd?: string } } } | null) => ({
-    data: atom ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null) : null,
+  useEnvironmentQuery: (
+    atom: {
+      __q?: string;
+      args?: { environmentId?: string; input?: { cwd?: string; projectId?: string } };
+    } | null,
+  ) => ({
+    data:
+      atom?.__q === "worktree.catalog"
+        ? (h.state.worktreeCatalogs.get(
+            `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
+          ) ?? null)
+        : atom
+          ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
+          : null,
     error: null,
     isPending: false,
     refresh: () => {},
@@ -424,6 +450,22 @@ vi.mock("../state/desktopUpdate", () => ({
   useDesktopUpdateState: () => h.state.desktopUpdateState,
 }));
 
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    catalog: (args: unknown) => {
+      h.state.discoveryCatalogSubscriptions.push(args);
+      return { __q: "worktree.catalog", args };
+    },
+    refresh: { label: "worktree.refresh" },
+    updatePolicy: { label: "worktree.updatePolicy" },
+    addOne: { label: "worktree.addOne" },
+    addAll: { label: "worktree.addAll" },
+  },
+  useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
+    h.state.discoveryFocusRefreshCalls.push([...projects]);
+  },
+}));
+
 vi.mock("../state/projectDataSafety", () => ({
   projectDataSafetyStore: {
     open: h.spies.openProjectDataRecovery,
@@ -450,7 +492,36 @@ vi.mock("../hooks/useThreadActions", () => ({
   useThreadActions: () => ({
     archiveThread: h.spies.archiveThread,
     deleteThread: h.spies.deleteThread,
+    worktreeRemovalTarget: null,
+    requestWorktreeRemoval: h.spies.requestWorktreeRemoval,
+    closeWorktreeRemovalDialog: h.spies.closeWorktreeRemovalDialog,
+    completeWorktreeRemoval: h.spies.completeWorktreeRemoval,
   }),
+}));
+
+vi.mock("./WorktreeAvailabilityWarning", () => ({
+  WorktreeAvailabilityWarning: ({ status, onRetry, onRemove }: any) => {
+    h.capture("WorktreeAvailabilityWarning", { status, onRetry, onRemove });
+    return (
+      <div data-testid={`availability-warning-${status.threadId}`}>
+        <span>{status.availability}</span>
+        <span>{status.path}</span>
+        <button type="button" onClick={onRetry}>
+          Retry detection
+        </button>
+        <button type="button" onClick={onRemove}>
+          Remove from BiBCode
+        </button>
+      </div>
+    );
+  },
+}));
+
+vi.mock("./WorktreeRemovalDialog", () => ({
+  WorktreeRemovalDialog: (props: Record<string, unknown>) => {
+    h.capture("WorktreeRemovalDialog", props);
+    return null;
+  },
 }));
 
 vi.mock("../hooks/useHandleNewThread", () => ({
@@ -684,6 +755,7 @@ function makeProject(
     repositoryIdentity: null,
     defaultModelSelection: null,
     scripts: [],
+    worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: iso(600),
     updatedAt: iso(60),
     environmentId: ENV_MAIN,
@@ -975,6 +1047,9 @@ beforeEach(() => {
     primaryServerKeybindings: {},
   };
   h.state.vcsStatusByCwd = {};
+  h.state.worktreeCatalogs = new Map();
+  h.state.discoveryCatalogSubscriptions = [];
+  h.state.discoveryFocusRefreshCalls = [];
   h.state.runningTerminalIds = [];
   h.state.discoveredPortsByThreadId = {};
   h.state.desktopBootstraps = [];
@@ -1008,11 +1083,16 @@ beforeEach(() => {
   h.state.shortcutLabelOptions = [];
   h.state.showJumpHintModifiers = false;
   h.state.terminalSurfaceOpen = false;
+  h.state.presentationPolicy = createEnvironmentPresentationPolicy({
+    surface: "browser",
+    platform: "unknown",
+  });
   h.spies.contextMenuShow.mockResolvedValue(null);
   h.spies.dialogConfirm.mockResolvedValue(true);
   h.spies.toastAdd.mockReturnValue("toast-1");
   h.spies.archiveThread.mockResolvedValue({ _tag: "Success", value: undefined });
   h.spies.deleteThread.mockResolvedValue({ _tag: "Success", value: undefined });
+  h.spies.completeWorktreeRemoval.mockResolvedValue({ _tag: "Success", value: undefined });
   h.spies.getDraftThreadByProjectRef.mockReturnValue(null);
   h.spies.openDiscoveredPort.mockImplementation(async () => h.state.openDiscoveredPortResult);
   h.spies.pointerWithin.mockReturnValue([]);
@@ -1254,6 +1334,50 @@ staticDescribe("Sidebar full render", () => {
     const markup = render(<Sidebar />);
     expect(markup).toContain("Project data is still loading");
     expect(markup).not.toContain("No projects yet");
+  });
+
+  it("keeps a saved remote project row while hiding desktop remote recovery controls", () => {
+    h.state.presentationPolicy = createEnvironmentPresentationPolicy({
+      surface: "desktop",
+      platform: "macos",
+    });
+    const savedRemoteProject = makeProject("saved-remote", {
+      environmentId: ENV_REMOTE,
+      title: "Saved remote repository",
+      workspaceRoot: "/srv/saved-remote",
+    });
+    h.state.projects = [savedRemoteProject];
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "Remote Box",
+        connectionId: "remote:box",
+        phase: "error",
+        error: "Remote host is offline.",
+      }),
+    ];
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_REMOTE,
+          status: "unavailable",
+          hasSnapshot: true,
+          error: "Remote host is offline.",
+        },
+      ],
+      hasSnapshot: true,
+      hasCachedShell: true,
+    };
+
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Saved remote repository");
+    const availabilityActions = captured("Button").map((entry) => entry.props["children"]);
+    expect(availabilityActions).toContain("Diagnostics");
+    expect(availabilityActions).not.toContain("Retry");
+    expect(availabilityActions).not.toContain("Settings");
   });
 
   it("wires storage-change actions and confirms storage adoption through the local dialog", async () => {
@@ -1621,6 +1745,29 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("boot failed");
   });
 
+  it("renders an unavailable local secondary as failed instead of connecting", () => {
+    baseScenario();
+    h.state.desktopBootstraps = [
+      {
+        id: "wsl:ubuntu-20.04",
+        label: "WSL (Ubuntu-20.04)",
+        httpBaseUrl: null,
+        wsBaseUrl: null,
+        preflightError: {
+          kind: "wsl-secondary-unavailable",
+          detail: "Could not find a Linux bibcode server binary for WSL.",
+        },
+      },
+    ];
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("Couldn&#x27;t connect WSL (Ubuntu-20.04)");
+    expect(markup).toContain("Could not find a Linux bibcode server binary for WSL.");
+    expect(markup).toMatch(/data-mock="AlertDescription"[^>]*class="[^"]*wrap-anywhere[^"]*"/);
+    expect(markup).not.toContain("Connecting WSL (Ubuntu-20.04)");
+  });
+
   it("falls back to a generic error when a failed backend reports no error text", () => {
     baseScenario();
     h.state.environments = [
@@ -1888,6 +2035,76 @@ staticDescribe("project header context menu", () => {
     expect(h.spies.routerNavigate).toHaveBeenCalledWith({ to: "/settings/archived" });
   });
 
+  it("toggles hidden and shown discovered worktrees from the project menu", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; label: string }>) => {
+        const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
+        expect(visibility?.label).toBe("Show hidden worktrees");
+        return visibility!.id;
+      },
+    );
+    render(<Sidebar />);
+    const hiddenHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onContextMenu"] === "function",
+    )!.props;
+
+    invoke(hiddenHeader, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.updatePolicy",
+      input: {
+        environmentId: ENV_MAIN,
+        input: expect.objectContaining({
+          projectId: ProjectId.make("project-a"),
+          visibility: "shown",
+        }),
+      },
+    });
+
+    h.state.projects = [
+      makeProject("project-a", {
+        worktreeDiscovery: {
+          visibility: "shown",
+          initialPromptDismissedAt: null,
+          baselinePaths: [],
+        },
+      }),
+    ];
+    h.state.commandCalls = [];
+    h.state.captures.length = 0;
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; label: string }>) => {
+        const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
+        expect(visibility?.label).toBe("Hide discovered worktrees");
+        return visibility!.id;
+      },
+    );
+    render(<Sidebar />);
+    const shownHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onContextMenu"] === "function",
+    )!.props;
+
+    invoke(shownHeader, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.updatePolicy",
+      input: {
+        environmentId: ENV_MAIN,
+        input: expect.objectContaining({
+          projectId: ProjectId.make("project-a"),
+          visibility: "hidden",
+        }),
+      },
+    });
+  });
+
   it("opens the rename and grouping dialogs from the menu", async () => {
     const header = projectHeaderProps();
     fakeLocalApi();
@@ -1996,6 +2213,330 @@ staticDescribe("project header context menu", () => {
     expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain(
       "project.delete",
     );
+  });
+});
+
+staticDescribe("worktree discovery integration", () => {
+  function discoveredCatalog(path: string, branch: string) {
+    return {
+      repositoryKey: WorktreeRepositoryKey.make(`repository:${path}`),
+      generation: 42,
+      authoritative: true,
+      observedAt: "2026-08-09T12:00:00.000Z",
+      scanStatus: { _tag: "ready" },
+      worktrees: [
+        {
+          worktreeKey: WorktreeKey.make(`worktree:${path}`),
+          path,
+          branch,
+          head: "abcdef0123456789",
+          isPrimary: false,
+          isBare: false,
+          locked: false,
+          registrationState: "registered",
+          directoryState: "present",
+          adoptionState: "none",
+          eligibleForAdoption: true,
+        },
+      ],
+      adoptedWorkspaces: [],
+    };
+  }
+
+  it("subscribes only while the existing child panel is rendered and places discovery before primary", () => {
+    baseScenario();
+    h.state.routeParams = {};
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    h.state.worktreeCatalogs.set(
+      `${ENV_MAIN}:${projectA.id}`,
+      discoveredCatalog("C:/worktrees/discovered", "feature/discovered"),
+    );
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+    });
+
+    const collapsedMarkup = render(<Sidebar />);
+    expect(collapsedMarkup).not.toContain("Discovered worktrees");
+    expect(collapsedMarkup).not.toContain("feature/discovered");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([]);
+
+    h.state.discoveryCatalogSubscriptions = [];
+    h.state.discoveryFocusRefreshCalls = [];
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: true },
+    });
+    const expandedMarkup = render(<Sidebar />);
+    const discoveryIndex = expandedMarkup.indexOf("Discovered worktrees");
+    const primaryIndex = expandedMarkup.indexOf(">primary<");
+
+    expect(discoveryIndex).toBeGreaterThan(-1);
+    expect(primaryIndex).toBeGreaterThan(discoveryIndex);
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    ]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([
+      [{ environmentId: ENV_MAIN, projectId: projectA.id }],
+    ]);
+    expect(
+      captured("SidebarMenuSubButton").some(
+        (entry) => entry.props["data-testid"] === "thread-row-thread-idle",
+      ),
+    ).toBe(true);
+
+    h.state.discoveryCatalogSubscriptions = [];
+    h.state.discoveryFocusRefreshCalls = [];
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+    });
+    const recollapsedMarkup = render(<Sidebar />);
+    expect(recollapsedMarkup).not.toContain("Discovered worktrees");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([]);
+  });
+
+  it("keeps grouped mixed-capability discovery at the supported physical boundary", () => {
+    groupedScenario();
+    h.state.routeParams = {};
+    const remoteProjectId = ProjectId.make("project-a-remote");
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [ENV_REMOTE, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+    h.state.worktreeCatalogs.set(
+      `${ENV_MAIN}:${projectA.id}`,
+      discoveredCatalog("C:/local/discovered", "feature/local"),
+    );
+    h.state.worktreeCatalogs.set(
+      `${ENV_REMOTE}:${remoteProjectId}`,
+      discoveredCatalog("C:/remote/discovered", "feature/remote"),
+    );
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("feature/local");
+    expect(markup).not.toContain("feature/remote");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    ]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([
+      [{ environmentId: ENV_MAIN, projectId: projectA.id }],
+    ]);
+  });
+
+  it("keeps a missing adopted row selectable while disabling workspace actions and exposing recovery", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
+      repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
+      generation: 43,
+      authoritative: true,
+      observedAt: "2026-08-09T12:01:00.000Z",
+      scanStatus: { _tag: "ready" },
+      worktrees: [],
+      adoptedWorkspaces: [
+        {
+          threadId: threadActive.id,
+          worktreeKey: WorktreeKey.make("worktree:missing"),
+          path: "C:/wt/x",
+          branch: "feature/x",
+          availability: "missing-registered",
+          registrationState: "prunable",
+          locked: false,
+        },
+      ],
+    });
+
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("availability-warning-thread-active");
+    expect(markup).toContain("C:/wt/x");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "missing row");
+    invoke(row, "onClick", mouseEvent());
+    expect(h.spies.routerNavigate).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/$environmentId/$threadId" }),
+    );
+
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; disabled?: boolean; children?: unknown[] }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return null;
+    });
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(true);
+    expect(menuItems.find((item) => item.id === "open-in")?.disabled).toBe(true);
+
+    const warning = captured("WorktreeAvailabilityWarning").find(
+      (entry) => (entry.props.status as { threadId: string }).threadId === threadActive.id,
+    );
+    expect(warning).toBeDefined();
+    invoke(warning!.props, "onRetry", undefined);
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.refresh",
+      input: { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    });
+    invoke(warning!.props, "onRemove", undefined);
+    expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: threadActive.id,
+        availability: "missing-registered",
+        path: "C:/wt/x",
+      }),
+    );
+  });
+
+  it("keeps retained verification-unavailable rows usable for workspace actions", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
+      repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
+      generation: 44,
+      authoritative: false,
+      observedAt: "2026-08-09T12:02:00.000Z",
+      scanStatus: {
+        _tag: "degraded",
+        reason: "git-failed",
+        message: "verification is temporarily unavailable",
+        failedAt: "2026-08-09T12:02:00.000Z",
+        lastAuthoritativeAt: "2026-08-09T12:01:00.000Z",
+      },
+      worktrees: [],
+      adoptedWorkspaces: [
+        {
+          threadId: threadActive.id,
+          worktreeKey: WorktreeKey.make("worktree:retained"),
+          path: "C:/wt/x",
+          branch: "feature/x",
+          availability: "verification-unavailable",
+          registrationState: "registered",
+          locked: false,
+        },
+      ],
+    });
+
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; disabled?: boolean; children?: unknown[] }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return null;
+    });
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "retained degraded row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(false);
+    expect(menuItems.find((item) => item.id === "open-in")?.disabled).not.toBe(true);
+  });
+
+  it("starts no row subscription and uses direct legacy detach when capability is false", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+
+    render(<Sidebar />);
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "legacy worktree row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.deleteThread).toHaveBeenCalledWith({
+      environmentId: ENV_MAIN,
+      threadId: threadActive.id,
+    });
+    expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("keeps false-capability bulk deletion on detach-only thread actions", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+    h.selectionStore.setState({
+      selectedThreadKeys: new Set([threadKeyOf(threadIdle), threadKeyOf(threadActive)]),
+    });
+
+    render(<Sidebar />);
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-idle"), "legacy bulk row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.deleteThread).toHaveBeenCalledTimes(2);
+    expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+});
+
+staticDescribe("worktree removal completion owner", () => {
+  const removedTarget = {
+    environmentId: ENV_MAIN,
+    projectId: projectA.id,
+    threadId: threadActive.id,
+    title: threadActive.title,
+    path: "C:/wt/x",
+    branch: "feat/x",
+    availability: "present",
+    registrationState: "registered",
+    locked: false,
+  } as const;
+  const removedResult = {
+    threadRemoved: true,
+    gitOutcome: "removed",
+    orphanCleanupPending: false,
+  } as const;
+
+  async function reportRemoval(): Promise<void> {
+    baseScenario();
+    render(<Sidebar />);
+    const dialog = captured("WorktreeRemovalDialog").at(-1);
+    expect(dialog).toBeDefined();
+    const onRemoved = dialog!.props.onRemoved as (
+      target: typeof removedTarget,
+      result: typeof removedResult,
+    ) => void;
+    onRemoved(removedTarget, removedResult);
+    await flush();
+  }
+
+  it("surfaces fallback-navigation failure exactly once", async () => {
+    h.spies.completeWorktreeRemoval.mockResolvedValueOnce(failureResult("route unavailable"));
+
+    await reportRemoval();
+
+    expect(h.spies.toastAdd).toHaveBeenCalledTimes(1);
+    expect(h.spies.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Worktree removed, but navigation failed",
+        description: "route unavailable",
+      }),
+    );
+  });
+
+  it("keeps successful and interrupted cleanup silent", async () => {
+    await reportRemoval();
+    expect(h.spies.toastAdd).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    h.spies.completeWorktreeRemoval.mockResolvedValueOnce({
+      _tag: "Failure",
+      cause: Cause.interrupt(1),
+    });
+    await reportRemoval();
+    expect(h.spies.toastAdd).not.toHaveBeenCalled();
   });
 });
 
@@ -2366,6 +2907,27 @@ staticDescribe("thread context menu", () => {
     expect(h.spies.deleteThread).not.toHaveBeenCalled();
   });
 
+  it("opens the typed removal dialog for a worktree instead of native delete confirmation", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "worktree row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: projectA.id,
+        threadId: threadActive.id,
+        path: "C:/wt/x",
+      }),
+    );
+    expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
+    expect(h.spies.deleteThread).not.toHaveBeenCalled();
+  });
+
   it("shows the multi-select menu when the row is part of a selection", async () => {
     baseScenario();
     // The row's isSelected flag is read at render time, so select first.
@@ -2387,6 +2949,11 @@ staticDescribe("thread context menu", () => {
     h.spies.contextMenuShow.mockResolvedValue("delete");
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "1 worktree-backed thread will be removed from BiBCode only. Git worktrees and files are left untouched.",
+      ),
+    );
     expect(h.spies.deleteThread).toHaveBeenCalledTimes(2);
     expect(h.spies.removeFromSelection).toHaveBeenCalled();
   });
@@ -2561,7 +3128,8 @@ staticDescribe("primary row", () => {
       (call: { label: string }) => call.label === "thread.create",
     );
     expect(createCall).toBeDefined();
-    expect(createCall.input.input.kind).toBe("default");
+    expect(createCall.input.input).not.toHaveProperty("kind");
+    expect(createCall.input.input).not.toHaveProperty("worktreePath");
     expect(createCall.input.input.modelSelection.model).toBe("claude-fable-5");
     expect(createCall.input.input.modelSelection.options).toEqual([
       { id: "effort", value: "high" },

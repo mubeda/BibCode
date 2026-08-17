@@ -24,7 +24,8 @@ use crate::{
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
-        ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
+        RegistrationSource,
     },
     orchestration::{
         ProviderTurnDelivery, TurnDeliveryState, canonical_command_digest,
@@ -82,6 +83,7 @@ use crate::{
     },
     server_settings::{ProviderBinarySettingsState, ProviderSettingsStore},
 };
+use futures_util::{StreamExt, stream};
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -96,6 +98,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS: usize = 8;
+const CODEX_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -429,6 +434,12 @@ pub struct ProviderRuntimeSupervisor {
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 }
 
+#[derive(Clone)]
+pub struct ProviderSessionIdentity {
+    thread_id: String,
+    driver: Arc<dyn ProviderDriver>,
+}
+
 enum SupervisorMessage {
     Launch {
         request: Box<ProviderLaunchRequest>,
@@ -436,6 +447,14 @@ enum SupervisorMessage {
     },
     Handle {
         command: Box<OrchestrationCommand>,
+        response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
+    },
+    CaptureSessionIdentity {
+        thread_id: String,
+        response: oneshot::Sender<Result<Option<ProviderSessionIdentity>, ProviderRuntimeError>>,
+    },
+    StopSessionIfCurrent {
+        identity: ProviderSessionIdentity,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
     Deliver {
@@ -811,6 +830,46 @@ impl ProviderRuntimeSupervisor {
             response,
         })
         .await
+    }
+
+    pub async fn capture_session_identity(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<ProviderSessionIdentity>, ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::CaptureSessionIdentity {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    pub async fn stop_session_if_current(
+        &self,
+        identity: ProviderSessionIdentity,
+    ) -> Result<(), ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::StopSessionIfCurrent {
+                identity,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
     }
 
     pub async fn deliver_turn(
@@ -2138,6 +2197,35 @@ async fn run_supervisor(
                     operational_log.as_ref(),
                 )
                 .await;
+                let _ = response.send(result);
+            }
+            SupervisorMessage::CaptureSessionIdentity {
+                thread_id,
+                response,
+            } => {
+                let identity = sessions
+                    .get(&thread_id)
+                    .map(|entry| ProviderSessionIdentity {
+                        thread_id,
+                        driver: entry.driver.clone(),
+                    });
+                let _ = response.send(Ok(identity));
+            }
+            SupervisorMessage::StopSessionIfCurrent { identity, response } => {
+                let is_current = sessions
+                    .get(&identity.thread_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.driver, &identity.driver));
+                let result = if is_current {
+                    stop_session(
+                        &engine.repositories(),
+                        &activity,
+                        &mut sessions,
+                        &identity.thread_id,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
                 let _ = response.send(result);
             }
             SupervisorMessage::Deliver {
@@ -4720,9 +4808,27 @@ async fn shutdown_sessions(
     sessions: &mut HashMap<String, SessionEntry>,
 ) -> Result<(), ProviderRuntimeError> {
     let thread_ids = sessions.keys().cloned().collect::<Vec<_>>();
+    let mut detached = Vec::with_capacity(thread_ids.len());
     let mut first_error = None;
     for thread_id in thread_ids {
-        if let Err(error) = stop_session(repositories, activity, sessions, &thread_id).await
+        match detach_session(activity, sessions, &thread_id).await {
+            Ok(entry) => detached.push((thread_id, entry)),
+            Err(ProviderRuntimeError::SessionNotFound { .. }) => {}
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    let mut shutdowns = stream::iter(detached.into_iter().map(|(thread_id, entry)| async move {
+        let result = entry.driver.shutdown().await;
+        repositories
+            .delete_provider_session_runtime(thread_id)
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        result
+    }))
+    .buffer_unordered(MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS);
+    while let Some(result) = shutdowns.next().await {
+        if let Err(error) = result
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -4816,6 +4922,8 @@ pub struct NativeProviderDriverFactory {
     attachments: AttachmentMaterializer,
     attribution: ProcessAttributionRegistry,
     activity_controller: AgentActivityController,
+    claude_probe_cache: ClaudeActivityProbeCache,
+    claude_probe_launch_policy: ClaudeProbeLaunchPolicy,
 }
 
 impl NativeProviderDriverFactory {
@@ -4842,10 +4950,28 @@ impl NativeProviderDriverFactory {
         attribution: ProcessAttributionRegistry,
         activity_controller: AgentActivityController,
     ) -> Self {
+        Self::with_claude_probe_cache(
+            attachments_dir,
+            attribution,
+            activity_controller,
+            production_claude_probe_cache(),
+            ClaudeProbeLaunchPolicy::Direct,
+        )
+    }
+
+    fn with_claude_probe_cache(
+        attachments_dir: PathBuf,
+        attribution: ProcessAttributionRegistry,
+        activity_controller: AgentActivityController,
+        claude_probe_cache: ClaudeActivityProbeCache,
+        claude_probe_launch_policy: ClaudeProbeLaunchPolicy,
+    ) -> Self {
         Self {
             attachments: AttachmentMaterializer::new(attachments_dir),
             attribution,
             activity_controller,
+            claude_probe_cache,
+            claude_probe_launch_policy,
         }
     }
 }
@@ -4894,6 +5020,8 @@ impl ProviderDriverFactory for NativeProviderDriverFactory {
                         self.attachments.clone(),
                         self.attribution.clone(),
                         activity_enabled,
+                        self.claude_probe_cache.clone(),
+                        self.claude_probe_launch_policy,
                     )
                     .await?,
                 ) as Arc<dyn ProviderDriver>),
@@ -4946,12 +5074,26 @@ impl ChildWrapper for AttributedChild {
     }
 }
 
-fn spawn_child(
+async fn spawn_child(
     request: &ProviderLaunchRequest,
     args: &[String],
     pipe_output: bool,
     attribution: ProcessAttributionRegistry,
 ) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError> {
+    spawn_child_after_spawn(request, args, pipe_output, attribution, |_| async {}).await
+}
+
+async fn spawn_child_after_spawn<F, Fut>(
+    request: &ProviderLaunchRequest,
+    args: &[String],
+    pipe_output: bool,
+    attribution: ProcessAttributionRegistry,
+    after_spawn: F,
+) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let provider = request.provider.clone();
     let environment = normalize_provider_environment(
         request
@@ -4969,6 +5111,11 @@ fn spawn_child(
         provider: provider.clone(),
         detail: format!("provider executable was not found: {}", request.binary_path),
     })?;
+    let executable = if provider == "opencode" {
+        crate::provider::opencode::resolve_owned_executable(Platform::current(), &executable)
+    } else {
+        executable
+    };
     let launch = prepare_provider_launch(&executable, args).map_err(|detail| {
         ProviderRuntimeError::Spawn {
             provider: provider.clone(),
@@ -4999,15 +5146,52 @@ fn spawn_child(
     let mut inner = command
         .spawn()
         .map_err(|error| ProviderRuntimeError::Spawn {
-            provider,
+            provider: provider.clone(),
             detail: error.to_string(),
         })?;
-    let registration = inner
-        .id()
-        .and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
-        .filter(|_| matches!(inner.try_wait(), Ok(None)))
-        .and_then(|identity| {
-            attribution.register_identity(
+    if let Some(pid) = inner.id() {
+        after_spawn(pid).await;
+    }
+    let registration = match inner.try_wait() {
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            let identity = match inner
+                .id()
+                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
+            {
+                Some(identity) => identity,
+                None => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: "spawned provider process has no stable process identity"
+                            .to_owned(),
+                    });
+                }
+            };
+            match inner.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("exited provider ownership unit", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: "provider process exited before ownership admission".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: format!(
+                            "failed to revalidate spawned provider process identity: {error}"
+                        ),
+                    });
+                }
+            }
+            match attribution.register_identity(
                 identity,
                 ProcessRegistrationMetadata {
                     scope: AttributionScope::External,
@@ -5015,8 +5199,32 @@ fn spawn_child(
                     label: request.provider_label.clone(),
                     source: RegistrationSource::Provider,
                 },
-            )
-        });
+            ) {
+                Ok(registration) => Some(registration),
+                Err(ProcessRegistrationError::Shutdown) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("rejected provider process", &report);
+                    return Err(ProviderRuntimeError::Shutdown);
+                }
+                Err(error @ ProcessRegistrationError::Capacity) => {
+                    let report = terminate_and_wait(&mut *inner).await;
+                    log_cleanup_failures("unattributed provider process", &report);
+                    return Err(ProviderRuntimeError::Spawn {
+                        provider,
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            let report = terminate_and_wait(&mut *inner).await;
+            log_cleanup_failures("unattributed provider process", &report);
+            return Err(ProviderRuntimeError::Spawn {
+                provider,
+                detail: format!("failed to inspect spawned provider process: {error}"),
+            });
+        }
+    };
     Ok(Box::new(AttributedChild {
         inner,
         registration,
@@ -5142,6 +5350,24 @@ fn claude_activity_target_id(
 }
 
 impl CodexDriver {
+    async fn shutdown_with_grace(
+        &self,
+        graceful_timeout: Duration,
+    ) -> Result<bool, ProviderRuntimeError> {
+        let result = match tokio::time::timeout(graceful_timeout, self.runtime.shutdown()).await {
+            Ok(result) => result.map(|()| true).map_err(provider_error("codex")),
+            Err(_) => {
+                tracing::warn!(
+                    graceful_timeout_ms = graceful_timeout.as_millis(),
+                    "Codex provider did not acknowledge graceful shutdown; forcing owned process cleanup"
+                );
+                Ok(false)
+            }
+        };
+        kill_child(&self.child).await;
+        result
+    }
+
     async fn spawn(
         mut request: ProviderLaunchRequest,
         attachments: AttachmentMaterializer,
@@ -5176,7 +5402,7 @@ impl CodexDriver {
             ]);
         }
         args.push("app-server".to_owned());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -5476,13 +5702,9 @@ impl ProviderDriver for CodexDriver {
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            let result = self
-                .runtime
-                .shutdown()
+            self.shutdown_with_grace(CODEX_GRACEFUL_SHUTDOWN_TIMEOUT)
                 .await
-                .map_err(provider_error("codex"));
-            kill_child(&self.child).await;
-            result
+                .map(|_| ())
         })
     }
 }
@@ -5503,7 +5725,7 @@ impl CursorDriver {
             args.extend(["-e".to_owned(), endpoint.clone()]);
         }
         args.push("acp".to_owned());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -5762,7 +5984,7 @@ impl GrokDriver {
         }
         .to_owned();
         let args = vec!["agent".to_owned(), "stdio".to_owned()];
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -5989,12 +6211,9 @@ impl OpenCodeDriver {
             "--hostname=127.0.0.1".to_owned(),
             format!("--port={port}"),
         ];
-        let child = Arc::new(Mutex::new(spawn_child(
-            &request,
-            &args,
-            false,
-            attribution,
-        )?));
+        let child = Arc::new(Mutex::new(
+            spawn_child(&request, &args, false, attribution).await?,
+        ));
         wait_for_endpoint(&endpoint, &child).await?;
         let runtime =
             OpenCodeSessionRuntime::new_with_options_reconciliation_revision_and_agent_activity(
@@ -7379,39 +7598,47 @@ struct ClaudeProbeCacheState {
     tick: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ClaudeActivityProbeCache {
+    state: Arc<StdMutex<ClaudeProbeCacheState>>,
+}
+
+impl ClaudeActivityProbeCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClaudeProbeCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum ClaudeProbeLaunchPolicy {
+    #[default]
+    Direct,
+    #[cfg(unix)]
+    PosixShellFixture,
+}
+
 #[derive(Debug, Default)]
 struct ClaudeProbeResult {
     version: String,
     support: ClaudeActivitySupport,
 }
 
-static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<StdMutex<ClaudeProbeCacheState>> = OnceLock::new();
+static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<ClaudeActivityProbeCache> = OnceLock::new();
 
-fn claude_probe_cache() -> &'static StdMutex<ClaudeProbeCacheState> {
-    CLAUDE_ACTIVITY_PROBE_CACHE.get_or_init(|| StdMutex::new(ClaudeProbeCacheState::default()))
-}
-
-async fn probe_claude_activity_support(binary_path: &str) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_environment(binary_path, std::iter::empty(), Duration::ZERO)
-        .await
-}
-
-async fn probe_claude_activity_support_with_resolution_delay(
-    binary_path: &str,
-    resolution_delay: Duration,
-) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_environment(
-        binary_path,
-        std::iter::empty(),
-        resolution_delay,
-    )
-    .await
+fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
+    CLAUDE_ACTIVITY_PROBE_CACHE
+        .get_or_init(ClaudeActivityProbeCache::default)
+        .clone()
 }
 
 async fn probe_claude_activity_support_with_environment<'a>(
     binary_path: &str,
     environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
     resolution_delay: Duration,
+    cache: ClaudeActivityProbeCache,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let binary_path = binary_path.to_owned();
     let search_path = effective_provider_search_path(environment);
@@ -7452,7 +7679,8 @@ async fn probe_claude_activity_support_with_environment<'a>(
         let Some((key, executable)) = resolution else {
             return ClaudeActivitySupport::default();
         };
-        probe_resolved_claude_activity_support(key, executable, deadline).await
+        probe_resolved_claude_activity_support(key, executable, deadline, cache, launch_policy)
+            .await
     })
     .await
     .unwrap_or_default()
@@ -7462,52 +7690,54 @@ async fn probe_resolved_claude_activity_support(
     key: ClaudeProbeCacheKey,
     executable: PathBuf,
     deadline: Instant,
+    cache: ClaudeActivityProbeCache,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let mut receiver = {
-        let mut cache = claude_probe_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.tick = cache.tick.saturating_add(1);
-        let tick = cache.tick;
-        if let Some(version) = cache.ready_versions.get(&key).cloned() {
+        let mut cache_state = cache.lock();
+        cache_state.tick = cache_state.tick.saturating_add(1);
+        let tick = cache_state.tick;
+        if let Some(version) = cache_state.ready_versions.get(&key).cloned() {
             let versioned_key = ClaudeVersionedProbeKey {
                 executable: key.clone(),
                 version,
             };
-            if let Some(ready) = cache.ready.get_mut(&versioned_key) {
+            if let Some(ready) = cache_state.ready.get_mut(&versioned_key) {
                 ready.last_used = tick;
                 return ready.probe.support;
             }
-            cache.ready_versions.remove(&key);
+            cache_state.ready_versions.remove(&key);
         }
-        if let Some(in_flight) = cache.in_flight.get(&key) {
+        if let Some(in_flight) = cache_state.in_flight.get(&key) {
             in_flight.receiver.clone()
         } else {
-            if cache.in_flight.len() >= CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY {
+            if cache_state.in_flight.len() >= CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY {
                 return ClaudeActivitySupport::default();
             }
-            cache.next_id = cache.next_id.saturating_add(1);
-            let id = cache.next_id;
+            cache_state.next_id = cache_state.next_id.saturating_add(1);
+            let id = cache_state.next_id;
             let (sender, receiver) = tokio::sync::watch::channel(None);
-            cache.in_flight.insert(
+            cache_state.in_flight.insert(
                 key.clone(),
                 ClaudeInFlightProbe {
                     id,
                     receiver: receiver.clone(),
                 },
             );
+            let producer_cache = cache.clone();
             tokio::spawn(async move {
-                let result = probe_claude_activity_support_uncached(&executable, deadline)
-                    .await
-                    .filter(|result| !result.version.is_empty())
-                    .map(|result| ClaudeCachedProbe {
-                        version: result.version,
-                        support: result.support,
-                    });
+                let result =
+                    probe_claude_activity_support_uncached(&executable, deadline, launch_policy)
+                        .await
+                        .filter(|result| !result.version.is_empty())
+                        .map(|result| ClaudeCachedProbe {
+                            version: result.version,
+                            support: result.support,
+                        });
                 let outcome = result
                     .clone()
                     .map_or(ClaudeProbeOutcome::Failed, ClaudeProbeOutcome::Supported);
-                finish_claude_probe(key, id, result);
+                finish_claude_probe(&producer_cache, key, id, result);
                 sender.send_replace(Some(outcome));
             });
             receiver
@@ -7532,10 +7762,13 @@ async fn probe_resolved_claude_activity_support(
     }
 }
 
-fn finish_claude_probe(key: ClaudeProbeCacheKey, id: u64, result: Option<ClaudeCachedProbe>) {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn finish_claude_probe(
+    owner: &ClaudeActivityProbeCache,
+    key: ClaudeProbeCacheKey,
+    id: u64,
+    result: Option<ClaudeCachedProbe>,
+) {
+    let mut cache = owner.lock();
     if !matches!(
         cache.in_flight.get(&key),
         Some(ClaudeInFlightProbe { id: current_id, .. }) if *current_id == id
@@ -7588,9 +7821,12 @@ fn insert_claude_ready_probe(
 async fn probe_claude_activity_support_uncached(
     executable: &Path,
     deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<ClaudeProbeResult> {
-    let version = run_claude_probe_command(executable, "--version", deadline).await?;
-    let Some(help) = run_claude_probe_command(executable, "--help", deadline).await else {
+    let version =
+        run_claude_probe_command(executable, "--version", deadline, launch_policy).await?;
+    let Some(help) = run_claude_probe_command(executable, "--help", deadline, launch_policy).await
+    else {
         return Some(ClaudeProbeResult {
             version,
             ..ClaudeProbeResult::default()
@@ -7612,9 +7848,10 @@ async fn run_claude_probe_command(
     executable: &Path,
     argument: &str,
     deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
-    let launch = prepare_provider_launch(executable, [argument]).ok()?;
+    let launch = prepare_claude_probe_launch(executable, argument, launch_policy)?;
     let mut command = tokio::process::Command::new(launch.program);
     command
         .args(launch.args)
@@ -7650,6 +7887,25 @@ async fn run_claude_probe_command(
     }
     let text = text.trim().to_owned();
     (!text.is_empty()).then_some(text)
+}
+
+fn prepare_claude_probe_launch(
+    executable: &Path,
+    argument: &str,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Option<PreparedLaunch> {
+    #[cfg(unix)]
+    if matches!(launch_policy, ClaudeProbeLaunchPolicy::PosixShellFixture)
+        && executable.extension() == Some(OsStr::new("sh"))
+    {
+        return Some(PreparedLaunch {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![executable.as_os_str().to_owned(), OsString::from(argument)],
+            raw_windows_args: None,
+        });
+    }
+    let _ = launch_policy;
+    prepare_provider_launch(executable, [argument]).ok()
 }
 
 fn build_claude_launch_arguments(
@@ -7795,72 +8051,108 @@ pub fn build_claude_launch_arguments_with_settings_for_test(
     build_claude_launch_arguments(request, session_id, support, hook_settings.as_ref())
 }
 
+/// Owns an isolated Claude activity-probe cache for integration tests.
+///
+/// Production constructors intentionally use the process-global cache. Tests
+/// that seed or inspect cache state use this context so parallel test cases do
+/// not mutate one another's fixtures.
 #[doc(hidden)]
-pub async fn probe_claude_activity_support_for_test(binary_path: &str) -> ClaudeActivitySupport {
-    probe_claude_activity_support(binary_path).await
+#[derive(Clone, Debug, Default)]
+pub struct ClaudeActivityProbeTestContext {
+    cache: ClaudeActivityProbeCache,
 }
 
-#[doc(hidden)]
-pub async fn probe_claude_activity_support_with_resolution_delay_for_test(
-    binary_path: &str,
-    resolution_delay: Duration,
-) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_resolution_delay(binary_path, resolution_delay).await
-}
+impl ClaudeActivityProbeTestContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-#[doc(hidden)]
-pub async fn reset_claude_activity_probe_cache_for_test() {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *cache = ClaudeProbeCacheState::default();
-}
+    #[must_use]
+    pub fn driver_factory(&self, attachments_dir: PathBuf) -> NativeProviderDriverFactory {
+        NativeProviderDriverFactory::with_claude_probe_cache(
+            attachments_dir,
+            ProcessAttributionRegistry::new(),
+            AgentActivityController::new(true),
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+    }
 
-#[doc(hidden)]
-pub async fn claude_activity_probe_cache_len_for_test() -> usize {
-    claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .ready
-        .len()
-}
+    pub async fn probe(&self, binary_path: &str) -> ClaudeActivitySupport {
+        probe_claude_activity_support_with_environment(
+            binary_path,
+            std::iter::empty(),
+            Duration::ZERO,
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+        .await
+    }
 
-#[doc(hidden)]
-pub async fn seed_claude_activity_probe_cache_for_test(count: usize) {
-    let mut cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for index in 0..count {
-        let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
-        let key = ClaudeProbeCacheKey {
-            executable,
-            modified: None,
-            length: u64::try_from(index).unwrap_or(u64::MAX),
-            file_identity: None,
-        };
-        insert_claude_ready_probe(
-            &mut cache,
-            key,
-            ClaudeCachedProbe {
-                version: format!("test-{index}"),
-                support: ClaudeActivitySupport::default(),
-            },
-        );
+    pub async fn probe_with_resolution_delay(
+        &self,
+        binary_path: &str,
+        resolution_delay: Duration,
+    ) -> ClaudeActivitySupport {
+        probe_claude_activity_support_with_environment(
+            binary_path,
+            std::iter::empty(),
+            resolution_delay,
+            self.cache.clone(),
+            test_claude_probe_launch_policy(),
+        )
+        .await
+    }
+
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.cache.lock().ready.len()
+    }
+
+    pub fn seed_cache(&self, count: usize) {
+        let mut cache = self.cache.lock();
+        for index in 0..count {
+            let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
+            let key = ClaudeProbeCacheKey {
+                executable,
+                modified: None,
+                length: u64::try_from(index).unwrap_or(u64::MAX),
+                file_identity: None,
+            };
+            insert_claude_ready_probe(
+                &mut cache,
+                key,
+                ClaudeCachedProbe {
+                    version: format!("test-{index}"),
+                    support: ClaudeActivitySupport::default(),
+                },
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn cache_paths(&self) -> Vec<String> {
+        let cache = self.cache.lock();
+        let mut paths = cache
+            .ready
+            .keys()
+            .map(|key| key.executable.executable.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 }
 
-#[doc(hidden)]
-pub async fn claude_activity_probe_cache_paths_for_test() -> Vec<String> {
-    let cache = claude_probe_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut paths = cache
-        .ready
-        .keys()
-        .map(|key| key.executable.executable.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
+const fn test_claude_probe_launch_policy() -> ClaudeProbeLaunchPolicy {
+    #[cfg(unix)]
+    {
+        ClaudeProbeLaunchPolicy::PosixShellFixture
+    }
+    #[cfg(not(unix))]
+    {
+        ClaudeProbeLaunchPolicy::Direct
+    }
 }
 
 impl ClaudeDriver {
@@ -7869,6 +8161,8 @@ impl ClaudeDriver {
         attachments: AttachmentMaterializer,
         attribution: ProcessAttributionRegistry,
         activity_enabled: bool,
+        probe_cache: ClaudeActivityProbeCache,
+        probe_launch_policy: ClaudeProbeLaunchPolicy,
     ) -> Result<Self, ProviderRuntimeError> {
         let supports_fast_mode = claude_supports_fast_mode(request.model.as_deref());
         validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
@@ -7889,6 +8183,8 @@ impl ClaudeDriver {
                 .iter()
                 .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
             Duration::ZERO,
+            probe_cache,
+            probe_launch_policy,
         )
         .await;
         let hook_sink = if support.include_hook_events && support.forward_subagent_text {
@@ -7908,7 +8204,7 @@ impl ClaudeDriver {
         }
         let args =
             build_claude_launch_arguments(&request, &session_id, support, hook_settings.as_ref());
-        let mut child = spawn_child(&request, &args, true, attribution)?;
+        let mut child = spawn_child(&request, &args, true, attribution).await?;
         let stdout = child
             .stdout()
             .take()
@@ -9312,6 +9608,7 @@ mod tests {
             ProviderEnvironmentVariableState, ProviderInstanceState, ProviderSettingsState,
             ProvidersState,
         },
+        test_support::{FixtureEvent, TestSandbox},
     };
     use axum::{
         Json, Router,
@@ -9324,7 +9621,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex as StdMutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::{Duration, Instant},
@@ -9337,8 +9634,32 @@ mod tests {
         time::timeout,
     };
 
-    #[cfg(unix)]
-    static CLAUDE_STOP_TASK_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const PROVIDER_FIXTURE_INTEGRATION_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    #[derive(Clone, Copy, Debug)]
+    struct ProviderFixtureDeadline(tokio::time::Instant);
+
+    impl ProviderFixtureDeadline {
+        fn after(duration: std::time::Duration) -> Self {
+            Self(tokio::time::Instant::now() + duration)
+        }
+
+        fn integration() -> Self {
+            Self::after(PROVIDER_FIXTURE_INTEGRATION_TIMEOUT)
+        }
+
+        fn instant(self) -> tokio::time::Instant {
+            self.0
+        }
+
+        async fn observe<F>(self, future: F) -> Result<F::Output, tokio::time::error::Elapsed>
+        where
+            F: std::future::Future,
+        {
+            tokio::time::timeout_at(self.0, future).await
+        }
+    }
 
     fn targeted_claude_runtime(
         thread_id: impl Into<String>,
@@ -9350,24 +9671,6 @@ mod tests {
         );
         runtime.set_targeted_activity_control_supported(true);
         runtime
-    }
-
-    struct CurrentDirectoryGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CurrentDirectoryGuard {
-        fn enter(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().expect("read original current directory");
-            std::env::set_current_dir(path).expect("enter fixture current directory");
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirectoryGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.original).expect("restore original current directory");
-        }
     }
 
     #[derive(Default)]
@@ -9384,6 +9687,10 @@ mod tests {
         models: Vec<String>,
         rollbacks: Vec<i64>,
         shutdowns: usize,
+        shutdown_entered: Option<Arc<tokio::sync::Semaphore>>,
+        shutdown_release: Option<Arc<tokio::sync::Semaphore>>,
+        shutdown_active: Arc<AtomicUsize>,
+        max_shutdown_active: Arc<AtomicUsize>,
         send_gate: Option<Arc<tokio::sync::Notify>>,
         send_entered: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
@@ -9400,6 +9707,238 @@ mod tests {
     struct SupervisorDriver {
         state: Arc<StdMutex<SupervisorDriverState>>,
         events: tokio::sync::Mutex<mpsc::Receiver<super::ProviderEvent>>,
+    }
+
+    struct CodexStartupMilestones {
+        initialize_response_ready: Arc<FixtureEvent>,
+        initialize_checkpoint: u64,
+        thread_response_ready: Arc<FixtureEvent>,
+        thread_checkpoint: u64,
+        owner_completed: Arc<FixtureEvent>,
+        owner_checkpoint: u64,
+    }
+
+    impl CodexStartupMilestones {
+        fn new(
+            initialize_response_ready: Arc<FixtureEvent>,
+            thread_response_ready: Arc<FixtureEvent>,
+            owner_completed: Arc<FixtureEvent>,
+        ) -> Self {
+            let initialize_checkpoint = initialize_response_ready.checkpoint();
+            let thread_checkpoint = thread_response_ready.checkpoint();
+            let owner_checkpoint = owner_completed.checkpoint();
+            Self {
+                initialize_response_ready,
+                initialize_checkpoint,
+                thread_response_ready,
+                thread_checkpoint,
+                owner_completed,
+                owner_checkpoint,
+            }
+        }
+
+        async fn wait_until(&self, deadline: tokio::time::Instant) -> Result<(), &'static str> {
+            self.wait_for(
+                &self.initialize_response_ready,
+                self.initialize_checkpoint,
+                deadline,
+                "initialize_response_ready",
+            )
+            .await?;
+            self.wait_for(
+                &self.thread_response_ready,
+                self.thread_checkpoint,
+                deadline,
+                "thread_response_ready",
+            )
+            .await?;
+            self.wait_for(
+                &self.owner_completed,
+                self.owner_checkpoint,
+                deadline,
+                "owner_completed",
+            )
+            .await
+        }
+
+        async fn wait_for(
+            &self,
+            event: &FixtureEvent,
+            checkpoint: u64,
+            deadline: tokio::time::Instant,
+            milestone: &'static str,
+        ) -> Result<(), &'static str> {
+            tokio::time::timeout_at(deadline, event.wait_after(checkpoint))
+                .await
+                .map_err(|_| milestone)
+        }
+
+        fn reached(&self) -> (bool, bool, bool) {
+            (
+                self.initialize_response_ready.checkpoint() > self.initialize_checkpoint,
+                self.thread_response_ready.checkpoint() > self.thread_checkpoint,
+                self.owner_completed.checkpoint() > self.owner_checkpoint,
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_startup_milestones_accept_owner_scheduled_after_two_seconds() {
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
+        let owner_completed = Arc::new(FixtureEvent::default());
+        let milestones = CodexStartupMilestones::new(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+            owner_completed.clone(),
+        );
+        let observation =
+            milestones.wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+        tokio::pin!(observation);
+
+        std::future::poll_fn(|context| {
+            assert!(observation.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "the obsolete two-second observer bound must not complete startup"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        initialize_response_ready.publish();
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "initialize alone must not satisfy ordered startup"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        thread_response_ready.publish();
+        std::future::poll_fn(|context| {
+            assert!(
+                observation.as_mut().poll(context).is_pending(),
+                "responses alone must not satisfy owner completion"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        owner_completed.publish();
+
+        observation
+            .await
+            .expect("all ordered milestones complete within the shared deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_fixture_deadline_is_not_restarted_between_milestones() {
+        let started_at = tokio::time::Instant::now();
+        let deadline = ProviderFixtureDeadline::after(std::time::Duration::from_secs(15));
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        deadline
+            .observe(std::future::ready("first"))
+            .await
+            .expect("first milestone before the deadline");
+        deadline
+            .observe(std::future::pending::<()>())
+            .await
+            .expect_err("second milestone must retain the original deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            std::time::Duration::from_secs(15),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_fixture_integration_deadline_preserves_loaded_suite_headroom() {
+        let started_at = tokio::time::Instant::now();
+        let deadline = ProviderFixtureDeadline::integration();
+
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+        deadline
+            .observe(std::future::pending::<()>())
+            .await
+            .expect_err("the integration fixture must remain bounded by one absolute deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            std::time::Duration::from_secs(30),
+        );
+    }
+
+    struct ProviderFixtureOwnerAbortProbe(Arc<AtomicBool>);
+
+    impl Drop for ProviderFixtureOwnerAbortProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_fixture_deadline_failure_aborts_owner_and_reaps_driver_before_panicking() {
+        // Mutation caught: restoring an internal capture expect, or converting its deadline
+        // error before cleanup, detaches the retained owner and leaves the fixture process live.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("missing-capture.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
+        driver.start().await.expect("Cursor fixture should start");
+
+        let owner_aborted = Arc::new(AtomicBool::new(false));
+        let (owner_started, owner_started_receiver) = tokio::sync::oneshot::channel();
+        let owner_probe = owner_aborted.clone();
+        let owner = tokio::spawn(async move {
+            let _probe = ProviderFixtureOwnerAbortProbe(owner_probe);
+            owner_started.send(()).expect("owner start observation");
+            std::future::pending::<()>().await;
+        });
+        owner_started_receiver
+            .await
+            .expect("retained owner should start");
+
+        let deadline = ProviderFixtureDeadline::after(std::time::Duration::ZERO);
+        let capture_error = captured_request(deadline, &capture_path, |_| false)
+            .await
+            .expect_err("expired capture returns its deadline error to the cleanup owner");
+        let cleanup_driver = driver.clone();
+        let failure = tokio::spawn(async move {
+            fixture_deadline_failure_with_owner(
+                cleanup_driver.as_ref(),
+                owner,
+                "provider request capture",
+                capture_error,
+            )
+            .await;
+        });
+
+        assert!(
+            failure
+                .await
+                .expect_err("cleanup owner converts the deadline into the test failure")
+                .is_panic(),
+            "the deadline remains a test failure after cleanup"
+        );
+        assert!(
+            owner_aborted.load(Ordering::SeqCst),
+            "cleanup aborts and joins the retained owner before failing"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped fixture status")
+                .is_some(),
+            "cleanup shuts down and reaps the real fixture driver before failing"
+        );
     }
 
     impl ProviderDriver for SupervisorDriver {
@@ -9601,6 +10140,28 @@ mod tests {
 
         fn shutdown(&self) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
+                let (entered, release, active, max_active) = {
+                    let state = self.state.lock().unwrap();
+                    (
+                        state.shutdown_entered.clone(),
+                        state.shutdown_release.clone(),
+                        state.shutdown_active.clone(),
+                        state.max_shutdown_active.clone(),
+                    )
+                };
+                let active_count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(active_count, Ordering::AcqRel);
+                if let Some(entered) = entered {
+                    entered.add_permits(1);
+                }
+                if let Some(release) = release {
+                    release
+                        .acquire()
+                        .await
+                        .expect("shutdown release remains open")
+                        .forget();
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
                 self.state.lock().unwrap().shutdowns += 1;
                 Ok(())
             })
@@ -9686,6 +10247,7 @@ mod tests {
     }
 
     fn native_launch(temp: &TempDir, provider: &str) -> super::ProviderLaunchRequest {
+        let environment_sandbox = TestSandbox::new("provider-launch-environment");
         super::ProviderLaunchRequest {
             thread_id: "native-test-thread".to_owned(),
             activity_causal_revision: 0,
@@ -9702,7 +10264,7 @@ mod tests {
             effort: None,
             agent: None,
             resume_cursor: None,
-            environment: Default::default(),
+            environment: environment_sandbox.environment(std::iter::empty::<(String, String)>()),
             endpoint: None,
             server_password: None,
             mcp: None,
@@ -9747,6 +10309,31 @@ mod tests {
 
     async fn launch_request_with_options(options: Vec<Value>) -> super::ProviderLaunchRequest {
         launch_request_for_provider_with_options("codex", "gpt-5.6", options).await
+    }
+
+    #[test]
+    fn production_native_factories_share_the_direct_claude_probe_cache() {
+        let temp = TempDir::new().expect("provider factory fixture directory");
+        let first = super::NativeProviderDriverFactory::new(temp.path().join("attachments-a"));
+        let second = super::NativeProviderDriverFactory::new(temp.path().join("attachments-b"));
+
+        assert!(
+            Arc::ptr_eq(
+                &first.claude_probe_cache.state,
+                &second.claude_probe_cache.state
+            ),
+            "production factories must preserve process-wide Claude probe reuse"
+        );
+        assert!(matches!(
+            (
+                first.claude_probe_launch_policy,
+                second.claude_probe_launch_policy
+            ),
+            (
+                super::ClaudeProbeLaunchPolicy::Direct,
+                super::ClaudeProbeLaunchPolicy::Direct
+            )
+        ));
     }
 
     #[tokio::test]
@@ -9977,8 +10564,11 @@ lines.on("line", (line) => {
                 r#"const fs = require("node:fs");
 const readline = require("node:readline");
 const lines = readline.createInterface({ input: process.stdin });
-lines.on("line", (line) => {
-  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+	lines.on("line", (line) => {
+	  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+	  if (process.env.BIBCODE_TEST_REQUEST_READY) {
+	    fs.writeFileSync(process.env.BIBCODE_TEST_REQUEST_READY, "ready\n");
+	  }
   const timer = setInterval(() => {
     if (!fs.existsSync(process.env.BIBCODE_TEST_ACK_GATE)) return;
     clearInterval(timer);
@@ -10006,6 +10596,11 @@ lines.on("line", (line) => {
     fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
   }
   const request = JSON.parse(line);
+  if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER) {
+    fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER, request.method);
+    process.stderr.write("BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED\n");
+  }
+  if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE) return;
   let result;
   switch (request.method) {
     case "initialize":
@@ -10030,11 +10625,21 @@ lines.on("line", (line) => {
       result = { thread: { id: "native-codex-thread", turns: [] } };
       break;
     case "shutdown":
+      if (process.env.BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER) {
+        fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER, request.method);
+      }
+      if (process.env.BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE) return;
       result = null;
       break;
     default:
       return;
   }
+  const marker = request.method === "initialize"
+      ? process.env.BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER
+      : request.method === "thread/start"
+        ? process.env.BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER
+        : undefined;
+  if (marker) fs.writeFileSync(marker, request.method);
   process.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
 });
 "#
@@ -10136,7 +10741,8 @@ done
     const CLAUDE_REPLAY_FIXTURE: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
-  while [ ! -f "$BIBCODE_TEST_ACK_GATE" ]; do sleep 0.01; done
+  [ -z "$BIBCODE_TEST_REQUEST_READY" ] || printf '%s\n' ready > "$BIBCODE_TEST_REQUEST_READY"
+  IFS= read -r _ < "$BIBCODE_TEST_ACK_GATE"
   printf '%s\n' "$line"
 done
 "#;
@@ -10179,6 +10785,7 @@ done
         fixture: &str,
         capture_path: &std::path::Path,
         acknowledgement_gate: Option<&std::path::Path>,
+        request_ready: Option<&std::path::Path>,
     ) -> Arc<super::ClaudeDriver> {
         let executable = executable_fixture(temp, name, fixture);
         let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
@@ -10194,12 +10801,20 @@ done
                 gate.to_string_lossy().into_owned(),
             );
         }
+        if let Some(ready) = request_ready {
+            request.environment.insert(
+                "BIBCODE_TEST_REQUEST_READY".to_owned(),
+                ready.to_string_lossy().into_owned(),
+            );
+        }
         Arc::new(
             super::ClaudeDriver::spawn(
                 request,
                 factory.attachments.clone(),
                 factory.attribution.clone(),
                 false,
+                factory.claude_probe_cache.clone(),
+                factory.claude_probe_launch_policy,
             )
             .await
             .expect("Claude delivery fixture should start"),
@@ -10212,6 +10827,7 @@ case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
 esac
+[ -z "$BIBCODE_TEST_READY_FIFO" ] || printf '%s\n' ready > "$BIBCODE_TEST_READY_FIFO"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   case "$line" in
@@ -10238,16 +10854,37 @@ done
         temp: &TempDir,
         outcome: &str,
     ) -> (Arc<super::ClaudeDriver>, std::path::PathBuf) {
-        super::reset_claude_activity_probe_cache_for_test().await;
+        let probe_context = super::ClaudeActivityProbeTestContext::new();
         let capture = temp
             .path()
             .join(format!("claude-stop-task-{outcome}.jsonl"));
         let executable = executable_fixture(
             temp,
-            &format!("claude-stop-task-{outcome}"),
+            &format!("claude-stop-task-{outcome}.sh"),
             CLAUDE_STOP_TASK_FIXTURE,
         );
-        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let ready_fifo = temp
+            .path()
+            .join(format!("claude-stop-task-{outcome}.ready"));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&ready_fifo)
+                .status()
+                .expect("mkfifo starts")
+                .success(),
+            "Claude stop-task readiness FIFO is created"
+        );
+        use std::os::unix::fs::OpenOptionsExt;
+        let ready = tokio::io::unix::AsyncFd::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&ready_fifo)
+                .expect("open Claude stop-task readiness FIFO without blocking"),
+        )
+        .expect("register Claude stop-task readiness FIFO");
+        let factory = probe_context.driver_factory(temp.path().join("attachments"));
         let mut request = native_launch(temp, "claudeAgent");
         request.binary_path = executable.to_string_lossy().into_owned();
         request.environment.insert(
@@ -10258,16 +10895,46 @@ done
             "BIBCODE_TEST_STOP_TASK_OUTCOME".to_owned(),
             outcome.to_owned(),
         );
+        request.environment.insert(
+            "BIBCODE_TEST_READY_FIFO".to_owned(),
+            ready_fifo.to_string_lossy().into_owned(),
+        );
         let driver = Arc::new(
             super::ClaudeDriver::spawn(
                 request,
                 factory.attachments.clone(),
                 factory.attribution.clone(),
                 true,
+                factory.claude_probe_cache.clone(),
+                factory.claude_probe_launch_policy,
             )
             .await
             .expect("Claude stop-task driver"),
         );
+        let marker = tokio::time::timeout(Duration::from_secs(15), async {
+            use std::io::Read;
+
+            let mut bytes = [0_u8; 32];
+            loop {
+                let mut readable = ready
+                    .readable()
+                    .await
+                    .expect("Claude stop-task readiness FIFO remains registered");
+                match readable.try_io(|inner| {
+                    let mut file = inner.get_ref();
+                    file.read(&mut bytes)
+                }) {
+                    Ok(Ok(count)) if count > 0 => {
+                        break String::from_utf8_lossy(&bytes[..count]).into_owned();
+                    }
+                    Ok(Ok(_)) | Err(_) => continue,
+                    Ok(Err(error)) => panic!("read Claude stop-task readiness FIFO: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Claude stop-task fixture readiness outer bound");
+        assert_eq!(marker.trim(), "ready");
         (driver, capture)
     }
 
@@ -10275,8 +10942,6 @@ done
     #[tokio::test]
     async fn claude_targeted_activity_writes_only_stop_task_for_the_exact_target() {
         // Mutation caught: falling back to root interrupt or sending a foreign target variant.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
         let temp = TempDir::new().expect("Claude stop-task fixture");
         let (driver, capture) = claude_stop_task_driver(&temp, "success").await;
         assert!(
@@ -10319,8 +10984,6 @@ done
     #[tokio::test]
     async fn claude_authoritative_unsupported_downgrades_until_a_fresh_generation() {
         // Mutation caught: retrying provider I/O after authoritative unsupported, or persisting it forever.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
         let temp = TempDir::new().expect("Claude unsupported fixture");
         let (driver, capture) = claude_stop_task_driver(&temp, "unsupported").await;
         let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
@@ -10386,8 +11049,6 @@ done
     #[tokio::test]
     async fn claude_generic_stop_task_failure_does_not_downgrade_the_generation() {
         // Mutation caught: treating every remote task failure as authoritative protocol unsupported.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
         let temp = TempDir::new().expect("Claude failure fixture");
         let (driver, capture) = claude_stop_task_driver(&temp, "failed").await;
         let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
@@ -10425,8 +11086,6 @@ done
     #[tokio::test]
     async fn claude_timeout_and_closed_stop_task_do_not_downgrade_the_generation() {
         // Mutation caught: permanently disabling targeted control for transient transport failures.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
         for (outcome, expected_detail) in [
             ("timeout", "targeted activity cancellation timed out"),
             ("closed", "targeted activity cancellation connection closed"),
@@ -10465,7 +11124,6 @@ done
 
     #[tokio::test]
     async fn claude_options_acknowledge_the_exact_launch_vector_and_restart_only_fast_changes() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
         let fixture = executable_fixture(&temp, "claude-options", CLAUDE_FIXTURE);
@@ -10478,6 +11136,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             false,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("Claude driver should create");
@@ -10506,19 +11166,59 @@ done
 
     #[tokio::test]
     async fn claude_delivery_waits_for_the_replayed_user_message_before_accepting() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
         let acknowledgement_gate = temp.path().join("release-acknowledgement");
+        #[cfg(unix)]
+        let request_ready_path = temp.path().join("request-ready");
+        #[cfg(unix)]
+        let (request_ready, mut acknowledgement_writer) = {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            for path in [&request_ready_path, &acknowledgement_gate] {
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(path)
+                        .status()
+                        .expect("Claude delivery mkfifo starts")
+                        .success(),
+                    "Claude delivery FIFO is created"
+                );
+            }
+            let open_fifo = |path: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .expect("open Claude delivery FIFO without blocking")
+            };
+            (
+                tokio::io::unix::AsyncFd::new(open_fifo(&request_ready_path))
+                    .expect("register Claude delivery readiness FIFO"),
+                open_fifo(&acknowledgement_gate),
+            )
+        };
         let driver = claude_delivery_fixture(
             &temp,
             "claude-delivery-replay",
             CLAUDE_REPLAY_FIXTURE,
             &capture_path,
             Some(&acknowledgement_gate),
+            {
+                #[cfg(unix)]
+                {
+                    Some(request_ready_path.as_path())
+                }
+                #[cfg(windows)]
+                {
+                    None
+                }
+            },
         )
         .await;
         driver.start().await.expect("Claude fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
         let delivery_driver = driver.clone();
         let mut delivery = tokio::spawn(async move {
             delivery_driver
@@ -10530,17 +11230,75 @@ done
                 )
                 .await
         });
-        captured_request(&capture_path, |value| value["type"] == "user").await;
+        #[cfg(unix)]
+        if let Err(error) = deadline
+            .observe(async {
+                use std::io::Read;
+
+                let mut bytes = [0_u8; 16];
+                loop {
+                    let mut readable = request_ready
+                        .readable()
+                        .await
+                        .expect("Claude delivery readiness FIFO remains registered");
+                    match readable.try_io(|inner| {
+                        let mut file = inner.get_ref();
+                        file.read(&mut bytes)
+                    }) {
+                        Ok(Ok(count)) if count > 0 => break,
+                        Ok(Ok(_)) | Err(_) => continue,
+                        Ok(Err(error)) => panic!("read Claude delivery readiness FIFO: {error}"),
+                    }
+                }
+            })
+            .await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery FIFO readiness",
+                error,
+            )
+            .await;
+        }
+        #[cfg(windows)]
+        if let Err(error) =
+            captured_request(deadline, &capture_path, |value| value["type"] == "user").await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery request capture",
+                error,
+            )
+            .await;
+        }
 
         let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
         let was_pending = premature.is_err();
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            acknowledgement_writer
+                .write_all(b"release\n")
+                .expect("release acknowledgement");
+        }
+        #[cfg(windows)]
         std::fs::write(&acknowledgement_gate, b"release").expect("release acknowledgement");
         let outcome = match premature {
             Ok(outcome) => outcome.expect("delivery task should join"),
-            Err(_) => timeout(std::time::Duration::from_secs(2), delivery)
-                .await
-                .expect("replayed user message should acknowledge delivery")
-                .expect("delivery task should join"),
+            Err(_) => match deadline.observe(&mut delivery).await {
+                Ok(outcome) => outcome.expect("delivery task should join"),
+                Err(error) => {
+                    fixture_deadline_failure_with_owner(
+                        driver.as_ref(),
+                        delivery,
+                        "Claude replay acknowledgement",
+                        error,
+                    )
+                    .await
+                }
+            },
         };
         driver.shutdown().await.expect("Claude fixture shutdown");
 
@@ -10556,7 +11314,6 @@ done
 
     #[tokio::test]
     async fn claude_delivery_disconnect_after_write_without_replay_is_ambiguous() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
         let driver = claude_delivery_fixture(
@@ -10565,11 +11322,13 @@ done
             CLAUDE_DISCONNECT_FIXTURE,
             &capture_path,
             None,
+            None,
         )
         .await;
         driver.start().await.expect("Claude fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
         let delivery_driver = driver.clone();
-        let delivery = tokio::spawn(async move {
+        let mut delivery = tokio::spawn(async move {
             delivery_driver
                 .deliver(
                     "hello".to_owned(),
@@ -10579,11 +11338,29 @@ done
                 )
                 .await
         });
-        captured_request(&capture_path, |value| value["type"] == "user").await;
-        let outcome = timeout(std::time::Duration::from_secs(2), delivery)
-            .await
-            .expect("provider disconnect should resolve delivery")
-            .expect("delivery task should join");
+        if let Err(error) =
+            captured_request(deadline, &capture_path, |value| value["type"] == "user").await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Claude delivery request capture",
+                error,
+            )
+            .await;
+        }
+        let outcome = match deadline.observe(&mut delivery).await {
+            Ok(outcome) => outcome.expect("delivery task should join"),
+            Err(error) => {
+                fixture_deadline_failure_with_owner(
+                    driver.as_ref(),
+                    delivery,
+                    "Claude delivery disconnect outcome",
+                    error,
+                )
+                .await
+            }
+        };
         driver.shutdown().await.expect("Claude fixture shutdown");
 
         assert!(matches!(
@@ -10595,7 +11372,6 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_completion_queries_order_stream_usage_mcp_status_then_completion() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-context-query.jsonl");
         let driver = claude_delivery_fixture(
@@ -10604,42 +11380,62 @@ done
             CLAUDE_CONTEXT_QUERY_FIXTURE,
             &capture_path,
             None,
+            None,
         )
         .await;
         driver.start().await.expect("Claude fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
 
-        let outcome = timeout(
-            std::time::Duration::from_secs(2),
-            driver.deliver(
+        let outcome = match deadline
+            .observe(driver.deliver(
                 "measure context".to_owned(),
                 Vec::new(),
                 "default".to_owned(),
                 "unused-no-id-key".to_owned(),
-            ),
-        )
-        .await
-        .expect("delivery timeout");
+            ))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "Claude delivery outcome", error)
+                    .await
+            }
+        };
         assert!(matches!(
             outcome,
             super::ProviderDeliveryOutcome::Accepted { .. }
         ));
 
-        let stream_usage = timeout(std::time::Duration::from_secs(2), driver.next_event())
-            .await
-            .expect("stream usage timeout")
-            .expect("stream usage event");
-        let authoritative_usage = timeout(std::time::Duration::from_secs(2), driver.next_event())
-            .await
-            .expect("authoritative usage timeout")
-            .expect("authoritative usage event");
-        let mcp_status = timeout(std::time::Duration::from_secs(2), driver.next_event())
-            .await
-            .expect("MCP status timeout")
-            .expect("MCP status event");
-        let completion = timeout(std::time::Duration::from_secs(2), driver.next_event())
-            .await
-            .expect("completion timeout")
-            .expect("completion event");
+        let stream_usage = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("stream usage event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "stream usage event", error)
+                    .await
+            }
+        };
+        let authoritative_usage = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("authoritative usage event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "authoritative usage event",
+                    error,
+                )
+                .await
+            }
+        };
+        let mcp_status = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("MCP status event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "MCP status event", error).await
+            }
+        };
+        let completion = match deadline.observe(driver.next_event()).await {
+            Ok(event) => event.expect("completion event"),
+            Err(error) => {
+                provider_fixture_deadline_failure(driver.as_ref(), "completion event", error).await
+            }
+        };
 
         assert_eq!(stream_usage.event_type, "thread.token-usage.updated");
         assert_eq!(stream_usage.payload["usage"]["usedTokens"], 1_550);
@@ -10651,10 +11447,21 @@ done
         assert_eq!(completion.event_type, "turn.completed");
         assert_eq!(completion.payload["state"], "completed");
 
-        let query = captured_request(&capture_path, |value| {
+        let query = match captured_request(deadline, &capture_path, |value| {
             value["request"]["subtype"] == "get_context_usage"
         })
-        .await;
+        .await
+        {
+            Ok(query) => query,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Claude context-usage capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             query,
             json!({
@@ -10663,10 +11470,21 @@ done
                 "request": { "subtype": "get_context_usage" }
             })
         );
-        let mcp_query = captured_request(&capture_path, |value| {
+        let mcp_query = match captured_request(deadline, &capture_path, |value| {
             value["request"]["subtype"] == "mcp_status"
         })
-        .await;
+        .await
+        {
+            Ok(query) => query,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Claude MCP-status capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             mcp_query,
             json!({
@@ -11477,15 +12295,28 @@ done
 while IFS= read -r line; do
   [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  response_marker=
   case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      if [ -n "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER" ]; then
+        : > "$BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER"
+        printf '%s\n' 'BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED' >&2
+      fi
+      [ -z "$BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE" ] || continue
+      response_marker=$BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER
+      [ -z "$response_marker" ] || : > "$response_marker"
+      printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*) response_marker=$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"thread/rollback"'*) printf '{"id":%s,"result":{"thread":{"id":"native-codex-thread","turns":[]}}}\n' "$id" ;;
-    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+    *'"method":"shutdown"'*)
+      [ -z "$BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER" ] || : > "$BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER"
+      [ -n "$BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE" ] || printf '{"id":%s,"result":null}\n' "$id"
+      ;;
   esac
 done
 "#;
@@ -11560,7 +12391,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_missing_session_is_definitely_not_sent() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
@@ -11589,7 +12419,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_waits_for_the_session_prompt_response_before_accepting() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let acknowledgement_gate = temp.path().join("release-response");
@@ -11602,6 +12431,7 @@ done
         )
         .await;
         driver.start().await.expect("Cursor fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
         let delivery_driver = driver.clone();
         let mut delivery = tokio::spawn(async move {
             delivery_driver
@@ -11613,17 +12443,37 @@ done
                 )
                 .await
         });
-        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
+            value["method"] == "session/prompt"
+        })
+        .await
+        {
+            fixture_deadline_failure_with_owner(
+                driver.as_ref(),
+                delivery,
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
 
         let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
         let was_pending = premature.is_err();
         std::fs::write(&acknowledgement_gate, b"release").expect("release response");
         let outcome = match premature {
             Ok(outcome) => outcome.expect("delivery task should join"),
-            Err(_) => timeout(std::time::Duration::from_secs(2), delivery)
-                .await
-                .expect("prompt response should acknowledge delivery")
-                .expect("delivery task should join"),
+            Err(_) => match deadline.observe(&mut delivery).await {
+                Ok(outcome) => outcome.expect("delivery task should join"),
+                Err(error) => {
+                    fixture_deadline_failure_with_owner(
+                        driver.as_ref(),
+                        delivery,
+                        "Cursor session/prompt acknowledgement",
+                        error,
+                    )
+                    .await
+                }
+            },
         };
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
@@ -11639,23 +12489,42 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_disconnect_after_write_before_response_is_ambiguous() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, true, false).await;
         driver.start().await.expect("Cursor fixture should start");
-        let outcome = timeout(
-            std::time::Duration::from_secs(2),
-            driver.deliver(
+        let deadline = ProviderFixtureDeadline::integration();
+        let outcome = match deadline
+            .observe(driver.deliver(
                 "hello".to_owned(),
                 Vec::new(),
                 "default".to_owned(),
                 "unused-no-id-key".to_owned(),
-            ),
-        )
+            ))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    driver.as_ref(),
+                    "Cursor delivery disconnect outcome",
+                    error,
+                )
+                .await
+            }
+        };
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
+            value["method"] == "session/prompt"
+        })
         .await
-        .expect("provider disconnect should resolve delivery");
-        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+        {
+            provider_fixture_deadline_failure(
+                driver.as_ref(),
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
         assert!(matches!(
@@ -11666,11 +12535,11 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_remote_prompt_rejection_is_rejected() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, true).await;
         driver.start().await.expect("Cursor fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
 
         let outcome = driver
             .deliver(
@@ -11680,7 +12549,18 @@ done
                 "unused-no-id-key".to_owned(),
             )
             .await;
-        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+        if let Err(error) = captured_request(deadline, &capture_path, |value| {
+            value["method"] == "session/prompt"
+        })
+        .await
+        {
+            provider_fixture_deadline_failure(
+                driver.as_ref(),
+                "Cursor session/prompt capture",
+                error,
+            )
+            .await;
+        }
         driver.shutdown().await.expect("Cursor fixture shutdown");
 
         assert!(matches!(
@@ -11694,7 +12574,6 @@ done
     async fn cursor_delivery_prompt_write_zero_bytes_is_definitely_not_sent() {
         // Mutation caught: treating a proven zero-byte failure as possibly submitted prevents a
         // safe retry.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::BeforeFirstByte).await;
 
@@ -11710,7 +12589,6 @@ done
     async fn cursor_delivery_prompt_write_partial_bytes_is_ambiguous() {
         // Mutation caught: write_all erases a successful prefix when a later write fails, making
         // a possibly submitted prompt look safe to retry.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::AfterPrefix).await;
 
@@ -11732,7 +12610,6 @@ done
     async fn cursor_delivery_prompt_write_flush_failure_is_ambiguous() {
         // Mutation caught: a flush error occurs after write_all accepted the complete prompt frame,
         // so classifying it as definitely unsent can duplicate a provider-visible prompt.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::OnFlush).await;
 
@@ -11754,7 +12631,6 @@ done
     async fn cursor_delivery_prompt_write_confirmation_loss_is_ambiguous_without_a_pending_leak() {
         // Mutation caught: dropping the writer confirmation without removing its correlation
         // leaves a permanently pending response entry after the durable driver returns Ambiguous.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, pending_request_count) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::LoseConfirmation).await;
 
@@ -11970,22 +12846,54 @@ done
         }
     }
 
-    async fn captured_request(path: &std::path::Path, predicate: impl Fn(&Value) -> bool) -> Value {
-        timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let captured = std::fs::read_to_string(path).unwrap_or_default();
-                if let Some(request) = captured
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .find(|request| predicate(request))
-                {
-                    return request;
+    async fn provider_fixture_deadline_failure<D>(
+        driver: &D,
+        stage: &str,
+        elapsed: tokio::time::error::Elapsed,
+    ) -> !
+    where
+        D: ProviderDriver + ?Sized,
+    {
+        let shutdown = driver.shutdown().await;
+        panic!(
+            "{stage} exceeded the fixture deadline after driver shutdown: {shutdown:?}; {elapsed}"
+        );
+    }
+
+    async fn fixture_deadline_failure_with_owner<T, D>(
+        driver: &D,
+        owner: tokio::task::JoinHandle<T>,
+        stage: &str,
+        elapsed: tokio::time::error::Elapsed,
+    ) -> !
+    where
+        D: ProviderDriver + ?Sized,
+    {
+        owner.abort();
+        let _ = owner.await;
+        provider_fixture_deadline_failure(driver, stage, elapsed).await
+    }
+
+    async fn captured_request(
+        deadline: ProviderFixtureDeadline,
+        path: &std::path::Path,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Result<Value, tokio::time::error::Elapsed> {
+        deadline
+            .observe(async {
+                loop {
+                    let captured = std::fs::read_to_string(path).unwrap_or_default();
+                    if let Some(request) = captured
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .find(|request| predicate(request))
+                    {
+                        return request;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("provider request capture timeout")
+            })
+            .await
     }
 
     async fn prepared_attachment_pair(factory: &super::NativeProviderDriverFactory) -> Vec<Value> {
@@ -12011,11 +12919,12 @@ done
     async fn live_claims(
         registry: &ProcessAttributionRegistry,
     ) -> Vec<crate::diagnostics::ProcessClaim> {
+        let sample_started_at = Instant::now();
         let rows = NativeProcessSampler::default()
             .sample()
             .await
             .expect("native process sample");
-        registry.bind_and_snapshot(&rows, Instant::now())
+        registry.bind_and_snapshot(&rows, sample_started_at)
     }
 
     #[tokio::test]
@@ -12177,6 +13086,87 @@ done
         assert!(second.lock().unwrap().targeted_calls.is_empty());
 
         supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_drains_distinct_provider_sessions_concurrently() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create", "commandId":"thread-two", "threadId":"t2",
+                    "projectId":"p1", "title":"Thread two", "kind":"workspace",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "branch":null, "worktreePath":null,
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .expect("second thread command"),
+            )
+            .await
+            .expect("second thread");
+        let shutdown_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let shutdown_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let shutdown_active = Arc::new(AtomicUsize::new(0));
+        let max_shutdown_active = Arc::new(AtomicUsize::new(0));
+        let driver_state = || {
+            Arc::new(StdMutex::new(SupervisorDriverState {
+                shutdown_entered: Some(shutdown_entered.clone()),
+                shutdown_release: Some(shutdown_release.clone()),
+                shutdown_active: shutdown_active.clone(),
+                max_shutdown_active: max_shutdown_active.clone(),
+                ..SupervisorDriverState::default()
+            }))
+        };
+        let first = driver_state();
+        let second = driver_state();
+        let (_first_tx, first_rx) = mpsc::channel(1);
+        let (_second_tx, second_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SequencedSupervisorFactory {
+                drivers: StdMutex::new(std::collections::VecDeque::from([
+                    (first.clone(), first_rx),
+                    (second.clone(), second_rx),
+                ])),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut first_launch = native_launch(&temp, "codex");
+        first_launch.thread_id = "t1".to_owned();
+        supervisor.launch(first_launch).await.expect("first launch");
+        let mut second_launch = native_launch(&temp, "codex");
+        second_launch.thread_id = "t2".to_owned();
+        supervisor
+            .launch(second_launch)
+            .await
+            .expect("second launch");
+
+        let shutdown_supervisor = supervisor.clone();
+        let shutdown = tokio::spawn(async move { shutdown_supervisor.shutdown().await });
+        let both_entered = timeout(
+            std::time::Duration::from_secs(2),
+            shutdown_entered.acquire_many(2),
+        )
+        .await;
+        shutdown_release.add_permits(2);
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("supervisor shutdown succeeds");
+
+        assert!(
+            both_entered.is_ok(),
+            "independent provider-session cleanup must not be serialized"
+        );
+        assert_eq!(max_shutdown_active.load(Ordering::Acquire), 2);
+        assert_eq!(first.lock().unwrap().shutdowns, 1);
+        assert_eq!(second.lock().unwrap().shutdowns, 1);
         engine.shutdown().await;
     }
 
@@ -13676,7 +14666,6 @@ done
 
     #[tokio::test]
     async fn native_factory_attributes_provider_until_child_exit() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let registry = ProcessAttributionRegistry::new();
         let factory = super::NativeProviderDriverFactory::with_process_attribution(
@@ -14298,13 +15287,13 @@ done
 
     #[tokio::test]
     async fn consuming_attributed_child_releases_provider_registration() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let registry = ProcessAttributionRegistry::new();
         let fixture = executable_fixture(&temp, "consumed-claude", CLAUDE_FIXTURE);
         let mut request = native_launch(&temp, "claudeAgent");
         request.binary_path = fixture.to_string_lossy().into_owned();
         let child = super::spawn_child(&request, &[], false, registry.clone())
+            .await
             .expect("provider child should spawn");
         assert_eq!(live_claims(&registry).await.len(), 1);
 
@@ -14312,6 +15301,115 @@ done
         assert!(live_claims(&registry).await.is_empty());
         let _ = inner.start_kill();
         let _ = inner.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_freeze_rejects_and_reaps_a_provider_spawn_in_flight() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let registry = ProcessAttributionRegistry::new();
+        let fixture = executable_fixture(&temp, "late-claude", CLAUDE_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        let (spawned_sender, spawned) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let spawned_release = release.clone();
+        let spawned_registry = registry.clone();
+        let spawn = tokio::spawn(async move {
+            super::spawn_child_after_spawn(
+                &request,
+                &[],
+                false,
+                spawned_registry,
+                move |pid| async move {
+                    spawned_sender.send(pid).expect("spawned PID receiver");
+                    spawned_release.notified().await;
+                },
+            )
+            .await
+        });
+        let pid = spawned.await.expect("provider spawned before admission");
+        let identity = NativeProcessSampler::process_identity(pid).expect("provider identity");
+
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
+        release.notify_one();
+        assert!(matches!(
+            spawn.await.expect("spawn task"),
+            Err(super::ProviderRuntimeError::Shutdown)
+        ));
+        assert!(live_claims(&registry).await.is_empty());
+        for _ in 0..100 {
+            match NativeProcessSampler::process_identity(pid) {
+                Ok(current) if current == identity => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => return,
+            }
+        }
+        panic!("rejected provider process {pid} was not reaped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_capacity_rejects_and_reaps_a_provider_spawn_in_flight() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let registry = ProcessAttributionRegistry::new();
+        let registrations = (0..512_u32)
+            .map(|pid| {
+                registry
+                    .register_identity(
+                        crate::diagnostics::ProcessIdentity {
+                            pid: pid + 10_000,
+                            started_at: u64::from(pid),
+                        },
+                        crate::diagnostics::ProcessRegistrationMetadata {
+                            scope: AttributionScope::External,
+                            kind: AttributionKind::Provider,
+                            label: "capacity fixture".to_owned(),
+                            source: crate::diagnostics::RegistrationSource::Provider,
+                        },
+                    )
+                    .expect("fill registry")
+            })
+            .collect::<Vec<_>>();
+        let fixture = executable_fixture(&temp, "capacity-claude", CLAUDE_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        let (spawned_sender, spawned) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let spawned_release = release.clone();
+        let spawned_registry = registry.clone();
+        let spawn = tokio::spawn(async move {
+            super::spawn_child_after_spawn(
+                &request,
+                &[],
+                false,
+                spawned_registry,
+                move |pid| async move {
+                    spawned_sender.send(pid).expect("spawned PID receiver");
+                    spawned_release.notified().await;
+                },
+            )
+            .await
+        });
+        let pid = spawned.await.expect("provider spawned before admission");
+        let identity = NativeProcessSampler::process_identity(pid).expect("provider identity");
+
+        release.notify_one();
+        assert!(matches!(
+            spawn.await.expect("spawn task"),
+            Err(super::ProviderRuntimeError::Spawn { .. })
+        ));
+        for _ in 0..100 {
+            match NativeProcessSampler::process_identity(pid) {
+                Ok(current) if current == identity => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => {
+                    drop(registrations);
+                    return;
+                }
+            }
+        }
+        panic!("unattributed provider process {pid} was not reaped");
     }
 
     #[tokio::test]
@@ -14581,9 +15679,179 @@ done
     }
 
     #[tokio::test]
-    async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+    async fn codex_fixture_timeout_cleanup_reaps_an_unresponsive_shutdown() {
         let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let codex_fixture = executable_fixture(&temp, "codex-timeout-fixture", CODEX_FIXTURE);
+        let shutdown_request_ready = temp.path().join("codex-shutdown-request-ready");
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_SHUTDOWN_REQUEST_READY_MARKER".to_owned(),
+            shutdown_request_ready.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_IGNORE_SHUTDOWN_RESPONSE".to_owned(),
+            "1".to_owned(),
+        );
+        let driver = super::CodexDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+            true,
+        )
+        .await
+        .expect("Codex timeout driver should create");
+        driver
+            .start()
+            .await
+            .expect("Codex timeout driver should start");
+
+        let shutdown_outcome = timeout(std::time::Duration::from_secs(3), driver.shutdown()).await;
+        if shutdown_outcome.is_err() {
+            super::kill_child(&driver.child).await;
+        }
+
+        assert!(
+            matches!(shutdown_outcome, Ok(Ok(()))),
+            "unresponsive graceful shutdown must force owned cleanup: {shutdown_outcome:?}"
+        );
+        assert!(
+            shutdown_request_ready.is_file(),
+            "fixture must positively receive the shutdown request"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped Codex fixture status")
+                .is_some(),
+            "bounded cleanup must kill and reap the owned fixture child"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_startup_watchdog_reaps_a_fixture_that_never_reaches_initialize_response() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let codex_fixture = executable_fixture(&temp, "codex-stalled-start-fixture", CODEX_FIXTURE);
+        let initialize_request_ready = temp.path().join("codex-initialize-request-ready");
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER".to_owned(),
+            initialize_request_ready.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_CODEX_IGNORE_INITIALIZE_RESPONSE".to_owned(),
+            "1".to_owned(),
+        );
+        let driver = Arc::new(
+            super::CodexDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("stalled Codex driver should create"),
+        );
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
+        let owner_completed = Arc::new(FixtureEvent::default());
+        let initialize_request_queued = Arc::new(FixtureEvent::default());
+        let initialize_request_checkpoint = initialize_request_queued.checkpoint();
+        driver
+            .runtime
+            .observe_initialize_request_queued_for_test(initialize_request_queued.clone())
+            .await;
+        driver.runtime.observe_startup_responses_for_test(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+        );
+        let milestones = CodexStartupMilestones::new(
+            initialize_response_ready.clone(),
+            thread_response_ready,
+            owner_completed.clone(),
+        );
+        let start_driver = driver.clone();
+        let start_task = tokio::spawn(async move {
+            let result = start_driver.start().await;
+            owner_completed.publish();
+            result
+        });
+
+        let diagnostic_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let observation = tokio::time::timeout_at(diagnostic_deadline, async {
+            initialize_request_queued
+                .wait_after(initialize_request_checkpoint)
+                .await;
+            loop {
+                let event = driver
+                    .runtime
+                    .next_event()
+                    .await
+                    .ok_or_else(|| "stalled Codex fixture event stream closed".to_owned())?;
+                if event.event_type == "runtime.warning"
+                    && event.payload["message"] == "BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED"
+                {
+                    return Ok::<(), String>(());
+                }
+            }
+        })
+        .await;
+        let observation_error = match observation {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!(
+                "fixture did not receive initialize before the diagnostic deadline: {error}"
+            )),
+        };
+        if let Some(error) = observation_error {
+            start_task.abort();
+            let _ = start_task.await;
+            let cleanup = driver
+                .shutdown_with_grace(std::time::Duration::from_secs(2))
+                .await;
+            panic!("{error}; cleanup={cleanup:?}");
+        }
+        assert_eq!(
+            initialize_response_ready.checkpoint(),
+            milestones.initialize_checkpoint,
+            "fixture must withhold the initialize response"
+        );
+        start_task.abort();
+        let _ = start_task.await;
+        let shutdown_outcome = driver
+            .shutdown_with_grace(std::time::Duration::from_secs(2))
+            .await;
+
+        assert!(
+            initialize_request_ready.is_file(),
+            "fixture must positively receive initialize before withholding its response"
+        );
+        assert!(
+            shutdown_outcome.is_ok(),
+            "bounded cleanup must terminate the stalled fixture: {shutdown_outcome:?}"
+        );
+        assert!(
+            driver
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("reaped stalled Codex fixture status")
+                .is_some(),
+            "bounded cleanup must reap the stalled startup fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
         let attachment_root = temp.path().join("state&").join("attachments");
         let factory = super::NativeProviderDriverFactory::new(attachment_root.clone());
         let attachments = prepared_attachment_pair(&factory).await;
@@ -14614,6 +15882,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             true,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("Claude driver should create");
@@ -14636,10 +15906,21 @@ done
                 .expect("Claude turn should send")
                 .is_some()
         );
-        let claude_user = captured_request(&capture_path, |request| {
+        let claude_user = match captured_request(deadline, &capture_path, |request| {
             request["type"] == "user" && request["session_id"] == "claude-session"
         })
-        .await;
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    &claude,
+                    "native Claude user-message capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             claude_user["message"],
             json!({
@@ -14687,11 +15968,14 @@ done
         assert!(claude.set_model("other".to_owned()).await.is_err());
         assert!(claude.rollback(1).await.is_err());
         assert_eq!(
-            timeout(std::time::Duration::from_secs(2), claude.next_event())
-                .await
-                .expect("Claude event timeout")
-                .expect("Claude stderr event")
-                .event_type,
+            match deadline.observe(claude.next_event()).await {
+                Ok(event) => event.expect("Claude stderr event"),
+                Err(error) => {
+                    provider_fixture_deadline_failure(&claude, "native Claude stderr event", error)
+                        .await
+                }
+            }
+            .event_type,
             "session.stderr",
         );
         claude.shutdown().await.expect("Claude should shut down");
@@ -14703,6 +15987,8 @@ done
             factory.attachments.clone(),
             factory.attribution.clone(),
             true,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
         )
         .await
         .expect("fresh Claude driver should create");
@@ -14712,31 +15998,98 @@ done
             .expect("fresh Claude should shut down");
 
         let codex_fixture = executable_fixture(&temp, "codex-fixture", CODEX_FIXTURE);
+        let codex_initialize_response_ready = temp.path().join("codex-initialize-response-ready");
+        let codex_thread_response_ready = temp.path().join("codex-thread-response-ready");
         let mut codex_request = native_launch(&temp, "codex");
         codex_request.binary_path = codex_fixture.to_string_lossy().into_owned();
         codex_request.environment.insert(
             "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
             capture_value.clone(),
         );
-        let codex = factory
-            .create(codex_request)
+        codex_request.environment.insert(
+            "BIBCODE_TEST_CODEX_INITIALIZE_RESPONSE_READY_MARKER".to_owned(),
+            codex_initialize_response_ready
+                .to_string_lossy()
+                .into_owned(),
+        );
+        codex_request.environment.insert(
+            "BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER".to_owned(),
+            codex_thread_response_ready.to_string_lossy().into_owned(),
+        );
+        let codex = Arc::new(
+            super::CodexDriver::spawn(
+                codex_request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
             .await
-            .expect("Codex driver should create");
+            .expect("Codex driver should create"),
+        );
+        let initialize_response_ready = Arc::new(FixtureEvent::default());
+        let thread_response_ready = Arc::new(FixtureEvent::default());
+        let start_completed = Arc::new(FixtureEvent::default());
+        codex.runtime.observe_startup_responses_for_test(
+            initialize_response_ready.clone(),
+            thread_response_ready.clone(),
+        );
+        let startup_milestones = CodexStartupMilestones::new(
+            initialize_response_ready,
+            thread_response_ready,
+            start_completed.clone(),
+        );
+        let start_driver = codex.clone();
+        let start_completion = start_completed.clone();
+        let start_task = tokio::spawn(async move {
+            let result = start_driver.start().await;
+            start_completion.publish();
+            result
+        });
+        if let Err(missing_milestone) = startup_milestones.wait_until(deadline.instant()).await {
+            let (initialize_response_ready, thread_response_ready, owner_completed) =
+                startup_milestones.reached();
+            start_task.abort();
+            let _ = start_task.await;
+            let shutdown_outcome = codex
+                .shutdown_with_grace(std::time::Duration::from_secs(2))
+                .await;
+            panic!(
+                "Codex start diagnostic watchdog expired at {missing_milestone}: \
+                 initialize_response_ready={initialize_response_ready}, \
+                 thread_response_ready={thread_response_ready}, owner_completed={owner_completed}, \
+                 shutdown_outcome={shutdown_outcome:?}"
+            );
+        }
+        assert!(
+            codex_initialize_response_ready.is_file(),
+            "Codex fixture must prepare its initialize response"
+        );
+        assert!(
+            codex_thread_response_ready.is_file(),
+            "Codex fixture must prepare its thread/start response"
+        );
+        let started = start_task
+            .await
+            .expect("Codex start owner task should join")
+            .expect("Codex should start");
         assert_eq!(
-            timeout(std::time::Duration::from_secs(2), codex.start())
-                .await
-                .expect("Codex start timeout")
-                .expect("Codex should start")
-                .resume_cursor,
+            started.resume_cursor,
             Some(json!({"threadId":"native-codex-thread"})),
         );
         assert!(
-            !timeout(std::time::Duration::from_secs(2), codex.next_event())
-                .await
-                .expect("Codex event timeout")
-                .expect("Codex startup event")
-                .event_type
-                .is_empty()
+            !match deadline.observe(codex.next_event()).await {
+                Ok(event) => event.expect("Codex startup event"),
+                Err(error) => {
+                    provider_fixture_deadline_failure(
+                        codex.as_ref(),
+                        "native Codex startup event",
+                        error,
+                    )
+                    .await
+                }
+            }
+            .event_type
+            .is_empty()
         );
         codex
             .set_interaction_mode("plan".to_owned())
@@ -14753,8 +16106,21 @@ done
                 .expect("Codex turn should send")
                 .is_some()
         );
-        let codex_turn =
-            captured_request(&capture_path, |request| request["method"] == "turn/start").await;
+        let codex_turn = match captured_request(deadline, &capture_path, |request| {
+            request["method"] == "turn/start"
+        })
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex turn/start capture",
+                    error,
+                )
+                .await
+            }
+        };
         assert_eq!(
             codex_turn["params"]["input"],
             json!([
@@ -14818,12 +16184,19 @@ done
                     .is_some()
             );
             assert!(
-                !timeout(std::time::Duration::from_secs(2), driver.next_event())
-                    .await
-                    .expect("ACP event timeout")
-                    .expect("ACP startup event")
-                    .event_type
-                    .is_empty()
+                !match deadline.observe(driver.next_event()).await {
+                    Ok(event) => event.expect("ACP startup event"),
+                    Err(error) => {
+                        provider_fixture_deadline_failure(
+                            driver.as_ref(),
+                            "native ACP startup event",
+                            error,
+                        )
+                        .await
+                    }
+                }
+                .event_type
+                .is_empty()
             );
             let turn = driver
                 .send(
@@ -14839,11 +16212,22 @@ done
             } else {
                 "grok-session"
             };
-            let prompt = captured_request(&capture_path, |request| {
+            let prompt = match captured_request(deadline, &capture_path, |request| {
                 request["method"] == "session/prompt"
                     && request["params"]["sessionId"] == session_id
             })
-            .await;
+            .await
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    provider_fixture_deadline_failure(
+                        driver.as_ref(),
+                        "native ACP session/prompt capture",
+                        error,
+                    )
+                    .await
+                }
+            };
             assert_eq!(
                 prompt["params"]["prompt"],
                 json!([
@@ -14890,7 +16274,6 @@ done
 
     #[tokio::test]
     async fn native_opencode_adapter_covers_live_session_turn_and_control_commands() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let prompt_body = Arc::new(StdMutex::new(None::<Value>));
         let app = Router::new()
             .route(
@@ -15570,111 +16953,135 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn executable_resolution_prefers_case_insensitive_instance_path_override() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let ambient = tempfile::TempDir::new().expect("ambient executable directory");
-        let instance = tempfile::TempDir::new().expect("instance executable directory");
-        let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-        let ambient_executable = ambient.path().join(executable_name);
-        let instance_executable = instance.path().join(executable_name);
-        std::fs::write(&ambient_executable, b"ambient").expect("write ambient executable");
-        std::fs::write(&instance_executable, b"instance").expect("write instance executable");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", ambient.path()) };
-
-        let environment = [(
-            std::ffi::OsString::from("pAtH"),
-            std::ffi::OsString::from(instance.path()),
-        )];
-        let resolved = super::resolve_provider_executable_with_environment(
-            "codex",
-            environment
-                .iter()
-                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
-        );
-
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
-        assert_eq!(resolved, Some(instance_executable));
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_launch_executes_the_instance_path_binary_instead_of_ambient_path() {
+    async fn provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temp = tempfile::TempDir::new().expect("runtime fixture root");
-        let ambient = temp.path().join("ambient");
-        let instance = temp.path().join("instance");
+        const CASE: &str = "provider-runtime-path-precedence";
+        const TEST_NAME: &str = "production::provider_runtime::tests::provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process";
+        const SENTINEL: &str = "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-runtime-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let temp = TempDir::new().expect("provider runtime PATH child");
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let instance_executable = instance.join("provider-fixture");
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            let marker = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_RUNTIME_MARKER").expect("isolated runtime marker"),
+            );
+            let path_marker = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_PATH_MARKER").expect("isolated PATH marker"),
+            );
+            assert_eq!(
+                super::resolve_provider_executable_with_environment(
+                    "provider-fixture",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let environment = [(
+                std::ffi::OsString::from("pAtH"),
+                instance.as_os_str().to_owned(),
+            )];
+            assert_eq!(
+                super::resolve_provider_executable_with_environment(
+                    "provider-fixture",
+                    environment
+                        .iter()
+                        .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+                ),
+                Some(instance_executable)
+            );
+
+            let mut request = native_launch(&temp, "fixture");
+            request.binary_path = "provider-fixture".to_owned();
+            request
+                .environment
+                .retain(|name, _| !name.eq_ignore_ascii_case("PATH"));
+            request
+                .environment
+                .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
+            request
+                .environment
+                .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
+            request.environment.insert(
+                "PATH_MARKER".to_owned(),
+                path_marker.to_string_lossy().into_owned(),
+            );
+
+            let mut child =
+                super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
+                    .await
+                    .expect("spawn instance executable");
+            child.wait().await.expect("wait for runtime fixture");
+
+            assert_eq!(
+                std::fs::read_to_string(marker).expect("launch marker"),
+                "instance"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path_marker).expect("effective PATH marker"),
+                instance.to_string_lossy()
+            );
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-runtime-path-parent");
+        let ambient = sandbox.path("ambient");
+        let instance = sandbox.path("instance");
         std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
-        for (directory, value) in [(&ambient, "ambient"), (&instance, "instance")] {
-            let executable = directory.join("provider-fixture");
+        let ambient_executable = ambient.join("provider-fixture");
+        let instance_executable = instance.join("provider-fixture");
+        for (executable, label) in [
+            (&ambient_executable, "ambient"),
+            (&instance_executable, "instance"),
+        ] {
             std::fs::write(
-                &executable,
+                executable,
                 format!(
-                    "#!/bin/sh\nprintf '%s' '{value}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
+                    "#!/bin/sh\nprintf '%s' '{label}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
                 ),
             )
             .expect("write runtime executable");
-            let mut permissions = std::fs::metadata(&executable)
+            let mut permissions = std::fs::metadata(executable)
                 .expect("runtime fixture metadata")
                 .permissions();
             permissions.set_mode(0o700);
-            std::fs::set_permissions(&executable, permissions)
+            std::fs::set_permissions(executable, permissions)
                 .expect("make runtime fixture executable");
         }
-        let marker = temp.path().join("launched");
-        let path_marker = temp.path().join("effective-path");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", &ambient) };
-        let mut request = native_launch(&temp, "fixture");
-        request.binary_path = "provider-fixture".to_owned();
-        request
-            .environment
-            .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
-        request
-            .environment
-            .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
-        request.environment.insert(
-            "PATH_MARKER".to_owned(),
-            path_marker.to_string_lossy().into_owned(),
+        let marker = sandbox.path("launched");
+        let path_marker = sandbox.path("effective-path");
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+                ("BIBCODE_TEST_RUNTIME_MARKER", marker.as_os_str()),
+                ("BIBCODE_TEST_PATH_MARKER", path_marker.as_os_str()),
+            ],
         );
-
-        let mut child = super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
-            .expect("spawn instance executable");
-        child.wait().await.expect("wait for runtime fixture");
-
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
-        assert_eq!(
-            std::fs::read_to_string(marker).expect("launch marker"),
-            "instance"
+        assert!(
+            output.status.success(),
+            "isolated runtime PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            std::fs::read_to_string(path_marker).expect("effective PATH marker"),
-            instance.to_string_lossy()
-        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 
     #[cfg(windows)]
@@ -15707,76 +17114,64 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn provider_executable_resolution_keeps_one_component_file_in_process_cwd() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let search_directory = tempfile::TempDir::new().expect("provider search directory");
-        let executable_name = if cfg!(windows) {
-            "provider-fixture.exe"
-        } else {
-            "provider-fixture"
-        };
-        std::fs::write(directory.path().join(executable_name), b"fixture")
-            .expect("write provider fixture");
-        let _current_directory = CurrentDirectoryGuard::enter(directory.path());
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                executable_name,
-                Some(search_directory.path().as_os_str())
-            ),
-            Some(std::path::PathBuf::from(executable_name))
-        );
-    }
-
     #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_executable_resolution_keeps_absolute_file_when_cwd_is_inaccessible() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let executable = directory.path().join("provider-fixture");
-        std::fs::write(&executable, b"fixture").expect("write provider fixture");
-        let inaccessible_cwd = directory.path().join("removed-cwd");
-        std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
-        let _current_directory = CurrentDirectoryGuard::enter(&inaccessible_cwd);
-        std::fs::remove_dir(&inaccessible_cwd).expect("remove current directory");
+    #[test]
+    fn invalid_cwd_cases_are_process_isolated() {
+        const TEST_NAME: &str =
+            "production::provider_runtime::tests::invalid_cwd_cases_are_process_isolated";
+        if TestSandbox::is_isolated_case("missing-cwd", TEST_NAME) {
+            let directory = tempfile::tempdir().expect("isolated CWD");
+            let executable = directory.path().join("provider-fixture");
+            std::fs::write(&executable, b"fixture").expect("write provider fixture");
+            let search_directory = directory.path().join("search");
+            std::fs::create_dir(&search_directory).expect("create provider search directory");
+            std::env::set_current_dir(directory.path()).expect("enter isolated CWD");
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    "provider-fixture",
+                    Some(search_directory.as_os_str())
+                ),
+                Some(std::path::PathBuf::from("provider-fixture"))
+            );
+            let inaccessible_cwd = directory.path().join("removed-cwd");
+            std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
+            std::env::set_current_dir(&inaccessible_cwd).expect("enter isolated CWD");
+            std::fs::remove_dir_all(&inaccessible_cwd).expect("remove isolated CWD");
+            assert!(
+                std::env::current_dir().is_err(),
+                "fixture must make the child process CWD inaccessible"
+            );
+
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    &executable.to_string_lossy(),
+                    Some(std::ffi::OsStr::new(""))
+                ),
+                Some(executable.clone())
+            );
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    "provider-fixture",
+                    Some(directory.path().as_os_str())
+                ),
+                Some(executable)
+            );
+            println!("BIBCODE_TEST_ISOLATED_CASE_DONE=missing-cwd");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-missing-cwd-parent");
+        let output = sandbox.run_isolated_case("missing-cwd", TEST_NAME, &[]);
         assert!(
-            std::env::current_dir().is_err(),
-            "fixture must make the process cwd inaccessible"
+            output.status.success(),
+            "isolated missing-CWD case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                &executable.to_string_lossy(),
-                Some(std::ffi::OsStr::new(""))
-            ),
-            Some(executable)
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_executable_resolution_finds_bare_command_when_cwd_is_inaccessible() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let executable = directory.path().join("provider-fixture");
-        std::fs::write(&executable, b"fixture").expect("write provider fixture");
-        let inaccessible_cwd = directory.path().join("removed-cwd");
-        std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
-        let _current_directory = CurrentDirectoryGuard::enter(&inaccessible_cwd);
-        std::fs::remove_dir(&inaccessible_cwd).expect("remove current directory");
         assert!(
-            std::env::current_dir().is_err(),
-            "fixture must make the process cwd inaccessible"
-        );
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                "provider-fixture",
-                Some(directory.path().as_os_str())
-            ),
-            Some(executable)
+            String::from_utf8_lossy(&output.stdout)
+                .contains("BIBCODE_TEST_ISOLATED_CASE_DONE=missing-cwd"),
+            "isolated child did not confirm the exact missing-CWD case"
         );
     }
 
@@ -15898,7 +17293,7 @@ done
     #[test]
     fn explicit_instance_overrides_legacy_binary_settings() {
         let providers = ProvidersState::default();
-        assert!(!providers.cursor.enabled);
+        assert!(providers.cursor.enabled);
         let instance = ProviderInstanceState {
             driver: "cursor".to_owned(),
             enabled: true,

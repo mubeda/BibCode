@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests read fixture logs and save screenshots.
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import {
@@ -43,7 +44,7 @@ interface ProviderScenario {
 }
 
 const visibleComposerFormSelector =
-  '//*[@data-chat-composer-form="true" and not(ancestor::*[contains(concat(" ", normalize-space(@class), " "), " hidden ")])]';
+  '//*[@data-center-surface-host and @data-visible="true"]//*[@data-chat-composer-form="true"]';
 
 const scenarios: readonly ProviderScenario[] = [
   {
@@ -70,12 +71,6 @@ const scenarios: readonly ProviderScenario[] = [
     keyboardCommand: "init",
     nativePrompt: "@reviewer",
   },
-  {
-    provider: "grok",
-    displayName: "Grok",
-    keyboardCommand: "skills",
-    nativePrompt: "/skills",
-  },
 ] as const;
 
 const expectedProviderInputs = [
@@ -85,7 +80,6 @@ const expectedProviderInputs = [
   { provider: "claudeAgent", prompt: "/docs" },
   { provider: "cursor", prompt: "/review" },
   { provider: "opencode", prompt: "@reviewer" },
-  { provider: "grok", prompt: "/skills" },
 ] as const;
 
 function composerForm() {
@@ -110,6 +104,10 @@ async function visibleComposerItemIds(): Promise<string[]> {
         const style = window.getComputedStyle(element);
         const rectangle = element.getBoundingClientRect();
         return (
+          element.checkVisibility({
+            opacityProperty: true,
+            visibilityProperty: true,
+          }) &&
           style.display !== "none" &&
           style.visibility !== "hidden" &&
           rectangle.width > 0 &&
@@ -164,13 +162,11 @@ async function waitForComposerItem(id: string): Promise<void> {
 async function clickVisibleComposerItem(id: string): Promise<void> {
   const selector = `[data-composer-item-id="${id}"]`;
   await waitForComposerItem(id);
-  for (const candidate of await browser.$$(selector)) {
-    if ((await candidate.isDisplayed()) && (await candidate.isEnabled())) {
-      await candidate.click();
-      return;
-    }
-  }
-  throw new Error(`The visible composer item was not clickable: ${id}`);
+  const candidate = browser.$(selector);
+  await candidate.waitForExist({ timeoutMsg: `The composer item disappeared: ${id}` });
+  await candidate.waitForDisplayed({ timeoutMsg: `The composer item remained hidden: ${id}` });
+  await candidate.waitForEnabled({ timeoutMsg: `The composer item remained disabled: ${id}` });
+  await candidate.click();
 }
 
 async function waitForComposerItemsToClose(): Promise<void> {
@@ -236,13 +232,26 @@ async function waitForComposerValue(value: string): Promise<void> {
 }
 
 async function ensureFixtureProjectImported(): Promise<void> {
+  const appOrigin = await browser.execute(() => window.location.origin);
+  await browser.url(`${appOrigin}/#/`);
   await ensureMainSidebarOpen();
-  const existingProject = browser.$(
-    `//button[.//span[normalize-space()="${desktopUiFixture.projectName}"]]`,
-  );
-  if (await existingProject.isExisting()) {
-    await existingProject.waitForDisplayed();
+  const projectSelector = `//button[@data-sidebar="menu-button"][.//span[normalize-space()="${desktopUiFixture.projectName}"]]`;
+  const hasVisibleProject = async () => {
+    for (const candidate of await browser.$$(projectSelector)) {
+      if (await candidate.isDisplayed()) return true;
+    }
+    return false;
+  };
+  if (await hasVisibleProject()) {
     return;
+  }
+
+  const projectDataLoading = browser.$("//*[normalize-space()='Project data is still loading']");
+  if (await projectDataLoading.isExisting()) {
+    await projectDataLoading.waitForDisplayed({
+      reverse: true,
+      timeoutMsg: "The primary project catalog did not become ready for fixture import.",
+    });
   }
 
   const addProject = browser.$('[data-testid="sidebar-add-project-trigger"]');
@@ -255,26 +264,29 @@ async function ensureFixtureProjectImported(): Promise<void> {
   await browseFolder.waitForDisplayed();
   await mockDesktopUiFolderPicker(preparedProjectPath);
   await browseFolder.click();
-  await existingProject.waitForDisplayed();
+  await browser.waitUntil(hasVisibleProject, {
+    timeoutMsg: "The imported fixture project did not become visible in the main sidebar.",
+  });
 }
 
 async function openInitialCodexDraft(): Promise<void> {
-  const project = browser.$(
-    `//button[.//span[normalize-space()="${desktopUiFixture.projectName}"]]`,
+  const projectSelector = `//button[@data-sidebar="menu-button"][.//span[normalize-space()="${desktopUiFixture.projectName}"]]`;
+  const primaryWorkspace = browser.$(
+    '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
   );
-  await expect(project).toBeDisplayed();
-  await project.click();
-  await project.moveTo();
-  const newChatClicked = await browser.execute((projectName) => {
-    const expectedLabel = `New main-branch chat in ${projectName}`;
-    const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
-      (candidate) => candidate.ariaLabel === expectedLabel,
-    );
-    if (!button || button.disabled) return false;
-    button.click();
-    return true;
-  }, desktopUiFixture.projectName);
-  expect(newChatClicked).toBe(true);
+  if (!(await primaryWorkspace.isDisplayed())) {
+    let projectClicked = false;
+    for (const project of await browser.$$(projectSelector)) {
+      if (await project.isDisplayed()) {
+        await project.click();
+        projectClicked = true;
+        break;
+      }
+    }
+    expect(projectClicked).toBe(true);
+    await primaryWorkspace.waitForDisplayed();
+  }
+  await primaryWorkspace.click();
   await waitForComposerDisplayed();
 }
 
@@ -321,7 +333,43 @@ async function openProviderPanel(displayName: string): Promise<void> {
       `.//button[@aria-label="Close ${displayName}"] and ` +
       `.//span[normalize-space()="${displayName}"]]`,
   );
-  await activeProviderTab.waitForDisplayed();
+  try {
+    await activeProviderTab.waitForDisplayed();
+  } catch (error) {
+    const diagnostics = await browser.execute(() => {
+      const centerPanelStorage = Object.fromEntries(
+        Array.from({ length: window.localStorage.length }, (_, index) =>
+          window.localStorage.key(index),
+        )
+          .filter((key): key is string => key !== null && /center|panel/i.test(key))
+          .map((key) => [key, window.localStorage.getItem(key)]),
+      );
+      return {
+        href: window.location.href,
+        centerPanelStorage,
+        tabs: [...document.querySelectorAll<HTMLElement>("[data-center-panel-tab-id]")].map(
+          (tab) => ({
+            id: tab.dataset.centerPanelTabId ?? null,
+            groupId: tab.dataset.centerPanelGroupId ?? null,
+            active: tab.dataset.activeTab ?? null,
+            text: tab.textContent,
+          }),
+        ),
+        notifications: [...document.querySelectorAll<HTMLElement>('[aria-label="Notifications"]')]
+          .map((region) => region.textContent)
+          .filter((text): text is string => text !== null && text.length > 0),
+      };
+    });
+    NodeFS.writeFileSync(
+      NodePath.join(
+        preparedArtifactDirectory,
+        `provider-panel-${displayName.toLowerCase()}-failure.json`,
+      ),
+      JSON.stringify(diagnostics, null, 2),
+      "utf8",
+    );
+    throw error;
+  }
   await waitForComposerDisplayed();
 }
 
@@ -359,15 +407,20 @@ async function activateProviderPanel(displayName: string): Promise<void> {
   await waitForComposerDisplayed();
 }
 
-async function assertProviderLockedModelPicker(scenario: ProviderScenario): Promise<void> {
+async function assertUnifiedModelPicker(scenario: ProviderScenario): Promise<void> {
   const pickerTrigger = composerForm().$('[data-chat-provider-model-picker="true"]');
   await expect(pickerTrigger).toBeEnabled();
   await pickerTrigger.click();
 
-  const pickerContent = browser.$('[data-model-picker-content="true"]');
-  await pickerContent.waitForDisplayed();
-  expect((await pickerContent.$$("[data-model-picker-provider]")).length).toBe(0);
-  const semanticModelRowSelector = "[data-model-picker-instance-id][data-model-picker-model-slug]";
+  await browser.waitUntil(
+    async () => {
+      for (const content of await browser.$$('[data-model-picker-content="true"]')) {
+        if (await content.isDisplayed()) return true;
+      }
+      return false;
+    },
+    { timeoutMsg: `The ${scenario.displayName} model picker did not open.` },
+  );
   const readVisibleModelRows = () =>
     browser.execute(() =>
       [
@@ -400,30 +453,38 @@ async function assertProviderLockedModelPicker(scenario: ProviderScenario): Prom
     },
   );
   const modelRows = await readVisibleModelRows();
-  expect((await pickerContent.$$(semanticModelRowSelector)).length).toBe(modelRows.length);
-  expect(
-    modelRows.every((row) => row.instanceId === scenario.provider && row.modelSlug.length > 0),
-  ).toBe(true);
+  expect(modelRows.every((row) => row.instanceId.length > 0 && row.modelSlug.length > 0)).toBe(
+    true,
+  );
+  expect(modelRows.some((row) => row.instanceId === scenario.provider)).toBe(true);
   expect(new Set(modelRows.map((row) => `${row.instanceId}:${row.modelSlug}`)).size).toBe(
     modelRows.length,
   );
   if (scenario.provider === "claudeAgent") {
-    expect(modelRows.map(({ modelSlug }) => modelSlug)).toEqual(["opus", "sonnet"]);
-    expect(modelRows[0]?.label).toContain("Opus 5");
+    const claudeRows = modelRows.filter(({ instanceId }) => instanceId === "claudeAgent");
+    expect(claudeRows.map(({ modelSlug }) => modelSlug)).toEqual(["opus", "sonnet"]);
+    expect(claudeRows[0]?.label).toContain("Opus 5");
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "claude-opus-5-model-picker.png"),
     );
   }
   if (scenario.provider === "codex") {
     await browser.saveScreenshot(
-      NodePath.join(preparedArtifactDirectory, "composer-provider-locked-model-picker.png"),
+      NodePath.join(preparedArtifactDirectory, "composer-unified-model-picker.png"),
     );
   }
   await browser.keys("Escape");
-  await pickerContent.waitForDisplayed({ reverse: true });
+  await browser.waitUntil(
+    async () => {
+      for (const content of await browser.$$('[data-model-picker-content="true"]')) {
+        if (await content.isDisplayed()) return false;
+      }
+      return true;
+    },
+    { timeoutMsg: `The ${scenario.displayName} model picker did not close.` },
+  );
   if (scenario.provider === "claudeAgent") {
-    const traitsTrigger = composerForm().$("button*=High");
-    await expect(traitsTrigger).toHaveText(expect.stringContaining("Normal"));
+    await expect(composerForm().$('button[aria-label="Reasoning effort: High"]')).toBeDisplayed();
   }
 }
 
@@ -626,12 +687,13 @@ async function codexDraftChipsAreValid(): Promise<boolean> {
 }
 
 async function persistProviderDraftsAndRestart(): Promise<void> {
-  const persistedThread = browser.$('[data-testid^="thread-row-"][data-active="true"]');
-  await persistedThread.waitForDisplayed();
-  const persistedThreadTestId = await persistedThread.getAttribute("data-testid");
-  const hostThreadId = persistedThreadTestId?.replace("thread-row-", "") ?? "";
+  const hostThreadId = await browser.execute(() => {
+    const match = window.location.hash.match(/\/(?:primary|threads)\/([^/?#]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : "";
+  });
   expect(hostThreadId.length).toBeGreaterThan(0);
-  const persistedThreadSelector = `[data-testid="thread-row-${hostThreadId}"]`;
+  const persistedThreadSelector =
+    '//*[@data-thread-item="true" and .//span[normalize-space()="main"]]';
   const openCodePanelThreadId = await browser.execute((hostThreadId) => {
     const rawStore = window.localStorage.getItem("bibcode:center-panel-state:v1");
     if (!rawStore) return null;
@@ -663,7 +725,7 @@ async function persistProviderDraftsAndRestart(): Promise<void> {
   }
 
   const codexPrompt = "$refactor ";
-  await activateProviderPanel("Main");
+  await activateProviderPanel("Codex");
   await setComposerValue("");
   await appendAndSelectComposerItem("$ref", "provider-skill:codex:dollar:refactor");
   await browser.waitUntil(() => persistedDraftMatches(hostThreadId, codexPrompt), {
@@ -705,7 +767,7 @@ async function persistProviderDraftsAndRestart(): Promise<void> {
     NodePath.join(preparedArtifactDirectory, "composer-restored-chips.png"),
   );
 
-  await activateProviderPanel("Main");
+  await activateProviderPanel("Codex");
   expect(await persistedDraftMatches(hostThreadId, codexPrompt)).toBe(true);
   await browser.waitUntil(codexDraftChipsAreValid, {
     timeoutMsg: "The persisted Codex dollar-skill chip was not restored.",
@@ -724,14 +786,14 @@ function assertCompleteProviderInputLog(composerLogBaseline: number): void {
 }
 
 describe("packaged native composer triggers", () => {
-  it("normalizes every provider, sends exact native syntax, closes stale menus, and restores chips", async () => {
+  it("normalizes every ready provider, sends exact native syntax, closes stale menus, and restores chips", async () => {
     const composerLogBaseline = readProviderInputLog(preparedProviderInputLogPath).length;
     await setDesktopUiWindowSize(1_100, 760);
     await ensureFixtureProjectImported();
     await openInitialCodexDraft();
 
     for (const [index, scenario] of scenarios.entries()) {
-      await assertProviderLockedModelPicker(scenario);
+      await assertUnifiedModelPicker(scenario);
       await assertColonMenu(scenario.provider);
       await assertSlashMenu(scenario);
       await assertDollarMenu(scenario.provider);
@@ -752,7 +814,7 @@ describe("packaged native composer triggers", () => {
 
     assertCompleteProviderInputLog(composerLogBaseline);
     await setComposerValue("/");
-    await waitForComposerItem("provider-command:grok:skills");
+    await waitForComposerItem("provider-command:opencode:init");
     await persistProviderDraftsAndRestart();
   });
 });

@@ -101,6 +101,7 @@ interface GitActionsControlProps {
    * sync and the focus-driven vcs status refresh.
    */
   hideTrigger?: boolean;
+  workspaceUnavailable?: string | null;
 }
 
 interface PendingDefaultBranchAction {
@@ -978,6 +979,7 @@ export default function GitActionsControl({
   activeThreadRef,
   draftId,
   hideTrigger = false,
+  workspaceUnavailable = null,
 }: GitActionsControlProps) {
   const updateThreadMetadata = useAtomCommand(
     threadEnvironment.updateMetadata,
@@ -1041,13 +1043,11 @@ export default function GitActionsControl({
           return;
         }
 
-        const worktreePath = activeServerThread.worktreePath;
         void updateThreadMetadata({
           environmentId: activeThreadRef.environmentId,
           input: {
             threadId: activeThreadRef.threadId,
             branch,
-            worktreePath,
           },
         });
 
@@ -1086,7 +1086,7 @@ export default function GitActionsControl({
   );
 
   const gitStatusQuery = useEnvironmentQuery(
-    activeEnvironmentId !== null && gitCwd !== null
+    activeEnvironmentId !== null && gitCwd !== null && workspaceUnavailable === null
       ? vcsEnvironment.status({
           environmentId: activeEnvironmentId,
           input: { cwd: gitCwd },
@@ -1187,7 +1187,7 @@ export default function GitActionsControl({
   }, [updateActiveProgressToast]);
 
   useEffect(() => {
-    if (gitCwd === null) {
+    if (gitCwd === null || workspaceUnavailable !== null) {
       return;
     }
 
@@ -1217,7 +1217,7 @@ export default function GitActionsControl({
       window.removeEventListener("focus", scheduleRefreshCurrentGitStatus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [activeEnvironmentId, gitCwd, refreshVcsStatus]);
+  }, [activeEnvironmentId, gitCwd, refreshVcsStatus, workspaceUnavailable]);
 
   const openExistingPr = useCallback(async () => {
     const api = readLocalApi();
@@ -1660,6 +1660,15 @@ export default function GitActionsControl({
   const canPublishRepository = isRepo && gitStatusForActions !== null && !hasPrimaryRemote;
 
   if (!gitCwd) return null;
+
+  if (workspaceUnavailable) {
+    return hideTrigger ? null : (
+      <Button type="button" variant="outline" size="xs" disabled title={workspaceUnavailable}>
+        <GitBranchPlusIcon className="size-3.5" aria-hidden />
+        <span className="ml-0.5">Git unavailable</span>
+      </Button>
+    );
+  }
 
   return (
     <>

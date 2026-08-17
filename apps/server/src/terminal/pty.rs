@@ -148,9 +148,9 @@ pub struct PtySpawnInput {
 
 pub trait PtyProcess: fmt::Debug + Send + Sync {
     fn pid(&self) -> u32;
-    fn process_identity(&self) -> Option<ProcessIdentity> {
-        None
-    }
+    /// Returns the stable process identity captured by the backend at spawn.
+    /// A live PTY must provide this identity before the manager can publish it.
+    fn process_identity(&self) -> Option<ProcessIdentity>;
     fn write(&self, data: &str) -> Result<(), String>;
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self) -> Result<(), String>;
@@ -182,7 +182,7 @@ struct SpawnedChildGuard {
     #[cfg(unix)]
     process_group: Option<i32>,
     #[cfg(windows)]
-    job: Option<WindowsJob>,
+    job: Option<Arc<WindowsJob>>,
     #[cfg(test)]
     tree_cleanup_observer: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -262,11 +262,19 @@ impl SpawnedChildGuard {
     #[cfg(windows)]
     fn own_job(&mut self, job: WindowsJob) {
         debug_assert!(self.job.is_none(), "PTY child job already attached");
-        self.job = Some(job);
+        self.job = Some(Arc::new(job));
     }
 
     #[cfg(windows)]
-    fn commit_job(mut self) -> Result<WindowsJob, String> {
+    fn clone_job_for_waiter(&self) -> Result<Arc<WindowsJob>, String> {
+        self.job
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "PTY child job was not retained during setup".to_owned())
+    }
+
+    #[cfg(windows)]
+    fn commit_job(mut self) -> Result<Arc<WindowsJob>, String> {
         let job = self
             .job
             .take()
@@ -420,11 +428,41 @@ impl PortablePtyBackend {
             return Err(error.to_string());
         }
         let exit_sender = exit.clone();
+        #[cfg(windows)]
+        let waiter_job = child.clone_job_for_waiter()?;
+        #[cfg(unix)]
+        let process_group = child.process_group;
+        #[cfg(unix)]
+        let process_group_ownership = Arc::new(Mutex::new(if process_group.is_some() {
+            UnixProcessGroupOwnership::Reserved
+        } else {
+            UnixProcessGroupOwnership::Released
+        }));
+        #[cfg(unix)]
+        let waiter_process_group_ownership = Arc::clone(&process_group_ownership);
         let wait_child = child.handoff_child_to_waiter();
         spawn_pty_thread(
             format!("bibcode-pty-wait-{pid}"),
             Box::new(move || {
                 let mut child = wait_child;
+                #[cfg(unix)]
+                if let Some(process_group) = process_group {
+                    if let Err(error) = wait_for_unix_child_exit_without_reaping(pid) {
+                        tracing::warn!(%error, pid, "failed to reserve PTY root identity through group cleanup");
+                    }
+                    loop {
+                        match kill_reserved_unix_process_group_after_root_exit(
+                            process_group,
+                            &waiter_process_group_ownership,
+                        ) {
+                            Ok(()) => break,
+                            Err(error) => {
+                                tracing::warn!(%error, process_group, "failed to terminate PTY process group after root exit; retaining ownership for retry");
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    }
+                }
                 let event = match child.wait() {
                     Ok(status) => PtyExit {
                         exit_code: i32::try_from(status.exit_code()).ok(),
@@ -435,6 +473,22 @@ impl PortablePtyBackend {
                         signal: None,
                     },
                 };
+                #[cfg(windows)]
+                {
+                    if let Err(error) = waiter_job.terminate() {
+                        tracing::warn!(%error, "failed to terminate PTY Job after root exit");
+                    }
+                    match waiter_job.wait_for_exit(Duration::from_secs(3)) {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!("PTY Job did not exit before ownership release"),
+                        Err(error) => tracing::warn!(%error, "failed waiting for PTY Job cleanup"),
+                    }
+                    // `portable_pty::WinChild` owns the root process handle. Release it
+                    // before publishing the exit notification so shutdown callers cannot
+                    // observe a completed Job while the exited PID is still queryable.
+                    drop(child);
+                    drop(waiter_job);
+                }
                 let _ = exit_sender.send(Some(event));
             }),
         )
@@ -443,7 +497,6 @@ impl PortablePtyBackend {
         let process_group = child.commit_process_group();
         #[cfg(windows)]
         let job = child.commit_job()?;
-
         Ok(Arc::new(PortablePtyProcess {
             pid,
             process_identity,
@@ -456,8 +509,10 @@ impl PortablePtyBackend {
             exit,
             #[cfg(unix)]
             process_group,
+            #[cfg(unix)]
+            process_group_ownership,
             #[cfg(windows)]
-            job,
+            job: Mutex::new(Some(job)),
         }))
     }
 }
@@ -732,8 +787,10 @@ struct PortablePtyProcess {
     exit: watch::Sender<Option<PtyExit>>,
     #[cfg(unix)]
     process_group: Option<i32>,
+    #[cfg(unix)]
+    process_group_ownership: Arc<Mutex<UnixProcessGroupOwnership>>,
     #[cfg(windows)]
-    job: WindowsJob,
+    job: Mutex<Option<Arc<WindowsJob>>>,
 }
 
 impl fmt::Debug for PortablePtyProcess {
@@ -797,11 +854,21 @@ impl PtyProcess for PortablePtyProcess {
     fn kill(&self) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            return kill_unix_process_group(process_group).map_err(|error| error.to_string());
+            return kill_reserved_unix_process_group(process_group, &self.process_group_ownership)
+                .map_err(|error| error.to_string());
         }
         #[cfg(windows)]
         {
-            if let Err(error) = self.job.terminate() {
+            let job = self
+                .job
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                .cloned();
+            let Some(job) = job else {
+                return Ok(());
+            };
+            if let Err(error) = job.terminate() {
                 return Err(error.to_string());
             }
             Ok(())
@@ -818,10 +885,22 @@ impl PtyProcess for PortablePtyProcess {
 
     #[cfg(windows)]
     fn wait_for_process_tree_exit(&self, timeout: Duration) -> Result<Option<bool>, String> {
-        self.job
+        let job = self
+            .job
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .cloned();
+        let Some(job) = job else {
+            return Ok(Some(true));
+        };
+        let exited = job
             .wait_for_exit(timeout)
-            .map(Some)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if exited {
+            self.job.lock().map_err(|error| error.to_string())?.take();
+        }
+        Ok(Some(exited))
     }
 
     fn subscribe_output(&self) -> broadcast::Receiver<String> {
@@ -851,6 +930,83 @@ unsafe extern "C" {
 fn kill_unix_process_group(process_group: i32) -> std::io::Result<()> {
     // Negative PIDs target the complete process group created by the PTY.
     kill_unix_target(-process_group)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixProcessGroupOwnership {
+    Reserved,
+    Released,
+}
+
+#[cfg(unix)]
+fn signal_reserved_unix_process_group_with(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+    signal: impl FnOnce(i32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut ownership = ownership
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *ownership == UnixProcessGroupOwnership::Released {
+        return Ok(());
+    }
+    signal(process_group)?;
+    *ownership = UnixProcessGroupOwnership::Released;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_reserved_unix_process_group(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+) -> std::io::Result<()> {
+    signal_reserved_unix_process_group_with(process_group, ownership, kill_unix_process_group)
+}
+
+#[cfg(unix)]
+fn kill_reserved_unix_process_group_after_root_exit(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+) -> std::io::Result<()> {
+    signal_reserved_unix_process_group_with(process_group, ownership, |process_group| {
+        match kill_unix_process_group(process_group) {
+            Ok(()) => Ok(()),
+            // Once the owned root is observed exited but kept waitable,
+            // EPERM means the group contains no signalable process. Any live
+            // descendant of this same-user ownership unit would make the
+            // group signal succeed, so there is no owned live member left.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_unix_child_exit_without_reaping(process_id: u32) -> std::io::Result<()> {
+    let process_id = libc::id_t::try_from(process_id)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    loop {
+        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: information points to valid writable storage. WNOWAIT keeps
+        // the exited leader waitable so its PID/PGID cannot be reused before
+        // the owned group has been signalled.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process_id,
+                information.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1178,6 +1334,25 @@ mod tests {
             assert!(process_group.is_none());
             assert!(!committed_killed.load(std::sync::atomic::Ordering::Acquire));
         }
+
+        #[cfg(windows)]
+        {
+            let committed_killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut guard = SpawnedChildGuard::new(Box::new(SetupTestChild {
+                killed: committed_killed.clone(),
+                panic_on_clone: false,
+            }));
+            guard.own_job(WindowsJob::new().expect("create committed PTY test job"));
+            let waiter_job = guard
+                .clone_job_for_waiter()
+                .expect("clone waiter PTY job ownership");
+            let child = guard.handoff_child_to_waiter();
+            let job = guard.commit_job().expect("commit PTY job ownership");
+
+            assert!(Arc::ptr_eq(&job, &waiter_job));
+            drop(child);
+            assert!(!committed_killed.load(std::sync::atomic::Ordering::Acquire));
+        }
     }
 
     #[test]
@@ -1233,6 +1408,59 @@ mod tests {
 
         assert!(result.is_err());
         assert!(killed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_group_signal_keeps_authority_until_waiter_retry_succeeds() {
+        let ownership = Arc::new(Mutex::new(UnixProcessGroupOwnership::Reserved));
+        let first_entered = Arc::new(std::sync::Barrier::new(2));
+        let first_release = Arc::new(std::sync::Barrier::new(2));
+        let first_ownership = ownership.clone();
+        let entered = first_entered.clone();
+        let release = first_release.clone();
+        let first = std::thread::spawn(move || {
+            signal_reserved_unix_process_group_with(42, &first_ownership, |_| {
+                entered.wait();
+                release.wait();
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            })
+        });
+        first_entered.wait();
+
+        let second_ownership = ownership.clone();
+        let (second_entered, second_entry) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            signal_reserved_unix_process_group_with(42, &second_ownership, |_| {
+                second_entered.send(()).expect("waiter signal observer");
+                Ok(())
+            })
+        });
+        assert!(
+            second_entry
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "waiter signal must serialize behind the in-progress manager attempt"
+        );
+        first_release.wait();
+        assert_eq!(
+            first
+                .join()
+                .expect("manager signal task")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        second_entry
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter retries after manager failure");
+        second.join().expect("waiter signal task").unwrap();
+        assert_eq!(
+            *ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            UnixProcessGroupOwnership::Released
+        );
     }
 
     #[cfg(unix)]
@@ -1999,6 +2227,87 @@ mod tests {
         assert!(exit.borrow().is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_root_exit_kills_late_hup_resistant_descendant_before_exit_publication() {
+        let directory = tempfile::tempdir().expect("late descendant fixture");
+        let descendant_release = directory.path().join("release-descendant");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&descendant_release)
+                .status()
+                .expect("mkfifo starts")
+                .success(),
+            "late-descendant release FIFO is created"
+        );
+        let process = PortablePtyBackend
+            .spawn(&PtySpawnInput {
+                executable: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "trap 'exit 0' USR1; BIBCODE_ROOT_PID=$$; export BIBCODE_ROOT_PID; /bin/sh -c 'trap \"\" HUP; printf \"\\nBIBCODE_DESCENDANT_PID=%s\\n\" \"$$\"; IFS= read -r _ < \"$BIBCODE_RELEASE_FIFO\"; kill -USR1 \"$BIBCODE_ROOT_PID\"; exec sleep 30' & wait"
+                        .to_owned(),
+                ],
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+                env: BTreeMap::from([(
+                    "BIBCODE_RELEASE_FIFO".to_owned(),
+                    descendant_release.to_string_lossy().into_owned(),
+                )]),
+            })
+            .expect("spawn natural-exit PTY root");
+        let descendant_identity_marker = "BIBCODE_DESCENDANT_PID=";
+        let mut output = process.subscribe_output();
+        let mut exit = process.subscribe_exit();
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut observed = String::new();
+            loop {
+                observed.push_str(&output.recv().await.expect("PTY output remains open"));
+                if let Some(pid) = observed
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(descendant_identity_marker))
+                {
+                    return pid.parse::<u32>().expect("numeric late descendant PID");
+                }
+            }
+        })
+        .await
+        .expect("late descendant publishes its framed PID");
+        let descendant_identity = NativeProcessSampler::process_identity(descendant_pid)
+            .expect("capture late descendant identity");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&descendant_release)
+            .expect("open late-descendant release FIFO")
+            .write_all(b"release\n")
+            .expect("release late descendant after identity capture");
+
+        tokio::time::timeout(Duration::from_secs(3), exit.changed())
+            .await
+            .expect("root exit publication outer bound")
+            .expect("root exit publisher remains live");
+        assert!(exit.borrow().is_some());
+        // Exit publication is the ownership-release boundary. A zombie may
+        // remain briefly visible after SIGKILL, but it is no longer a live
+        // escape; distinguish that state through the native process status.
+        let sampler = NativeProcessSampler::default();
+        let descendant_is_live = sampler
+            .collect_rows()
+            .await
+            .expect("sample descendant status")
+            .into_iter()
+            .find(|row| {
+                row.pid == descendant_identity.pid
+                    && row.started_at == descendant_identity.started_at
+            })
+            .is_some_and(|row| !row.status.to_ascii_lowercase().contains("zomb"));
+        assert!(
+            !descendant_is_live,
+            "late same-group descendant survived root exit publication"
+        );
+    }
+
     #[test]
     fn portable_backend_rejects_a_missing_executable_before_opening_a_pty() {
         let error = PortablePtyBackend
@@ -2031,6 +2340,8 @@ mod tests {
             exit,
             #[cfg(unix)]
             process_group: None,
+            #[cfg(unix)]
+            process_group_ownership: Arc::new(Mutex::new(UnixProcessGroupOwnership::Released)),
         };
 
         assert!(process.write("data").unwrap_err().contains("write failed"));
@@ -2075,6 +2386,8 @@ mod tests {
             exit,
             #[cfg(unix)]
             process_group: None,
+            #[cfg(unix)]
+            process_group_ownership: Arc::new(Mutex::new(UnixProcessGroupOwnership::Released)),
         };
 
         let _ = catch_unwind(AssertUnwindSafe(|| {

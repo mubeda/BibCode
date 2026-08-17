@@ -72,6 +72,7 @@ async function mountLauncher(overrides: Partial<AddProjectStartStepProps> = {}):
   await mount(
     <AddProjectStartStep
       hosts={[localHost, remoteHost]}
+      locationLabel="Host"
       selectedEnvironmentId={localHost.environmentId}
       busy={false}
       error={null}
@@ -103,6 +104,7 @@ describe("Add Project presentational steps", () => {
     await mount(
       <AddProjectStartStep
         hosts={[localHost, remoteHost]}
+        locationLabel="Host"
         selectedEnvironmentId={localHost.environmentId}
         busy={false}
         error={null}
@@ -178,11 +180,29 @@ describe("Add Project presentational steps", () => {
     expect(document.activeElement).toBe(browse);
   });
 
-  it("always labels the host selector and disables it for one host", async () => {
-    await mountLauncher({ hosts: [localHost] });
+  it("omits the location selector from the DOM and accessibility tree when unnecessary", async () => {
+    await mountLauncher({ hosts: [localHost], locationLabel: null });
 
-    expect(document.body.textContent).toContain("Host");
-    expect(buttonWithText("Local Mac").disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("Host");
+    expect(document.body.textContent).not.toContain("Location");
+    expect(document.querySelector('[role="combobox"]')).toBeNull();
+  });
+
+  it("renders a Location selector for Windows primary and WSL hosts", async () => {
+    await mountLauncher({
+      hosts: [
+        { ...localHost, label: "This device" },
+        { ...remoteHost, label: "Ubuntu (WSL)" },
+      ],
+      locationLabel: "Location",
+    });
+
+    const selector = document.querySelector('[role="combobox"]');
+    expect(selector?.getAttribute("aria-label")).toBe("Location");
+    if (!(selector instanceof HTMLElement)) throw new Error("Missing location selector");
+    await click(selector);
+    expect(document.body.textContent).toContain("This device");
+    expect(document.body.textContent).toContain("Ubuntu (WSL)");
   });
 
   it("renders launcher failures as an accessible alert", async () => {

@@ -48,6 +48,11 @@ const CACHED_PROJECT = {
   repositoryIdentity: null,
   defaultModelSelection: null,
   scripts: [],
+  worktreeDiscovery: {
+    visibility: "hidden",
+    initialPromptDismissedAt: null,
+    baselinePaths: [],
+  },
   createdAt: "2026-06-01T00:00:00.000Z",
   updatedAt: "2026-06-01T00:00:00.000Z",
 } as const;
@@ -618,6 +623,11 @@ describe("environment shell synchronization", () => {
               repositoryIdentity: null,
               defaultModelSelection: null,
               scripts: [],
+              worktreeDiscovery: {
+                visibility: "hidden",
+                initialPromptDismissedAt: null,
+                baselinePaths: [],
+              },
               createdAt: "2026-06-01T00:00:00.000Z",
               updatedAt: "2026-06-01T00:00:00.000Z",
             },

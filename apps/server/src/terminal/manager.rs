@@ -3,9 +3,12 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, mpsc},
     time::Duration,
 };
+
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -21,14 +24,14 @@ use super::{
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
-        ProcessRegistration, ProcessRegistrationMetadata, ProcessSampler, RegistrationSource,
-        build_descendant_entries,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata, ProcessSampler,
+        RegistrationSource, build_descendant_entries,
     },
     process::{Platform, ProcessCleanupReport, ShellCandidate, resolve_shell_candidates},
     provider_terminal::{
         PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration,
+        TerminalObserverGeneration, TerminalObserverGenerationLease,
     },
 };
 
@@ -38,6 +41,7 @@ const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(1);
 const MAX_ISOLATED_OBSERVER_CALLBACKS: usize = 8;
 const MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS: usize = 16;
 const MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK: usize = 1;
+const OBSERVER_CALLBACK_JOIN_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const OBSERVER_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const OBSERVER_WORKER_ABORT_TIMEOUT: Duration = Duration::from_millis(50);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -145,6 +149,8 @@ impl Default for TerminalManagerOptions {
 pub enum TerminalError {
     #[error("terminal manager is shut down")]
     Shutdown,
+    #[error("terminal publication was cancelled")]
+    PublicationCancelled,
     #[error("terminal cwd does not exist: {0}")]
     CwdNotFound(String),
     #[error("terminal cwd is not a directory: {0}")]
@@ -199,6 +205,14 @@ struct Session {
 
 type SessionKey = (String, String);
 type SharedSession = Arc<Mutex<Session>>;
+
+#[derive(Clone)]
+pub(crate) struct TerminalSessionIdentity {
+    key: SessionKey,
+    session: SharedSession,
+    generation: Arc<SessionGeneration>,
+    process: Arc<dyn PtyProcess>,
+}
 
 #[derive(Clone)]
 struct StreamingSecretRedactor {
@@ -351,7 +365,7 @@ impl PreparedObserverHandle {
         }
     }
 
-    async fn on_spawned(&self, pid: u32, generation: TerminalObserverGeneration) -> bool {
+    async fn on_spawned(&self, pid: u32, generation: TerminalObserverGenerationLease) -> bool {
         if self.inner.generation.cancellation_reason().is_some() {
             return false;
         }
@@ -420,7 +434,7 @@ impl PreparedObserverHandle {
                     .observer
                     .set_agent_activity_enabled(
                         enabled,
-                        state.generation.clone(),
+                        state.generation.observation(),
                         state.generation.worker_context(),
                     )
                     .await
@@ -437,13 +451,250 @@ impl PreparedObserverHandle {
 #[derive(Clone, Debug)]
 struct ObserverCallbackIsolation {
     slots: Arc<tokio::sync::Semaphore>,
+    global_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    joined_callback_thread: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    callback_thread_exit_hook: Arc<StdMutex<Option<Arc<ObserverCallbackThreadExitTestHook>>>>,
+}
+
+struct ObserverCallbackThreadJoin {
+    callback: &'static str,
+    thread: std::thread::JoinHandle<()>,
+    manager_permit: tokio::sync::OwnedSemaphorePermit,
+    global_permit: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(test)]
+    joined_callback_thread: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+struct ObserverCallbackJoinReaper {
+    sender: mpsc::SyncSender<ObserverCallbackThreadJoin>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ObserverCallbackThreadExitTestHook {
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+struct ObserverCallbackThreadExitGuard(Arc<ObserverCallbackThreadExitTestHook>);
+
+#[cfg(test)]
+std::thread_local! {
+    static OBSERVER_CALLBACK_THREAD_EXIT_GUARD:
+        std::cell::RefCell<Option<ObserverCallbackThreadExitGuard>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl Default for ObserverCallbackThreadExitTestHook {
+    fn default() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new((StdMutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObserverCallbackThreadExitTestHook {
+    async fn wait_until_reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("callback thread exit hook remains open")
+            .forget();
+    }
+
+    fn block_before_exit(&self) {
+        self.reached.add_permits(1);
+        let mut released = self
+            .release
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = self
+                .release
+                .1
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .release
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObserverCallbackThreadExitGuard {
+    fn drop(&mut self) {
+        self.0.block_before_exit();
+    }
+}
+
+impl ObserverCallbackThreadJoin {
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    fn join(self) {
+        if self.thread.join().is_err() {
+            tracing::warn!(
+                callback = self.callback,
+                "provider terminal observer callback thread panicked"
+            );
+        }
+        drop(self.manager_permit);
+        drop(self.global_permit);
+        #[cfg(test)]
+        if let Some(joined_callback_thread) = self.joined_callback_thread {
+            let _ = joined_callback_thread.send(());
+        }
+    }
+}
+
+impl ObserverCallbackJoinReaper {
+    fn start() -> Option<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<ObserverCallbackThreadJoin>(
+            MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
+        );
+        std::thread::Builder::new()
+            .name("terminal-observer-callback-join-reaper".to_owned())
+            .spawn(move || Self::run(receiver))
+            .ok()?;
+        Some(Self { sender })
+    }
+
+    fn submit(
+        &self,
+        callback: ObserverCallbackThreadJoin,
+    ) -> Result<(), ObserverCallbackThreadJoin> {
+        self.sender.try_send(callback).map_err(|error| match error {
+            mpsc::TrySendError::Full(callback) | mpsc::TrySendError::Disconnected(callback) => {
+                callback
+            }
+        })
+    }
+
+    fn run(receiver: mpsc::Receiver<ObserverCallbackThreadJoin>) {
+        let mut callbacks: Vec<ObserverCallbackThreadJoin> =
+            Vec::with_capacity(MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS);
+        loop {
+            let mut index = 0;
+            while index < callbacks.len() {
+                if callbacks[index].is_finished() {
+                    callbacks.swap_remove(index).join();
+                } else {
+                    index += 1;
+                }
+            }
+
+            let callback = if callbacks.is_empty() {
+                match receiver.recv() {
+                    Ok(callback) => callback,
+                    Err(_) => return,
+                }
+            } else {
+                match receiver.recv_timeout(OBSERVER_CALLBACK_JOIN_REAPER_POLL_INTERVAL) {
+                    Ok(callback) => callback,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        for callback in callbacks {
+                            callback.join();
+                        }
+                        return;
+                    }
+                }
+            };
+
+            if callbacks.len() == MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS {
+                tracing::error!(
+                    callback = callback.callback,
+                    capacity = MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
+                    "provider terminal observer callback join reaper capacity was exceeded"
+                );
+                callback.join();
+            } else {
+                callbacks.push(callback);
+            }
+        }
+    }
 }
 
 impl Default for ObserverCallbackIsolation {
     fn default() -> Self {
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
+            global_slots: GLOBAL_OBSERVER_CALLBACK_SLOTS.clone(),
+            #[cfg(test)]
+            joined_callback_thread: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            callback_thread_exit_hook: Arc::new(StdMutex::new(None)),
         }
+    }
+}
+
+#[cfg(test)]
+impl ObserverCallbackIsolation {
+    fn with_slots(
+        slots: Arc<tokio::sync::Semaphore>,
+        global_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            slots,
+            global_slots,
+            joined_callback_thread: Arc::new(StdMutex::new(None)),
+            callback_thread_exit_hook: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    fn callback_thread_exit_hook(&self) -> Arc<ObserverCallbackThreadExitTestHook> {
+        let hook = Arc::new(ObserverCallbackThreadExitTestHook::default());
+        assert!(
+            self.callback_thread_exit_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(hook.clone())
+                .is_none(),
+            "only one callback thread exit can be observed at a time"
+        );
+        hook
+    }
+
+    fn callback_thread_joined(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            self.joined_callback_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(sender)
+                .is_none(),
+            "only one callback thread join can be observed at a time"
+        );
+        receiver
+    }
+
+    fn take_callback_thread_joined(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.joined_callback_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn take_callback_thread_exit_hook(&self) -> Option<Arc<ObserverCallbackThreadExitTestHook>> {
+        self.callback_thread_exit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -453,6 +704,8 @@ static GLOBAL_OBSERVER_CALLBACK_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
             MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
         ))
     });
+static GLOBAL_OBSERVER_CALLBACK_JOIN_REAPER: LazyLock<Option<ObserverCallbackJoinReaper>> =
+    LazyLock::new(ObserverCallbackJoinReaper::start);
 
 enum IsolatedCallbackResult<T> {
     Completed(T),
@@ -472,9 +725,10 @@ where
     run_isolated_observer_callback(isolation, callback, execution_budget, move || {
         // Every admitted asynchronous callback owns one isolation thread and
         // at most one Tokio blocking-pool thread. With the process-global
-        // admission cap, callback isolation is therefore bounded to 32
-        // manager-created threads. Trusted Rust callbacks can still create
-        // unmanaged raw std::threads; this is not a sandbox.
+        // admission cap, callbacks are therefore bounded to 32
+        // manager-created threads plus the one process-wide join reaper.
+        // Trusted Rust callbacks can still create unmanaged raw std::threads;
+        // this is not a sandbox.
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK)
@@ -520,9 +774,16 @@ async fn run_isolated_observer_callback<T>(
 where
     T: Send + 'static,
 {
+    let Some(join_reaper) = GLOBAL_OBSERVER_CALLBACK_JOIN_REAPER.as_ref() else {
+        tracing::warn!(
+            callback,
+            "failed to start provider terminal observer callback join reaper"
+        );
+        return None;
+    };
     let manager_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
-        isolation.slots.acquire_owned(),
+        isolation.slots.clone().acquire_owned(),
     )
     .await
     {
@@ -543,7 +804,7 @@ where
     };
     let global_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
-        GLOBAL_OBSERVER_CALLBACK_SLOTS.clone().acquire_owned(),
+        isolation.global_slots.clone().acquire_owned(),
     )
     .await
     {
@@ -566,16 +827,42 @@ where
         }
     };
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    #[cfg(test)]
+    let callback_thread_exit_hook = isolation.take_callback_thread_exit_hook();
     let thread = std::thread::Builder::new()
         .name(format!("terminal-observer-{callback}"))
         .spawn(move || {
-            let _manager_permit = manager_permit;
-            let _global_permit = global_permit;
+            #[cfg(test)]
+            if let Some(callback_thread_exit_hook) = callback_thread_exit_hook {
+                OBSERVER_CALLBACK_THREAD_EXIT_GUARD.with(|guard| {
+                    guard
+                        .borrow_mut()
+                        .replace(ObserverCallbackThreadExitGuard(callback_thread_exit_hook));
+                });
+            }
             let _ = result_sender.send(invoke());
         });
     if let Err(error) = thread {
         tracing::warn!(callback, %error, "failed to start provider terminal observer isolation");
         return None;
+    }
+    let thread = thread.expect("checked observer callback thread spawn result");
+    #[cfg(test)]
+    let joined_callback_thread = isolation.take_callback_thread_joined();
+    let callback_join = ObserverCallbackThreadJoin {
+        callback,
+        thread,
+        manager_permit,
+        global_permit,
+        #[cfg(test)]
+        joined_callback_thread,
+    };
+    if let Err(callback_join) = join_reaper.submit(callback_join) {
+        tracing::error!(
+            callback,
+            "provider terminal observer callback join reaper stopped; joining inline"
+        );
+        callback_join.join();
     }
     match tokio::time::timeout(execution_budget, result_receiver).await {
         Ok(Ok(IsolatedCallbackResult::Completed(value))) => Some(value),
@@ -645,6 +932,27 @@ impl UncommittedPtyProcess {
 
     fn commit(mut self) {
         self.process = None;
+    }
+
+    async fn cleanup(mut self) {
+        let Some(process) = self.process.take() else {
+            return;
+        };
+        let exit = process.subscribe_exit();
+        if let Err(error) = process.kill() {
+            tracing::debug!(
+                %error,
+                pid = process.pid(),
+                "failed to kill rejected terminal process"
+            );
+        }
+        if let Err(error) = wait_for_terminal_process_tree_exit(process.clone(), exit).await {
+            tracing::debug!(
+                %error,
+                pid = process.pid(),
+                "rejected terminal process did not finish cleanup cleanly"
+            );
+        }
     }
 }
 
@@ -1267,6 +1575,10 @@ impl TerminalManager {
         }
     }
 
+    pub(crate) fn process_attribution_registry(&self) -> ProcessAttributionRegistry {
+        self.inner.attribution.clone()
+    }
+
     pub async fn set_agent_activity_enabled(
         &self,
         enabled: bool,
@@ -1298,21 +1610,32 @@ impl TerminalManager {
         &self,
         input: TerminalOpenInput,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
-        self.open_inner(input, None).await
+        self.open_inner(input, None, CancellationToken::new()).await
     }
 
-    pub(crate) async fn open_with_initial_input(
+    pub(crate) async fn open_with_publication_cancellation(
+        &self,
+        input: TerminalOpenInput,
+        publication_cancellation: CancellationToken,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.open_inner(input, None, publication_cancellation).await
+    }
+
+    pub(crate) async fn open_with_initial_input_and_publication_cancellation(
         &self,
         input: TerminalOpenInput,
         initial_input: String,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
-        self.open_inner(input, Some(initial_input)).await
+        self.open_inner(input, Some(initial_input), publication_cancellation)
+            .await
     }
 
     async fn open_inner(
         &self,
         input: TerminalOpenInput,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let generation = {
@@ -1327,12 +1650,28 @@ impl TerminalManager {
             }
             self.inner.generations.current(&key)
         };
-        self.start(input, false, generation, initial_input).await
+        self.start(
+            input,
+            false,
+            generation,
+            initial_input,
+            publication_cancellation,
+        )
+        .await
     }
 
     pub async fn restart(
         &self,
         input: TerminalRestartInput,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.restart_with_publication_cancellation(input, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn restart_with_publication_cancellation(
+        &self,
+        input: TerminalRestartInput,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         if let Some(generation) = self.inner.generations.peek(&key) {
@@ -1392,7 +1731,10 @@ impl TerminalManager {
             )
             .await;
         log_terminal_cleanup("restart", &closed.report);
-        match self.start_inner(input, true, generation, None).await {
+        match self
+            .start_inner(input, true, generation, None, publication_cancellation)
+            .await
+        {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 self.publish_closed_sessions(&closed.notifications);
@@ -1407,14 +1749,21 @@ impl TerminalManager {
         restarted: bool,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let operation = self.inner.operations.for_key(&key);
         let _operation = operation.lock_owned().await;
         let startup = generation.startup.clone();
         let _startup = startup.lock().await;
-        self.start_inner(input, restarted, generation, initial_input)
-            .await
+        self.start_inner(
+            input,
+            restarted,
+            generation,
+            initial_input,
+            publication_cancellation,
+        )
+        .await
     }
 
     async fn start_inner(
@@ -1423,6 +1772,7 @@ impl TerminalManager {
         restarted: bool,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         self.inner.worktree_removals.ensure_available(
             &input.thread_id,
@@ -1644,6 +1994,12 @@ impl TerminalManager {
             });
         };
         let mut uncommitted_process = UncommittedPtyProcess::new(process);
+        if publication_cancellation.is_cancelled() {
+            generation
+                .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
+                .await;
+            return Err(TerminalError::PublicationCancelled);
+        }
         if generation.is_invalidated() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
@@ -1678,7 +2034,7 @@ impl TerminalManager {
                     env,
                 })
                 .map_err(|error| TerminalError::Spawn {
-                    attempted,
+                    attempted: attempted.clone(),
                     message: error,
                 })?;
             uncommitted_process = UncommittedPtyProcess::new(process);
@@ -1686,7 +2042,7 @@ impl TerminalManager {
         let process = uncommitted_process.process();
         if let Some(observer) = generation.observer() {
             let completed = observer
-                .on_spawned(process.pid(), generation.observation.clone())
+                .on_spawned(process.pid(), generation.observation.observation())
                 .await;
             if !completed {
                 generation
@@ -1711,20 +2067,39 @@ impl TerminalManager {
             .unwrap_or_else(|| terminal_label(&input.terminal_id));
         let exit = process.subscribe_exit();
         let process_has_exited = exit.borrow().is_some();
-        let attribution_registration = (!process_has_exited)
-            .then(|| process.process_identity())
-            .flatten()
-            .and_then(|identity| {
-                self.inner.attribution.register_identity(
-                    identity,
-                    ProcessRegistrationMetadata {
-                        scope: AttributionScope::External,
-                        kind: AttributionKind::Terminal,
-                        label: label.clone(),
-                        source: RegistrationSource::Terminal,
-                    },
-                )
-            });
+        let attribution_registration = if process_has_exited {
+            None
+        } else {
+            let Some(identity) = process.process_identity() else {
+                uncommitted_process.cleanup().await;
+                return Err(TerminalError::Spawn {
+                    attempted,
+                    message: "spawned terminal process has no stable process identity".to_owned(),
+                });
+            };
+            match self.inner.attribution.register_identity(
+                identity,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Terminal,
+                    label: label.clone(),
+                    source: RegistrationSource::Terminal,
+                },
+            ) {
+                Ok(registration) => Some(registration),
+                Err(ProcessRegistrationError::Shutdown) => {
+                    uncommitted_process.cleanup().await;
+                    return Err(TerminalError::Shutdown);
+                }
+                Err(error @ ProcessRegistrationError::Capacity) => {
+                    uncommitted_process.cleanup().await;
+                    return Err(TerminalError::Spawn {
+                        attempted,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
         let history = TerminalHistory::new(self.inner.options.history_line_limit);
         debug_assert_eq!(
             history.line_limit(),
@@ -1760,6 +2135,12 @@ impl TerminalManager {
         }));
         let _lifecycle = self.inner.lifecycle.lock().await;
         let _publication = generation.publication.lock().await;
+        if publication_cancellation.is_cancelled() {
+            generation
+                .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
+                .await;
+            return Err(TerminalError::PublicationCancelled);
+        }
         self.inner.worktree_removals.ensure_available(
             &input.thread_id,
             Some(&input.cwd),
@@ -1921,7 +2302,7 @@ impl TerminalManager {
         tokio::spawn(async move {
             loop {
                 let observed_exit = exit.borrow().clone();
-                let Some(PtyExit { exit_code, signal }) = observed_exit else {
+                let Some(exit) = observed_exit else {
                     tokio::select! {
                         () = exit_cancel.cancelled() => return,
                         () = exit_generation.cancellation.cancelled() => return,
@@ -1933,51 +2314,8 @@ impl TerminalManager {
                     }
                     continue;
                 };
-                exit_generation.stop_output().await;
-                let _publication = exit_generation.publication.lock().await;
-                if exit_generation.is_invalidated() {
-                    return;
-                }
-                let registered = {
-                    let sessions = exit_inner.sessions.read().await;
-                    let session = exit_session.lock().await;
-                    sessions
-                        .get(&(session.thread_id.clone(), session.terminal_id.clone()))
-                        .is_some_and(|current| Arc::ptr_eq(current, &exit_session))
-                };
-                if !registered {
-                    return;
-                }
-                exit_generation
-                    .cancel_and_invalidate(TerminalObserverCancellationReason::ProcessExited)
+                Self::finalize_process_exit(&exit_inner, &exit_session, &exit_generation, exit)
                     .await;
-                let (event, summary) = {
-                    let mut session = exit_session.lock().await;
-                    session.status = TerminalStatus::Exited;
-                    session.attribution_registration.take();
-                    session.observer.take();
-                    session.pid = None;
-                    session.process = None;
-                    session.exit_code = exit_code;
-                    session.exit_signal = signal;
-                    session.has_running_subprocess = false;
-                    session.child_command_label = None;
-                    let sequence = session.advance();
-                    (
-                        TerminalEvent::Exited {
-                            thread_id: session.thread_id.clone(),
-                            terminal_id: session.terminal_id.clone(),
-                            sequence,
-                            exit_code,
-                            exit_signal: signal,
-                        },
-                        session.summary(),
-                    )
-                };
-                let _ = exit_inner.events.send(event);
-                let _ = exit_inner
-                    .metadata
-                    .send(TerminalMetadataEvent::Upsert { terminal: summary });
                 return;
             }
         });
@@ -2050,6 +2388,62 @@ impl TerminalManager {
         });
     }
 
+    async fn finalize_process_exit(
+        inner: &Arc<Inner>,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+        exit: PtyExit,
+    ) {
+        generation.stop_output().await;
+        let _publication = generation.publication.lock().await;
+        if generation.is_invalidated() {
+            return;
+        }
+        let registered = {
+            let sessions = inner.sessions.read().await;
+            let locked_session = session.lock().await;
+            sessions
+                .get(&(
+                    locked_session.thread_id.clone(),
+                    locked_session.terminal_id.clone(),
+                ))
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+        };
+        if !registered {
+            return;
+        }
+        generation
+            .cancel_and_invalidate(TerminalObserverCancellationReason::ProcessExited)
+            .await;
+        let (event, summary) = {
+            let mut session = session.lock().await;
+            session.status = TerminalStatus::Exited;
+            session.attribution_registration.take();
+            session.observer.take();
+            session.pid = None;
+            session.process = None;
+            session.exit_code = exit.exit_code;
+            session.exit_signal = exit.signal;
+            session.has_running_subprocess = false;
+            session.child_command_label = None;
+            let sequence = session.advance();
+            (
+                TerminalEvent::Exited {
+                    thread_id: session.thread_id.clone(),
+                    terminal_id: session.terminal_id.clone(),
+                    sequence,
+                    exit_code: exit.exit_code,
+                    exit_signal: exit.signal,
+                },
+                session.summary(),
+            )
+        };
+        let _ = inner.events.send(event);
+        let _ = inner
+            .metadata
+            .send(TerminalMetadataEvent::Upsert { terminal: summary });
+    }
+
     async fn publish_output_chunk(
         inner: &Inner,
         session: &SharedSession,
@@ -2117,6 +2511,15 @@ impl TerminalManager {
         &self,
         input: TerminalAttachInput,
     ) -> Result<TerminalAttachment, TerminalError> {
+        self.attach_with_publication_cancellation(input, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn attach_with_publication_cancellation(
+        &self,
+        input: TerminalAttachInput,
+        publication_cancellation: CancellationToken,
+    ) -> Result<TerminalAttachment, TerminalError> {
         let events = self.inner.events.subscribe();
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let request_generation = {
@@ -2156,6 +2559,7 @@ impl TerminalManager {
                     false,
                     request_generation.clone(),
                     None,
+                    publication_cancellation,
                 )
                 .await?;
                 self.inner
@@ -2418,6 +2822,131 @@ impl TerminalManager {
         Ok(guard)
     }
 
+    /// Stops every live terminal process for a thread while retaining the
+    /// exited session snapshots and their bounded transcript history.
+    pub async fn quiesce_thread_preserving_history(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), TerminalError> {
+        let identities = self.capture_thread_session_identities(thread_id).await;
+        self.quiesce_sessions_preserving_history_if_current(identities)
+            .await
+    }
+
+    pub(crate) async fn capture_thread_session_identities(
+        &self,
+        thread_id: &str,
+    ) -> Vec<TerminalSessionIdentity> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let sessions = {
+            let sessions = self.inner.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|((candidate_thread, _), _)| candidate_thread == thread_id)
+                .map(|(key, session)| (key.clone(), session.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut identities = Vec::with_capacity(sessions.len());
+        for (key, session) in sessions {
+            let (generation, process) = {
+                let session = session.lock().await;
+                (session.generation.clone(), session.process.clone())
+            };
+            if let Some(process) = process {
+                identities.push(TerminalSessionIdentity {
+                    key,
+                    session,
+                    generation,
+                    process,
+                });
+            }
+        }
+        identities
+    }
+
+    pub(crate) async fn quiesce_sessions_preserving_history_if_current(
+        &self,
+        identities: Vec<TerminalSessionIdentity>,
+    ) -> Result<(), TerminalError> {
+        let (targets, mut failed) = {
+            let _lifecycle = self.inner.lifecycle.lock().await;
+            let mut targets = Vec::with_capacity(identities.len());
+            let mut failed = false;
+            for identity in identities {
+                let registered = {
+                    let sessions = self.inner.sessions.read().await;
+                    sessions
+                        .get(&identity.key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &identity.session))
+                };
+                let generation_is_current = self
+                    .inner
+                    .generations
+                    .peek(&identity.key)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &identity.generation));
+                let process_is_current = if registered && generation_is_current {
+                    let session = identity.session.lock().await;
+                    Arc::ptr_eq(&session.generation, &identity.generation)
+                        && session
+                            .process
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &identity.process))
+                } else {
+                    false
+                };
+                if !process_is_current {
+                    continue;
+                }
+                let exit = identity.process.subscribe_exit();
+                match identity.process.kill() {
+                    Ok(()) => targets.push((
+                        identity.key,
+                        identity.session,
+                        identity.generation,
+                        identity.process,
+                        exit,
+                    )),
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(
+                            thread_id = %identity.key.0,
+                            terminal_id = %identity.key.1,
+                            pid = identity.process.pid(),
+                            %error,
+                            "failed to stop terminal for unavailable workspace"
+                        );
+                    }
+                }
+            }
+            (targets, failed)
+        };
+        for (key, session, generation, process, exit) in targets {
+            let observed = exit.clone();
+            match wait_for_terminal_process_tree_exit(process, exit).await {
+                Ok(()) => {
+                    let observed_exit = observed.borrow().clone();
+                    if let Some(exit) = observed_exit {
+                        Self::finalize_process_exit(&self.inner, &session, &generation, exit).await;
+                    }
+                }
+                Err(error) => {
+                    failed = true;
+                    tracing::warn!(
+                        thread_id = %key.0,
+                        terminal_id = %key.1,
+                        %error,
+                        "terminal quiesce did not finish cleanly"
+                    );
+                }
+            }
+        }
+        if failed {
+            Err(TerminalError::Close)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn close_sessions(
         &self,
         thread_id: &str,
@@ -2569,6 +3098,9 @@ impl TerminalManager {
             self.publish_closed_sessions(&closed.notifications);
             report.merge(closed.report);
         }
+        if let Some(preparer) = self.inner.options.launch_preparer.as_ref() {
+            preparer.shutdown().await;
+        }
         report
     }
 
@@ -2594,6 +3126,7 @@ async fn wait_for_terminal_process_tree_exit(
     process: Arc<dyn PtyProcess>,
     mut root_exit: tokio::sync::watch::Receiver<Option<PtyExit>>,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + TERMINAL_CLOSE_WAIT_TIMEOUT;
     let tree_process = Arc::clone(&process);
     let tree_exit = tokio::task::spawn_blocking(move || {
         tree_process.wait_for_process_tree_exit(TERMINAL_CLOSE_WAIT_TIMEOUT)
@@ -2602,25 +3135,22 @@ async fn wait_for_terminal_process_tree_exit(
     .map_err(|error| format!("process-tree wait task failed: {error}"))??;
 
     match tree_exit {
-        Some(true) => Ok(()),
+        Some(true) => {
+            if wait_for_terminal_root_exit(&mut root_exit, deadline).await {
+                Ok(())
+            } else {
+                Err(format!(
+                    "process did not finish reaping within {} ms",
+                    TERMINAL_CLOSE_WAIT_TIMEOUT.as_millis()
+                ))
+            }
+        }
         Some(false) => Err(format!(
             "process tree did not exit within {} ms",
             TERMINAL_CLOSE_WAIT_TIMEOUT.as_millis()
         )),
         None => {
-            let already_exited = root_exit.borrow().is_some();
-            let exited = already_exited
-                || tokio::time::timeout(TERMINAL_CLOSE_WAIT_TIMEOUT, async {
-                    while root_exit.borrow().is_none() {
-                        root_exit.changed().await.map_err(|_| ())?;
-                    }
-                    Ok::<(), ()>(())
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .is_some();
-            if exited {
+            if wait_for_terminal_root_exit(&mut root_exit, deadline).await {
                 Ok(())
             } else {
                 Err(format!(
@@ -2630,6 +3160,23 @@ async fn wait_for_terminal_process_tree_exit(
             }
         }
     }
+}
+
+async fn wait_for_terminal_root_exit(
+    root_exit: &mut tokio::sync::watch::Receiver<Option<PtyExit>>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    root_exit.borrow().is_some()
+        || tokio::time::timeout_at(deadline, async {
+            while root_exit.borrow().is_none() {
+                root_exit.changed().await.map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some()
 }
 
 fn log_terminal_cleanup(operation: &'static str, report: &ProcessCleanupReport) {
@@ -2817,6 +3364,25 @@ mod tests {
     };
     use std::time::Instant;
 
+    #[derive(Debug, Default)]
+    struct ShutdownRecordingPreparer {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TerminalLaunchPreparer for ShutdownRecordingPreparer {
+        fn prepare(
+            &self,
+            _input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::PassThrough))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
     #[derive(Debug)]
     struct RegistryObserver;
 
@@ -2824,7 +3390,7 @@ mod tests {
         fn on_spawned(
             &self,
             _pid: u32,
-            _generation: TerminalObserverGeneration,
+            _generation: TerminalObserverGenerationLease,
             _workers: TerminalObserverWorkerContext,
         ) {
         }
@@ -2832,6 +3398,122 @@ mod tests {
         fn diagnostic_label(&self) -> &str {
             "registry-observer"
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_callback_slot_is_reusable_after_aborted_owner() {
+        let local_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let isolation =
+            ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let exited = isolation.callback_thread_joined();
+        let exit_hook = isolation.callback_thread_exit_hook();
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn({
+            let isolation = isolation.clone();
+            async move {
+                run_observer_callback(
+                    isolation,
+                    "aborted_owner",
+                    Duration::from_secs(5),
+                    async move {
+                        started_sender.send(()).expect("callback thread started");
+                        release_receiver.await.expect("release callback thread");
+                    },
+                )
+                .await
+            }
+        });
+        started.await.expect("callback thread started");
+
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("aborted callback owner")
+                .is_cancelled()
+        );
+        assert!(local_slots.clone().try_acquire_owned().is_err());
+        assert!(global_slots.clone().try_acquire_owned().is_err());
+        release.send(()).expect("release callback thread");
+        exit_hook.wait_until_reached().await;
+        let local_slot_retained_until_thread_exit =
+            local_slots.clone().try_acquire_owned().is_err();
+        let global_slot_retained_until_thread_exit =
+            global_slots.clone().try_acquire_owned().is_err();
+        exit_hook.release();
+        exited.await.expect("callback thread joined");
+        assert!(local_slot_retained_until_thread_exit);
+        assert!(global_slot_retained_until_thread_exit);
+        assert!(local_slots.try_acquire_owned().is_ok());
+        assert!(global_slots.try_acquire_owned().is_ok());
+
+        assert_eq!(
+            run_observer_callback(
+                isolation,
+                "replacement_after_abort",
+                Duration::from_secs(1),
+                async { "replacement" },
+            )
+            .await,
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_callback_slot_is_reusable_after_callback_panic() {
+        let local_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let isolation =
+            ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let exited = isolation.callback_thread_joined();
+        let exit_hook = isolation.callback_thread_exit_hook();
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn({
+            let isolation = isolation.clone();
+            async move {
+                run_observer_callback(
+                    isolation,
+                    "panicked_callback",
+                    Duration::from_secs(1),
+                    async move {
+                        started_sender.send(()).expect("callback thread started");
+                        release_receiver.await.expect("release callback thread");
+                        panic!("injected observer callback panic");
+                    },
+                )
+                .await
+            }
+        });
+        started.await.expect("callback thread started");
+        assert!(local_slots.clone().try_acquire_owned().is_err());
+        assert!(global_slots.clone().try_acquire_owned().is_err());
+        release.send(()).expect("release callback thread");
+        assert_eq!(caller.await.expect("panicked callback owner"), None);
+        exit_hook.wait_until_reached().await;
+        let local_slot_retained_until_thread_exit =
+            local_slots.clone().try_acquire_owned().is_err();
+        let global_slot_retained_until_thread_exit =
+            global_slots.clone().try_acquire_owned().is_err();
+        exit_hook.release();
+        exited.await.expect("callback thread joined");
+        assert!(local_slot_retained_until_thread_exit);
+        assert!(global_slot_retained_until_thread_exit);
+        assert!(local_slots.try_acquire_owned().is_ok());
+        assert!(global_slots.try_acquire_owned().is_ok());
+
+        assert_eq!(
+            run_observer_callback(
+                isolation,
+                "replacement_after_panic",
+                Duration::from_secs(1),
+                async { 7_u8 },
+            )
+            .await,
+            Some(7)
+        );
     }
 
     #[tokio::test]
@@ -2863,6 +3545,23 @@ mod tests {
         );
         assert!(!displaced.observation.is_current());
         assert!(replacement.observation.is_current());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_owned_launch_preparer_after_terminal_generations() {
+        let preparer = Arc::new(ShutdownRecordingPreparer::default());
+        let manager = TerminalManager::new(
+            Arc::new(HistoryTestBackend::default()),
+            TerminalManagerOptions {
+                launch_preparer: Some(preparer.clone()),
+                ..TerminalManagerOptions::default()
+            },
+        );
+
+        manager.shutdown().await;
+        manager.shutdown().await;
+
+        assert_eq!(preparer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3031,7 +3730,7 @@ mod tests {
             let (exit, _) = tokio::sync::watch::channel(None);
             Self {
                 pid,
-                process_identity: None,
+                process_identity: Some(crate::diagnostics::ProcessIdentity { pid, started_at: 0 }),
                 exit_on_identity_read: std::sync::Mutex::new(None),
                 output,
                 exit,
@@ -3082,6 +3781,13 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Release);
             self.tree_exited
                 .store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        fn report_process_tree_exited(&self) {
+            self.tree_exit_supported
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.tree_exited
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         fn fail_kill(&self, error: impl Into<String>) {
@@ -3211,7 +3917,7 @@ mod tests {
         let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
 
         manager
-            .open_with_initial_input(
+            .open_with_initial_input_and_publication_cancellation(
                 TerminalOpenInput::new(
                     "thread",
                     "setup-install",
@@ -3220,6 +3926,7 @@ mod tests {
                     30,
                 ),
                 "vp install\r".to_owned(),
+                CancellationToken::new(),
             )
             .await
             .expect("terminal opens only after setup input is submitted");
@@ -3227,6 +3934,55 @@ mod tests {
         assert_eq!(backend.latest().writes(), ["vp install\r"]);
         assert_eq!(manager.subscribe_metadata().await.initial.len(), 1);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_publication_cancellation_kills_the_uncommitted_process() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+        let generation = manager
+            .inner
+            .generations
+            .current(&("thread".to_owned(), "setup-cancelled".to_owned()));
+        let publication = generation.publication.lock().await;
+        let cancellation = CancellationToken::new();
+        let open_manager = manager.clone();
+        let open_cancellation = cancellation.clone();
+        let cwd = root.path().to_path_buf();
+        let open = tokio::spawn(async move {
+            open_manager
+                .open_with_initial_input_and_publication_cancellation(
+                    TerminalOpenInput::new("thread", "setup-cancelled", cwd, 120, 30),
+                    "vp install\r".to_owned(),
+                    open_cancellation,
+                )
+                .await
+        });
+        while backend.processes.lock().expect("processes").is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        drop(publication);
+        assert!(matches!(
+            open.await.expect("open task"),
+            Err(TerminalError::PublicationCancelled)
+        ));
+        let process = backend
+            .processes
+            .lock()
+            .expect("processes")
+            .first()
+            .cloned()
+            .expect("spawned process");
+        assert!(process.is_killed());
+        assert!(
+            manager
+                .require_session("thread", "setup-cancelled")
+                .await
+                .is_err()
+        );
     }
 
     #[derive(Debug)]
@@ -3353,6 +4109,48 @@ mod tests {
         assert!(
             !close.is_finished(),
             "close returned before the killed process released its resources"
+        );
+
+        process.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), close)
+            .await
+            .expect("terminal close timed out")
+            .expect("terminal close task");
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_root_reaping_after_the_process_tree_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-tree-reaping",
+                "term-tree-reaping",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let process = backend.latest();
+        process.delay_exit_on_kill();
+        process.report_process_tree_exited();
+        let close_manager = manager.clone();
+        let close = tokio::spawn(async move {
+            close_manager
+                .close("thread-tree-reaping", Some("term-tree-reaping"))
+                .await
+                .unwrap();
+        });
+
+        while !process.is_killed() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !close.is_finished(),
+            "close returned after the process tree exited but before root reaping completed"
         );
 
         process.exit(0);
@@ -4537,6 +5335,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_quiesce_stops_every_process_and_retains_session_history() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-one", "term-two"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-quiesce",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let mut events = manager.subscribe_events();
+        for (process, transcript) in backend
+            .processes
+            .lock()
+            .expect("processes")
+            .iter()
+            .zip(["retained-one\n", "retained-two\n"])
+        {
+            process.emit(transcript);
+        }
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("output timeout")
+                .expect("output event");
+            assert!(matches!(event, TerminalEvent::Output { .. }));
+        }
+
+        manager
+            .quiesce_thread_preserving_history("thread-quiesce")
+            .await
+            .expect("quiesce");
+
+        for (terminal_id, transcript) in [
+            ("term-one", "retained-one\n"),
+            ("term-two", "retained-two\n"),
+        ] {
+            let attachment = manager
+                .attach(TerminalAttachInput::existing("thread-quiesce", terminal_id))
+                .await
+                .expect("retained terminal attaches");
+            assert_eq!(attachment.initial.status, TerminalStatus::Exited);
+            assert_eq!(attachment.initial.history, transcript);
+        }
+        assert!(
+            backend
+                .processes
+                .lock()
+                .expect("processes")
+                .iter()
+                .all(|process| process.is_killed())
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_workspace_quiesce_skips_a_replacement_and_stops_other_captured_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-replaced", "term-retained"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-exact-quiesce",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let captured = manager
+            .capture_thread_session_identities("thread-exact-quiesce")
+            .await;
+        assert_eq!(captured.len(), 2, "cleanup captures every live session");
+
+        manager
+            .restart(TerminalRestartInput {
+                thread_id: "thread-exact-quiesce".to_owned(),
+                terminal_id: "term-replaced".to_owned(),
+                cwd: root.path().to_path_buf(),
+                worktree_path: None,
+                cols: 80,
+                rows: 24,
+                env: std::collections::BTreeMap::new(),
+                command: None,
+            })
+            .await
+            .expect("recovered replacement starts");
+        let processes = backend.processes.lock().expect("processes").clone();
+        let replacement = processes.last().expect("replacement process").clone();
+        let mut events = manager.subscribe_events();
+        replacement.emit("replacement-history\n");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(events.recv().await, Ok(TerminalEvent::Output { data, .. }) if data == "replacement-history\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement output published");
+
+        manager
+            .quiesce_sessions_preserving_history_if_current(captured)
+            .await
+            .expect("stale exact cleanup");
+
+        assert!(
+            !replacement.is_killed(),
+            "stale cleanup must not kill the recovered replacement"
+        );
+        manager
+            .write("thread-exact-quiesce", "term-replaced", "still-usable")
+            .await
+            .expect("replacement remains writable");
+        let replacement_attachment = manager
+            .attach(TerminalAttachInput::existing(
+                "thread-exact-quiesce",
+                "term-replaced",
+            ))
+            .await
+            .expect("replacement remains attachable");
+        assert_eq!(
+            replacement_attachment.initial.status,
+            TerminalStatus::Running
+        );
+        assert_eq!(
+            replacement_attachment.initial.history,
+            "replacement-history\n"
+        );
+        let retained_attachment = manager
+            .attach(TerminalAttachInput::existing(
+                "thread-exact-quiesce",
+                "term-retained",
+            ))
+            .await
+            .expect("captured session history remains attachable");
+        assert_eq!(retained_attachment.initial.status, TerminalStatus::Exited);
+        assert!(processes[1].is_killed());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_quiesce_attempts_every_process_when_kills_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-one", "term-two"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-quiesce-errors",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let processes = backend.processes.lock().expect("processes").clone();
+        for process in &processes {
+            process.fail_kill("expected kill failure");
+        }
+
+        assert!(matches!(
+            manager
+                .quiesce_thread_preserving_history("thread-quiesce-errors")
+                .await,
+            Err(TerminalError::Close)
+        ));
+        assert!(
+            processes.iter().all(|process| process.is_killed()),
+            "one failed kill must not prevent later terminals from being signaled"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn console_theme_survives_attach_and_updates_on_restart() {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(HistoryTestBackend::default());
@@ -4734,6 +5736,91 @@ mod tests {
         .expect("terminal exit event");
         assert!(terminal_claims(&registry, &[pid]).is_empty());
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frozen_runtime_rejects_and_reaps_a_late_terminal_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: true,
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let manager = attributed_manager(backend.clone(), registry.clone());
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
+
+        let result = manager
+            .open(TerminalOpenInput::new(
+                "thread-after-freeze",
+                "term-after-freeze",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+
+        assert!(matches!(result, Err(TerminalError::Shutdown)));
+        let process = backend.latest();
+        assert!(process.is_killed(), "rejected late process must be killed");
+        assert!(
+            process.subscribe_exit().borrow().is_some(),
+            "rejected late process must be observed as exited before open returns"
+        );
+        assert!(
+            manager
+                .require_session("thread-after-freeze", "term-after-freeze")
+                .await
+                .is_err(),
+            "a rejected process must never be published as a terminal session"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_registry_rejects_and_reaps_an_unattributed_terminal_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend {
+            expose_process_identity: true,
+            ..HistoryTestBackend::default()
+        });
+        let registry = ProcessAttributionRegistry::new();
+        let registrations = (0..512_u32)
+            .map(|pid| {
+                registry
+                    .register_identity(
+                        crate::diagnostics::ProcessIdentity {
+                            pid: pid + 10_000,
+                            started_at: u64::from(pid),
+                        },
+                        ProcessRegistrationMetadata {
+                            scope: AttributionScope::External,
+                            kind: AttributionKind::Provider,
+                            label: "capacity fixture".to_owned(),
+                            source: RegistrationSource::Provider,
+                        },
+                    )
+                    .expect("fill registry")
+            })
+            .collect::<Vec<_>>();
+        let manager = attributed_manager(backend.clone(), registry);
+
+        let result = manager
+            .open(TerminalOpenInput::new(
+                "thread-at-capacity",
+                "term-at-capacity",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await;
+
+        assert!(matches!(result, Err(TerminalError::Spawn { .. })));
+        let process = backend.latest();
+        assert!(process.is_killed(), "unattributed process must be killed");
+        assert!(
+            process.subscribe_exit().borrow().is_some(),
+            "unattributed process must be reaped before open returns"
+        );
+        drop(registrations);
     }
 
     #[tokio::test]

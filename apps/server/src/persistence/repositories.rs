@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -156,6 +156,14 @@ impl Repositories {
             )?;
             Ok(())
         }).await
+    }
+
+    /// Finalizes a command only when its identity is still absent or held by the exact matching
+    /// reservation. An accepted/rejected or differently owned receipt is never overwritten.
+    pub async fn finalize_command_receipt(&self, row: CommandReceipt) -> Result<()> {
+        self.database
+            .call(move |connection| finalize_command_receipt_on(connection, row))
+            .await
     }
 
     pub async fn get_command_receipt(&self, command_id: String) -> Result<Option<CommandReceipt>> {
@@ -305,23 +313,170 @@ impl Repositories {
     pub async fn upsert_project(&self, row: ProjectionProject) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (project_id) DO UPDATE SET \
                    title=excluded.title, workspace_root=excluded.workspace_root, \
-                   default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, \
+                   default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, worktree_discovery_json=excluded.worktree_discovery_json, \
                    created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
-                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, row.created_at, row.updated_at, row.deleted_at],
+                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at],
             )?; Ok(())
         }).await
     }
 
     pub async fn get_project(&self, project_id: String) -> Result<Option<ProjectionProject>> {
-        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectionProject>> {
-        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
+        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
+    }
+
+    /// Establishes the durable repository identity exactly once and then compares only.
+    pub async fn pin_project_worktree_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> Result<Option<WorktreeRepositoryPinOutcome>> {
+        self.database
+            .call(move |connection| {
+                let established = connection.execute(
+                    "INSERT INTO project_worktree_repository_pins (project_id, repository_key) \
+                     SELECT ?, ? WHERE EXISTS (SELECT 1 FROM projection_projects WHERE project_id = ?) \
+                     ON CONFLICT (project_id) DO NOTHING",
+                    params![project_id, repository_key, project_id],
+                )?;
+                let pinned = connection
+                    .query_row(
+                        "SELECT pins.repository_key FROM projection_projects AS projects \
+                         LEFT JOIN project_worktree_repository_pins AS pins USING (project_id) \
+                         WHERE projects.project_id = ?",
+                        [&project_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let Some(pinned) = pinned else {
+                    return Ok(None);
+                };
+                let Some(pinned_repository_key) = pinned else {
+                    return Ok(None);
+                };
+                if established == 1 {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Established))
+                } else if pinned_repository_key == repository_key {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Matched))
+                } else {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Mismatch {
+                        pinned_repository_key,
+                    }))
+                }
+            })
+            .await
+    }
+
+    /// Atomically establishes an immutable command identity without overwriting an existing
+    /// receipt. A matching reserved receipt is intentionally resumable after interruption.
+    pub async fn reserve_command_receipt(
+        &self,
+        row: CommandReceipt,
+    ) -> Result<(CommandReceipt, bool)> {
+        self.database
+            .call(move |connection| {
+                let inserted = connection.execute(
+                    "INSERT OR IGNORE INTO orchestration_command_receipts (\
+                       command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest\
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        row.command_id,
+                        row.aggregate_kind,
+                        row.aggregate_id,
+                        row.accepted_at,
+                        row.result_sequence,
+                        row.status,
+                        row.error,
+                        row.payload_digest
+                    ],
+                )?;
+                let receipt = connection
+                    .query_row(
+                        "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
+                         FROM orchestration_command_receipts WHERE command_id = ?",
+                        [&row.command_id],
+                        decode_command_receipt,
+                    )
+                    .map_err(crate::persistence::PersistenceError::from)?;
+                Ok((receipt, inserted == 1))
+            })
+            .await
+    }
+
+    pub async fn release_reserved_command_receipt(
+        &self,
+        command_id: String,
+        aggregate_kind: String,
+        aggregate_id: String,
+        payload_digest: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "DELETE FROM orchestration_command_receipts \
+                         WHERE command_id = ? AND aggregate_kind = ? AND aggregate_id = ? \
+                           AND payload_digest = ? AND status = 'reserved'",
+                        params![command_id, aggregate_kind, aggregate_id, payload_digest],
+                    )
+                    .map(|deleted| deleted == 1)
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn prepare_reserved_command_receipt(
+        &self,
+        command_id: String,
+        payload_digest: String,
+    ) -> Result<Option<CommandReceipt>> {
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE orchestration_command_receipts SET status = 'prepared' \
+                     WHERE command_id = ? AND payload_digest = ? AND status = 'reserved'",
+                    params![command_id, payload_digest],
+                )?;
+                connection
+                    .query_row(
+                        "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
+                         FROM orchestration_command_receipts WHERE command_id = ?",
+                        [&command_id],
+                        decode_command_receipt,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn verify_prepared_command_receipt(
+        &self,
+        command_id: String,
+        aggregate_kind: String,
+        aggregate_id: String,
+        payload_digest: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM orchestration_command_receipts \
+                         WHERE command_id = ? AND aggregate_kind = ? AND aggregate_id = ? \
+                           AND payload_digest = ? AND status = 'prepared')",
+                        params![command_id, aggregate_kind, aggregate_id, payload_digest],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
     }
 
     pub async fn delete_project(&self, project_id: String) -> Result<()> {
@@ -372,6 +527,47 @@ impl Repositories {
                     [project_id],
                     decode_thread,
                 )
+            })
+            .await
+    }
+
+    /// Reads the project and its canonical worktree-owning threads in one SQLite job.
+    ///
+    /// Panel and deleted threads cannot claim worktrees. The extra sentinel row reports
+    /// truncation without allowing the returned collection to exceed `limit`.
+    pub async fn load_worktree_catalog_projection(
+        &self,
+        project_id: String,
+        limit: usize,
+    ) -> Result<Option<WorktreeCatalogProjection>> {
+        let limit = min(limit, 512);
+        self.database
+            .call(move |connection| {
+                let Some(project) = connection
+                    .query_row(
+                        "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?",
+                        [&project_id],
+                        decode_project,
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+                let sentinel_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+                let mut threads = collect(
+                    connection,
+                    &(THREAD_SELECT.to_owned()
+                        + " WHERE project_id = ? AND kind <> 'panel' AND deleted_at IS NULL ORDER BY created_at ASC, thread_id ASC LIMIT ?"),
+                    params![project_id, sentinel_limit],
+                    decode_thread,
+                )?;
+                let truncated = threads.len() > limit;
+                threads.truncate(limit);
+                Ok(Some(WorktreeCatalogProjection {
+                    project,
+                    threads,
+                    truncated,
+                }))
             })
             .await
     }
@@ -1007,6 +1203,39 @@ pub struct CommandReceipt {
     pub error: Option<String>,
     pub payload_digest: Option<String>,
 }
+
+pub(crate) fn finalize_command_receipt_on(
+    connection: &Connection,
+    receipt: CommandReceipt,
+) -> Result<()> {
+    let command_id = receipt.command_id.clone();
+    let changed = connection.execute(
+        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (command_id) DO UPDATE SET \
+           aggregate_kind = excluded.aggregate_kind, aggregate_id = excluded.aggregate_id, accepted_at = excluded.accepted_at, \
+           result_sequence = excluded.result_sequence, status = excluded.status, error = excluded.error, payload_digest = excluded.payload_digest \
+         WHERE orchestration_command_receipts.status IN ('reserved', 'prepared') \
+           AND orchestration_command_receipts.aggregate_kind = excluded.aggregate_kind \
+           AND orchestration_command_receipts.aggregate_id = excluded.aggregate_id \
+           AND orchestration_command_receipts.payload_digest IS excluded.payload_digest",
+        params![
+            receipt.command_id,
+            receipt.aggregate_kind,
+            receipt.aggregate_id,
+            receipt.accepted_at,
+            receipt.result_sequence,
+            receipt.status,
+            receipt.error,
+            receipt.payload_digest
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PersistenceError::CommandReceiptConflict(command_id))
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeRemovalReceipt {
     pub owner_thread_id: String,
@@ -1044,9 +1273,18 @@ pub struct ProjectionProject {
     pub workspace_root: String,
     pub default_model_selection: Option<Value>,
     pub scripts: Value,
+    pub worktree_discovery: Value,
+    pub worktree_repository_key: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub deleted_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeRepositoryPinOutcome {
+    Established,
+    Matched,
+    Mismatch { pinned_repository_key: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionThread {
@@ -1068,6 +1306,13 @@ pub struct ProjectionThread {
     pub pending_user_input_count: i64,
     pub has_actionable_proposed_plan: i64,
     pub deleted_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorktreeCatalogProjection {
+    pub project: ProjectionProject,
+    pub threads: Vec<ProjectionThread>,
+    pub truncated: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionThreadMessage {
@@ -1357,9 +1602,11 @@ fn decode_project(row: &Row<'_>) -> rusqlite::Result<ProjectionProject> {
         workspace_root: row.get(2)?,
         default_model_selection: decode_optional_json(row.get(3)?, "default_model_selection_json")?,
         scripts: decode_json(row.get(4)?, "scripts_json")?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        deleted_at: row.get(7)?,
+        worktree_discovery: decode_json(row.get(5)?, "worktree_discovery_json")?,
+        worktree_repository_key: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        deleted_at: row.get(9)?,
     })
 }
 fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {

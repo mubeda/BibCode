@@ -26,6 +26,7 @@ import {
   PROVIDER_DISPLAY_NAMES,
   RuntimeMode,
 } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   connectionStatusText,
   type EnvironmentConnectionPresentation,
@@ -66,6 +67,10 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@bibcode/client-runtime/state/runtime";
+import {
+  selectWorktreeCatalogCapabilityPolicy,
+  selectWorktreeWorkspaceActionsAvailable,
+} from "@bibcode/client-runtime/state/worktrees";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -195,9 +200,10 @@ import {
   nextProjectScriptId,
   projectScriptIdFromCommand,
 } from "~/projectScripts";
-import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
+import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
+import { worktreeEnvironment } from "../state/worktrees";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { resolveThreadProviderBinding } from "../threadProviderBinding";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
@@ -227,6 +233,7 @@ import {
 import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
+import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
@@ -541,10 +548,12 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   target,
   threadRef,
   surface,
+  timestampFormat,
 }: {
   readonly target: ActivityStateTarget;
   readonly threadRef: ScopedThreadRef;
   readonly surface: ActivityRightPanelSurface;
+  readonly timestampFormat: TimestampFormat;
 }) {
   const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const stateSourceAtom = useMemo(() => environmentActivity.stateAtom(target), [target]);
@@ -828,6 +837,7 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   }
   return (
     <ActivityPanel
+      timestampFormat={timestampFormat}
       route={surface}
       snapshot={snapshot}
       roster={roster}
@@ -847,6 +857,9 @@ type EnvironmentUnavailableState = {
   readonly label: string;
   readonly connection: EnvironmentConnectionPresentation;
 };
+
+const WORKSPACE_UNAVAILABLE_REASON =
+  "Workspace unavailable. Retry detection or remove it from BiBCode.";
 
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
 
@@ -910,6 +923,7 @@ type ChatViewRouteProps =
 type ChatViewPanelProps = {
   variant: "panel";
   panelThreadRef: ScopedThreadRef;
+  workspaceUnavailable: string | null;
   environmentId?: never;
   threadId?: never;
   routeKind?: never;
@@ -1035,6 +1049,7 @@ interface PersistentThreadTerminalPanelProps {
   splitVerticalShortcutLabel?: string | undefined;
   newShortcutLabel?: string | undefined;
   closeShortcutLabel?: string | undefined;
+  workspaceUnavailable: string | null;
 }
 
 const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPanel({
@@ -1053,6 +1068,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
   splitVerticalShortcutLabel,
   newShortcutLabel,
   closeShortcutLabel,
+  workspaceUnavailable,
 }: PersistentThreadTerminalPanelProps) {
   const serverThread = useThread(threadRef);
   const draftThread = useComposerDraftStore((store) => store.getDraftThreadByRef(threadRef));
@@ -1177,6 +1193,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       splitVerticalShortcutLabel={splitVerticalShortcutLabel}
       newShortcutLabel={newShortcutLabel}
       closeShortcutLabel={closeShortcutLabel}
+      workspaceUnavailable={workspaceUnavailable}
       onActiveTerminalChange={onActiveTerminalChange}
       onCloseTerminal={onCloseTerminal}
       onAddTerminalContext={onAddTerminalContext}
@@ -1213,6 +1230,7 @@ interface LiveCenterPanelWorkspaceProps {
   readonly onDropSurface: CenterPanelWorkspaceProps["onDropSurface"];
   readonly onMergeGroup: CenterPanelWorkspaceProps["onMergeGroup"];
   readonly onSetSplitRatio: CenterPanelWorkspaceProps["onSetSplitRatio"];
+  readonly workspaceUnavailable: string | null;
 }
 
 const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
@@ -1237,6 +1255,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
   onDropSurface,
   onMergeGroup,
   onSetSplitRatio,
+  workspaceUnavailable,
 }: LiveCenterPanelWorkspaceProps) {
   const renderCenterSurface = useCallback(
     (surface: CenterSurface, context: CenterPanelSurfaceRenderContext) => {
@@ -1248,6 +1267,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
             <ChatView
               variant="panel"
               panelThreadRef={scopeThreadRef(hostThreadRef.environmentId, surface.threadId)}
+              workspaceUnavailable={workspaceUnavailable}
             />
           );
         case "terminal":
@@ -1262,6 +1282,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
               focusEligible={context.focused}
               onAddTerminalContext={onAddTerminalContext}
               onClose={() => onCloseSurface(context.groupId, surface)}
+              workspaceUnavailable={workspaceUnavailable}
             />
           );
       }
@@ -1275,6 +1296,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
       onAddTerminalContext,
       onCloseSurface,
       terminalFocusRequestId,
+      workspaceUnavailable,
     ],
   );
 
@@ -1328,7 +1350,12 @@ function ChatViewContent(props: ChatViewProps) {
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
-  const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
+  const createPanelThread = useAtomCommand(worktreeEnvironment.createPanel, {
+    reportFailure: false,
+  });
+  const createManagedWorktree = useAtomCommand(worktreeEnvironment.createManaged, {
+    reportFailure: false,
+  });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
@@ -1371,6 +1398,7 @@ function ChatViewContent(props: ChatViewProps) {
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
+  const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const primaryEnvironment = usePrimaryEnvironment();
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const environmentById = useMemo(
@@ -1896,6 +1924,40 @@ function ChatViewContent(props: ChatViewProps) {
     ? scopeProjectRef(activeThread.environmentId, activeThread.projectId)
     : null;
   const activeProject = useProject(activeProjectRef);
+  const activeEnvironmentDescriptor =
+    activeThread === undefined
+      ? undefined
+      : environmentById.get(activeThread.environmentId)?.serverConfig?.environment;
+  const activeEnvironmentSupportsWorktreeCatalog =
+    activeEnvironmentDescriptor !== undefined &&
+    selectWorktreeCatalogCapabilityPolicy(activeEnvironmentDescriptor).catalogRpc === "enabled";
+  const activeWorktreeCatalog = useEnvironmentQuery(
+    !isPanel &&
+      activeThread?.worktreePath &&
+      activeProject &&
+      activeEnvironmentSupportsWorktreeCatalog
+      ? worktreeEnvironment.catalog({
+          environmentId: activeThread.environmentId,
+          input: { projectId: activeProject.id },
+        })
+      : null,
+  );
+  const activeAdoptedWorkspace =
+    activeThread === undefined
+      ? null
+      : (activeWorktreeCatalog.data?.adoptedWorkspaces.find(
+          (workspace) => workspace.threadId === activeThread.id,
+        ) ?? null);
+  const workspaceUnavailable = isPanel
+    ? props.workspaceUnavailable
+    : selectWorktreeWorkspaceActionsAvailable(activeAdoptedWorkspace)
+      ? null
+      : WORKSPACE_UNAVAILABLE_REASON;
+  const workspaceUnavailableRef = useRef(workspaceUnavailable);
+  useLayoutEffect(() => {
+    workspaceUnavailableRef.current = workspaceUnavailable;
+  }, [workspaceUnavailable]);
+  const readWorkspaceUnavailable = useCallback(() => workspaceUnavailableRef.current, []);
   const consumeActivityDockEscapeClose = useCallback(() => {
     if (!activeThread) {
       return false;
@@ -1945,8 +2007,9 @@ function ChatViewContent(props: ChatViewProps) {
   }, [fileEditingSessions, openFileRelativePaths]);
 
   useEffect(() => {
+    fileEditingSessions.setSavingEnabled(workspaceUnavailable === null);
     fileEditingSessions.setActivePath(activeFileRelativePath);
-  }, [activeFileRelativePath, fileEditingSessions]);
+  }, [activeFileRelativePath, fileEditingSessions, workspaceUnavailable]);
 
   useEffect(() => fileEditingSessions.acquireOwnership(), [fileEditingSessions]);
   const [pendingFileSurfaceIdsByProject, setPendingFileSurfaceIdsByProject] = useState<
@@ -2118,14 +2181,68 @@ function ChatViewContent(props: ChatViewProps) {
   );
 
   const handlePreparedPullRequestThread = useCallback(
-    async (input: { branch: string; worktreePath: string | null }) => {
-      await openOrReuseProjectDraftThread({
-        branch: input.branch,
-        worktreePath: input.worktreePath,
-        envMode: input.worktreePath ? "worktree" : "local",
+    async (input: { branch: string; mode: "local" | "worktree" }) => {
+      if (input.mode === "local") {
+        await openOrReuseProjectDraftThread({
+          branch: input.branch,
+          worktreePath: null,
+          envMode: "local",
+        });
+        return;
+      }
+      if (!activeProject) {
+        throw new Error("No active project is available for this pull request.");
+      }
+      const nextThreadId = newThreadId();
+      const targetInstanceId =
+        activeProject.defaultModelSelection?.instanceId ??
+        useComposerDraftStore.getState().stickyActiveProvider ??
+        defaultInstanceIdForDriver(ProviderDriverKind.make("codex"));
+      const resolution = resolveProviderSessionSelectionForInstance({
+        instanceId: targetInstanceId,
+        providers: activeEnvironment?.serverConfig?.providers ?? [],
+        settings,
+        projectSelection: activeProject.defaultModelSelection,
+      });
+      const result = await createManagedWorktree({
+        environmentId: activeProject.environmentId,
+        input: {
+          commandId: newCommandId(),
+          projectId: activeProject.id,
+          threadId: nextThreadId,
+          title: input.branch,
+          refName: input.branch,
+          newRefName: null,
+          baseRefName: null,
+          threadDefaults: {
+            modelSelection: resolution.modelSelection,
+            runtimeMode: DEFAULT_RUNTIME_MODE,
+            interactionMode: DEFAULT_INTERACTION_MODE,
+          },
+        },
+      });
+      if (result._tag === "Failure") {
+        throw squashAtomCommandFailure(result);
+      }
+      if (resolution.fallback) {
+        console.warn("Provider session default fallback", resolution.fallback);
+      }
+      await navigate({
+        to: "/$environmentId/$threadId",
+        params: {
+          environmentId: activeProject.environmentId,
+          threadId: nextThreadId,
+        },
       });
     },
-    [openOrReuseProjectDraftThread],
+    [
+      activeEnvironment?.serverConfig?.providers,
+      activeProject,
+      createManagedWorktree,
+      navigate,
+      openOrReuseProjectDraftThread,
+      settings,
+    ],
   );
 
   useEffect(() => {
@@ -2188,6 +2305,10 @@ function ChatViewContent(props: ChatViewProps) {
     const items: ComposerBannerStackItem[] = [];
     if (activeEnvironmentUnavailableState) {
       const connection = activeEnvironmentUnavailableState.connection;
+      const target = environmentById.get(activeEnvironmentUnavailableState.environmentId)?.entry
+        ?.target;
+      const permitsReconnect = target !== undefined && presentation.permitsConnectionAction(target);
+      const showConnections = presentation.showRemoteDeviceControls;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
       items.push({
@@ -2198,28 +2319,42 @@ function ChatViewContent(props: ChatViewProps) {
         description:
           connection.error ??
           "Reconnect this environment before sending messages or running actions.",
-        actions: (
-          <>
-            <Button
-              size="xs"
-              disabled={isReconnecting}
-              onClick={() =>
-                void handleReconnectActiveEnvironment(
-                  activeEnvironmentUnavailableState.environmentId,
-                )
-              }
-            >
-              {isReconnecting ? "Reconnecting..." : "Reconnect"}
-            </Button>
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => void navigate({ to: "/settings/connections" })}
-            >
-              Connections
-            </Button>
-          </>
-        ),
+        actions:
+          permitsReconnect || showConnections ? (
+            <>
+              {permitsReconnect ? (
+                <Button
+                  size="xs"
+                  disabled={isReconnecting}
+                  onClick={() =>
+                    void handleReconnectActiveEnvironment(
+                      activeEnvironmentUnavailableState.environmentId,
+                    )
+                  }
+                >
+                  {isReconnecting ? "Reconnecting..." : "Reconnect"}
+                </Button>
+              ) : null}
+              {showConnections ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => void navigate({ to: "/settings/connections" })}
+                >
+                  Connections
+                </Button>
+              ) : null}
+            </>
+          ) : undefined,
+      });
+    }
+    if (workspaceUnavailable) {
+      items.push({
+        id: `workspace-unavailable:${activeThread?.id ?? "unknown"}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: "Workspace unavailable",
+        description: workspaceUnavailable,
       });
     }
     if (providerBinding.conflict) {
@@ -2253,13 +2388,17 @@ function ChatViewContent(props: ChatViewProps) {
     return items;
   }, [
     activeEnvironmentUnavailableState,
+    activeThread?.id,
     handleReconnectActiveEnvironment,
+    environmentById,
     navigate,
+    presentation,
     providerBinding.conflict,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,
     versionMismatchServerLabel,
+    workspaceUnavailable,
   ]);
   const { lockedProvider, lockedProviderInstanceId } = providerBinding;
   const lockProviderPickerToActiveInstance = isPanel || lockedProviderInstanceId !== null;
@@ -2666,7 +2805,7 @@ function ChatViewContent(props: ChatViewProps) {
       })
     : null;
   const gitStatusQuery = useEnvironmentQuery(
-    gitCwd === null
+    gitCwd === null || workspaceUnavailable !== null
       ? null
       : vcsEnvironment.status({
           environmentId,
@@ -3093,7 +3232,7 @@ function ChatViewContent(props: ChatViewProps) {
     [activeProject, activeThreadId, activeThreadRef, activeThreadWorktreePath, openTerminal],
   );
   const addTerminalSurface = useCallback(() => {
-    if (!activeThreadRef || !activeThreadId || !activeProject) return;
+    if (!activeThreadRef || !activeThreadId || !activeProject || workspaceUnavailable) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
     const reservation = reserveActiveTerminalId();
     if (!reservation) return;
@@ -3108,6 +3247,7 @@ function ChatViewContent(props: ChatViewProps) {
     gitCwd,
     openReservedRightPanelTerminal,
     reserveActiveTerminalId,
+    workspaceUnavailable,
   ]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -3115,6 +3255,7 @@ function ChatViewContent(props: ChatViewProps) {
         !activeThreadRef ||
         !activeThreadId ||
         !activeProject ||
+        workspaceUnavailable !== null ||
         activeRightPanelSurface?.kind !== "terminal" ||
         activeRightPanelSurface.terminalIds.length >= MAX_TERMINALS_PER_GROUP
       ) {
@@ -3142,6 +3283,7 @@ function ChatViewContent(props: ChatViewProps) {
       gitCwd,
       openReservedRightPanelTerminal,
       reserveActiveTerminalId,
+      workspaceUnavailable,
     ],
   );
   const splitPanelTerminalVertical = useCallback(() => {
@@ -3897,7 +4039,8 @@ function ChatViewContent(props: ChatViewProps) {
   // terminal, both sharing the live host thread's resolved effective cwd.
   const handleCreateChatPanel = useCallback(
     (entry: ProviderInstanceEntry) => {
-      if (!activeThread || !activeThreadRef || !centerPanelLaunchContext) return;
+      if (!activeThread || !activeThreadRef || !centerPanelLaunchContext || workspaceUnavailable)
+        return;
       const configuredDefault = settings.providerSessionDefaults[entry.driverKind];
       const projectSelection =
         activeProject?.defaultModelSelection?.instanceId === entry.instanceId
@@ -3929,6 +4072,7 @@ function ChatViewContent(props: ChatViewProps) {
       centerPanelActions,
       centerPanelLaunchContext,
       settings.providerSessionDefaults,
+      workspaceUnavailable,
     ],
   );
   const openCenterTerminal = useCallback(
@@ -3937,10 +4081,10 @@ function ChatViewContent(props: ChatViewProps) {
       options?: OpenTerminalPanelOptions,
       launchOverride?: CenterTerminalLaunch,
     ): Promise<CenterTerminalCreationResult> => {
-      if (!activeThreadRef) {
+      if (!activeThreadRef || workspaceUnavailable) {
         const result = {
           status: "rejected" as const,
-          reason: "Terminal launch context is unavailable.",
+          reason: workspaceUnavailable ?? "Terminal launch context is unavailable.",
         };
         toastManager.add(
           stackedThreadToast({
@@ -4072,6 +4216,7 @@ function ChatViewContent(props: ChatViewProps) {
       closeTerminalMutation,
       openTerminal,
       reserveActiveTerminalId,
+      workspaceUnavailable,
     ],
   );
   const handleOpenTerminalPanel = useCallback(() => {
@@ -4103,7 +4248,14 @@ function ChatViewContent(props: ChatViewProps) {
         rememberAsLastInvoked?: boolean;
       },
     ) => {
-      if (!activeThreadId || !activeThreadRef || !activeProject || !activeThread) return;
+      if (
+        !activeThreadId ||
+        !activeThreadRef ||
+        !activeProject ||
+        !activeThread ||
+        readWorkspaceUnavailable()
+      )
+        return;
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -4155,6 +4307,7 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        if (readWorkspaceUnavailable()) return;
         centerPanelActions.activateSurface(activeThreadRef, focusedGroup.id, reusableTerminal.id);
         setTerminalFocusRequestId((value) => value + 1);
         targetTerminalId = reusableTerminal.terminalId;
@@ -4177,9 +4330,11 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        if (readWorkspaceUnavailable()) return;
         targetTerminalId = creationResult.terminalId;
       }
 
+      if (readWorkspaceUnavailable()) return;
       enqueueTerminalInput({
         environmentId,
         threadId: activeThreadId,
@@ -4209,6 +4364,7 @@ function ChatViewContent(props: ChatViewProps) {
       gitCwd,
       openCenterTerminal,
       openTerminal,
+      readWorkspaceUnavailable,
       runningTerminalIds,
       setLastInvokedScriptByProjectId,
       setThreadError,
@@ -4536,6 +4692,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
       sendInFlightRef.current
     )
@@ -5313,6 +5470,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      workspaceUnavailable !== null ||
       sendInFlightRef.current
     ) {
       return;
@@ -5356,18 +5514,18 @@ function ChatViewContent(props: ChatViewProps) {
       resetLocalDispatch();
     };
 
-    const createResult = await createThread({
+    const createResult = await createPanelThread({
       environmentId,
       input: {
+        commandId: newCommandId(),
+        hostThreadId: activeThread.id,
         threadId: nextThreadId,
-        projectId: activeProject.id,
         title: nextThreadTitle,
-        modelSelection: nextThreadModelSelection,
-        runtimeMode,
-        interactionMode: "default",
-        branch: activeThreadBranch,
-        worktreePath: activeThread.worktreePath,
-        createdAt,
+        threadDefaults: {
+          modelSelection: nextThreadModelSelection,
+          runtimeMode,
+          interactionMode: "default",
+        },
       },
     });
     let failure: AtomCommandResult<unknown, unknown> | null =
@@ -5455,7 +5613,8 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread,
     beginLocalDispatch,
     activeEnvironmentUnavailable,
-    createThread,
+    workspaceUnavailable,
+    createPanelThread,
     deleteThread,
     isConnecting,
     isSendBusy,
@@ -5650,6 +5809,7 @@ function ChatViewContent(props: ChatViewProps) {
         splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
         newShortcutLabel={newTerminalShortcutLabel ?? undefined}
         closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+        workspaceUnavailable={workspaceUnavailable}
       />
     ) : activeRightPanelSurface?.kind === "diff" ? (
       <Suspense fallback={null}>
@@ -5657,6 +5817,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           composerDraftTarget={composerDraftTarget}
           thread={activeThread}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "sourceControl" ? (
@@ -5666,6 +5827,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           threadRef={activeThreadRef}
           gitCwd={gitCwd}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "plan" ? (
@@ -5687,6 +5849,7 @@ function ChatViewContent(props: ChatViewProps) {
         target={activityStateTarget}
         threadRef={activeThreadRef}
         surface={activeActivitySurface}
+        timestampFormat={timestampFormat}
       />
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
@@ -5709,6 +5872,7 @@ function ChatViewContent(props: ChatViewProps) {
           onOpenFile={openFileSurface}
           onPendingChange={handleFilePendingChange}
           editingSessions={fileEditingSessions}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : null
@@ -5883,7 +6047,9 @@ function ChatViewContent(props: ChatViewProps) {
                             lockedProvider={lockedProvider}
                             providerBindingInstanceId={providerBinding.instanceId}
                             lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
-                            providerBindingConflictReason={providerBindingConflictReason}
+                            providerBindingConflictReason={
+                              workspaceUnavailable ?? providerBindingConflictReason
+                            }
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
                               activeProject?.defaultModelSelection
@@ -5942,7 +6108,6 @@ function ChatViewContent(props: ChatViewProps) {
                       key={pullRequestDialogState.key}
                       open
                       environmentId={activeThread.environmentId}
-                      threadId={activeThread.id}
                       cwd={activeProject?.workspaceRoot ?? null}
                       initialReference={pullRequestDialogState.initialReference}
                       onOpenChange={(open) => {
@@ -5992,6 +6157,7 @@ function ChatViewContent(props: ChatViewProps) {
                   onAddProjectScript={saveProjectScript}
                   onUpdateProjectScript={updateProjectScript}
                   onDeleteProjectScript={deleteProjectScript}
+                  workspaceUnavailable={workspaceUnavailable}
                 />
               )}
               hostChatSurfaceBody={hostChatSurfaceBody}
@@ -6010,6 +6176,7 @@ function ChatViewContent(props: ChatViewProps) {
               onDropSurface={dropCenterPanelSurface}
               onMergeGroup={mergeCenterPanelGroup}
               onSetSplitRatio={setCenterPanelSplitRatio}
+              workspaceUnavailable={workspaceUnavailable}
             />
           ) : (
             hostChatSurfaceBody

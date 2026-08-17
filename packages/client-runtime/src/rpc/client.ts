@@ -50,6 +50,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeTerminalMetadata
   | typeof WS_METHODS.subscribePreviewEvents
   | typeof WS_METHODS.subscribeDiscoveredLocalServers
+  | typeof WS_METHODS.subscribeWorktreeCatalog
   | typeof WS_METHODS.previewAutomationConnect
   | typeof WS_METHODS.subscribeVcsStatus
   | typeof WS_METHODS.terminalAttach;
@@ -112,24 +113,30 @@ const currentSession = Effect.fn("EnvironmentRpc.currentSession")(function* () {
   );
 });
 
-export const request = Effect.fn("EnvironmentRpc.request")(function* <
+export const requestInSession = Effect.fn("EnvironmentRpc.requestInSession")(function* <
   TTag extends EnvironmentUnaryRpcTag,
->(tag: TTag, input: EnvironmentRpcInput<TTag>) {
-  const supervisor = yield* EnvironmentSupervisor;
+>(session: RpcSession, environmentId: string, tag: TTag, input: EnvironmentRpcInput<TTag>) {
   yield* Effect.annotateCurrentSpan({
-    "environment.id": supervisor.target.environmentId,
+    "environment.id": environmentId,
     "rpc.method": tag,
   });
-  const session = yield* currentSession();
   const observer = yield* EnvironmentRpcRequestObserver;
   const method = session.client[tag] as (
     input: EnvironmentRpcInput<TTag>,
   ) => Effect.Effect<EnvironmentRpcSuccess<TTag>, EnvironmentRpcFailure<TTag>>;
   const completeObservation = yield* observer.observe({
-    environmentId: supervisor.target.environmentId,
+    environmentId,
     method: tag,
   });
   return yield* method(input).pipe(Effect.ensuring(completeObservation));
+});
+
+export const request = Effect.fn("EnvironmentRpc.request")(function* <
+  TTag extends EnvironmentUnaryRpcTag,
+>(tag: TTag, input: EnvironmentRpcInput<TTag>) {
+  const supervisor = yield* EnvironmentSupervisor;
+  const session = yield* currentSession();
+  return yield* requestInSession(session, supervisor.target.environmentId, tag, input);
 });
 
 export function runStream<TTag extends EnvironmentStreamCommandRpcTag>(

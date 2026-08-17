@@ -4191,6 +4191,35 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.writes).toContain("\r\n[terminal] Unable to open path\r\n");
   });
 
+  it("keeps retained path links mounted but guards activation while the workspace is unavailable", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    const props = viewportProps();
+    const mounted = await mount(<TerminalViewport {...props} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("retained src/main.ts:12"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+    expect(link).toBeDefined();
+    terminal.writes.length = 0;
+
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    await act(async () =>
+      mounted.root.render(<TerminalViewport {...props} workspaceUnavailable={reason} />),
+    );
+
+    expect(xtermState.terminals).toHaveLength(1);
+    expect(terminal.dispose).not.toHaveBeenCalled();
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).not.toHaveBeenCalled();
+    expect(terminal.writes).toContain(`\r\n[terminal] ${reason}\r\n`);
+
+    await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+    expect(xtermState.terminals).toHaveLength(1);
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/src/main.ts:12");
+  });
+
   it("ignores link providers and activations after the terminal is disposed", async () => {
     vi.stubGlobal("navigator", { platform: "MacIntel" });
     const mounted = await mount(<TerminalViewport {...viewportProps()} />);
@@ -4459,5 +4488,34 @@ describe("ThreadTerminalPanel mounted controls", () => {
     expect(document.querySelector('button[aria-label^="New Terminal"]')).toBeNull();
     expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
     expect(onCloseTerminal).not.toHaveBeenCalled();
+  });
+
+  it("disables create, split, restart, and terminal writes with one workspace reason", async () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    const onSplitTerminal = vi.fn();
+    const onNewTerminal = vi.fn();
+    await mount(
+      <ThreadTerminalPanel
+        {...panelProps({ onSplitTerminal, onNewTerminal })}
+        workspaceUnavailable={reason}
+      />,
+    );
+
+    const split = buttonByLabel("Split Terminal Horizontally");
+    const create = buttonByLabel("New Terminal");
+    expect(split.disabled).toBe(true);
+    expect(create.disabled).toBe(true);
+    expect(split.title).toBe(reason);
+    expect(create.title).toBe(reason);
+    await click(split);
+    await click(create);
+    expect(onSplitTerminal).not.toHaveBeenCalled();
+    expect(onNewTerminal).not.toHaveBeenCalled();
+
+    const terminal = xtermState.terminals[0]!;
+    terminal.dataHandler?.("echo blocked\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(testState.writeCommand).not.toHaveBeenCalled();
   });
 });

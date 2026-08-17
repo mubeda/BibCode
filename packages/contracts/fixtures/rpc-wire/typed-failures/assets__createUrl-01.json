@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "_Dt~Pey2{",
-          "requiredScope": "access:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "_Dt~Pey2{&zy",
+          "threadId": "t,o0",
+          "path": "_g3F]0[h",
+          "availability": "present"
         }
       }
     ]

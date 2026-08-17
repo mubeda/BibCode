@@ -1,0 +1,23 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "GitCommandError",
+          "operation": "F0",
+          "command": "!$z@q",
+          "cwd": "3]Sks",
+          "stdoutLength": -3.5032461608120427e-44,
+          "stderrLength": 8.114570922335069e-32,
+          "outputLength": 2.5204329319157906e-14,
+          "detail": "$",
+          "cause": "undefined"
+        }
+      }
+    ]
+  }
+}

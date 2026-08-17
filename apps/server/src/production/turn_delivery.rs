@@ -25,7 +25,10 @@ use crate::{
         deliver_durable_orchestration_turn, finalize_delivery_route_cwd,
         reconcile_orchestration_turn,
     },
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
+
+use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 #[cfg(test)]
 use crate::production::provider_runtime::ProviderRuntimeError;
@@ -58,6 +61,34 @@ pub struct TurnDeliveryService {
     force_cancel: CancellationToken,
     wake: Arc<Notify>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    retry_probe: Arc<DeliveryRetryProbe>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DeliveryRetryProbe {
+    scheduled: std::sync::atomic::AtomicUsize,
+    changed: Notify,
+}
+
+#[cfg(test)]
+impl DeliveryRetryProbe {
+    fn record(&self) {
+        self.scheduled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+
+    async fn wait_for(&self, expected: usize) {
+        loop {
+            let changed = self.changed.notified();
+            if self.scheduled.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl TurnDeliveryService {
@@ -93,6 +124,54 @@ impl TurnDeliveryService {
                 reconcile_orchestration_turn(&provider, &engine, &settings_root, row).await
             })
         });
+        Self::start_worker(
+            engine,
+            MAX_CONCURRENT_THREADS,
+            MAX_CONCURRENT_THREADS,
+            router,
+            reconciler,
+        )
+    }
+
+    pub(crate) fn start_with_availability(
+        engine: OrchestrationEngine,
+        provider: Arc<ProviderRuntimeSupervisor>,
+        settings_root: PathBuf,
+        availability: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        let route_engine = engine.clone();
+        let route_provider = provider.clone();
+        let route_settings_root = settings_root.clone();
+        let admission =
+            WorkspaceAdmissionController::new(availability.clone(), engine.repositories());
+        let provider_router: ProviderDeliveryRouter = Arc::new(move |command, delivery_key| {
+            let engine = route_engine.clone();
+            let provider = route_provider.clone();
+            let settings_root = route_settings_root.clone();
+            Box::pin(async move {
+                deliver_durable_orchestration_turn(
+                    &provider,
+                    &engine,
+                    &settings_root,
+                    command,
+                    delivery_key,
+                )
+                .await
+            })
+        });
+        let router = guard_delivery_router(admission, provider_router);
+        let reconciliation_engine = engine.clone();
+        let reconciliation_admission =
+            WorkspaceAdmissionController::new(availability, engine.repositories());
+        let provider_reconciler: DeliveryReconciler = Arc::new(move |row| {
+            let engine = reconciliation_engine.clone();
+            let provider = provider.clone();
+            let settings_root = settings_root.clone();
+            Box::pin(async move {
+                reconcile_orchestration_turn(&provider, &engine, &settings_root, row).await
+            })
+        });
+        let reconciler = guard_delivery_reconciler(reconciliation_admission, provider_reconciler);
         Self::start_worker(
             engine,
             MAX_CONCURRENT_THREADS,
@@ -179,6 +258,8 @@ impl TurnDeliveryService {
         let force_cancel = CancellationToken::new();
         let wake = Arc::new(Notify::new());
         let permits = Arc::new(Semaphore::new(capacity));
+        #[cfg(test)]
+        let retry_probe = Arc::new(DeliveryRetryProbe::default());
         let worker = tokio::spawn(run(
             engine,
             router,
@@ -189,13 +270,22 @@ impl TurnDeliveryService {
             force_cancel.clone(),
             shutdown_grace,
             wake.clone(),
+            #[cfg(test)]
+            retry_probe.clone(),
         ));
         Self {
             shutdown,
             force_cancel,
             wake,
             worker: Mutex::new(Some(worker)),
+            #[cfg(test)]
+            retry_probe,
         }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_retries_scheduled(&self, expected: usize) {
+        self.retry_probe.wait_for(expected).await;
     }
 
     pub(crate) fn wake(&self) {
@@ -213,6 +303,92 @@ impl TurnDeliveryService {
             "delivery worker must finish or enter force cancellation"
         );
     }
+}
+
+fn workspace_admission_detail(error: WorkspaceAdmissionError) -> String {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => error.message,
+        WorkspaceAdmissionError::Identity(error) => error.message,
+        WorkspaceAdmissionError::Resolution(error) => error,
+    }
+}
+
+fn guard_delivery_router(
+    admission: WorkspaceAdmissionController,
+    router: ProviderDeliveryRouter,
+) -> ProviderDeliveryRouter {
+    Arc::new(move |command, delivery_key| {
+        let admission = admission.clone();
+        let router = router.clone();
+        Box::pin(async move {
+            let thread_id = match &command {
+                OrchestrationCommand::ThreadTurnStart { thread_id, .. } => thread_id,
+                _ => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: "durable provider delivery requires a turn start".to_owned(),
+                    };
+                }
+            };
+            let workspace_admission = match admission
+                .acquire_thread(thread_id, std::iter::empty())
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: workspace_admission_detail(error),
+                    };
+                }
+            };
+            let loss = workspace_admission.loss_cancellation();
+            let route = router(command, delivery_key);
+            tokio::pin!(route);
+            tokio::select! {
+                biased;
+                () = loss.cancelled() => ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: loss
+                        .unavailable()
+                        .map_or_else(|| "workspace became unavailable".to_owned(), |error| error.message),
+                },
+                outcome = &mut route => outcome,
+            }
+        })
+    })
+}
+
+fn guard_delivery_reconciler(
+    admission: WorkspaceAdmissionController,
+    reconciler: DeliveryReconciler,
+) -> DeliveryReconciler {
+    Arc::new(move |row| {
+        let admission = admission.clone();
+        let reconciler = reconciler.clone();
+        Box::pin(async move {
+            let workspace_admission = match admission
+                .acquire_thread(&row.thread_id, std::iter::empty())
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return ProviderReconciliationOutcome::Unavailable {
+                        detail: workspace_admission_detail(error),
+                    };
+                }
+            };
+            let loss = workspace_admission.loss_cancellation();
+            let reconcile = reconciler(row);
+            tokio::pin!(reconcile);
+            tokio::select! {
+                biased;
+                () = loss.cancelled() => ProviderReconciliationOutcome::Unavailable {
+                    detail: loss
+                        .unavailable()
+                        .map_or_else(|| "workspace became unavailable".to_owned(), |error| error.message),
+                },
+                outcome = &mut reconcile => outcome,
+            }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -252,6 +428,7 @@ async fn run(
     force_cancel: CancellationToken,
     shutdown_grace: Duration,
     wake: Arc<Notify>,
+    #[cfg(test)] retry_probe: Arc<DeliveryRetryProbe>,
 ) {
     let mut tasks = JoinSet::new();
     let mut recovery_task = None;
@@ -350,10 +527,14 @@ async fn run(
                         }
                         Ok(DeliveryTaskOutcome::DefinitelyNotSent) => {
                             schedule_retry(&mut retry_backoffs, command_id);
+                            #[cfg(test)]
+                            retry_probe.record();
                         }
                         Err(error) => {
                             tracing::warn!(%error, "provider delivery transition failed");
                             schedule_retry(&mut retry_backoffs, command_id);
+                            #[cfg(test)]
+                            retry_probe.record();
                         }
                     }
                 }
@@ -1021,8 +1202,12 @@ mod tests {
             BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderLaunchRequest,
             SupervisorOptions,
         },
+        worktree_catalog::{AdoptedWorktreeAvailability, WorkspaceLossTransition},
     };
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        future::ready,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     struct NeverFactory;
 
@@ -1070,6 +1255,143 @@ mod tests {
             },
             "createdAt": "2026-08-01T00:00:00Z"
         })
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, changed: &Notify, expected: usize) {
+        loop {
+            let notified = changed.notified();
+            let actual = counter.load(Ordering::SeqCst);
+            if actual >= expected {
+                assert_eq!(actual, expected);
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_workspace_blocks_delivery_and_reconciliation_before_provider_routing() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(
+            registry
+                .mark_unavailable(WorkspaceLossTransition {
+                    thread_id: "thread-guarded".to_owned(),
+                    repository_key: "repository-a".to_owned(),
+                    generation: 1,
+                    path: PathBuf::from("/repo/worktrees/guarded"),
+                    availability: AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+        let admission = WorkspaceAdmissionController::registry_only(registry);
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let observed_delivery_calls = delivery_calls.clone();
+        let router = guard_delivery_router(
+            admission.clone(),
+            Arc::new(move |_command, _delivery_key| {
+                observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Accepted { turn_id: None }))
+            }),
+        );
+        let reconciliation_calls = Arc::new(AtomicUsize::new(0));
+        let observed_reconciliation_calls = reconciliation_calls.clone();
+        let reconciler = guard_delivery_reconciler(
+            admission,
+            Arc::new(move |_row| {
+                observed_reconciliation_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderReconciliationOutcome::Found))
+            }),
+        );
+
+        let command = serde_json::from_value(turn_payload("command-1", "thread-guarded"))
+            .expect("turn command");
+        assert!(matches!(
+            router(command, "delivery-key".to_owned()).await,
+            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert!(matches!(
+            reconciler(row("command-1", "thread-guarded")).await,
+            ProviderReconciliationOutcome::Unavailable { .. }
+        ));
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciliation_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_loss_cancels_an_inflight_provider_route_before_publication() {
+        struct PendingRoute {
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Future for PendingRoute {
+            type Output = ProviderDeliveryOutcome;
+
+            fn poll(
+                self: Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingRoute {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let started = Arc::new(Semaphore::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let router = guard_delivery_router(
+            WorkspaceAdmissionController::registry_only(registry.clone()),
+            Arc::new({
+                let started = started.clone();
+                let drops = drops.clone();
+                move |_command, _delivery_key| {
+                    started.add_permits(1);
+                    Box::pin(PendingRoute {
+                        drops: drops.clone(),
+                    })
+                }
+            }),
+        );
+        let command = serde_json::from_value(turn_payload("command-loss", "thread-loss"))
+            .expect("turn command");
+        let route = tokio::spawn(async move { router(command, "delivery-loss".to_owned()).await });
+        started
+            .acquire()
+            .await
+            .expect("provider route starts")
+            .forget();
+
+        assert!(
+            registry
+                .mark_unavailable(WorkspaceLossTransition {
+                    thread_id: "thread-loss".to_owned(),
+                    repository_key: "repository-a".to_owned(),
+                    generation: 1,
+                    path: PathBuf::from("/repo/worktrees/loss"),
+                    availability: AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+                .expect("physical identity resolves")
+        );
+        tokio::task::yield_now().await;
+        let finished = route.is_finished();
+        if !finished {
+            route.abort();
+        }
+        assert!(
+            finished,
+            "workspace loss must cancel the provider publication future"
+        );
+        assert!(matches!(
+            route.await.expect("guarded route task"),
+            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     async fn seed_delivery(
@@ -2066,6 +2388,7 @@ mod tests {
     async fn permanent_bootstrap_failure_retains_backoff_across_respawns() {
         struct FailingBootstrapEffects {
             attempts: AtomicUsize,
+            attempted: Notify,
         }
 
         impl ThreadTurnBootstrapEffects for FailingBootstrapEffects {
@@ -2075,6 +2398,7 @@ mod tests {
                 _cancellation: &'a CancellationToken,
             ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
                 self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.attempted.notify_one();
                 Box::pin(async { Err("permanent worktree failure".to_owned()) })
             }
 
@@ -2118,37 +2442,25 @@ mod tests {
             .expect("engine");
         let effects = Arc::new(FailingBootstrapEffects {
             attempts: AtomicUsize::new(0),
+            attempted: Notify::new(),
         });
         engine.set_bootstrap_effects(effects.clone());
         let router: DeliveryRouter = Arc::new(|_| Box::pin(async { Ok(()) }));
         let service = TurnDeliveryService::start_with_router(engine.clone(), 1, router.clone());
 
-        for expected in [1, 2] {
-            for _ in 0..1_000 {
-                if effects.attempts.load(Ordering::SeqCst) >= expected {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(effects.attempts.load(Ordering::SeqCst), expected);
-            tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        }
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_count(&effects.attempts, &effects.attempted, 1).await;
+        service.wait_for_retries_scheduled(1).await;
+        tokio::time::advance(RETRY_BACKOFF_MIN).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 2).await;
+        service.wait_for_retries_scheduled(2).await;
+        tokio::time::advance(RETRY_BACKOFF_MIN).await;
         assert_eq!(
             effects.attempts.load(Ordering::SeqCst),
             2,
             "the second failure must retain the 100ms delay instead of resetting to 50ms"
         );
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        for _ in 0..1_000 {
-            if effects.attempts.load(Ordering::SeqCst) >= 3 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(effects.attempts.load(Ordering::SeqCst), 3);
+        wait_for_count(&effects.attempts, &effects.attempted, 3).await;
 
         service.shutdown().await;
         engine.shutdown().await;
@@ -2170,7 +2482,7 @@ mod tests {
             ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
                 Box::pin(async move {
                     self.attempts.fetch_add(1, Ordering::SeqCst);
-                    self.attempted.notify_waiters();
+                    self.attempted.notify_one();
                     self.releases
                         .acquire()
                         .await
@@ -2186,16 +2498,6 @@ mod tests {
             ) -> BoxBootstrapFuture<'a, BootstrapSetupResult> {
                 Box::pin(async { Ok(BootstrapSetupResult::NoScript) })
             }
-        }
-
-        async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
-            for _ in 0..1_000 {
-                if counter.load(Ordering::SeqCst) >= expected {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(counter.load(Ordering::SeqCst), expected);
         }
 
         let database = Database::open_in_memory().await.expect("database");
@@ -2256,7 +2558,7 @@ mod tests {
                 let healthy_releases = healthy_releases.clone();
                 Box::pin(async move {
                     healthy_routes.fetch_add(1, Ordering::SeqCst);
-                    healthy_started.notify_waiters();
+                    healthy_started.notify_one();
                     healthy_releases
                         .acquire()
                         .await
@@ -2268,28 +2570,21 @@ mod tests {
         });
         let service = TurnDeliveryService::start_with_router(engine.clone(), 2, router);
 
-        wait_for_count(&effects.attempts, 1).await;
-        wait_for_count(&healthy_routes, 1).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 1).await;
+        wait_for_count(&healthy_routes, &healthy_started, 1).await;
+        healthy_releases.add_permits(1);
+        wait_for_count(&healthy_routes, &healthy_started, 2).await;
+        healthy_releases.add_permits(1);
+        wait_for_count(&healthy_routes, &healthy_started, 3).await;
+        healthy_releases.add_permits(1);
         effects.releases.add_permits(1);
-        wait_for_count(&healthy_routes, 2).await;
-        healthy_releases.add_permits(1);
-        wait_for_count(&healthy_routes, 3).await;
-        healthy_releases.add_permits(1);
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
-        }
+        service.wait_for_retries_scheduled(1).await;
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        wait_for_count(&effects.attempts, 2).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 2).await;
 
         effects.releases.add_permits(1);
-        healthy_releases.add_permits(1);
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
-        }
+        service.wait_for_retries_scheduled(2).await;
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
         assert_eq!(
             effects.attempts.load(Ordering::SeqCst),
             2,
@@ -2297,7 +2592,7 @@ mod tests {
         );
 
         tokio::time::advance(RETRY_BACKOFF_MIN).await;
-        wait_for_count(&effects.attempts, 3).await;
+        wait_for_count(&effects.attempts, &effects.attempted, 3).await;
         effects.releases.add_permits(8);
         healthy_releases.add_permits(8);
         service.shutdown().await;

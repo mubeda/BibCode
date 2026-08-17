@@ -102,15 +102,30 @@ describe("VcsRemoveWorktreeInput", () => {
 });
 
 describe("GitPreparePullRequestThreadInput", () => {
-  it("accepts pull request references and mode", () => {
+  it("accepts only local preparation without client-directed owner identity", () => {
     const parsed = decodePreparePullRequestThreadInput({
       cwd: "/repo",
       reference: "#42",
-      mode: "worktree",
+      mode: "local",
     });
 
     expect(parsed.reference).toBe("#42");
-    expect(parsed.mode).toBe("worktree");
+    expect(parsed.mode).toBe("local");
+    expect(() =>
+      decodePreparePullRequestThreadInput({
+        cwd: "/repo",
+        reference: "#42",
+        mode: "worktree",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodePreparePullRequestThreadInput({
+        cwd: "/repo",
+        reference: "#42",
+        mode: "local",
+        threadId: "caller-selected-owner",
+      }),
+    ).toThrow();
   });
 });
 
@@ -268,16 +283,5 @@ describe("git errors", () => {
       makeInvalidClassInstance(GitPullRequestMaterializationError.prototype, invalid),
       encodeExpected,
     );
-  });
-
-  it("reports invalid worktree paths on decode and encode", () => {
-    const invalid = { cwd: "/repo", refName: "main", path: "" };
-    const expected = {
-      rootTag: "Composite" as const,
-      paths: [["path"]],
-      containsTag: "InvalidValue" as const,
-    };
-    expectDecodeFailure(VcsCreateWorktreeInput, invalid, expected);
-    expectEncodeFailure(VcsCreateWorktreeInput, invalid, expected);
   });
 });

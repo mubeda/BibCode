@@ -54,6 +54,7 @@ const wslHost: AddProjectHostOption = {
 
 const testState = {
   hosts: [primaryHost, remoteHost, wslHost] as ReadonlyArray<AddProjectHostOption>,
+  locationLabel: "Host" as const,
   pickResult: { _tag: "Cancelled" } as PickAddProjectFolderResult,
   pickFolder: vi.fn(async () => testState.pickResult),
   operations: {
@@ -74,6 +75,7 @@ function WorkflowProbe({ open }: { readonly open: boolean }) {
     open,
     onOpenChange: testState.onOpenChange,
     hosts: testState.hosts,
+    locationLabel: testState.locationLabel,
     primaryEnvironmentId: ENV_PRIMARY,
     operations: testState.operationOverride ?? testState.operations,
     pickFolder: testState.pickFolder,

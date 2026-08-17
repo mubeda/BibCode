@@ -32,6 +32,7 @@ const DESCRIPTOR = {
   storageInstanceId: "store-current",
   capabilities: {
     repositoryIdentity: true,
+    worktreeCatalog: false,
     activityProtocolVersion: null,
   },
 } satisfies ExecutionEnvironmentDescriptor;

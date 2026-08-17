@@ -6,11 +6,9 @@ import {
 } from "@bibcode/contracts";
 import {
   BotIcon,
-  CheckCircle2Icon,
   ChevronDownIcon,
   Clock3Icon,
   ListTodoIcon,
-  LoaderCircleIcon,
   RefreshCwIcon,
   TriangleAlertIcon,
 } from "lucide-react";
@@ -335,7 +333,7 @@ export function ActivityDock({
   const toggleContent = expanded ? (
     <>
       {providerGlyph}
-      {!compact ? <span className="truncate">Activity</span> : null}
+      <span className="truncate">Activity</span>
       <ChevronDownIcon aria-hidden="true" className="ml-auto size-4" />
     </>
   ) : (
@@ -426,53 +424,35 @@ export function ActivityDock({
               >
                 <BotIcon aria-hidden="true" className="size-4" />
                 <SectionStatus state={subagentSectionState} />
-                {compact ? (
-                  <>
-                    <span
-                      aria-hidden="true"
-                      className="flex whitespace-nowrap text-xs tabular-nums"
-                      data-activity-count="active"
-                    >
-                      <LoaderCircleIcon className="mr-1 size-3" />
-                      {subagentActive}
+                <span
+                  className="flex min-w-0 flex-1 flex-col"
+                  data-activity-section-copy="subagents"
+                >
+                  <span
+                    className="flex min-w-0 items-center gap-2"
+                    data-activity-section-primary="subagents"
+                  >
+                    <span className="min-w-0 flex-1 truncate">Subagents</span>
+                    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
+                      Active {subagentActive}
                     </span>
-                    <span
-                      aria-hidden="true"
-                      className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
-                      data-activity-count="done"
-                    >
-                      <CheckCircle2Icon className="mr-1 size-3" />
-                      {subagentDone}
+                    <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
+                      Done {subagentDone}
                     </span>
-                  </>
-                ) : (
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className="flex min-w-0 items-center gap-2"
-                      data-activity-section-primary="subagents"
-                    >
-                      <span className="min-w-0 flex-1 truncate">Subagents</span>
-                      <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
-                        Active {subagentActive}
-                      </span>
-                      <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                        Done {subagentDone}
-                      </span>
-                    </span>
-                    {activeSubagent === undefined ? null : (
-                      <span
-                        aria-hidden="true"
-                        className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
-                        data-activity-section-metadata="subagents"
-                      >
-                        <Clock3Icon className="mr-1 size-3 shrink-0" />
-                        <span className="truncate">
-                          {activityElapsedLabel(activeSubagent.startedAt, elapsedNow)}
-                        </span>
-                      </span>
-                    )}
                   </span>
-                )}
+                  {activeSubagent === undefined ? null : (
+                    <span
+                      aria-hidden="true"
+                      className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
+                      data-activity-section-metadata="subagents"
+                    >
+                      <Clock3Icon className="mr-1 size-3 shrink-0" />
+                      <span className="truncate">
+                        {activityElapsedLabel(activeSubagent.startedAt, elapsedNow)}
+                      </span>
+                    </span>
+                  )}
+                </span>
               </Button>
             ) : null}
             {visibility.showBackgroundTasks ? (
@@ -488,53 +468,35 @@ export function ActivityDock({
               >
                 <ListTodoIcon aria-hidden="true" className="size-4" />
                 <SectionStatus state={backgroundSectionState} />
-                {compact ? (
-                  <>
-                    <span
-                      aria-hidden="true"
-                      className="flex whitespace-nowrap text-xs tabular-nums"
-                      data-activity-count="active"
-                    >
-                      <LoaderCircleIcon className="mr-1 size-3" />
-                      {backgroundActive}
+                <span
+                  className="flex min-w-0 flex-1 flex-col"
+                  data-activity-section-copy="backgroundTasks"
+                >
+                  <span
+                    className="flex min-w-0 items-center gap-2"
+                    data-activity-section-primary="backgroundTasks"
+                  >
+                    <span className="min-w-0 flex-1 truncate">Background tasks</span>
+                    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
+                      Active {backgroundActive}
                     </span>
-                    <span
-                      aria-hidden="true"
-                      className="flex whitespace-nowrap text-xs text-muted-foreground tabular-nums"
-                      data-activity-count="done"
-                    >
-                      <CheckCircle2Icon className="mr-1 size-3" />
-                      {backgroundDone}
+                    <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
+                      Done {backgroundDone}
                     </span>
-                  </>
-                ) : (
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className="flex min-w-0 items-center gap-2"
-                      data-activity-section-primary="backgroundTasks"
-                    >
-                      <span className="min-w-0 flex-1 truncate">Background tasks</span>
-                      <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
-                        Active {backgroundActive}
-                      </span>
-                      <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                        Done {backgroundDone}
-                      </span>
-                    </span>
-                    {activeBackgroundTask === undefined ? null : (
-                      <span
-                        aria-hidden="true"
-                        className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
-                        data-activity-section-metadata="backgroundTasks"
-                      >
-                        <Clock3Icon className="mr-1 size-3 shrink-0" />
-                        <span className="truncate">
-                          {activityElapsedLabel(activeBackgroundTask.startedAt, elapsedNow)}
-                        </span>
-                      </span>
-                    )}
                   </span>
-                )}
+                  {activeBackgroundTask === undefined ? null : (
+                    <span
+                      aria-hidden="true"
+                      className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
+                      data-activity-section-metadata="backgroundTasks"
+                    >
+                      <Clock3Icon className="mr-1 size-3 shrink-0" />
+                      <span className="truncate">
+                        {activityElapsedLabel(activeBackgroundTask.startedAt, elapsedNow)}
+                      </span>
+                    </span>
+                  )}
+                </span>
               </Button>
             ) : null}
           </div>

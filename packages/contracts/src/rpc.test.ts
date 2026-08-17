@@ -9,7 +9,6 @@ import {
   WsServerConsumeCodexRateLimitResetRpc,
   WsServerRefreshProvidersRpc,
   WsVcsPullRpc,
-  WsVcsRemoveWorktreeRpc,
   WsVcsInitRpc,
   WsShellOpenInEditorRpc,
   WsSubscribeVcsStatusRpc,
@@ -19,18 +18,61 @@ import {
   WsPreviewListRpc,
   WsSourceControlLookupRepositoryRpc,
   WsProjectsReadFileRpc,
+  WsReviewGetDiffPreviewRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationSubscribeShellRpc,
   WsSubscribeAuthAccessRpc,
   WsActivityGetSnapshotRpc,
   WsSubscribeActivityRpc,
+  WsSubscribeWorktreeCatalogRpc,
+  WsVcsRefreshWorktreeCatalogRpc,
+  WsWorktreeUpdateDiscoveryPolicyRpc,
+  WsWorktreeAdoptRpc,
+  WsWorktreeCreateManagedRpc,
+  WsWorktreeCreatePanelRpc,
+  WsWorktreeRetargetRpc,
+  WsWorktreeGetRemovalPlanRpc,
+  WsWorktreeRemoveFromBibCodeRpc,
+  WsWorktreeRemoveRpc,
 } from "./rpc.ts";
+
+const decodeSubscribeWorktreeCatalog = Schema.decodeUnknownSync(
+  WsSubscribeWorktreeCatalogRpc.payloadSchema,
+);
+const decodeRefreshWorktreeCatalog = Schema.decodeUnknownSync(
+  WsVcsRefreshWorktreeCatalogRpc.payloadSchema,
+);
+const decodeUpdateWorktreeDiscoveryPolicy = Schema.decodeUnknownSync(
+  WsWorktreeUpdateDiscoveryPolicyRpc.payloadSchema,
+);
+const decodeWorktreeAdopt = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.payloadSchema);
+const decodeWorktreeCreateManaged = Schema.decodeUnknownSync(
+  WsWorktreeCreateManagedRpc.payloadSchema,
+);
+const decodeWorktreeCreatePanel = Schema.decodeUnknownSync(WsWorktreeCreatePanelRpc.payloadSchema);
+const decodeWorktreeRetarget = Schema.decodeUnknownSync(WsWorktreeRetargetRpc.payloadSchema);
+const decodeWorktreeAdoptResult = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.successSchema);
+const decodeWorktreeAdoptError = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.errorSchema);
+const decodeWorktreeRemovalPlan = Schema.decodeUnknownSync(
+  WsWorktreeGetRemovalPlanRpc.successSchema,
+);
+const decodeWorktreeRemovalResult = Schema.decodeUnknownSync(
+  WsWorktreeRemoveFromBibCodeRpc.successSchema,
+);
+const decodeWorktreeRemovalError = Schema.decodeUnknownSync(WsWorktreeRemoveRpc.errorSchema);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
     const values = Object.values(WS_METHODS);
     const unique = new Set(values);
     expect(unique.size).toBe(values.length);
+  });
+
+  it("does not expose raw worktree lifecycle methods", () => {
+    expect("vcsCreateWorktree" in WS_METHODS).toBe(false);
+    expect(Object.values(WS_METHODS)).not.toContain("vcs.createWorktree");
+    expect("vcsRemoveWorktree" in WS_METHODS).toBe(false);
+    expect(Object.values(WS_METHODS)).not.toContain("vcs.removeWorktree");
   });
 
   it("uses stable wire names for representative methods", () => {
@@ -51,10 +93,90 @@ describe("WS_METHODS", () => {
       activityRetrySubtreeCancellation: "activity.retrySubtreeCancellation",
     });
     expect(WS_METHODS.subscribeActivity).toBe("subscribeActivity");
+    expect(WS_METHODS.subscribeWorktreeCatalog).toBe("subscribeWorktreeCatalog");
+    expect(WS_METHODS.vcsRefreshWorktreeCatalog).toBe("vcs.refreshWorktreeCatalog");
+    expect(WS_METHODS.worktreeUpdateDiscoveryPolicy).toBe("worktree.updateDiscoveryPolicy");
+    expect(WS_METHODS.worktreeAdopt).toBe("worktree.adopt");
+    expect(WS_METHODS.worktreeCreateManaged).toBe("worktree.createManaged");
+    expect(WS_METHODS.worktreeCreatePanel).toBe("worktree.createPanel");
+    expect(WS_METHODS.worktreeRetarget).toBe("worktree.retarget");
+    expect(WS_METHODS.worktreeGetRemovalPlan).toBe("worktree.getRemovalPlan");
+    expect(WS_METHODS.worktreeRemoveFromBibCode).toBe("worktree.removeFromBibCode");
+    expect(WS_METHODS.worktreeRemove).toBe("worktree.remove");
   });
 });
 
 describe("individual RPC definitions", () => {
+  it("accepts workspace-unavailable failures at guarded unary boundaries", () => {
+    const unavailable = {
+      _tag: "WorkspaceUnavailableError",
+      reason: "workspace-unavailable",
+      message: "The workspace directory is missing.",
+      threadId: "thread-1",
+      path: "/repo/worktrees/missing",
+      availability: "missing-registered",
+    };
+    for (const rpc of [
+      WsOrchestrationDispatchCommandRpc,
+      WsTerminalOpenRpc,
+      WsTerminalWriteRpc,
+      WsVcsPullRpc,
+      WsProjectsReadFileRpc,
+      WsReviewGetDiffPreviewRpc,
+    ]) {
+      expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(unavailable)).not.toThrow();
+    }
+  });
+
+  it("accepts physical identity failures at guarded and removal boundaries", () => {
+    const identity = {
+      _tag: "WorkspaceIdentityError",
+      reason: "workspace-identity-unavailable",
+      message: "The physical workspace identity could not be verified.",
+      path: "/repo/worktrees/alias",
+    };
+    for (const rpc of [
+      WsOrchestrationDispatchCommandRpc,
+      WsTerminalOpenRpc,
+      WsTerminalWriteRpc,
+      WsVcsPullRpc,
+      WsProjectsReadFileRpc,
+      WsReviewGetDiffPreviewRpc,
+      WsWorktreeRemoveFromBibCodeRpc,
+      WsWorktreeRemoveRpc,
+    ]) {
+      expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(identity)).not.toThrow();
+    }
+  });
+
+  it("accepts structured finite-operation admission failures at every mutating worktree boundary", () => {
+    for (const failure of [
+      {
+        _tag: "WorktreeOperationError",
+        reason: "operation-capacity",
+        message: "The server is already processing the maximum number of worktree operations.",
+      },
+      {
+        _tag: "WorktreeOperationError",
+        reason: "operation-shutting-down",
+        message: "The worktree operation runtime is shutting down.",
+      },
+    ]) {
+      for (const rpc of [
+        WsWorktreeUpdateDiscoveryPolicyRpc,
+        WsWorktreeAdoptRpc,
+        WsWorktreeCreateManagedRpc,
+        WsWorktreeCreatePanelRpc,
+        WsWorktreeRetargetRpc,
+        WsWorktreeGetRemovalPlanRpc,
+        WsWorktreeRemoveFromBibCodeRpc,
+        WsWorktreeRemoveRpc,
+      ]) {
+        expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(failure)).not.toThrow();
+      }
+    }
+  });
+
   it("tags each RPC with its wire method name", () => {
     expect(WsServerGetConfigRpc._tag).toBe(WS_METHODS.serverGetConfig);
     expect(WsServerConsumeCodexRateLimitResetRpc._tag).toBe(
@@ -62,7 +184,6 @@ describe("individual RPC definitions", () => {
     );
     expect(WsServerRefreshProvidersRpc._tag).toBe(WS_METHODS.serverRefreshProviders);
     expect(WsVcsPullRpc._tag).toBe(WS_METHODS.vcsPull);
-    expect(WsVcsRemoveWorktreeRpc._tag).toBe(WS_METHODS.vcsRemoveWorktree);
     expect(WsVcsInitRpc._tag).toBe(WS_METHODS.vcsInit);
     expect(WsShellOpenInEditorRpc._tag).toBe(WS_METHODS.shellOpenInEditor);
     expect(WsTerminalOpenRpc._tag).toBe(WS_METHODS.terminalOpen);
@@ -74,6 +195,16 @@ describe("individual RPC definitions", () => {
     expect(WsRpcGroup.requests.has("activity.cancelSubtree")).toBe(true);
     expect(WsRpcGroup.requests.has("activity.retrySubtreeCancellation")).toBe(true);
     expect(WsSubscribeActivityRpc._tag).toBe(WS_METHODS.subscribeActivity);
+    expect(WsSubscribeWorktreeCatalogRpc._tag).toBe(WS_METHODS.subscribeWorktreeCatalog);
+    expect(WsVcsRefreshWorktreeCatalogRpc._tag).toBe(WS_METHODS.vcsRefreshWorktreeCatalog);
+    expect(WsWorktreeUpdateDiscoveryPolicyRpc._tag).toBe(WS_METHODS.worktreeUpdateDiscoveryPolicy);
+    expect(WsWorktreeAdoptRpc._tag).toBe(WS_METHODS.worktreeAdopt);
+    expect(WsWorktreeCreateManagedRpc._tag).toBe(WS_METHODS.worktreeCreateManaged);
+    expect(WsWorktreeCreatePanelRpc._tag).toBe(WS_METHODS.worktreeCreatePanel);
+    expect(WsWorktreeRetargetRpc._tag).toBe(WS_METHODS.worktreeRetarget);
+    expect(WsWorktreeGetRemovalPlanRpc._tag).toBe(WS_METHODS.worktreeGetRemovalPlan);
+    expect(WsWorktreeRemoveFromBibCodeRpc._tag).toBe(WS_METHODS.worktreeRemoveFromBibCode);
+    expect(WsWorktreeRemoveRpc._tag).toBe(WS_METHODS.worktreeRemove);
   });
 
   it("carries payload/success/error schemas on unary RPCs", () => {
@@ -96,6 +227,7 @@ describe("individual RPC definitions", () => {
       WsCloudInstallRelayClientRpc,
       WsSubscribeAuthAccessRpc,
       WsOrchestrationSubscribeShellRpc,
+      WsSubscribeWorktreeCatalogRpc,
     ]) {
       expect(streamRpc.errorSchema).toBe(Schema.Never);
       expect(Schema.isSchema(streamRpc.successSchema)).toBe(true);
@@ -130,10 +262,180 @@ describe("WsRpcGroup", () => {
       WsOrchestrationDispatchCommandRpc,
       WsOrchestrationSubscribeShellRpc,
       WsSubscribeAuthAccessRpc,
+      WsSubscribeWorktreeCatalogRpc,
+      WsVcsRefreshWorktreeCatalogRpc,
+      WsWorktreeUpdateDiscoveryPolicyRpc,
+      WsWorktreeAdoptRpc,
+      WsWorktreeCreateManagedRpc,
+      WsWorktreeCreatePanelRpc,
+      WsWorktreeRetargetRpc,
+      WsWorktreeGetRemovalPlanRpc,
+      WsWorktreeRemoveFromBibCodeRpc,
+      WsWorktreeRemoveRpc,
     ];
     for (const rpc of members) {
       expect(WsRpcGroup.requests.get(rpc._tag)).toBe(rpc);
     }
+  });
+
+  it("keeps catalog reads project-scoped and discovery baselines server-owned", () => {
+    expect(decodeSubscribeWorktreeCatalog({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(decodeRefreshWorktreeCatalog({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(
+      decodeUpdateWorktreeDiscoveryPolicy({
+        commandId: "command-1",
+        projectId: "project-1",
+        visibility: "hidden",
+        acknowledgeGeneration: 9,
+        dismissInitialPrompt: true,
+        baselinePaths: ["/client-path"],
+      }),
+    ).toEqual({
+      commandId: "command-1",
+      projectId: "project-1",
+      visibility: "hidden",
+      acknowledgeGeneration: 9,
+      dismissInitialPrompt: true,
+    });
+  });
+
+  it("registers adoption with opaque server-resolved identity and typed outcomes", () => {
+    expect(
+      decodeWorktreeAdopt({
+        commandId: "command-adopt-1",
+        projectId: "project-1",
+        worktreeKey: "worktree-1",
+        expectedGeneration: 9,
+        threadDefaults: {
+          modelSelection: { instanceId: "codex", model: "gpt-5" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+        },
+      }),
+    ).toMatchObject({
+      commandId: "command-adopt-1",
+      projectId: "project-1",
+      worktreeKey: "worktree-1",
+      expectedGeneration: 9,
+    });
+    expect(
+      ["created", "existing", "restored"].map((disposition) =>
+        decodeWorktreeAdoptResult({ threadId: "thread-1", disposition }),
+      ),
+    ).toHaveLength(3);
+    expect(
+      decodeWorktreeAdoptError({
+        _tag: "WorktreeAdoptionError",
+        reason: "stale-generation",
+        message: "Refresh required.",
+        currentGeneration: 10,
+      }),
+    ).toMatchObject({ reason: "stale-generation", currentGeneration: 10 });
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeAdopt)).toBe(WsWorktreeAdoptRpc);
+  });
+
+  it("registers dedicated creation and retargeting with server-resolved authority", () => {
+    const threadDefaults = {
+      modelSelection: { instanceId: "codex", model: "gpt-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+    } as const;
+    expect(
+      decodeWorktreeCreateManaged({
+        commandId: "command-managed",
+        projectId: "project-1",
+        threadId: "thread-managed",
+        title: "Managed worktree",
+        refName: "HEAD",
+        newRefName: "feature/managed",
+        baseRefName: "HEAD",
+        threadDefaults,
+      }),
+    ).toEqual({
+      commandId: "command-managed",
+      projectId: "project-1",
+      threadId: "thread-managed",
+      title: "Managed worktree",
+      refName: "HEAD",
+      newRefName: "feature/managed",
+      baseRefName: "HEAD",
+      threadDefaults,
+    });
+    expect(
+      decodeWorktreeCreatePanel({
+        commandId: "command-panel",
+        hostThreadId: "thread-host",
+        threadId: "thread-panel",
+        title: "Panel",
+        threadDefaults,
+      }),
+    ).toEqual({
+      commandId: "command-panel",
+      hostThreadId: "thread-host",
+      threadId: "thread-panel",
+      title: "Panel",
+      threadDefaults,
+    });
+    expect(
+      decodeWorktreeRetarget({
+        commandId: "command-retarget",
+        projectId: "project-1",
+        threadId: "thread-1",
+        worktreeKey: "worktree-1",
+        expectedGeneration: 12,
+      }),
+    ).toEqual({
+      commandId: "command-retarget",
+      projectId: "project-1",
+      threadId: "thread-1",
+      worktreeKey: "worktree-1",
+      expectedGeneration: 12,
+    });
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeCreateManaged)).toBe(
+      WsWorktreeCreateManagedRpc,
+    );
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeCreatePanel)).toBe(WsWorktreeCreatePanelRpc);
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeRetarget)).toBe(WsWorktreeRetargetRpc);
+  });
+
+  it("registers typed removal planning, detach-only, and destructive RPCs", () => {
+    expect(
+      decodeWorktreeRemovalPlan({
+        planToken: "plan-1",
+        generation: 4,
+        availability: "missing-registered",
+        registered: true,
+        locked: false,
+        trackedChangeCount: 0,
+        untrackedFileCount: 0,
+        pruneImpact: [{ path: "/repo/missing", pruneReason: "stale gitdir", locked: false }],
+      }).pruneImpact[0]?.pruneReason,
+    ).toBe("stale gitdir");
+    expect(
+      decodeWorktreeRemovalResult({
+        threadRemoved: true,
+        gitOutcome: "not-requested",
+        orphanCleanupPending: false,
+      }).threadRemoved,
+    ).toBe(true);
+    expect(
+      decodeWorktreeRemovalError({
+        _tag: "WorktreeRemovalError",
+        reason: "git-failed",
+        message: "Git removal failed.",
+      }),
+    ).toMatchObject({ _tag: "WorktreeRemovalError", reason: "git-failed" });
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeGetRemovalPlan)).toBe(
+      WsWorktreeGetRemovalPlanRpc,
+    );
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeRemoveFromBibCode)).toBe(
+      WsWorktreeRemoveFromBibCodeRpc,
+    );
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeRemove)).toBe(WsWorktreeRemoveRpc);
   });
 
   it("contains every RPC exactly once and covers the whole WS surface", () => {

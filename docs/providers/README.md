@@ -7,7 +7,11 @@ BiBCode currently supports these coding-agent providers:
 | [Codex](./codex.md)       | Enabled       | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
 | [Claude](./claude.md)     | Enabled       | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
 | [OpenCode](./opencode.md) | Enabled       | HTTP and server events    | Structured chat and conditional terminal observation. |
-| [Cursor](./cursor.md)     | Disabled      | Agent Client Protocol     | Early Access; no structured activity in protocol v2.  |
+| [Cursor](./cursor.md)     | Enabled       | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+
+The legacy Grok driver is intentionally not exposed as a supported provider:
+it is omitted from Settings and from chat/terminal action menus even if an old
+settings payload still contains an enabled Grok entry.
 
 Start with [Provider setup](../getting-started/provider-setup.md) for installation
 and authentication commands. Provider CLIs and credentials live on the machine

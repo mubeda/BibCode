@@ -71,6 +71,7 @@ pub struct RelayClientOptions {
     search_path: Option<OsString>,
     release_asset: Option<RelayReleaseAsset>,
     download_timeout: Duration,
+    validation_timeout: Duration,
 }
 
 impl RelayClientOptions {
@@ -91,6 +92,7 @@ impl RelayClientOptions {
             search_path: std::env::var_os("PATH"),
             release_asset,
             download_timeout: Duration::from_secs(120),
+            validation_timeout: VALIDATION_TIMEOUT,
         }
     }
 
@@ -128,6 +130,13 @@ impl RelayClientOptions {
     #[must_use]
     pub const fn with_download_timeout(mut self, duration: Duration) -> Self {
         self.download_timeout = duration;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_validation_timeout(mut self, duration: Duration) -> Self {
+        self.validation_timeout = duration;
         self
     }
 
@@ -345,11 +354,12 @@ impl NativeRelayClient {
         make_executable(&executable).await?;
 
         report_stage(report, "validating").await?;
-        run_checked(
+        run_checked_with_timeout(
             &executable,
             [OsString::from("--version")],
             "validation_failed",
             "downloaded relay client binary did not run",
+            self.options.validation_timeout,
         )
         .await?;
 
@@ -590,10 +600,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_checked_with_timeout(program, args, reason, message, VALIDATION_TIMEOUT).await
+}
+
+async fn run_checked_with_timeout<I, S>(
+    program: impl AsRef<OsStr>,
+    args: I,
+    reason: &'static str,
+    message: &'static str,
+    validation_timeout: Duration,
+) -> Result<(), RelayInstallError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new(program);
     configure_background_command(&mut command);
     command.args(args).kill_on_drop(true);
-    let output = timeout(VALIDATION_TIMEOUT, command.output())
+    let output = timeout(validation_timeout, command.output())
         .await
         .map_err(|_| RelayInstallError::new(reason, format!("{message}: timed out")))?
         .map_err(|error| RelayInstallError::new(reason, format!("{message}: {error}")))?;
@@ -730,6 +754,99 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct RelayValidationFixture {
+        _sandbox: TestSandbox,
+        executable: PathBuf,
+        curl: PathBuf,
+        pid_path: PathBuf,
+        listener: TcpListener,
+        endpoint: String,
+        pair_started: Arc<tokio::sync::Barrier>,
+        reaped: Arc<FixtureEvent>,
+    }
+
+    #[cfg(unix)]
+    async fn relay_validation_fixture(
+        sandbox: TestSandbox,
+        pair_started: Arc<tokio::sync::Barrier>,
+    ) -> RelayValidationFixture {
+        let pid_path = sandbox.path("validation.pid");
+        let executable = sandbox.executable_script(
+            "relay-validation",
+            "pid_tmp=\"${1}.tmp\"\nprintf '%s' \"$$\" > \"$pid_tmp\"\nmv \"$pid_tmp\" \"$1\"\n\"$2\" --silent --show-error --fail \"$3\"\nprintf 'cloudflared fixture\\n'",
+            "",
+        );
+        let curl = sandbox.executable_on_path("curl");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay validation fixture");
+        let endpoint = format!(
+            "http://{}/started",
+            listener.local_addr().expect("relay fixture address")
+        );
+        RelayValidationFixture {
+            _sandbox: sandbox,
+            executable,
+            curl,
+            pid_path,
+            listener,
+            endpoint,
+            pair_started,
+            reaped: Arc::new(FixtureEvent::default()),
+        }
+    }
+
+    #[cfg(unix)]
+    impl RelayValidationFixture {
+        async fn run(&self) -> (Result<(), RelayInstallError>, i32) {
+            let validation = run_checked(
+                &self.executable,
+                [
+                    self.pid_path.as_os_str().to_owned(),
+                    self.curl.as_os_str().to_owned(),
+                    OsString::from(&self.endpoint),
+                ],
+                "validation_failed",
+                "relay validation fixture failed",
+            );
+            tokio::pin!(validation);
+            let (mut connection, _) = tokio::select! {
+                accepted = self.listener.accept() => accepted.expect("accept relay fixture child"),
+                result = &mut validation => panic!("relay child exited before start rendezvous: {result:?}"),
+            };
+            let mut request = [0_u8; 2_048];
+            let request_bytes = connection
+                .read(&mut request)
+                .await
+                .expect("read relay fixture request");
+            assert!(request_bytes > 0, "relay fixture sent an HTTP request");
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("relay validation PID")
+                .parse::<i32>()
+                .expect("numeric relay validation PID");
+            self.pair_started.wait().await;
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("release relay fixture child");
+            drop(connection);
+            let result = validation.await;
+            self.reaped.publish();
+            (result, pid)
+        }
+
+        async fn wait_reaped(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.reaped.wait_after(0))
+                .await
+                .expect("relay validation reap outer watchdog");
+        }
+    }
+
     fn successful_reporter() -> InstallReporter {
         Arc::new(|_| Box::pin(async { Ok(()) }))
     }
@@ -770,9 +887,30 @@ mod tests {
         spawn_raw_response(response).await
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_relay_validation_children_publish_distinct_pids_and_reap_in_parallel() {
+        let pair_started = Arc::new(tokio::sync::Barrier::new(2));
+        let left = relay_validation_fixture(
+            TestSandbox::new("relay-validation-left"),
+            pair_started.clone(),
+        )
+        .await;
+        let right =
+            relay_validation_fixture(TestSandbox::new("relay-validation-right"), pair_started)
+                .await;
+
+        let ((left_result, left_pid), (right_result, right_pid)) =
+            tokio::join!(left.run(), right.run());
+
+        left_result.expect("left relay validation");
+        right_result.expect("right relay validation");
+        assert_ne!(left_pid, right_pid);
+        tokio::join!(left.wait_reaped(), right.wait_reaped());
+    }
+
     #[tokio::test]
     async fn native_relay_client_covers_resolution_installation_and_private_helpers() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let fixture = native_success_executable();
         let executable = temp.path().join("cloudflared");
@@ -1006,7 +1144,8 @@ mod tests {
         )
         .with_search_path(OsString::new())
         .with_release_asset(Some(asset))
-        .with_download_timeout(Duration::from_secs(5));
+        .with_download_timeout(Duration::from_secs(5))
+        .with_validation_timeout(Duration::from_secs(45));
         let managed = install_options.managed_executable_path();
         let service = relay_client_service_with_options(install_options);
         let install_events = service.install().await.expect("install relay");
@@ -1036,7 +1175,6 @@ mod tests {
 
     #[tokio::test]
     async fn relay_installer_maps_lock_directory_download_and_activation_failures() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let reporter = successful_reporter();
 
@@ -1190,7 +1328,6 @@ mod tests {
 
     #[tokio::test]
     async fn windows_named_relay_binary_installs_from_native_fixture() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let fixture = fs::read(native_success_executable())
             .await

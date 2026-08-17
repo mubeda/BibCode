@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     sync::{Arc, Mutex},
 };
@@ -16,6 +17,26 @@ use super::{
 #[derive(Debug)]
 pub struct NativeProcessSampler {
     system: Arc<Mutex<System>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuntimeProcessOwnership {
+    roots: Vec<ProcessIdentity>,
+    captured: Vec<ProcessIdentity>,
+}
+
+impl RuntimeProcessOwnership {
+    pub(crate) fn roots_only(roots: Vec<ProcessIdentity>) -> Self {
+        Self {
+            roots,
+            captured: Vec::new(),
+        }
+    }
+
+    fn capture(rows: &[ProcessRow], roots: Vec<ProcessIdentity>) -> Self {
+        let captured = runtime_owned_process_identities(rows, &roots);
+        Self { roots, captured }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +101,35 @@ impl NativeProcessSampler {
         signal_process_identity(expected_identity, signal)
     }
 
+    pub(crate) async fn capture_runtime_process_ownership(
+        &self,
+        roots: Vec<ProcessIdentity>,
+    ) -> Result<RuntimeProcessOwnership, SamplingError> {
+        if roots.is_empty() {
+            return Ok(RuntimeProcessOwnership::roots_only(roots));
+        }
+        let rows = self.sample().await?;
+        Ok(RuntimeProcessOwnership::capture(&rows, roots))
+    }
+
+    pub(crate) async fn cleanup_runtime_process_ownership(
+        &self,
+        ownership: RuntimeProcessOwnership,
+    ) -> Result<ProcessCleanupReport, SignalError> {
+        if ownership.roots.is_empty() && ownership.captured.is_empty() {
+            return Ok(ProcessCleanupReport::default());
+        }
+        let rows = self
+            .sample()
+            .await
+            .map_err(|error| SignalError::Read(error.to_string()))?;
+        let identities = residual_runtime_owned_process_identities(&rows, &ownership);
+        Ok(cleanup_runtime_process_identities(
+            &identities,
+            |identity| signal_process_identity(identity, ProcessSignal::Kill),
+        ))
+    }
+
     pub(crate) async fn cleanup_descendants(
         &self,
         root_pid: u32,
@@ -101,20 +151,109 @@ impl NativeProcessSampler {
                     })
             })
             .collect::<Vec<_>>();
-        Ok(cleanup_process_identities(&identities, |identity| {
-            signal_process_identity(identity, ProcessSignal::Kill)
-        }))
+        Ok(cleanup_runtime_process_identities(
+            &identities,
+            |identity| signal_process_identity(identity, ProcessSignal::Kill),
+        ))
     }
 }
 
-fn cleanup_process_identities(
+fn runtime_owned_process_identities(
+    rows: &[ProcessRow],
+    roots: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    let rows_by_pid = rows
+        .iter()
+        .map(|row| (row.pid, row))
+        .collect::<HashMap<_, _>>();
+    let mut children_by_pid = HashMap::<u32, Vec<&ProcessRow>>::new();
+    for row in rows {
+        children_by_pid.entry(row.ppid).or_default().push(row);
+    }
+    for children in children_by_pid.values_mut() {
+        children.sort_by_key(|row| row.pid);
+    }
+
+    fn visit(
+        identity: ProcessIdentity,
+        rows_by_pid: &HashMap<u32, &ProcessRow>,
+        children_by_pid: &HashMap<u32, Vec<&ProcessRow>>,
+        visited: &mut HashSet<ProcessIdentity>,
+        owned: &mut Vec<ProcessIdentity>,
+    ) {
+        let Some(row) = rows_by_pid.get(&identity.pid) else {
+            return;
+        };
+        if row.started_at != identity.started_at || !visited.insert(identity) {
+            return;
+        }
+        for child in children_by_pid
+            .get(&identity.pid)
+            .into_iter()
+            .flatten()
+            .filter(|child| child.started_at >= identity.started_at)
+        {
+            visit(
+                ProcessIdentity {
+                    pid: child.pid,
+                    started_at: child.started_at,
+                },
+                rows_by_pid,
+                children_by_pid,
+                visited,
+                owned,
+            );
+        }
+        owned.push(identity);
+    }
+
+    let mut visited = HashSet::new();
+    let mut owned = Vec::new();
+    for root in roots {
+        visit(
+            *root,
+            &rows_by_pid,
+            &children_by_pid,
+            &mut visited,
+            &mut owned,
+        );
+    }
+    owned
+}
+
+fn residual_runtime_owned_process_identities(
+    rows: &[ProcessRow],
+    ownership: &RuntimeProcessOwnership,
+) -> Vec<ProcessIdentity> {
+    let live = rows
+        .iter()
+        .map(|row| ProcessIdentity {
+            pid: row.pid,
+            started_at: row.started_at,
+        })
+        .collect::<HashSet<_>>();
+    let mut residual = runtime_owned_process_identities(rows, &ownership.roots);
+    let mut included = residual.iter().copied().collect::<HashSet<_>>();
+    residual.extend(
+        ownership
+            .captured
+            .iter()
+            .copied()
+            .filter(|identity| live.contains(identity) && included.insert(*identity)),
+    );
+    residual
+}
+
+fn cleanup_runtime_process_identities(
     identities: &[ProcessIdentity],
     mut signal: impl FnMut(ProcessIdentity) -> Result<(), SignalError>,
 ) -> ProcessCleanupReport {
     let mut report = ProcessCleanupReport::default();
     for identity in identities {
         match signal(*identity) {
-            Ok(()) => report.record_success(),
+            Ok(()) | Err(SignalError::NotFound(_) | SignalError::StaleIdentity(_)) => {
+                report.record_success();
+            }
             Err(error) => {
                 report.record_failure(format!("process {}: {error}", identity.pid));
             }
@@ -328,8 +467,8 @@ fn macos_process_creation_identity(seconds: u64, microseconds: u64) -> std::io::
 #[cfg(windows)]
 fn platform_process_record(pid: u32) -> std::io::Result<PlatformProcessRecord> {
     use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION},
+        Foundation::{CloseHandle, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION},
     };
 
     // SAFETY: the requested access is query-only and the returned owned handle
@@ -338,7 +477,21 @@ fn platform_process_record(pid: u32) -> std::io::Result<PlatformProcessRecord> {
     if handle.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let record = windows_process_record(handle);
+    let record = (|| {
+        let mut exit_code = 0_u32;
+        // SAFETY: `handle` is a live query handle and `exit_code` is valid
+        // writable storage for the duration of the call.
+        if unsafe { GetExitCodeProcess(handle, &mut exit_code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if exit_code != u32::try_from(STILL_ACTIVE).expect("STILL_ACTIVE fits u32") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("process {pid} has exited"),
+            ));
+        }
+        windows_process_record(handle)
+    })();
     // SAFETY: `handle` was opened successfully above and is closed once.
     unsafe { CloseHandle(handle) };
     record
@@ -686,7 +839,10 @@ pub enum SignalError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    };
 
     use super::*;
     use crate::diagnostics::ProcessIdentity;
@@ -710,6 +866,68 @@ mod tests {
                 .store(self.bound_identity, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    fn locked_native_process_sampler() -> (
+        NativeProcessSampler,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let system = Arc::new(Mutex::new(System::new()));
+        let system_to_lock = system.clone();
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = system_to_lock
+                .lock()
+                .expect("fresh process sampler mutex should lock");
+            locked_tx
+                .send(())
+                .expect("sampler lock publication should succeed");
+            release_rx
+                .recv()
+                .expect("sampler lock release should arrive");
+        });
+        locked_rx
+            .recv()
+            .expect("sampler lock publication should arrive");
+        (NativeProcessSampler { system }, release_tx, blocker)
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_ownership_capture_does_not_require_native_sampling() {
+        let (sampler, release, blocker) = locked_native_process_sampler();
+        let ownership = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sampler.capture_runtime_process_ownership(Vec::new()),
+        )
+        .await;
+        release.send(()).expect("sampler lock release should send");
+        blocker.join().expect("sampler lock holder should join");
+        let ownership = ownership
+            .expect("empty ownership capture should not wait for native sampling")
+            .expect("empty ownership should not sample the native process table");
+
+        assert!(ownership.roots.is_empty());
+        assert!(ownership.captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_ownership_cleanup_does_not_require_native_sampling() {
+        let (sampler, release, blocker) = locked_native_process_sampler();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sampler
+                .cleanup_runtime_process_ownership(RuntimeProcessOwnership::roots_only(Vec::new())),
+        )
+        .await;
+        release.send(()).expect("sampler lock release should send");
+        blocker.join().expect("sampler lock holder should join");
+        let report = report
+            .expect("empty ownership cleanup should not wait for native sampling")
+            .expect("empty ownership should not sample the native process table");
+
+        assert_eq!(report, ProcessCleanupReport::default());
     }
 
     #[tokio::test]
@@ -753,6 +971,27 @@ mod tests {
 
         assert_eq!(identity.pid, std::process::id());
         assert_eq!(identity.started_at, platform.started_at);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_identity_rejects_an_exited_process_with_a_retained_handle() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit", "0"])
+            .spawn()
+            .expect("spawn exited-process identity fixture");
+        let pid = child.id();
+        assert!(
+            child
+                .wait()
+                .expect("wait for exited-process identity fixture")
+                .success()
+        );
+
+        assert!(
+            NativeProcessSampler::process_identity(pid).is_err(),
+            "an exited Windows process must not be reported as a live identity"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -846,7 +1085,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut attempted = Vec::new();
 
-        let report = cleanup_process_identities(&identities, |identity| {
+        let report = cleanup_runtime_process_identities(&identities, |identity| {
             attempted.push(identity.pid);
             if identity.pid == 2 {
                 Ok(())
@@ -865,6 +1104,129 @@ mod tests {
                 .failures
                 .iter()
                 .all(|failure| failure.chars().count() <= 160)
+        );
+    }
+
+    #[test]
+    fn owned_closure_excludes_a_peer_runtime_under_the_same_server_pid() {
+        let mut server = ProcessRow::fixture(10, 1, "server");
+        server.started_at = 10;
+        let mut runtime_a = ProcessRow::fixture(20, 10, "runtime-a");
+        runtime_a.started_at = 20;
+        let mut runtime_a_child = ProcessRow::fixture(21, 20, "runtime-a-child");
+        runtime_a_child.started_at = 21;
+        let mut runtime_b = ProcessRow::fixture(30, 10, "runtime-b");
+        runtime_b.started_at = 30;
+        let mut runtime_b_child = ProcessRow::fixture(31, 30, "runtime-b-child");
+        runtime_b_child.started_at = 31;
+
+        let owned = runtime_owned_process_identities(
+            &[
+                server,
+                runtime_a,
+                runtime_a_child,
+                runtime_b,
+                runtime_b_child,
+            ],
+            &[ProcessIdentity {
+                pid: 20,
+                started_at: 20,
+            }],
+        );
+
+        assert_eq!(
+            owned,
+            [
+                ProcessIdentity {
+                    pid: 21,
+                    started_at: 21,
+                },
+                ProcessIdentity {
+                    pid: 20,
+                    started_at: 20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_closure_rejects_pid_reuse_and_creation_time_inversion() {
+        let mut replacement = ProcessRow::fixture(20, 10, "replacement");
+        replacement.started_at = 200;
+        let mut older_child = ProcessRow::fixture(21, 20, "older-child");
+        older_child.started_at = 150;
+
+        let owned = runtime_owned_process_identities(
+            &[replacement, older_child],
+            &[ProcessIdentity {
+                pid: 20,
+                started_at: 100,
+            }],
+        );
+
+        assert!(owned.is_empty(), "a reused PID cannot inherit ownership");
+
+        let matching_root = ProcessIdentity {
+            pid: 20,
+            started_at: 200,
+        };
+        let owned = runtime_owned_process_identities(
+            &[
+                ProcessRow {
+                    started_at: 200,
+                    ..ProcessRow::fixture(20, 10, "matching-root")
+                },
+                ProcessRow {
+                    started_at: 150,
+                    ..ProcessRow::fixture(21, 20, "older-child")
+                },
+            ],
+            &[matching_root],
+        );
+        assert_eq!(
+            owned,
+            [matching_root],
+            "a child older than its matching parent identity cannot inherit ownership"
+        );
+    }
+
+    #[test]
+    fn residual_selection_includes_descendants_forked_after_initial_capture() {
+        let root_a = ProcessIdentity {
+            pid: 20,
+            started_at: 20,
+        };
+        let initial_rows = [ProcessRow {
+            started_at: 20,
+            ..ProcessRow::fixture(20, 10, "runtime-a")
+        }];
+        let ownership = RuntimeProcessOwnership::capture(&initial_rows, vec![root_a]);
+        let residual_rows = [
+            ProcessRow {
+                started_at: 20,
+                ..ProcessRow::fixture(20, 10, "runtime-a")
+            },
+            ProcessRow {
+                started_at: 21,
+                ..ProcessRow::fixture(21, 20, "late-a-child")
+            },
+            ProcessRow {
+                started_at: 30,
+                ..ProcessRow::fixture(30, 10, "runtime-b")
+            },
+        ];
+
+        let residual = residual_runtime_owned_process_identities(&residual_rows, &ownership);
+
+        assert_eq!(
+            residual,
+            [
+                ProcessIdentity {
+                    pid: 21,
+                    started_at: 21,
+                },
+                root_a,
+            ]
         );
     }
 

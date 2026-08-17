@@ -10,6 +10,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+#[cfg(test)]
+use crate::test_support::FixtureEvent;
 use crate::{
     backend::{BackendRunConfig, BackendSupervisor, BackendUpdateSnapshot},
     config::{app_version, runtime_info},
@@ -128,9 +130,9 @@ pub struct DesktopUpdateManager {
     #[cfg(test)]
     check_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    background_check_completions: std::sync::atomic::AtomicUsize,
+    background_check_completion: FixtureEvent,
     #[cfg(test)]
-    background_check_completion: tokio::sync::Notify,
+    background_timer_armed: FixtureEvent,
     #[cfg(test)]
     install_failure: Mutex<Option<String>>,
 }
@@ -1016,7 +1018,12 @@ fn append_recovery_error(message: String, recovery_error: Option<String>) -> Str
 }
 
 pub async fn run_background_update_checks<R: Runtime>(app: AppHandle<R>) {
-    tokio::time::sleep(STARTUP_UPDATE_CHECK_DELAY).await;
+    let startup_delay = tokio::time::sleep(STARTUP_UPDATE_CHECK_DELAY);
+    #[cfg(test)]
+    app.state::<DesktopUpdateManager>()
+        .background_timer_armed
+        .publish();
+    startup_delay.await;
     loop {
         match run_isolated_background_check(app.clone()).await {
             Ok(result) if result["state"]["errorContext"] == "check" => {
@@ -1034,13 +1041,14 @@ pub async fn run_background_update_checks<R: Runtime>(app: AppHandle<R>) {
         }
         #[cfg(test)]
         app.state::<DesktopUpdateManager>()
-            .background_check_completions
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .background_check_completion
+            .publish();
+        let background_delay = tokio::time::sleep(BACKGROUND_UPDATE_CHECK_INTERVAL);
         #[cfg(test)]
         app.state::<DesktopUpdateManager>()
-            .background_check_completion
-            .notify_one();
-        tokio::time::sleep(BACKGROUND_UPDATE_CHECK_INTERVAL).await;
+            .background_timer_armed
+            .publish();
+        background_delay.await;
     }
 }
 
@@ -1502,26 +1510,25 @@ mod tests {
         (base_url, thread)
     }
 
-    async fn wait_for_test_signal(receiver: &mpsc::Receiver<()>, description: &str) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match receiver.try_recv() {
-                    Ok(()) => return,
-                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        panic!("{description}: signal sender disconnected")
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+    async fn wait_for_fixture_event(event: &FixtureEvent, checkpoint: u64, description: &str) {
+        tokio::time::timeout(Duration::from_secs(5), event.wait_after(checkpoint))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
     }
 
     async fn wait_for_background_check_completion(manager: &DesktopUpdateManager, expected: usize) {
-        while manager.background_check_completions.load(Ordering::SeqCst) < expected {
-            manager.background_check_completion.notified().await;
-        }
+        let expected = u64::try_from(expected).expect("completion count should fit u64");
+        manager
+            .background_check_completion
+            .wait_until_at_least(expected)
+            .await;
+    }
+
+    async fn wait_for_background_timer(manager: &DesktopUpdateManager, expected: u64) {
+        manager
+            .background_timer_armed
+            .wait_until_at_least(expected)
+            .await;
     }
 
     #[test]
@@ -1753,16 +1760,17 @@ mod tests {
     async fn background_checks_wait_fifteen_seconds_then_thirty_minutes_after_completion() {
         let requests = Arc::new(AtomicUsize::new(0));
         let app = updater_test_app_with_request_counter(requests.clone());
+        let manager = app.state::<DesktopUpdateManager>();
         let task = tokio::spawn(run_background_update_checks(app.handle().clone()));
 
-        tokio::task::yield_now().await;
+        wait_for_background_timer(&manager, 1).await;
         tokio::time::advance(Duration::from_secs(14)).await;
         assert_eq!(requests.load(Ordering::SeqCst), 0);
         tokio::time::advance(Duration::from_secs(1)).await;
-        let manager = app.state::<DesktopUpdateManager>();
         wait_for_background_check_completion(&manager, 1).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
+        wait_for_background_timer(&manager, 2).await;
         tokio::time::advance(Duration::from_secs(30 * 60 - 1)).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1805,18 +1813,15 @@ mod tests {
         assert!(poison.is_err());
         assert!(manager.inner.is_poisoned());
         let task = tokio::spawn(run_background_update_checks(app.handle().clone()));
-        tokio::task::yield_now().await;
+        wait_for_background_timer(&manager, 1).await;
         tokio::time::advance(STARTUP_UPDATE_CHECK_DELAY).await;
         let manager = app.state::<DesktopUpdateManager>();
         wait_for_background_check_completion(&manager, 1).await;
         assert_eq!(manager.check_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            manager.background_check_completions.load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(manager.background_check_completion.checkpoint(), 1);
         manager.inner.clear_poison();
-        tokio::task::yield_now().await;
 
+        wait_for_background_timer(&manager, 2).await;
         tokio::time::advance(BACKGROUND_UPDATE_CHECK_INTERVAL).await;
         let manager = app.state::<DesktopUpdateManager>();
         wait_for_background_check_completion(&manager, 2).await;
@@ -1838,15 +1843,15 @@ mod tests {
         );
         let requests = Arc::new(AtomicUsize::new(0));
         let server_requests = requests.clone();
-        let (request_started_sender, request_started_receiver) = mpsc::channel();
+        let request_started = Arc::new(FixtureEvent::default());
+        let request_started_checkpoint = request_started.checkpoint();
+        let server_request_started = request_started.clone();
         let (release_sender, release_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("update request should arrive");
             assert_request_read(&mut stream, "update request should read");
             server_requests.fetch_add(1, Ordering::SeqCst);
-            request_started_sender
-                .send(())
-                .expect("test should observe the update request");
+            server_request_started.publish();
             release_receiver
                 .recv()
                 .expect("test should release update response");
@@ -1860,8 +1865,9 @@ mod tests {
         let first_handle = app.handle().clone();
         let first = tokio::spawn(async move { first_manager.check_for_update(first_handle).await });
 
-        wait_for_test_signal(
-            &request_started_receiver,
+        wait_for_fixture_event(
+            &request_started,
+            request_started_checkpoint,
             "update request should become active",
         )
         .await;
@@ -2016,11 +2022,11 @@ mod tests {
             .expect("update response should write");
         });
         let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = app.state::<DesktopUpdateManager>();
         let task = tokio::spawn(run_background_update_checks(app.handle().clone()));
 
-        tokio::task::yield_now().await;
+        wait_for_background_timer(&manager, 1).await;
         tokio::time::advance(Duration::from_secs(15)).await;
-        let manager = app.state::<DesktopUpdateManager>();
         wait_for_background_check_completion(&manager, 1).await;
         let state = manager.state(app.handle());
 
@@ -2047,7 +2053,9 @@ mod tests {
             "signature": STANDARD.encode(TEST_SIGNATURE),
         })
         .to_string();
-        let (check_started_sender, check_started_receiver) = mpsc::channel();
+        let check_started = Arc::new(FixtureEvent::default());
+        let check_started_checkpoint = check_started.checkpoint();
+        let server_check_started = check_started.clone();
         let (release_check_sender, release_check_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("initial check should arrive");
@@ -2061,9 +2069,7 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("overlapping check should arrive");
             assert_request_read(&mut stream, "overlapping check should read");
-            check_started_sender
-                .send(())
-                .expect("test should observe the in-flight check");
+            server_check_started.publish();
             release_check_receiver
                 .recv()
                 .expect("test should release the check");
@@ -2081,8 +2087,9 @@ mod tests {
         let check_manager = manager.clone();
         let check_handle = app.handle().clone();
         let check = tokio::spawn(async move { check_manager.check_for_update(check_handle).await });
-        wait_for_test_signal(
-            &check_started_receiver,
+        wait_for_fixture_event(
+            &check_started,
+            check_started_checkpoint,
             "second check should become in flight",
         )
         .await;
@@ -2120,7 +2127,9 @@ mod tests {
             "signature": STANDARD.encode(TEST_SIGNATURE),
         })
         .to_string();
-        let (download_started_sender, download_started_receiver) = mpsc::channel();
+        let download_started = Arc::new(FixtureEvent::default());
+        let download_started_checkpoint = download_started.checkpoint();
+        let server_download_started = download_started.clone();
         let (release_download_sender, release_download_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("initial check should arrive");
@@ -2134,9 +2143,7 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("download should request artifact");
             assert_request_read(&mut stream, "download should read");
-            download_started_sender
-                .send(())
-                .expect("test should observe download admission");
+            server_download_started.publish();
             release_download_receiver
                 .recv()
                 .expect("test should release the artifact");
@@ -2155,7 +2162,12 @@ mod tests {
         let download_handle = app.handle().clone();
         let download =
             tokio::spawn(async move { download_manager.download_update(download_handle).await });
-        wait_for_test_signal(&download_started_receiver, "download should become active").await;
+        wait_for_fixture_event(
+            &download_started,
+            download_started_checkpoint,
+            "download should become active",
+        )
+        .await;
 
         let check = manager.check_for_update(app.handle().clone()).await;
         release_download_sender
@@ -2187,7 +2199,9 @@ mod tests {
         .to_string();
         let artifact_requests = Arc::new(AtomicUsize::new(0));
         let server_artifact_requests = artifact_requests.clone();
-        let (download_started_sender, download_started_receiver) = mpsc::channel();
+        let download_started = Arc::new(FixtureEvent::default());
+        let download_started_checkpoint = download_started.checkpoint();
+        let server_download_started = download_started.clone();
         let (release_download_sender, release_download_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("initial check should arrive");
@@ -2202,9 +2216,7 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("download should request artifact");
             assert_request_read(&mut stream, "download should read");
             server_artifact_requests.fetch_add(1, Ordering::SeqCst);
-            download_started_sender
-                .send(())
-                .expect("test should observe download admission");
+            server_download_started.publish();
             release_download_receiver
                 .recv()
                 .expect("test should release the artifact");
@@ -2222,7 +2234,12 @@ mod tests {
         let first_manager = manager.clone();
         let first_handle = app.handle().clone();
         let first = tokio::spawn(async move { first_manager.download_update(first_handle).await });
-        wait_for_test_signal(&download_started_receiver, "download should become active").await;
+        wait_for_fixture_event(
+            &download_started,
+            download_started_checkpoint,
+            "download should become active",
+        )
+        .await;
 
         let second = tokio::time::timeout(
             Duration::from_millis(100),
@@ -2250,14 +2267,14 @@ mod tests {
             "http://{}",
             listener.local_addr().expect("update server address")
         );
-        let (check_started_sender, check_started_receiver) = mpsc::channel();
+        let check_started = Arc::new(FixtureEvent::default());
+        let check_started_checkpoint = check_started.checkpoint();
+        let server_check_started = check_started.clone();
         let (release_check_sender, release_check_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("first check should arrive");
             assert_request_read(&mut stream, "first check should read");
-            check_started_sender
-                .send(())
-                .expect("test should observe the in-flight check");
+            server_check_started.publish();
             release_check_receiver
                 .recv()
                 .expect("test should release the first check");
@@ -2274,7 +2291,12 @@ mod tests {
         let check_manager = manager.clone();
         let check_handle = app.handle().clone();
         let check = tokio::spawn(async move { check_manager.check_for_update(check_handle).await });
-        wait_for_test_signal(&check_started_receiver, "check should become active").await;
+        wait_for_fixture_event(
+            &check_started,
+            check_started_checkpoint,
+            "check should become active",
+        )
+        .await;
 
         check.abort();
         assert!(
@@ -2309,7 +2331,9 @@ mod tests {
             "signature": STANDARD.encode(TEST_SIGNATURE),
         })
         .to_string();
-        let (download_started_sender, download_started_receiver) = mpsc::channel();
+        let download_started = Arc::new(FixtureEvent::default());
+        let download_started_checkpoint = download_started.checkpoint();
+        let server_download_started = download_started.clone();
         let (release_download_sender, release_download_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("initial check should arrive");
@@ -2323,9 +2347,7 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("first download should arrive");
             assert_request_read(&mut stream, "first download should read");
-            download_started_sender
-                .send(())
-                .expect("test should observe download admission");
+            server_download_started.publish();
             release_download_receiver
                 .recv()
                 .expect("test should release the first download");
@@ -2347,7 +2369,12 @@ mod tests {
         let download_handle = app.handle().clone();
         let download =
             tokio::spawn(async move { download_manager.download_update(download_handle).await });
-        wait_for_test_signal(&download_started_receiver, "download should become active").await;
+        wait_for_fixture_event(
+            &download_started,
+            download_started_checkpoint,
+            "download should become active",
+        )
+        .await;
 
         download.abort();
         assert!(

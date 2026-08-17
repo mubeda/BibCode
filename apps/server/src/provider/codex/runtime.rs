@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -17,6 +18,8 @@ use crate::activity::{
     ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState, ActivitySection,
     ActivitySectionHealth, ProviderActivityMutation,
 };
+#[cfg(test)]
+use crate::test_support::FixtureEvent;
 
 use super::{
     activity::{
@@ -187,6 +190,8 @@ struct RuntimeInner {
     mcp_status_publication_barrier: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     #[cfg(test)]
     mcp_status_completion_barrier: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    startup_response_events: StdMutex<Option<(Arc<FixtureEvent>, Arc<FixtureEvent>)>>,
 }
 
 #[derive(Clone, Default)]
@@ -748,6 +753,8 @@ impl CodexSessionRuntime {
             mcp_status_publication_barrier: Mutex::new(None),
             #[cfg(test)]
             mcp_status_completion_barrier: Mutex::new(None),
+            #[cfg(test)]
+            startup_response_events: StdMutex::new(None),
             activity: Mutex::new(RuntimeActivityState {
                 agent_activity_enabled,
                 tracker: CodexActivityTracker::new(None),
@@ -934,6 +941,58 @@ impl CodexSessionRuntime {
         self.start_with_mcp_opening(mcp_completion).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_startup_responses_for_test(
+        &self,
+        initialize_response_ready: Arc<FixtureEvent>,
+        thread_response_ready: Arc<FixtureEvent>,
+    ) {
+        *self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned") =
+            Some((initialize_response_ready, thread_response_ready));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_initialize_request_queued_for_test(
+        &self,
+        event: Arc<FixtureEvent>,
+    ) {
+        self.inner
+            .connection
+            .lock()
+            .await
+            .observe_request_queued_for_test("initialize", event);
+    }
+
+    #[cfg(test)]
+    fn publish_initialize_response_ready(&self) {
+        if let Some((event, _)) = self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned")
+            .as_ref()
+        {
+            event.publish();
+        }
+    }
+
+    #[cfg(test)]
+    fn publish_thread_response_ready(&self) {
+        if let Some((_, event)) = self
+            .inner
+            .startup_response_events
+            .lock()
+            .expect("Codex startup response event mutex poisoned")
+            .as_ref()
+        {
+            event.publish();
+        }
+    }
+
     async fn claim_mcp_opening(&self) -> Result<McpOpenCompletion, RuntimeError> {
         let reservation = self.inner.mcp_opening.lock().await.take();
         let completion = if let Some(reservation) = reservation {
@@ -989,6 +1048,8 @@ impl CodexSessionRuntime {
                     build_initialize_params(&self.inner.options.version),
                 )
                 .await?;
+            #[cfg(test)]
+            self.publish_initialize_response_ready();
             connection.notify_without_params("initialized").await?;
             let opened = if let Some(resume_thread_id) = resume_thread_id {
                 match connection
@@ -1024,6 +1085,8 @@ impl CodexSessionRuntime {
             } else {
                 connection.request("thread/start", open_payload).await?
             };
+            #[cfg(test)]
+            self.publish_thread_response_ready();
             let provider_thread_id = opened
                 .get("thread")
                 .and_then(|thread| thread.get("id"))
@@ -2103,13 +2166,14 @@ impl CodexSessionRuntime {
             }
         }
         if background_page_decoded {
+            let observed_at = current_timestamp();
             let mut activity = self.inner.activity.lock().await;
             if !self.reconciliation_is_current_locked(&pass, &activity) {
                 return;
             }
             let background = activity.tracker.reconcile_background_terminals(
                 &background_terminals,
-                FIXED_EVENT_TIME,
+                &observed_at,
                 background_authority,
             );
             activity.stage_reconciliation_mutations(background.mutations);
@@ -3260,6 +3324,16 @@ fn pending_actor_transitions_are_valid(
 
 fn method_is_incompatible(error: &ProtocolError) -> bool {
     matches!(error, ProtocolError::RemoteRequest { code: -32601, .. })
+}
+
+fn current_timestamp() -> String {
+    format_observation_timestamp(OffsetDateTime::now_utc())
+}
+
+fn format_observation_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .format(&Rfc3339)
+        .expect("current UTC observation time must format as RFC 3339")
 }
 
 fn request_type(kind: PendingRequestKind) -> &'static str {
@@ -6156,6 +6230,90 @@ mod tests {
         let mut activity = runtime.inner.activity.lock().await;
         activity.install_root_thread_id("provider-root");
         activity.tracker.begin_detail_baseline();
+    }
+
+    #[test]
+    fn background_observation_timestamp_format_is_canonical() {
+        let observed_at = OffsetDateTime::from_unix_timestamp_nanos(1_786_710_896_789_000_000)
+            .expect("fixed observation timestamp");
+
+        assert_eq!(
+            format_observation_timestamp(observed_at),
+            "2026-08-14T12:34:56.789Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_reconciliation_stamps_work_with_its_observation_time() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+
+            let root_read = read_runtime_test_json(&mut reader).await;
+            assert_eq!(root_read["method"], "thread/read");
+            write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read)).await;
+
+            let thread_list = read_runtime_test_json(&mut reader).await;
+            assert_eq!(thread_list["method"], "thread/list");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": thread_list["id"].clone(),
+                    "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
+                }),
+            )
+            .await;
+
+            let background = read_runtime_test_json(&mut reader).await;
+            assert_eq!(background["method"], "thread/backgroundTerminals/list");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": background["id"].clone(),
+                    "result": {
+                        "data": [{
+                            "itemId": "background-live",
+                            "processId": "process-live",
+                            "command": "sleep 90"
+                        }],
+                        "nextCursor": null
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let before_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        runtime.reconcile_once().await;
+        let after_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        peer.await.expect("reconciliation peer");
+
+        let events = drain_runtime_events(&runtime).await;
+        let started_at = events
+            .iter()
+            .flat_map(|event| &event.activity)
+            .find_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertWorkItem(work_item)
+                    if work_item.id == "codex:item:background-live" =>
+                {
+                    Some(work_item.started_at.as_str())
+                }
+                _ => None,
+            })
+            .expect("reconciled background work item");
+        let started_at_ms = OffsetDateTime::parse(started_at, &Rfc3339)
+            .expect("canonical RFC 3339 background timestamp")
+            .unix_timestamp_nanos()
+            / 1_000_000;
+
+        assert!(
+            (before_ms..=after_ms).contains(&started_at_ms),
+            "background observation timestamp {started_at_ms}ms must be within reconciliation bounds {before_ms}ms..={after_ms}ms"
+        );
     }
 
     fn verified_reconciliation_child() -> ReconciliationThread {

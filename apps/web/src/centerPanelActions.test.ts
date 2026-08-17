@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const h = vi.hoisted(() => ({
   createResult: { _tag: "Success", value: undefined } as unknown,
   deleteResults: [] as unknown[],
-  createThread: vi.fn(),
+  createPanel: vi.fn(),
   deleteThread: vi.fn(),
   addToast: vi.fn(),
-  openChatPanel: vi.fn(),
+  reserveChatPanel: vi.fn(),
+  releaseChatPanelReservation: vi.fn(),
+  removeThread: vi.fn(),
   activateSurface: vi.fn(),
   closeSurface: vi.fn(),
   closeOtherSurfaces: vi.fn(),
@@ -35,7 +37,9 @@ vi.mock("~/centerPanelStore", () => ({
   HOST_SURFACE_ID: "host",
   useCenterPanelStore: {
     getState: () => ({
-      openChatPanel: h.openChatPanel,
+      reserveChatPanel: h.reserveChatPanel,
+      releaseChatPanelReservation: h.releaseChatPanelReservation,
+      removeThread: h.removeThread,
       activateSurface: h.activateSurface,
       closeSurface: h.closeSurface,
       closeOtherSurfaces: h.closeOtherSurfaces,
@@ -48,15 +52,21 @@ vi.mock("~/centerPanelStore", () => ({
 }));
 
 vi.mock("~/lib/utils", () => ({
+  newCommandId: () => "command-panel-create",
   newThreadId: () => "new-panel-thread",
 }));
 
 vi.mock("~/state/threads", () => ({
-  threadEnvironment: { create: "create", delete: "delete" },
+  threadEnvironment: { delete: "delete" },
+}));
+
+vi.mock("~/state/worktrees", () => ({
+  worktreeEnvironment: { createPanel: "create-panel" },
 }));
 
 vi.mock("~/state/use-atom-command", () => ({
-  useAtomCommand: (command: string) => (command === "create" ? h.createThread : h.deleteThread),
+  useAtomCommand: (command: string) =>
+    command === "create-panel" ? h.createPanel : h.deleteThread,
 }));
 
 import { useCenterPanelActions } from "./centerPanelActions";
@@ -73,7 +83,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.createResult = { _tag: "Success", value: undefined };
   h.deleteResults = [];
-  h.createThread.mockImplementation(() => Promise.resolve(h.createResult));
+  h.createPanel.mockImplementation(() => Promise.resolve(h.createResult));
   h.deleteThread.mockImplementation(() =>
     Promise.resolve(h.deleteResults.shift() ?? { _tag: "Success", value: undefined }),
   );
@@ -84,7 +94,31 @@ afterEach(() => {
 });
 
 describe("center panel actions", () => {
-  it("creates chat panels with the resolved selection and copied workspace values", async () => {
+  it("registers a reserved chat panel before the server command settles", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    let resolveCreatePanel!: (value: unknown) => void;
+    const createPanelResult = new Promise<unknown>((resolve) => {
+      resolveCreatePanel = resolve;
+    });
+    h.createPanel.mockReturnValueOnce(createPanelResult);
+
+    const creation = actions.createChatPanel({
+      hostRef,
+      projectId: ProjectId.make("project-1"),
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("cursor"),
+        model: "cursor-fixture",
+      },
+      providerLabel: "Cursor",
+    });
+
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, "new-panel-thread", "Cursor");
+    resolveCreatePanel({ _tag: "Success", value: undefined });
+    await expect(creation).resolves.toBe("new-panel-thread");
+    expect(h.removeThread).not.toHaveBeenCalled();
+  });
+
+  it("creates chat panels through the server-resolved panel API", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
     const modelSelection = {
       instanceId: ProviderInstanceId.make("codex"),
@@ -104,19 +138,28 @@ describe("center panel actions", () => {
     });
 
     expect(threadId).toBe("new-panel-thread");
-    expect(h.createThread).toHaveBeenCalledWith({
+    expect(h.createPanel).toHaveBeenCalledWith({
       environmentId: hostRef.environmentId,
-      input: expect.objectContaining({
+      input: {
+        commandId: "command-panel-create",
+        hostThreadId: hostRef.threadId,
         threadId: "new-panel-thread",
         title: "Panel — Codex",
-        branch: "feature/panels",
-        worktreePath: null,
-        modelSelection,
-        kind: "panel",
-      }),
+        threadDefaults: {
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        },
+      },
     });
-    expect(h.createThread.mock.calls[0]?.[0].input.modelSelection).toBe(modelSelection);
-    expect(h.openChatPanel).toHaveBeenCalledWith(hostRef, threadId, "Codex");
+    expect(h.createPanel.mock.calls[0]?.[0].input.threadDefaults.modelSelection).toBe(
+      modelSelection,
+    );
+    expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("projectId");
+    expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("worktreePath");
+    expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("branch");
+    expect(h.createPanel.mock.calls[0]?.[0].input).not.toHaveProperty("kind");
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, threadId, "Codex");
 
     await actions.createChatPanel({
       hostRef,
@@ -126,14 +169,11 @@ describe("center panel actions", () => {
       modelSelection,
       providerLabel: "Codex",
     });
-    expect(h.createThread).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        input: expect.objectContaining({ branch: null, worktreePath: "/tmp/worktree" }),
-      }),
-    );
+    expect(h.createPanel).toHaveBeenCalledTimes(2);
+    expect(h.createPanel.mock.calls[1]?.[0].input).toEqual(h.createPanel.mock.calls[0]?.[0].input);
   });
 
-  it("returns null for interrupted creation and reports typed and untyped failures", async () => {
+  it("retains ambiguous interrupted creation and rolls back explicit failures", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
     const input = {
       hostRef,
@@ -146,11 +186,16 @@ describe("center panel actions", () => {
     };
 
     h.createResult = { _tag: "Failure", interrupted: true, cause: new Error("cancelled") };
-    await expect(actions.createChatPanel(input)).resolves.toBeNull();
+    await expect(actions.createChatPanel(input)).resolves.toBe("new-panel-thread");
     expect(h.addToast).not.toHaveBeenCalled();
+    expect(h.removeThread).not.toHaveBeenCalled();
 
     h.createResult = { _tag: "Failure", cause: new Error("server offline") };
     await expect(actions.createChatPanel(input)).resolves.toBeNull();
+    expect(h.removeThread).toHaveBeenLastCalledWith({
+      environmentId: hostRef.environmentId,
+      threadId: "new-panel-thread",
+    });
     expect(h.addToast).toHaveBeenLastCalledWith(
       expect.objectContaining({ description: "server offline" }),
     );

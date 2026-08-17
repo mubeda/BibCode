@@ -150,7 +150,6 @@ const testState = vi.hoisted(() => ({
   queryAtoms: [] as unknown[],
   refreshRefs: vi.fn(),
   createWorktree: vi.fn(),
-  createThread: vi.fn(),
   replaceMainWithTerminal: vi.fn(),
   updateSettings: vi.fn(),
   navigate: vi.fn(),
@@ -168,6 +167,7 @@ vi.mock("@bibcode/client-runtime/state/runtime", () => ({
 
 vi.mock("~/lib/utils", () => ({
   cn: (...values: unknown[]) => values.filter(Boolean).join(" "),
+  newCommandId: () => "command-create-worktree",
   newThreadId: () => testState.nextThreadId,
 }));
 
@@ -188,18 +188,18 @@ vi.mock("~/state/query", () => ({
   },
 }));
 
-vi.mock("~/state/threads", () => ({ threadEnvironment: { create: "thread.create" } }));
-
 vi.mock("~/state/vcs", () => ({
   vcsEnvironment: {
     listRefs: (args: unknown) => ({ kind: "vcs.listRefs", args }),
-    createWorktree: "vcs.createWorktree",
   },
 }));
 
+vi.mock("~/state/worktrees", () => ({
+  worktreeEnvironment: { createManaged: "worktree.createManaged" },
+}));
+
 vi.mock("~/state/use-atom-command", () => ({
-  useAtomCommand: (command: string) =>
-    command === "vcs.createWorktree" ? testState.createWorktree : testState.createThread,
+  useAtomCommand: () => testState.createWorktree,
 }));
 
 vi.mock("~/centerPanelStore", () => ({
@@ -397,10 +397,13 @@ function resetScenario(): void {
   testState.refs = [];
   testState.queryAtoms = [];
   testState.refreshRefs.mockReset();
-  testState.createWorktree
-    .mockReset()
-    .mockResolvedValue(success({ worktree: { path: "/repo/.worktrees/feature" } }));
-  testState.createThread.mockReset().mockResolvedValue(success(undefined));
+  testState.createWorktree.mockReset().mockResolvedValue(
+    success({
+      threadId: testState.nextThreadId,
+      path: "/repo/.worktrees/feature",
+      refName: "feature",
+    }),
+  );
   testState.replaceMainWithTerminal.mockReset();
   testState.updateSettings.mockReset();
   testState.navigate.mockReset();
@@ -665,10 +668,12 @@ staticDescribe("CreateWorktreeDialog", () => {
     expect(captured.selects[1]?.value).toBe("chat:claudeAgent");
     await submitWorktree();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: expect.objectContaining({ instanceId: "claudeAgent" }),
+          threadDefaults: expect.objectContaining({
+            modelSelection: expect.objectContaining({ instanceId: "claudeAgent" }),
+          }),
         }),
       }),
     );
@@ -735,10 +740,12 @@ staticDescribe("CreateWorktreeDialog", () => {
     render();
     await submitWorktree();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: expect.objectContaining({ instanceId: "claudeAgent" }),
+          threadDefaults: expect.objectContaining({
+            modelSelection: expect.objectContaining({ instanceId: "claudeAgent" }),
+          }),
         }),
       }),
     );
@@ -775,10 +782,12 @@ staticDescribe("CreateWorktreeDialog", () => {
     expect(captured.selects[1]?.value).toBe("chat:codex");
     await submitWorktree();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: expect.objectContaining({ instanceId: "codex" }),
+          threadDefaults: expect.objectContaining({
+            modelSelection: expect.objectContaining({ instanceId: "codex" }),
+          }),
         }),
       }),
     );
@@ -959,17 +968,19 @@ staticDescribe("CreateWorktreeDialog", () => {
     button("Create worktree").onClick?.();
     await flushPromises();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: {
-            instanceId: "codex",
-            model: "gpt-5.4",
-            options: [
-              { id: "reasoningEffort", value: "high" },
-              { id: "serviceTier", value: "fast" },
-            ],
-          },
+          threadDefaults: expect.objectContaining({
+            modelSelection: {
+              instanceId: "codex",
+              model: "gpt-5.4",
+              options: [
+                { id: "reasoningEffort", value: "high" },
+                { id: "serviceTier", value: "fast" },
+              ],
+            },
+          }),
         }),
       }),
     );
@@ -1052,17 +1063,19 @@ staticDescribe("CreateWorktreeDialog", () => {
     button("Create worktree").onClick?.();
     await flushPromises();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: {
-            instanceId: "codex",
-            model: "gpt-5.4",
-            options: [
-              { id: "reasoningEffort", value: "high" },
-              { id: "serviceTier", value: "fast" },
-            ],
-          },
+          threadDefaults: expect.objectContaining({
+            modelSelection: {
+              instanceId: "codex",
+              model: "gpt-5.4",
+              options: [
+                { id: "reasoningEffort", value: "high" },
+                { id: "serviceTier", value: "fast" },
+              ],
+            },
+          }),
         }),
       }),
     );
@@ -1077,10 +1090,12 @@ staticDescribe("CreateWorktreeDialog", () => {
     button("Create worktree").onClick?.();
     await flushPromises();
 
-    expect(testState.createThread).toHaveBeenCalledWith(
+    expect(testState.createWorktree).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          modelSelection: expect.objectContaining({ instanceId: "codex" }),
+          threadDefaults: expect.objectContaining({
+            modelSelection: expect.objectContaining({ instanceId: "codex" }),
+          }),
         }),
       }),
     );
@@ -1102,7 +1117,8 @@ staticDescribe("CreateWorktreeDialog", () => {
     expect(testState.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Failed to create worktree", description }),
     );
-    expect(testState.createThread).not.toHaveBeenCalled();
+    expect(testState.createWorktree).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).not.toHaveBeenCalled();
   });
 
   it("suppresses interrupted worktree failures", async () => {
@@ -1115,32 +1131,6 @@ staticDescribe("CreateWorktreeDialog", () => {
     button("Create worktree").onClick?.();
     await flushPromises();
     expect(testState.toastAdd).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [new Error("thread failed"), false, "thread failed"],
-    ["opaque", false, "An error occurred."],
-    [new Error("cancelled"), true, null],
-  ])("handles thread creation failures", async (error, interrupted, description) => {
-    testState.createThread.mockResolvedValue(failure(error, interrupted));
-    render();
-    button("Name").onClick?.();
-    render();
-    input("Worktree / branch name").onChange?.({ target: { value: "thread-failure" } });
-    render();
-    button("Create worktree").onClick?.();
-    await flushPromises();
-
-    if (description === null) {
-      expect(testState.toastAdd).not.toHaveBeenCalled();
-    } else {
-      expect(testState.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: "Worktree created but thread creation failed",
-          description,
-        }),
-      );
-    }
     expect(testState.navigate).not.toHaveBeenCalled();
   });
 
@@ -1372,7 +1362,9 @@ if (browserRuntime) {
       testState.refs = [{ name: "main" }, { name: "feature/login" }];
       testState.createWorktree.mockResolvedValue(
         success({
-          worktree: { path: "/repo/.worktrees/feature-login-2", refName: "feature/login-2" },
+          threadId: "thread-created",
+          path: "/repo/.worktrees/feature-login",
+          refName: "feature/login",
         }),
       );
       const { container, root } = await mountDialog();
@@ -1385,21 +1377,25 @@ if (browserRuntime) {
       expect(testState.createWorktree).toHaveBeenCalledWith({
         environmentId: ENVIRONMENT_ID,
         input: {
-          cwd: "/repo",
+          commandId: "command-create-worktree",
+          projectId: PROJECT_ID,
+          threadId: "thread-created",
+          title: "feature/login",
           refName: "feature/login",
           newRefName: null,
           baseRefName: null,
-          path: null,
+          threadDefaults: {
+            modelSelection: expect.objectContaining({ instanceId: "codex" }),
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          },
         },
       });
-      expect(testState.createThread).toHaveBeenCalledWith(
-        expect.objectContaining({
-          input: expect.objectContaining({
-            title: "feature/login-2",
-            branch: "feature/login-2",
-          }),
-        }),
-      );
+      const managedInput = testState.createWorktree.mock.calls[0]?.[0].input;
+      expect(managedInput).not.toHaveProperty("cwd");
+      expect(managedInput).not.toHaveProperty("path");
+      expect(managedInput).not.toHaveProperty("worktreePath");
+      expect(managedInput).not.toHaveProperty("kind");
 
       await React.act(async () => root.unmount());
       container.remove();
@@ -1440,7 +1436,11 @@ if (browserRuntime) {
       ];
       testState.refs = [{ name: "remote-feature" }];
       testState.createWorktree.mockResolvedValue(
-        success({ worktree: { path: "/remote/worktree", refName: "remote-feature" } }),
+        success({
+          threadId: "thread-created",
+          path: "/remote/worktree",
+          refName: "remote-feature",
+        }),
       );
       const { container, root } = await mountDialog(true, remoteProjectRef);
 
@@ -1463,11 +1463,18 @@ if (browserRuntime) {
       expect(testState.createWorktree).toHaveBeenCalledWith({
         environmentId: remoteEnvironmentId,
         input: {
-          cwd: "/remote/repo",
+          commandId: "command-create-worktree",
+          projectId: PROJECT_ID,
+          threadId: "thread-created",
+          title: "remote-feature",
           refName: "remote-feature",
           newRefName: null,
           baseRefName: null,
-          path: null,
+          threadDefaults: {
+            modelSelection: expect.objectContaining({ instanceId: "codex" }),
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          },
         },
       });
 
@@ -1653,22 +1660,20 @@ if (browserRuntime) {
       expect(testState.createWorktree).toHaveBeenCalledWith({
         environmentId: ENVIRONMENT_ID,
         input: {
-          cwd: "/repo",
+          commandId: "command-create-worktree",
+          projectId: PROJECT_ID,
+          threadId: "thread-created",
+          title: "My-Feature",
           refName: "HEAD",
           newRefName: "My-Feature",
           baseRefName: "HEAD",
-          path: null,
+          threadDefaults: {
+            modelSelection: expect.objectContaining({ instanceId: "claude", model: "sonnet" }),
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          },
         },
       });
-      expect(testState.createThread).toHaveBeenCalledWith(
-        expect.objectContaining({
-          environmentId: ENVIRONMENT_ID,
-          input: expect.objectContaining({
-            threadId: "thread-created",
-            modelSelection: expect.objectContaining({ instanceId: "claude", model: "sonnet" }),
-          }),
-        }),
-      );
       expect(testState.onOpenChange).toHaveBeenCalledWith(false);
       expect(testState.navigate).toHaveBeenCalledWith({
         to: "/$environmentId/$threadId",

@@ -11,6 +11,7 @@ pub use backup::{
     StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup, create_verified_backup, inspect_store,
     inventory_verified_backups, preserve_and_start_empty, restore_backup,
 };
+pub(crate) use database::{CommitFence, CommitPermit};
 pub use database::{Database, PersistenceError, Result};
 pub use migrations::{MIGRATIONS, Migration, apply_migrations, pending_migrations, run_migrations};
 pub use repositories::*;

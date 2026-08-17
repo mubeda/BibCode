@@ -8,6 +8,7 @@ pub(crate) use source::{ProviderMaintenanceCapabilities, ProviderUpdateCommand};
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         path::Path,
         sync::{
             Arc,
@@ -24,6 +25,7 @@ mod tests {
 
     use super::latest::{ClaudeReleaseChannel, LatestVersionSource};
     use super::*;
+    use crate::test_support::TestSandbox;
 
     #[test]
     fn resolves_cross_platform_installation_sources() {
@@ -418,6 +420,20 @@ mod tests {
             binary_path: binary_path.to_owned(),
             environment: Vec::new(),
         }
+    }
+
+    fn sandbox_target(
+        sandbox: &TestSandbox,
+        driver: &str,
+        binary_path: &str,
+    ) -> ProviderMaintenanceTarget {
+        let mut target = target(driver, binary_path);
+        target.environment = sandbox
+            .environment(std::iter::empty::<(String, String)>())
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
+        target
     }
 
     fn global_npm_target(directory: &Path, driver: &str) -> ProviderMaintenanceTarget {
@@ -946,11 +962,14 @@ mod tests {
         assert!(concurrent_requests.load(Ordering::SeqCst) >= 2);
     }
 
-    fn output_command(bytes: usize) -> ProviderUpdateCommand {
+    fn output_command(sandbox: &TestSandbox, bytes: usize) -> ProviderUpdateCommand {
         if cfg!(windows) {
             ProviderUpdateCommand {
                 display: "powershell test output".to_owned(),
-                executable: "powershell.exe".to_owned(),
+                executable: sandbox
+                    .executable_on_path("powershell.exe")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec![
                     "-NoProfile".to_owned(),
                     "-NonInteractive".to_owned(),
@@ -962,7 +981,10 @@ mod tests {
         } else {
             ProviderUpdateCommand {
                 display: "sh test output".to_owned(),
-                executable: "sh".to_owned(),
+                executable: sandbox
+                    .executable_on_path("sh")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec![
                     "-c".to_owned(),
                     format!("head -c {bytes} /dev/zero | tr '\\0' x"),
@@ -972,11 +994,14 @@ mod tests {
         }
     }
 
-    fn exit_command(code: i32) -> ProviderUpdateCommand {
+    fn exit_command(sandbox: &TestSandbox, code: i32) -> ProviderUpdateCommand {
         if cfg!(windows) {
             ProviderUpdateCommand {
                 display: format!("powershell exit {code}"),
-                executable: "powershell.exe".to_owned(),
+                executable: sandbox
+                    .executable_on_path("powershell.exe")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec![
                     "-NoProfile".to_owned(),
                     "-NonInteractive".to_owned(),
@@ -988,18 +1013,24 @@ mod tests {
         } else {
             ProviderUpdateCommand {
                 display: format!("sh exit {code}"),
-                executable: "sh".to_owned(),
+                executable: sandbox
+                    .executable_on_path("sh")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec!["-c".to_owned(), format!("exit {code}")],
                 lock_key: "test-exit",
             }
         }
     }
 
-    fn sleep_command() -> ProviderUpdateCommand {
+    fn sleep_command(sandbox: &TestSandbox) -> ProviderUpdateCommand {
         if cfg!(windows) {
             ProviderUpdateCommand {
                 display: "powershell sleep".to_owned(),
-                executable: "powershell.exe".to_owned(),
+                executable: sandbox
+                    .executable_on_path("powershell.exe")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec![
                     "-NoProfile".to_owned(),
                     "-NonInteractive".to_owned(),
@@ -1011,7 +1042,10 @@ mod tests {
         } else {
             ProviderUpdateCommand {
                 display: "sleep 2".to_owned(),
-                executable: "sleep".to_owned(),
+                executable: sandbox
+                    .executable_on_path("sleep")
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec!["2".to_owned()],
                 lock_key: "test-sleep",
             }
@@ -1020,11 +1054,11 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_captures_bounded_output() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let command = output_command(12_000);
+        let sandbox = TestSandbox::new("provider-update-output");
+        let command = output_command(&sandbox, 12_000);
         let result = ProviderMaintenance::new()
             .run_update_command(
-                &target("cursor", "cursor-agent"),
+                &sandbox_target(&sandbox, "cursor", "cursor-agent"),
                 &command,
                 &CancellationToken::new(),
             )
@@ -1041,11 +1075,11 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_preserves_non_zero_exit_code() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let sandbox = TestSandbox::new("provider-update-exit");
         let result = ProviderMaintenance::new()
             .run_update_command(
-                &target("cursor", "cursor-agent"),
-                &exit_command(7),
+                &sandbox_target(&sandbox, "cursor", "cursor-agent"),
+                &exit_command(&sandbox, 7),
                 &CancellationToken::new(),
             )
             .await
@@ -1058,7 +1092,6 @@ mod tests {
     async fn update_command_applies_the_same_case_variant_path_used_for_resolution() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().expect("update PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
@@ -1109,11 +1142,11 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_timeout_stops_the_child() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let sandbox = TestSandbox::new("provider-update-timeout");
         let error = ProviderMaintenance::new()
             .run_update_command_with_timeout(
-                &target("cursor", "cursor-agent"),
-                &sleep_command(),
+                &sandbox_target(&sandbox, "cursor", "cursor-agent"),
+                &sleep_command(&sandbox),
                 &CancellationToken::new(),
                 Duration::from_millis(25),
             )
@@ -1125,7 +1158,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_claude_package_actions_run_through_cmd_shims() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("update shim directory");
         let winget_capture = directory.path().join("winget-args.txt");
         let npm_capture = directory.path().join("npm-args.txt");
@@ -1284,44 +1316,75 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn maintenance_classifies_the_instance_path_executable_instead_of_ambient_path() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let root = tempfile::tempdir().expect("maintenance executable root");
-        let ambient = root.path().join("ambient/.opencode/bin");
-        let instance = root.path().join("instance/.npm-global/bin");
+    async fn maintenance_instance_path_outranks_ambient_path_in_an_isolated_process() {
+        const CASE: &str = "provider-maintenance-path-precedence";
+        const TEST_NAME: &str = "production::provider_maintenance::tests::maintenance_instance_path_outranks_ambient_path_in_an_isolated_process";
+        const SENTINEL: &str =
+            "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-maintenance-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            assert_eq!(
+                resolve_provider_executable_with_environment(
+                    "opencode",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let target = ProviderMaintenanceTarget {
+                instance_id: "opencode-work".to_owned(),
+                driver: "opencode".to_owned(),
+                binary_path: "opencode".to_owned(),
+                environment: vec![("PaTh".into(), instance.as_os_str().to_owned())],
+            };
+
+            let capabilities = ProviderMaintenance::new().capabilities(&target).await;
+
+            assert_eq!(
+                capabilities
+                    .update
+                    .as_ref()
+                    .map(|update| update.display.as_str()),
+                Some("npm install -g opencode-ai@latest")
+            );
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-maintenance-path");
+        let ambient = sandbox.path("ambient/.opencode/bin");
+        let instance = sandbox.path("instance/.npm-global/bin");
         std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
-        std::fs::write(ambient.join("opencode"), b"ambient").expect("ambient executable");
+        let ambient_executable = ambient.join("opencode");
+        std::fs::write(&ambient_executable, b"ambient").expect("ambient executable");
         std::fs::write(instance.join("opencode"), b"instance").expect("instance executable");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", &ambient) };
-        let target = ProviderMaintenanceTarget {
-            instance_id: "opencode-work".to_owned(),
-            driver: "opencode".to_owned(),
-            binary_path: "opencode".to_owned(),
-            environment: vec![("PaTh".into(), instance.as_os_str().to_owned())],
-        };
-
-        let capabilities = ProviderMaintenance::new().capabilities(&target).await;
-
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
-        assert_eq!(
-            capabilities
-                .update
-                .as_ref()
-                .map(|update| update.display.as_str()),
-            Some("npm install -g opencode-ai@latest")
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+            ],
         );
+        assert!(
+            output.status.success(),
+            "isolated maintenance PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 }
 use std::{

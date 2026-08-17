@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
-        OrchestrationError, canonical_command_digest, engine::TurnDeliveryResolutionAction,
+        OrchestrationError, canonical_command_digest,
+        engine::{CommandLifetimeGuard, OptionalNullable, TurnDeliveryResolutionAction},
         load_snapshot,
     },
     persistence::{OrchestrationEvent, ProjectionThread},
@@ -24,6 +25,7 @@ use crate::{
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     server_settings::ProviderSettingsStore,
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
 use super::orchestration_effects::install_project_command_effects;
@@ -32,11 +34,20 @@ use super::provider_runtime::{
     freeze_delivery_route, route_orchestration_command,
 };
 use super::turn_delivery::TurnDeliveryService;
+use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 const STREAM_CAPACITY: usize = 16;
 
 pub fn register_orchestration_rpc(registry: &mut RpcRegistry, engine: OrchestrationEngine) {
-    register_orchestration_rpc_inner(registry, engine, None);
+    register_orchestration_rpc_inner(registry, engine, None, None);
+}
+
+pub fn register_orchestration_rpc_with_availability(
+    registry: &mut RpcRegistry,
+    engine: OrchestrationEngine,
+    availability: WorkspaceAvailabilityRegistry,
+) {
+    register_orchestration_rpc_inner(registry, engine, None, Some(availability));
 }
 
 pub fn register_orchestration_rpc_with_delivery(
@@ -56,6 +67,29 @@ pub fn register_orchestration_rpc_with_delivery(
             attachments,
             turn_delivery,
         }),
+        None,
+    );
+}
+
+pub fn register_orchestration_rpc_with_delivery_and_availability(
+    registry: &mut RpcRegistry,
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: WorkspaceAvailabilityRegistry,
+) {
+    let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
+    register_orchestration_rpc_inner(
+        registry,
+        engine,
+        Some(ProviderRegistration {
+            provider,
+            settings_root,
+            attachments,
+            turn_delivery,
+        }),
+        Some(availability),
     );
 }
 
@@ -71,18 +105,37 @@ fn register_orchestration_rpc_inner(
     registry: &mut RpcRegistry,
     engine: OrchestrationEngine,
     provider: Option<ProviderRegistration>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
 ) {
     install_project_command_effects(&engine);
+    let availability = availability
+        .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
     let dispatch = engine.clone();
     registry.register_unary("orchestration.dispatchCommand", move |request, _| {
         let dispatch = dispatch.clone();
         let provider = provider.clone();
+        let availability = availability.clone();
         async move {
             let payload_digest = canonical_command_digest(&request.payload)
                 .map_err(|error| invalid_request(&request.tag, error))?;
-            let command = serde_json::from_value::<OrchestrationCommand>(request.payload)
-                .map_err(|error| invalid_request(&request.tag, error.to_string()))?;
-            if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
+            let command = decode_public_orchestration_command(&dispatch, request.payload)
+                .await
+                .map_err(|error| invalid_request(&request.tag, error))?;
+            let command_claim = dispatch
+                .acquire_command_admission(command.command_id())
+                .await
+                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+                let workspace_admission = if let Some(availability) = &availability {
+                    Some(
+                        availability
+                            .acquire_thread(thread_id, std::iter::empty())
+                            .await
+                            .map_err(workspace_admission_error)?,
+                    )
+                } else {
+                    None
+                };
                 let provider = provider.ok_or_else(|| {
                     invalid_request(
                         &request.tag,
@@ -95,11 +148,20 @@ fn register_orchestration_rpc_inner(
                     command,
                     payload_digest,
                     request.tag,
+                    workspace_admission,
+                    command_claim,
                 )
                 .await;
             }
-            dispatch_prepared_command(dispatch, provider, command, payload_digest, request.tag)
-                .await
+            dispatch_prepared_command(
+                dispatch,
+                provider,
+                command,
+                payload_digest,
+                request.tag,
+                command_claim,
+            )
+            .await
         }
     });
 
@@ -139,12 +201,137 @@ fn register_orchestration_rpc_inner(
     );
 }
 
+/// Decodes the public orchestration wire shape and resolves the small amount of
+/// server-owned context that ordinary commands need. Worktree policy, identity,
+/// lifecycle kind, and adopted-owner deletion are deliberately not part of this
+/// generic ingress.
+pub(crate) async fn decode_public_orchestration_command(
+    engine: &OrchestrationEngine,
+    payload: Value,
+) -> Result<OrchestrationCommand, String> {
+    let supplied_prepare_cwd = payload
+        .get("bootstrap")
+        .and_then(|bootstrap| bootstrap.get("prepareWorktree"))
+        .and_then(Value::as_object)
+        .is_some_and(|prepare| prepare.contains_key("projectCwd"));
+    let mut command = serde_json::from_value::<OrchestrationCommand>(payload)
+        .map_err(|error| error.to_string())?;
+    if command.is_server_internal() {
+        return Err(
+            "server-internal orchestration commands cannot be dispatched by clients".to_owned(),
+        );
+    }
+
+    const DEDICATED_AUTHORITY: &str = "worktree authority requires a dedicated server-resolved RPC";
+    match &command {
+        OrchestrationCommand::ProjectMetaUpdate {
+            worktree_discovery: Some(_),
+            ..
+        }
+        | OrchestrationCommand::ThreadCreate { kind: Some(_), .. }
+        | OrchestrationCommand::ThreadCreate {
+            worktree_path: Some(_),
+            ..
+        }
+        | OrchestrationCommand::ThreadMetaUpdate {
+            worktree_path: OptionalNullable::Present(_),
+            ..
+        } => return Err(DEDICATED_AUTHORITY.to_owned()),
+        OrchestrationCommand::ThreadTurnStart {
+            bootstrap: Some(bootstrap),
+            ..
+        } if supplied_prepare_cwd
+            || bootstrap
+                .create_thread
+                .as_ref()
+                .is_some_and(|create| create.worktree_path.is_some()) =>
+        {
+            return Err(DEDICATED_AUTHORITY.to_owned());
+        }
+        OrchestrationCommand::ThreadDelete { thread_id, .. } => {
+            if engine
+                .repositories()
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some_and(|thread| {
+                    thread.deleted_at.is_none()
+                        && thread.kind == "workspace"
+                        && thread.worktree_path.is_some()
+                })
+            {
+                return Err(DEDICATED_AUTHORITY.to_owned());
+            }
+        }
+        OrchestrationCommand::ProjectDelete { project_id, .. }
+            if engine
+                .repositories()
+                .list_threads_by_project(project_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .any(|thread| {
+                    thread.deleted_at.is_none()
+                        && thread.kind == "workspace"
+                        && thread.worktree_path.is_some()
+                }) =>
+        {
+            return Err(DEDICATED_AUTHORITY.to_owned());
+        }
+        _ => {}
+    }
+
+    if let OrchestrationCommand::ThreadCreate {
+        project_id, kind, ..
+    } = &mut command
+    {
+        let has_default = engine
+            .repositories()
+            .list_threads_by_project(project_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .any(|thread| thread.deleted_at.is_none() && thread.kind == "default");
+        *kind = Some(if has_default { "workspace" } else { "default" }.to_owned());
+    }
+
+    if let OrchestrationCommand::ThreadTurnStart {
+        thread_id,
+        bootstrap: Some(bootstrap),
+        ..
+    } = &mut command
+        && let Some(prepare) = bootstrap.prepare_worktree.as_mut()
+    {
+        let project_id = if let Some(create) = bootstrap.create_thread.as_ref() {
+            create.project_id.clone()
+        } else {
+            engine
+                .repositories()
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("thread '{thread_id}' does not exist"))?
+                .project_id
+        };
+        prepare.project_cwd = engine
+            .repositories()
+            .get_project(project_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|project| project.deleted_at.is_none())
+            .ok_or_else(|| format!("project '{project_id}' does not exist"))?
+            .workspace_root;
+    }
+    Ok(command)
+}
+
 async fn dispatch_prepared_command(
     dispatch: OrchestrationEngine,
     provider: Option<ProviderRegistration>,
     command: OrchestrationCommand,
     payload_digest: String,
     request_tag: String,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
     let delivery_cancellation = match &command {
         OrchestrationCommand::ThreadTurnDeliveryResolve {
@@ -168,15 +355,26 @@ async fn dispatch_prepared_command(
     let legacy_replay = existing_receipt
         .as_ref()
         .is_some_and(|receipt| receipt.payload_digest.is_none());
-    let route_before_admission = existing_receipt.is_none()
+    let route_before_admission = if !legacy_replay
         && matches!(
             &command,
             OrchestrationCommand::ThreadMetaUpdate {
                 model_selection: Some(_),
                 ..
             }
-        );
+        ) {
+        dispatch
+            .reserve_generic_command_admission(&command_claim, &command, &payload_digest)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
+    } else {
+        false
+    };
     if route_before_admission && let Some(provider) = provider.as_ref() {
+        #[cfg(test)]
+        dispatch
+            .test_hooks()
+            .note_generic_external_preparation_attempt();
         route_orchestration_command(
             &provider.provider,
             &dispatch,
@@ -188,7 +386,9 @@ async fn dispatch_prepared_command(
     }
     let accepted_new = Arc::new(AtomicBool::new(false));
     let result = if legacy_replay {
-        dispatch.dispatch(command.clone()).await
+        dispatch
+            .dispatch_with_command_claim(command.clone(), command_claim)
+            .await
     } else {
         let turn_delivery = is_delivery_resolution
             .then(|| {
@@ -199,13 +399,14 @@ async fn dispatch_prepared_command(
             .flatten();
         let committed = accepted_new.clone();
         dispatch
-            .dispatch_with_admission(
+            .dispatch_with_admission_and_command_claim(
                 command.clone(),
                 CommandAdmission {
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
                 },
+                command_claim,
                 move || {
                     committed.store(true, Ordering::Release);
                     if let Some(turn_delivery) = turn_delivery {
@@ -264,18 +465,78 @@ async fn dispatch_turn_command(
     command: OrchestrationCommand,
     payload_digest: String,
     request_tag: String,
+    workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
-    if let Some(replay) = preflight_turn_replay(
-        &dispatch,
-        command.clone(),
-        payload_digest.clone(),
-        &request_tag,
-    )
-    .await?
+    let existing_receipt = dispatch
+        .repositories()
+        .get_command_receipt(command.command_id().to_owned())
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if existing_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.payload_digest.is_none())
     {
-        return replay;
+        let result = dispatch
+            .dispatch_with_command_claim(command, command_claim)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        return serde_json::to_value(result)
+            .map_err(|error| invalid_request(&request_tag, error.to_string()));
     }
 
+    let prepare_external = dispatch
+        .reserve_generic_command_admission(&command_claim, &command, &payload_digest)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if !prepare_external {
+        let result = dispatch
+            .dispatch_with_admission_and_command_claim(
+                command,
+                CommandAdmission {
+                    payload_digest,
+                    attachment_refs: Vec::new(),
+                    provider_turn: None,
+                },
+                command_claim,
+                || {},
+            )
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        return serde_json::to_value(result)
+            .map_err(|error| invalid_request(&request_tag, error.to_string()));
+    }
+
+    let reserved_command = command.clone();
+    let reserved_digest = payload_digest.clone();
+    let result = dispatch_reserved_turn_command(
+        dispatch.clone(),
+        provider,
+        command,
+        payload_digest,
+        request_tag.clone(),
+        workspace_admission,
+        command_claim.clone(),
+    )
+    .await;
+    if result.is_err() {
+        dispatch
+            .release_generic_command_admission(&command_claim, &reserved_command, &reserved_digest)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    }
+    result
+}
+
+async fn dispatch_reserved_turn_command(
+    dispatch: OrchestrationEngine,
+    provider: ProviderRegistration,
+    command: OrchestrationCommand,
+    payload_digest: String,
+    request_tag: String,
+    workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
+) -> RpcResult {
     let (command, prepared_batch) = prepare_attachments(&provider.attachments, command)
         .await
         .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
@@ -313,52 +574,53 @@ async fn dispatch_turn_command(
         }),
     };
     let turn_delivery = provider.turn_delivery.clone();
-    let result = dispatch
-        .dispatch_with_admission(command, admission, move || {
-            if let Some(batch) = prepared_batch {
-                batch.commit();
-            }
-            turn_delivery.wake();
-        })
-        .await
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-    serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
-}
-
-async fn preflight_turn_replay(
-    dispatch: &OrchestrationEngine,
-    command: OrchestrationCommand,
-    payload_digest: String,
-    request_tag: &str,
-) -> Result<Option<RpcResult>, Value> {
-    if let Some(receipt) = dispatch
-        .repositories()
-        .get_command_receipt(command.command_id().to_owned())
-        .await
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
-    {
-        let result = if receipt.payload_digest.is_none() {
-            dispatch.dispatch(command).await
-        } else {
-            dispatch
-                .dispatch_with_admission(
-                    command,
-                    CommandAdmission {
-                        payload_digest,
-                        attachment_refs: Vec::new(),
-                        provider_turn: None,
-                    },
-                    || {},
-                )
-                .await
+    let on_commit = move || {
+        if let Some(batch) = prepared_batch {
+            batch.commit();
         }
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-        return Ok(Some(
-            serde_json::to_value(result)
-                .map_err(|error| invalid_request(request_tag, error.to_string())),
-        ));
+        turn_delivery.wake();
+    };
+    let result = if let Some(workspace_admission) = workspace_admission {
+        let loss = workspace_admission.loss_cancellation();
+        let commit_fence = workspace_admission.commit_fence();
+        let lifetime =
+            CommandLifetimeGuard::new(workspace_admission, loss.cancellation_token(), commit_fence);
+        let dispatch = dispatch.dispatch_with_admission_lifetime_and_command_claim(
+            command,
+            admission,
+            lifetime,
+            command_claim,
+            on_commit,
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                let unavailable = loss
+                    .unavailable()
+                    .expect("workspace loss cancellation retains its error");
+                return Err(workspace_admission_error(
+                    WorkspaceAdmissionError::Unavailable(unavailable),
+                ));
+            }
+            result = &mut dispatch => {
+                if matches!(result, Err(OrchestrationError::Cancelled))
+                    && let Some(unavailable) = loss.unavailable()
+                {
+                    return Err(workspace_admission_error(
+                        WorkspaceAdmissionError::Unavailable(unavailable),
+                    ));
+                }
+                result
+            },
+        }
+    } else {
+        dispatch
+            .dispatch_with_admission_and_command_claim(command, admission, command_claim, on_commit)
+            .await
     }
-    Ok(None)
+    .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
 }
 
 async fn turn_identity(
@@ -493,6 +755,9 @@ fn shell_stream(
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    // Subscribe before loading the initial snapshot so an event committed in
+    // between is queued for the stream instead of disappearing in that gap.
+    let mut events = engine.subscribe_events();
     tokio::spawn(async move {
         if send_snapshot(&sender, shell_snapshot(&engine, false).await)
             .await
@@ -500,7 +765,6 @@ fn shell_stream(
         {
             return;
         }
-        let mut events = engine.subscribe_events();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
@@ -524,21 +788,25 @@ fn thread_stream(
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
-    tokio::spawn(async move {
-        let input = match decode::<SubscribeThreadInput>(request) {
-            Ok(input) => input,
-            Err(error) => {
+    let input = match decode::<SubscribeThreadInput>(request) {
+        Ok(input) => input,
+        Err(error) => {
+            tokio::spawn(async move {
                 let _ = sender.send(Err(error)).await;
-                return;
-            }
-        };
+            });
+            return receiver;
+        }
+    };
+    // Match the shell stream's subscribe-before-snapshot ordering. Provider
+    // startup can publish a session update while this snapshot is loading.
+    let mut events = engine.subscribe_events();
+    tokio::spawn(async move {
         if send_snapshot(&sender, thread_snapshot(&engine, &input.thread_id).await)
             .await
             .is_err()
         {
             return;
         }
-        let mut events = engine.subscribe_events();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
@@ -588,6 +856,7 @@ pub async fn shell_snapshot(engine: &OrchestrationEngine, archived: bool) -> Rpc
                 "workspaceRoot": project.workspace_root,
                 "defaultModelSelection": project.default_model_selection,
                 "scripts": project.scripts,
+                "worktreeDiscovery": project.worktree_discovery,
                 "createdAt": project.created_at,
                 "updatedAt": project.updated_at,
             })
@@ -822,6 +1091,20 @@ fn orchestration_error(tag: &str, error: impl std::fmt::Display) -> Value {
     json!({ "_tag": tag, "message": error.to_string() })
 }
 
+fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        }
+        WorkspaceAdmissionError::Identity(error) => {
+            serde_json::to_value(error).expect("workspace identity error serializes")
+        }
+        WorkspaceAdmissionError::Resolution(error) => {
+            orchestration_error("OrchestrationDispatchCommandError", error)
+        }
+    }
+}
+
 fn provider_command_error(error: impl std::fmt::Display) -> Value {
     orchestration_error("OrchestrationDispatchCommandError", error)
 }
@@ -873,13 +1156,18 @@ mod tests {
         persistence::{Database, run_migrations},
         production::{
             provider_runtime::{
-                BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderLaunchRequest,
-                ProviderRuntimeError, SupervisorOptions,
+                BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderEvent,
+                ProviderLaunchRequest, ProviderRuntimeError, StartedSession, SupervisorOptions,
             },
             turn_delivery::DeliveryRouter,
         },
+        provider::attachments::AttachmentPrepareTestPause,
+        worktree_catalog::{
+            AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+        },
     };
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicUsize;
     use tokio_tungstenite::tungstenite::Message;
 
     const CREATED_AT: &str = "2026-07-11T00:00:00.000Z";
@@ -896,6 +1184,141 @@ mod tests {
                     provider: request.provider,
                 })
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct ModelMutationProbe {
+        set_model_calls: AtomicUsize,
+        fail_set_model_calls: AtomicUsize,
+        pause_next_set_model: std::sync::Mutex<Option<Arc<ModelMutationPause>>>,
+    }
+
+    #[derive(Default)]
+    struct ModelMutationPause {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ModelMutationProbe {
+        fn pause_next_set_model(&self) -> Arc<ModelMutationPause> {
+            let pause = Arc::new(ModelMutationPause::default());
+            *self
+                .pause_next_set_model
+                .lock()
+                .expect("model mutation pause mutex") = Some(pause.clone());
+            pause
+        }
+    }
+
+    impl ProviderDriver for ModelMutationProbe {
+        fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+            Box::pin(async { Ok(StartedSession::default()) })
+        }
+
+        fn send(
+            &self,
+            _text: String,
+            _attachments: Vec<Value>,
+            _interaction_mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn interrupt(
+            &self,
+            _turn_id: Option<String>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn approve(
+            &self,
+            _request_id: String,
+            _decision: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn answer(
+            &self,
+            _request_id: String,
+            _answers: Value,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_mode(
+            &self,
+            _mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_model(
+            &self,
+            _model: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            self.set_model_calls.fetch_add(1, Ordering::SeqCst);
+            let pause = self
+                .pause_next_set_model
+                .lock()
+                .expect("model mutation pause mutex")
+                .take();
+            let fail = self
+                .fail_set_model_calls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move {
+                if let Some(pause) = pause {
+                    pause.entered.notify_one();
+                    pause.release.notified().await;
+                }
+                if fail {
+                    Err(ProviderRuntimeError::Provider {
+                        provider: "probe".to_owned(),
+                        detail: "injected model mutation failure".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn set_options(
+            &self,
+            _options: Vec<Value>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(
+            &self,
+            _turn_count: i64,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ModelMutationProbeFactory(Arc<ModelMutationProbe>);
+
+    impl ProviderDriverFactory for ModelMutationProbeFactory {
+        fn create(
+            &self,
+            _request: ProviderLaunchRequest,
+        ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+            let probe: Arc<dyn ProviderDriver> = self.0.clone();
+            Box::pin(async move { Ok(probe) })
         }
     }
 
@@ -1039,12 +1462,41 @@ mod tests {
         command: OrchestrationCommand,
     ) -> RpcResult {
         let payload_digest = canonical_command_digest(&command).expect("command digest");
+        let command_claim = engine
+            .acquire_command_admission(command.command_id())
+            .await
+            .expect("test command claim");
         dispatch_prepared_command(
             engine.clone(),
             provider,
             command,
             payload_digest,
             "orchestration.dispatchCommand".to_owned(),
+            command_claim,
+        )
+        .await
+    }
+
+    async fn dispatch_turn_for_test(
+        engine: OrchestrationEngine,
+        provider: ProviderRegistration,
+        command: OrchestrationCommand,
+        payload_digest: String,
+        request_tag: String,
+        workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    ) -> RpcResult {
+        let command_claim = engine
+            .acquire_command_admission(command.command_id())
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        dispatch_turn_command(
+            engine,
+            provider,
+            command,
+            payload_digest,
+            request_tag,
+            workspace_admission,
+            command_claim,
         )
         .await
     }
@@ -1365,12 +1817,13 @@ mod tests {
             .expect("events before replay")
             .len();
 
-        let replay = dispatch_turn_command(
+        let replay = dispatch_turn_for_test(
             engine.clone(),
             registration.clone(),
             accepted,
             "ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
+            None,
         )
         .await
         .expect("legacy accepted turn replays its stored result");
@@ -1378,12 +1831,13 @@ mod tests {
             replay,
             serde_json::to_value(original).expect("original result")
         );
-        let rejection = dispatch_turn_command(
+        let rejection = dispatch_turn_for_test(
             engine.clone(),
             registration,
             rejected,
             "different ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
+            None,
         )
         .await
         .expect_err("legacy rejected turn remains rejected");
@@ -1413,6 +1867,197 @@ mod tests {
         }
 
         service.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn losing_turn_admission_never_prepares_external_attachments() {
+        let hooks = TestHooks::default();
+        let (database, engine, thread_id) = delivery_engine(hooks.clone()).await;
+        let state = tempfile::tempdir().expect("provider state");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let (registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            delivery.clone(),
+        );
+        let command = decode_command(json!({
+            "type":"thread.turn.start",
+            "commandId":"attachment-admission-race",
+            "threadId":thread_id,
+            "message":{
+                "messageId":"attachment-admission-message",
+                "role":"user",
+                "text":"review",
+                "attachments":[{
+                    "type":"file",
+                    "id":"attachment-admission-file",
+                    "name":"notes.txt",
+                    "mimeType":"text/plain",
+                    "sizeBytes":5,
+                    "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "createdAt":CREATED_AT
+        }));
+        let payload_digest = canonical_command_digest(&command).expect("turn digest");
+        let removal_claim = engine
+            .acquire_command_admission("attachment-admission-race")
+            .await
+            .expect("removal owns absent turn identity");
+        engine
+            .reserve_worktree_removal_admission(
+                &removal_claim,
+                "attachment-admission-race",
+                "removal-project",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves the absent turn identity");
+        let dispatch_engine = engine.clone();
+        let mut dispatch = tokio::spawn(async move {
+            dispatch_turn_for_test(
+                dispatch_engine,
+                registration,
+                command,
+                payload_digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut dispatch)
+                .await
+                .is_err(),
+            "turn must wait while removal owns the command ID"
+        );
+        drop(removal_claim);
+
+        let error = dispatch
+            .await
+            .expect("turn dispatch joins")
+            .expect_err("losing turn conflicts");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
+        );
+        assert!(
+            !state.path().join("attachments").exists(),
+            "losing admission must not initialize or publish the attachment store"
+        );
+
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_matching_turn_replays_without_repreparing_attachments() {
+        let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let state = tempfile::tempdir().expect("provider state");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let (mut registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            delivery.clone(),
+        );
+        let publication = Arc::new(AttachmentPrepareTestPause::default());
+        registration.attachments = AttachmentMaterializer::new(state.path().join("attachments"))
+            .with_pause_after_final_publication(publication.clone());
+        let command = decode_command(json!({
+            "type":"thread.turn.start",
+            "commandId":"concurrent-attachment-command",
+            "threadId":thread_id,
+            "message":{
+                "messageId":"concurrent-attachment-message",
+                "role":"user",
+                "text":"review",
+                "attachments":[{
+                    "type":"file",
+                    "id":"concurrent-attachment-file",
+                    "name":"notes.txt",
+                    "mimeType":"text/plain",
+                    "sizeBytes":5,
+                    "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "createdAt":CREATED_AT
+        }));
+        let digest = canonical_command_digest(&command).expect("turn digest");
+        let first_engine = engine.clone();
+        let first_registration = registration.clone();
+        let first_command = command.clone();
+        let first_digest = digest.clone();
+        let first = tokio::spawn(async move {
+            dispatch_turn_for_test(
+                first_engine,
+                first_registration,
+                first_command,
+                first_digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            publication.wait_until_reached(),
+        )
+        .await
+        .expect("first claimant publishes attachment");
+        let second_engine = engine.clone();
+        let mut second = tokio::spawn(async move {
+            dispatch_turn_for_test(
+                second_engine,
+                registration,
+                command,
+                digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "matching turn must wait for the live claimant"
+        );
+        std::fs::write(
+            state
+                .path()
+                .join("attachments")
+                .join("concurrent-attachment-file"),
+            b"other",
+        )
+        .expect("corrupt the published file to expose duplicate preparation");
+        publication.release();
+        let first_result = first
+            .await
+            .expect("first turn joins")
+            .expect("first turn accepts");
+        let second_result = second
+            .await
+            .expect("second turn joins")
+            .expect("matching turn replays without attachment preparation");
+        assert_eq!(second_result, first_result);
+
+        delivery.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;
     }
@@ -1482,6 +2127,278 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn losing_generic_admission_never_reaches_the_provider() {
+        let hooks = TestHooks::default();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        engine
+            .dispatch(decode_command(json!({
+                "type":"project.create",
+                "commandId":"provider-race-project-create",
+                "projectId":"provider-race-project",
+                "title":"Provider Race Project",
+                "workspaceRoot":"C:/provider-race-project",
+                "defaultModelSelection":null,
+                "createdAt":CREATED_AT
+            })))
+            .await
+            .expect("project created");
+        engine
+            .dispatch(decode_command(json!({
+                "type":"thread.create",
+                "commandId":"provider-race-thread-create",
+                "threadId":"provider-race-thread",
+                "projectId":"provider-race-project",
+                "title":"Provider Race Thread",
+                "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":null,
+                "createdAt":CREATED_AT
+            })))
+            .await
+            .expect("thread created");
+
+        let probe = Arc::new(ModelMutationProbe::default());
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(ModelMutationProbeFactory(probe.clone())),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let state = tempfile::tempdir().expect("provider state");
+        provider
+            .launch(ProviderLaunchRequest {
+                thread_id: "provider-race-thread".to_owned(),
+                activity_causal_revision: 0,
+                provider: "codex".to_owned(),
+                provider_label: "Codex".to_owned(),
+                provider_instance_id: Some("codex".to_owned()),
+                binary_path: "probe".to_owned(),
+                cwd: state.path().to_path_buf(),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                options: Vec::new(),
+                service_tier: None,
+                effort: None,
+                agent: None,
+                resume_cursor: None,
+                environment: Default::default(),
+                endpoint: None,
+                server_password: None,
+                mcp: None,
+                codex_home: None,
+            })
+            .await
+            .expect("provider launches");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let registration = ProviderRegistration {
+            provider: provider.clone(),
+            settings_root: state.path().to_path_buf(),
+            attachments: AttachmentMaterializer::new(state.path().join("attachments")),
+            turn_delivery: delivery.clone(),
+        };
+        let command = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-race-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+        }));
+        let removal_claim = engine
+            .acquire_command_admission("provider-race-command")
+            .await
+            .expect("removal owns absent provider command identity");
+        let reserved = engine
+            .reserve_worktree_removal_admission(
+                &removal_claim,
+                "provider-race-command",
+                "provider-race-project",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves the absent command identity");
+        assert!(reserved.0.is_none());
+        let generic_engine = engine.clone();
+        let racing_registration = registration.clone();
+        let mut generic = tokio::spawn(async move {
+            dispatch_prepared_for_test(&generic_engine, Some(racing_registration), command).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut generic)
+                .await
+                .is_err(),
+            "generic provider command must wait while removal owns the command ID"
+        );
+        drop(removal_claim);
+
+        let error = generic
+            .await
+            .expect("generic dispatch joins")
+            .expect_err("losing generic admission conflicts");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            0,
+            "a losing generic command must not mutate the provider"
+        );
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("provider-race-command".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("removal receipt");
+        assert_eq!(receipt.status, "reserved");
+        assert_eq!(receipt.payload_digest.as_deref(), Some("removal-payload"));
+
+        probe.fail_set_model_calls.store(1, Ordering::SeqCst);
+        let resumable = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-resume-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+        }));
+        dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable.clone())
+            .await
+            .expect_err("injected provider failure leaves exact admission resumable");
+        let calls_after_failure = probe.set_model_calls.load(Ordering::SeqCst);
+        assert!(calls_after_failure > 0);
+        let reserved = engine
+            .repositories()
+            .get_command_receipt("provider-resume-command".to_owned())
+            .await
+            .expect("resumable receipt read")
+            .expect("resumable receipt");
+        assert_eq!(reserved.status, "reserved");
+        assert_eq!(
+            reserved.payload_digest.as_deref(),
+            Some(
+                canonical_command_digest(&resumable)
+                    .expect("resume digest")
+                    .as_str()
+            )
+        );
+
+        let accepted =
+            dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable.clone())
+                .await
+                .expect("same-digest retry resumes provider mutation and durable admission");
+        let calls_after_retry = probe.set_model_calls.load(Ordering::SeqCst);
+        assert!(calls_after_retry > calls_after_failure);
+        assert_eq!(
+            dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable)
+                .await
+                .expect("accepted retry replays"),
+            accepted
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_after_retry,
+            "accepted replay must not repeat provider mutation"
+        );
+        let changed = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-resume-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.2"}
+        }));
+        dispatch_prepared_for_test(&engine, Some(registration.clone()), changed)
+            .await
+            .expect_err("changed payload conflicts before provider mutation");
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_after_retry
+        );
+
+        let concurrent = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-concurrent-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.3"}
+        }));
+        let calls_before_concurrent = probe.set_model_calls.load(Ordering::SeqCst);
+        let preparations_before_concurrent = hooks.generic_external_preparation_attempts();
+        let provider_pause = probe.pause_next_set_model();
+        let first_engine = engine.clone();
+        let first_registration = registration.clone();
+        let first_command = concurrent.clone();
+        let first = tokio::spawn(async move {
+            dispatch_prepared_for_test(&first_engine, Some(first_registration), first_command).await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider_pause.entered.notified(),
+        )
+        .await
+        .expect("first matching claimant reaches provider mutation");
+        let second_engine = engine.clone();
+        let second_registration = registration.clone();
+        let mut second = tokio::spawn(async move {
+            dispatch_prepared_for_test(&second_engine, Some(second_registration), concurrent).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the matching waiter must not complete while the live claimant owns preparation"
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_before_concurrent + 1,
+            "matching live claimants must coalesce to one provider mutation"
+        );
+        assert_eq!(
+            hooks.generic_external_preparation_attempts(),
+            preparations_before_concurrent + 1,
+            "the matching waiter must replay without entering provider preparation"
+        );
+        provider_pause.release.notify_one();
+        let first_result = first
+            .await
+            .expect("first matching claimant joins")
+            .expect("first matching claimant succeeds");
+        let second_result = second
+            .await
+            .expect("second matching claimant joins")
+            .expect("second matching claimant replays");
+        assert_eq!(second_result, first_result);
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_before_concurrent + 1,
+            "accepted replay must not reroute after waiting"
+        );
+
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;
     }
 
@@ -1623,6 +2540,631 @@ mod tests {
             .expect("close registered RPC socket");
         handle.shutdown();
         handle.join().await.expect("registered RPC server joins");
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_cannot_commit_after_authoritative_workspace_loss() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let hooks = TestHooks::default();
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        let state = tempfile::tempdir().expect("provider state");
+        engine
+            .dispatch(decode_command(json!({
+                "type": "project.create",
+                "commandId": "loss-project-create",
+                "projectId": "loss-project",
+                "title": "Loss project",
+                "workspaceRoot": state.path(),
+                "defaultModelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("project created");
+        let thread_id = load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(NeverFactory),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let router: DeliveryRouter = Arc::new(|_| Box::pin(async { Ok(()) }));
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            router,
+        ));
+        let availability = WorkspaceAvailabilityRegistry::new();
+        let mut registry = RpcRegistry::empty();
+        register_orchestration_rpc_with_delivery_and_availability(
+            &mut registry,
+            engine.clone(),
+            provider.clone(),
+            state.path().to_path_buf(),
+            delivery.clone(),
+            availability.clone(),
+        );
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(state.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+            registry,
+        )
+        .await
+        .expect("registered RPC server starts");
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/ws", handle.local_addr()))
+                .await
+                .expect("registered RPC socket connects");
+        let durable_after_disconnect = json!({
+            "type": "thread.turn.start",
+            "commandId": "disconnect-only-turn",
+            "threadId": thread_id,
+            "message": {
+                "messageId": "disconnect-only-message",
+                "role": "user",
+                "text": "must retain durable handoff",
+                "attachments": []
+            },
+            "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+            "createdAt": CREATED_AT
+        });
+        let disconnect_pause = hooks.pause_before_next_command_persist();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "6",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": durable_after_disconnect,
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send disconnect-only turn request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            disconnect_pause.wait_until_entered(),
+        )
+        .await
+        .expect("disconnect-only turn reaches persistence");
+        socket
+            .send(Message::Text(
+                json!({"_tag": "Interrupt", "requestId": "6"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("interrupt disconnect-only request");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("disconnect-only interrupt response timeout")
+            .expect("disconnect-only interrupt response")
+            .expect("disconnect-only interrupt frame");
+        disconnect_pause.release();
+        let disconnect_scope = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 0,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&disconnect_scope),
+        )
+        .await
+        .expect("queued command retains and then releases its admission lease");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("disconnect-only-turn".to_owned())
+                .await
+                .expect("disconnect-only receipt")
+                .is_some(),
+            "RPC interruption alone preserves durable command handoff"
+        );
+        dispatch_registered_command(&mut socket, "9", durable_after_disconnect)
+            .await
+            .expect("interrupted durable command replays exactly");
+        let event_count_before_loss_turn = engine
+            .read_events(0)
+            .await
+            .expect("events before loss turn")
+            .len();
+
+        let pause = hooks.pause_before_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "7",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "loss-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "loss-message",
+                            "role": "user",
+                            "text": "must not commit after loss",
+                            "attachments": []
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send turn request");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                () = pause.wait_until_entered() => {}
+                frame = socket.next() => panic!("turn exited before persistence: {frame:?}"),
+            }
+        })
+        .await
+        .expect("turn reaches the SQLite pre-finalization barrier");
+        socket
+            .send(Message::Text(
+                json!({"_tag": "Interrupt", "requestId": "7"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("interrupt turn request");
+        let interrupted = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("interrupt response timeout")
+            .expect("interrupt response")
+            .expect("interrupt frame");
+        assert!(matches!(interrupted, Message::Text(_)));
+
+        let loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 1,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        assert!(
+            availability
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
+        pause.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&loss),
+        )
+        .await
+        .expect("workspace admission drains after the SQLite barrier releases");
+
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("loss-turn".to_owned())
+            .await
+            .expect("receipt lookup");
+        let outbox = engine
+            .repositories()
+            .get_provider_turn_delivery("loss-turn".to_owned())
+            .await
+            .expect("outbox lookup");
+        let event_count_after_loss_turn = engine
+            .read_events(0)
+            .await
+            .expect("events after loss turn")
+            .len();
+        let messages = thread_snapshot(&engine, &thread_id)
+            .await
+            .expect("thread snapshot")["thread"]["messages"]
+            .as_array()
+            .expect("messages")
+            .clone();
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message["id"] == "disconnect-only-message" })
+        );
+        assert!(
+            receipt.is_none()
+                && outbox.is_none()
+                && event_count_after_loss_turn == event_count_before_loss_turn
+                && !messages
+                    .iter()
+                    .any(|message| message["id"] == "loss-message"),
+            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, events_before={event_count_before_loss_turn}, events_after={event_count_after_loss_turn}, message={} ",
+            receipt.is_some(),
+            outbox.is_some(),
+            messages
+                .iter()
+                .any(|message| message["id"] == "loss-message"),
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await
+            .expect("physical identity resolves");
+        for (suffix, generation, source_plan) in [
+            ("accepted", 2_u64, None),
+            ("rejected", 3_u64, Some("missing-forced-order-plan")),
+        ] {
+            let finalization_pause = hooks.pause_before_next_command_finalization();
+            let rejection_pause = availability.pause_after_next_finalization_rejection();
+            let mut payload = json!({
+                "type": "thread.turn.start",
+                "commandId": format!("forced-order-{suffix}-turn"),
+                "threadId": thread_id,
+                "message": {
+                    "messageId": format!("forced-order-{suffix}-message"),
+                    "role": "user",
+                    "text": "loss must retain its exact public error",
+                    "attachments": []
+                },
+                "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                "createdAt": CREATED_AT
+            });
+            if let Some(plan_id) = source_plan {
+                payload["sourceProposedPlan"] = json!({
+                    "threadId": thread_id,
+                    "planId": plan_id,
+                });
+            }
+            let request = dispatch_registered_command(&mut socket, "12", payload);
+            tokio::pin!(request);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    () = finalization_pause.wait_until_entered() => {}
+                    result = &mut request => panic!("forced-order turn exited before finalization: {result:?}"),
+                }
+            })
+            .await
+            .expect("forced-order turn reaches pre-finalization barrier");
+
+            let forced_loss = WorkspaceLossTransition {
+                thread_id: thread_id.clone(),
+                repository_key: "loss-repository".to_owned(),
+                generation,
+                path: state.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            };
+            let loss_availability = availability.clone();
+            let loss_transition = forced_loss.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let loss_task = tokio::task::spawn_blocking(move || {
+                runtime.block_on(loss_availability.mark_unavailable(loss_transition))
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rejection_pause.wait_until_entered(),
+            )
+            .await
+            .expect("loss rejects finalization before publishing cancellation");
+            finalization_pause.release();
+
+            let error = request
+                .await
+                .expect_err("loss-wins RPC returns a typed failure");
+            rejection_pause.release();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), loss_task)
+                    .await
+                    .expect("forced-order loss completes")
+                    .expect("forced-order loss joins")
+                    .expect("physical identity resolves")
+            );
+            assert_eq!(
+                error[0]["error"]["_tag"], "WorkspaceUnavailableError",
+                "accepted and rejected persistence must not expose generic cancellation"
+            );
+            assert_eq!(error[0]["error"]["threadId"], thread_id);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                availability.wait_for_transition_admissions(&forced_loss),
+            )
+            .await
+            .expect("forced-order admission drains");
+            assert!(
+                engine
+                    .repositories()
+                    .get_command_receipt(format!("forced-order-{suffix}-turn"))
+                    .await
+                    .expect("forced-order receipt lookup")
+                    .is_none()
+            );
+            availability
+                .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+                .await
+                .expect("physical identity resolves");
+        }
+        let commit_wins_pause = hooks.pause_after_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "8",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "commit-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "commit-wins-message",
+                            "role": "user",
+                            "text": "commit finalization wins before loss",
+                            "attachments": []
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send commit-wins turn request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            commit_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("turn acquires finalization fence before SQLite commit");
+        let commit_wins_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 4,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        let (loss_started_tx, loss_started_rx) = tokio::sync::oneshot::channel();
+        let commit_wins_availability = availability.clone();
+        let commit_wins_transition = commit_wins_loss.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let loss_task = tokio::task::spawn_blocking(move || {
+            let _ = loss_started_tx.send(());
+            runtime.block_on(commit_wins_availability.mark_unavailable(commit_wins_transition))
+        });
+        loss_started_rx.await.expect("loss task starts");
+        tokio::task::yield_now().await;
+        assert!(
+            !loss_task.is_finished(),
+            "loss cannot linearize while the SQLite commit permit is held"
+        );
+        commit_wins_pause.release();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), loss_task)
+                .await
+                .expect("loss completes after commit")
+                .expect("loss task joins")
+                .expect("physical identity resolves")
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&commit_wins_loss),
+        )
+        .await
+        .expect("commit-wins admission drains");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("commit-wins-turn".to_owned())
+                .await
+                .expect("commit-wins receipt lookup")
+                .is_some(),
+            "a command that owns finalization must commit before loss"
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("commit-wins-turn".to_owned())
+                .await
+                .expect("commit-wins outbox lookup")
+                .is_some(),
+            "the provider outbox commits in the same transaction"
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await
+            .expect("physical identity resolves");
+        let rejected_loss_wins_pause = hooks.pause_before_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "10",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "rejected-loss-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "rejected-loss-wins-message",
+                            "role": "user",
+                            "text": "missing source plan must reject",
+                            "attachments": []
+                        },
+                        "sourceProposedPlan": {
+                            "threadId": thread_id,
+                            "planId": "missing-plan"
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send rejected loss-wins request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rejected_loss_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("rejection reaches the SQLite pre-finalization barrier");
+        let rejected_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 5,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        assert!(
+            availability
+                .mark_unavailable(rejected_loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
+        rejected_loss_wins_pause.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&rejected_loss),
+        )
+        .await
+        .expect("rejected loss-wins admission drains");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("rejected-loss-wins-turn".to_owned())
+                .await
+                .expect("rejected loss-wins receipt lookup")
+                .is_none(),
+            "loss-before-finalization must roll back a rejected receipt"
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await
+            .expect("physical identity resolves");
+        let rejected_commit_wins_pause = hooks.pause_after_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "11",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "rejected-commit-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "rejected-commit-wins-message",
+                            "role": "user",
+                            "text": "rejection finalization wins before loss",
+                            "attachments": []
+                        },
+                        "sourceProposedPlan": {
+                            "threadId": thread_id,
+                            "planId": "still-missing-plan"
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send rejected commit-wins request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rejected_commit_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("rejection owns finalization before SQLite commit");
+        let rejected_commit_wins_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 6,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        let (rejected_loss_started_tx, rejected_loss_started_rx) = tokio::sync::oneshot::channel();
+        let rejected_commit_wins_availability = availability.clone();
+        let rejected_commit_wins_transition = rejected_commit_wins_loss.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let rejected_loss_task = tokio::task::spawn_blocking(move || {
+            let _ = rejected_loss_started_tx.send(());
+            runtime.block_on(
+                rejected_commit_wins_availability.mark_unavailable(rejected_commit_wins_transition),
+            )
+        });
+        rejected_loss_started_rx
+            .await
+            .expect("rejected loss task starts");
+        tokio::task::yield_now().await;
+        assert!(
+            !rejected_loss_task.is_finished(),
+            "loss cannot linearize while rejected-receipt finalization is held"
+        );
+        rejected_commit_wins_pause.release();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), rejected_loss_task,)
+                .await
+                .expect("rejected loss completes after commit")
+                .expect("rejected loss task joins")
+                .expect("physical identity resolves")
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&rejected_commit_wins_loss),
+        )
+        .await
+        .expect("rejected commit-wins admission drains");
+        let rejected_receipt = engine
+            .repositories()
+            .get_command_receipt("rejected-commit-wins-turn".to_owned())
+            .await
+            .expect("rejected commit-wins receipt lookup")
+            .expect("rejected receipt commits before loss");
+        assert_eq!(rejected_receipt.status, "rejected");
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("rejected-commit-wins-turn".to_owned())
+                .await
+                .expect("rejected commit-wins outbox lookup")
+                .is_none(),
+            "a rejected turn cannot create provider delivery"
+        );
+
+        socket.close(None).await.expect("close socket");
+        handle.shutdown();
+        handle.join().await.expect("server joins");
         delivery.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;
@@ -2334,6 +3876,50 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         assert!(send_snapshot(&sender, Ok(json!({}))).await.is_err());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thread_stream_subscribes_before_returning_to_concurrent_dispatchers() {
+        let engine = migrated_engine().await;
+        engine
+            .dispatch(decode_command(json!({
+                "type": "project.create",
+                "commandId": "project",
+                "projectId": "project",
+                "title": "Project",
+                "workspaceRoot": "C:/repo",
+                "defaultModelSelection": null,
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("project created");
+        let thread_id = load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let cancellation = CancellationToken::new();
+
+        let stream = thread_stream(
+            engine.clone(),
+            request(
+                "orchestration.subscribeThread",
+                json!({ "threadId": thread_id }),
+            ),
+            cancellation.clone(),
+        );
+
+        assert_eq!(
+            engine.event_subscriber_count_for_test(),
+            1,
+            "the event receiver must exist before a concurrent post-snapshot update can publish",
+        );
+        cancellation.cancel();
+        drop(stream);
         engine.shutdown().await;
     }
 }

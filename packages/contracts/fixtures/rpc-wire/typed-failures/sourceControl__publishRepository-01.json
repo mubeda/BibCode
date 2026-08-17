@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "bind$fineG",
-          "requiredScope": "access:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "apply",
+          "threadId": "binkeywin4re",
+          "path": "^01w}N(?",
+          "availability": "removing"
         }
       }
     ]

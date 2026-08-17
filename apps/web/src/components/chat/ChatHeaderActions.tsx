@@ -56,6 +56,7 @@ interface ChatHeaderActionsProps {
     input: NewProjectScriptInput,
   ) => Promise<ProjectScriptActionResult>;
   onDeleteProjectScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+  workspaceUnavailable?: string | null;
 }
 
 export function shouldShowOpenInPicker(input: {
@@ -93,6 +94,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
   onAddProjectScript,
   onUpdateProjectScript,
   onDeleteProjectScript,
+  workspaceUnavailable = null,
 }: ChatHeaderActionsProps) {
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const showOpenInPicker = shouldShowOpenInPicker({
@@ -104,7 +106,8 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     scripts: activeProjectScripts ?? [],
     keybindings,
     preferredScriptId,
-    enabled: activeProjectScripts !== undefined,
+    enabled: activeProjectScripts !== undefined && workspaceUnavailable === null,
+    disabledReason: workspaceUnavailable,
     onRunScript: onRunProjectScript,
     onAddScript: onAddProjectScript,
     onUpdateScript: onUpdateProjectScript,
@@ -115,10 +118,11 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     keybindings,
     availableEditors,
     openInCwd,
-    enableShortcut: showOpenInPicker,
+    enableShortcut: showOpenInPicker && workspaceUnavailable === null,
   });
   const projectScriptActionsAvailable = activeProjectScripts !== undefined;
-  const openInActionsAvailable = showOpenInPicker && openInEditor.options.length > 0;
+  const openInActionsAvailable =
+    showOpenInPicker && workspaceUnavailable === null && openInEditor.options.length > 0;
   const compactActionsAvailable = projectScriptActionsAvailable || openInActionsAvailable;
 
   return (
@@ -133,7 +137,8 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
       <ChatHeaderPanelMenu
         providerStatuses={providerStatuses}
         settings={settings}
-        canCreatePanel={canCreatePanel}
+        canCreatePanel={canCreatePanel && workspaceUnavailable === null}
+        unavailableReason={workspaceUnavailable}
         onCreateChatPanel={onCreateChatPanel}
         onOpenTerminalPanel={onOpenTerminalPanel}
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}
@@ -142,7 +147,9 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
       {density === "expanded" ? (
         <>
           <ProjectScriptsExpandedActions controller={projectScripts} />
-          {showOpenInPicker ? <OpenInExpandedActions controller={openInEditor} /> : null}
+          {showOpenInPicker && workspaceUnavailable === null ? (
+            <OpenInExpandedActions controller={openInEditor} />
+          ) : null}
         </>
       ) : compactActionsAvailable ? (
         <Menu>
@@ -167,6 +174,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
           // Trigger hidden: git actions live in the Source Control panel, but
           // the control must stay mounted for its thread-branch sync effect.
           hideTrigger
+          workspaceUnavailable={workspaceUnavailable}
         />
       )}
     </div>

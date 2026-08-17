@@ -17,6 +17,9 @@ const DESKTOP_UPGRADE_WORKFLOW_PATH = NodePath.join(
   ".github/workflows/desktop-upgrade-smoke.yml",
 );
 const PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "package.json");
+const SERVER_PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "apps/server/package.json");
+const DESKTOP_PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "apps/desktop/package.json");
+const RELEASE_GUIDE_PATH = NodePath.join(REPOSITORY_ROOT, "docs/operations/release.md");
 
 interface WorkflowStep {
   readonly env?: Record<string, string>;
@@ -64,6 +67,33 @@ function allStepCommands(job: WorkflowJob): string {
 }
 
 describe("cross-platform CI contract", () => {
+  it("uses default Rust harness threads in standard package and CI commands", () => {
+    const serverPackage = JSON.parse(NodeFS.readFileSync(SERVER_PACKAGE_JSON_PATH, "utf8")) as {
+      readonly scripts: Record<string, string>;
+    };
+    const desktopPackage = JSON.parse(NodeFS.readFileSync(DESKTOP_PACKAGE_JSON_PATH, "utf8")) as {
+      readonly scripts: Record<string, string>;
+    };
+    const { raw: ciWorkflow, workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const rustWorkspaceTestStep = requireJob(workflow, "test").steps?.find(
+      (step) => step.name === "Rust workspace tests",
+    );
+    const releaseGuide = NodeFS.readFileSync(RELEASE_GUIDE_PATH, "utf8");
+
+    expect(serverPackage.scripts.test).toBe(
+      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-server -j 2",
+    );
+    expect(desktopPackage.scripts.test).toBe(
+      "node ../../scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
+    );
+    expect(rustWorkspaceTestStep?.run).toBe("cargo test --workspace -j 2");
+    expect(ciWorkflow).not.toContain("--test-threads=1");
+    expect(releaseGuide).toContain(
+      "node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2",
+    );
+    expect(releaseGuide).not.toContain("cargo test -p bibcode-desktop -j 2 -- --test-threads=1");
+  });
+
   it("keeps portable validation on Ubuntu 24.04", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
 
@@ -137,6 +167,17 @@ describe("cross-platform CI contract", () => {
     expect(commands).toMatch(/vp run --filter @bibcode\/desktop test/);
     expect(commands).toMatch(/node scripts\/build-desktop-artifact\.ts/);
     expect(commands).not.toMatch(/gh release|softprops\/action-gh-release/);
+  });
+
+  it("runs the native desktop E2E support contracts on Windows", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const nativeSteps = requireJob(workflow, "native_desktop").steps ?? [];
+    const windowsE2eStep = nativeSteps.find(
+      (step) => step.name === "Test Windows desktop E2E support contracts",
+    );
+
+    expect(windowsE2eStep?.if).toBe("matrix.platform == 'win'");
+    expect(windowsE2eStep?.run).toBe("vp test run apps/desktop/e2e/support/test-project.test.ts");
   });
 
   it("installs the full official Linux Tauri prerequisite set", () => {

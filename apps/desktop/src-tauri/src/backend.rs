@@ -8,7 +8,7 @@ use bibcode_server::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    fs,
+    fmt, fs,
     io::{self, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
@@ -29,6 +29,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
+#[cfg(test)]
+use crate::test_support::FixtureEvent;
 
 mod ui_process_observer;
 
@@ -363,6 +365,8 @@ struct ManagedBackendRuntime {
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     completion: Arc<Notify>,
     join_result: Arc<AsyncMutex<Option<Result<(), String>>>>,
+    #[cfg(test)]
+    stop_requested_event: Arc<FixtureEvent>,
 }
 
 impl ManagedBackendRuntime {
@@ -394,11 +398,15 @@ impl ManagedBackendRuntime {
             shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             completion,
             join_result,
+            #[cfg(test)]
+            stop_requested_event: Arc::default(),
         }
     }
 
     fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.stop_requested_event.publish();
         if let Ok(mut shutdown) = self.shutdown.lock()
             && let Some(sender) = shutdown.take()
         {
@@ -524,17 +532,108 @@ fn backend_slot_key(plan: &BackendLaunchPlan) -> String {
 #[cfg(test)]
 type BackendStartPublishGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
-#[derive(Debug, Clone, Default)]
+trait WslCommandResolver: Send + Sync {
+    fn command(&self) -> std::process::Command;
+
+    fn server_binary_candidates(&self) -> Result<Vec<PathBuf>, String>;
+}
+
+trait BackendPortResolver: Send + Sync {
+    fn port(&self) -> u16;
+}
+
+#[derive(Debug, Default)]
+struct SystemBackendPortResolver;
+
+impl BackendPortResolver for SystemBackendPortResolver {
+    fn port(&self) -> u16 {
+        crate::config::bibcode_env_var("BIBCODE_PORT")
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse::<u16>().ok())
+            .or_else(select_desktop_backend_port)
+            .or_else(portpicker::pick_unused_port)
+            .unwrap_or(DEFAULT_BACKEND_PORT)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SystemWslCommandResolver;
+
+impl WslCommandResolver for SystemWslCommandResolver {
+    fn command(&self) -> std::process::Command {
+        std::process::Command::new("wsl.exe")
+    }
+
+    fn server_binary_candidates(&self) -> Result<Vec<PathBuf>, String> {
+        let mut candidates = Vec::new();
+        if let Some(path) = crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV)
+            && !path.is_empty()
+        {
+            candidates.push(PathBuf::from(path));
+        }
+        let current_dir = std::env::current_dir().map_err(|error| {
+            format!("Could not resolve current directory for WSL binary discovery: {error}")
+        })?;
+        let target_root = current_dir.join("target");
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            for profile in ["debug", "release"] {
+                candidates.push(target_root.join(triple).join(profile).join("bibcode"));
+            }
+        }
+        Ok(candidates)
+    }
+}
+
+#[derive(Clone)]
 pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
     ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
+    backend_port_resolver: Arc<dyn BackendPortResolver>,
+    wsl_command_resolver: Arc<dyn WslCommandResolver>,
     #[cfg(test)]
     start_publish_gate: Arc<Mutex<Option<BackendStartPublishGate>>>,
     #[cfg(test)]
     shutdown_cleanup_reached: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     #[cfg(test)]
     late_start_cleanup_failure: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    concurrent_stop_waiting: Arc<FixtureEvent>,
+    #[cfg(test)]
+    runtime_published: Arc<FixtureEvent>,
+}
+
+impl fmt::Debug for BackendSupervisor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendSupervisor")
+            .field("state", &self.state)
+            .field("start_completed", &self.start_completed)
+            .field("ui_process_observer", &self.ui_process_observer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for BackendSupervisor {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            start_completed: Arc::default(),
+            ui_process_observer: Arc::default(),
+            backend_port_resolver: Arc::new(SystemBackendPortResolver),
+            wsl_command_resolver: Arc::new(SystemWslCommandResolver),
+            #[cfg(test)]
+            start_publish_gate: Arc::default(),
+            #[cfg(test)]
+            shutdown_cleanup_reached: Arc::default(),
+            #[cfg(test)]
+            late_start_cleanup_failure: Arc::default(),
+            #[cfg(test)]
+            concurrent_stop_waiting: Arc::default(),
+            #[cfg(test)]
+            runtime_published: Arc::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +732,35 @@ impl BackendProjectDataOperation {
 impl BackendSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_wsl_resolver(wsl_command_resolver: Arc<dyn WslCommandResolver>) -> Self {
+        Self {
+            wsl_command_resolver,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend_port_resolver(backend_port_resolver: Arc<dyn BackendPortResolver>) -> Self {
+        Self {
+            backend_port_resolver,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    async fn test_wsl_plan(&self, distro: &str) -> Result<BackendLaunchPlan, String> {
+        resolve_wsl_launch_plan_for_distro(
+            self.wsl_command_resolver.as_ref(),
+            distro.to_owned(),
+            DEFAULT_BACKEND_PORT,
+            "test-token".to_owned(),
+            PathBuf::from("test-backend.log"),
+            format!("{WSL_INSTANCE_ID_PREFIX}{distro}"),
+            format!("WSL {distro}"),
+        )
     }
 
     pub(crate) fn snapshot_for_update(&self) -> BackendUpdateSnapshot {
@@ -957,7 +1085,11 @@ impl BackendSupervisor {
         reason: &'static str,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
-        let selection = match default_launch_plans(&app) {
+        let selection = match default_launch_plans(
+            &app,
+            self.backend_port_resolver.as_ref(),
+            self.wsl_command_resolver.as_ref(),
+        ) {
             Ok(selection) => selection,
             Err(error) => {
                 self.record_planning_error(error.clone());
@@ -1123,6 +1255,8 @@ impl BackendSupervisor {
                 ),
             });
         };
+        #[cfg(test)]
+        self.runtime_published.publish();
 
         if let Some(previous) = previous {
             let _ = stop_managed_backend(previous, BackendShutdownConfig::default()).await;
@@ -1307,6 +1441,8 @@ impl BackendSupervisor {
             } = &mut state.lifecycle
             {
                 *active_terminate |= terminate;
+                #[cfg(test)]
+                self.concurrent_stop_waiting.publish();
                 (completion.clone(), None)
             } else if let BackendLifecycle::Active { epoch } = state.lifecycle {
                 let shutdown_epoch = epoch.saturating_add(1);
@@ -1602,6 +1738,8 @@ async fn start_managed_backend(
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
+            #[cfg(test)]
+            prepare_isolated_test_server_settings(&data_root.effective)?;
             let server_config = server_config_for_launch(data_root.clone(), &plan.config);
             let handle =
                 ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
@@ -1669,6 +1807,51 @@ async fn start_managed_backend(
             ))
         }
     }
+}
+
+#[cfg(test)]
+fn prepare_isolated_test_server_settings(base_dir: &Path) -> Result<(), String> {
+    let state_dir = base_dir.join("userdata");
+    fs::create_dir_all(&state_dir).map_err(|error| {
+        format!(
+            "failed to create isolated desktop test state at {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let settings_path = state_dir.join("settings.json");
+    let mut settings = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&settings_path)
+    {
+        Ok(settings) => settings,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to create isolated desktop test settings at {}: {error}",
+                settings_path.display()
+            ));
+        }
+    };
+    serde_json::to_writer(
+        &mut settings,
+        &json!({
+            "enableProviderUpdateChecks": false,
+            "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            }
+        }),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write isolated desktop test settings at {}: {error}",
+            settings_path.display()
+        )
+    })
 }
 
 fn server_config_for_launch(
@@ -2051,91 +2234,6 @@ struct WslDistroEntry {
     is_default: bool,
 }
 
-#[cfg(test)]
-static WSL_COMMAND_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
-#[cfg(test)]
-static WSL_SERVER_BINARY_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-#[cfg(all(test, windows))]
-struct WslCommandOverrideGuard {
-    previous_command: Option<PathBuf>,
-    previous_server_binary: Option<PathBuf>,
-}
-
-#[cfg(all(test, windows))]
-impl WslCommandOverrideGuard {
-    fn set(&self, program: PathBuf) {
-        *WSL_COMMAND_OVERRIDE
-            .lock()
-            .expect("WSL command override mutex poisoned") = Some(program);
-    }
-
-    fn set_server_binary(&self, binary: PathBuf) {
-        *WSL_SERVER_BINARY_OVERRIDE
-            .lock()
-            .expect("WSL server binary override mutex poisoned") = Some(binary);
-    }
-}
-
-#[cfg(all(test, windows))]
-impl Drop for WslCommandOverrideGuard {
-    fn drop(&mut self) {
-        *WSL_COMMAND_OVERRIDE
-            .lock()
-            .expect("WSL command override mutex poisoned") = self.previous_command.take();
-        *WSL_SERVER_BINARY_OVERRIDE
-            .lock()
-            .expect("WSL server binary override mutex poisoned") =
-            self.previous_server_binary.take();
-    }
-}
-
-#[cfg(all(test, windows))]
-fn set_wsl_command_override(program: Option<PathBuf>) -> WslCommandOverrideGuard {
-    let previous_command = std::mem::replace(
-        &mut *WSL_COMMAND_OVERRIDE
-            .lock()
-            .expect("WSL command override mutex poisoned"),
-        program,
-    );
-    let previous_server_binary = WSL_SERVER_BINARY_OVERRIDE
-        .lock()
-        .expect("WSL server binary override mutex poisoned")
-        .clone();
-    WslCommandOverrideGuard {
-        previous_command,
-        previous_server_binary,
-    }
-}
-
-fn new_wsl_command() -> std::process::Command {
-    #[cfg(test)]
-    if let Some(program) = WSL_COMMAND_OVERRIDE
-        .lock()
-        .expect("WSL command override mutex poisoned")
-        .clone()
-    {
-        #[cfg(windows)]
-        {
-            if program
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
-            {
-                let mut command = std::process::Command::new("cmd.exe");
-                command.args(["/d", "/s", "/c"]).arg(program);
-                return command;
-            }
-            return std::process::Command::new(program);
-        }
-        #[cfg(not(windows))]
-        {
-            return std::process::Command::new(program);
-        }
-    }
-
-    std::process::Command::new("wsl.exe")
-}
-
 fn decode_wsl_command_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xff, 0xfe]) {
         let values = bytes[2..]
@@ -2169,8 +2267,12 @@ fn parse_wsl_distro_entries(raw: &str) -> Vec<WslDistroEntry> {
         .collect()
 }
 
-fn run_wsl_command(distro: &str, args: &[&str]) -> Result<String, String> {
-    let mut command = new_wsl_command();
+fn run_wsl_command(
+    resolver: &dyn WslCommandResolver,
+    distro: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut command = resolver.command();
     configure_background_std_command(&mut command);
     let output = command
         .args(["-d", distro, "--"])
@@ -2188,8 +2290,8 @@ fn run_wsl_command(distro: &str, args: &[&str]) -> Result<String, String> {
     Ok(decode_wsl_command_output(&output.stdout))
 }
 
-fn list_wsl_distros() -> Result<Vec<WslDistroEntry>, String> {
-    let mut command = new_wsl_command();
+fn list_wsl_distros(resolver: &dyn WslCommandResolver) -> Result<Vec<WslDistroEntry>, String> {
+    let mut command = resolver.command();
     configure_background_std_command(&mut command);
     let output = command
         .args(["-l", "-v"])
@@ -2208,11 +2310,14 @@ fn list_wsl_distros() -> Result<Vec<WslDistroEntry>, String> {
     )))
 }
 
-fn resolve_wsl_distro(settings: &BackendDesktopSettings) -> Result<String, String> {
+fn resolve_wsl_distro(
+    resolver: &dyn WslCommandResolver,
+    settings: &BackendDesktopSettings,
+) -> Result<String, String> {
     if let Some(distro) = &settings.wsl_distro {
         return Ok(distro.clone());
     }
-    let distros = list_wsl_distros()?;
+    let distros = list_wsl_distros(resolver)?;
     distros
         .iter()
         .find(|distro| distro.is_default)
@@ -2221,9 +2326,13 @@ fn resolve_wsl_distro(settings: &BackendDesktopSettings) -> Result<String, Strin
         .ok_or_else(|| "WSL has no installed distributions.".to_string())
 }
 
-fn resolve_wsl_path(distro: &str, windows_path: &Path) -> Result<String, String> {
+fn resolve_wsl_path(
+    resolver: &dyn WslCommandResolver,
+    distro: &str,
+    windows_path: &Path,
+) -> Result<String, String> {
     let windows_path = windows_path.to_string_lossy();
-    let output = run_wsl_command(distro, &["wslpath", "-a", &windows_path])?;
+    let output = run_wsl_command(resolver, distro, &["wslpath", "-a", &windows_path])?;
     output
         .lines()
         .map(str::trim)
@@ -2232,11 +2341,14 @@ fn resolve_wsl_path(distro: &str, windows_path: &Path) -> Result<String, String>
         .ok_or_else(|| format!("wslpath returned no Linux path for {windows_path}"))
 }
 
-fn resolve_wsl_server_binary(distro: &str) -> Result<String, String> {
-    let candidates = wsl_server_binary_candidates()?;
+fn resolve_wsl_server_binary(
+    resolver: &dyn WslCommandResolver,
+    distro: &str,
+) -> Result<String, String> {
+    let candidates = resolver.server_binary_candidates()?;
     for candidate in candidates {
         if candidate.is_file() {
-            return resolve_wsl_path(distro, &candidate);
+            return resolve_wsl_path(resolver, distro, &candidate);
         }
     }
 
@@ -2245,16 +2357,19 @@ fn resolve_wsl_server_binary(distro: &str) -> Result<String, String> {
     ))
 }
 
-fn resolve_wsl_renderer_host(distro: &str) -> Option<String> {
-    let output = run_wsl_command(distro, &["hostname", "-I"]).ok()?;
+fn resolve_wsl_renderer_host(resolver: &dyn WslCommandResolver, distro: &str) -> Option<String> {
+    let output = run_wsl_command(resolver, distro, &["hostname", "-I"]).ok()?;
     output
         .split_whitespace()
         .find(|value| value.parse::<Ipv4Addr>().is_ok())
         .map(ToOwned::to_owned)
 }
 
-fn resolve_wsl_data_root(distro: &str) -> Result<String, String> {
-    let environment = run_wsl_command(distro, &["env"])?;
+fn resolve_wsl_data_root(
+    resolver: &dyn WslCommandResolver,
+    distro: &str,
+) -> Result<String, String> {
+    let environment = run_wsl_command(resolver, distro, &["env"])?;
     let value = environment
         .lines()
         .find_map(|line| line.strip_prefix("BIBCODE_HOME="))
@@ -2277,6 +2392,7 @@ fn resolve_wsl_data_root(distro: &str) -> Result<String, String> {
 }
 
 fn resolve_wsl_launch_plan_for_distro(
+    resolver: &dyn WslCommandResolver,
     running_distro: String,
     port: u16,
     desktop_bootstrap_token: String,
@@ -2284,9 +2400,9 @@ fn resolve_wsl_launch_plan_for_distro(
     environment_id: String,
     label: String,
 ) -> Result<BackendLaunchPlan, String> {
-    let binary_path = resolve_wsl_server_binary(&running_distro)?;
-    let data_root = resolve_wsl_data_root(&running_distro)?;
-    let renderer_host = resolve_wsl_renderer_host(&running_distro)
+    let binary_path = resolve_wsl_server_binary(resolver, &running_distro)?;
+    let data_root = resolve_wsl_data_root(resolver, &running_distro)?;
+    let renderer_host = resolve_wsl_renderer_host(resolver, &running_distro)
         .unwrap_or_else(|| DESKTOP_LOOPBACK_HOST.to_string());
 
     Ok(BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
@@ -2303,13 +2419,15 @@ fn resolve_wsl_launch_plan_for_distro(
 }
 
 fn resolve_wsl_primary_launch_plan(
+    resolver: &dyn WslCommandResolver,
     settings: &BackendDesktopSettings,
     port: u16,
     desktop_bootstrap_token: String,
     log_path: PathBuf,
 ) -> Result<BackendLaunchPlan, String> {
-    let running_distro = resolve_wsl_distro(settings)?;
+    let running_distro = resolve_wsl_distro(resolver, settings)?;
     resolve_wsl_launch_plan_for_distro(
+        resolver,
         running_distro,
         port,
         desktop_bootstrap_token,
@@ -2320,17 +2438,19 @@ fn resolve_wsl_primary_launch_plan(
 }
 
 fn resolve_wsl_secondary_launch_plan<R: Runtime>(
+    resolver: &dyn WslCommandResolver,
     app: &AppHandle<R>,
     settings: &BackendDesktopSettings,
     primary_port: u16,
 ) -> Result<BackendLaunchPlan, String> {
-    let running_distro = resolve_wsl_distro(settings)?;
+    let running_distro = resolve_wsl_distro(resolver, settings)?;
     let port = pick_desktop_backend_port_excluding(&[primary_port]).ok_or_else(|| {
         format!("Could not find an available desktop backend port outside {primary_port}.")
     })?;
     let log_path = wsl_backend_log_path(app, &running_distro)?;
     let (environment_id, label) = configured_wsl_secondary_identity(settings);
     resolve_wsl_launch_plan_for_distro(
+        resolver,
         running_distro,
         port,
         Uuid::new_v4().simple().to_string(),
@@ -2448,17 +2568,14 @@ fn unavailable_wsl_secondary_from_plan(
 
 fn default_launch_plans<R: Runtime>(
     app: &AppHandle<R>,
+    backend_port_resolver: &dyn BackendPortResolver,
+    wsl_command_resolver: &dyn WslCommandResolver,
 ) -> Result<DefaultLaunchPlans, BackendPlanError> {
     let settings =
         read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
     let log_path =
         primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
-    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        .or_else(select_desktop_backend_port)
-        .or_else(portpicker::pick_unused_port)
-        .unwrap_or(DEFAULT_BACKEND_PORT);
+    let port = backend_port_resolver.port();
     let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
     let native_bootstrap_token = desktop_bootstrap_token.clone();
     let native_log_path = log_path.clone();
@@ -2487,36 +2604,17 @@ fn default_launch_plans<R: Runtime>(
                     .with_log_path(native_log_path),
             )
         },
-        || resolve_wsl_primary_launch_plan(&settings, port, desktop_bootstrap_token, log_path),
-        || resolve_wsl_secondary_launch_plan(app, &settings, port),
+        || {
+            resolve_wsl_primary_launch_plan(
+                wsl_command_resolver,
+                &settings,
+                port,
+                desktop_bootstrap_token,
+                log_path,
+            )
+        },
+        || resolve_wsl_secondary_launch_plan(wsl_command_resolver, app, &settings, port),
     )
-}
-
-fn wsl_server_binary_candidates() -> Result<Vec<PathBuf>, String> {
-    let mut candidates = Vec::new();
-    #[cfg(test)]
-    if let Some(path) = WSL_SERVER_BINARY_OVERRIDE
-        .lock()
-        .expect("WSL server binary override mutex poisoned")
-        .clone()
-    {
-        candidates.push(path);
-    }
-    if let Some(path) = crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV)
-        && !path.is_empty()
-    {
-        candidates.push(PathBuf::from(path));
-    }
-    let current_dir = std::env::current_dir().map_err(|error| {
-        format!("Could not resolve current directory for WSL binary discovery: {error}")
-    })?;
-    let target_root = current_dir.join("target");
-    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-        for profile in ["debug", "release"] {
-            candidates.push(target_root.join(triple).join(profile).join("bibcode"));
-        }
-    }
-    Ok(candidates)
 }
 
 fn primary_backend_log_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -2733,6 +2831,202 @@ mod tests {
     };
 
     #[derive(Debug)]
+    struct TestBackendPortResolver {
+        port: u16,
+    }
+
+    impl TestBackendPortResolver {
+        fn new(port: u16) -> Self {
+            Self { port }
+        }
+    }
+
+    impl BackendPortResolver for TestBackendPortResolver {
+        fn port(&self) -> u16 {
+            self.port
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisors_keep_distinct_wsl_resolvers() {
+        let left =
+            BackendSupervisor::with_wsl_resolver(Arc::new(TestWslCommandResolver::new("left-wsl")));
+        let right = BackendSupervisor::with_wsl_resolver(Arc::new(TestWslCommandResolver::new(
+            "right-wsl",
+        )));
+        let (left_plan, right_plan) =
+            tokio::join!(left.test_wsl_plan("Ubuntu"), right.test_wsl_plan("Ubuntu"),);
+        let BackendLaunchTarget::ExternalProcess {
+            args: left_args, ..
+        } = left_plan.expect("left plan").target
+        else {
+            panic!("left resolver must produce a WSL process plan");
+        };
+        let BackendLaunchTarget::ExternalProcess {
+            args: right_args, ..
+        } = right_plan.expect("right plan").target
+        else {
+            panic!("right resolver must produce a WSL process plan");
+        };
+        assert!(left_args.iter().any(|arg| arg == "/left-wsl/bibcode"));
+        assert!(right_args.iter().any(|arg| arg == "/right-wsl/bibcode"));
+    }
+
+    #[tokio::test]
+    async fn retained_fixture_connection_buffers_release_after_readiness() {
+        let (port, ready, checkpoint, release, server) = spawn_retained_fixture_connection();
+        let mut client =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("fixture client should connect");
+
+        client
+            .write_all(&[1])
+            .expect("fixture readiness should write");
+        wait_for_fixture_event(&ready, checkpoint, "retained fixture readiness").await;
+        release.send(()).expect("fixture release should send");
+
+        let mut marker = [0_u8; 1];
+        client
+            .read_exact(&mut marker)
+            .expect("buffered fixture release should read");
+        assert_eq!(marker, [1]);
+        server.join().expect("fixture server should finish");
+    }
+
+    #[derive(Debug)]
+    struct TestWslCommandResolver {
+        _root: tempfile::TempDir,
+        command_path: PathBuf,
+        server_binary: PathBuf,
+        #[cfg(windows)]
+        missing_command: bool,
+    }
+
+    impl TestWslCommandResolver {
+        fn new(label: &str) -> Self {
+            let root = tempfile::Builder::new()
+                .prefix(&format!("bibcode-desktop-wsl-{label}-"))
+                .tempdir()
+                .expect("WSL resolver fixture directory should open");
+            let server_binary = root.path().join("bibcode");
+            fs::write(&server_binary, b"fixture")
+                .expect("WSL resolver server fixture should write");
+            #[cfg(unix)]
+            let command_path = {
+                use std::os::unix::fs::PermissionsExt;
+
+                let path = root.path().join("wsl-fixture.sh");
+                fs::write(
+                    &path,
+                    format!(
+                        r#"#!/bin/sh
+if [ "$1" = "-l" ]; then
+  printf '  NAME STATE VERSION\n* Ubuntu Running 2\n  Debian Stopped 2\n'
+  exit 0
+fi
+if [ "$2" = "Fail" ]; then
+  printf 'forced failure\n' >&2
+  exit 7
+fi
+if [ "$4" = "wslpath" ]; then
+  if [ "$2" = "Empty" ]; then exit 0; fi
+  printf '/{label}/bibcode\n'
+  exit 0
+fi
+if [ "$4" = "hostname" ]; then
+  if [ "$2" = "Invalid" ]; then printf 'not-an-address\n'; else printf 'not-an-address 172.20.0.2\n'; fi
+  exit 0
+fi
+if [ "$4" = "env" ]; then
+  printf 'HOME=/home/bibcode-test\n'
+  exit 0
+fi
+exit 9
+"#
+                    ),
+                )
+                .expect("WSL resolver command fixture should write");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("WSL resolver command fixture should be executable");
+                path
+            };
+            #[cfg(windows)]
+            let command_path = {
+                let path = root.path().join("wsl-fixture.cmd");
+                fs::write(
+                    &path,
+                    format!(
+                        r#"@echo off
+if "%1"=="-l" (
+  echo   NAME STATE VERSION
+  echo * Ubuntu Running 2
+  echo   Debian Stopped 2
+  exit /b 0
+)
+if "%2"=="Fail" (
+  echo forced failure 1>&2
+  exit /b 7
+)
+if "%4"=="wslpath" (
+  if "%2"=="Empty" exit /b 0
+  echo /{label}/bibcode
+  exit /b 0
+)
+if "%4"=="hostname" (
+  if "%2"=="Invalid" echo not-an-address
+  if not "%2"=="Invalid" echo not-an-address 172.20.0.2
+  exit /b 0
+)
+if "%4"=="env" (
+  echo HOME=/home/bibcode-test
+  exit /b 0
+)
+exit /b 9
+"#
+                    ),
+                )
+                .expect("WSL resolver command fixture should write");
+                path
+            };
+            Self {
+                _root: root,
+                command_path,
+                server_binary,
+                #[cfg(windows)]
+                missing_command: false,
+            }
+        }
+
+        #[cfg(windows)]
+        fn with_missing_command(mut self) -> Self {
+            self.command_path = self._root.path().join("missing-wsl.exe");
+            self.missing_command = true;
+            self
+        }
+    }
+
+    impl WslCommandResolver for TestWslCommandResolver {
+        fn command(&self) -> std::process::Command {
+            #[cfg(windows)]
+            {
+                if self.missing_command {
+                    return std::process::Command::new(&self.command_path);
+                }
+                let mut command = std::process::Command::new("cmd.exe");
+                command.args(["/d", "/s", "/c"]).arg(&self.command_path);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                std::process::Command::new(&self.command_path)
+            }
+        }
+
+        fn server_binary_candidates(&self) -> Result<Vec<PathBuf>, String> {
+            Ok(vec![self.server_binary.clone()])
+        }
+    }
+
+    #[derive(Debug)]
     struct MarkerDesktopUiProcessObserver;
 
     impl DesktopUiProcessObserver for MarkerDesktopUiProcessObserver {
@@ -2855,7 +3149,7 @@ mod tests {
             .expect("initial in-process backend should stop");
 
         supervisor.schedule_restart(plan, readiness, restart, "test restart".to_string());
-        let restarted = wait_for_restart_config(&supervisor).await;
+        let restarted = wait_for_restart_config(&supervisor, readiness.timeout).await;
         request_process_diagnostics(&restarted).await;
         assert_eq!(observer.observation_count(), 2);
 
@@ -2937,9 +3231,44 @@ mod tests {
         (format!("http://{address}"), receiver, server)
     }
 
+    fn spawn_retained_fixture_connection() -> (
+        u16,
+        Arc<FixtureEvent>,
+        u64,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("fixture event listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("fixture event listener address")
+            .port();
+        let ready = Arc::new(FixtureEvent::default());
+        let checkpoint = ready.checkpoint();
+        let server_ready = ready.clone();
+        let (release, wait_for_release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("fixture event should arrive");
+            let mut marker = [0_u8; 1];
+            stream
+                .read_exact(&mut marker)
+                .expect("fixture readiness marker should read");
+            assert_eq!(marker, [1]);
+            server_ready.publish();
+            wait_for_release
+                .recv()
+                .expect("fixture release should arrive");
+            stream
+                .write_all(&[1])
+                .expect("fixture release marker should write");
+        });
+        (port, ready, checkpoint, release, server)
+    }
+
     #[cfg(windows)]
     fn spawn_external_backend_http_server(
-        shutdown_signal_path: PathBuf,
+        shutdown_release: mpsc::Sender<()>,
     ) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
         let port = listener.local_addr().expect("listener address").port();
@@ -2962,8 +3291,9 @@ mod tests {
                 stream.write_all(response).expect("response should write");
                 stream.flush().expect("response should flush");
                 if index == 1 {
-                    fs::write(&shutdown_signal_path, b"shutdown")
-                        .expect("shutdown signal should write");
+                    shutdown_release
+                        .send(())
+                        .expect("external backend release should send");
                 }
             }
         });
@@ -2987,11 +3317,13 @@ mod tests {
     async fn start_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+        prepare_isolated_test_server_settings(base_dir)
+            .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
-        let handle = ServerRuntime::start(server_config_for_launch(
-            test_cli_data_root(base_dir),
-            &config,
-        ))
+        let handle = ServerRuntime::start_with_ui_process_observer(
+            server_config_for_launch(test_cli_data_root(base_dir), &config),
+            Arc::new(UnavailableDesktopUiProcessObserver),
+        )
         .await
         .expect("test server should start");
         config.port = handle.local_addr().port();
@@ -3001,12 +3333,17 @@ mod tests {
     async fn start_rpc_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+        prepare_isolated_test_server_settings(base_dir)
+            .expect("isolated desktop test settings should write");
         let mut config = local_test_config(0);
         let server_config =
             server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
-        let handle = ServerRuntime::start(server_config)
-            .await
-            .expect("RPC test server should start");
+        let handle = ServerRuntime::start_with_ui_process_observer(
+            server_config,
+            Arc::new(UnavailableDesktopUiProcessObserver),
+        )
+        .await
+        .expect("RPC test server should start");
         config.port = handle.local_addr().port();
         (handle, config)
     }
@@ -3016,6 +3353,7 @@ mod tests {
         id: usize,
         method: &str,
         payload: Value,
+        response_timeout: Duration,
     ) -> ServerMessage
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -3034,7 +3372,7 @@ mod tests {
             ))
             .await
             .expect("RPC request should send");
-        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        let frame = tokio::time::timeout(response_timeout, socket.next())
             .await
             .expect("RPC response should arrive before the timeout")
             .expect("RPC socket should remain open")
@@ -3084,14 +3422,25 @@ mod tests {
         let (mut socket, _) = connect_async(request)
             .await
             .expect("desktop runtime WebSocket should connect");
-        let response = request_rpc(&mut socket, 1, "server.getProcessDiagnostics", json!({})).await;
+        let response = request_rpc(
+            &mut socket,
+            1,
+            "server.getProcessDiagnostics",
+            json!({}),
+            Duration::from_secs(10),
+        )
+        .await;
         assert_rpc_completed("server.getProcessDiagnostics", &response);
         socket.close(None).await.expect("RPC socket should close");
     }
 
-    async fn wait_for_restart_config(supervisor: &BackendSupervisor) -> BackendRunConfig {
-        tokio::time::timeout(Duration::from_secs(5), async {
+    async fn wait_for_restart_config(
+        supervisor: &BackendSupervisor,
+        readiness_timeout: Duration,
+    ) -> BackendRunConfig {
+        tokio::time::timeout(readiness_timeout, async {
             loop {
+                let checkpoint = supervisor.runtime_published.checkpoint();
                 let config = {
                     let state = supervisor
                         .state
@@ -3112,11 +3461,17 @@ mod tests {
                 if let Some(config) = config {
                     return config;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                supervisor.runtime_published.wait_after(checkpoint).await;
             }
         })
         .await
         .expect("scheduled restart should start an in-process runtime")
+    }
+
+    async fn wait_for_fixture_event(event: &FixtureEvent, checkpoint: u64, description: &str) {
+        tokio::time::timeout(Duration::from_secs(5), event.wait_after(checkpoint))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
     }
 
     fn assert_rpc_completed(method: &str, message: &ServerMessage) {
@@ -3146,6 +3501,27 @@ mod tests {
             advertised_host: None,
             tailscale_serve_enabled: false,
             tailscale_serve_port: 443,
+        }
+    }
+
+    #[test]
+    fn isolated_test_server_settings_disable_host_provider_probes() {
+        let root = tempfile::tempdir().expect("isolated state tempdir should open");
+
+        prepare_isolated_test_server_settings(root.path())
+            .expect("isolated desktop test settings should write");
+
+        let settings: Value = serde_json::from_slice(
+            &fs::read(root.path().join("userdata/settings.json"))
+                .expect("isolated desktop test settings should read"),
+        )
+        .expect("isolated desktop test settings should decode");
+        assert_eq!(settings["enableProviderUpdateChecks"], false);
+        for provider in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+            assert_eq!(
+                settings["providers"][provider]["enabled"], false,
+                "{provider} must not probe the developer host during desktop tests"
+            );
         }
     }
 
@@ -3784,6 +4160,7 @@ mod tests {
             shutdown: Arc::new(Mutex::new(None)),
             completion: Arc::new(Notify::new()),
             join_result: join_result.clone(),
+            stop_requested_event: Arc::default(),
         };
         let cleanup_gate = runtime.join_result.lock().await;
         {
@@ -3800,23 +4177,33 @@ mod tests {
             );
         }
 
+        let stop_requested_checkpoint = runtime.stop_requested_event.checkpoint();
         let first_supervisor = supervisor.clone();
         let first_stop = tokio::spawn(async move {
             first_supervisor
                 .stop(BackendShutdownConfig::default())
                 .await
         });
-        while !runtime.stop_requested.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
+        wait_for_fixture_event(
+            &runtime.stop_requested_event,
+            stop_requested_checkpoint,
+            "first stop request",
+        )
+        .await;
 
+        let concurrent_wait_checkpoint = supervisor.concurrent_stop_waiting.checkpoint();
         let second_supervisor = supervisor.clone();
         let second_stop = tokio::spawn(async move {
             second_supervisor
                 .stop(BackendShutdownConfig::default())
                 .await
         });
-        tokio::task::yield_now().await;
+        wait_for_fixture_event(
+            &supervisor.concurrent_stop_waiting,
+            concurrent_wait_checkpoint,
+            "concurrent stop waiter",
+        )
+        .await;
         assert!(
             !second_stop.is_finished(),
             "a concurrent stop must wait for the cleanup already in progress"
@@ -3859,6 +4246,7 @@ mod tests {
             join_result: Arc::new(AsyncMutex::new(Some(Err(
                 "restart-blocking cleanup failure".to_string(),
             )))),
+            stop_requested_event: Arc::default(),
         };
         supervisor
             .state
@@ -4008,13 +4396,19 @@ mod tests {
             .await
             .expect("shutdown should reach its in-flight start wait");
 
+        let concurrent_wait_checkpoint = supervisor.concurrent_stop_waiting.checkpoint();
         let second_stop_supervisor = supervisor.clone();
         let second_stop = tokio::spawn(async move {
             second_stop_supervisor
                 .stop(BackendShutdownConfig::default())
                 .await
         });
-        tokio::task::yield_now().await;
+        wait_for_fixture_event(
+            &supervisor.concurrent_stop_waiting,
+            concurrent_wait_checkpoint,
+            "late-start concurrent stop waiter",
+        )
+        .await;
         assert!(
             !first_stop.is_finished() && !second_stop.is_finished(),
             "all stop callers must wait for late startup cleanup"
@@ -4203,6 +4597,7 @@ mod tests {
 
     #[test]
     fn configured_wsl_distro_does_not_require_discovery() {
+        let resolver = SystemWslCommandResolver;
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
             tailscale_serve_enabled: false,
@@ -4212,48 +4607,18 @@ mod tests {
             wsl_distro: Some("Debian".to_string()),
         };
 
-        assert_eq!(resolve_wsl_distro(&settings), Ok("Debian".to_string()));
+        assert_eq!(
+            resolve_wsl_distro(&resolver, &settings),
+            Ok("Debian".to_string())
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn native_wsl_resolution_covers_discovery_paths_and_command_failures() {
-        let temp = tempfile::tempdir().expect("WSL fixture directory should open");
-        let fixture = temp.path().join("wsl-fixture.cmd");
-        fs::write(
-            &fixture,
-            r#"@echo off
-if "%1"=="-l" (
-  echo   NAME STATE VERSION
-  echo * Ubuntu Running 2
-  echo   Debian Stopped 2
-  exit /b 0
-)
-if "%2"=="Fail" (
-  echo forced failure 1>&2
-  exit /b 7
-)
-if "%4"=="wslpath" (
-  if "%2"=="Empty" exit /b 0
-  echo /opt/bibcode
-  exit /b 0
-)
-if "%4"=="hostname" (
-  if "%2"=="Invalid" echo not-an-address
-  if not "%2"=="Invalid" echo not-an-address 172.20.0.2
-  exit /b 0
-)
-if "%4"=="env" (
-  echo HOME=/home/bibcode-test
-  exit /b 0
-)
-exit /b 9
-"#,
-        )
-        .expect("WSL fixture should write");
-        let command_override = set_wsl_command_override(Some(fixture));
+        let resolver = TestWslCommandResolver::new("native-wsl");
 
-        let distros = list_wsl_distros().expect("fixture distros should list");
+        let distros = list_wsl_distros(&resolver).expect("fixture distros should list");
         assert_eq!(
             distros,
             vec![
@@ -4275,23 +4640,24 @@ exit /b 9
             wsl_only: true,
             wsl_distro: None,
         };
-        assert_eq!(resolve_wsl_distro(&settings), Ok("Ubuntu".to_string()));
         assert_eq!(
-            resolve_wsl_path("Ubuntu", Path::new(r"C:\bibcode")),
-            Ok("/opt/bibcode".to_string())
+            resolve_wsl_distro(&resolver, &settings),
+            Ok("Ubuntu".to_string())
         );
         assert_eq!(
-            resolve_wsl_renderer_host("Ubuntu"),
+            resolve_wsl_path(&resolver, "Ubuntu", Path::new(r"C:\bibcode")),
+            Ok("/native-wsl/bibcode".to_string())
+        );
+        assert_eq!(
+            resolve_wsl_renderer_host(&resolver, "Ubuntu"),
             Some("172.20.0.2".to_string())
         );
-        let server_binary = temp.path().join("bibcode");
-        fs::write(&server_binary, b"fixture").expect("server binary fixture should write");
-        command_override.set_server_binary(server_binary);
         assert_eq!(
-            resolve_wsl_server_binary("Ubuntu"),
-            Ok("/opt/bibcode".to_string())
+            resolve_wsl_server_binary(&resolver, "Ubuntu"),
+            Ok("/native-wsl/bibcode".to_string())
         );
         let plan = resolve_wsl_launch_plan_for_distro(
+            &resolver,
             "Ubuntu".to_string(),
             3773,
             "token".to_string(),
@@ -4303,6 +4669,7 @@ exit /b 9
         assert_eq!(plan.config.local_host, "172.20.0.2");
         assert_eq!(plan.log_path, Some(PathBuf::from("backend.log")));
         let primary = resolve_wsl_primary_launch_plan(
+            &resolver,
             &settings,
             3774,
             "primary-token".to_string(),
@@ -4310,27 +4677,26 @@ exit /b 9
         )
         .expect("primary WSL launch plan should resolve");
         assert_eq!(primary.config.environment_id, PRIMARY_LOCAL_ENVIRONMENT_ID);
-        assert_eq!(resolve_wsl_renderer_host("Invalid"), None);
+        assert_eq!(resolve_wsl_renderer_host(&resolver, "Invalid"), None);
         assert!(
-            resolve_wsl_path("Empty", Path::new(r"C:\bibcode"))
+            resolve_wsl_path(&resolver, "Empty", Path::new(r"C:\bibcode"))
                 .unwrap_err()
                 .contains("returned no Linux path")
         );
         assert!(
-            run_wsl_command("Fail", &["hostname", "-I"])
+            run_wsl_command(&resolver, "Fail", &["hostname", "-I"])
                 .unwrap_err()
                 .contains("exited with status")
         );
 
-        let missing = temp.path().join("missing-wsl.exe");
-        command_override.set(missing);
+        let missing = TestWslCommandResolver::new("missing").with_missing_command();
         assert!(
-            list_wsl_distros()
+            list_wsl_distros(&missing)
                 .unwrap_err()
                 .contains("Could not list WSL")
         );
         assert!(
-            run_wsl_command("Ubuntu", &["hostname", "-I"])
+            run_wsl_command(&missing, "Ubuntu", &["hostname", "-I"])
                 .unwrap_err()
                 .contains("Could not run wsl.exe")
         );
@@ -4339,6 +4705,7 @@ exit /b 9
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn unavailable_wsl_commands_fail_through_native_resolution_helpers() {
+        let resolver = SystemWslCommandResolver;
         let settings = BackendDesktopSettings {
             server_exposure_mode: "local-only".to_string(),
             tailscale_serve_enabled: false,
@@ -4349,19 +4716,20 @@ exit /b 9
         };
 
         assert!(
-            list_wsl_distros()
+            list_wsl_distros(&resolver)
                 .unwrap_err()
                 .contains("Could not list WSL")
         );
         assert!(
-            resolve_wsl_path("Missing", Path::new("/tmp/repository"))
+            resolve_wsl_path(&resolver, "Missing", Path::new("/tmp/repository"))
                 .unwrap_err()
                 .contains("Could not run wsl.exe")
         );
-        assert_eq!(resolve_wsl_renderer_host("Missing"), None);
-        assert!(resolve_wsl_server_binary("Missing").is_err());
+        assert_eq!(resolve_wsl_renderer_host(&resolver, "Missing"), None);
+        assert!(resolve_wsl_server_binary(&resolver, "Missing").is_err());
         assert!(
             resolve_wsl_launch_plan_for_distro(
+                &resolver,
                 "Missing".to_string(),
                 3773,
                 "token".to_string(),
@@ -4373,6 +4741,7 @@ exit /b 9
         );
         assert!(
             resolve_wsl_primary_launch_plan(
+                &resolver,
                 &settings,
                 3773,
                 "token".to_string(),
@@ -4706,7 +5075,16 @@ exit /b 9
                 .unwrap()
                 .ends_with("server-child-wsl-Ubuntu_Test.log")
         );
-        assert!(!default_launch_plans(handle).unwrap().plans.is_empty());
+        assert!(
+            !default_launch_plans(
+                handle,
+                &SystemBackendPortResolver,
+                &SystemWslCommandResolver,
+            )
+            .unwrap()
+            .plans
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4731,13 +5109,19 @@ exit /b 9
                 .expect("temporary root should canonicalize")
                 .join("data-root")
         );
-        let supervisor = BackendSupervisor::new();
+        let supervisor = BackendSupervisor::with_backend_port_resolver(Arc::new(
+            TestBackendPortResolver::new(0),
+        ));
 
         let started = supervisor
             .start_default(app.handle().clone())
             .await
             .expect("default backend should start");
         assert_ne!(started.port, 0);
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, started.port)).is_err(),
+            "the running server must retain its published listener address"
+        );
 
         let restarted = supervisor
             .restart_default_if_active(app.handle().clone())
@@ -4745,11 +5129,17 @@ exit /b 9
             .expect("default backend should restart")
             .expect("active backend should produce a replacement config");
         assert_ne!(restarted.port, 0);
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port)).is_err(),
+            "the replacement server must retain its published listener address"
+        );
 
         supervisor
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
+        let _released_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port))
+            .expect("joined backend shutdown must release the listener address");
     }
 
     #[tokio::test]
@@ -4769,7 +5159,9 @@ exit /b 9
             .build(context)
             .expect("mock Tauri app");
 
-        let initial = BackendSupervisor::new();
+        let initial = BackendSupervisor::with_backend_port_resolver(Arc::new(
+            TestBackendPortResolver::new(0),
+        ));
         initial
             .start_default(app.handle().clone())
             .await
@@ -5166,9 +5558,10 @@ exit /b 9
     #[tokio::test]
     async fn termination_waits_for_in_process_backend_cleanup_before_exit() {
         let temp = tempfile::tempdir().expect("tempdir should open");
-        let (handle, config) = start_test_server(temp.path()).await;
+        let (handle, _config) = start_test_server(temp.path()).await;
         let backend = BackendSupervisor::new();
         let runtime = ManagedBackendRuntime::new(42, handle);
+        let runtime_probe = runtime.clone();
         {
             let mut state = backend
                 .state
@@ -5185,15 +5578,24 @@ exit /b 9
         let (terminate, termination) = oneshot::channel();
         let exit_requested = Arc::new(AtomicBool::new(false));
         let exit_requested_task = exit_requested.clone();
+        let termination_waiting = Arc::new(FixtureEvent::default());
+        let termination_waiting_checkpoint = termination_waiting.checkpoint();
+        let termination_waiting_task = termination_waiting.clone();
 
         let shutdown = tokio::spawn(shutdown_backend_after_termination(
             backend.clone(),
             async move {
+                termination_waiting_task.publish();
                 let _ = termination.await;
             },
             move || exit_requested_task.store(true, Ordering::SeqCst),
         ));
-        tokio::task::yield_now().await;
+        wait_for_fixture_event(
+            &termination_waiting,
+            termination_waiting_checkpoint,
+            "termination listener",
+        )
+        .await;
         assert!(
             !exit_requested.load(Ordering::SeqCst),
             "exit must not be requested before termination"
@@ -5212,10 +5614,12 @@ exit /b 9
                 .is_empty(),
             "backend state must be drained before exit"
         );
-        let address = format!("{}:{}", config.local_host, config.port);
         assert!(
-            tokio::net::TcpStream::connect(address).await.is_err(),
-            "in-process server must stop before exit is requested"
+            matches!(
+                runtime_probe.join_result.lock().await.as_ref(),
+                Some(Ok(()))
+            ),
+            "in-process server must join before exit is requested"
         );
     }
 
@@ -5279,13 +5683,11 @@ exit /b 9
             "sourceControl.lookupRepository",
             "sourceControl.publishRepository",
             "vcs.createRef",
-            "vcs.createWorktree",
             "vcs.discardFiles",
             "vcs.generateCommitMessage",
             "vcs.listCommits",
             "vcs.pull",
             "vcs.refreshStatus",
-            "vcs.removeWorktree",
             "vcs.stageFiles",
             "vcs.switchRef",
             "vcs.unstageFiles",
@@ -5293,12 +5695,26 @@ exit /b 9
         .into_iter()
         .enumerate()
         {
-            let message = request_rpc(&mut socket, id + 1, method, json!({})).await;
+            let message = request_rpc(
+                &mut socket,
+                id + 1,
+                method,
+                json!({}),
+                Duration::from_secs(45),
+            )
+            .await;
             assert_rpc_completed(method, &message);
         }
 
         let cwd = workspace.path().to_string_lossy();
-        let initialized = request_rpc(&mut socket, 100, "vcs.init", json!({ "cwd": cwd })).await;
+        let initialized = request_rpc(
+            &mut socket,
+            100,
+            "vcs.init",
+            json!({ "cwd": cwd }),
+            Duration::from_secs(45),
+        )
+        .await;
         assert!(
             matches!(
                 &initialized,
@@ -5314,6 +5730,7 @@ exit /b 9
             101,
             "vcs.listRefs",
             json!({ "cwd": cwd, "limit": 25 }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5336,6 +5753,7 @@ exit /b 9
                 "rows": 24,
                 "env": {}
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5355,6 +5773,7 @@ exit /b 9
                 "cols": 100,
                 "rows": 30
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5372,6 +5791,7 @@ exit /b 9
                 "threadId": "desktop-runtime-smoke",
                 "terminalId": "desktop-runtime-terminal"
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5496,21 +5916,28 @@ exit /b 9
     async fn external_backend_receives_bootstrap_serves_readiness_and_shuts_down() {
         let temp = tempfile::tempdir().expect("tempdir should open");
         let bootstrap_path = temp.path().join("bootstrap.txt");
-        let shutdown_signal_path = temp.path().join("shutdown.signal");
         let shutdown_observed_path = temp.path().join("shutdown-observed.txt");
-        let (port, requests, server) =
-            spawn_external_backend_http_server(shutdown_signal_path.clone());
+        let (
+            bootstrap_event_port,
+            bootstrap_observed,
+            bootstrap_checkpoint,
+            shutdown_release,
+            bootstrap_server,
+        ) = spawn_retained_fixture_connection();
+        let (port, requests, server) = spawn_external_backend_http_server(shutdown_release);
         let script = format!(
             r#"
 $bootstrap = [Console]::In.ReadToEnd()
 [IO.File]::WriteAllText({}, $bootstrap)
-while (-not [IO.File]::Exists({})) {{
-  Start-Sleep -Milliseconds 10
-}}
+$client = [Net.Sockets.TcpClient]::new('127.0.0.1', {})
+$stream = $client.GetStream()
+$stream.WriteByte(1)
+if ($stream.ReadByte() -ne 1) {{ exit 12 }}
+$client.Dispose()
 [IO.File]::WriteAllText({}, 'shutdown-observed')
 "#,
             powershell_string_literal(&bootstrap_path),
-            powershell_string_literal(&shutdown_signal_path),
+            bootstrap_event_port,
             powershell_string_literal(&shutdown_observed_path),
         );
         let bootstrap_line = "{\"mode\":\"desktop-test\"}\n".to_string();
@@ -5552,13 +5979,12 @@ while (-not [IO.File]::Exists({})) {{
             .to_ascii_lowercase();
         assert!(readiness.starts_with(&format!("get {BACKEND_READINESS_PATH} http/1.1")));
 
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !bootstrap_path.is_file() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("external backend should capture bootstrap before shutdown");
+        wait_for_fixture_event(
+            &bootstrap_observed,
+            bootstrap_checkpoint,
+            "external backend bootstrap capture",
+        )
+        .await;
         assert_eq!(
             fs::read_to_string(&bootstrap_path).expect("bootstrap should be captured"),
             bootstrap_line
@@ -5574,7 +6000,9 @@ while (-not [IO.File]::Exists({})) {{
         assert!(shutdown.starts_with("post /.well-known/bibcode/desktop/shutdown http/1.1"));
         assert!(shutdown.contains("x-bibcode-desktop-bootstrap-token: desktop-token"));
         server.join().expect("test HTTP server should finish");
-        assert!(shutdown_signal_path.is_file());
+        bootstrap_server
+            .join()
+            .expect("bootstrap event server should finish");
         assert_eq!(
             fs::read_to_string(&shutdown_observed_path)
                 .expect("child should record observing shutdown"),
@@ -5668,7 +6096,9 @@ while (-not [IO.File]::Exists({})) {{
         assert!(can_listen_on_host(0, "127.0.0.1"));
         assert!(!can_listen_on_host(0, "127.0.0.1\0"));
 
-        let candidates = wsl_server_binary_candidates().expect("candidate discovery should work");
+        let candidates = SystemWslCommandResolver
+            .server_binary_candidates()
+            .expect("candidate discovery should work");
         for suffix in [
             PathBuf::from("target/x86_64-unknown-linux-gnu/debug/bibcode"),
             PathBuf::from("target/x86_64-unknown-linux-gnu/release/bibcode"),

@@ -34,6 +34,10 @@ pub mod terminal;
 pub mod text_generation;
 pub mod vcs;
 pub mod workspace;
+pub mod worktree_catalog;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use clap::Parser;
 use serde_json::json;
@@ -86,7 +90,7 @@ pub async fn run_cli() -> Result<(), RunError> {
 
 async fn run_server(config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
-    let handle = ServerRuntime::start(config).await?;
+    let handle = ServerRuntime::start_standalone(config).await?;
     let http_base_url = format!("http://{}", handle.local_addr());
     let browser_target = handle
         .startup_access()

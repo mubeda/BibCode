@@ -1,6 +1,8 @@
 # Cursor
 
-Cursor support is currently **Early Access** and disabled by default.
+Cursor is a supported provider and is enabled by default. Its installation and
+authentication status remain truthful: if `cursor-agent` is unavailable or not
+signed in, Settings keeps the Cursor card visible and reports that state.
 
 Install the Cursor CLI on the machine running the BiBCode server, then sign in:
 
@@ -28,8 +30,8 @@ workspace. Provider inventory uses `cursor-agent about` for installation and
 authentication status and queries ACP for available models.
 
 Cursor workspace slash commands, skills, and agents are discovered from the
-server-side workspace environment. Because this integration is Early Access,
-capabilities can vary with the installed Cursor CLI.
+server-side workspace environment. Capabilities can vary with the installed
+Cursor CLI.
 
 ## Updates and version advisories
 

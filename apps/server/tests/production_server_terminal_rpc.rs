@@ -3,8 +3,8 @@ use std::{
     net::SocketAddr,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -23,8 +23,105 @@ use bibcode_server::production::server_terminal::{
 };
 use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime, cloud,
-    diagnostics, provider_usage, terminal,
+    diagnostics, provider_usage,
+    terminal::{self, PtyBackend, PtyExit, PtyProcess, PtySpawnInput},
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
+
+#[derive(Debug)]
+struct GateTestPty {
+    identity: diagnostics::ProcessIdentity,
+    killed: AtomicBool,
+    output: tokio::sync::broadcast::Sender<String>,
+    exit: tokio::sync::watch::Sender<Option<PtyExit>>,
+}
+
+impl GateTestPty {
+    fn new() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(generation, 0, "synthetic PTY generation wrapped to zero");
+        let (output, _) = tokio::sync::broadcast::channel(8);
+        let (exit, _) = tokio::sync::watch::channel(None);
+        Self {
+            identity: diagnostics::ProcessIdentity {
+                pid: 42_424,
+                started_at: generation,
+            },
+            killed: AtomicBool::new(false),
+            output,
+            exit,
+        }
+    }
+}
+
+impl PtyProcess for GateTestPty {
+    fn pid(&self) -> u32 {
+        self.identity.pid
+    }
+
+    fn process_identity(&self) -> Option<diagnostics::ProcessIdentity> {
+        Some(self.identity)
+    }
+
+    fn write(&self, _data: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn kill(&self) -> Result<(), String> {
+        self.killed.store(true, Ordering::Release);
+        self.exit.send_replace(Some(PtyExit {
+            exit_code: None,
+            signal: None,
+        }));
+        Ok(())
+    }
+
+    fn subscribe_output(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.output.subscribe()
+    }
+
+    fn subscribe_exit(&self) -> tokio::sync::watch::Receiver<Option<PtyExit>> {
+        self.exit.subscribe()
+    }
+}
+
+#[test]
+fn gate_test_ptys_distinguish_same_pid_generations() {
+    let first = GateTestPty::new();
+    let replacement = GateTestPty::new();
+    assert_eq!(first.identity.pid, replacement.identity.pid);
+    assert_ne!(first.identity.started_at, 0);
+    assert!(replacement.identity.started_at > first.identity.started_at);
+    assert_ne!(first.identity, replacement.identity);
+}
+
+#[derive(Debug)]
+struct GateTestBackend {
+    process: Arc<GateTestPty>,
+    started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl PtyBackend for GateTestBackend {
+    fn spawn(&self, _input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
+        if let Some(started) = self.started.lock().expect("started lock").take() {
+            started.send(()).expect("spawn-started receiver");
+        }
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spawn release");
+        Ok(self.process.clone())
+    }
+}
 
 #[derive(Debug)]
 struct FixtureControl;
@@ -56,16 +153,295 @@ impl ProductionServerControl for FixtureControl {
 
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn terminal_rpc_test_lock() -> &'static tokio::sync::Mutex<()> {
-    // Server shutdown cleans every descendant of this test process, so parallel
-    // runtimes in the same integration binary can otherwise kill each other's PTYs.
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+#[tokio::test]
+async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_close() {
+    let temp = TempDir::new().expect("temporary directory");
+    let registry = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-guarded".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 3,
+                path: temp.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    let services = fixture_services().with_availability_registry(registry);
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let client = socket.as_mut().expect("socket");
+    let start = json!({
+        "threadId":"thread-guarded",
+        "terminalId":"terminal-1",
+        "cwd":temp.path().to_string_lossy(),
+        "cols":80,
+        "rows":24,
+    });
+
+    for (id, method, payload) in [
+        ("1", "terminal.open", start.clone()),
+        ("2", "terminal.restart", start.clone()),
+        (
+            "3",
+            "terminal.write",
+            json!({
+                "threadId":"thread-guarded","terminalId":"terminal-1","data":"secret"
+            }),
+        ),
+        (
+            "4",
+            "terminal.attach",
+            json!({
+                "threadId":"thread-guarded",
+                "terminalId":"terminal-1",
+                "cwd":temp.path().to_string_lossy(),
+                "restartIfNotRunning":true,
+            }),
+        ),
+    ] {
+        let error = failure_value(request(client, id, method, payload).await);
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-guarded");
+    }
+    assert_success(
+        request(
+            client,
+            "5",
+            "terminal.close",
+            json!({
+                "threadId":"thread-guarded","terminalId":"terminal-1"
+            }),
+        )
+        .await,
+    );
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach() {
+    let temp = TempDir::new().expect("temporary directory");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let services = fixture_services().with_availability_registry(availability.clone());
+    let quiescer = services.clone();
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server starts");
+    let mut writer = Some(open_socket(handle.local_addr()).await);
+    let writer_socket = writer.as_mut().expect("writer");
+    assert_success(
+        request(
+            writer_socket,
+            "1",
+            "terminal.open",
+            json!({
+                "threadId":"thread-history",
+                "terminalId":"terminal-history",
+                "cwd":temp.path().to_string_lossy(),
+                "cols":80,
+                "rows":24,
+            }),
+        )
+        .await,
+    );
+
+    let mut reader = Some(open_socket(handle.local_addr()).await);
+    let reader_socket = reader.as_mut().expect("reader");
+    send_request(
+        reader_socket,
+        "1",
+        "terminal.attach",
+        json!({
+            "threadId":"thread-history","terminalId":"terminal-history"
+        }),
+    )
+    .await;
+    let _initial = next_chunk_and_ack(reader_socket, "1").await;
+    assert_success(
+        request(
+            writer_socket,
+            "2",
+            "terminal.write",
+            json!({
+                "threadId":"thread-history",
+                "terminalId":"terminal-history",
+                "data":"retained-history\r",
+            }),
+        )
+        .await,
+    );
+    let _output = next_terminal_event_and_ack(reader_socket, "1", "retained output", |value| {
+        value["type"] == "output"
+            && value["data"]
+                .as_str()
+                .is_some_and(|data| data.contains("retained-history"))
+    })
+    .await;
+
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-history".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 8,
+                path: temp.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    quiescer
+        .quiesce_thread_terminals_for_workspace_loss("thread-history")
+        .await
+        .expect("thread terminal quiesce");
+
+    let mut history_reader = Some(open_socket(handle.local_addr()).await);
+    let history_socket = history_reader.as_mut().expect("history reader");
+    send_request(
+        history_socket,
+        "1",
+        "terminal.attach",
+        json!({
+            "threadId":"thread-history","terminalId":"terminal-history"
+        }),
+    )
+    .await;
+    let snapshot = next_chunk_and_ack(history_socket, "1").await;
+    assert_eq!(snapshot[0]["snapshot"]["status"], "exited");
+    assert!(
+        snapshot[0]["snapshot"]["history"]
+            .as_str()
+            .expect("history")
+            .contains("retained-history")
+    );
+
+    for socket in [&mut reader, &mut history_reader, &mut writer] {
+        close_socket(socket).await;
+    }
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
+    let temp = TempDir::new().expect("temporary directory");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let process = Arc::new(GateTestPty::new());
+    let manager = terminal::TerminalManager::new(
+        Arc::new(GateTestBackend {
+            process: process.clone(),
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        }),
+        terminal::TerminalManagerOptions::default(),
+    );
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let services = fixture_services_with_manager(manager, empty_usage())
+        .with_availability_registry(availability.clone());
+    let quiescer = services.clone();
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let client = socket.as_mut().expect("socket");
+    send_request(
+        client,
+        "1",
+        "terminal.open",
+        json!({
+            "threadId":"panel-racing",
+            "terminalId":"terminal-racing",
+            "cwd":temp.path().to_string_lossy(),
+            "cols":80,
+            "rows":24,
+        }),
+    )
+    .await;
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("terminal spawn reaches publication barrier");
+    })
+    .await
+    .expect("spawn barrier waiter");
+
+    let loss = WorkspaceLossTransition {
+        thread_id: "workspace-owner".to_owned(),
+        repository_key: "repository-1".to_owned(),
+        generation: 9,
+        path: temp.path().to_path_buf(),
+        availability: AdoptedWorktreeAvailability::MissingRegistered,
+    };
+    assert!(
+        availability
+            .mark_unavailable(loss.clone())
+            .await
+            .expect("physical identity resolves")
+    );
+    let cleanup_services = quiescer.clone();
+    let cleanup = tokio::spawn(async move {
+        cleanup_services
+            .quiesce_thread_terminals_for_workspace_loss("panel-racing")
+            .await
+            .expect("visible panel terminals quiesce promptly");
+    });
+    cleanup
+        .await
+        .expect("loss cleanup finishes without admission drain");
+    assert!(!process.killed.load(Ordering::Acquire));
+
+    release_tx.send(()).expect("release terminal spawn");
+    let error = failure_value(next_message(client).await);
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert!(
+        process.killed.load(Ordering::Acquire),
+        "the uncommitted PTY must be killed when spawn returns after loss",
+    );
+    assert!(
+        !quiescer
+            .terminal_exists("panel-racing", "terminal-racing")
+            .await
+    );
+
+    let error = failure_value(
+        request(
+            client,
+            "2",
+            "terminal.open",
+            json!({
+                "threadId":"panel-racing",
+                "terminalId":"terminal-after-loss",
+                "cwd":temp.path().to_string_lossy(),
+                "cols":80,
+                "rows":24,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
 }
 
 #[tokio::test]
 async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let config = test_config(&temp);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -267,7 +643,6 @@ async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace(
 
 #[tokio::test]
 async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -338,7 +713,6 @@ async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
 
 #[tokio::test]
 async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let calls = Arc::new(AtomicUsize::new(0));
     let now = time::OffsetDateTime::now_utc();
@@ -421,7 +795,6 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
 
 #[tokio::test]
 async fn terminal_command_activity_hint_decodes_strictly_without_entering_launch_env() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let mut registry = RpcRegistry::empty();
     register_server_terminal_rpc(&mut registry, fixture_services());
@@ -533,7 +906,6 @@ async fn terminal_command_activity_hint_decodes_strictly_without_entering_launch
 
 #[tokio::test]
 async fn provider_usage_reset_rpc_rejects_blank_request_ids_with_typed_error() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let mut registry = RpcRegistry::empty();
     register_server_terminal_rpc(&mut registry, fixture_services());
@@ -570,7 +942,6 @@ async fn provider_usage_reset_rpc_rejects_blank_request_ids_with_typed_error() {
 
 #[tokio::test]
 async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_processes() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -734,7 +1105,6 @@ async fn terminal_rpc_attach_tracks_activity_and_cleans_up_running_child_process
 
 #[tokio::test]
 async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round_trip() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -1108,7 +1478,6 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
 
 #[tokio::test]
 async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_interrupts() {
-    let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let services = fixture_services();
     let mut registry = RpcRegistry::empty();
@@ -1358,14 +1727,30 @@ fn registrar_source_contains_every_owned_rpc_name() {
 }
 
 fn fixture_services() -> ServerTerminalServices {
-    let usage = provider_usage::ProviderUsageService::new(
-        Vec::new(),
-        Arc::new(time::OffsetDateTime::now_utc),
-    );
-    fixture_services_with_usage(usage)
+    fixture_services_with_usage(empty_usage())
+}
+
+fn empty_usage() -> provider_usage::ProviderUsageService {
+    provider_usage::ProviderUsageService::new(Vec::new(), Arc::new(time::OffsetDateTime::now_utc))
 }
 
 fn fixture_services_with_usage(
+    usage: provider_usage::ProviderUsageService,
+) -> ServerTerminalServices {
+    fixture_services_with_manager(
+        terminal::TerminalManager::new(
+            Arc::new(terminal::PortablePtyBackend),
+            terminal::TerminalManagerOptions {
+                subprocess_poll_interval: Duration::from_millis(100),
+                ..terminal::TerminalManagerOptions::default()
+            },
+        ),
+        usage,
+    )
+}
+
+fn fixture_services_with_manager(
+    terminal: terminal::TerminalManager,
     usage: provider_usage::ProviderUsageService,
 ) -> ServerTerminalServices {
     let sampler = Arc::new(diagnostics::NativeProcessSampler::default());
@@ -1395,13 +1780,7 @@ fn fixture_services_with_usage(
         },
     );
     ServerTerminalServices::new(
-        terminal::TerminalManager::new(
-            Arc::new(terminal::PortablePtyBackend),
-            terminal::TerminalManagerOptions {
-                subprocess_poll_interval: Duration::from_millis(100),
-                ..terminal::TerminalManagerOptions::default()
-            },
-        ),
+        terminal,
         sampler,
         resource_sampler,
         monitor,

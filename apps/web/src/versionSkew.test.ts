@@ -38,6 +38,7 @@ describe("versionSkew", () => {
           storageInstanceId: null,
           capabilities: {
             repositoryIdentity: true,
+            worktreeCatalog: false,
             activityProtocolVersion: null,
           },
         },

@@ -12,6 +12,8 @@ import {
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationMessage,
+  OrchestrationProject,
+  OrchestrationProjectShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
@@ -43,6 +45,8 @@ const decodeOrchestrationLatestTurn = Schema.decodeUnknownEffect(OrchestrationLa
 const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(OrchestrationProposedPlan);
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeDispatchResult = Schema.decodeUnknownEffect(DispatchResult);
+const decodeOrchestrationProject = Schema.decodeUnknownEffect(OrchestrationProject);
+const decodeOrchestrationProjectShell = Schema.decodeUnknownEffect(OrchestrationProjectShell);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
@@ -114,6 +118,91 @@ const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpda
 const decodeChatAttachment = Schema.decodeUnknownEffect(ChatAttachment);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const encodeClientOrchestrationCommand = Schema.encodeEffect(ClientOrchestrationCommand);
+
+it.effect("client orchestration schema excludes workspace authority fields", () =>
+  Effect.gen(function* () {
+    const commands = [
+      {
+        type: "project.meta.update",
+        commandId: "project-meta-1",
+        projectId: "project-1",
+        worktreeDiscovery: {
+          visibility: "shown",
+          initialPromptDismissedAt: null,
+          baselinePaths: ["/caller/chosen"],
+        },
+      },
+      {
+        type: "thread.create",
+        commandId: "thread-create-1",
+        threadId: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        kind: "workspace",
+        branch: null,
+        worktreePath: "/caller/chosen",
+        createdAt: "2026-08-11T00:00:00.000Z",
+      },
+      {
+        type: "thread.meta.update",
+        commandId: "thread-meta-1",
+        threadId: "thread-1",
+        worktreePath: "/caller/retargeted",
+      },
+      {
+        type: "thread.turn.start",
+        commandId: "turn-start-1",
+        threadId: "thread-1",
+        message: {
+          messageId: "message-1",
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        bootstrap: {
+          createThread: {
+            projectId: "project-1",
+            title: "Thread",
+            modelSelection: { provider: "codex", model: "gpt-5" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: "/caller/chosen",
+            createdAt: "2026-08-11T00:00:00.000Z",
+          },
+          prepareWorktree: {
+            projectCwd: "/caller/chosen",
+            baseBranch: "main",
+          },
+        },
+        createdAt: "2026-08-11T00:00:00.000Z",
+      },
+    ] as const;
+
+    const decoded = yield* Effect.all(
+      commands.map((command) => decodeClientOrchestrationCommand(command)),
+    );
+    const projectMeta = decoded[0]!;
+    const threadCreate = decoded[1]!;
+    const threadMeta = decoded[2]!;
+    const turnStart = decoded[3]!;
+
+    assert.isFalse("worktreeDiscovery" in projectMeta);
+    assert.isFalse("kind" in threadCreate);
+    assert.isFalse("worktreePath" in threadCreate);
+    assert.isFalse("worktreePath" in threadMeta);
+    if (turnStart.type !== "thread.turn.start" || turnStart.bootstrap === undefined) {
+      assert.fail("Expected a bootstrap turn-start command.");
+    }
+    assert.isFalse("worktreePath" in turnStart.bootstrap.createThread!);
+    assert.isFalse("projectCwd" in turnStart.bootstrap.prepareWorktree!);
+  }),
+);
 
 it.effect("decodes image and file chat attachments", () =>
   Effect.gen(function* () {
@@ -404,6 +493,49 @@ it.effect("decodes historical project.created payloads with a default provider",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.defaultModelSelection?.instanceId, "codex");
+  }),
+);
+
+it.effect("defaults missing worktree discovery policy for legacy project representations", () =>
+  Effect.gen(function* () {
+    const legacyProject = {
+      id: "project-1",
+      title: "Project Title",
+      workspaceRoot: "/tmp/workspace",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deletedAt: null,
+    };
+    const legacyCreated = {
+      projectId: "project-1",
+      title: "Project Title",
+      workspaceRoot: "/tmp/workspace",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const legacyMetaUpdated = {
+      projectId: "project-1",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const [decodedProject, decodedProjectShell, decodedCreated, metaUpdated] = yield* Effect.all([
+      decodeOrchestrationProject(legacyProject),
+      decodeOrchestrationProjectShell(legacyProject),
+      decodeProjectCreatedPayload(legacyCreated),
+      decodeProjectMetaUpdatedPayload(legacyMetaUpdated),
+    ]);
+    for (const project of [decodedProject, decodedProjectShell, decodedCreated]) {
+      assert.deepStrictEqual(project.worktreeDiscovery, {
+        visibility: "hidden",
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      });
+    }
+    assert.strictEqual(Object.hasOwn(metaUpdated, "worktreeDiscovery"), false);
   }),
 );
 

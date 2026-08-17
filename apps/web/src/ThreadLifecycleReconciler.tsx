@@ -1,5 +1,9 @@
 import { useAtomValue } from "@effect/atom-react";
-import { parseScopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
+import {
+  parseScopedThreadKey,
+  scopedThreadKey,
+  scopeThreadRef,
+} from "@bibcode/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { useEffect, useMemo, useRef } from "react";
@@ -36,10 +40,17 @@ export function reconcileThreadPanelState(
   environmentId: EnvironmentId,
   retainedThreadIds: ReadonlySet<ThreadId>,
 ): void {
+  const centerPanelState = useCenterPanelStore.getState();
   for (const threadId of collectPersistedThreadIds(environmentId)) {
-    if (retainedThreadIds.has(threadId)) continue;
     const threadRef = scopeThreadRef(environmentId, threadId);
-    useCenterPanelStore.getState().removeThread(threadRef);
+    if (retainedThreadIds.has(threadId)) {
+      centerPanelState.releaseChatPanelReservation(threadRef);
+      continue;
+    }
+    if (centerPanelState.pendingChatPanelThreadKeys.has(scopedThreadKey(threadRef))) {
+      continue;
+    }
+    centerPanelState.removeThread(threadRef);
     useRightPanelStore.getState().removeThread(threadRef);
   }
 }

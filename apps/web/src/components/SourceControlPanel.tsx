@@ -100,6 +100,7 @@ interface SourceControlPanelProps {
   mode: DiffPanelMode;
   threadRef: ScopedThreadRef;
   gitCwd: string | null;
+  workspaceUnavailable?: string | null;
 }
 
 const RUNNING_ACTIONS = [
@@ -140,12 +141,19 @@ function isDefaultBranchConfirmable(
   );
 }
 
-export default function SourceControlPanel({ mode, threadRef, gitCwd }: SourceControlPanelProps) {
+export default function SourceControlPanel({
+  mode,
+  threadRef,
+  gitCwd,
+  workspaceUnavailable = null,
+}: SourceControlPanelProps) {
   const environmentId = threadRef.environmentId;
   const scope = useMemo(() => ({ environmentId, cwd: gitCwd }), [environmentId, gitCwd]);
 
   const statusQuery = useEnvironmentQuery(
-    gitCwd === null ? null : vcsEnvironment.status({ environmentId, input: { cwd: gitCwd } }),
+    gitCwd === null || workspaceUnavailable !== null
+      ? null
+      : vcsEnvironment.status({ environmentId, input: { cwd: gitCwd } }),
   );
   const status: VcsStatusResult | null = statusQuery.data ?? null;
 
@@ -801,6 +809,19 @@ export default function SourceControlPanel({ mode, threadRef, gitCwd }: SourceCo
     onOpenExternalEditor,
     isPrimaryEnv,
   };
+
+  if (workspaceUnavailable) {
+    return (
+      <DiffPanelShell mode={mode} header={header}>
+        <div
+          role="alert"
+          className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground"
+        >
+          {workspaceUnavailable}
+        </div>
+      </DiffPanelShell>
+    );
+  }
 
   return (
     <DiffPanelShell mode={mode} header={header}>

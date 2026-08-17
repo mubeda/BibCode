@@ -68,6 +68,7 @@ interface FileBrowserPanelProps {
    * filesystem operations. Returning null prevents the mutation.
    */
   onBeginPathMutation?: (request: FilePathMutationRequest) => Promise<FilePathMutationLease | null>;
+  workspaceUnavailable?: string | null;
 }
 
 const TREE_UNSAFE_CSS = `
@@ -164,6 +165,7 @@ export default function FileBrowserPanel({
   availableEditors,
   onOpenFile,
   onBeginPathMutation,
+  workspaceUnavailable = null,
 }: FileBrowserPanelProps) {
   const { resolvedTheme } = useTheme();
   const entriesQuery = useProjectEntriesQuery(environmentId, cwd);
@@ -207,9 +209,18 @@ export default function FileBrowserPanel({
   const closeFileSurfacesUnder = useRightPanelStore((state) => state.closeFileSurfacesUnder);
 
   const [dialogRequest, setDialogRequest] = useState<FileEntryDialogRequest | null>(null);
+  const workspaceUnavailableRef = useRef(workspaceUnavailable);
   // Right-click on empty tree space: Pierre only surfaces row menus, so a background menu is
   // opened from the container's contextmenu event, anchored to the cursor point.
   const [backgroundMenu, setBackgroundMenu] = useState<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    workspaceUnavailableRef.current = workspaceUnavailable;
+    if (workspaceUnavailable) {
+      setDialogRequest(null);
+      setBackgroundMenu(null);
+    }
+  }, [workspaceUnavailable]);
 
   const copyText = useCallback((text: string) => {
     void navigator.clipboard.writeText(text).catch((error: unknown) => {
@@ -292,6 +303,7 @@ export default function FileBrowserPanel({
         initialValue: "",
         confirmLabel: "Create",
         onSubmit: (name) => {
+          if (workspaceUnavailableRef.current) return;
           void (async () => {
             const relativePath = joinRelativePath(targetDir, name);
             const result = await createEntry({ environmentId, input: { cwd, relativePath, kind } });
@@ -324,6 +336,7 @@ export default function FileBrowserPanel({
         confirmLabel: "Rename",
         selectBasename: true,
         onSubmit: (name) => {
+          if (workspaceUnavailableRef.current) return;
           if (name === currentName) return;
           const toRelativePath = joinRelativePath(parentRelativePath(relativePath), name);
           void (async () => {
@@ -385,6 +398,7 @@ export default function FileBrowserPanel({
         confirmLabel: "Delete",
         destructive: true,
         onConfirm: () => {
+          if (workspaceUnavailableRef.current) return;
           void (async () => {
             let lease: FilePathMutationLease | null | undefined;
             try {
@@ -538,19 +552,23 @@ export default function FileBrowserPanel({
     (relativePath: string, kind: FileTreeEntryKind): FileTreeMenuActions => {
       const targetDir = kind === "directory" ? relativePath : parentRelativePath(relativePath);
       return {
-        onNewFile: () => createChildEntry(targetDir, "file"),
-        onNewFolder: () => createChildEntry(targetDir, "directory"),
         onCopyPath: () => copyText(joinWorkspacePath(cwd, relativePath)),
         onCopyRelativePath: () => copyText(relativePath),
-        ...(typeof window !== "undefined" && window.desktopBridge?.openInFileManager
-          ? { onOpenFileManager: () => openInFileManager(relativePath, kind) }
+        ...(workspaceUnavailable === null
+          ? {
+              onNewFile: () => createChildEntry(targetDir, "file"),
+              onNewFolder: () => createChildEntry(targetDir, "directory"),
+              ...(typeof window !== "undefined" && window.desktopBridge?.openInFileManager
+                ? { onOpenFileManager: () => openInFileManager(relativePath, kind) }
+                : {}),
+              onDuplicate: () => duplicateEntryAt(relativePath),
+              onAddAsProject: () => addAsProject(joinWorkspacePath(cwd, relativePath)),
+              onOpenExternalEditor: () => openExternalEditor(relativePath),
+              onOpenPreview: () => openPreviewFor(relativePath),
+              onRename: () => renameEntryAt(relativePath),
+              onDelete: () => deleteEntryAt(relativePath, kind),
+            }
           : {}),
-        onDuplicate: () => duplicateEntryAt(relativePath),
-        onAddAsProject: () => addAsProject(joinWorkspacePath(cwd, relativePath)),
-        onOpenExternalEditor: () => openExternalEditor(relativePath),
-        onOpenPreview: () => openPreviewFor(relativePath),
-        onRename: () => renameEntryAt(relativePath),
-        onDelete: () => deleteEntryAt(relativePath, kind),
       };
     },
     [
@@ -564,6 +582,7 @@ export default function FileBrowserPanel({
       openInFileManager,
       openPreviewFor,
       renameEntryAt,
+      workspaceUnavailable,
     ],
   );
 
@@ -685,8 +704,12 @@ export default function FileBrowserPanel({
             hasWorkspaceRoot,
           })}
           actions={{
-            onNewFile: () => createChildEntry("", "file"),
-            onNewFolder: () => createChildEntry("", "directory"),
+            ...(workspaceUnavailable === null
+              ? {
+                  onNewFile: () => createChildEntry("", "file"),
+                  onNewFolder: () => createChildEntry("", "directory"),
+                }
+              : {}),
             onCopyPath: () => copyText(cwd),
             onRefresh: () => entriesQuery.refresh(),
           }}

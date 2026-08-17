@@ -144,6 +144,7 @@ const ENVIRONMENT_ID = EnvironmentId.make("environment-lifecycle");
 const HOST_ID = ThreadId.make("host-thread");
 const DELETED_ID = ThreadId.make("deleted-thread");
 const ARCHIVED_ID = ThreadId.make("archived-thread");
+const RESERVED_PANEL_ID = ThreadId.make("reserved-panel-thread");
 const DRAFT_THREAD_ID = ThreadId.make("draft-thread");
 const HOST_REF = scopeThreadRef(ENVIRONMENT_ID, HOST_ID);
 const DELETED_REF = scopeThreadRef(ENVIRONMENT_ID, DELETED_ID);
@@ -191,7 +192,7 @@ beforeEach(() => {
   h.shellStateListeners.clear();
   h.archivedStates.clear();
   h.refreshArchived.mockReset();
-  useCenterPanelStore.setState({ byThreadKey: {} });
+  useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
   useRightPanelStore.setState({ byThreadKey: {} });
   useComposerDraftStore.setState({
     draftsByThreadKey: {},
@@ -242,6 +243,54 @@ describe("AppRoot thread lifecycle reconciliation", () => {
 
     expect(useCenterPanelStore.getState()).toBe(centerAfterFirstReconciliation);
     expect(useRightPanelStore.getState()).toBe(rightAfterFirstReconciliation);
+  });
+
+  it("retains a reserved panel until an authoritative snapshot observes it", async () => {
+    publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(12, [HOST_ID])));
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(12, []) }],
+      error: null,
+      isLoading: false,
+    });
+    useCenterPanelStore.getState().reserveChatPanel(HOST_REF, RESERVED_PANEL_ID, "Cursor");
+
+    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+
+    expect(
+      selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, HOST_REF).surfaces,
+    ).toContainEqual({
+      id: `chat:${RESERVED_PANEL_ID}`,
+      kind: "chat",
+      threadId: RESERVED_PANEL_ID,
+      providerLabel: "Cursor",
+    });
+
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(13, []) }],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => {
+      publishShellState(
+        ENVIRONMENT_ID,
+        shellState("live", snapshot(13, [HOST_ID, RESERVED_PANEL_ID])),
+      );
+      root.render(<AppRoot router={{} as AppRouter} />);
+    });
+
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(14, []) }],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => {
+      publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(14, [HOST_ID])));
+      root.render(<AppRoot router={{} as AppRouter} />);
+    });
+
+    expect(
+      selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, HOST_REF).surfaces,
+    ).toEqual([{ id: HOST_SURFACE_ID, kind: "chat-host" }]);
   });
 
   it.each([
