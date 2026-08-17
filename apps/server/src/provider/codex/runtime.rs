@@ -956,6 +956,18 @@ impl CodexSessionRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) async fn observe_initialize_request_queued_for_test(
+        &self,
+        event: Arc<FixtureEvent>,
+    ) {
+        self.inner
+            .connection
+            .lock()
+            .await
+            .observe_request_queued_for_test("initialize", event);
+    }
+
+    #[cfg(test)]
     fn publish_initialize_response_ready(&self) {
         if let Some((event, _)) = self
             .inner

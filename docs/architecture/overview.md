@@ -152,8 +152,11 @@ persistent database, WAL, or marker bytes and entries. SQLite may create or
 update `state.sqlite-shm` as volatile WAL-index coordination; SHM contains no
 database content and is not required for crash recovery. Once validation
 succeeds, normal SQLite locking continues to support sequential or simultaneous
-server processes sharing that established store. Graceful server join still
-waits for the SQLite worker to close before returning.
+server processes sharing that established store. Graceful server join sends an
+explicit close through the bounded SQLite queue after previously admitted jobs.
+The worker then closes even if a stale cloned database handle remains; those
+handles reject later calls as unavailable. Join still waits for the worker's
+positive close notification before returning.
 
 Desktop development and installed builds use the same resolved base data root
 by default, but select separate `dev` and `userdata` state kinds. Rust desktop
@@ -398,6 +401,17 @@ support therefore varies between desktop hosts, and between desktop and browser
 mode. The frontend feature-detects optional APIs and supplies its own fallback
 rather than assuming the Chromium behavior that browser mode and Windows
 happen to share.
+
+Center chat-panel creation reserves and activates its client surface before the
+server command settles. A confirmed command failure removes that reservation;
+an interrupted result is ambiguous because durable thread creation may already
+have committed, so the surface remains visible instead of silently orphaning a
+valid panel thread. The reservation is renderer-local and remains protected
+from older authoritative snapshots until a snapshot actually observes the new
+thread; normal remote-deletion reconciliation resumes after that observation.
+Authoritative thread removal later clears every surface that references that
+thread. This ordering is shared by browser and all desktop hosts; it does not
+depend on a WebView-specific scheduling delay.
 
 The terminal's WebGL renderer is the current instance. xterm keeps its canvas
 backing store aligned to the exact device-pixel box by observing

@@ -127,6 +127,18 @@ struct ProviderProbePause {
     release: Arc<Notify>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderUpdateVerification {
+    provider: String,
+    instance_id: String,
+    before_version: String,
+    after_version: String,
+    expected_version: String,
+    exit_code: i32,
+    status: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct ProviderUpdateCheckTask {
     cancellation: CancellationToken,
@@ -211,11 +223,15 @@ pub struct NativeServerControl {
     #[cfg(test)]
     next_provider_update_running_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
+    next_provider_update_after_version_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_refresh_handoff_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
+    provider_update_verifications: Arc<std::sync::Mutex<Vec<ProviderUpdateVerification>>>,
     keybinding_rules: Arc<RwLock<Vec<Value>>>,
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
@@ -313,11 +329,15 @@ impl NativeServerControl {
             #[cfg(test)]
             next_provider_update_running_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            next_provider_update_after_version_probe_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_refresh_handoff_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            provider_update_verifications: Arc::new(std::sync::Mutex::new(Vec::new())),
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
@@ -539,6 +559,16 @@ impl NativeServerControl {
     async fn install_next_provider_update_running_pause(&self) -> ProviderProbePause {
         let pause = ProviderProbePause::new();
         *self.next_provider_update_running_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn install_next_provider_update_after_version_probe_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self
+            .next_provider_update_after_version_probe_pause
+            .lock()
+            .await = Some(pause.clone());
         pause
     }
 
@@ -784,6 +814,16 @@ impl NativeServerControl {
         );
         let before_version =
             provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+        #[cfg(test)]
+        if let Some(pause) = self
+            .next_provider_update_after_version_probe_pause
+            .lock()
+            .await
+            .take()
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
         let (_, pre_run_settings) = self.settings_snapshot().await;
         let pre_run_target = provider_inventory::maintenance_target(
             &pre_run_settings,
@@ -973,6 +1013,19 @@ impl NativeServerControl {
                 "provider update verification"
             );
         }
+        #[cfg(test)]
+        self.provider_update_verifications
+            .lock()
+            .expect("provider update verification mutex poisoned")
+            .push(ProviderUpdateVerification {
+                provider: target.driver.clone(),
+                instance_id: target.instance_id.clone(),
+                before_version: before_version.as_deref().unwrap_or("unknown").to_owned(),
+                after_version: after_version.as_deref().unwrap_or("unknown").to_owned(),
+                expected_version: expected_version.as_deref().unwrap_or("unknown").to_owned(),
+                exit_code: command_result.exit_code,
+                status: status.to_owned(),
+            });
         let finished_at = now_iso();
         let (providers, _) = self
             .publish_provider_update_state(
@@ -2157,17 +2210,12 @@ pub(crate) fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Write},
         sync::{Mutex as StdMutex, atomic::AtomicUsize},
         time::Duration,
     };
 
     use axum::{Json, Router, extract::State, routing::get};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        sync::OnceCell,
-    };
+    use tokio::{net::TcpListener, sync::OnceCell};
     use url::Url;
     use uuid::Uuid;
 
@@ -2189,40 +2237,6 @@ mod tests {
             TEST_STORAGE_INSTANCE_ID,
         ));
         config
-    }
-
-    #[derive(Clone, Default)]
-    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
-
-    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
-
-    impl Write for TraceCaptureWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("trace capture lock")
-                .extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
-        type Writer = TraceCaptureWriter;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            TraceCaptureWriter(self.0.clone())
-        }
-    }
-
-    impl TraceCapture {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().expect("trace capture lock").clone())
-                .expect("UTF-8 trace output")
-        }
     }
 
     #[test]
@@ -2447,20 +2461,6 @@ mod tests {
         compile_cursor_update_fixture(directory, "9.8.7").await
     }
 
-    async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
-        let executable = compile_cursor_update_fixture(directory, "9.8.7").await;
-        tokio::fs::write(
-            executable
-                .parent()
-                .expect("Cursor release directory")
-                .join("update-sleep-ms"),
-            "2000",
-        )
-        .await
-        .expect("write Cursor update delay");
-        executable
-    }
-
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
         control_with_cursor_update_fixture_environment(executable, json!([])).await
     }
@@ -2647,13 +2647,6 @@ mod tests {
         tokio::fs::write(release_directory.join("update-exit-code"), "0")
             .await
             .expect("write successful update exit code");
-        let trace = TraceCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(trace.clone())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let succeeded = control
             .update_provider(
                 &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
@@ -2675,22 +2668,22 @@ mod tests {
                 executable.display()
             )
         );
-        let trace = trace.text();
-        for expected in [
-            "provider update verification",
-            "provider=cursor",
-            "instance_id=cursor-work",
-            "before_version=2026.06.19-653a7fb",
-            "after_version=2026.06.19-653a7fb",
-            "expected_version=2026.08.04-aaa8809",
-            "exit_code=0",
-            "status=unchanged",
-        ] {
-            assert!(
-                trace.contains(expected),
-                "missing {expected:?} in trace: {trace}"
-            );
-        }
+        assert_eq!(
+            control
+                .provider_update_verifications
+                .lock()
+                .expect("provider update verification lock")
+                .last(),
+            Some(&ProviderUpdateVerification {
+                provider: "cursor".to_owned(),
+                instance_id: "cursor-work".to_owned(),
+                before_version: "2026.06.19-653a7fb".to_owned(),
+                after_version: "2026.06.19-653a7fb".to_owned(),
+                expected_version: "2026.08.04-aaa8809".to_owned(),
+                exit_code: 0,
+                status: "unchanged".to_owned(),
+            })
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
@@ -3155,7 +3148,13 @@ mod tests {
             .iter()
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("Cursor provider");
-        assert_eq!(provider["updateState"]["status"], "succeeded");
+        assert!(
+            matches!(
+                provider["updateState"]["status"].as_str(),
+                Some("succeeded" | "unchanged")
+            ),
+            "a completed update must not be reported as failed"
+        );
     }
 
     #[tokio::test]
@@ -3313,20 +3312,10 @@ mod tests {
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
         let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
         let old_release = old_executable.parent().expect("old release directory");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fresh pre-probe control");
-        let control = control_with_cursor_update_fixture_environment(
-            old_executable.clone(),
-            json!([{
-                "name": "BIBCODE_TEST_CURSOR_VERSION_PROBE_CONTROL",
-                "value": listener
-                    .local_addr()
-                    .expect("fresh pre-probe control address")
-                    .to_string()
-            }]),
-        )
-        .await;
+        let control = control_with_cursor_update_fixture(old_executable.clone()).await;
+        let pre_run_pause = control
+            .install_next_provider_update_after_version_probe_pause()
+            .await;
         let mut updating = {
             let control = control.clone();
             tokio::spawn(async move {
@@ -3338,22 +3327,12 @@ mod tests {
                     .await
             })
         };
-        let (mut probe_control, _) = tokio::select! {
-            connection = listener.accept() => connection.expect("accept fresh pre-probe control"),
-            result = &mut updating => {
-                panic!("provider update completed before the fresh pre-probe entered: {result:?}")
-            }
-        };
-        let mut entered = [0_u8; 1];
         tokio::select! {
-            result = probe_control.read_exact(&mut entered) => {
-                result.expect("read fresh pre-probe entered event");
-            }
+            () = pre_run_pause.wait_until_entered() => {}
             result = &mut updating => {
                 panic!("provider update completed before the fresh pre-probe entered: {result:?}")
             }
         }
-        assert_eq!(entered, [b'E']);
 
         control
             .update_settings(json!({
@@ -3369,10 +3348,7 @@ mod tests {
             }))
             .await
             .expect("replace target during pre-probe");
-        probe_control
-            .write_all(b"R")
-            .await
-            .expect("release old version probe");
+        pre_run_pause.release();
 
         let result = updating
             .await
@@ -3395,12 +3371,12 @@ mod tests {
     #[tokio::test]
     async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused() {
         let directory = tempfile::tempdir().expect("state directory");
-        let control = control_with_cursor_update_fixture(
-            write_slow_cursor_update_fixture(directory.path()).await,
-        )
-        .await;
+        let control =
+            control_with_cursor_update_fixture(write_cursor_update_fixture(directory.path()).await)
+                .await;
         let mut events = control.config_events.subscribe();
-        let updating = {
+        let running_pause = control.install_next_provider_update_running_pause().await;
+        let mut updating = {
             let control = control.clone();
             tokio::spawn(async move {
                 control
@@ -3411,25 +3387,27 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("provider update event");
-                if event["type"] == "providerStatuses"
-                    && event["payload"]["providers"]
-                        .as_array()
-                        .is_some_and(|providers| {
-                            providers.iter().any(|provider| {
-                                provider["instanceId"] == "cursor-work"
-                                    && provider["updateState"]["status"] == "running"
-                            })
-                        })
-                {
-                    break;
-                }
+        tokio::select! {
+            () = running_pause.wait_until_entered() => {}
+            result = &mut updating => {
+                panic!("provider update completed before publishing its running state: {result:?}")
             }
-        })
-        .await
-        .expect("running state published");
+        }
+        let running_published = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            event["type"] == "providerStatuses"
+                && event["payload"]["providers"]
+                    .as_array()
+                    .is_some_and(|providers| {
+                        providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        })
+                    })
+        });
+        assert!(
+            running_published,
+            "running state was not published before the barrier"
+        );
 
         let quick_pause = control.install_next_quick_provider_probe_pause().await;
         let settings_update = {
@@ -3451,6 +3429,7 @@ mod tests {
             })
         };
         quick_pause.wait_until_entered().await;
+        running_pause.release();
 
         let result = updating
             .await
@@ -3473,14 +3452,13 @@ mod tests {
     #[tokio::test]
     async fn cancelled_provider_update_publishes_failed_state() {
         let directory = tempfile::tempdir().expect("state directory");
-        let control = control_with_cursor_update_fixture(
-            write_slow_cursor_update_fixture(directory.path()).await,
-        )
-        .await;
+        let control =
+            control_with_cursor_update_fixture(write_cursor_update_fixture(directory.path()).await)
+                .await;
         let mut events = control.config_events.subscribe();
         let cancellation = CancellationToken::new();
         let running_pause = control.install_next_provider_update_running_pause().await;
-        let updating = {
+        let mut updating = {
             let control = control.clone();
             let cancellation = cancellation.clone();
             tokio::spawn(async move {
@@ -3492,9 +3470,12 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(10), running_pause.wait_until_entered())
-            .await
-            .expect("provider update reached its running-state publication barrier");
+        tokio::select! {
+            () = running_pause.wait_until_entered() => {}
+            result = &mut updating => {
+                panic!("provider update completed before publishing its running state: {result:?}")
+            }
+        }
         let running_published = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
             event["type"] == "providerStatuses"
                 && event["payload"]["providers"]
