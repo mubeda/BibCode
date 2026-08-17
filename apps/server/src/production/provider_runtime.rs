@@ -83,6 +83,7 @@ use crate::{
     },
     server_settings::{ProviderBinarySettingsState, ProviderSettingsStore},
 };
+use futures_util::{StreamExt, stream};
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -97,6 +98,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS: usize = 8;
+const CODEX_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -4804,9 +4808,27 @@ async fn shutdown_sessions(
     sessions: &mut HashMap<String, SessionEntry>,
 ) -> Result<(), ProviderRuntimeError> {
     let thread_ids = sessions.keys().cloned().collect::<Vec<_>>();
+    let mut detached = Vec::with_capacity(thread_ids.len());
     let mut first_error = None;
     for thread_id in thread_ids {
-        if let Err(error) = stop_session(repositories, activity, sessions, &thread_id).await
+        match detach_session(activity, sessions, &thread_id).await {
+            Ok(entry) => detached.push((thread_id, entry)),
+            Err(ProviderRuntimeError::SessionNotFound { .. }) => {}
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    let mut shutdowns = stream::iter(detached.into_iter().map(|(thread_id, entry)| async move {
+        let result = entry.driver.shutdown().await;
+        repositories
+            .delete_provider_session_runtime(thread_id)
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        result
+    }))
+    .buffer_unordered(MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS);
+    while let Some(result) = shutdowns.next().await {
+        if let Err(error) = result
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -5280,20 +5302,6 @@ async fn kill_child(child: &SharedChild) {
     log_cleanup_failures("provider process", &report);
 }
 
-#[cfg(test)]
-async fn shutdown_codex_fixture_bounded(
-    driver: &CodexDriver,
-    graceful_timeout: Duration,
-) -> Result<bool, ProviderRuntimeError> {
-    match tokio::time::timeout(graceful_timeout, driver.shutdown()).await {
-        Ok(result) => result.map(|()| true),
-        Err(_) => {
-            kill_child(&driver.child).await;
-            Ok(false)
-        }
-    }
-}
-
 fn runtime_mode(value: &str) -> CodexRuntimeMode {
     match value {
         "approval-required" => CodexRuntimeMode::ApprovalRequired,
@@ -5342,6 +5350,24 @@ fn claude_activity_target_id(
 }
 
 impl CodexDriver {
+    async fn shutdown_with_grace(
+        &self,
+        graceful_timeout: Duration,
+    ) -> Result<bool, ProviderRuntimeError> {
+        let result = match tokio::time::timeout(graceful_timeout, self.runtime.shutdown()).await {
+            Ok(result) => result.map(|()| true).map_err(provider_error("codex")),
+            Err(_) => {
+                tracing::warn!(
+                    graceful_timeout_ms = graceful_timeout.as_millis(),
+                    "Codex provider did not acknowledge graceful shutdown; forcing owned process cleanup"
+                );
+                Ok(false)
+            }
+        };
+        kill_child(&self.child).await;
+        result
+    }
+
     async fn spawn(
         mut request: ProviderLaunchRequest,
         attachments: AttachmentMaterializer,
@@ -5676,13 +5702,9 @@ impl ProviderDriver for CodexDriver {
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            let result = self
-                .runtime
-                .shutdown()
+            self.shutdown_with_grace(CODEX_GRACEFUL_SHUTDOWN_TIMEOUT)
                 .await
-                .map_err(provider_error("codex"));
-            kill_child(&self.child).await;
-            result
+                .map(|_| ())
         })
     }
 }
@@ -9665,6 +9687,10 @@ mod tests {
         models: Vec<String>,
         rollbacks: Vec<i64>,
         shutdowns: usize,
+        shutdown_entered: Option<Arc<tokio::sync::Semaphore>>,
+        shutdown_release: Option<Arc<tokio::sync::Semaphore>>,
+        shutdown_active: Arc<AtomicUsize>,
+        max_shutdown_active: Arc<AtomicUsize>,
         send_gate: Option<Arc<tokio::sync::Notify>>,
         send_entered: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
@@ -10114,6 +10140,28 @@ mod tests {
 
         fn shutdown(&self) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
+                let (entered, release, active, max_active) = {
+                    let state = self.state.lock().unwrap();
+                    (
+                        state.shutdown_entered.clone(),
+                        state.shutdown_release.clone(),
+                        state.shutdown_active.clone(),
+                        state.max_shutdown_active.clone(),
+                    )
+                };
+                let active_count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(active_count, Ordering::AcqRel);
+                if let Some(entered) = entered {
+                    entered.add_permits(1);
+                }
+                if let Some(release) = release {
+                    release
+                        .acquire()
+                        .await
+                        .expect("shutdown release remains open")
+                        .forget();
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
                 self.state.lock().unwrap().shutdowns += 1;
                 Ok(())
             })
@@ -12867,11 +12915,12 @@ done
     async fn live_claims(
         registry: &ProcessAttributionRegistry,
     ) -> Vec<crate::diagnostics::ProcessClaim> {
+        let sample_started_at = Instant::now();
         let rows = NativeProcessSampler::default()
             .sample()
             .await
             .expect("native process sample");
-        registry.bind_and_snapshot(&rows, Instant::now())
+        registry.bind_and_snapshot(&rows, sample_started_at)
     }
 
     #[tokio::test]
@@ -13033,6 +13082,87 @@ done
         assert!(second.lock().unwrap().targeted_calls.is_empty());
 
         supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_drains_distinct_provider_sessions_concurrently() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create", "commandId":"thread-two", "threadId":"t2",
+                    "projectId":"p1", "title":"Thread two", "kind":"workspace",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "branch":null, "worktreePath":null,
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .expect("second thread command"),
+            )
+            .await
+            .expect("second thread");
+        let shutdown_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let shutdown_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let shutdown_active = Arc::new(AtomicUsize::new(0));
+        let max_shutdown_active = Arc::new(AtomicUsize::new(0));
+        let driver_state = || {
+            Arc::new(StdMutex::new(SupervisorDriverState {
+                shutdown_entered: Some(shutdown_entered.clone()),
+                shutdown_release: Some(shutdown_release.clone()),
+                shutdown_active: shutdown_active.clone(),
+                max_shutdown_active: max_shutdown_active.clone(),
+                ..SupervisorDriverState::default()
+            }))
+        };
+        let first = driver_state();
+        let second = driver_state();
+        let (_first_tx, first_rx) = mpsc::channel(1);
+        let (_second_tx, second_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SequencedSupervisorFactory {
+                drivers: StdMutex::new(std::collections::VecDeque::from([
+                    (first.clone(), first_rx),
+                    (second.clone(), second_rx),
+                ])),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut first_launch = native_launch(&temp, "codex");
+        first_launch.thread_id = "t1".to_owned();
+        supervisor.launch(first_launch).await.expect("first launch");
+        let mut second_launch = native_launch(&temp, "codex");
+        second_launch.thread_id = "t2".to_owned();
+        supervisor
+            .launch(second_launch)
+            .await
+            .expect("second launch");
+
+        let shutdown_supervisor = supervisor.clone();
+        let shutdown = tokio::spawn(async move { shutdown_supervisor.shutdown().await });
+        let both_entered = timeout(
+            std::time::Duration::from_secs(2),
+            shutdown_entered.acquire_many(2),
+        )
+        .await;
+        shutdown_release.add_permits(2);
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("supervisor shutdown succeeds");
+
+        assert!(
+            both_entered.is_ok(),
+            "independent provider-session cleanup must not be serialized"
+        );
+        assert_eq!(max_shutdown_active.load(Ordering::Acquire), 2);
+        assert_eq!(first.lock().unwrap().shutdowns, 1);
+        assert_eq!(second.lock().unwrap().shutdowns, 1);
         engine.shutdown().await;
     }
 
@@ -15573,15 +15703,13 @@ done
             .await
             .expect("Codex timeout driver should start");
 
-        let shutdown_outcome = timeout(
-            std::time::Duration::from_secs(3),
-            super::shutdown_codex_fixture_bounded(&driver, std::time::Duration::from_millis(100)),
-        )
-        .await
-        .expect("Codex timeout cleanup must remain bounded");
+        let shutdown_outcome = timeout(std::time::Duration::from_secs(3), driver.shutdown()).await;
+        if shutdown_outcome.is_err() {
+            super::kill_child(&driver.child).await;
+        }
 
         assert!(
-            matches!(shutdown_outcome, Ok(false)),
+            matches!(shutdown_outcome, Ok(Ok(()))),
             "unresponsive graceful shutdown must force owned cleanup: {shutdown_outcome:?}"
         );
         assert!(
@@ -15629,12 +15757,18 @@ done
         let initialize_response_ready = Arc::new(FixtureEvent::default());
         let thread_response_ready = Arc::new(FixtureEvent::default());
         let owner_completed = Arc::new(FixtureEvent::default());
+        let initialize_request_queued = Arc::new(FixtureEvent::default());
+        let initialize_request_checkpoint = initialize_request_queued.checkpoint();
+        driver
+            .runtime
+            .observe_initialize_request_queued_for_test(initialize_request_queued.clone())
+            .await;
         driver.runtime.observe_startup_responses_for_test(
             initialize_response_ready.clone(),
             thread_response_ready.clone(),
         );
         let milestones = CodexStartupMilestones::new(
-            initialize_response_ready,
+            initialize_response_ready.clone(),
             thread_response_ready,
             owner_completed.clone(),
         );
@@ -15645,20 +15779,23 @@ done
             result
         });
 
-        let missing = milestones
-            .wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
-            .await
-            .expect_err("fixture never publishes the initialize response milestone");
-        start_task.abort();
-        let _ = start_task.await;
-        let shutdown_outcome = timeout(
-            std::time::Duration::from_secs(3),
-            super::shutdown_codex_fixture_bounded(&driver, std::time::Duration::from_secs(2)),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            initialize_request_queued.wait_after(initialize_request_checkpoint),
         )
         .await
-        .expect("stalled startup cleanup must remain bounded");
+        .expect("fixture start must queue initialize before the diagnostic deadline");
+        assert_eq!(
+            initialize_response_ready.checkpoint(),
+            milestones.initialize_checkpoint,
+            "fixture must withhold the initialize response"
+        );
+        start_task.abort();
+        let _ = start_task.await;
+        let shutdown_outcome = driver
+            .shutdown_with_grace(std::time::Duration::from_secs(2))
+            .await;
 
-        assert_eq!(missing, "initialize_response_ready");
         assert!(
             initialize_request_ready.is_file(),
             "fixture must positively receive initialize before withholding its response"
@@ -15881,9 +16018,9 @@ done
                 startup_milestones.reached();
             start_task.abort();
             let _ = start_task.await;
-            let shutdown_outcome =
-                super::shutdown_codex_fixture_bounded(&codex, std::time::Duration::from_secs(2))
-                    .await;
+            let shutdown_outcome = codex
+                .shutdown_with_grace(std::time::Duration::from_secs(2))
+                .await;
             panic!(
                 "Codex start diagnostic watchdog expired at {missing_milestone}: \
                  initialize_response_ready={initialize_response_ready}, \

@@ -185,7 +185,10 @@ async function dispatchDesktopActivityCommands(
                 thread?.session !== null && typeof thread?.session === "object"
                   ? (thread.session as Record<string, unknown>)
                   : null;
-              if (typeof session?.providerInstanceId !== "string") return;
+              if (typeof session?.providerInstanceId !== "string") {
+                socket.send(JSON.stringify({ _tag: "Ack", requestId: message.requestId }));
+                return;
+              }
             }
             window.clearTimeout(request.timeout);
             pending.delete(message.requestId);

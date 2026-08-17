@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests read fixture logs and save screenshots.
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import {
@@ -332,7 +333,43 @@ async function openProviderPanel(displayName: string): Promise<void> {
       `.//button[@aria-label="Close ${displayName}"] and ` +
       `.//span[normalize-space()="${displayName}"]]`,
   );
-  await activeProviderTab.waitForDisplayed();
+  try {
+    await activeProviderTab.waitForDisplayed();
+  } catch (error) {
+    const diagnostics = await browser.execute(() => {
+      const centerPanelStorage = Object.fromEntries(
+        Array.from({ length: window.localStorage.length }, (_, index) =>
+          window.localStorage.key(index),
+        )
+          .filter((key): key is string => key !== null && /center|panel/i.test(key))
+          .map((key) => [key, window.localStorage.getItem(key)]),
+      );
+      return {
+        href: window.location.href,
+        centerPanelStorage,
+        tabs: [...document.querySelectorAll<HTMLElement>("[data-center-panel-tab-id]")].map(
+          (tab) => ({
+            id: tab.dataset.centerPanelTabId ?? null,
+            groupId: tab.dataset.centerPanelGroupId ?? null,
+            active: tab.dataset.activeTab ?? null,
+            text: tab.textContent,
+          }),
+        ),
+        notifications: [...document.querySelectorAll<HTMLElement>('[aria-label="Notifications"]')]
+          .map((region) => region.textContent)
+          .filter((text): text is string => text !== null && text.length > 0),
+      };
+    });
+    NodeFS.writeFileSync(
+      NodePath.join(
+        preparedArtifactDirectory,
+        `provider-panel-${displayName.toLowerCase()}-failure.json`,
+      ),
+      JSON.stringify(diagnostics, null, 2),
+      "utf8",
+    );
+    throw error;
+  }
   await waitForComposerDisplayed();
 }
 

@@ -2516,6 +2516,11 @@ impl OrchestrationEngine {
         self.events.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn event_subscriber_count_for_test(&self) -> usize {
+        self.events.receiver_count()
+    }
+
     pub async fn read_events(
         &self,
         from_sequence_exclusive: i64,

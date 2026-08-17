@@ -29,7 +29,7 @@ const appBinaryPath = resolveDesktopAppPath({
   environment: process.env,
 });
 const requestedSpec = process.env.BIBCODE_E2E_SPEC?.trim();
-const desktopUiSpecs =
+const desktopUiSpecFiles =
   requestedSpec && requestedSpec.length > 0
     ? [requestedSpec]
     : [
@@ -40,6 +40,7 @@ const desktopUiSpecs =
         "./specs/composer-native-triggers.e2e.ts",
         "./specs/chat-activity-panel.e2e.ts",
       ];
+const desktopUiSpecs = requestedSpec ? desktopUiSpecFiles : [desktopUiSpecFiles];
 
 if (!NodeFS.existsSync(appBinaryPath)) {
   throw new Error(`Packaged BiBCode application does not exist: ${appBinaryPath}`);
@@ -92,6 +93,17 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
     throw new Error(resetError);
   }
   await browser.refresh();
+  await waitForDesktopUiDocumentLoad();
+}
+
+async function waitForDesktopUiDocumentLoad(): Promise<void> {
+  await browser.executeAsync((done: () => void) => {
+    if (document.readyState === "complete") {
+      done();
+      return;
+    }
+    window.addEventListener("load", done, { once: true });
+  });
 }
 
 export const config = {
@@ -125,7 +137,7 @@ export const config = {
   bail: 0,
   waitforTimeout: 20_000,
   connectionRetryTimeout: 120_000,
-  connectionRetryCount: 1,
+  connectionRetryCount: 0,
   transformRequest: normalizeWebDriverRequest,
   framework: "mocha",
   reporters: ["spec"],
@@ -134,6 +146,23 @@ export const config = {
     timeout: 120_000,
   },
   before: async () => {
+    const pluginReady = await browser.execute(() => {
+      const host = window as Window & {
+        readonly wdioTauri?: {
+          readonly execute?: unknown;
+          readonly waitForInit?: unknown;
+        };
+      };
+      return (
+        typeof host.wdioTauri?.execute === "function" &&
+        typeof host.wdioTauri.waitForInit === "function"
+      );
+    });
+    if (!pluginReady) {
+      throw new Error("The packaged Tauri WebDriver plugin did not initialize.");
+    }
+  },
+  beforeTest: async () => {
     await resetDesktopUiConnectionCache();
     await browser.execute(() => {
       const sheet = [...document.styleSheets].find((candidate) => {
@@ -195,7 +224,7 @@ export const config = {
     }
   },
   after: async (_result: unknown, _capabilities: unknown, currentSpecs: ReadonlyArray<string>) => {
-    if (!isFinalDesktopUiSpec(currentSpecs, desktopUiSpecs)) return;
+    if (!isFinalDesktopUiSpec(currentSpecs, desktopUiSpecFiles)) return;
     // Ask Tauri to run its normal ExitRequested path so the in-process backend and provider
     // children release Windows filesystem handles before the launcher service stops the driver.
     await requestDesktopUiApplicationExit();

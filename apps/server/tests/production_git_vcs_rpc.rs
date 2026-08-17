@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -15,7 +15,10 @@ use bibcode_server::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, timeout, timeout_at},
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use bibcode_server::production::git_vcs::{
@@ -25,6 +28,7 @@ use bibcode_server::production::git_vcs::{
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
+const MAX_PARALLEL_GIT_RPC_FIXTURES: usize = 12;
 
 fn start_git_status_integration_deadline() -> (Instant, Instant) {
     let started = Instant::now();
@@ -34,12 +38,14 @@ fn start_git_status_integration_deadline() -> (Instant, Instant) {
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct GitServerHarness {
+    _parallelism_permit: OwnedSemaphorePermit,
     handle: Option<bibcode_server::ServerHandle>,
     socket: Option<TestSocket>,
 }
 
 #[tokio::test]
 async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_launch() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("server state");
     let workspace = TempDir::new().expect("guarded workspace");
     let availability = WorkspaceAvailabilityRegistry::new();
@@ -95,6 +101,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 
 impl GitServerHarness {
     async fn start(temp: &TempDir) -> Self {
+        let parallelism_permit = acquire_git_rpc_fixture().await;
         let mut registry = RpcRegistry::empty();
         register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
@@ -104,6 +111,7 @@ impl GitServerHarness {
             .await
             .expect("WebSocket connects");
         Self {
+            _parallelism_permit: parallelism_permit,
             handle: Some(handle),
             socket: Some(socket),
         }
@@ -209,6 +217,7 @@ async fn raw_vcs_create_worktree_is_unavailable_without_git_side_effects() {
 
 #[tokio::test]
 async fn registers_native_vcs_handlers_with_unchanged_wire_shapes() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     let mut registry = RpcRegistry::empty();
@@ -247,7 +256,7 @@ async fn generate_commit_message_is_empty_when_there_are_no_changes() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
 
     request(
         &mut socket,
@@ -265,6 +274,7 @@ async fn generate_commit_message_is_empty_when_there_are_no_changes() {
 
 #[tokio::test]
 async fn vcs_status_stream_is_bounded_and_cancellable() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     std::process::Command::new("git")
@@ -321,6 +331,7 @@ async fn vcs_status_stream_is_bounded_and_cancellable() {
 
 #[tokio::test]
 async fn automatic_git_fetch_setting_changes_apply_without_restart() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "automatic_git_fetch_setting_changes_apply_without_restart",
     ) {
@@ -428,7 +439,7 @@ async fn refresh_status_publishes_external_branch_changes_to_status_subscribers(
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
     commit_file(repository.path(), "tracked.txt", "base\n", "initial");
-    let (handle, mut status_socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut status_socket) = start_git_server(&temp).await;
     let (mut refresh_socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
         .expect("refresh WebSocket connects");
@@ -514,6 +525,7 @@ async fn refresh_status_publishes_external_branch_changes_to_status_subscribers(
 
 #[tokio::test]
 async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback_poller() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -639,6 +651,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
 
 #[tokio::test]
 async fn stacked_commit_stream_finishes_with_a_decodable_success_event() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     for args in [
@@ -726,6 +739,7 @@ async fn stacked_commit_stream_finishes_with_a_decodable_success_event() {
 
 #[tokio::test]
 async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     for args in [
@@ -813,6 +827,7 @@ async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
 
 #[tokio::test]
 async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     for args in [
@@ -927,6 +942,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
 
 #[tokio::test]
 async fn stacked_commit_as_is_preserves_newer_unstaged_edits() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     for args in [
@@ -1041,7 +1057,7 @@ async fn stacked_selected_commit_excludes_unrelated_staged_files() {
     std::fs::write(repository.path().join("b.txt"), "unrelated b\n").expect("write unrelated b");
     run_git(&repository, &["add", "b.txt"]);
 
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
     let result = run_stacked_action(
         &mut socket,
         "12",
@@ -1083,7 +1099,7 @@ async fn stacked_commit_without_paths_stages_all_changes() {
     std::fs::write(repository.path().join("tracked.txt"), "updated\n").expect("update tracked");
     std::fs::write(repository.path().join("untracked.txt"), "new\n").expect("write untracked");
 
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
     let result = run_stacked_action(
         &mut socket,
         "13",
@@ -1121,7 +1137,7 @@ async fn stacked_clean_commit_is_a_successful_no_op() {
     run_git(&repository, &["add", "tracked.txt"]);
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
 
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
     let result = run_stacked_action(
         &mut socket,
         "14",
@@ -1156,7 +1172,7 @@ async fn stacked_feature_branch_rejects_a_clean_worktree_without_creating_a_bran
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
     let original_branch = git_stdout(&repository, &["branch", "--show-current"]);
 
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
     let result = run_stacked_action(
         &mut socket,
         "15",
@@ -1201,7 +1217,7 @@ async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
     std::fs::write(repository.path().join("tracked.txt"), "dirty\n").expect("dirty worktree");
 
-    let (handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
     let result = run_stacked_action(
         &mut socket,
         "16",
@@ -2461,9 +2477,11 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
 async fn start_git_server(
     temp: &TempDir,
 ) -> (
+    OwnedSemaphorePermit,
     bibcode_server::ServerHandle,
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let mut registry = RpcRegistry::empty();
     register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
     let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
@@ -2472,7 +2490,19 @@ async fn start_git_server(
     let (socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
         .expect("WebSocket connects");
-    (handle, socket)
+    (parallelism_permit, handle, socket)
+}
+
+fn git_rpc_fixture_parallelism() -> Arc<Semaphore> {
+    static PARALLELISM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(PARALLELISM.get_or_init(|| Arc::new(Semaphore::new(MAX_PARALLEL_GIT_RPC_FIXTURES))))
+}
+
+async fn acquire_git_rpc_fixture() -> OwnedSemaphorePermit {
+    git_rpc_fixture_parallelism()
+        .acquire_owned()
+        .await
+        .expect("Git RPC fixture parallelism remains open")
 }
 
 async fn run_stacked_action<S>(

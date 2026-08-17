@@ -23,6 +23,8 @@ import {
 
 const contexts: DesktopUiTestContext[] = [];
 const hostTemporaryDirectories: string[] = [];
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- These compatibility assertions must distinguish the native Windows host from simulated Unix targets.
+const isNativeWindowsHost = process.platform === "win32";
 
 interface FixtureProtocol {
   readonly close: () => Promise<void>;
@@ -214,8 +216,7 @@ describe.each([
   });
 });
 
-// oxlint-disable-next-line bibcode/no-global-process-runtime -- This contract must execute only on the native Windows host.
-it.runIf(process.platform === "win32")(
+it.runIf(isNativeWindowsHost)(
   "executes the Cursor action shim through the native Windows command processor",
   () => {
     const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "win" };
@@ -247,8 +248,15 @@ describe.each(["mac", "linux"])("prepareDesktopUiTestContext on %s", (platform) 
     const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
     const context = prepareDesktopUiTestContext(environment);
     contexts.push(context);
-    const canonicalSocket = NodePath.join(
-      NodeFS.realpathSync(context.stateRoot),
+    const canonicalStateRoot = isNativeWindowsHost
+      ? NodePath.posix.join(
+          platform === "mac" ? "/private/tmp" : "/tmp",
+          NodePath.basename(context.runRoot),
+          "state",
+        )
+      : NodeFS.realpathSync(context.stateRoot);
+    const canonicalSocket = NodePath.posix.join(
+      canonicalStateRoot,
       "userdata",
       "runtime",
       "provider-terminal",
