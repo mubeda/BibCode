@@ -110,6 +110,7 @@ type CoveragePathDisposition =
 interface RootViteModule {
   readonly default: {
     readonly test?: {
+      readonly exclude?: readonly string[];
       readonly coverage?: {
         readonly provider?: string;
         readonly include?: readonly string[];
@@ -243,6 +244,12 @@ function readNonEmptyLines(path: string): string[] {
 }
 
 describe("root coverage policy", () => {
+  it("excludes local Git worktrees from the root test graph", async () => {
+    const viteModule = await loadRootViteModule();
+
+    expect(viteModule.default.test?.exclude).toContain("**/.worktrees/**");
+  });
+
   it("covers every repository source file in the live tree after subtracting known non-owned paths", async () => {
     const viteModule = await loadRootViteModule();
     const coverage = viteModule.default.test?.coverage;

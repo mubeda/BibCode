@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -55,6 +56,7 @@ pub struct WorkspaceRpc {
     service: WorkspaceService,
     indexes: Arc<Mutex<HashMap<PathBuf, WorkspaceSearchIndex>>>,
     dependencies: WorkspaceRpcDependencies,
+    availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
 impl WorkspaceRpc {
@@ -70,13 +72,24 @@ impl WorkspaceRpc {
             service,
             indexes: Arc::new(Mutex::new(HashMap::new())),
             dependencies,
+            availability_registry: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.availability_registry = Some(availability_registry);
+        self
     }
 
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, Value> {
         match method {
             "projects.readFile" => {
                 let input: PathInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
                 self.service
                     .read_file(Path::new(&input.cwd), &input.relative_path)
                     .await
@@ -91,6 +104,8 @@ impl WorkspaceRpc {
             }
             "projects.writeFile" => {
                 let input: WriteInput = decode(payload)?;
+                let admission = self.acquire_path(&input.cwd).await?;
+                let _finalization = Self::begin_mutation(admission.as_ref())?;
                 let result = self
                     .service
                     .write_file(Path::new(&input.cwd), &input.relative_path, &input.contents)
@@ -112,6 +127,8 @@ impl WorkspaceRpc {
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
+                let admission = self.acquire_path(&input.cwd).await?;
+                let _finalization = Self::begin_mutation(admission.as_ref())?;
                 let result = self
                     .service
                     .create_entry(Path::new(&input.cwd), &input.relative_path, input.kind)
@@ -130,6 +147,8 @@ impl WorkspaceRpc {
             }
             "projects.renameEntry" => {
                 let input: RenameInput = decode(payload)?;
+                let admission = self.acquire_path(&input.cwd).await?;
+                let _finalization = Self::begin_mutation(admission.as_ref())?;
                 let result = self
                     .service
                     .rename_entry(
@@ -152,6 +171,8 @@ impl WorkspaceRpc {
             }
             "projects.deleteEntry" => {
                 let input: PathInput = decode(payload)?;
+                let admission = self.acquire_path(&input.cwd).await?;
+                let _finalization = Self::begin_mutation(admission.as_ref())?;
                 let result = self
                     .service
                     .delete_entry(Path::new(&input.cwd), &input.relative_path)
@@ -170,6 +191,8 @@ impl WorkspaceRpc {
             }
             "projects.duplicateEntry" => {
                 let input: PathInput = decode(payload)?;
+                let admission = self.acquire_path(&input.cwd).await?;
+                let _finalization = Self::begin_mutation(admission.as_ref())?;
                 let result = self
                     .service
                     .duplicate_entry(Path::new(&input.cwd), &input.relative_path)
@@ -188,6 +211,7 @@ impl WorkspaceRpc {
             }
             "projects.listEntries" => {
                 let input: ListInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectListEntriesError", &input.cwd, &error)
                 })?;
@@ -200,6 +224,7 @@ impl WorkspaceRpc {
             }
             "projects.searchEntries" => {
                 let input: SearchInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectSearchEntriesError", &input.cwd, &error)
                 })?;
@@ -214,6 +239,10 @@ impl WorkspaceRpc {
             }
             "filesystem.browse" => {
                 let input: BrowseInput = decode(payload)?;
+                let _admission = match &input.cwd {
+                    Some(cwd) => self.acquire_path(cwd).await?,
+                    None => None,
+                };
                 self.service
                     .browse(
                         &input.partial_path,
@@ -230,6 +259,7 @@ impl WorkspaceRpc {
             }
             "review.getDiffPreview" => {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
                 self.handle_review_get_diff_preview(input).await
             }
             _ => Err(json!({
@@ -244,6 +274,40 @@ impl WorkspaceRpc {
             return;
         };
         self.indexes.lock().await.remove(&canonical);
+    }
+
+    async fn acquire_path(&self, cwd: &str) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+        let Some(registry) = &self.availability_registry else {
+            return Ok(None);
+        };
+        registry
+            .acquire_path_admission([Path::new(cwd)])
+            .await
+            .map(Some)
+            .map_err(workspace_unavailable_wire)
+    }
+
+    async fn acquire_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+        let Some(registry) = &self.availability_registry else {
+            return Ok(None);
+        };
+        registry
+            .acquire_admission(thread_id, std::iter::empty())
+            .await
+            .map(Some)
+            .map_err(workspace_unavailable_wire)
+    }
+
+    fn begin_mutation(
+        admission: Option<&WorkspaceAdmissionLease>,
+    ) -> Result<Option<crate::persistence::CommitPermit>, Value> {
+        admission
+            .map(WorkspaceAdmissionLease::begin_finalization)
+            .transpose()
+            .map_err(workspace_unavailable_wire)
     }
 
     async fn index(&self, cwd: &str) -> Result<WorkspaceSearchIndex, WorkspaceError> {
@@ -270,8 +334,12 @@ impl WorkspaceRpc {
             .asset_access
             .as_ref()
             .ok_or_else(|| defect("assets.createUrl is not configured"))?;
+        let mut admissions = Vec::new();
         let workspace_root = match &input.resource {
             AssetResource::WorkspaceFile { thread_id, .. } => {
+                if let Some(admission) = self.acquire_thread(thread_id).await? {
+                    admissions.push(admission);
+                }
                 let resolver = self
                     .dependencies
                     .asset_context_resolver
@@ -280,7 +348,12 @@ impl WorkspaceRpc {
                         defect("assets.createUrl requires a workspace context resolver")
                     })?;
                 match resolver.resolve_workspace_root(thread_id).await {
-                    Ok(Some(root)) => Some(root),
+                    Ok(Some(root)) => {
+                        if let Some(admission) = self.acquire_path(&root.to_string_lossy()).await? {
+                            admissions.push(admission);
+                        }
+                        Some(root)
+                    }
                     Ok(None) => {
                         return Err(asset_wire(
                             &input.resource,
@@ -298,7 +371,13 @@ impl WorkspaceRpc {
                     }
                 }
             }
-            _ => None,
+            AssetResource::ProjectFavicon { cwd } => {
+                if let Some(admission) = self.acquire_path(cwd).await? {
+                    admissions.push(admission);
+                }
+                None
+            }
+            AssetResource::Attachment { .. } => None,
         };
         let issued = asset_access
             .issue(AssetIssueRequest {
@@ -307,6 +386,7 @@ impl WorkspaceRpc {
             })
             .await
             .map_err(|error| asset_wire_from_error(&input.resource, &error))?;
+        drop(admissions);
         encode(issued).map_err(|error| defect(&error.to_string()))
     }
 
@@ -334,6 +414,10 @@ fn decode<T: for<'de> Deserialize<'de>>(payload: Value) -> Result<T, Value> {
             "message": error.to_string(),
         })
     })
+}
+
+fn workspace_unavailable_wire(error: impl serde::Serialize) -> Value {
+    serde_json::to_value(error).expect("workspace availability error serializes")
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<Value, WorkspaceError> {
@@ -515,6 +599,151 @@ struct AssetCreateUrlInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree_catalog::{AdoptedWorktreeAvailability, WorkspaceLossTransition};
+    use std::time::Duration;
+
+    struct PausingMutationObserver {
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl WorkspaceMutationObserver for PausingMutationObserver {
+        fn workspace_mutated<'a>(&'a self, _cwd: &'a Path) -> WorkspaceMutationFuture<'a> {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("mutation observer release")
+                    .forget();
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_workspace_write_retains_admission_until_the_rpc_finishes() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let physical_root = std::fs::canonicalize(root.path()).expect("canonical workspace root");
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let observer = Arc::new(PausingMutationObserver {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let rpc = WorkspaceRpc::with_dependencies(
+            WorkspaceService::default(),
+            WorkspaceRpcDependencies {
+                mutation_observer: Some(observer.clone()),
+                ..WorkspaceRpcDependencies::default()
+            },
+        )
+        .with_availability_registry(registry.clone());
+        let writing = tokio::spawn(async move {
+            rpc.handle(
+                "projects.writeFile",
+                json!({
+                    "cwd":physical_root,
+                    "relativePath":"paused.txt",
+                    "contents":"complete before removal"
+                }),
+            )
+            .await
+        });
+        observer
+            .entered
+            .acquire()
+            .await
+            .expect("write reaches mutation observer")
+            .forget();
+
+        let removal_registry = registry.clone();
+        let removal_path = root.path().to_path_buf();
+        let mut removal = tokio::spawn(async move {
+            removal_registry
+                .mark_removing("workspace-thread", &removal_path)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "Removing cannot finalize while the admitted write RPC is paused"
+        );
+        assert!(!writing.is_finished());
+        observer.release.add_permits(1);
+        writing
+            .await
+            .expect("write task joins")
+            .expect("write RPC succeeds");
+        drop(removal.await.expect("removal task joins"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("paused.txt")).expect("written file"),
+            "complete before removal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_rpc_admissions_span_operations_and_mutation_finalization() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let rpc = WorkspaceRpc::new(WorkspaceService::default())
+            .with_availability_registry(registry.clone());
+        let physical_root = std::fs::canonicalize(root.path()).expect("canonical workspace root");
+        let admission = rpc
+            .acquire_path(&root.path().to_string_lossy())
+            .await
+            .expect("path admitted")
+            .expect("configured registry returns a lease");
+        let transition = WorkspaceLossTransition {
+            thread_id: "workspace-thread".to_owned(),
+            repository_key: "repository-key".to_owned(),
+            generation: 1,
+            path: physical_root.clone(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        let loss_registry = registry.clone();
+        let loss_transition = transition.clone();
+        let loss_cancellation = admission.loss_cancellation();
+        let loss =
+            tokio::spawn(async move { loss_registry.mark_unavailable(loss_transition).await });
+        assert!(
+            loss.await
+                .expect("loss task joins")
+                .expect("physical identity resolves")
+        );
+        assert!(loss_cancellation.is_cancelled());
+        drop(admission);
+        registry
+            .clear_recovered("workspace-thread", &physical_root)
+            .await
+            .expect("physical identity resolves");
+
+        let admission = rpc
+            .acquire_path(&root.path().to_string_lossy())
+            .await
+            .expect("path admitted before the next loss")
+            .expect("configured registry returns a lease");
+        let finalization = WorkspaceRpc::begin_mutation(Some(&admission))
+            .expect("mutation finalization begins")
+            .expect("configured registry returns a finalization permit");
+        let loss_registry = registry.clone();
+        let removal_path = physical_root.clone();
+        let mut loss = tokio::spawn(async move {
+            loss_registry
+                .mark_removing("workspace-thread", &removal_path)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut loss)
+                .await
+                .is_err(),
+            "workspace loss waits until the filesystem mutation's final commit window ends"
+        );
+        drop(finalization);
+        drop(admission);
+        drop(loss.await.expect("final loss task joins"));
+    }
 
     #[tokio::test]
     async fn rpc_error_mappers_cover_workspace_filesystem_and_asset_variants() {

@@ -1,4 +1,4 @@
-import type { EnvironmentId, ThreadId } from "@bibcode/contracts";
+import type { EnvironmentId } from "@bibcode/contracts";
 import { isAtomCommandInterrupted } from "@bibcode/client-runtime/state/runtime";
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -29,17 +29,15 @@ import { Spinner } from "./ui/spinner";
 interface PullRequestThreadDialogProps {
   open: boolean;
   environmentId: EnvironmentId;
-  threadId: ThreadId;
   cwd: string | null;
   initialReference: string | null;
   onOpenChange: (open: boolean) => void;
-  onPrepared: (input: { branch: string; worktreePath: string | null }) => Promise<void> | void;
+  onPrepared: (input: { branch: string; mode: "local" | "worktree" }) => Promise<void> | void;
 }
 
 export function PullRequestThreadDialog({
   open,
   environmentId,
-  threadId,
   cwd,
   initialReference,
   onOpenChange,
@@ -49,6 +47,7 @@ export function PullRequestThreadDialog({
   const [reference, setReference] = useState(initialReference ?? "");
   const [referenceDirty, setReferenceDirty] = useState(false);
   const [preparingMode, setPreparingMode] = useState<"local" | "worktree" | null>(null);
+  const [preparedError, setPreparedError] = useState<unknown>(null);
   const [debouncedReference, referenceDebouncer] = useDebouncedValue(
     reference,
     { wait: 450 },
@@ -139,23 +138,34 @@ export function PullRequestThreadDialog({
         return;
       }
       setPreparingMode(mode);
-      const result = await preparePullRequestThreadAction.run({
-        reference: parsedReference,
-        mode,
-        ...(mode === "worktree" ? { threadId } : {}),
-      });
-      setPreparingMode(null);
-      if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) {
-          preparePullRequestThreadAction.resetError();
+      setPreparedError(null);
+      try {
+        if (mode === "worktree") {
+          await onPrepared({
+            branch: resolvedPullRequest.headBranch,
+            mode,
+          });
+        } else {
+          const result = await preparePullRequestThreadAction.run({
+            reference: parsedReference,
+          });
+          if (result._tag === "Failure") {
+            if (isAtomCommandInterrupted(result)) {
+              preparePullRequestThreadAction.resetError();
+            }
+            return;
+          }
+          await onPrepared({
+            branch: result.value.branch,
+            mode,
+          });
         }
-        return;
+        onOpenChange(false);
+      } catch (error) {
+        setPreparedError(error);
+      } finally {
+        setPreparingMode(null);
       }
-      await onPrepared({
-        branch: result.value.branch,
-        worktreePath: result.value.worktreePath,
-      });
-      onOpenChange(false);
     },
     [
       cwd,
@@ -164,7 +174,6 @@ export function PullRequestThreadDialog({
       parsedReference,
       preparePullRequestThreadAction,
       resolvedPullRequest,
-      threadId,
     ],
   );
 
@@ -179,17 +188,21 @@ export function PullRequestThreadDialog({
     validationMessage ??
     (resolvedPullRequest === null && pullRequestResolution.error
       ? pullRequestResolution.error
-      : preparePullRequestThreadAction.error instanceof Error
-        ? preparePullRequestThreadAction.error.message
-        : preparePullRequestThreadAction.error
+      : preparedError instanceof Error
+        ? preparedError.message
+        : preparedError
           ? `Failed to prepare ${terminology.singular} thread.`
-          : null);
+          : preparePullRequestThreadAction.error instanceof Error
+            ? preparePullRequestThreadAction.error.message
+            : preparePullRequestThreadAction.error
+              ? `Failed to prepare ${terminology.singular} thread.`
+              : null);
 
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (!preparePullRequestThreadAction.isPending) {
+        if (preparingMode === null && !preparePullRequestThreadAction.isPending) {
           onOpenChange(nextOpen);
         }
       }}
@@ -223,7 +236,11 @@ export function PullRequestThreadDialog({
                   return;
                 }
                 event.preventDefault();
-                if (!isResolving && !preparePullRequestThreadAction.isPending) {
+                if (
+                  !isResolving &&
+                  preparingMode === null &&
+                  !preparePullRequestThreadAction.isPending
+                ) {
                   void handleConfirm("local");
                 }
               }}
@@ -262,7 +279,7 @@ export function PullRequestThreadDialog({
             variant="outline"
             size="sm"
             onClick={() => onOpenChange(false)}
-            disabled={preparePullRequestThreadAction.isPending}
+            disabled={preparingMode !== null || preparePullRequestThreadAction.isPending}
           >
             Cancel
           </Button>
@@ -277,6 +294,7 @@ export function PullRequestThreadDialog({
               !cwd ||
               !resolvedPullRequest ||
               isResolving ||
+              preparingMode !== null ||
               preparePullRequestThreadAction.isPending
             }
           >
@@ -292,6 +310,7 @@ export function PullRequestThreadDialog({
               !cwd ||
               !resolvedPullRequest ||
               isResolving ||
+              preparingMode !== null ||
               preparePullRequestThreadAction.isPending
             }
           >

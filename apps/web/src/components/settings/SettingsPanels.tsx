@@ -5,12 +5,14 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   DEFAULT_SERVER_SETTINGS,
   defaultInstanceIdForDriver,
+  type EnvironmentId,
+  type OrchestrationThreadShell,
   PROVIDER_DISPLAY_NAMES,
   ProviderDriverKind,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
   type ProviderSessionDefault,
-  type ScopedThreadRef,
+  type WorktreeRemovalResult,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
@@ -19,6 +21,7 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
+import { selectWorktreeCatalogCapabilityPolicy } from "@bibcode/client-runtime/state/worktrees";
 import {
   BUNDLED_TERMINAL_FONT_PREFERENCE,
   DEFAULT_DEFAULT_AGENT_SELECTION,
@@ -50,6 +53,7 @@ import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hos
 import { useTheme } from "../../hooks/useTheme";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
+import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "../WorktreeRemovalDialog";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import {
   getCustomModelOptionsByInstance,
@@ -68,7 +72,7 @@ import {
 } from "../../state/server";
 import { usePrimaryEnvironment } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
-import { useProjects } from "../../state/entities";
+import { useProjects, useServerConfigs } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
 import {
   isCustomTerminalFontAvailable,
@@ -1327,13 +1331,7 @@ function EnvironmentScopedProviderSettingsPanel({
     [providerUpdateCandidates],
   );
   const visibleProviderSettings = PROVIDER_SETTINGS.filter(
-    (providerSettings) =>
-      providerSettings.provider !== "grok" &&
-      (providerSettings.provider !== "cursor" ||
-        serverProviders.some(
-          (provider) =>
-            provider.instanceId === defaultInstanceIdForDriver(ProviderDriverKind.make("cursor")),
-        )),
+    (providerSettings) => providerSettings.provider !== "grok",
   );
   const textGenerationModelSelection = resolveAppModelSelectionState(settings, serverProviders);
   const textGenInstanceId = textGenerationModelSelection.instanceId;
@@ -1818,7 +1816,16 @@ function EnvironmentScopedProviderSettingsPanel({
 
 export function ArchivedThreadsPanel() {
   const projects = useProjects();
-  const { unarchiveThread, confirmAndDeleteThread } = useThreadActions();
+  const serverConfigs = useServerConfigs();
+  const {
+    unarchiveThread,
+    deleteThread,
+    confirmAndDeleteThread,
+    worktreeRemovalTarget,
+    requestWorktreeRemoval,
+    closeWorktreeRemovalDialog,
+    completeWorktreeRemoval,
+  } = useThreadActions();
   const environmentIds = useMemo(
     () => [...new Set(projects.map((project) => project.environmentId))],
     [projects],
@@ -1881,9 +1888,13 @@ export function ArchivedThreadsPanel() {
   }, [archivedSnapshots]);
 
   const handleArchivedThreadContextMenu = useCallback(
-    async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
+    async (
+      thread: OrchestrationThreadShell & { readonly environmentId: EnvironmentId },
+      position: { x: number; y: number },
+    ) => {
       const api = readLocalApi();
       if (!api) return;
+      const threadRef = scopeThreadRef(thread.environmentId, thread.id);
       const clicked = await api.contextMenu.show(
         [
           { id: "unarchive", label: "Unarchive" },
@@ -1910,7 +1921,46 @@ export function ArchivedThreadsPanel() {
       }
 
       if (clicked === "delete") {
-        const result = await confirmAndDeleteThread(threadRef);
+        const serverConfig = serverConfigs.get(thread.environmentId);
+        const removalPolicy =
+          serverConfig === undefined
+            ? null
+            : selectWorktreeCatalogCapabilityPolicy(serverConfig.environment).removal;
+        if (
+          thread.worktreePath &&
+          thread.kind !== "panel" &&
+          removalPolicy !== "legacy-detach-only"
+        ) {
+          requestWorktreeRemoval({
+            environmentId: thread.environmentId,
+            projectId: thread.projectId,
+            threadId: thread.id,
+            title: thread.title,
+            path: thread.worktreePath,
+            branch: thread.branch ?? null,
+            availability: "verification-unavailable",
+            registrationState: null,
+            locked: false,
+          });
+          return;
+        }
+        const isLegacyWorktreeDetach =
+          thread.worktreePath !== null &&
+          thread.worktreePath !== undefined &&
+          thread.kind !== "panel" &&
+          removalPolicy === "legacy-detach-only";
+        if (isLegacyWorktreeDetach) {
+          const confirmed = await api.dialogs.confirm(
+            [
+              `Remove worktree "${thread.title}" from BiBCode?`,
+              "The Git worktree and its files will be left untouched.",
+            ].join("\n"),
+          );
+          if (!confirmed) return;
+        }
+        const result = isLegacyWorktreeDetach
+          ? await deleteThread(threadRef)
+          : await confirmAndDeleteThread(threadRef);
         if (result._tag === "Success") {
           refreshArchivedThreads();
         } else if (!isAtomCommandInterrupted(result)) {
@@ -1925,116 +1975,156 @@ export function ArchivedThreadsPanel() {
         }
       }
     },
-    [confirmAndDeleteThread, refreshArchivedThreads, unarchiveThread],
+    [
+      confirmAndDeleteThread,
+      deleteThread,
+      refreshArchivedThreads,
+      requestWorktreeRemoval,
+      serverConfigs,
+      unarchiveThread,
+    ],
+  );
+
+  const handleWorktreeRemoved = useCallback(
+    async (removedTarget: WorktreeRemovalTarget, result: WorktreeRemovalResult) => {
+      const cleanupResult = await completeWorktreeRemoval(removedTarget, result);
+      if (cleanupResult._tag === "Success") {
+        refreshArchivedThreads();
+        return;
+      }
+      if (isAtomCommandInterrupted(cleanupResult)) return;
+
+      const error = squashAtomCommandFailure(cleanupResult);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Worktree removed, but navigation failed",
+          description:
+            error instanceof Error
+              ? error.message
+              : "Select another thread from the archived list to continue.",
+        }),
+      );
+    },
+    [completeWorktreeRemoval, refreshArchivedThreads],
   );
 
   return (
-    <SettingsPageContainer>
-      {archivedGroups.length === 0 ? (
-        <SettingsSection title="Archived threads">
-          <SettingsRow
-            title={
-              <span className="inline-flex items-center gap-2">
-                {isLoadingArchive ? (
-                  <LoaderIcon className="size-3.5 animate-spin text-muted-foreground" />
-                ) : (
-                  <ArchiveIcon className="size-3.5 text-muted-foreground" />
-                )}
-                {isLoadingArchive
-                  ? "Loading archived threads"
-                  : archiveError
-                    ? "Could not load archived threads"
-                    : "No archived threads"}
-              </span>
-            }
-            description={
-              isLoadingArchive
-                ? "Checking connected environments."
-                : (archiveError ?? "Archived threads will appear here.")
-            }
-          />
-        </SettingsSection>
-      ) : (
-        archivedGroups.map(({ project, threads: projectThreads }) => (
-          <SettingsSection
-            key={project.id}
-            title={project.name}
-            icon={<ProjectFavicon environmentId={project.environmentId} cwd={project.cwd} />}
-          >
-            {projectThreads.map((thread) => (
-              <SettingsRow
-                key={thread.id}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  void (async () => {
-                    const result = await settlePromise(() =>
-                      handleArchivedThreadContextMenu(
-                        scopeThreadRef(thread.environmentId, thread.id),
-                        {
+    <>
+      <WorktreeRemovalDialog
+        open={worktreeRemovalTarget !== null}
+        target={worktreeRemovalTarget}
+        onOpenChange={(open) => {
+          if (!open) closeWorktreeRemovalDialog();
+        }}
+        onRemoved={(removedTarget, result) => {
+          void handleWorktreeRemoved(removedTarget, result);
+        }}
+      />
+      <SettingsPageContainer>
+        {archivedGroups.length === 0 ? (
+          <SettingsSection title="Archived threads">
+            <SettingsRow
+              title={
+                <span className="inline-flex items-center gap-2">
+                  {isLoadingArchive ? (
+                    <LoaderIcon className="size-3.5 animate-spin text-muted-foreground" />
+                  ) : (
+                    <ArchiveIcon className="size-3.5 text-muted-foreground" />
+                  )}
+                  {isLoadingArchive
+                    ? "Loading archived threads"
+                    : archiveError
+                      ? "Could not load archived threads"
+                      : "No archived threads"}
+                </span>
+              }
+              description={
+                isLoadingArchive
+                  ? "Checking connected environments."
+                  : (archiveError ?? "Archived threads will appear here.")
+              }
+            />
+          </SettingsSection>
+        ) : (
+          archivedGroups.map(({ project, threads: projectThreads }) => (
+            <SettingsSection
+              key={project.id}
+              title={project.name}
+              icon={<ProjectFavicon environmentId={project.environmentId} cwd={project.cwd} />}
+            >
+              {projectThreads.map((thread) => (
+                <SettingsRow
+                  key={thread.id}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    void (async () => {
+                      const result = await settlePromise(() =>
+                        handleArchivedThreadContextMenu(thread, {
                           x: event.clientX,
                           y: event.clientY,
-                        },
-                      ),
-                    );
-                    if (result._tag === "Failure") {
-                      const error = squashAtomCommandFailure(result);
-                      toastManager.add(
-                        stackedThreadToast({
-                          type: "error",
-                          title: "Archived thread action failed",
-                          description:
-                            error instanceof Error ? error.message : "An error occurred.",
                         }),
                       );
-                    }
-                  })();
-                }}
-                title={thread.title}
-                description={
-                  <>
-                    Archived {formatRelativeTimeLabel(thread.archivedAt ?? thread.createdAt)}
-                    {" \u00b7 Created "}
-                    {formatRelativeTimeLabel(thread.createdAt)}
-                  </>
-                }
-                control={
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 shrink-0 cursor-pointer gap-1.5 px-2.5"
-                    onClick={() => {
-                      void (async () => {
-                        const result = await unarchiveThread(
-                          scopeThreadRef(thread.environmentId, thread.id),
+                      if (result._tag === "Failure") {
+                        const error = squashAtomCommandFailure(result);
+                        toastManager.add(
+                          stackedThreadToast({
+                            type: "error",
+                            title: "Archived thread action failed",
+                            description:
+                              error instanceof Error ? error.message : "An error occurred.",
+                          }),
                         );
-                        if (result._tag === "Success") {
-                          refreshArchivedThreads();
-                          return;
-                        }
-                        if (!isAtomCommandInterrupted(result)) {
-                          const error = squashAtomCommandFailure(result);
-                          toastManager.add(
-                            stackedThreadToast({
-                              type: "error",
-                              title: "Failed to unarchive thread",
-                              description:
-                                error instanceof Error ? error.message : "An error occurred.",
-                            }),
+                      }
+                    })();
+                  }}
+                  title={thread.title}
+                  description={
+                    <>
+                      Archived {formatRelativeTimeLabel(thread.archivedAt ?? thread.createdAt)}
+                      {" \u00b7 Created "}
+                      {formatRelativeTimeLabel(thread.createdAt)}
+                    </>
+                  }
+                  control={
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 shrink-0 cursor-pointer gap-1.5 px-2.5"
+                      onClick={() => {
+                        void (async () => {
+                          const result = await unarchiveThread(
+                            scopeThreadRef(thread.environmentId, thread.id),
                           );
-                        }
-                      })();
-                    }}
-                  >
-                    <ArchiveX className="size-3.5" />
-                    <span>Unarchive</span>
-                  </Button>
-                }
-              />
-            ))}
-          </SettingsSection>
-        ))
-      )}
-    </SettingsPageContainer>
+                          if (result._tag === "Success") {
+                            refreshArchivedThreads();
+                            return;
+                          }
+                          if (!isAtomCommandInterrupted(result)) {
+                            const error = squashAtomCommandFailure(result);
+                            toastManager.add(
+                              stackedThreadToast({
+                                type: "error",
+                                title: "Failed to unarchive thread",
+                                description:
+                                  error instanceof Error ? error.message : "An error occurred.",
+                              }),
+                            );
+                          }
+                        })();
+                      }}
+                    >
+                      <ArchiveX className="size-3.5" />
+                      <span>Unarchive</span>
+                    </Button>
+                  }
+                />
+              ))}
+            </SettingsSection>
+          ))
+        )}
+      </SettingsPageContainer>
+    </>
   );
 }

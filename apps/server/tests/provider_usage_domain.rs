@@ -7,11 +7,13 @@ use provider_usage::{
     RateLimitResetCredits, STALE_THRESHOLD_MS, production_fetchers,
 };
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
     future::Future,
+    io::Read,
     path::{Path, PathBuf},
     pin::Pin,
+    process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -20,38 +22,78 @@ use std::{
 use time::{Duration, OffsetDateTime};
 use tokio::sync::oneshot;
 
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<OsString>)>,
+const PROVIDER_USAGE_TEST_NAME: &str =
+    "production_fetchers_handle_local_credentials_and_codex_rpc_responses";
+
+fn run_isolated_case(case: &str, test_name: &str) -> Output {
+    let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env("BIBCODE_TEST_ISOLATED_CASE", case)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run isolated fixture case");
+    let mut stdout = child.stdout.take().expect("isolated child stdout");
+    let mut stderr = child.stderr.take().expect("isolated child stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .expect("read isolated child stdout");
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("read isolated child stderr");
+        bytes
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
+            break (status, false);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            break (
+                child.wait().expect("reap timed-out isolated fixture case"),
+                true,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let stdout = stdout_reader.join().expect("join isolated stdout reader");
+    let stderr = stderr_reader.join().expect("join isolated stderr reader");
+    assert!(
+        !timed_out,
+        "isolated fixture case timed out:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
-impl EnvGuard {
-    fn new(keys: &[&'static str]) -> Self {
-        Self {
-            saved: keys
-                .iter()
-                .map(|key| (*key, std::env::var_os(key)))
-                .collect(),
-        }
-    }
-
-    fn set(key: &'static str, value: impl AsRef<OsStr>) {
-        // This test target runs with RUST_TEST_THREADS=1 and restores every value on drop.
-        unsafe { std::env::set_var(key, value) };
-    }
+fn is_isolated_case(case: &str, test_name: &str) -> bool {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    std::env::var("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Ok(case)
+        && arguments
+            .windows(2)
+            .any(|values| values == ["--exact", test_name])
+        && arguments.iter().any(|value| value == "--test-threads=1")
 }
 
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.drain(..) {
-            // This test target runs with RUST_TEST_THREADS=1 and restores every value on drop.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+fn set_provider_usage_environment(key: &str, value: impl AsRef<OsStr>) {
+    assert!(is_isolated_case(
+        "provider-usage-env",
+        PROVIDER_USAGE_TEST_NAME
+    ));
+    // SAFETY: this helper rejects every process except the exact one-test self-child.
+    unsafe { std::env::set_var(key, value) };
 }
 
 fn write_codex_fixture(
@@ -713,19 +755,29 @@ async fn completes_a_refresh_when_a_provider_fetcher_never_returns() {
 
 #[tokio::test]
 async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() {
+    if !is_isolated_case("provider-usage-env", PROVIDER_USAGE_TEST_NAME) {
+        let output = run_isolated_case("provider-usage-env", PROVIDER_USAGE_TEST_NAME);
+        assert!(
+            output.status.success(),
+            "isolated provider-usage environment case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("BIBCODE_TEST_ISOLATED_CASE_DONE=provider-usage-env"),
+            "isolated child did not confirm the exact provider-usage environment case"
+        );
+        return;
+    }
+
     let temporary = tempfile::tempdir().expect("temporary directory");
-    let _environment = EnvGuard::new(&[
-        "BIBCODE_CLAUDE_KEYCHAIN_ACCESS",
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "CODEX_BIN",
-    ]);
     let claude_home = temporary.path().join("claude");
     let codex_home = temporary.path().join("codex");
     fs::create_dir_all(&codex_home).expect("codex home");
-    EnvGuard::set("CLAUDE_CONFIG_DIR", &claude_home);
-    EnvGuard::set("BIBCODE_CLAUDE_KEYCHAIN_ACCESS", "disabled");
-    EnvGuard::set("CODEX_HOME", &codex_home);
+    set_provider_usage_environment("CLAUDE_CONFIG_DIR", &claude_home);
+    set_provider_usage_environment("BIBCODE_CLAUDE_KEYCHAIN_ACCESS", "disabled");
+    set_provider_usage_environment("CODEX_HOME", &codex_home);
 
     let fetchers = production_fetchers();
     assert_eq!(fetchers.len(), 2);
@@ -747,7 +799,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
 
     fs::write(codex_home.join("auth.json"), "{}").expect("Codex auth fixture");
     let missing_binary = temporary.path().join("missing-codex.cmd");
-    EnvGuard::set("CODEX_BIN", &missing_binary);
+    set_provider_usage_environment("CODEX_BIN", &missing_binary);
     let missing_binary_error = codex_fetch().await.expect_err("missing Codex binary");
     assert_eq!(
         missing_binary_error.message,
@@ -763,7 +815,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
         &["{\"id\":1,\"error\":{}}"],
         None,
     );
-    EnvGuard::set("CODEX_BIN", &initialize_error);
+    set_provider_usage_environment("CODEX_BIN", &initialize_error);
     let initialize_error = codex_fetch().await.expect_err("initialize error");
     assert_eq!(initialize_error.message, "Codex initialize failed.");
 
@@ -776,7 +828,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
         &["{\"id\":1,\"result\":{}}"],
         Some(&rate_limit_error_payload),
     );
-    EnvGuard::set("CODEX_BIN", &rate_limit_error);
+    set_provider_usage_environment("CODEX_BIN", &rate_limit_error);
     let rate_limit_error = codex_fetch().await.expect_err("rate-limit error");
     assert_eq!(rate_limit_error.message, "Codex rate-limit read failed.");
     assert!(!rate_limit_error.message.contains(SENTINEL_SECRET));
@@ -796,7 +848,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
     assert!(!serialized_error.contains(SENTINEL_SECRET));
 
     let early_exit = write_codex_fixture(temporary.path(), "early-exit", &[], None);
-    EnvGuard::set("CODEX_BIN", &early_exit);
+    set_provider_usage_environment("CODEX_BIN", &early_exit);
     let early_exit = codex_fetch().await.expect_err("early app-server exit");
     assert_eq!(
         early_exit.message,
@@ -811,7 +863,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
             "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":\"invalid\"},\"secondary\":{}}}}",
         ),
     );
-    EnvGuard::set("CODEX_BIN", &malformed);
+    set_provider_usage_environment("CODEX_BIN", &malformed);
     let malformed = codex_fetch().await.expect("malformed rate-limit snapshot");
     assert_eq!(malformed.status, ProviderUsageStatus::Unavailable);
     assert_eq!(
@@ -831,7 +883,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
             "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":7.4,\"resetsAt\":\"1900000000\"},\"secondary\":{\"utilization\":101.2,\"resets_at\":1900000000000}},\"rateLimitResetCredits\":{\"availableCount\":2,\"totalEarnedCount\":5,\"nextExpiresAt\":1900000100,\"credits\":[{\"status\":\"available\",\"expiresAt\":1900000200}]}}}",
         ),
     );
-    EnvGuard::set("CODEX_BIN", &successful);
+    set_provider_usage_environment("CODEX_BIN", &successful);
     let successful = codex_fetch().await.expect("successful Codex usage");
     assert_eq!(successful.status, ProviderUsageStatus::Ok);
     assert_eq!(
@@ -878,7 +930,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
             "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":8}},\"rateLimitResetCredits\":{\"availableCount\":3,\"credits\":[{\"status\":\"available\",\"expiresAt\":1900000300},{\"status\":\"consumed\",\"expiresAt\":1800000000},{\"status\":\"AVAILABLE\",\"expiresAt\":\"1900000200\"}]}}}",
         ),
     );
-    EnvGuard::set("CODEX_BIN", &derived_expiry);
+    set_provider_usage_environment("CODEX_BIN", &derived_expiry);
     let derived_expiry = codex_fetch().await.expect("derived credit expiry");
     let credits = derived_expiry
         .rate_limit_reset_credits
@@ -892,4 +944,5 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
             .unix_timestamp(),
         1_900_000_200
     );
+    println!("BIBCODE_TEST_ISOLATED_CASE_DONE=provider-usage-env");
 }

@@ -28,14 +28,14 @@ import { useNavigate } from "@tanstack/react-router";
 import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
-import { newThreadId } from "~/lib/utils";
+import { newCommandId, newThreadId } from "~/lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { useProjects, useServerConfigs } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
-import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { vcsEnvironment } from "~/state/vcs";
+import { worktreeEnvironment } from "~/state/worktrees";
 
 import {
   buildSmartRows,
@@ -269,8 +269,9 @@ export function CreateWorktreeDialog({
     [mode, nameText, selectedBranchRefName, githubItem, baseBranchOverride],
   );
 
-  const createWorktree = useAtomCommand(vcsEnvironment.createWorktree, { reportFailure: false });
-  const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
+  const createManagedWorktree = useAtomCommand(worktreeEnvironment.createManaged, {
+    reportFailure: false,
+  });
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const createDisabled = getCreateWorktreeDisabled({
@@ -294,32 +295,6 @@ export function CreateWorktreeDialog({
     setFormError(null);
     setIsSubmitting(true);
     try {
-      const worktreeResult = await createWorktree({
-        environmentId,
-        input: {
-          cwd,
-          refName: resolution.refName,
-          newRefName: resolution.newRefName,
-          baseRefName: resolution.baseRefName,
-          path: null,
-        },
-      });
-      if (worktreeResult._tag === "Failure") {
-        if (!isAtomCommandInterrupted(worktreeResult)) {
-          const error = squashAtomCommandFailure(worktreeResult);
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Failed to create worktree",
-              description: error instanceof Error ? error.message : "An error occurred.",
-            }),
-          );
-        }
-        return;
-      }
-
-      const worktreePath = worktreeResult.value.worktree.path;
-      const finalRefName = worktreeResult.value.worktree.refName;
       const threadId = newThreadId();
       const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
       const requestedAction = selectableAgentActions.find(
@@ -341,26 +316,30 @@ export function CreateWorktreeDialog({
         console.warn("Provider session default fallback", resolvedDefault.fallback);
       }
 
-      const threadResult = await createThread({
+      const worktreeResult = await createManagedWorktree({
         environmentId,
         input: {
+          commandId: newCommandId(),
           threadId,
           projectId: project.id,
-          title: finalRefName,
-          modelSelection: resolvedDefault.modelSelection,
-          runtimeMode: DEFAULT_RUNTIME_MODE,
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          branch: finalRefName,
-          worktreePath,
+          title: resolution.branchName,
+          refName: resolution.refName,
+          newRefName: resolution.newRefName,
+          baseRefName: resolution.baseRefName,
+          threadDefaults: {
+            modelSelection: resolvedDefault.modelSelection,
+            runtimeMode: DEFAULT_RUNTIME_MODE,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          },
         },
       });
-      if (threadResult._tag === "Failure") {
-        if (!isAtomCommandInterrupted(threadResult)) {
-          const error = squashAtomCommandFailure(threadResult);
+      if (worktreeResult._tag === "Failure") {
+        if (!isAtomCommandInterrupted(worktreeResult)) {
+          const error = squashAtomCommandFailure(worktreeResult);
           toastManager.add(
             stackedThreadToast({
               type: "error",
-              title: "Worktree created but thread creation failed",
+              title: "Failed to create worktree",
               description: error instanceof Error ? error.message : "An error occurred.",
             }),
           );
@@ -394,8 +373,7 @@ export function CreateWorktreeDialog({
     environmentId,
     cwd,
     resolution,
-    createWorktree,
-    createThread,
+    createManagedWorktree,
     agentActionValue,
     agentActions,
     selectableAgentActions,

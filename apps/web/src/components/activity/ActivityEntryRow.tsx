@@ -1,4 +1,5 @@
 import type { ActivityEntry } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   ActivityIcon,
   CheckCircle2Icon,
@@ -11,6 +12,7 @@ import {
 import type { ComponentType } from "react";
 
 import { cn } from "~/lib/utils";
+import { formatChatTimestampTooltip } from "~/timestampFormat";
 
 const COLLAPSIBLE_DETAIL_LENGTH = 4_096;
 
@@ -29,9 +31,14 @@ const ENTRY_PRESENTATION: Record<
 
 export interface ActivityEntryRowProps {
   readonly entry: ActivityEntry;
+  readonly timestampFormat: TimestampFormat;
 }
 
-function EntryDetail({ entry }: ActivityEntryRowProps) {
+function formatActivityEntryTimestamp(value: string, timestampFormat: TimestampFormat): string {
+  return formatChatTimestampTooltip(value, timestampFormat) || value;
+}
+
+function EntryDetail({ entry }: Pick<ActivityEntryRowProps, "entry">) {
   if (entry.detail === null) {
     return null;
   }
@@ -53,7 +60,7 @@ function EntryDetail({ entry }: ActivityEntryRowProps) {
   );
 }
 
-export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
+export function ActivityEntryRow({ entry, timestampFormat }: ActivityEntryRowProps) {
   const presentation = ENTRY_PRESENTATION[entry.kind];
   const Icon = presentation.icon;
 
@@ -66,7 +73,7 @@ export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
       data-activity-entry-id={entry.id}
       data-activity-entry-kind={entry.kind}
     >
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
         <span
           className="shrink-0 text-xs font-medium text-muted-foreground"
@@ -74,9 +81,13 @@ export function ActivityEntryRow({ entry }: ActivityEntryRowProps) {
         >
           {presentation.label}
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm">{entry.title}</span>
-        <time className="shrink-0 text-[11px] text-muted-foreground" dateTime={entry.createdAt}>
-          {entry.createdAt}
+        <span className="min-w-16 flex-1 truncate text-sm">{entry.title}</span>
+        <time
+          className="ml-auto shrink-0 text-[11px] text-muted-foreground"
+          dateTime={entry.createdAt}
+          title={entry.createdAt}
+        >
+          {formatActivityEntryTimestamp(entry.createdAt, timestampFormat)}
         </time>
       </div>
       <EntryDetail entry={entry} />

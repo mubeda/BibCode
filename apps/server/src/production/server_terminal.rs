@@ -11,10 +11,12 @@ use crate::{
     diagnostics::{
         AttributedProcess, AttributionConfidence, AttributionKind, AttributionScope, BucketMetric,
         CurrentProcessDiagnostics, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
-        ProcessAttributionTotals, ProcessIdentity, ProcessResourceHistory, ProcessResourceTotals,
-        ProcessRow, ProcessSignal, SplitMetric, UiCoverage, UiCoverageStatus,
+        ProcessAttributionRegistry, ProcessAttributionTotals, ProcessIdentity,
+        ProcessResourceHistory, ProcessResourceTotals, ProcessRow, ProcessSignal,
+        RuntimeProcessOwnership, SplitMetric, UiCoverage, UiCoverageStatus,
         bound_diagnostic_string, process_tree_metadata,
     },
+    persistence::Repositories,
     production::orchestration_effects::SetupScriptLaunch,
     provider_usage::{
         CodexRateLimitResetOutcome, ConsumeCodexRateLimitResetResult, ProviderUsageCommandError,
@@ -24,9 +26,12 @@ use crate::{
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
         TerminalAttachInput, TerminalError, TerminalLaunchCommand, TerminalManager,
-        TerminalMetadataEvent, TerminalOpenInput,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalSessionIdentity,
     },
+    worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
+
+use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 const PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS: usize = 160;
 
@@ -55,6 +60,7 @@ pub trait ProductionServerControl: std::fmt::Debug + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ServerTerminalServices {
     terminal: TerminalManager,
+    process_attribution: ProcessAttributionRegistry,
     process_sampler: Arc<NativeProcessSampler>,
     process_tree_cleanup: ProcessTreeCleanup,
     resource_sampler: Arc<NativeResourceSampler>,
@@ -62,6 +68,7 @@ pub struct ServerTerminalServices {
     provider_usage: ProviderUsageService,
     relay: RelayClientService,
     control: Arc<dyn ProductionServerControl>,
+    workspace_admission: Option<WorkspaceAdmissionController>,
 }
 
 impl ServerTerminalServices {
@@ -83,7 +90,7 @@ impl ServerTerminalServices {
             provider_usage,
             relay,
             control,
-            ProcessTreeCleanup::StandaloneServer,
+            ProcessTreeCleanup::EmbeddedHost,
         )
     }
 
@@ -98,8 +105,10 @@ impl ServerTerminalServices {
         control: Arc<dyn ProductionServerControl>,
         process_tree_cleanup: ProcessTreeCleanup,
     ) -> Self {
+        let process_attribution = terminal.process_attribution_registry();
         Self {
             terminal,
+            process_attribution,
             process_sampler,
             process_tree_cleanup,
             resource_sampler,
@@ -107,26 +116,78 @@ impl ServerTerminalServices {
             provider_usage,
             relay,
             control,
+            workspace_admission: None,
         }
     }
 
-    pub async fn shutdown(&self) {
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.workspace_admission = Some(WorkspaceAdmissionController::registry_only(
+            availability_registry,
+        ));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_workspace_admission(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+        repositories: Repositories,
+    ) -> Self {
+        self.workspace_admission = Some(WorkspaceAdmissionController::new(
+            availability_registry,
+            repositories,
+        ));
+        self
+    }
+
+    pub(crate) async fn freeze_process_ownership(&self) -> RuntimeProcessOwnership {
+        let roots = self.process_attribution.freeze_and_snapshot_identities();
+        match self
+            .process_sampler
+            .capture_runtime_process_ownership(roots.clone())
+            .await
+        {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                let error = bound_diagnostic_string(
+                    &error.to_string(),
+                    PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
+                );
+                tracing::warn!(
+                    %error,
+                    root_count = roots.len(),
+                    "failed to capture the initial runtime-owned process closure"
+                );
+                RuntimeProcessOwnership::roots_only(roots)
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown_with_process_ownership(&self, ownership: RuntimeProcessOwnership) {
         self.terminal.shutdown().await;
-        match cleanup_server_descendants(self.process_tree_cleanup, &self.process_sampler).await {
-            Ok(Some(report)) if report.failure_count > 0 => {
+        match self
+            .process_sampler
+            .cleanup_runtime_process_ownership(ownership)
+            .await
+        {
+            Ok(report) if report.failure_count > 0 => {
                 tracing::warn!(
                     attempted = report.attempted,
                     succeeded = report.succeeded,
                     failed = report.failure_count,
                     failures = ?report.failures,
-                    "identity-bound descendant cleanup completed with failures"
+                    "runtime-owned process cleanup completed with failures"
                 );
             }
-            Ok(Some(report)) if report.attempted > 0 => {
+            Ok(report) if report.attempted > 0 => {
                 tracing::debug!(
                     attempted = report.attempted,
                     succeeded = report.succeeded,
-                    "identity-bound descendant cleanup completed"
+                    "runtime-owned process cleanup completed"
                 );
             }
             Ok(_) => {}
@@ -135,13 +196,73 @@ impl ServerTerminalServices {
                     &error.to_string(),
                     PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
                 );
-                tracing::warn!(%error, "failed to inspect remaining descendants during shutdown");
+                tracing::warn!(%error, "failed to inspect remaining runtime-owned processes during shutdown");
+            }
+        }
+        match cleanup_server_descendants(self.process_tree_cleanup, &self.process_sampler).await {
+            Ok(Some(report)) if report.failure_count > 0 => {
+                tracing::warn!(
+                    attempted = report.attempted,
+                    succeeded = report.succeeded,
+                    failed = report.failure_count,
+                    failures = ?report.failures,
+                    "standalone descendant cleanup completed with failures"
+                );
+            }
+            Ok(Some(report)) if report.attempted > 0 => {
+                tracing::debug!(
+                    attempted = report.attempted,
+                    succeeded = report.succeeded,
+                    "standalone descendant cleanup completed"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let error = bound_diagnostic_string(
+                    &error.to_string(),
+                    PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS,
+                );
+                tracing::warn!(%error, "failed to inspect standalone descendants during shutdown");
             }
         }
     }
 
+    pub async fn shutdown(&self) {
+        let ownership = self.freeze_process_ownership().await;
+        self.shutdown_with_process_ownership(ownership).await;
+    }
+
     pub async fn close_thread_terminals(&self, thread_id: &str) {
         let _ = self.terminal.close(thread_id, None).await;
+    }
+
+    pub async fn quiesce_thread_terminals_for_workspace_loss(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        self.terminal
+            .quiesce_thread_preserving_history(thread_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn capture_thread_terminal_identities(
+        &self,
+        thread_id: &str,
+    ) -> Vec<TerminalSessionIdentity> {
+        self.terminal
+            .capture_thread_session_identities(thread_id)
+            .await
+    }
+
+    pub(crate) async fn quiesce_terminal_identities_for_workspace_loss(
+        &self,
+        identities: Vec<TerminalSessionIdentity>,
+    ) -> Result<(), String> {
+        self.terminal
+            .quiesce_sessions_preserving_history_if_current(identities)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub async fn terminal_exists(&self, thread_id: &str, terminal_id: &str) -> bool {
@@ -154,6 +275,13 @@ impl ServerTerminalServices {
     }
 
     pub async fn launch_setup_script(&self, input: SetupScriptLaunch) -> Result<(), String> {
+        let workspace_admission = acquire_terminal_start(
+            self.workspace_admission.as_ref(),
+            &input.thread_id,
+            &input.cwd.to_string_lossy(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let mut terminal_input = TerminalOpenInput::new(
             input.thread_id.clone(),
             input.terminal_id.clone(),
@@ -163,10 +291,22 @@ impl ServerTerminalServices {
         );
         terminal_input.worktree_path = Some(input.worktree_path);
         terminal_input.env = input.env;
-        self.terminal
-            .open_with_initial_input(terminal_input, format!("{}\r", input.command))
-            .await
-            .map_err(|error| error.to_string())?;
+        let publication_cancellation = workspace_admission
+            .as_ref()
+            .map_or_else(CancellationToken::new, |admission| {
+                admission.loss_cancellation().cancellation_token()
+            });
+        await_terminal_publication(
+            workspace_admission,
+            self.terminal
+                .open_with_initial_input_and_publication_cancellation(
+                    terminal_input,
+                    format!("{}\r", input.command),
+                    publication_cancellation,
+                ),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -375,35 +515,65 @@ fn register_cloud_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServ
 
 fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
     let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
     registry.register_unary("terminal.open", move |request, _cancellation| {
         let terminal = terminal.clone();
+        let availability = availability.clone();
         async move {
             let input: TerminalStartPayload = decode_payload(&request.payload)?;
-            terminal
-                .open(input.into_open(false)?)
-                .await
-                .map(|snapshot| {
-                    serde_json::to_value(snapshot).expect("terminal snapshot serializes")
-                })
-                .map_err(terminal_error)
+            let workspace_admission =
+                acquire_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            await_terminal_publication(
+                workspace_admission,
+                terminal.open_with_publication_cancellation(
+                    input.into_open(false)?,
+                    publication_cancellation,
+                ),
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).expect("terminal snapshot serializes"))
         }
     });
 
     let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
     registry.register_stream("terminal.attach", move |request, cancellation| {
         let terminal = terminal.clone();
+        let availability = availability.clone();
         spawn_stream(cancellation, move |sender, cancellation| async move {
             let input: TerminalAttachPayload = match decode_payload(&request.payload) {
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
+            let workspace_admission = if input.restart_if_not_running {
+                match acquire_terminal_attach(availability.as_ref(), &input).await {
+                    Ok(admission) => admission,
+                    Err(error) => { let _ = sender.send(Err(error)).await; return; }
+                }
+            } else { None };
             let input = match input.into_attach() {
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
-            let mut attachment = match terminal.attach(input).await {
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            let mut attachment = match await_terminal_publication(
+                workspace_admission,
+                terminal.attach_with_publication_cancellation(
+                    input,
+                    publication_cancellation,
+                ),
+            ).await {
                 Ok(attachment) => attachment,
-                Err(error) => { let _ = sender.send(Err(terminal_error(error))).await; return; }
+                Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
             if sender.send(Ok(vec![json!({
                 "type": "snapshot",
@@ -423,21 +593,22 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         })
     });
 
-    register_terminal_unary(
-        registry,
-        "terminal.write",
-        services.terminal.clone(),
-        |terminal, payload| {
-            Box::pin(async move {
-                let input: TerminalWritePayload = decode_payload(&payload)?;
-                terminal
-                    .write(&input.thread_id, &input.terminal_id, &input.data)
-                    .await
-                    .map_err(terminal_error)?;
-                Ok(Value::Null)
-            })
-        },
-    );
+    let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
+    registry.register_unary("terminal.write", move |request, _cancellation| {
+        let terminal = terminal.clone();
+        let availability = availability.clone();
+        async move {
+            let input: TerminalWritePayload = decode_payload(&request.payload)?;
+            let _workspace_admission =
+                acquire_terminal_thread(availability.as_ref(), &input.thread_id).await?;
+            terminal
+                .write(&input.thread_id, &input.terminal_id, &input.data)
+                .await
+                .map_err(terminal_error)?;
+            Ok(Value::Null)
+        }
+    });
     register_terminal_unary(
         registry,
         "terminal.resize",
@@ -468,23 +639,31 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             })
         },
     );
-    register_terminal_unary(
-        registry,
-        "terminal.restart",
-        services.terminal.clone(),
-        |terminal, payload| {
-            Box::pin(async move {
-                let input: TerminalStartPayload = decode_payload(&payload)?;
-                terminal
-                    .restart(input.into_open(true)?)
-                    .await
-                    .map(|snapshot| {
-                        serde_json::to_value(snapshot).expect("terminal snapshot serializes")
-                    })
-                    .map_err(terminal_error)
-            })
-        },
-    );
+    let terminal = services.terminal.clone();
+    let availability = services.workspace_admission.clone();
+    registry.register_unary("terminal.restart", move |request, _cancellation| {
+        let terminal = terminal.clone();
+        let availability = availability.clone();
+        async move {
+            let input: TerminalStartPayload = decode_payload(&request.payload)?;
+            let workspace_admission =
+                acquire_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            await_terminal_publication(
+                workspace_admission,
+                terminal.restart_with_publication_cancellation(
+                    input.into_open(true)?,
+                    publication_cancellation,
+                ),
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).expect("terminal snapshot serializes"))
+        }
+    });
     register_terminal_unary(
         registry,
         "terminal.close",
@@ -537,6 +716,100 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             }
         })
     });
+}
+
+async fn acquire_terminal_start(
+    admission: Option<&WorkspaceAdmissionController>,
+    thread_id: &str,
+    cwd: &str,
+) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    admission
+        .acquire_thread(thread_id, [std::path::Path::new(cwd)])
+        .await
+        .map(Some)
+        .map_err(workspace_admission_error)
+}
+
+async fn acquire_terminal_attach(
+    admission: Option<&WorkspaceAdmissionController>,
+    input: &TerminalAttachPayload,
+) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    if let Some(cwd) = input.cwd.as_deref() {
+        return admission
+            .acquire_thread(&input.thread_id, [std::path::Path::new(cwd)])
+            .await
+            .map(Some)
+            .map_err(workspace_admission_error);
+    }
+    acquire_terminal_thread(Some(admission), &input.thread_id).await
+}
+
+async fn acquire_terminal_thread(
+    admission: Option<&WorkspaceAdmissionController>,
+    thread_id: &str,
+) -> Result<Option<WorkspaceAdmissionLease>, Value> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    admission
+        .acquire_thread(thread_id, std::iter::empty())
+        .await
+        .map(Some)
+        .map_err(workspace_admission_error)
+}
+
+async fn await_terminal_publication<T, F>(
+    admission: Option<WorkspaceAdmissionLease>,
+    operation: F,
+) -> Result<T, Value>
+where
+    F: Future<Output = Result<T, TerminalError>>,
+{
+    let loss = admission
+        .as_ref()
+        .map(WorkspaceAdmissionLease::loss_cancellation);
+    let result = if let Some(loss) = &loss {
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                let unavailable = loss
+                    .unavailable()
+                    .expect("workspace loss cancellation retains its error");
+                return Err(serde_json::to_value(unavailable)
+                    .expect("workspace unavailable error serializes"));
+            }
+            result = &mut operation => result,
+        }
+    } else {
+        operation.await
+    };
+    if matches!(result, Err(TerminalError::PublicationCancelled))
+        && let Some(unavailable) = loss.and_then(|loss| loss.unavailable())
+    {
+        return Err(
+            serde_json::to_value(unavailable).expect("workspace unavailable error serializes")
+        );
+    }
+    result.map_err(terminal_error)
+}
+
+fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        }
+        WorkspaceAdmissionError::Identity(error) => {
+            serde_json::to_value(error).expect("workspace identity error serializes")
+        }
+        WorkspaceAdmissionError::Resolution(error) => terminal_error(TerminalError::Io(error)),
+    }
 }
 
 type TerminalUnary = fn(TerminalManager, Value) -> JsonFuture;
@@ -1116,7 +1389,7 @@ fn terminal_metadata_to_wire(event: TerminalMetadataEvent) -> Value {
 
 fn terminal_error(error: TerminalError) -> Value {
     match error {
-        TerminalError::Shutdown => json!({
+        TerminalError::Shutdown | TerminalError::PublicationCancelled => json!({
             "_tag": "TerminalSpawnError",
             "reason": "Terminal manager is shut down.",
         }),
@@ -1191,7 +1464,10 @@ fn format_epoch_ms(value: i128) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
     use std::{future::Future, pin::Pin, process::Stdio, time::Duration};
+
+    use futures_util::FutureExt as _;
 
     use crate::{
         ServerConfig,
@@ -1203,14 +1479,15 @@ mod tests {
             ResourceSampler, SamplingError, SplitMetric, UiCoverage, UiCoverageStatus,
         },
         production::control::NativeServerControl,
-        terminal::{PortablePtyBackend, TerminalLaunchCommand, TerminalManagerOptions},
+        terminal::{
+            PortablePtyBackend, TerminalEvent, TerminalLaunchCommand, TerminalManagerOptions,
+        },
     };
 
     use super::*;
 
     #[tokio::test]
     async fn embedded_host_cleanup_preserves_unmanaged_host_descendants() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let mut command = if cfg!(windows) {
             let mut command = tokio::process::Command::new("C:\\Windows\\System32\\ping.exe");
             command.args(["-n", "30", "127.0.0.1"]);
@@ -1222,7 +1499,6 @@ mod tests {
         };
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let mut sentinel = command.spawn().expect("sentinel process starts");
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let cleanup = cleanup_server_descendants(
             ProcessTreeCleanup::EmbeddedHost,
@@ -1265,6 +1541,268 @@ mod tests {
             "command": command,
         }))
         .expect("terminal attach payload decodes")
+    }
+
+    async fn real_terminal_services(root: &std::path::Path) -> ServerTerminalServices {
+        let attribution = ProcessAttributionRegistry::new();
+        let terminal = TerminalManager::with_process_attribution(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::from_millis(20),
+                ..TerminalManagerOptions::default()
+            },
+            attribution.clone(),
+        );
+        let sampler = Arc::new(NativeProcessSampler::default());
+        let resource_sampler = Arc::new(NativeResourceSampler::new(
+            sampler.clone(),
+            attribution,
+            Arc::new(NotApplicableUiProcessObserver),
+        ));
+        let monitor = Arc::new(DiagnosticsMonitor::new(
+            resource_sampler.clone(),
+            Duration::from_secs(60),
+        ));
+        let usage = ProviderUsageService::new(Vec::new(), Arc::new(OffsetDateTime::now_utc));
+        let relay = RelayClientService::new(
+            || async {
+                RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                }
+            },
+            |_report| async {
+                Ok(RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                })
+            },
+        );
+        let control = Arc::new(
+            NativeServerControl::new(ServerConfig::new(root), json!({"policy":"test"})).await,
+        );
+        ServerTerminalServices::new(
+            terminal,
+            sampler,
+            resource_sampler,
+            monitor,
+            usage,
+            relay,
+            control,
+        )
+    }
+
+    fn write_probe_command(value: &str) -> String {
+        if cfg!(windows) {
+            format!("echo.\recho {value}\r")
+        } else {
+            format!("printf '\\n%s\\n' '{value}'\n")
+        }
+    }
+
+    fn strip_terminal_control_sequences(input: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum State {
+            Text,
+            Escape,
+            Csi,
+            Osc,
+            OscEscape,
+        }
+
+        let mut state = State::Text;
+        let mut stripped = String::with_capacity(input.len());
+        for character in input.chars() {
+            state = match state {
+                State::Text if character == '\u{1b}' => State::Escape,
+                State::Text => {
+                    stripped.push(character);
+                    State::Text
+                }
+                State::Escape if character == '[' => State::Csi,
+                State::Escape if character == ']' => State::Osc,
+                State::Escape => State::Text,
+                State::Csi if ('@'..='~').contains(&character) => State::Text,
+                State::Csi => State::Csi,
+                State::Osc if character == '\u{7}' => State::Text,
+                State::Osc if character == '\u{1b}' => State::OscEscape,
+                State::Osc => State::Osc,
+                State::OscEscape if character == '\\' => State::Text,
+                State::OscEscape if character == '\u{1b}' => State::OscEscape,
+                State::OscEscape => State::Osc,
+            };
+        }
+        stripped
+    }
+
+    fn probe_output_contains_exact_line(output: &str, value: &str) -> bool {
+        strip_terminal_control_sequences(output)
+            .lines()
+            .any(|line| line.trim() == value)
+    }
+
+    #[test]
+    fn terminal_probe_ignores_windows_vt_sequences_without_accepting_the_echoed_command() {
+        let observed = concat!(
+            "\u{1b}[?25lecho still-alive-b\n",
+            "\u{1b}[?25lstill-alive-b\u{1b}[8;1H \u{1b}[?25h",
+        );
+
+        assert!(probe_output_contains_exact_line(observed, "still-alive-b"));
+        assert!(!probe_output_contains_exact_line(
+            "\u{1b}[?25lecho still-alive-b\u{1b}[?25h",
+            "still-alive-b",
+        ));
+    }
+
+    fn real_terminal_input(
+        thread_id: &str,
+        terminal_id: &str,
+        cwd: &std::path::Path,
+    ) -> TerminalOpenInput {
+        let mut input = TerminalOpenInput::new(thread_id, terminal_id, cwd.to_path_buf(), 80, 24);
+        if cfg!(windows) {
+            input.command = Some(TerminalLaunchCommand {
+                executable: "cmd.exe".to_owned(),
+                args: vec![
+                    "/d".to_owned(),
+                    "/q".to_owned(),
+                    "/k".to_owned(),
+                    "prompt $H".to_owned(),
+                ],
+                label: None,
+                activity: None,
+            });
+        } else {
+            input.command = Some(TerminalLaunchCommand {
+                executable: "/bin/sh".to_owned(),
+                args: Vec::new(),
+                label: None,
+                activity: None,
+            });
+        }
+        input
+    }
+
+    async fn wait_for_probe(
+        events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
+        thread_id: &str,
+        terminal_id: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Ok(TerminalEvent::Output {
+                        thread_id: event_thread,
+                        terminal_id: event_terminal,
+                        data,
+                        ..
+                    }) if event_thread == thread_id && event_terminal == terminal_id => {
+                        output.push_str(&data.replace('\r', ""));
+                        if probe_output_contains_exact_line(&output, value) {
+                            return Ok(());
+                        }
+                        if output.len() > 16 * 1024 {
+                            return Err(format!(
+                                "terminal {terminal_id} exceeded its bounded probe output"
+                            ));
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(format!(
+                            "terminal {terminal_id} event stream closed before probe"
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out waiting for terminal {terminal_id} probe; observed output: {output:?}"
+            )
+        })?
+    }
+
+    fn exact_process_exited(identity: ProcessIdentity) -> Result<(), String> {
+        if matches!(
+            NativeProcessSampler::process_identity(identity.pid),
+            Ok(current) if current == identity
+        ) {
+            return Err(format!(
+                "runtime-owned process {} remained alive after shutdown",
+                identity.pid
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutting_down_one_runtime_reaps_only_its_real_terminal_child() {
+        let root_a = tempfile::tempdir().expect("runtime A root");
+        let root_b = tempfile::tempdir().expect("runtime B root");
+        let (services_a, services_b) = tokio::join!(
+            real_terminal_services(root_a.path()),
+            real_terminal_services(root_b.path())
+        );
+        let mut events_b = services_b.terminal.subscribe_events();
+        let outcome = AssertUnwindSafe(async {
+            let (opened_a, opened_b) = tokio::join!(
+                services_a.terminal.open(real_terminal_input(
+                    "thread-a",
+                    "terminal-a",
+                    root_a.path()
+                )),
+                services_b.terminal.open(real_terminal_input(
+                    "thread-b",
+                    "terminal-b",
+                    root_b.path()
+                ))
+            );
+            let pid_a = opened_a
+                .map_err(|error| error.to_string())?
+                .pid
+                .ok_or("A pid")?;
+            let pid_b = opened_b
+                .map_err(|error| error.to_string())?
+                .pid
+                .ok_or("B pid")?;
+            let identity_a = NativeProcessSampler::process_identity(pid_a)
+                .map_err(|error| format!("A identity: {error}"))?;
+            let identity_b = NativeProcessSampler::process_identity(pid_b)
+                .map_err(|error| format!("B identity: {error}"))?;
+            services_a.shutdown().await;
+            exact_process_exited(identity_a)?;
+            let current_b = NativeProcessSampler::process_identity(pid_b)
+                .map_err(|error| format!("runtime B remains alive: {error}"))?;
+            if current_b != identity_b {
+                return Err("runtime B identity changed during runtime A shutdown".to_owned());
+            }
+            services_b
+                .terminal
+                .write(
+                    "thread-b",
+                    "terminal-b",
+                    &write_probe_command("still-alive-b"),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            wait_for_probe(&mut events_b, "thread-b", "terminal-b", "still-alive-b").await?;
+            Ok::<_, String>((identity_a, identity_b))
+        })
+        .catch_unwind()
+        .await;
+
+        tokio::join!(services_a.shutdown(), services_b.shutdown());
+        match outcome {
+            Ok(Ok((identity_a, identity_b))) => {
+                exact_process_exited(identity_a).expect("runtime A exact cleanup");
+                exact_process_exited(identity_b).expect("runtime B exact cleanup");
+            }
+            Ok(Err(error)) => panic!("two-runtime terminal assertion failed: {error}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn assert_invalid_terminal_launch_command(command: Value) {
@@ -2080,7 +2618,6 @@ mod tests {
 
     #[tokio::test]
     async fn unit_build_covers_server_terminal_callbacks_payloads_and_wire_adapters() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("terminal workspace");
         let terminal = TerminalManager::new(
             Arc::new(PortablePtyBackend),

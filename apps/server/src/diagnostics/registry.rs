@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
+use thiserror::Error;
 
 use super::{
     AttributionKind, AttributionScope, PROCESS_CLAIM_LABEL_MAX_SCALARS, ProcessClaim,
@@ -39,8 +40,17 @@ pub struct ProcessRegistration {
     registry: Weak<Mutex<RegistryState>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ProcessRegistrationError {
+    #[error("process ownership registration is closed for shutdown")]
+    Shutdown,
+    #[error("process ownership registry capacity is exhausted")]
+    Capacity,
+}
+
 #[derive(Debug)]
 struct RegistryState {
+    accepting_registrations: bool,
     next_registration_id: u64,
     entries: HashMap<u64, RegistryEntry>,
     registration_order: VecDeque<u64>,
@@ -58,6 +68,7 @@ struct RegistryEntry {
 enum RegistrationObservation {
     AwaitingFirstSample { deadline: Instant },
     Observed,
+    Suppressed,
 }
 
 impl ProcessAttributionRegistry {
@@ -65,6 +76,7 @@ impl ProcessAttributionRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryState {
+                accepting_registrations: true,
                 next_registration_id: 0,
                 entries: HashMap::new(),
                 registration_order: VecDeque::new(),
@@ -72,34 +84,22 @@ impl ProcessAttributionRegistry {
         }
     }
 
-    pub fn register_identity(
+    pub(crate) fn register_identity(
         &self,
         identity: ProcessIdentity,
         mut metadata: ProcessRegistrationMetadata,
-    ) -> Option<ProcessRegistration> {
+    ) -> Result<ProcessRegistration, ProcessRegistrationError> {
         let now = Instant::now();
         let mut state = lock_state(&self.inner);
-        {
-            let RegistryState {
-                entries,
-                registration_order,
-                ..
-            } = &mut *state;
-            entries.retain(|_, entry| {
-                !matches!(
-                    entry.observation,
-                    RegistrationObservation::AwaitingFirstSample { deadline }
-                        if deadline <= now
-                )
-            });
-            registration_order.retain(|registration_id| entries.contains_key(registration_id));
+        if !state.accepting_registrations {
+            return Err(ProcessRegistrationError::Shutdown);
         }
         if state.entries.len() >= REGISTRY_CAPACITY {
             tracing::warn!(
                 capacity = REGISTRY_CAPACITY,
-                "process attribution registry is full; using external fallback"
+                "process attribution registry is full; rejecting new process root"
             );
-            return None;
+            return Err(ProcessRegistrationError::Capacity);
         }
 
         metadata.label = normalize_label(&metadata.label);
@@ -117,10 +117,25 @@ impl ProcessAttributionRegistry {
         );
         state.registration_order.push_back(registration_id);
 
-        Some(ProcessRegistration {
+        Ok(ProcessRegistration {
             registration_id,
             registry: Arc::downgrade(&self.inner),
         })
+    }
+
+    pub(crate) fn freeze_and_snapshot_identities(&self) -> Vec<ProcessIdentity> {
+        let mut state = lock_state(&self.inner);
+        state.accepting_registrations = false;
+        state
+            .registration_order
+            .iter()
+            .filter_map(|registration_id| {
+                state
+                    .entries
+                    .get(registration_id)
+                    .map(|entry| entry.identity)
+            })
+            .collect()
     }
 
     #[must_use]
@@ -142,7 +157,6 @@ impl ProcessAttributionRegistry {
 
         let mut state = lock_state(&self.inner);
         let mut snapshot = Vec::with_capacity(state.entries.len());
-        let mut stale_registration_ids = Vec::new();
         {
             let RegistryState {
                 entries,
@@ -153,52 +167,54 @@ impl ProcessAttributionRegistry {
                 let Some(entry) = entries.get_mut(registration_id) else {
                     return false;
                 };
-                let (retained, emit_claim) = match entry.observation {
+                let emit_claim = match entry.observation {
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sample_started_at < entry.registered_at
                             && sampled_identities.contains(&entry.identity) =>
                     {
                         entry.observation = RegistrationObservation::Observed;
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sample_started_at < entry.registered_at =>
                     {
-                        (true, false)
+                        false
                     }
                     RegistrationObservation::AwaitingFirstSample { deadline }
                         if deadline <= sample_started_at =>
                     {
-                        (false, false)
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sampled_identities.contains(&entry.identity) =>
                     {
                         entry.observation = RegistrationObservation::Observed;
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::AwaitingFirstSample { .. }
                         if sampled_pids.contains(&entry.identity.pid) =>
                     {
-                        (false, false)
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
                     }
-                    RegistrationObservation::AwaitingFirstSample { .. } => (true, false),
+                    RegistrationObservation::AwaitingFirstSample { .. } => false,
                     RegistrationObservation::Observed
                         if sampled_identities.contains(&entry.identity) =>
                     {
-                        (true, true)
+                        true
                     }
                     RegistrationObservation::Observed
                         if sample_started_at < entry.registered_at =>
                     {
-                        (true, false)
+                        false
                     }
-                    RegistrationObservation::Observed => (false, false),
+                    RegistrationObservation::Observed => {
+                        entry.observation = RegistrationObservation::Suppressed;
+                        false
+                    }
+                    RegistrationObservation::Suppressed => false,
                 };
-                if !retained {
-                    stale_registration_ids.push(*registration_id);
-                    return false;
-                }
                 if emit_claim {
                     snapshot.push(ProcessClaim {
                         identity: entry.identity,
@@ -209,9 +225,6 @@ impl ProcessAttributionRegistry {
                 }
                 true
             });
-            for registration_id in &stale_registration_ids {
-                entries.remove(registration_id);
-            }
         }
         snapshot
     }
@@ -369,15 +382,22 @@ mod tests {
     }
 
     #[test]
-    fn captured_identity_expires_without_an_initial_observation() {
+    fn expired_diagnostic_visibility_preserves_shutdown_ownership_until_token_drop() {
         let registry = ProcessAttributionRegistry::new();
-        let _registration = register(&registry, 42, 100, "external/provider");
+        let registration = register(&registry, 42, 100, "external/provider");
         let registered_at = Instant::now();
 
         let claims =
             registry.bind_and_snapshot(&[row(42, 1, 100)], registered_at + FIRST_OBSERVATION_TTL);
 
         assert!(claims.is_empty());
+        assert_eq!(
+            registry.freeze_and_snapshot_identities(),
+            [identity(42, 100)],
+            "diagnostic observation expiry must not evict a live process owner"
+        );
+        drop(registration);
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
     }
 
     #[test]
@@ -462,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_captured_identity_is_pruned_after_a_sample() {
+    fn missing_captured_identity_is_suppressed_until_its_owner_drops() {
         let registry = ProcessAttributionRegistry::new();
         let _registration = register(&registry, 42, 100, "external/provider");
         let now = Instant::now();
@@ -474,6 +494,10 @@ mod tests {
                 .bind_and_snapshot(&[row(42, 1, 100)], now)
                 .is_empty()
         );
+        assert_eq!(
+            registry.freeze_and_snapshot_identities(),
+            [identity(42, 100)]
+        );
     }
 
     #[test]
@@ -483,11 +507,10 @@ mod tests {
             .map(|pid| register(&registry, pid, 100, "external/provider"))
             .collect::<Vec<_>>();
 
-        assert!(
-            registry
-                .register_identity(identity(999, 100), metadata("overflow"))
-                .is_none()
-        );
+        assert!(matches!(
+            registry.register_identity(identity(999, 100), metadata("overflow")),
+            Err(ProcessRegistrationError::Capacity)
+        ));
         assert_eq!(
             registry.bind_and_snapshot(&[row(0, 1, 100)], Instant::now()),
             vec![crate::diagnostics::ProcessClaim {
@@ -587,6 +610,29 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn shutdown_freeze_is_idempotent_and_rejects_late_roots() {
+        let registry = ProcessAttributionRegistry::new();
+        let _first = register(&registry, 2, 20, "first");
+        let _second = register(&registry, 1, 10, "second");
+
+        let first_snapshot = registry.freeze_and_snapshot_identities();
+        let second_snapshot = registry.freeze_and_snapshot_identities();
+        let late = registry.register_identity(identity(3, 30), metadata("late"));
+
+        assert_eq!(
+            first_snapshot,
+            [identity(2, 20), identity(1, 10)],
+            "freeze must preserve exact registration order"
+        );
+        assert_eq!(second_snapshot, first_snapshot);
+        assert!(
+            matches!(late, Err(ProcessRegistrationError::Shutdown)),
+            "a frozen runtime cannot publish a late root"
+        );
+        assert_eq!(registry.freeze_and_snapshot_identities(), first_snapshot);
     }
 
     #[test]

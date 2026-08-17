@@ -5,12 +5,16 @@ use std::{
     time::Duration,
 };
 
+use bibcode_server::production::orchestration_rpc::register_orchestration_rpc_with_availability;
 use bibcode_server::{
     RpcExit, RpcRegistry, ServerConfig, ServerHandle, ServerMessage, ServerRuntime,
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
     persistence::{CheckpointDiffBlob, Database, NewOrchestrationEvent, run_migrations},
     production::{
         host_paths::process_compatible_path, orchestration_rpc::register_orchestration_rpc,
+    },
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -115,6 +119,252 @@ async fn harness() -> Harness {
     }
 }
 
+#[tokio::test]
+async fn workspace_unavailable_rejects_turn_and_generic_owner_delete_without_retiring_guard() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let workspace = temp.path().join("guarded-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("engine starts");
+    engine
+        .dispatch(
+            serde_json::from_value(create_project(
+                "project-guarded",
+                &workspace.to_string_lossy(),
+            ))
+            .expect("project command"),
+        )
+        .await
+        .expect("project created");
+    engine
+        .dispatch(
+            serde_json::from_value(create_thread(
+                "thread-guarded",
+                "project-guarded",
+                "Guarded thread",
+            ))
+            .expect("thread command"),
+        )
+        .await
+        .expect("thread created");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-guarded".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 5,
+                path: workspace,
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_availability(
+        &mut registry,
+        engine.clone(),
+        availability.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects")
+        .0;
+
+    rpc_request(&mut socket, "1", "orchestration.dispatchCommand", json!({
+        "type":"thread.turn.start",
+        "commandId":"blocked-turn",
+        "threadId":"thread-guarded",
+        "message":{"messageId":"message-1","role":"user","text":"must not persist","attachments":[]},
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":CREATED_AT,
+    })).await;
+    let error = expect_failure(&mut socket, "1").await;
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("blocked-turn".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none()
+    );
+
+    rpc_request(
+        &mut socket,
+        "2",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.delete",
+            "commandId":"delete-guarded-thread",
+            "threadId":"thread-guarded",
+            "createdAt":CREATED_AT,
+        }),
+    )
+    .await;
+    let delete_error = expect_failure(&mut socket, "2").await;
+    assert_invalid_request(
+        &delete_error,
+        "orchestration.dispatchCommand",
+        "dedicated server-resolved",
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_thread("thread-guarded".to_owned())
+            .await
+            .expect("thread query")
+            .is_some_and(|thread| thread.deleted_at.is_none()),
+        "generic deletion must leave the adopted owner intact"
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("delete-guarded-thread".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none(),
+        "public rejection happens before durable command admission"
+    );
+    assert!(
+        availability.guard_thread("thread-guarded").await.is_err(),
+        "generic rejection cannot silently retire the adopted workspace guard"
+    );
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn workspace_unavailable_resolves_a_persisted_panel_path_before_turn_admission() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let workspace = temp.path().join("guarded-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("engine starts");
+    engine
+        .dispatch(
+            serde_json::from_value(create_project(
+                "project-panel-guard",
+                &temp.path().to_string_lossy(),
+            ))
+            .expect("project command"),
+        )
+        .await
+        .expect("project created");
+    for (thread_id, kind, path) in [
+        (
+            "workspace-owner",
+            "workspace",
+            workspace.to_string_lossy().into_owned(),
+        ),
+        (
+            "panel-alias",
+            "panel",
+            workspace
+                .join(".")
+                .join("alias")
+                .join("..")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ] {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create",
+                    "commandId":format!("create-{thread_id}"),
+                    "threadId":thread_id,
+                    "projectId":"project-panel-guard",
+                    "title":thread_id,
+                    "kind":kind,
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":"feature/panel-guard",
+                    "worktreePath":path,
+                    "createdAt":CREATED_AT,
+                }))
+                .expect("thread command"),
+            )
+            .await
+            .expect("thread created");
+    }
+    let availability = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "workspace-owner".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 6,
+                path: workspace,
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_availability(&mut registry, engine.clone(), availability);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects")
+        .0;
+
+    rpc_request(&mut socket, "1", "orchestration.dispatchCommand", json!({
+        "type":"thread.turn.start",
+        "commandId":"blocked-panel-turn",
+        "threadId":"panel-alias",
+        "message":{"messageId":"panel-message","role":"user","text":"must not persist","attachments":[]},
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":CREATED_AT,
+    })).await;
+    let error = expect_failure(&mut socket, "1").await;
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert_eq!(error["threadId"], "workspace-owner");
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("blocked-panel-turn".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none(),
+        "panel loss must reject before durable turn admission",
+    );
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    engine.shutdown().await;
+}
+
 async fn harness_with_historical_workspace() -> (Harness, PathBuf) {
     let temp = TempDir::new().expect("temporary base directory");
     let historical_workspace = temp.path().join("historical-workspace");
@@ -191,6 +441,20 @@ fn create_thread(thread_id: &str, project_id: &str, title: &str) -> Value {
     })
 }
 
+fn create_public_thread(thread_id: &str, project_id: &str, title: &str) -> Value {
+    json!({
+        "type": "thread.create",
+        "commandId": format!("create-{thread_id}"),
+        "threadId": thread_id,
+        "projectId": project_id,
+        "title": title,
+        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "createdAt": CREATED_AT,
+    })
+}
+
 #[tokio::test]
 async fn orchestration_rpc_registration_has_the_contract_modes() {
     let harness = harness().await;
@@ -213,6 +477,224 @@ async fn orchestration_rpc_registration_has_the_contract_modes() {
                 "{method} was missing or registered with the wrong mode: {issues}"
             );
         }
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
+async fn public_dispatch_rejects_every_generic_worktree_authority_bypass() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let authority_workspace = harness.workspace_root("authority-project");
+        harness
+            .engine
+            .dispatch(
+                serde_json::from_value(create_project(
+                    "authority-project",
+                    &authority_workspace,
+                ))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        harness
+            .engine
+            .dispatch(
+                serde_json::from_value(create_thread(
+                    "adopted-owner",
+                    "authority-project",
+                    "Adopted owner",
+                ))
+                .expect("internal owner command"),
+            )
+            .await
+            .expect("internal adopted owner created");
+        let default_thread_id = load_snapshot(&harness.engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.project_id == "authority-project" && thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let mut socket = harness.connect().await;
+        let rejected = [
+            (
+                "61",
+                json!({
+                    "type": "worktree.adopt-resolved",
+                    "commandId": "internal-adopt",
+                    "projectId": "project-1",
+                    "worktreeKey": "worktree-key",
+                    "path": "/server/resolved",
+                    "branch": "main",
+                    "head": "abcdef1",
+                    "modelSelection": {"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default"
+                }),
+            ),
+            (
+                "62",
+                json!({
+                    "type": "worktree.branch-reconcile-resolved",
+                    "commandId": "internal-reconcile",
+                    "projectId": "project-1",
+                    "threadId": "thread-1",
+                    "branch": "main"
+                }),
+            ),
+            (
+                "63",
+                json!({
+                    "type":"worktree.detach-resolved",
+                    "commandId":"internal-detach",
+                    "projectId":"authority-project",
+                    "threadId":"adopted-owner",
+                    "path":"C:/worktrees/adopted-owner",
+                    "gitOutcome":"not-requested",
+                    "detail":null,
+                    "orphanCleanupPending":false
+                }),
+            ),
+            (
+                "64",
+                json!({
+                    "type":"project.meta.update",
+                    "commandId":"raw-discovery-policy",
+                    "projectId":"authority-project",
+                    "worktreeDiscovery":{
+                        "visibility":"shown",
+                        "initialPromptDismissedAt":null,
+                        "baselinePaths":["C:/client/chosen-baseline"]
+                    }
+                }),
+            ),
+            (
+                "65",
+                json!({
+                    "type":"thread.create",
+                    "commandId":"raw-kind-create",
+                    "threadId":"raw-panel",
+                    "projectId":"authority-project",
+                    "title":"Raw panel",
+                    "kind":"panel",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":null,
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "66",
+                json!({
+                    "type":"thread.create",
+                    "commandId":"raw-path-create",
+                    "threadId":"raw-owner",
+                    "projectId":"authority-project",
+                    "title":"Raw owner",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":"raw",
+                    "worktreePath":"C:/client/chosen-worktree",
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "67",
+                json!({
+                    "type":"thread.meta.update",
+                    "commandId":"raw-retarget",
+                    "threadId":default_thread_id,
+                    "worktreePath":"C:/client/chosen-retarget"
+                }),
+            ),
+            (
+                "68",
+                json!({
+                    "type":"thread.turn.start",
+                    "commandId":"raw-bootstrap-path",
+                    "threadId":"raw-bootstrap-owner",
+                    "message":{"messageId":"raw-bootstrap-message","role":"user","text":"raw","attachments":[]},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "bootstrap":{
+                        "createThread":{
+                            "projectId":"authority-project",
+                            "title":"Raw bootstrap",
+                            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                            "runtimeMode":"full-access",
+                            "interactionMode":"default",
+                            "branch":"raw",
+                            "worktreePath":"C:/client/chosen-bootstrap",
+                            "createdAt":CREATED_AT
+                        },
+                        "prepareWorktree":{
+                            "projectCwd":"C:/client/chosen-repository",
+                            "baseBranch":"main"
+                        }
+                    },
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "69",
+                json!({
+                    "type":"thread.delete",
+                    "commandId":"raw-adopted-delete",
+                    "threadId":"adopted-owner"
+                }),
+            ),
+            (
+                "70",
+                json!({
+                    "type":"project.delete",
+                    "commandId":"raw-project-delete",
+                    "projectId":"authority-project",
+                    "force":true
+                }),
+            ),
+        ];
+        for (request_id, payload) in rejected {
+            let command_id = payload["commandId"]
+                .as_str()
+                .expect("rejected command id")
+                .to_owned();
+            let expected_message = if command_id.starts_with("internal-") {
+                "server-internal"
+            } else {
+                "dedicated server-resolved"
+            };
+            rpc_request(
+                &mut socket,
+                request_id,
+                "orchestration.dispatchCommand",
+                payload,
+            )
+            .await;
+            let error = expect_failure(&mut socket, request_id).await;
+            assert_invalid_request(
+                &error,
+                "orchestration.dispatchCommand",
+                expected_message,
+            );
+            assert!(
+                harness
+                    .engine
+                    .repositories()
+                    .get_command_receipt(command_id)
+                    .await
+                    .expect("receipt query")
+                    .is_none(),
+                "a rejected public worktree-authority bypass cannot reserve or persist a receipt"
+            );
+        }
+        socket.close(None).await.expect("close WebSocket");
     })
     .catch_unwind()
     .await;
@@ -950,7 +1432,7 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
         let created_thread = dispatch_command(
             &mut socket,
             "2",
-            create_thread("thread-1", "project-1", "Workspace thread"),
+            create_public_thread("thread-1", "project-1", "Workspace thread"),
         )
         .await;
         assert!(
@@ -967,7 +1449,6 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
                 "threadId": "thread-1",
                 "title": "Workspace thread renamed",
                 "branch": "feature/rpc",
-                "worktreePath": "C:/worktrees/thread-1",
             }),
         )
         .await;
@@ -1080,6 +1561,10 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
         .await;
         assert!(archived_snapshot["snapshotSequence"].as_i64().unwrap() >= 9);
         assert_eq!(archived_snapshot["projects"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            archived_snapshot["projects"][0]["worktreeDiscovery"],
+            json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]})
+        );
         let archived_threads = archived_snapshot["threads"]
             .as_array()
             .expect("archived threads");
@@ -1288,7 +1773,7 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
         dispatch_command(
             &mut command_socket,
             "2",
-            create_thread("thread-watched", "project-streams", "Watched thread"),
+            create_public_thread("thread-watched", "project-streams", "Watched thread"),
         )
         .await;
 
@@ -1322,7 +1807,7 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
         dispatch_command(
             &mut command_socket,
             "3",
-            create_thread("thread-unrelated", "project-streams", "Unrelated thread"),
+            create_public_thread("thread-unrelated", "project-streams", "Unrelated thread"),
         )
         .await;
         let shell_after_unrelated = expect_snapshot_chunk(&mut shell_socket, "101").await;
@@ -1344,7 +1829,6 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
                 "threadId": "thread-watched",
                 "title": "Watched thread updated",
                 "branch": "feature/watched",
-                "worktreePath": "C:/worktrees/thread-watched",
             }),
         )
         .await;

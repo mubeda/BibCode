@@ -1,3 +1,5 @@
+// @effect-diagnostics globalDate:off - This synchronous WDIO fixture stamps native protocol events outside an Effect runtime.
+
 export const desktopActivityFixture = {
   actor: {
     id: "bibcode-ui-reviewer-thread",
@@ -17,10 +19,6 @@ export const desktopActivityFixture = {
     id: "bibcode-ui-activity-thread",
     title: "Activity acceptance fixture",
   },
-  timestamps: {
-    createdAt: 1_783_600_000,
-    updatedAt: 1_783_600_060,
-  },
 } as const;
 
 export const desktopActivityMarkerFileName =
@@ -29,10 +27,7 @@ export const desktopActivityMarkerFileName =
 const desktopActivityModelSelection = {
   instanceId: "codex",
   model: "gpt-5.4",
-  options: [
-    { id: "reasoningEffort", value: "medium" },
-    { id: "serviceTier", value: "default" },
-  ],
+  options: [{ id: "reasoningEffort", value: "medium" }],
 } as const;
 
 /**
@@ -40,7 +35,14 @@ const desktopActivityModelSelection = {
  * spec. Dispatching the turn through the real RPC also starts the fixture
  * provider session, so the spec never depends on the add-project/new-chat UI.
  */
-export function desktopActivitySessionCommands(projectPath: string) {
+function activityCommandTimestamp(observedAtMs: number, offsetMs: number): string {
+  return new Date(observedAtMs + offsetMs).toISOString();
+}
+
+export function desktopActivitySessionCommands(
+  projectPath: string,
+  observedAtMs: number = Date.now(),
+) {
   return [
     {
       type: "project.create",
@@ -49,7 +51,7 @@ export function desktopActivitySessionCommands(projectPath: string) {
       title: desktopActivityFixture.project.title,
       workspaceRoot: projectPath,
       defaultModelSelection: desktopActivityModelSelection,
-      createdAt: "2026-07-29T18:00:00.000Z",
+      createdAt: activityCommandTimestamp(observedAtMs, -2_000),
     },
     {
       type: "thread.create",
@@ -57,13 +59,12 @@ export function desktopActivitySessionCommands(projectPath: string) {
       threadId: desktopActivityFixture.thread.id,
       projectId: desktopActivityFixture.project.id,
       title: desktopActivityFixture.thread.title,
-      kind: "workspace",
       modelSelection: desktopActivityModelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
       branch: "main",
       worktreePath: null,
-      createdAt: "2026-07-29T18:00:01.000Z",
+      createdAt: activityCommandTimestamp(observedAtMs, -1_000),
     },
     {
       type: "thread.turn.start",
@@ -78,12 +79,12 @@ export function desktopActivitySessionCommands(projectPath: string) {
       modelSelection: desktopActivityModelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
-      createdAt: "2026-07-29T18:00:02.000Z",
+      createdAt: activityCommandTimestamp(observedAtMs, 0),
     },
   ] as const;
 }
 
-export function desktopActivityFollowupTurnCommand() {
+export function desktopActivityFollowupTurnCommand(observedAtMs: number = Date.now()) {
   return {
     type: "thread.turn.start",
     commandId: "bibcode-ui-activity-followup-turn-start",
@@ -97,11 +98,11 @@ export function desktopActivityFollowupTurnCommand() {
     modelSelection: desktopActivityModelSelection,
     runtimeMode: "full-access",
     interactionMode: "default",
-    createdAt: "2026-07-29T18:00:03.000Z",
+    createdAt: activityCommandTimestamp(observedAtMs, 0),
   } as const;
 }
 
-export function desktopActivityComposerFollowupTurnCommand() {
+export function desktopActivityComposerFollowupTurnCommand(observedAtMs: number = Date.now()) {
   return {
     type: "thread.turn.start",
     commandId: "bibcode-ui-activity-composer-followup-turn-start",
@@ -115,7 +116,7 @@ export function desktopActivityComposerFollowupTurnCommand() {
     modelSelection: desktopActivityModelSelection,
     runtimeMode: "full-access",
     interactionMode: "default",
-    createdAt: "2026-07-29T18:00:04.000Z",
+    createdAt: activityCommandTimestamp(observedAtMs, 0),
   } as const;
 }
 

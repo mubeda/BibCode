@@ -27,6 +27,7 @@ describe("@wdio/tauri-service compatibility", () => {
     const e2eConfig = JSON.parse(
       NodeFS.readFileSync(new URL("../../src-tauri/tauri.e2e.conf.json", import.meta.url), "utf8"),
     ) as {
+      readonly identifier: string;
       readonly app: {
         readonly withGlobalTauri: boolean;
         readonly security: {
@@ -52,7 +53,38 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(webEntry.indexOf('import("@wdio/tauri-plugin")')).toBeLessThan(
       webEntry.indexOf('import("./bootstrap")'),
     );
+    expect(e2eConfig.identifier).toBe("com.bibcode.desktop.e2e");
     expect(e2eConfig.app.withGlobalTauri).toBe(true);
     expect(e2eConfig.app.security.capabilities[0]?.permissions).toContain("wdio:default");
+  });
+
+  it("uses one embedded-driver session and resets connection state before each smoke test", () => {
+    const wdioConfig = NodeFS.readFileSync(new URL("../wdio.conf.ts", import.meta.url), "utf8");
+
+    expect(wdioConfig).toContain("const desktopUiSpecFiles =");
+    expect(wdioConfig).toContain("[desktopUiSpecFiles]");
+    expect(wdioConfig).toContain("connectionRetryCount: 0");
+    expect(wdioConfig).toContain("beforeTest: async () =>");
+    expect(wdioConfig).toContain('document.readyState === "complete"');
+    expect(wdioConfig).toContain(
+      'window.addEventListener("load", () => done("ready"), { once: true })',
+    );
+    expect(wdioConfig).toContain("done({ error })");
+    expect(wdioConfig).toContain('done("ready")');
+    expect(wdioConfig).not.toContain("done(error)");
+    expect(wdioConfig).not.toContain("done()");
+    expect(wdioConfig).not.toContain("browser.waitUntil");
+    expect(wdioConfig).toContain("window.localStorage.clear()");
+    expect(wdioConfig).toContain("window.sessionStorage.clear()");
+    expect(wdioConfig).toContain('indexedDB.open("bibcode:connection-runtime", 2)');
+    expect(wdioConfig).toContain('["catalog", "shell", "thread"]');
+    expect(wdioConfig).toContain("transaction.objectStore(storeName).clear()");
+    expect(wdioConfig).not.toContain("indexedDB.deleteDatabase");
+    expect(wdioConfig.indexOf("window.localStorage.clear()")).toBeLessThan(
+      wdioConfig.indexOf('indexedDB.open("bibcode:connection-runtime", 2)'),
+    );
+    expect(wdioConfig.indexOf("transaction.objectStore(storeName).clear()")).toBeLessThan(
+      wdioConfig.indexOf("await browser.refresh()"),
+    );
   });
 });

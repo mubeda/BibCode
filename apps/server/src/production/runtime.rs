@@ -42,12 +42,13 @@ use crate::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
             JsonRouteResponse, RouteContext,
         },
+        managed_endpoint::ManagedEndpointRuntime,
         operational_logs::{OperationalLogOptions, OperationalLogs},
         orchestration_effects::{
             BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
             SetupScriptLaunch, process_compatible_path,
         },
-        orchestration_rpc::register_orchestration_rpc_with_delivery,
+        orchestration_rpc::register_orchestration_rpc_with_delivery_and_availability,
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             reconcile_abandoned_provider_sessions,
@@ -58,6 +59,11 @@ use crate::{
         },
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
+        worktree_catalog_rpc::{
+            WorktreeCatalogOperationRuntime, WorktreeCatalogRpcServices,
+            register_worktree_catalog_rpc,
+        },
+        worktree_runtime::WorktreeRuntime,
     },
     provider::attachments::{AttachmentMaterializer, MAX_ATTACHMENT_BYTES},
     provider_terminal::{
@@ -74,6 +80,7 @@ use crate::{
     server_settings::ProviderSettingsStore,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
     workspace::{AssetContextResolver, WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceService},
+    worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
 
 pub struct ProductionRuntime {
@@ -89,6 +96,10 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    managed_endpoint: ManagedEndpointRuntime,
+    _worktree_catalog: WorktreeCatalogService,
+    worktree_catalog_operations: WorktreeCatalogOperationRuntime,
+    worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
     _resource_sampler: Arc<NativeResourceSampler>,
     update_quiesced: tokio::sync::Mutex<bool>,
@@ -108,6 +119,11 @@ impl ProductionRuntime {
         self.provider_runtime.attach_connect_mcp(service).await;
     }
 
+    #[must_use]
+    pub fn managed_endpoint_runtime(&self) -> ManagedEndpointRuntime {
+        self.managed_endpoint.clone()
+    }
+
     pub async fn start(
         config: &ServerConfig,
         database: Database,
@@ -121,7 +137,7 @@ impl ProductionRuntime {
             auth,
             asset_secret,
             ui_process_observer,
-            ProcessTreeCleanup::StandaloneServer,
+            ProcessTreeCleanup::EmbeddedHost,
         )
         .await
     }
@@ -192,6 +208,8 @@ impl ProductionRuntime {
             .await
             .map_err(|error| error.to_string())?;
         let process_attribution = ProcessAttributionRegistry::new();
+        let managed_endpoint =
+            ManagedEndpointRuntime::with_process_attribution(process_attribution.clone());
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
             Arc::new(ProviderSettingsInventoryAuthority::new(provider_settings)),
@@ -251,22 +269,32 @@ impl ProductionRuntime {
             .await;
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
+        let workspace_availability = WorkspaceAvailabilityRegistry::new();
+        let worktree_catalog = WorktreeCatalogService::new_with_availability_registry(
+            Arc::new(repositories.clone()),
+            git_repository.clone(),
+            workspace_availability.clone(),
+        );
         let git_vcs = GitVcsRpcServices::with_production_dependencies(
             git_repository.clone(),
             terminal_manager.clone(),
             repositories.clone(),
             control.automatic_git_fetch_interval_signal(),
-        );
+        )
+        .with_availability_registry(workspace_availability.clone());
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
-                asset_context_resolver: Some(Arc::new(ProjectionAssetContext { repositories })),
+                asset_context_resolver: Some(Arc::new(ProjectionAssetContext {
+                    repositories: repositories.clone(),
+                })),
                 review_service: Some(ReviewService::new(Arc::new(GitReviewBackend))),
                 mutation_observer: Some(Arc::new(git_vcs.clone())),
             },
-        );
+        )
+        .with_availability_registry(workspace_availability.clone());
         let workspace_for_effects = workspace.clone();
         let preview = PreviewManager::new();
         let preview_automation = PreviewAutomationBroker::new();
@@ -298,7 +326,15 @@ impl ProductionRuntime {
             relay,
             control.clone(),
             process_tree_cleanup,
+        )
+        .with_workspace_admission(workspace_availability.clone(), repositories.clone());
+        let worktree_runtime = WorktreeRuntime::start(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            terminal_services.clone(),
+            workspace_availability.clone(),
         );
+        worktree_catalog.set_workspace_loss_observer(Arc::new(worktree_runtime.clone()));
         let orchestration_effects = OrchestrationEffects::start(
             orchestration.clone(),
             git_repository.clone(),
@@ -312,10 +348,11 @@ impl ProductionRuntime {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let turn_delivery = Arc::new(TurnDeliveryService::start(
+        let turn_delivery = Arc::new(TurnDeliveryService::start_with_availability(
             orchestration.clone(),
             provider_runtime.clone(),
             config.state_dir(),
+            workspace_availability.clone(),
         ));
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
@@ -325,15 +362,21 @@ impl ProductionRuntime {
             activity_projections.clone(),
             activity_cancellation,
         );
-        register_orchestration_rpc_with_delivery(
+        register_orchestration_rpc_with_delivery_and_availability(
             &mut registry,
             orchestration.clone(),
             provider_runtime.clone(),
             config.state_dir(),
             turn_delivery.clone(),
+            workspace_availability.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(&mut registry, git_vcs);
+        let worktree_catalog_rpc =
+            WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
+                .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
+        let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
+        register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;
 
@@ -350,6 +393,10 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            managed_endpoint,
+            _worktree_catalog: worktree_catalog,
+            worktree_catalog_operations,
+            worktree_runtime,
             worktree_removal_tasks,
             _resource_sampler: resource_sampler,
             update_quiesced: tokio::sync::Mutex::new(false),
@@ -372,9 +419,11 @@ impl ProductionRuntime {
                 ))
             }
             JsonOperation::OrchestrationDispatch => {
-                let command: OrchestrationCommand = serde_json::from_value(
+                let command = super::orchestration_rpc::decode_public_orchestration_command(
+                    &self.orchestration,
                     payload.ok_or_else(|| bad_request("Request body is required."))?,
                 )
+                .await
                 .map_err(bad_request)?;
                 if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
                     return Err(bad_request(
@@ -473,6 +522,11 @@ impl ProductionRuntime {
         if *quiesced {
             return Ok(());
         }
+        let process_ownership = self.terminal_services.freeze_process_ownership().await;
+        self.managed_endpoint.shutdown().await;
+        self.worktree_catalog_operations.shutdown().await;
+        self._worktree_catalog.shutdown().await;
+        self.worktree_runtime.shutdown().await;
         let mut first_error = None;
         self.worktree_removal_tasks.close_and_drain().await;
         self.provider_update_checks.shutdown().await;
@@ -483,7 +537,9 @@ impl ProductionRuntime {
             tracing::warn!(%error, "provider process-owner cleanup completed with failures");
             first_error = Some(error);
         }
-        self.terminal_services.shutdown().await;
+        self.terminal_services
+            .shutdown_with_process_ownership(process_ownership)
+            .await;
         if let Err(error) = self.operational_logs.shutdown().await {
             tracing::warn!(%error, "failed to shut down operational logs cleanly");
             if first_error.is_none() {
@@ -959,7 +1015,6 @@ mod tests {
     #[tokio::test]
     async fn production_activity_rpc_stream_receives_producer_projection_deltas() {
         // Mutation caught: registering RPC with fresh projections that do not share producer buses.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
@@ -1113,7 +1168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_turn_start_cannot_bypass_durable_admission() {
+    async fn http_dispatch_cannot_bypass_durable_or_worktree_authority() {
         let state = TempDir::new().expect("state");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         let database = Database::open_in_memory().await.expect("database");
@@ -1185,12 +1240,75 @@ mod tests {
                 .expect("delivery")
                 .is_none()
         );
+
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"http-owner-create",
+                    "threadId":"http-adopted-owner","projectId":"http-project",
+                    "title":"Adopted owner","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","interactionMode":"default","branch":"feature/http",
+                    "worktreePath":workspace_root.join("external-worktree"),"createdAt":"2026-08-01T00:00:02Z"
+                }))
+                .expect("internal owner command"),
+            )
+            .await
+            .expect("internal owner created");
+        for payload in [
+            json!({
+                "type":"worktree.adopt-resolved","commandId":"http-internal-adopt",
+                "projectId":"http-project","worktreeKey":"client-key","path":"/client/path",
+                "branch":"main","head":"abcdef1","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access","interactionMode":"default"
+            }),
+            json!({
+                "type":"project.meta.update","commandId":"http-raw-policy","projectId":"http-project",
+                "worktreeDiscovery":{"visibility":"shown","initialPromptDismissedAt":null,"baselinePaths":["/client/baseline"]}
+            }),
+            json!({
+                "type":"thread.create","commandId":"http-raw-path","threadId":"http-raw-owner",
+                "projectId":"http-project","title":"Raw owner","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access","interactionMode":"default","branch":"raw",
+                "worktreePath":"/client/worktree","createdAt":"2026-08-01T00:00:03Z"
+            }),
+            json!({
+                "type":"thread.delete","commandId":"http-raw-owner-delete","threadId":"http-adopted-owner"
+            }),
+            json!({
+                "type":"project.delete","commandId":"http-raw-project-delete","projectId":"http-project","force":true
+            }),
+        ] {
+            let command_id = payload["commandId"]
+                .as_str()
+                .expect("command id")
+                .to_owned();
+            let rejected = runtime
+                .json(
+                    JsonOperation::OrchestrationDispatch,
+                    Some(payload),
+                    route_context(),
+                )
+                .await;
+            assert!(
+                rejected.is_err(),
+                "HTTP generic dispatch must reject worktree authority"
+            );
+            assert!(
+                runtime
+                    .orchestration
+                    .repositories()
+                    .get_command_receipt(command_id)
+                    .await
+                    .expect("receipt")
+                    .is_none()
+            );
+        }
         runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn startup_interrupts_only_unresolved_terminal_activity() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1335,7 +1453,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1403,7 +1520,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_runtime_settings_updates_change_only_the_selected_source_controller() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
@@ -1477,7 +1593,6 @@ mod tests {
 
     #[tokio::test]
     async fn hardening_bootstrap_provider_observation_failure_does_not_abort_production_runtime() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1511,7 +1626,6 @@ mod tests {
 
     #[tokio::test]
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         let database = Database::open_in_memory()
@@ -1850,8 +1964,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_runtime_shutdown_cancels_owned_worktree_catalog_pollers() {
+        let state = TempDir::new().expect("temporary state directory");
+        let repository = state.path().join("catalog-runtime-project");
+        std::fs::create_dir(&repository).expect("repository directory");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_AUTHOR_NAME", "BiBCode Test")
+                .env("GIT_AUTHOR_EMAIL", "bibcode@example.invalid")
+                .env("GIT_COMMITTER_NAME", "BiBCode Test")
+                .env("GIT_COMMITTER_EMAIL", "bibcode@example.invalid")
+                .output()
+                .expect("Git command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "runtime catalog\n")
+            .expect("repository fixture");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "project.create",
+                    "commandId": "catalog-runtime-project",
+                    "projectId": "catalog-runtime-project",
+                    "title": "Catalog runtime project",
+                    "workspaceRoot": repository,
+                    "defaultModelSelection": null,
+                    "createdAt": "2026-08-09T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project creation");
+        let subscription = runtime
+            ._worktree_catalog
+            .subscribe("catalog-runtime-project")
+            .await
+            .expect("catalog subscription");
+        assert_eq!(runtime._worktree_catalog.active_poller_count_for_test(), 1);
+
+        runtime.shutdown().await;
+
+        assert_eq!(runtime._worktree_catalog.active_poller_count_for_test(), 0);
+        drop(subscription);
+    }
+
+    #[tokio::test]
     async fn git_review_backend_includes_untracked_files() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         assert!(
             std::process::Command::new("git")
@@ -1885,7 +2074,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_review_backend_includes_staged_changes_and_branch_range() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -1994,7 +2182,6 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_review_diff_marks_binary_and_oversized_files() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         assert!(
             std::process::Command::new("git")
@@ -2025,7 +2212,6 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         assert!(
             run_review_diff("\0", review_diff_args(false, Some("HEAD"), false))
                 .await

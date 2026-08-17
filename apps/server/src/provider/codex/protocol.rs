@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::{
     collections::HashMap,
     sync::{
@@ -15,6 +17,9 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use crate::test_support::FixtureEvent;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectionConfig {
@@ -108,6 +113,8 @@ struct Inner {
     close_reason: Mutex<Option<String>>,
     next_request_id: AtomicU64,
     _tasks: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(test)]
+    request_queued_events: StdMutex<HashMap<String, Arc<FixtureEvent>>>,
 }
 
 struct PendingRequest {
@@ -174,6 +181,8 @@ impl JsonRpcConnection {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             _tasks: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            request_queued_events: StdMutex::new(HashMap::new()),
         });
         let connection = Self {
             inner: inner.clone(),
@@ -294,6 +303,19 @@ impl JsonRpcConnection {
         self.inner.pending.lock().await.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_request_queued_for_test(
+        &self,
+        method: impl Into<String>,
+        event: Arc<FixtureEvent>,
+    ) {
+        self.inner
+            .request_queued_events
+            .lock()
+            .expect("Codex queued-request event mutex poisoned")
+            .insert(method.into(), event);
+    }
+
     async fn request_inner(
         &self,
         method: &str,
@@ -330,6 +352,17 @@ impl JsonRpcConnection {
             return Err(ProtocolError::Closed {
                 reason: self.close_reason().await,
             });
+        }
+        #[cfg(test)]
+        if let Some(event) = self
+            .inner
+            .request_queued_events
+            .lock()
+            .expect("Codex queued-request event mutex poisoned")
+            .get(method)
+            .cloned()
+        {
+            event.publish();
         }
         let receive_response = async {
             receiver.await.unwrap_or_else(|_| {
@@ -739,6 +772,7 @@ mod tests {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             _tasks: Mutex::new(Vec::new()),
+            request_queued_events: StdMutex::new(HashMap::new()),
         });
         (
             JsonRpcConnection {
@@ -878,6 +912,7 @@ mod tests {
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             _tasks: Mutex::new(Vec::new()),
+            request_queued_events: StdMutex::new(HashMap::new()),
         });
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
 

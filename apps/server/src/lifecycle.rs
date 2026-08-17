@@ -22,7 +22,6 @@ use crate::{
             ConnectMcpConfig, ConnectMcpService, PairingCredential, PairingIssuer, PreviewInvoker,
         },
         jwt::PersistentJwtCodec,
-        managed_endpoint::ManagedEndpointRuntime,
         server_terminal::ProcessTreeCleanup,
     },
     rpc::RpcRegistry,
@@ -42,6 +41,7 @@ pub struct ServerHandle {
     database: Option<Database>,
     _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
+    _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -86,6 +86,19 @@ impl ServerRuntime {
             config,
             None,
             ui_process_observer,
+            ProcessTreeCleanup::EmbeddedHost,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_standalone(
+        config: ServerConfig,
+    ) -> Result<ServerHandle, ServerError> {
+        let ui_process_observer = default_ui_process_observer(config.mode);
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
             ProcessTreeCleanup::StandaloneServer,
         )
         .await
@@ -113,7 +126,7 @@ impl ServerRuntime {
             config,
             Some(rpc_registry),
             ui_process_observer,
-            ProcessTreeCleanup::StandaloneServer,
+            ProcessTreeCleanup::EmbeddedHost,
         )
         .await
     }
@@ -135,8 +148,10 @@ impl ServerRuntime {
             .ensure_directories_without_database_side_effects()
             .await
             .map_err(|error| ServerError::StateFiles(error.to_string()))?;
-        logging::initialize(&state_paths.server_log)
-            .map_err(|error| ServerError::Logging(error.to_string()))?;
+        let log_sink = Arc::new(
+            logging::initialize_owned(&state_paths.server_log)
+                .map_err(|error| ServerError::Logging(error.to_string()))?,
+        );
         let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
@@ -206,7 +221,7 @@ impl ServerRuntime {
                 let jwt = PersistentJwtCodec::open(state_directory.join("environment-jwt.json"))
                     .await
                     .map_err(|error| ServerError::ProductionInitialize(error.to_string()))?;
-                let endpoint = ManagedEndpointRuntime::default();
+                let endpoint = runtime.managed_endpoint_runtime();
                 let pairing_auth = auth.clone();
                 let pairing = PairingIssuer::new(move |thumbprint| {
                     let auth = pairing_auth.clone();
@@ -324,7 +339,9 @@ impl ServerRuntime {
         let server_shutdown = shutdown.clone();
         let completion_signal = shutdown.clone();
         let cleanup_runtime = production_runtime.clone();
+        let task_log_sink = log_sink.clone();
         let task = tokio::spawn(async move {
+            let _log_sink = task_log_sink;
             let result = axum::serve(listener, app)
                 .with_graceful_shutdown(server_shutdown.cancelled_owned())
                 .await;
@@ -342,6 +359,7 @@ impl ServerRuntime {
             database: Some(database),
             _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
+            _log_sink: log_sink,
             shutdown,
             task: Some(task),
         })
@@ -577,8 +595,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_runtime_covers_production_fallback_startup_access_and_shutdown_paths() {
-        let _logging_guard = crate::logging::TEST_INITIALIZE_LOCK.lock().await;
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let production_state = tempfile::tempdir().expect("production state directory");
         let production_config =
             ServerConfig::new(production_state.path()).with_bind("127.0.0.1", 0);
@@ -597,6 +613,11 @@ mod tests {
         .await
         .expect("environment descriptor should respond");
         assert!(descriptor.status().is_success());
+        let descriptor = descriptor
+            .json::<serde_json::Value>()
+            .await
+            .expect("environment descriptor should decode");
+        assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
         let token = client
             .post(format!("http://{}/oauth/token", production.local_addr()))
             .form(&[

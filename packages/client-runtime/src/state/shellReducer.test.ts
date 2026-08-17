@@ -19,6 +19,11 @@ const stubProject = {
   repositoryIdentity: null,
   defaultModelSelection: null,
   scripts: [],
+  worktreeDiscovery: {
+    visibility: "hidden",
+    initialPromptDismissedAt: null,
+    baselinePaths: [],
+  },
   createdAt: "2026-04-01T00:00:00.000Z",
   updatedAt: "2026-04-01T00:00:00.000Z",
 } as const;
@@ -85,7 +90,15 @@ describe("applyShellStreamEvent", () => {
         projects: [stubProject],
       };
 
-      const updatedProject = { ...stubProject, title: "Updated Title" };
+      const updatedProject = {
+        ...stubProject,
+        title: "Updated Title",
+        worktreeDiscovery: {
+          visibility: "shown" as const,
+          initialPromptDismissedAt: "2026-08-09T00:00:00.000Z",
+          baselinePaths: ["/workspace/test-worktree"],
+        },
+      };
       const event: OrchestrationShellStreamEvent = {
         kind: "project-upserted",
         sequence: 2,
@@ -96,6 +109,7 @@ describe("applyShellStreamEvent", () => {
 
       expect(next.projects).toHaveLength(1);
       expect(next.projects[0]?.title).toBe("Updated Title");
+      expect(next.projects[0]?.worktreeDiscovery).toEqual(updatedProject.worktreeDiscovery);
       expect(next.snapshotSequence).toBe(2);
     });
   });

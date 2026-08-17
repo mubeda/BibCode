@@ -1,4 +1,13 @@
-use std::{env, fs, path::PathBuf, process, thread, time::Duration};
+use std::{
+    env, fs,
+    io::{Read, Write},
+    net::TcpStream,
+    path::PathBuf,
+    process, thread,
+    time::Duration,
+};
+
+const VERSION_PROBE_CONTROL_ENV: &str = "BIBCODE_TEST_CURSOR_VERSION_PROBE_CONTROL";
 
 fn adjacent_file(name: &str) -> PathBuf {
     env::current_exe()
@@ -31,17 +40,21 @@ fn reported_version(exit_code: Option<i32>) -> String {
 }
 
 fn pause_version_probe_if_configured() {
-    let pause = adjacent_file("version-pause");
-    if !pause.is_file() {
+    let Some(control_address) = env::var_os(VERSION_PROBE_CONTROL_ENV) else {
         return;
-    }
-    fs::write(adjacent_file("version-entered"), b"entered")
-        .expect("write version probe marker");
-    while !adjacent_file("version-release").is_file() {
-        thread::sleep(Duration::from_millis(5));
-    }
-    let _ = fs::remove_file(pause);
-    let _ = fs::remove_file(adjacent_file("version-release"));
+    };
+    let control_address = control_address
+        .into_string()
+        .expect("version probe control address is UTF-8");
+    let mut control = TcpStream::connect(control_address).expect("connect version probe control");
+    control
+        .write_all(b"E")
+        .expect("write version probe entered event");
+    let mut release = [0_u8; 1];
+    control
+        .read_exact(&mut release)
+        .expect("read version probe release event");
+    assert_eq!(release, [b'R'], "unexpected version probe release event");
 }
 
 fn main() {

@@ -22,6 +22,7 @@ interface ChatHeaderPanelMenuProps {
   readonly onOpenTerminalPanel: () => void;
   readonly onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
   readonly onAddCustomAction: () => void;
+  readonly unavailableReason?: string | null;
 }
 
 const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
@@ -48,6 +49,7 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
   onOpenTerminalPanel,
   onOpenProviderTerminalPanel,
   onAddCustomAction,
+  unavailableReason = null,
 }: ChatHeaderPanelMenuProps) {
   const agentActions = buildProviderAgentActions(providerStatuses, settings);
   const chatActions = agentActions.filter((action) => action.kind === "chat");
@@ -61,7 +63,9 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
       <MenuPopup align="end" className="min-w-52">
         {chatActions.map((action) => {
           const disabled = action.disabled || !canCreatePanel;
-          const reason = canCreatePanel ? action.disabledReason : PANEL_UNAVAILABLE_REASON;
+          const reason = canCreatePanel
+            ? action.disabledReason
+            : (unavailableReason ?? PANEL_UNAVAILABLE_REASON);
           const menuItem = (
             <MenuItem
               key={action.value}
@@ -92,7 +96,7 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
           </MenuItem>
         ) : (
           <DisabledReasonTooltip
-            reason={PANEL_UNAVAILABLE_REASON}
+            reason={unavailableReason ?? PANEL_UNAVAILABLE_REASON}
             trigger={
               <MenuItem className="data-disabled:pointer-events-auto" disabled>
                 <TerminalSquare className="size-4" />
@@ -107,7 +111,9 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
             {terminalActions.map((action) => {
               const terminalAction = action.terminalAction;
               const disabled = action.disabled || !canCreatePanel;
-              const reason = !canCreatePanel ? PANEL_UNAVAILABLE_REASON : action.disabledReason;
+              const reason = !canCreatePanel
+                ? (unavailableReason ?? PANEL_UNAVAILABLE_REASON)
+                : action.disabledReason;
               const menuItem = (
                 <MenuItem
                   key={action.value}
@@ -143,10 +149,22 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
           </>
         ) : null}
         <MenuSeparator />
-        <MenuItem onClick={onAddCustomAction}>
-          <PlusIcon className="size-4" />
-          Add custom action…
-        </MenuItem>
+        {unavailableReason ? (
+          <DisabledReasonTooltip
+            reason={unavailableReason}
+            trigger={
+              <MenuItem className="data-disabled:pointer-events-auto" disabled>
+                <PlusIcon className="size-4" />
+                Add custom action…
+              </MenuItem>
+            }
+          />
+        ) : (
+          <MenuItem onClick={onAddCustomAction}>
+            <PlusIcon className="size-4" />
+            Add custom action…
+          </MenuItem>
+        )}
       </MenuPopup>
     </Menu>
   );

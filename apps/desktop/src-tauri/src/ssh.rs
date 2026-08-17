@@ -6,12 +6,15 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Runtime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -29,6 +32,7 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+const SSH_CHILD_REAPER_CAPACITY: usize = 32;
 const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
 const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
@@ -344,13 +348,16 @@ impl SshEnvironmentLaunchPlan {
 }
 
 struct ManagedSshTunnel {
-    child: Child,
+    child: ManagedSshChild,
     bootstrap: SshEnvironmentBootstrap,
 }
 
 pub struct SshEnvironmentManager {
     tunnels: Mutex<HashMap<String, ManagedSshTunnel>>,
     auth_secrets: Mutex<HashMap<String, String>>,
+    askpass_temporary_base: PathBuf,
+    askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
+    child_reaper: SshChildReaper,
 }
 
 impl Default for SshEnvironmentManager {
@@ -361,10 +368,67 @@ impl Default for SshEnvironmentManager {
 
 impl SshEnvironmentManager {
     pub fn new() -> Self {
+        Self::with_askpass_temp_base_internal(env::temp_dir())
+    }
+
+    fn with_askpass_temp_base_internal(askpass_temporary_base: PathBuf) -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
             auth_secrets: Mutex::new(HashMap::new()),
+            askpass_temporary_base,
+            askpass_launcher: Mutex::new(Weak::new()),
+            child_reaper: SshChildReaper::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_askpass_temp_base(askpass_temporary_base: PathBuf) -> Self {
+        Self::with_askpass_temp_base_internal(askpass_temporary_base)
+    }
+
+    fn askpass_launcher(&self) -> Result<SshAskpassLauncher, String> {
+        if let Some(existing) = self
+            .askpass_launcher
+            .lock()
+            .map_err(|error| format!("Could not access SSH askpass owner: {error}"))?
+            .upgrade()
+        {
+            return Ok(SshAskpassLauncher {
+                inner: existing,
+                child_reaper: self.child_reaper.clone(),
+            });
+        }
+
+        let created =
+            SshAskpassLauncher::create_in(&self.askpass_temporary_base, self.child_reaper.clone())?;
+        let mut cached = self
+            .askpass_launcher
+            .lock()
+            .map_err(|error| format!("Could not access SSH askpass owner: {error}"))?;
+        if let Some(existing) = cached.upgrade() {
+            return Ok(SshAskpassLauncher {
+                inner: existing,
+                child_reaper: self.child_reaper.clone(),
+            });
+        }
+        *cached = Arc::downgrade(&created.inner);
+        Ok(created)
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.child_reaper.close();
+        let tunnels = self
+            .tunnels
+            .lock()
+            .map(|mut tunnels| tunnels.drain().map(|(_, tunnel)| tunnel).collect())
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not drain SSH tunnels during shutdown");
+                Vec::new()
+            });
+        for mut tunnel in tunnels {
+            tunnel.child.terminate_and_reap().await;
+        }
+        self.child_reaper.wait().await;
     }
 
     pub async fn ensure_environment<R: Runtime>(
@@ -374,6 +438,9 @@ impl SshEnvironmentManager {
         target: SshEnvironmentTarget,
         options: Option<SshEnvironmentEnsureOptions>,
     ) -> Result<SshEnvironmentBootstrap, String> {
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
         if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
@@ -382,12 +449,12 @@ impl SshEnvironmentManager {
 
         let local_port = portpicker::pick_unused_port()
             .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
-        let askpass_launcher = ensure_ssh_askpass_launcher()?;
+        let askpass_launcher = self.askpass_launcher()?;
         let remote_launch = self
             .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
-                async move { launch_or_reuse_remote_server(&target, &auth, &askpass_launcher).await }
+                async move { launch_or_reuse_remote_server(&target, &auth, askpass_launcher).await }
             })
             .await?;
         let tunnel_result = self
@@ -402,7 +469,7 @@ impl SshEnvironmentManager {
                         remote_launch,
                         &auth,
                     )?;
-                    let child = start_ssh_tunnel(&plan, &auth, &askpass_launcher).await?;
+                    let child = start_ssh_tunnel(&plan, &auth, askpass_launcher).await?;
                     Ok((plan, child))
                 }
             })
@@ -414,7 +481,7 @@ impl SshEnvironmentManager {
                     .cached_auth_secret(&key)
                     .map(SshAuthOptions::with_secret)
                     .unwrap_or_else(SshAuthOptions::batch);
-                let _ = stop_remote_server(&target, &cleanup_auth, &askpass_launcher).await;
+                let _ = stop_remote_server(&target, &cleanup_auth, askpass_launcher).await;
                 return Err(error);
             }
         };
@@ -428,7 +495,9 @@ impl SshEnvironmentManager {
                 self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
                     let target = target.clone();
                     let askpass_launcher = askpass_launcher.clone();
-                    async move { issue_remote_pairing_token(&target, &auth, &askpass_launcher).await }
+                    async move {
+                        issue_remote_pairing_token(&target, &auth, askpass_launcher).await
+                    }
                 })
                 .await?,
             )
@@ -443,16 +512,10 @@ impl SshEnvironmentManager {
             pairing_token,
             plan.remote_server_kind,
         );
-        self.tunnels
-            .lock()
-            .map_err(|error| format!("Could not record SSH tunnel: {error}"))?
-            .insert(
-                key,
-                ManagedSshTunnel {
-                    child,
-                    bootstrap: bootstrap.clone(),
-                },
-            );
+        if let Err((error, mut child)) = self.publish_tunnel(key, child, bootstrap.clone()) {
+            child.terminate_and_reap().await;
+            return Err(error);
+        }
         Ok(bootstrap)
     }
 
@@ -469,14 +532,18 @@ impl SshEnvironmentManager {
             .lock()
             .map_err(|error| format!("Could not access SSH tunnels: {error}"))?
             .remove(&key);
-        if let Some(mut tunnel) = tunnel {
-            terminate_child(&mut tunnel.child).await;
-        }
-        let askpass_launcher = ensure_ssh_askpass_launcher()?;
+        let askpass_launcher = match tunnel {
+            Some(mut tunnel) => {
+                let askpass_launcher = tunnel.child.askpass_launcher().clone();
+                tunnel.child.terminate_and_reap().await;
+                askpass_launcher
+            }
+            None => self.askpass_launcher()?,
+        };
         self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
             let target = target.clone();
             let askpass_launcher = askpass_launcher.clone();
-            async move { stop_remote_server(&target, &auth, &askpass_launcher).await }
+            async move { stop_remote_server(&target, &auth, askpass_launcher).await }
         })
         .await?;
         Ok(())
@@ -579,15 +646,46 @@ impl SshEnvironmentManager {
         };
         match tunnel
             .child
+            .child_mut()
             .try_wait()
             .map_err(|error| format!("Could not inspect SSH tunnel process: {error}"))?
         {
             None => Ok(Some(tunnel.bootstrap.clone())),
             Some(_status) => {
-                tunnels.remove(key);
+                let mut stale = tunnels.remove(key);
+                drop(tunnels);
+                if let Some(stale) = stale.as_mut() {
+                    stale.child.release_reaped();
+                }
+                drop(stale);
                 Ok(None)
             }
         }
+    }
+
+    fn publish_tunnel(
+        &self,
+        key: String,
+        child: ManagedSshChild,
+        bootstrap: SshEnvironmentBootstrap,
+    ) -> Result<(), (String, Box<ManagedSshChild>)> {
+        let mut tunnels = match self.tunnels.lock() {
+            Ok(tunnels) => tunnels,
+            Err(error) => {
+                return Err((
+                    format!("Could not record SSH tunnel: {error}"),
+                    Box::new(child),
+                ));
+            }
+        };
+        if !self.child_reaper.accepting() {
+            return Err((
+                "SSH process owner is shutting down.".to_string(),
+                Box::new(child),
+            ));
+        }
+        tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        Ok(())
     }
 }
 
@@ -698,23 +796,392 @@ fn is_ssh_auth_failure(message: &str) -> bool {
                 || normalized.contains("gssapi-with-mic")))
 }
 
-fn ensure_ssh_askpass_launcher() -> Result<PathBuf, String> {
-    let directory = env::temp_dir()
-        .join(format!("bibcode-ssh-runtime-{}", std::process::id()))
-        .join("bibcode-ssh-askpass");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to create SSH askpass directory: {error}"))?;
-    if cfg!(windows) {
-        let launcher = directory.join("ssh-askpass.cmd");
-        let script = directory.join("ssh-askpass.ps1");
-        write_askpass_file(&launcher, ASKPASS_WINDOWS_LAUNCHER_SCRIPT, None)?;
-        write_askpass_file(&script, ASKPASS_WINDOWS_SCRIPT, None)?;
-        Ok(launcher)
-    } else {
-        let launcher = directory.join("ssh-askpass.sh");
-        write_askpass_file(&launcher, ASKPASS_POSIX_SCRIPT, Some(0o700))?;
-        Ok(launcher)
+#[derive(Clone)]
+struct SshAskpassLauncher {
+    inner: Arc<SshAskpassLauncherInner>,
+    child_reaper: SshChildReaper,
+}
+
+struct SshAskpassLauncherInner {
+    root: PathBuf,
+    directory: PathBuf,
+    files: Vec<PathBuf>,
+    launcher: PathBuf,
+    cleanup_sender: watch::Sender<bool>,
+}
+
+impl SshAskpassLauncher {
+    fn create_in(temporary_base: &Path, child_reaper: SshChildReaper) -> Result<Self, String> {
+        let root = temporary_base.join(format!(
+            "bibcode-ssh-runtime-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root)
+            .map_err(|error| format!("Failed to create SSH askpass root: {error}"))?;
+        let directory = root.join("bibcode-ssh-askpass");
+        let launcher = if cfg!(windows) {
+            directory.join("ssh-askpass.cmd")
+        } else {
+            directory.join("ssh-askpass.sh")
+        };
+        let mut files = vec![launcher.clone()];
+        if cfg!(windows) {
+            files.push(directory.join("ssh-askpass.ps1"));
+        }
+        let (cleanup_sender, _) = watch::channel(false);
+        let inner = SshAskpassLauncherInner {
+            root,
+            directory,
+            files,
+            launcher,
+            cleanup_sender,
+        };
+
+        set_ssh_askpass_directory_permissions(&inner.root)?;
+        fs::create_dir(&inner.directory)
+            .map_err(|error| format!("Failed to create SSH askpass directory: {error}"))?;
+        set_ssh_askpass_directory_permissions(&inner.directory)?;
+        if cfg!(windows) {
+            write_askpass_file(&inner.launcher, ASKPASS_WINDOWS_LAUNCHER_SCRIPT, None)?;
+            write_askpass_file(
+                &inner.directory.join("ssh-askpass.ps1"),
+                ASKPASS_WINDOWS_SCRIPT,
+                None,
+            )?;
+        } else {
+            write_askpass_file(&inner.launcher, ASKPASS_POSIX_SCRIPT, Some(0o700))?;
+        }
+        Ok(Self {
+            inner: Arc::new(inner),
+            child_reaper,
+        })
     }
+
+    fn path(&self) -> &Path {
+        &self.inner.launcher
+    }
+
+    #[cfg(test)]
+    fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    #[cfg(test)]
+    fn cleanup_observer(&self) -> watch::Receiver<bool> {
+        self.inner.cleanup_sender.subscribe()
+    }
+
+    fn reserve_child(&self) -> Result<SshChildReaperPermit, String> {
+        self.child_reaper.reserve()
+    }
+}
+
+impl Drop for SshAskpassLauncherInner {
+    fn drop(&mut self) {
+        for file in &self.files {
+            if let Err(error) = fs::remove_file(file)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, "failed to remove an exact SSH askpass file");
+            }
+        }
+        for directory in [&self.directory, &self.root] {
+            if let Err(error) = fs::remove_dir(directory)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, "failed to remove an exact SSH askpass directory");
+            }
+        }
+        let _ = self.cleanup_sender.send(true);
+    }
+}
+
+#[derive(Clone)]
+struct SshChildReaper {
+    inner: Arc<SshChildReaperInner>,
+}
+
+struct SshChildReaperInner {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    capacity: Arc<Semaphore>,
+    idle: Notify,
+    #[cfg(test)]
+    admitted: Notify,
+    shutdown_sender: watch::Sender<bool>,
+}
+
+struct SshChildReaperPermit {
+    inner: Arc<SshChildReaperInner>,
+    capacity: Option<OwnedSemaphorePermit>,
+    runtime: tokio::runtime::Handle,
+    shutdown_receiver: watch::Receiver<bool>,
+}
+
+impl SshChildReaper {
+    fn new() -> Self {
+        let (shutdown_sender, _) = watch::channel(false);
+        Self {
+            inner: Arc::new(SshChildReaperInner {
+                accepting: AtomicBool::new(true),
+                active: AtomicUsize::new(0),
+                capacity: Arc::new(Semaphore::new(SSH_CHILD_REAPER_CAPACITY)),
+                idle: Notify::new(),
+                #[cfg(test)]
+                admitted: Notify::new(),
+                shutdown_sender,
+            }),
+        }
+    }
+
+    fn reserve(&self) -> Result<SshChildReaperPermit, String> {
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        let capacity = self
+            .inner
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "SSH process owner capacity was exceeded.".to_string())?;
+        self.inner.active.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        self.inner.admitted.notify_waiters();
+        let permit = SshChildReaperPermit {
+            inner: self.inner.clone(),
+            capacity: Some(capacity),
+            runtime: tokio::runtime::Handle::current(),
+            shutdown_receiver: self.inner.shutdown_sender.subscribe(),
+        };
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            drop(permit);
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        Ok(permit)
+    }
+
+    fn close(&self) {
+        self.inner.accepting.store(false, Ordering::Release);
+        self.inner.capacity.close();
+        let _ = self.inner.shutdown_sender.send(true);
+    }
+
+    fn accepting(&self) -> bool {
+        self.inner.accepting.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let idle = self.inner.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.inner.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    async fn wait_until_active(&self) {
+        loop {
+            let admitted = self.inner.admitted.notified();
+            tokio::pin!(admitted);
+            admitted.as_mut().enable();
+            if self.active() > 0 {
+                return;
+            }
+            admitted.await;
+        }
+    }
+}
+
+impl SshChildReaperPermit {
+    fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown_receiver.clone()
+    }
+
+    fn spawn_reap(self, mut child: Child, askpass_launcher: SshAskpassLauncher) {
+        let runtime = self.runtime.clone();
+        runtime.spawn(async move {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            drop(askpass_launcher);
+            drop(self);
+        });
+    }
+}
+
+impl Drop for SshChildReaperPermit {
+    fn drop(&mut self) {
+        self.capacity.take();
+        if self.inner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.idle.notify_waiters();
+        }
+    }
+}
+
+struct ManagedSshChild {
+    child: Option<Child>,
+    askpass_launcher: Option<SshAskpassLauncher>,
+    reaper_permit: Option<SshChildReaperPermit>,
+}
+
+impl ManagedSshChild {
+    fn new(
+        child: Child,
+        askpass_launcher: SshAskpassLauncher,
+        reaper_permit: SshChildReaperPermit,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            askpass_launcher: Some(askpass_launcher),
+            reaper_permit: Some(reaper_permit),
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("managed SSH child is live")
+    }
+
+    fn askpass_launcher(&self) -> &SshAskpassLauncher {
+        self.askpass_launcher
+            .as_ref()
+            .expect("managed SSH child retains askpass ownership")
+    }
+
+    fn release_reaped(&mut self) {
+        self.child.take();
+        self.askpass_launcher.take();
+        self.reaper_permit.take();
+    }
+
+    async fn terminate_and_reap(&mut self) {
+        let _ = self.child_mut().start_kill();
+        let waited =
+            tokio::time::timeout(SSH_TUNNEL_SHUTDOWN_TIMEOUT, self.child_mut().wait()).await;
+        if matches!(waited, Ok(Ok(_))) {
+            self.release_reaped();
+            return;
+        }
+        self.transfer_to_reaper();
+    }
+
+    async fn wait_with_output(&mut self) -> io::Result<std::process::Output> {
+        let mut stdout = self.child_mut().stdout.take();
+        let mut stderr = self.child_mut().stderr.take();
+        let stdout_task = async move {
+            let mut bytes = Vec::new();
+            if let Some(stdout) = stdout.as_mut() {
+                stdout.read_to_end(&mut bytes).await?;
+            }
+            Ok::<Vec<u8>, io::Error>(bytes)
+        };
+        let stderr_task = async move {
+            let mut bytes = Vec::new();
+            if let Some(stderr) = stderr.as_mut() {
+                stderr.read_to_end(&mut bytes).await?;
+            }
+            Ok::<Vec<u8>, io::Error>(bytes)
+        };
+        let mut shutdown = self
+            .reaper_permit
+            .as_ref()
+            .expect("managed SSH child retains bounded cleanup ownership")
+            .shutdown_receiver();
+        let status_task = async {
+            tokio::select! {
+                status = self.child_mut().wait() => status.map(|status| (status, false)),
+                _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                    let _ = self.child_mut().start_kill();
+                    self.child_mut().wait().await.map(|status| (status, true))
+                }
+            }
+        };
+        let ((status, interrupted), stdout, stderr) =
+            tokio::try_join!(status_task, stdout_task, stderr_task,)?;
+        self.release_reaped();
+        if interrupted {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "SSH process owner is shutting down",
+            ));
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn transfer_to_reaper(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let askpass_launcher = self.askpass_launcher.take();
+        let reaper_permit = self.reaper_permit.take();
+        let _ = child.start_kill();
+        if let (Some(askpass_launcher), Some(reaper_permit)) = (askpass_launcher, reaper_permit) {
+            reaper_permit.spawn_reap(child, askpass_launcher);
+        } else {
+            drop(child);
+        }
+    }
+
+    fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.reaper_permit
+            .as_ref()
+            .expect("managed SSH child retains bounded cleanup ownership")
+            .shutdown_receiver()
+    }
+}
+
+impl Drop for ManagedSshChild {
+    fn drop(&mut self) {
+        self.transfer_to_reaper();
+    }
+}
+
+async fn wait_for_ssh_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        let closed = *shutdown.borrow_and_update();
+        if closed {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn spawn_managed_ssh_child(
+    mut command: Command,
+    askpass_launcher: SshAskpassLauncher,
+    operation: &str,
+) -> Result<ManagedSshChild, String> {
+    let reaper_permit = askpass_launcher.reserve_child()?;
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to {operation}: {error}"))?;
+    Ok(ManagedSshChild::new(child, askpass_launcher, reaper_permit))
+}
+
+fn set_ssh_askpass_directory_permissions(directory: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Failed to chmod SSH askpass directory: {error}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 fn write_askpass_file(path: &Path, contents: &str, mode: Option<u32>) -> Result<(), String> {
@@ -756,7 +1223,7 @@ async fn run_remote_ssh_script(
     script: &str,
     script_args: &[String],
     auth: &SshAuthOptions,
-    askpass_launcher: &Path,
+    askpass_launcher: SshAskpassLauncher,
     operation: &str,
 ) -> Result<String, String> {
     let host_spec = build_ssh_host_spec(target)?;
@@ -769,23 +1236,34 @@ async fn run_remote_ssh_script(
     configure_background_command(&mut command);
     command
         .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher))
+        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Failed to run SSH {operation} command: {error}"))?;
+    let mut child = spawn_managed_ssh_child(
+        command,
+        askpass_launcher,
+        &format!("run SSH {operation} command"),
+    )?;
     let mut stdin = child
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
-    stdin
-        .write_all(script.as_bytes())
-        .await
-        .map_err(|error| format!("Failed to write SSH {operation} script: {error}"))?;
+    let mut shutdown = child.shutdown_receiver();
+    let write_result = tokio::select! {
+        result = stdin.write_all(script.as_bytes()) => result
+            .map_err(|error| format!("Failed to write SSH {operation} script: {error}")),
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            Err("SSH process owner is shutting down.".to_string())
+        }
+    };
     drop(stdin);
+    if let Err(error) = write_result {
+        child.terminate_and_reap().await;
+        return Err(error);
+    }
 
     let output = child
         .wait_with_output()
@@ -852,7 +1330,7 @@ pub fn parse_remote_launch_result(output: &str) -> Result<RemoteLaunchResult, St
 async fn launch_or_reuse_remote_server(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
-    askpass_launcher: &Path,
+    askpass_launcher: SshAskpassLauncher,
 ) -> Result<RemoteLaunchResult, String> {
     let state_key = remote_state_key(target);
     let output = run_remote_ssh_script(
@@ -870,7 +1348,7 @@ async fn launch_or_reuse_remote_server(
 async fn stop_remote_server(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
-    askpass_launcher: &Path,
+    askpass_launcher: SshAskpassLauncher,
 ) -> Result<(), String> {
     let state_key = remote_state_key(target);
     run_remote_ssh_script(
@@ -888,7 +1366,7 @@ async fn stop_remote_server(
 async fn issue_remote_pairing_token(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
-    askpass_launcher: &Path,
+    askpass_launcher: SshAskpassLauncher,
 ) -> Result<String, String> {
     let host_spec = build_ssh_host_spec(target)?;
     let mut args = base_ssh_args_with_auth(target, auth);
@@ -900,10 +1378,16 @@ async fn issue_remote_pairing_token(
     ]);
     let mut command = Command::new(ssh_command());
     configure_background_command(&mut command);
-    let output = command
+    command
         .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher))
-        .output()
+        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "run SSH pairing command")?;
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|error| format!("Failed to run SSH pairing command: {error}"))?;
     if !output.status.success() {
@@ -920,22 +1404,28 @@ async fn issue_remote_pairing_token(
 async fn start_ssh_tunnel(
     plan: &SshEnvironmentLaunchPlan,
     auth: &SshAuthOptions,
-    askpass_launcher: &Path,
-) -> Result<Child, String> {
+    askpass_launcher: SshAskpassLauncher,
+) -> Result<ManagedSshChild, String> {
     let mut command = Command::new(&plan.program);
     configure_background_command(&mut command);
-    let mut child = command
+    command
         .args(&plan.args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher))
+        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("Failed to start SSH tunnel: {error}"))?;
+        .kill_on_drop(true);
+    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "start SSH tunnel")?;
 
-    if let Err(error) = wait_for_ssh_tunnel_ready(&mut child, &plan.http_base_url).await {
-        terminate_child(&mut child).await;
+    let mut shutdown = child.shutdown_receiver();
+    let ready_result = tokio::select! {
+        result = wait_for_ssh_tunnel_ready(child.child_mut(), &plan.http_base_url) => result,
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            Err("SSH process owner is shutting down.".to_string())
+        }
+    };
+    if let Err(error) = ready_result {
+        child.terminate_and_reap().await;
         return Err(error);
     }
 
@@ -989,11 +1479,6 @@ async fn read_child_stderr(child: &mut Child) -> String {
         return String::new();
     }
     output.trim().to_string()
-}
-
-async fn terminate_child(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(SSH_TUNNEL_SHUTDOWN_TIMEOUT, child.wait()).await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1573,6 +2058,448 @@ mod tests {
         ))
     }
 
+    fn process_is_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: signal zero does not modify the target process.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"),
+                ])
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
+    #[test]
+    fn askpass_launcher_last_lease_removes_exact_root_without_persisting_secret() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let retained = launcher.clone();
+
+        assert!(launcher.path().is_file());
+        assert!(root.starts_with(temporary_base.path()));
+        assert!(
+            !fs::read_to_string(launcher.path())
+                .expect("askpass launcher should read")
+                .contains("fixture-password"),
+            "askpass files must not persist authentication secrets"
+        );
+
+        drop(launcher);
+        assert!(root.exists(), "a retained lease must keep its helper root");
+        drop(retained);
+        assert!(!root.exists(), "the final lease must remove its exact root");
+        assert_eq!(
+            fs::read_dir(temporary_base.path())
+                .expect("temporary base should remain readable")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn askpass_launcher_cleanup_preserves_unexpected_foreign_entries() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let directory = launcher
+            .path()
+            .parent()
+            .expect("askpass directory")
+            .to_path_buf();
+        let foreign = directory.join("foreign-owner.txt");
+        fs::write(&foreign, "foreign-owner-data").expect("foreign fixture should write");
+
+        drop(launcher);
+
+        assert_eq!(
+            fs::read_to_string(&foreign).expect("foreign entry must remain"),
+            "foreign-owner-data"
+        );
+        assert!(root.exists(), "a nonempty foreign-owned root must remain");
+        assert!(
+            !directory.join("ssh-askpass.sh").exists()
+                && !directory.join("ssh-askpass.cmd").exists()
+                && !directory.join("ssh-askpass.ps1").exists(),
+            "only the exact created helper files should be removed"
+        );
+    }
+
+    #[test]
+    fn concurrent_askpass_requests_share_one_live_unique_lease() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager = Arc::new(SshEnvironmentManager::with_askpass_temp_base(
+            temporary_base.path().to_path_buf(),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let owners = (0..8)
+            .map(|_| {
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager
+                        .askpass_launcher()
+                        .expect("parallel askpass launcher")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let owners = owners
+            .into_iter()
+            .map(|owner| owner.join().expect("parallel askpass owner"))
+            .collect::<Vec<_>>();
+        let expected_root = owners[0].root();
+
+        assert!(owners.iter().all(|owner| owner.root() == expected_root));
+        assert_eq!(
+            fs::read_dir(temporary_base.path())
+                .expect("temporary base should remain readable")
+                .count(),
+            1,
+            "concurrent requests must converge on one live helper root"
+        );
+        drop(owners);
+        assert_eq!(
+            fs::read_dir(temporary_base.path())
+                .expect("temporary base should remain readable")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_askpass_owner_removes_root_after_join() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let _launcher = launcher;
+            let _ = entered_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        entered_receiver
+            .await
+            .expect("cancelled owner should publish readiness");
+
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("owner should be cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            !root.exists(),
+            "joining cancellation must release the helper root"
+        );
+        assert_eq!(
+            fs::read_dir(temporary_base.path())
+                .expect("temporary base should remain readable")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_active_ssh_child_reaps_before_releasing_askpass_root() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let mut cleaned = launcher.cleanup_observer();
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.Write('ready!'); Start-Sleep -Seconds 60",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf 'ready!'; exec sleep 60"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let reaper_permit = launcher
+            .reserve_child()
+            .expect("active SSH child should reserve cleanup ownership");
+        let child = command.spawn().expect("active SSH child fixture");
+        let pid = child.id().expect("active SSH child PID");
+        let mut child = ManagedSshChild::new(child, launcher, reaper_permit);
+        let mut stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .expect("active SSH child stdout");
+        let mut readiness = [0_u8; 6];
+        stdout
+            .read_exact(&mut readiness)
+            .await
+            .expect("active SSH child readiness");
+        assert_eq!(&readiness, b"ready!");
+
+        let owner = tokio::spawn(async move {
+            let _child = child;
+            std::future::pending::<()>().await;
+        });
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("active owner should be cancelled")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(manager.shutdown(), manager.shutdown());
+        })
+        .await
+        .expect("concurrent manager shutdown should drain active SSH cleanup");
+        cleaned
+            .changed()
+            .await
+            .expect("cleanup observer should remain live");
+
+        assert!(
+            *cleaned.borrow(),
+            "cleanup must publish only after child reap"
+        );
+        assert!(
+            !root.exists(),
+            "reap completion must release the helper root"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "cleanup event must follow exact child exit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_shutdown_terminates_child_owned_by_retained_waiter() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.Write('ready!'); Start-Sleep -Seconds 60",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf 'ready!'; exec sleep 60"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let reaper_permit = launcher
+            .reserve_child()
+            .expect("active SSH child should reserve cleanup ownership");
+        let child = command.spawn().expect("active SSH child fixture");
+        let pid = child.id().expect("active SSH child PID");
+        let mut child = ManagedSshChild::new(child, launcher, reaper_permit);
+        let mut stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .expect("active SSH child stdout");
+        let mut readiness = [0_u8; 6];
+        stdout
+            .read_exact(&mut readiness)
+            .await
+            .expect("active SSH child readiness");
+        assert_eq!(&readiness, b"ready!");
+        let owner = tokio::spawn(async move { child.wait_with_output().await });
+
+        if tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(manager.shutdown(), manager.shutdown());
+        })
+        .await
+        .is_err()
+        {
+            owner.abort();
+            let _ = owner.await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), manager.shutdown()).await;
+            panic!("manager shutdown must interrupt a retained active SSH waiter");
+        }
+        let wait_error = owner
+            .await
+            .expect("retained SSH waiter should join")
+            .expect_err("manager shutdown should interrupt the SSH wait");
+
+        assert_eq!(wait_error.kind(), io::ErrorKind::Interrupted);
+        assert!(!root.exists(), "shutdown must release the askpass root");
+        assert!(!process_is_alive(pid), "shutdown must reap the exact child");
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("completed manager shutdown must remain idempotent");
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_interrupts_unpublished_tunnel_readiness() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager = Arc::new(SshEnvironmentManager::with_askpass_temp_base(
+            temporary_base.path().to_path_buf(),
+        ));
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 60".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "exec sleep 60".to_string()],
+            )
+        };
+        let target = SshEnvironmentTarget {
+            alias: "fixture".to_string(),
+            hostname: "fixture.invalid".to_string(),
+            username: Some("fixture-user".to_string()),
+            port: None,
+        };
+        let plan = SshEnvironmentLaunchPlan {
+            key: "shutdown-readiness".to_string(),
+            program,
+            args,
+            target,
+            local_port: 9,
+            remote_port: 9,
+            remote_server_kind: "fixture",
+            http_base_url: "http://127.0.0.1:9/".to_string(),
+            ws_base_url: "ws://127.0.0.1:9/".to_string(),
+        };
+        let owner = tokio::spawn(async move {
+            start_ssh_tunnel(&plan, &SshAuthOptions::batch(), launcher).await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.child_reaper.wait_until_active(),
+        )
+        .await
+        .expect("unpublished tunnel should reserve ownership before readiness");
+
+        tokio::time::timeout(Duration::from_secs(3), manager.shutdown())
+            .await
+            .expect("shutdown should interrupt unpublished tunnel readiness");
+        let error = match owner.await.expect("unpublished tunnel owner should join") {
+            Ok(mut child) => {
+                child.terminate_and_reap().await;
+                panic!("shutdown must reject unpublished tunnel readiness");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "SSH process owner is shutting down.");
+        assert_eq!(manager.child_reaper.active(), 0);
+        assert!(!root.exists(), "shutdown must release the askpass root");
+    }
+
+    #[tokio::test]
+    async fn ssh_child_reaper_capacity_refuses_spawn_admission_and_recovers() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let permits = (0..SSH_CHILD_REAPER_CAPACITY)
+            .map(|_| launcher.reserve_child().expect("bounded child ownership"))
+            .collect::<Vec<_>>();
+        let marker = temporary_base.path().join("spawned.txt");
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[IO.File]::WriteAllText($env:TASK9I_MARKER, 'spawned')",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf spawned > \"$TASK9I_MARKER\""]);
+            command
+        };
+        command.env("TASK9I_MARKER", &marker).kill_on_drop(true);
+
+        assert_eq!(manager.child_reaper.active(), SSH_CHILD_REAPER_CAPACITY);
+        assert_eq!(
+            launcher
+                .reserve_child()
+                .err()
+                .expect("capacity must reject before process spawn"),
+            "SSH process owner capacity was exceeded."
+        );
+        assert_eq!(
+            spawn_managed_ssh_child(command, launcher.clone(), "start capacity fixture")
+                .err()
+                .expect("capacity must fail before spawning"),
+            "SSH process owner capacity was exceeded."
+        );
+        assert!(!marker.exists(), "a refused child must never be spawned");
+
+        drop(permits);
+        assert_eq!(manager.child_reaper.active(), 0);
+        assert!(launcher.reserve_child().is_ok());
+        manager.shutdown().await;
+        assert_eq!(
+            launcher
+                .reserve_child()
+                .err()
+                .expect("shutdown must close child admission"),
+            "SSH process owner is shutting down."
+        );
+    }
+
     #[test]
     fn environment_manager_caches_clears_and_misses_auth_and_tunnels() {
         let manager = SshEnvironmentManager::default();
@@ -1598,10 +2525,13 @@ mod tests {
     async fn environment_manager_reports_unreachable_ssh_targets() {
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
+        let askpass_temporary_base = tempfile::tempdir().expect("askpass temporary base");
         let app = mock_builder()
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
-        let manager = SshEnvironmentManager::new();
+        let manager = SshEnvironmentManager::with_askpass_temp_base(
+            askpass_temporary_base.path().to_path_buf(),
+        );
         let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
         let target = SshEnvironmentTarget {
             alias: "unreachable-localhost".to_string(),
@@ -1615,12 +2545,27 @@ mod tests {
             .await
             .expect_err("an unreachable SSH target should not launch");
         assert!(ensure_error.contains("SSH launch command failed"));
+        assert_eq!(
+            fs::read_dir(askpass_temporary_base.path())
+                .expect("askpass temporary base should remain readable")
+                .count(),
+            0,
+            "failed ensure must release its askpass root"
+        );
 
         let disconnect_error = manager
             .disconnect_environment(app.handle(), &prompts, target)
             .await
             .expect_err("an unreachable SSH target should not disconnect remotely");
         assert!(disconnect_error.contains("SSH stop command failed"));
+        assert_eq!(
+            fs::read_dir(askpass_temporary_base.path())
+                .expect("askpass temporary base should remain readable")
+                .count(),
+            0,
+            "failed disconnect must release its askpass root"
+        );
+        manager.shutdown().await;
     }
 
     #[test]

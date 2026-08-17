@@ -6,17 +6,25 @@ four job groups:
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
   desktop build pipeline on Ubuntu 24.04.
-- **Test** runs every workspace package `test` script with `vp run test`, then
-  runs `cargo test --workspace -j 2 -- --test-threads=1` explicitly on Ubuntu
-  24.04. Rust test cases run serially because the process and Git integration
-  fixtures own process-global resources while each case executes.
+- **Test** runs every workspace package `test` script concurrently with
+  `vp run test`, then runs `cargo test --workspace -j 2` explicitly on Ubuntu
+  24.04. The `-j 2` bound limits concurrent Cargo compilation jobs; Rust test
+  binaries use the default parallel harness threads. Exact subprocess tests may
+  still select `--test-threads=1` inside an isolated child process that
+  intentionally owns process-global state.
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux x64, Windows x64, macOS
   arm64, and macOS x64 runners. Windows ARM is intentionally excluded while
-  `scripts/run-msvc-x64.mjs` remains x64-specific.
+  `scripts/run-msvc-x64.mjs` remains x64-specific. After the Rust host tests,
+  the Windows row alone runs
+  `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
+  supported native proof that the generated Cursor `.cmd` shim executes through
+  the Windows command processor and writes its exact action record. Simulated
+  target fixture assertions on other hosts are compatibility evidence, not a
+  native Windows pass.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's
@@ -38,3 +46,7 @@ runtime or TypeScript server.
 
 When changing a workflow, update its focused workflow-contract tests and run
 the repository gates documented in [Scripts](../reference/scripts.md).
+Repeatable native manual and packaged validation follows the
+[shared cross-platform runbook](../testing/cross-platform-validation.md) plus
+the matching Windows, Linux, or macOS page in the
+[testing runbook index](../testing/README.md).

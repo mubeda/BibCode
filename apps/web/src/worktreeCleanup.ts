@@ -1,51 +1,16 @@
-import type { ThreadShell } from "./types";
-
-function normalizeWorktreePath(path: string | null): string | null {
-  const trimmed = path?.trim();
-  if (!trimmed) {
-    return null;
-  }
-  return trimmed;
-}
-
-export interface WorktreeDeletionPlan {
-  readonly worktreePath: string;
-  readonly dependentPanelThreadIds: ReadonlyArray<ThreadShell["id"]>;
-}
-
-export function getWorktreeDeletionPlanForThread(
-  threads: ReadonlyArray<Pick<ThreadShell, "id" | "kind" | "worktreePath">>,
-  threadId: ThreadShell["id"],
-): WorktreeDeletionPlan | null {
-  const targetThread = threads.find((thread) => thread.id === threadId);
-  if (!targetThread || targetThread.kind === "panel") {
-    return null;
-  }
-
-  const targetWorktreePath = normalizeWorktreePath(targetThread.worktreePath);
-  if (!targetWorktreePath) {
-    return null;
-  }
-
-  const linkedThreads = threads.filter(
-    (thread) =>
-      thread.id !== threadId && normalizeWorktreePath(thread.worktreePath) === targetWorktreePath,
-  );
-  if (linkedThreads.some((thread) => thread.kind !== "panel")) {
-    return null;
-  }
-
-  return {
-    worktreePath: targetWorktreePath,
-    dependentPanelThreadIds: linkedThreads.map((thread) => thread.id),
-  };
-}
-
-export function getOrphanedWorktreePathForThread(
-  threads: ReadonlyArray<Pick<ThreadShell, "id" | "kind" | "worktreePath">>,
-  threadId: ThreadShell["id"],
-): string | null {
-  return getWorktreeDeletionPlanForThread(threads, threadId)?.worktreePath ?? null;
+export function getBulkThreadDeletionConfirmation(
+  threadCount: number,
+  worktreeCount: number,
+): string {
+  return [
+    `Delete ${threadCount} thread${threadCount === 1 ? "" : "s"}?`,
+    `This permanently clears conversation history for ${threadCount === 1 ? "this thread" : "these threads"}.`,
+    ...(worktreeCount > 0
+      ? [
+          `${worktreeCount} worktree-backed thread${worktreeCount === 1 ? "" : "s"} will be removed from BiBCode only. Git worktrees and files are left untouched.`,
+        ]
+      : []),
+  ].join("\n");
 }
 
 export function formatWorktreePathForDisplay(worktreePath: string): string {

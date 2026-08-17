@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-server"
-version = "0.3.13"
+version = "0.3.14"
 description = "BiBCode Rust server runtime"
 edition.workspace = true
 rust-version.workspace = true
@@ -64,6 +64,7 @@ windows-sys = { workspace = true, features = [
   "Wdk_Storage_FileSystem",
   "Wdk_System_Threading",
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",

@@ -622,6 +622,15 @@ beforeEach(() => {
 });
 
 describe("SourceControlPanel", () => {
+  it("uses the shared workspace guard instead of starting Git work", () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    const markup = render(buildProps({ workspaceUnavailable: reason }));
+
+    expect(testState.statusAtoms[0]).toBeNull();
+    expect(markup).toContain(reason);
+    expect(markup).not.toContain("Generate commit message with AI");
+  });
+
   it("shows a loading state while the first status fetch is pending", () => {
     testState.statusQuery = { data: null, error: null, isPending: true, refresh: vi.fn() };
     const markup = render(buildProps());

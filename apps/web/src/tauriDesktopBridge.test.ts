@@ -303,7 +303,11 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       platform: { os: "windows", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
-      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+      capabilities: {
+        repositoryIdentity: true,
+        worktreeCatalog: false,
+        activityProtocolVersion: null,
+      },
     },
     httpBaseUrl: "https://private.example.test/secret-path",
     socketUrl: "wss://private.example.test/secret-path/ws",

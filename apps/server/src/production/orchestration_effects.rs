@@ -594,7 +594,7 @@ async fn ensure_baseline(
     let Some(cwd) = resolve_workspace(engine, callbacks, thread_id).await? else {
         return Ok(());
     };
-    if !is_git_repository(&cwd, cancellation).await? {
+    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Ok(());
     }
     let turn_count = engine
@@ -606,8 +606,15 @@ async fn ensure_baseline(
         .max()
         .unwrap_or(0);
     let reference = checkpoint_ref(thread_id, turn_count);
-    if !has_ref(&cwd, &reference, cancellation).await? {
-        capture_checkpoint_with_cancellation(&cwd, thread_id, turn_count, cancellation).await?;
+    if !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
+        capture_checkpoint_with_cancellation(
+            &cwd,
+            Path::new("git"),
+            thread_id,
+            turn_count,
+            cancellation,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -631,7 +638,7 @@ async fn capture_missing_checkpoint(
     let Some(cwd) = resolve_workspace(engine, callbacks, thread_id).await? else {
         return Ok(());
     };
-    if !is_git_repository(&cwd, cancellation).await? {
+    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Ok(());
     }
 
@@ -648,15 +655,22 @@ async fn capture_missing_checkpoint(
     }
 
     let target_ref = checkpoint_ref(thread_id, turn_count);
-    capture_checkpoint_with_cancellation(&cwd, thread_id, turn_count, cancellation).await?;
+    capture_checkpoint_with_cancellation(
+        &cwd,
+        Path::new("git"),
+        thread_id,
+        turn_count,
+        cancellation,
+    )
+    .await?;
     callbacks
         .refresh_workspace(&cwd)
         .await
         .map_err(OrchestrationEffectsError::Effect)?;
 
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    let files = if has_ref(&cwd, &from_ref, cancellation).await? {
-        diff_file_summaries(&cwd, &from_ref, &target_ref, cancellation).await?
+    let files = if has_ref(&cwd, Path::new("git"), &from_ref, cancellation).await? {
+        diff_file_summaries(&cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
     } else {
         Vec::new()
     };
@@ -726,7 +740,7 @@ async fn revert_checkpoint(
                 "No active provider session with workspace cwd is bound to this thread.".to_owned(),
             )
         })?;
-    if !is_git_repository(&cwd, cancellation).await? {
+    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Err(OrchestrationEffectsError::Effect(
             "Checkpoints are unavailable because this project is not a git repository.".to_owned(),
         ));
@@ -759,7 +773,15 @@ async fn revert_checkpoint(
                 ))
             })?
     };
-    if !restore_checkpoint(&cwd, &target_ref, turn_count == 0, cancellation).await? {
+    if !restore_checkpoint(
+        &cwd,
+        Path::new("git"),
+        &target_ref,
+        turn_count == 0,
+        cancellation,
+    )
+    .await?
+    {
         return Err(OrchestrationEffectsError::Effect(format!(
             "Filesystem checkpoint is unavailable for turn {turn_count}."
         )));
@@ -779,7 +801,13 @@ async fn revert_checkpoint(
         .iter()
         .filter(|checkpoint| checkpoint.checkpoint_turn_count > turn_count)
     {
-        delete_ref(&cwd, &checkpoint.checkpoint_ref, cancellation).await?;
+        delete_ref(
+            &cwd,
+            Path::new("git"),
+            &checkpoint.checkpoint_ref,
+            cancellation,
+        )
+        .await?;
     }
     let created_at = now_iso();
     engine
@@ -870,18 +898,26 @@ pub async fn capture_checkpoint(
     thread_id: &str,
     turn_count: i64,
 ) -> Result<(), OrchestrationEffectsError> {
-    capture_checkpoint_with_cancellation(cwd, thread_id, turn_count, &CancellationToken::new())
-        .await
+    capture_checkpoint_with_cancellation(
+        cwd,
+        Path::new("git"),
+        thread_id,
+        turn_count,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
 async fn capture_checkpoint_with_cancellation(
     cwd: &Path,
+    git_command: &Path,
     thread_id: &str,
     turn_count: i64,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     let common_dir = run_git(
         cwd,
+        git_command,
         &["rev-parse", "--git-common-dir"],
         &[],
         false,
@@ -902,6 +938,7 @@ async fn capture_checkpoint_with_cancellation(
     let result = async {
         let head = run_git(
             cwd,
+            git_command,
             &["rev-parse", "--verify", "HEAD^{commit}"],
             &env,
             true,
@@ -909,15 +946,32 @@ async fn capture_checkpoint_with_cancellation(
         )
         .await?;
         if head.exit_code == 0 {
-            run_git(cwd, &["read-tree", "HEAD"], &env, false, cancellation).await?;
+            run_git(
+                cwd,
+                git_command,
+                &["read-tree", "HEAD"],
+                &env,
+                false,
+                cancellation,
+            )
+            .await?;
         }
-        run_git(cwd, &["add", "-A", "--", "."], &env, false, cancellation).await?;
-        let tree = run_git(cwd, &["write-tree"], &env, false, cancellation)
+        run_git(
+            cwd,
+            git_command,
+            &["add", "-A", "--", "."],
+            &env,
+            false,
+            cancellation,
+        )
+        .await?;
+        let tree = run_git(cwd, git_command, &["write-tree"], &env, false, cancellation)
             .await?
             .stdout;
         let message = format!("bibcode checkpoint ref={reference}");
         let commit = run_git(
             cwd,
+            git_command,
             &["commit-tree", tree.trim(), "-m", &message],
             &env,
             false,
@@ -927,6 +981,7 @@ async fn capture_checkpoint_with_cancellation(
         .stdout;
         run_git(
             cwd,
+            git_command,
             &["update-ref", &reference, commit.trim()],
             &[],
             false,
@@ -942,10 +997,12 @@ async fn capture_checkpoint_with_cancellation(
 
 async fn is_git_repository(
     cwd: &Path,
+    git_command: &Path,
     cancellation: &CancellationToken,
 ) -> Result<bool, OrchestrationEffectsError> {
     let output = run_git(
         cwd,
+        git_command,
         &["rev-parse", "--is-inside-work-tree"],
         &[],
         true,
@@ -957,11 +1014,13 @@ async fn is_git_repository(
 
 async fn has_ref(
     cwd: &Path,
+    git_command: &Path,
     reference: &str,
     cancellation: &CancellationToken,
 ) -> Result<bool, OrchestrationEffectsError> {
     Ok(run_git(
         cwd,
+        git_command,
         &[
             "rev-parse",
             "--verify",
@@ -979,15 +1038,17 @@ async fn has_ref(
 
 async fn restore_checkpoint(
     cwd: &Path,
+    git_command: &Path,
     reference: &str,
     fallback_to_head: bool,
     cancellation: &CancellationToken,
 ) -> Result<bool, OrchestrationEffectsError> {
-    let revision = if has_ref(cwd, reference, cancellation).await? {
+    let revision = if has_ref(cwd, git_command, reference, cancellation).await? {
         reference.to_owned()
     } else if fallback_to_head
         && run_git(
             cwd,
+            git_command,
             &["rev-parse", "--verify", "HEAD^{commit}"],
             &[],
             true,
@@ -1003,6 +1064,7 @@ async fn restore_checkpoint(
     };
     run_git(
         cwd,
+        git_command,
         &[
             "restore",
             "--source",
@@ -1017,9 +1079,18 @@ async fn restore_checkpoint(
         cancellation,
     )
     .await?;
-    run_git(cwd, &["clean", "-fd", "--", "."], &[], false, cancellation).await?;
+    run_git(
+        cwd,
+        git_command,
+        &["clean", "-fd", "--", "."],
+        &[],
+        false,
+        cancellation,
+    )
+    .await?;
     if run_git(
         cwd,
+        git_command,
         &["rev-parse", "--verify", "HEAD^{commit}"],
         &[],
         true,
@@ -1031,6 +1102,7 @@ async fn restore_checkpoint(
     {
         run_git(
             cwd,
+            git_command,
             &["reset", "--quiet", "--", "."],
             &[],
             false,
@@ -1043,11 +1115,13 @@ async fn restore_checkpoint(
 
 async fn delete_ref(
     cwd: &Path,
+    git_command: &Path,
     reference: &str,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     run_git(
         cwd,
+        git_command,
         &["update-ref", "-d", reference],
         &[],
         true,
@@ -1059,12 +1133,14 @@ async fn delete_ref(
 
 async fn diff_file_summaries(
     cwd: &Path,
+    git_command: &Path,
     from_ref: &str,
     to_ref: &str,
     cancellation: &CancellationToken,
 ) -> Result<Vec<Value>, OrchestrationEffectsError> {
     let output = run_git(
         cwd,
+        git_command,
         &[
             "diff",
             "--numstat",
@@ -1101,6 +1177,7 @@ async fn diff_file_summaries(
 
 async fn run_git(
     cwd: &Path,
+    git_command: &Path,
     args: &[&str],
     env: &[(OsString, OsString)],
     allow_non_zero_exit: bool,
@@ -1110,7 +1187,7 @@ async fn run_git(
         .run(
             ProcessRequest {
                 operation: "OrchestrationEffects.git".to_owned(),
-                command: PathBuf::from("git"),
+                command: git_command.to_path_buf(),
                 args: args.iter().map(OsString::from).collect(),
                 cwd: cwd.to_path_buf(),
                 env: env.to_vec(),
@@ -1162,12 +1239,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::persistence::{Database, ProjectionProject, Repositories, run_migrations};
+    use crate::test_support::TestSandbox;
 
     use super::*;
 
     #[tokio::test]
     async fn unit_build_covers_workspace_normalization_and_checkpoint_git_lifecycle() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let parent = tempfile::tempdir().expect("workspace parent");
         let missing = parent.path().join("nested/project");
         assert!(matches!(
@@ -1219,18 +1296,27 @@ mod tests {
             .expect("project command prepares");
         assert!(command_root.is_dir());
 
-        let repository = tempfile::tempdir().expect("repository");
+        let repository = TestSandbox::new("orchestration-checkpoint");
+        let git_command = repository.executable_on_path("git");
         let cancellation = CancellationToken::new();
         assert!(
-            !is_git_repository(repository.path(), &cancellation)
+            !is_git_repository(repository.root(), &git_command, &cancellation)
                 .await
                 .expect("non-repository probe")
         );
-        run_git(repository.path(), &["init"], &[], false, &cancellation)
-            .await
-            .expect("git init");
         run_git(
-            repository.path(),
+            repository.root(),
+            &git_command,
+            &["init"],
+            &[],
+            false,
+            &cancellation,
+        )
+        .await
+        .expect("git init");
+        run_git(
+            repository.root(),
+            &git_command,
             &["config", "core.autocrlf", "false"],
             &[],
             false,
@@ -1239,7 +1325,8 @@ mod tests {
         .await
         .expect("disable fixture line-ending conversion");
         run_git(
-            repository.path(),
+            repository.root(),
+            &git_command,
             &["config", "user.name", "BiBCode Test"],
             &[],
             false,
@@ -1248,7 +1335,8 @@ mod tests {
         .await
         .expect("git user name");
         run_git(
-            repository.path(),
+            repository.root(),
+            &git_command,
             &["config", "user.email", "bibcode@example.test"],
             &[],
             false,
@@ -1256,14 +1344,22 @@ mod tests {
         )
         .await
         .expect("git user email");
-        tokio::fs::write(repository.path().join("tracked.txt"), "baseline\n")
+        tokio::fs::write(repository.root().join("tracked.txt"), "baseline\n")
             .await
             .expect("baseline file");
-        run_git(repository.path(), &["add", "."], &[], false, &cancellation)
-            .await
-            .expect("git add");
         run_git(
-            repository.path(),
+            repository.root(),
+            &git_command,
+            &["add", "."],
+            &[],
+            false,
+            &cancellation,
+        )
+        .await
+        .expect("git add");
+        run_git(
+            repository.root(),
+            &git_command,
             &["commit", "-m", "baseline"],
             &[],
             false,
@@ -1272,32 +1368,50 @@ mod tests {
         .await
         .expect("git commit");
         assert!(
-            is_git_repository(repository.path(), &cancellation)
+            is_git_repository(repository.root(), &git_command, &cancellation)
                 .await
                 .expect("repository probe")
         );
 
-        capture_checkpoint(repository.path(), "thread/one", 0)
-            .await
-            .expect("baseline checkpoint");
+        capture_checkpoint_with_cancellation(
+            repository.root(),
+            &git_command,
+            "thread/one",
+            0,
+            &cancellation,
+        )
+        .await
+        .expect("baseline checkpoint");
         let baseline_ref = checkpoint_ref("thread/one", 0);
         assert!(
-            has_ref(repository.path(), &baseline_ref, &cancellation)
-                .await
-                .expect("baseline ref")
+            has_ref(
+                repository.root(),
+                &git_command,
+                &baseline_ref,
+                &cancellation,
+            )
+            .await
+            .expect("baseline ref")
         );
-        tokio::fs::write(repository.path().join("tracked.txt"), "changed\n")
+        tokio::fs::write(repository.root().join("tracked.txt"), "changed\n")
             .await
             .expect("changed file");
-        tokio::fs::write(repository.path().join("new.txt"), "new\n")
+        tokio::fs::write(repository.root().join("new.txt"), "new\n")
             .await
             .expect("new file");
-        capture_checkpoint_with_cancellation(repository.path(), "thread/one", 1, &cancellation)
-            .await
-            .expect("changed checkpoint");
+        capture_checkpoint_with_cancellation(
+            repository.root(),
+            &git_command,
+            "thread/one",
+            1,
+            &cancellation,
+        )
+        .await
+        .expect("changed checkpoint");
         let changed_ref = checkpoint_ref("thread/one", 1);
         let files = diff_file_summaries(
-            repository.path(),
+            repository.root(),
+            &git_command,
             &baseline_ref,
             &changed_ref,
             &cancellation,
@@ -1306,20 +1420,27 @@ mod tests {
         .expect("checkpoint diff");
         assert_eq!(files.len(), 2);
         assert!(
-            restore_checkpoint(repository.path(), &baseline_ref, false, &cancellation)
-                .await
-                .expect("checkpoint restore")
+            restore_checkpoint(
+                repository.root(),
+                &git_command,
+                &baseline_ref,
+                false,
+                &cancellation,
+            )
+            .await
+            .expect("checkpoint restore")
         );
         assert_eq!(
-            tokio::fs::read_to_string(repository.path().join("tracked.txt"))
+            tokio::fs::read_to_string(repository.root().join("tracked.txt"))
                 .await
                 .expect("restored file"),
             "baseline\n"
         );
-        assert!(!repository.path().join("new.txt").exists());
+        assert!(!repository.root().join("new.txt").exists());
         assert!(
             restore_checkpoint(
-                repository.path(),
+                repository.root(),
+                &git_command,
                 "refs/bibcode/checkpoints/missing",
                 true,
                 &cancellation,
@@ -1329,7 +1450,8 @@ mod tests {
         );
         assert!(
             !restore_checkpoint(
-                repository.path(),
+                repository.root(),
+                &git_command,
                 "refs/bibcode/checkpoints/missing",
                 false,
                 &cancellation,
@@ -1337,11 +1459,11 @@ mod tests {
             .await
             .expect("missing checkpoint")
         );
-        delete_ref(repository.path(), &changed_ref, &cancellation)
+        delete_ref(repository.root(), &git_command, &changed_ref, &cancellation)
             .await
             .expect("checkpoint ref deletes");
         assert!(
-            !has_ref(repository.path(), &changed_ref, &cancellation)
+            !has_ref(repository.root(), &git_command, &changed_ref, &cancellation,)
                 .await
                 .expect("deleted ref")
         );
@@ -1421,6 +1543,8 @@ mod tests {
                     .into_owned(),
                 default_model_selection: None,
                 scripts: json!({"not":"an array"}),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
+                worktree_repository_key: None,
                 created_at: "2026-07-16T00:00:00Z".to_owned(),
                 updated_at: "2026-07-16T00:00:00Z".to_owned(),
                 deleted_at: None,
@@ -1434,6 +1558,8 @@ mod tests {
                 workspace_root: parent.path().join("empty").to_string_lossy().into_owned(),
                 default_model_selection: None,
                 scripts: json!([]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
+                worktree_repository_key: None,
                 created_at: "2026-07-16T00:00:01Z".to_owned(),
                 updated_at: "2026-07-16T00:00:01Z".to_owned(),
                 deleted_at: None,
@@ -1452,6 +1578,8 @@ mod tests {
                     "command":"vp install",
                     "runOnWorktreeCreate":true
                 }]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
+                worktree_repository_key: None,
                 created_at: "2026-07-16T00:00:02Z".to_owned(),
                 updated_at: "2026-07-16T00:00:02Z".to_owned(),
                 deleted_at: None,
@@ -1645,6 +1773,8 @@ mod tests {
                     "command":"vp install",
                     "runOnWorktreeCreate":true
                 }]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
+                worktree_repository_key: None,
                 created_at: "2026-08-01T00:00:00Z".to_owned(),
                 updated_at: "2026-08-01T00:00:00Z".to_owned(),
                 deleted_at: None,

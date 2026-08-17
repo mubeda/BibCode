@@ -238,6 +238,26 @@ describe("sendFocusedKeyboardKey", () => {
     expect(document.activeElement).toBe(second);
   });
 
+  it("moves backward from a programmatically focused heading to the preceding control", async () => {
+    installDroppedKeyTransport();
+    const back = document.createElement("button");
+    back.setAttribute("aria-label", "Back to Subagents");
+    const heading = document.createElement("h2");
+    heading.tabIndex = -1;
+    const following = document.createElement("button");
+    following.setAttribute("aria-label", "Following control");
+    for (const element of [back, heading, following]) makeVisible(element);
+    document.body.append(back, heading, following);
+    heading.focus();
+
+    const result = await sendFocusedKeyboardKey("Tab", true);
+
+    expect(result.transport).toBe("synthetic");
+    expect(result.before.tagName).toBe("H2");
+    expect(result.after.ariaLabel).toBe("Back to Subagents");
+    expect(document.activeElement).toBe(back);
+  });
+
   it("uses native semantics without duplicate production events when the capability probe succeeds", async () => {
     installKeyTransport((target) => {
       target?.dispatchEvent(

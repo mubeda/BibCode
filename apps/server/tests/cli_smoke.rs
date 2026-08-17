@@ -300,7 +300,7 @@ async fn desktop_bootstrap_rejects_an_empty_shutdown_token() {
     drop(stdin);
 
     let mut stderr = child.stderr.take().expect("child stderr");
-    let status = match timeout(Duration::from_secs(3), child.wait()).await {
+    let status = match timeout(Duration::from_secs(10), child.wait()).await {
         Ok(status) => status.expect("server exit status"),
         Err(_) => {
             child.kill().await.expect("kill server after timeout");

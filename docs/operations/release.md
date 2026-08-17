@@ -242,6 +242,12 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 
 ## Local Verification
 
+The commands below remain release-specific checks. Use the
+[testing runbooks](../testing/README.md) for repeatable native platform,
+packaged UI, external-worktree, visual, process-cleanup, and compatibility
+evidence. This release checklist owns publication and release-asset approval;
+the runbooks own validation procedure and reporting.
+
 Run the repository gates:
 
 ```powershell
@@ -257,7 +263,7 @@ infrastructure:
 ```powershell
 vp test scripts/tauri-hardening.test.ts scripts/build-desktop-artifact.test.ts scripts/build-tauri-update-manifest.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
 vp test apps/web/src/components/settings/SettingsPanels.test.tsx apps/web/src/components/AppSidebarLayout.test.tsx apps/web/src/tauriDesktopBridge.test.ts apps/web/src/components/desktopUpdate.logic.test.ts apps/web/src/state/desktopUpdate.test.ts
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2 -- --test-threads=1
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2
 ```
 
 Build the native artifact for the current operating system:

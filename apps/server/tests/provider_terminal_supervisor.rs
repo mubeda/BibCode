@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -20,7 +20,7 @@ use bibcode_server::{
         ActivityRecordKind, ActivityRepository, ActivityScopeRef, AgentActivityController,
         AgentActivityDisableReport, AgentActivitySource,
     },
-    diagnostics::ProcessAttributionRegistry,
+    diagnostics::{ProcessAttributionRegistry, ProcessIdentity},
     persistence::{Database, StorageInstanceId, run_migrations},
     production::{
         agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
@@ -43,7 +43,7 @@ use bibcode_server::{
         ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition,
         TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverWorkerContext,
+        TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
         TerminalObserverWorkerSpawnError,
     },
     server_settings::{ProviderInstanceState, ProviderSettingsState, ProviderSettingsStore},
@@ -143,6 +143,7 @@ impl TraceCapture {
 #[derive(Debug)]
 struct RecordingProcess {
     pid: u32,
+    identity: ProcessIdentity,
     output: broadcast::Sender<String>,
     exit: watch::Sender<Option<PtyExit>>,
     killed: AtomicBool,
@@ -150,10 +151,21 @@ struct RecordingProcess {
 
 impl RecordingProcess {
     fn new(pid: u32) -> Self {
+        static NEXT_SYNTHETIC_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+        assert_ne!(pid, 0, "synthetic PTY PID must be nonzero");
+        let generation = NEXT_SYNTHETIC_PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            generation, 0,
+            "synthetic PTY process generation wrapped to zero"
+        );
         let (output, _) = broadcast::channel(8);
         let (exit, _) = watch::channel(None);
         Self {
             pid,
+            identity: ProcessIdentity {
+                pid,
+                started_at: generation,
+            },
             output,
             exit,
             killed: AtomicBool::new(false),
@@ -175,6 +187,10 @@ impl RecordingProcess {
 impl PtyProcess for RecordingProcess {
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn process_identity(&self) -> Option<ProcessIdentity> {
+        Some(self.identity)
     }
 
     fn write(&self, _data: &str) -> Result<(), String> {
@@ -201,6 +217,21 @@ impl PtyProcess for RecordingProcess {
     fn subscribe_exit(&self) -> watch::Receiver<Option<PtyExit>> {
         self.exit.subscribe()
     }
+}
+
+#[test]
+fn synthetic_pty_identities_are_nonzero_and_distinguish_pid_generations() {
+    let first = RecordingProcess::new(41);
+    let replacement = RecordingProcess::new(41);
+
+    assert_ne!(first.identity.started_at, 0);
+    assert_ne!(replacement.identity.started_at, 0);
+    assert_eq!(first.identity.pid, replacement.identity.pid);
+    assert!(
+        replacement.identity.started_at > first.identity.started_at,
+        "a replacement using the same synthetic PID needs a later stable generation"
+    );
+    assert_ne!(first.identity, replacement.identity);
 }
 
 #[derive(Debug)]
@@ -354,7 +385,7 @@ impl ProviderTerminalObserverFactory for DelayedProviderFactory {
 #[derive(Clone, Debug)]
 struct SpawnObservation {
     pid: u32,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 }
 
 #[derive(Clone, Debug)]
@@ -365,7 +396,7 @@ struct CancelObservation {
 
 #[derive(Debug, Default)]
 struct ObserverState {
-    generation: Mutex<Option<TerminalObserverGeneration>>,
+    generation: Mutex<Option<TerminalObserverGenerationLease>>,
     spawned: Mutex<Vec<SpawnObservation>>,
     cancelled: Mutex<Vec<CancelObservation>>,
     cancellation: tokio::sync::Notify,
@@ -410,7 +441,7 @@ impl PreparedTerminalObserver for RecordingObserver {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.state.generation.lock().expect("generation lock") = Some(generation.clone());
@@ -437,7 +468,7 @@ impl PreparedTerminalObserver for CountingActivityObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -445,7 +476,7 @@ impl PreparedTerminalObserver for CountingActivityObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -544,7 +575,7 @@ impl PreparedTerminalObserver for CountingActivityObserverProxy {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.observer.on_spawned(pid, generation, workers);
@@ -553,7 +584,7 @@ impl PreparedTerminalObserver for CountingActivityObserverProxy {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         self.observer
@@ -668,7 +699,7 @@ impl PreparedTerminalObserver for RacingPreparedObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -734,7 +765,7 @@ impl PreparedTerminalObserver for HungPreparedObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -835,7 +866,7 @@ struct FaultingPreparer {
     observer_on_spawned_fault: Fault,
     prepare_started: Arc<tokio::sync::Semaphore>,
     observer_started: Arc<tokio::sync::Semaphore>,
-    generation: Arc<Mutex<Option<TerminalObserverGeneration>>>,
+    generation: Arc<Mutex<Option<TerminalObserverGenerationLease>>>,
 }
 
 impl FaultingPreparer {
@@ -858,7 +889,7 @@ impl FaultingPreparer {
 struct FaultingObserver {
     on_spawned_fault: Fault,
     observer_started: Arc<tokio::sync::Semaphore>,
-    generation: Arc<Mutex<Option<TerminalObserverGeneration>>>,
+    generation: Arc<Mutex<Option<TerminalObserverGenerationLease>>>,
 }
 
 #[derive(Debug)]
@@ -905,7 +936,7 @@ struct SerializedCallbackState {
     maximum: std::sync::atomic::AtomicUsize,
     spawned: tokio::sync::Semaphore,
     release_spawned: (std::sync::Mutex<bool>, std::sync::Condvar),
-    spawned_generation: Mutex<Option<TerminalObserverGeneration>>,
+    spawned_generation: Mutex<Option<TerminalObserverGenerationLease>>,
 }
 
 impl Default for SerializedCallbackState {
@@ -954,7 +985,7 @@ impl PreparedTerminalObserver for SerializedCallbackObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         let _active = self.state.enter();
@@ -1014,7 +1045,7 @@ struct NonCooperativeCallbackState {
     maximum: AtomicUsize,
     started: AtomicUsize,
     release: (std::sync::Mutex<bool>, std::sync::Condvar),
-    generation: Mutex<Option<TerminalObserverGeneration>>,
+    generation: Mutex<Option<TerminalObserverGenerationLease>>,
 }
 
 impl Default for NonCooperativeCallbackState {
@@ -1045,7 +1076,7 @@ impl PreparedTerminalObserver for NonCooperativeCallbackObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.state.generation.lock().expect("generation lock") = Some(generation);
@@ -1125,7 +1156,7 @@ impl PreparedTerminalObserver for CallbackBlockingPoolObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -1208,7 +1239,7 @@ impl PreparedTerminalObserver for DurableObserverWorker {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         let mut ping_receiver = self
@@ -1305,7 +1336,7 @@ impl PreparedTerminalObserver for ObserverSetupBoundary {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.state.callback_ran.store(true, Ordering::Release);
@@ -1361,7 +1392,7 @@ impl PreparedTerminalObserver for WorkerContextCaptureObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -1459,7 +1490,7 @@ impl PreparedTerminalObserver for FaultingObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.generation.lock().expect("generation lock") = Some(generation);
@@ -1536,7 +1567,8 @@ impl TerminalLaunchPreparer for PlannedPreparer {
             {
                 PreparationPlan::PassThrough => TerminalLaunchPreparation::PassThrough,
                 PreparationPlan::Prepared(plan) => {
-                    *plan.observer.generation.lock().expect("generation lock") = Some(generation);
+                    *plan.observer.generation.lock().expect("generation lock") =
+                        Some(generation.observation());
                     plan.observer.cancellation.notify_waiters();
                     TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                         executable: plan.executable,
@@ -1573,7 +1605,7 @@ impl ProviderTerminalObserverFactory for RecordingFactory {
             self.scopes
                 .lock()
                 .expect("scopes lock")
-                .push(input.launch.generation.scope_id().to_owned());
+                .push(input.launch.generation.observation().scope_id().to_owned());
             self.runtime_dirs
                 .lock()
                 .expect("runtime dirs lock")
@@ -4092,7 +4124,7 @@ async fn hardening_generation_scope_is_published_only_after_factory_correlation(
         .snapshot(&logical_scope)
         .await
         .expect("published terminal scope");
-    assert_eq!(snapshot.scope_id, generation.scope_id());
+    assert_eq!(snapshot.scope_id, generation.observation().scope_id());
     assert_eq!(
         snapshot.capabilities,
         ActivityCapabilities::structured_full(false)
@@ -4166,12 +4198,19 @@ fn hardening_generation_scope_native_ids_are_generation_namespaced_and_bounded()
     let generation =
         TerminalObserverGeneration::new("thread-native".to_owned(), "terminal-native".to_owned());
     assert_eq!(
-        generation.namespace_native_id("actor:42"),
-        format!("{}:actor:42", generation.generation_id())
+        generation.observation().namespace_native_id("actor:42"),
+        format!("{}:actor:42", generation.observation().generation_id())
     );
-    let long = generation.namespace_native_id(&"native".repeat(100));
+    let long = generation
+        .observation()
+        .namespace_native_id(&"native".repeat(100));
     assert!(long.len() <= 256, "namespaced native id is unbounded");
-    assert_ne!(long, generation.namespace_native_id(&"other".repeat(100)));
+    assert_ne!(
+        long,
+        generation
+            .observation()
+            .namespace_native_id(&"other".repeat(100))
+    );
 }
 
 #[derive(Debug, Default)]
@@ -10378,7 +10417,10 @@ impl Default for OpenCodeActivityTransitionProbe {
 }
 
 impl OpenCodeActivityTransitionProbe {
-    async fn wait_for_first_poll_while<F>(&self, transition: Pin<&mut F>)
+    async fn wait_for_first_poll_while<F>(
+        &self,
+        transition: Pin<&mut F>,
+    ) -> Option<TerminalAgentActivityTransition>
     where
         F: Future<Output = TerminalAgentActivityTransition> + ?Sized,
     {
@@ -10391,14 +10433,39 @@ impl OpenCodeActivityTransitionProbe {
                 permit
                     .expect("OpenCode activity transition probe")
                     .forget();
+                None
             }
             completed = transition => {
+                if let Ok(permit) = self.first_polls.try_acquire() {
+                    permit.forget();
+                    return Some(completed);
+                }
                 panic!(
                     "OpenCode activity transition completed before reaching the provider: {completed:?}"
                 );
             }
         }
     }
+}
+
+#[tokio::test]
+async fn opencode_activity_transition_probe_accepts_provider_completion_on_first_poll() {
+    let activity_transition = Arc::new(OpenCodeActivityTransitionProbe::default());
+    let provider_entry = activity_transition.clone();
+    let mut transition = Box::pin(async move {
+        provider_entry.first_polls.add_permits(1);
+        TerminalAgentActivityTransition {
+            stopped: 1,
+            dormant: 1,
+            ..TerminalAgentActivityTransition::default()
+        }
+    });
+
+    let completed = activity_transition
+        .wait_for_first_poll_while(transition.as_mut())
+        .await
+        .expect("provider completed on its first poll");
+    assert_eq!((completed.stopped, completed.dormant), (1, 1));
 }
 
 struct ProbedOpenCodeObserverFactory {
@@ -10439,7 +10506,7 @@ impl PreparedTerminalObserver for ProbedOpenCodeObserver {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.inner.on_spawned(pid, generation, workers);
@@ -10452,7 +10519,7 @@ impl PreparedTerminalObserver for ProbedOpenCodeObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         let activity_transition = self.activity_transition.clone();
@@ -12055,10 +12122,15 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
         ])
         .await;
     let mut initial_disabling = Box::pin(fixture.manager.set_agent_activity_enabled(false));
-    activity_transition
+    let initially_disabled = if let Some(completed) = activity_transition
         .wait_for_first_poll_while(initial_disabling.as_mut())
-        .await;
-    let initially_disabled = initial_disabling.await;
+        .await
+    {
+        completed
+    } else {
+        initial_disabling.as_mut().await
+    };
+    drop(initial_disabling);
     assert_eq!(
         (
             initially_disabled.stopped,
@@ -12076,9 +12148,13 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
         .expect("OpenCode replacement pause") = Some(pause.clone());
 
     let mut first_enabling = Box::pin(fixture.manager.set_agent_activity_enabled(true));
-    activity_transition
-        .wait_for_first_poll_while(first_enabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(first_enabling.as_mut())
+            .await
+            .is_none(),
+        "OpenCode enable completed before the paused replacement"
+    );
     tokio::select! {
         biased;
         () = pause.entered.notified() => {}
@@ -12088,13 +12164,21 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
     }
 
     let mut disabling = Box::pin(fixture.manager.set_agent_activity_enabled(false));
-    activity_transition
-        .wait_for_first_poll_while(disabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(disabling.as_mut())
+            .await
+            .is_none(),
+        "OpenCode disable completed before superseding the paused replacement"
+    );
     let mut latest_enabling = Box::pin(fixture.manager.set_agent_activity_enabled(true));
-    activity_transition
-        .wait_for_first_poll_while(latest_enabling.as_mut())
-        .await;
+    assert!(
+        activity_transition
+            .wait_for_first_poll_while(latest_enabling.as_mut())
+            .await
+            .is_none(),
+        "latest OpenCode enable completed before the paused replacement was released"
+    );
     drop(first_enabling);
     drop(disabling);
 

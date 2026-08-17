@@ -43,11 +43,55 @@ flowchart TB
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
-  and process supervision. A standalone server may perform a final sweep of
-  descendants rooted at its own process after its managed owners shut down. An
-  in-process desktop server shares the Tauri host PID and therefore skips that
-  sweep: provider and terminal owners still stop their registered processes,
-  while host-owned WebView children remain under the desktop lifecycle.
+  and process supervision. Its worktree catalog joins bounded live Git and
+  filesystem observations with durable project and canonical-thread
+  projections. A nullable project repository-key pin is stored outside the
+  rebuildable projection, established only by a trusted primary-checkout scan,
+  and joined into project reads; generic projection writes cannot change it,
+  and projection rewind/replay preserves it. It fences later fallback anchors
+  and is not a persisted live catalog. Projects sharing a repository may share
+  Git observation, but retain isolated latest-value snapshots, streams, thread
+  joins, subscribers, suppressions, and mutation epochs. Catalog views retain
+  the last authoritative arrays through degraded observations and cancel
+  pending poll, Git, and probe work after their final subscriber before bounded
+  idle eviction. Project and repository lifecycle epochs make poller
+  initialization transferable across subscriber aborts and prevent canceled
+  prior-lifecycle work from publishing into an immediate reattachment.
+  Each live VCS-status repository entry gives coalesced local mutation
+  invalidations and its delayed fallback scan one local worker independent of
+  remote and ref refresh work. A slow fetch or remote probe therefore cannot
+  delay editor-save status publication; the final subscriber cancels both
+  worker lifecycles through the repository entry's shared cancellation owner.
+  Shared observations never bypass per-caller anchor validation, and final
+  view/repository ownership release is atomic against concurrent attachment. A
+  scan leader moves the repository single-flight guard into repository-owned
+  work, while its project-view caller waits with view cancellation. Detaching
+  that view therefore releases its refresh lock immediately; an alias may keep
+  the exact-anchor observation alive within the current repository lifecycle.
+  Mutation invalidations overwrite one per-view pending epoch and are drained
+  by at most one lifecycle-owned worker. When that worker queues behind a
+  pre-mutation scan, it alone may recover from the stored stale result with one
+  current-epoch scan; ordinary waiters still receive the identical stale error.
+  Invalidations before the recovery fence coalesce into that scan, while a
+  later mutation produces at most the next serialized recovery step. Final
+  detach cancels, aborts, and clears the worker slot, releasing its project
+  refresh lock even if a dependency await is not cancellation-aware. A
+  reattachment cannot inherit that project-view work or result, though it may
+  coalesce with an exact-anchor observation still owned by an aliased
+  repository lifecycle. External-checkout adoption is serialized by stable
+  project and physical-repository identity, revalidates live Git membership,
+  and persists canonical ordinary workspace ownership atomically without
+  creating Git state. Ownership uses the catalog's host-path identity key, so
+  lexical aliases retain one owner across replay even when the checkout is
+  missing. Public adoption receipts bind the canonical opaque payload and an
+  immutable result. Only healthy authoritative catalog observations may
+  reconcile durable adopted-thread branch metadata.
+  The standalone `bibcode` binary may perform a final sweep of descendants
+  rooted at its own process after its managed owners shut down. Reusable
+  in-process runtimes—including the desktop server—share their host PID and
+  therefore skip that sweep: provider and terminal owners still stop their
+  registered processes, while host-owned children remain under the host
+  lifecycle.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -108,8 +152,11 @@ persistent database, WAL, or marker bytes and entries. SQLite may create or
 update `state.sqlite-shm` as volatile WAL-index coordination; SHM contains no
 database content and is not required for crash recovery. Once validation
 succeeds, normal SQLite locking continues to support sequential or simultaneous
-server processes sharing that established store. Graceful server join still
-waits for the SQLite worker to close before returning.
+server processes sharing that established store. Graceful server join sends an
+explicit close through the bounded SQLite queue after previously admitted jobs.
+The worker then closes even if a stale cloned database handle remains; those
+handles reject later calls as unavailable. Join still waits for the worker's
+positive close notification before returning.
 
 Desktop development and installed builds use the same resolved base data root
 by default, but select separate `dev` and `userdata` state kinds. Rust desktop
@@ -319,6 +366,23 @@ permits with a bound, quiesces runtime-owned writers, queues, providers,
 terminals, and background tasks, checkpoints SQLite's WAL, and publishes and
 reloads a verified `PreUpdate` backup while holding the store-operation lock.
 
+Each in-process server runtime owns a distinct bounded process-attribution
+registry shared by its provider, terminal, provider-helper, and managed-endpoint
+owners. Runtime quiesce closes
+that registry to new roots and captures its exact `(pid, creation-time)`
+identities before either manager shuts down. A provider or PTY that finishes
+spawning after this fence is rejected with the typed shutdown outcome and its
+uncommitted owner terminates and reaps it before returning. Existing provider
+process-group or Windows Job owners, terminal PTY owners, independently spawned
+provider helpers, and the managed endpoint tunnel perform their
+normal cleanup first; a final native sample kills only residual identities in
+the captured runtime-owned closure, including descendants forked after the
+initial sample. It never sweeps every descendant of the shared application
+PID, so shutting down one embedded runtime cannot terminate a sibling
+runtime's provider, terminal, helper, or tunnel children. PID reuse is excluded by creation-time
+identity checks, registry entries leave with their process owners, and shutdown
+is idempotent without awaiting while the registry lock is held.
+
 Preparation is single-flight and returns a lease-bound identifier. Commit and
 cancel must present that identifier. Commit sends its HTTP response before the
 backend exits cleanly; cancellation, preparation failure, and lease expiry also
@@ -337,6 +401,17 @@ support therefore varies between desktop hosts, and between desktop and browser
 mode. The frontend feature-detects optional APIs and supplies its own fallback
 rather than assuming the Chromium behavior that browser mode and Windows
 happen to share.
+
+Center chat-panel creation reserves and activates its client surface before the
+server command settles. A confirmed command failure removes that reservation;
+an interrupted result is ambiguous because durable thread creation may already
+have committed, so the surface remains visible instead of silently orphaning a
+valid panel thread. The reservation is renderer-local and remains protected
+from older authoritative snapshots until a snapshot actually observes the new
+thread; normal remote-deletion reconciliation resumes after that observation.
+Authoritative thread removal later clears every surface that references that
+thread. This ordering is shared by browser and all desktop hosts; it does not
+depend on a WebView-specific scheduling delay.
 
 The terminal's WebGL renderer is the current instance. xterm keeps its canvas
 backing store aligned to the exact device-pixel box by observing
@@ -452,6 +527,18 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
   contracts, shared utilities, relay infrastructure, and development tooling.
+- Git worktree registration, directory availability, and path ownership are
+  resolved by the server catalog. Clients do not infer recovery from directory
+  existence or treat a degraded observation as an authoritative empty set.
+  Persisted thread projections resolve ordinary and panel aliases to the same
+  physical workspace, and short-lived server admission leases serialize new
+  durable/process publication against authoritative loss and bounded cleanup.
+  Loss cancellation remains attached to queued engine work after an RPC caller
+  disconnects. Each queued durable turn also carries an owned synchronous
+  finalization fence into the SQLite worker: authoritative loss either rejects
+  the transaction before commit or waits for the local commit to finish before
+  publishing the guard. The runtime starts canonical cleanup immediately under
+  one five-second deadline while resolving any persisted aliases in parallel.
 - Capability negotiation controls optional behavior such as activity and
   preview automation; clients must downgrade when a server cannot prove support.
 - Host WebView engines differ by platform, so optional browser APIs are

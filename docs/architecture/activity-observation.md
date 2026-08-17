@@ -196,6 +196,90 @@ provider terminal launched by BiBCode. It requires explicit enablement before
 that terminal is launched (or reopened), and it does not scrape arbitrary PTY
 text.
 
+The terminal manager is the sole owner of each observer generation's worker
+registry. Provider observer workers receive only a lightweight observation
+lease containing generation identity, publication fencing, and cancellation;
+that lease cannot retain the registry that owns the worker future or invalidate
+the generation. Only the manager-owned generation exposes lifecycle mutation.
+Explicit teardown cancels and drains the registry before invalidating
+publication. If the final manager generation owner is instead dropped,
+registry drop publishes cancellation without blocking and transfers its workers
+to a retained runtime cleanup task for the same bounded graceful-then-abort
+policy. Each transferred worker record also synchronously requests abort when
+dropped, so discarding that cleanup task during runtime shutdown cannot strand
+a noncooperative worker. The process-wide join reaper continues to own each
+worker thread and permit until joining proves the OS thread exited, so a worker
+that retains its observation lease cannot form an ownership cycle or
+permanently consume observer capacity.
+
+Terminal-observer setup and activity-transition callbacks use a separate
+isolation boundary with eight admissions per manager and sixteen across the
+process. One named process-wide standard-library join reaper retains every
+callback thread's `JoinHandle` plus both its manager and global admission
+permits until `JoinHandle::join` proves the OS thread exited. Returning a
+callback result, catching its panic, timing out or cancelling its async caller,
+and tearing down the caller's Tokio runtime therefore cannot release capacity
+while native thread teardown is still running. The reaper's submission channel
+and retained set are bounded by the same sixteen-permit global admission cap;
+it does not create a per-callback joiner thread and does not depend on an
+application Tokio runtime remaining alive.
+
+OpenCode helper cleanup is owned by the system helper launcher. Before a
+foreground cleanup waiter can block, the launcher transfers the exact child,
+reserved process-group identity, and one of sixteen cleanup permits into its
+retained reaper registry. The cleanup permit is acquired before the helper
+process is spawned. Retained submission synchronously inserts a pending
+registration before it spawns the Tokio reaper task, then promotes that exact
+entry to running without an await or other cancellation point. Pending and
+running entries and the active drain epoch share one registry mutex, so
+shutdown treats an in-flight submission as live work.
+
+Codex and OpenCode helpers are independent roots rather than descendants of the
+prepared PTY. Each receives a dedicated Unix process group or Windows Job and
+registers its exact root identity in the server runtime's shared attribution
+registry before publication. Registration rejection after shutdown freeze or
+at registry capacity terminates and reaps the uncommitted ownership unit.
+Codex retains a factory task guard through group/Job cleanup and exact wait;
+factory shutdown drains those guards. Natural Unix root exit is observed with
+`waitid(..., WNOWAIT)` so the leader reserves its PID/PGID until late
+same-group descendants are killed and the root is reaped.
+
+The foreground TERM/grace/KILL/wait budget remains bounded; a timed-out child
+stays registry-owned until `Child::wait` completes. An `Interrupted` wait is
+retried immediately. Any other wait failure keeps the same child,
+process-group guard, stdout ownership, and permit in that task and retries
+after a fixed 100 ms delay. The first shutdown of a non-empty registry phase
+publishes a snapshot drain epoch that permits one immediate retry per retained
+task. A task promoted after that publication reads the current snapshot and
+cannot miss the epoch. Concurrent and repeated shutdown callers, including
+replacements after an earlier caller is cancelled, reuse the active epoch and
+cannot repeatedly bypass the delay. A repeated failure cannot publish reap
+completion, disarm the guard, or release capacity.
+
+Shutdown removes completed running entries, creates or reuses the phase epoch,
+and decides whether it may return while holding the same registry mutex. When
+the last entry is removed, epoch reset and the empty-state shutdown return
+linearize under that lock; a later submission belongs to a distinct phase.
+Process waits, stdout joins, task joins, timers, logging, and notification
+waits all run after the mutex is released. Each completed task keeps its join
+handle in a shared async owner reachable from the registry. Shutdown callers
+serialize on that owner and await the handle by mutable reference, so
+cancelling one caller cannot detach the handle or make a replacement drain see
+an empty registry. Only a successful join permits removal. Normal reservation
+also prunes finished, successfully joined terminal records synchronously, so a
+long-running server cannot accumulate records beyond the live cleanup
+capacity; it never detaches a running task epilogue to do so. A persistent
+platform wait error therefore keeps shutdown pending at a finite retry cadence
+rather than discarding the exact owner or hot-looping, while repeated shutdown
+after an empty-state linearization is inert.
+
+Terminal-manager shutdown first cancels and drains observer generations and
+sessions, then calls the launch-preparer/factory shutdown hook to drain helper
+owners while the production Tokio runtime is still live. Codex and OpenCode
+use the hook; other provider factories use its no-op default. This makes waiter cancellation safe,
+bounds live helper/reaper ownership, and prevents runtime teardown from
+discarding an unreaped OpenCode child.
+
 ## Independent activity controls
 
 Each environment has separate Chat and AI Terminal activity gates. Chat defaults
@@ -214,6 +298,17 @@ parent is the root or an already verified actor. Bounded root, live, list, and
 nested recovery repairs reconnect topology. An empty successful list neither
 erases known actors nor suppresses hinted actors and their direct reads.
 Malformed, out-of-scope, self-referential, or cyclic hints are ignored.
+
+The official `thread/backgroundTerminals/list` response does not provide a
+background terminal start time. For each successfully decoded reconciliation
+batch, the server therefore samples one canonical RFC 3339 observation
+timestamp and uses it for that batch's background-work mutations. An unchanged
+tracker entry retains its first observation time across later batches. A server
+restart or other new tracker generation may begin that elapsed interval at its
+first new observation because no earlier provider timestamp exists to recover.
+Live root `commandExecution` start and completion notifications wake that
+bounded reconciliation path; the notifications remain hints, while the
+official background-terminal list stays authoritative for work-item state.
 
 For structured chat only, a verified descendant becomes cancellable while the
 tracker can prove one current active turn for that native child thread. Live
@@ -284,6 +379,18 @@ same exact active source parent. Present explicit lineage must still agree.
 Ambiguity is observable but unsupported and performs zero provider I/O;
 semantic text, timing, order, proximity, transcript reads, polling, and timers
 are never correlation inputs.
+A fallback target is provisional until matching exact PostToolUse evidence promotes it.
+It remains part of its parent's complete candidate set after installation. If later
+same-generation evidence makes that set non-unique, the correlator synchronously
+removes only the inferred target and inferred lineage, publishes unsupported control,
+and retains the actors and task facts as unresolved evidence. Exact targets are not
+revoked by sibling ambiguity, and exact evidence may later resolve one named child.
+Affirmative parent-level ambiguity disables further fallback for that parent until
+generation reset, so resolving one sibling exactly cannot reopen another by elimination.
+At most 200 ambiguous parent identities are retained across terminal cleanup. Reaching
+capacity preserves those parent-specific denials; a further affirmative ambiguity for a
+distinct parent latches all fallback admission closed until generation reset, while exact
+PostToolUse identity remains authoritative.
 Pending state is generation-owned and bounded to 200 correlations. Terminal
 events, runtime replacement, and Activity disablement retire or clear pending
 and installed fallback state.

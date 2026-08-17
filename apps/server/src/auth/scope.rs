@@ -44,9 +44,12 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
         | "subscribeVcsStatus"
+        | "subscribeWorktreeCatalog"
         | "vcs.listCommits"
         | "vcs.listRefs"
-        | "vcs.refreshStatus" => Some(SCOPE_ORCHESTRATION_READ),
+        | "vcs.refreshStatus"
+        | "vcs.refreshWorktreeCatalog"
+        | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
         "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
@@ -80,15 +83,20 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "sourceControl.publishRepository"
         | "vcs.clone"
         | "vcs.createRef"
-        | "vcs.createWorktree"
         | "vcs.discardFiles"
         | "vcs.generateCommitMessage"
         | "vcs.init"
         | "vcs.pull"
-        | "vcs.removeWorktree"
         | "vcs.stageFiles"
         | "vcs.switchRef"
         | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        "worktree.adopt"
+        | "worktree.createManaged"
+        | "worktree.createPanel"
+        | "worktree.remove"
+        | "worktree.removeFromBibCode"
+        | "worktree.retarget"
+        | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
         | "terminal.clear"
         | "terminal.close"
@@ -157,6 +165,28 @@ mod tests {
                 Some(ACTIVITY_READ_SCOPE),
                 "wrong activity RPC scope for {method}"
             );
+        }
+        for method in [
+            "subscribeWorktreeCatalog",
+            "vcs.refreshWorktreeCatalog",
+            "worktree.getRemovalPlan",
+        ] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_READ),
+                "wrong worktree catalog read scope for {method}"
+            );
+        }
+        assert_eq!(
+            required_scope("worktree.updateDiscoveryPolicy"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("worktree.adopt"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        for method in ["worktree.remove", "worktree.removeFromBibCode"] {
+            assert_eq!(required_scope(method), Some(SCOPE_ORCHESTRATION_OPERATE));
         }
         for method in [
             "activity.cancelSubtree",

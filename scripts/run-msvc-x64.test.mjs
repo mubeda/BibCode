@@ -1,13 +1,33 @@
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  canonicalizeCargoTestTarget,
   defaultWindowsCargoRunner,
   discoverVcVarsAll,
   quoteCmdArg,
   run,
   runMsvcX64,
 } from "./run-msvc-x64.mjs";
+
+const directoryAliasCapability = (() => {
+  const fixtureRoot = NodeFS.mkdtempSync(
+    NodePath.join(NodeOS.tmpdir(), "bibcode-directory-alias-capability-"),
+  );
+  const physicalRoot = NodePath.join(fixtureRoot, "physical");
+  const aliasRoot = NodePath.join(fixtureRoot, "alias");
+  try {
+    NodeFS.mkdirSync(physicalRoot);
+    NodeFS.symlinkSync(physicalRoot, aliasRoot, "junction");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    NodeFS.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+})();
 
 describe("run-msvc-x64", () => {
   it("quotes only command arguments that require cmd escaping", () => {
@@ -96,6 +116,196 @@ describe("run-msvc-x64", () => {
       expect.objectContaining({ shell: false }),
     );
   });
+
+  it("canonicalizes an explicit Cargo test target before launch", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn(() => "/private/tmp/bibcode-task9f-target");
+    const spawnSync = vi.fn(() => ({ status: 0 }));
+    const resolvedTarget = NodePath.resolve("/tmp/bibcode-task9f-target");
+
+    expect(
+      runMsvcX64(["cargo", "test", "-p", "bibcode-desktop"], {
+        env: { CARGO_TARGET_DIR: "/tmp/bibcode-task9f-target" },
+        programFilesX86: "",
+        mkdirSync,
+        realpathSync,
+        spawnSync,
+      }),
+    ).toBe(0);
+
+    expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, {
+      recursive: true,
+    });
+    expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "cargo",
+      ["test", "-p", "bibcode-desktop"],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CARGO_TARGET_DIR: "/private/tmp/bibcode-task9f-target",
+        }),
+      }),
+    );
+  });
+
+  it("uses the native canonical target identity on every platform", () => {
+    const resolvedTarget = NodePath.resolve("/tmp/bibcode-task9f-target");
+    for (const canonicalTarget of [
+      "/private/tmp/bibcode-task9f-target",
+      "/tmp/bibcode-task9f-target",
+      "C:\\isolated\\bibcode-task9f-target",
+    ]) {
+      const mkdirSync = vi.fn();
+      const realpathSync = vi.fn(() => canonicalTarget);
+      const configured = {
+        CARGO_TARGET_DIR: "/tmp/bibcode-task9f-target",
+        SENTINEL: "kept",
+      };
+
+      expect(
+        canonicalizeCargoTestTarget(["cargo", "test"], configured, {
+          mkdirSync,
+          realpathSync,
+        }),
+      ).toEqual({ CARGO_TARGET_DIR: canonicalTarget, SENTINEL: "kept" });
+      expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, {
+        recursive: true,
+      });
+      expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
+      expect(configured.CARGO_TARGET_DIR).toBe("/tmp/bibcode-task9f-target");
+    }
+  });
+
+  it("leaves unrelated commands and implicit targets outside canonicalization", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn();
+    const configured = { CARGO_TARGET_DIR: "relative-target", SENTINEL: "kept" };
+    const options = { cwd: "/repo", mkdirSync, realpathSync };
+
+    expect(canonicalizeCargoTestTarget(["cargo", "check"], configured, options)).toBe(configured);
+    expect(canonicalizeCargoTestTarget(["vp", "test"], configured, options)).toBe(configured);
+    expect(canonicalizeCargoTestTarget(["cargo", "test"], { SENTINEL: "kept" }, options)).toEqual({
+      SENTINEL: "kept",
+    });
+    const emptyTarget = { CARGO_TARGET_DIR: "", SENTINEL: "kept" };
+    expect(canonicalizeCargoTestTarget(["cargo", "test"], emptyTarget, options)).toBe(emptyTarget);
+    expect(mkdirSync).not.toHaveBeenCalled();
+    expect(realpathSync).not.toHaveBeenCalled();
+  });
+
+  it("resolves relative Cargo test targets against the launch directory", () => {
+    const mkdirSync = vi.fn();
+    const realpathSync = vi.fn(() => "/canonical/repo/isolated-target");
+    const configured = { CARGO_TARGET_DIR: "isolated-target", SENTINEL: "kept" };
+    const resolvedTarget = NodePath.resolve("/repo", "isolated-target");
+
+    const canonical = canonicalizeCargoTestTarget(["cargo", "test"], configured, {
+      cwd: "/repo",
+      mkdirSync,
+      realpathSync,
+    });
+
+    expect(mkdirSync).toHaveBeenCalledWith(resolvedTarget, { recursive: true });
+    expect(realpathSync).toHaveBeenCalledWith(resolvedTarget);
+    expect(canonical).toEqual({
+      CARGO_TARGET_DIR: "/canonical/repo/isolated-target",
+      SENTINEL: "kept",
+    });
+    expect(configured.CARGO_TARGET_DIR).toBe("isolated-target");
+  });
+
+  it("creates and canonicalizes real absent and relative Cargo test targets", () => {
+    const fixtureRoot = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target-contract-"),
+    );
+    const physicalRoot = NodePath.join(fixtureRoot, "physical");
+    const spawnSync = vi.fn(() => ({ status: 0 }));
+
+    try {
+      NodeFS.mkdirSync(physicalRoot);
+
+      const absentTarget = NodePath.join(physicalRoot, "absent-target");
+      expect(
+        runMsvcX64(["cargo", "test"], {
+          env: { CARGO_TARGET_DIR: absentTarget },
+          programFilesX86: "",
+          spawnSync,
+        }),
+      ).toBe(0);
+      expect(NodeFS.statSync(NodePath.join(physicalRoot, "absent-target")).isDirectory()).toBe(
+        true,
+      );
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "cargo",
+        ["test"],
+        expect.objectContaining({
+          env: expect.objectContaining({
+            CARGO_TARGET_DIR: NodeFS.realpathSync.native(
+              NodePath.join(physicalRoot, "absent-target"),
+            ),
+          }),
+        }),
+      );
+
+      NodeFS.mkdirSync(NodePath.join(physicalRoot, "existing-target"));
+      expect(
+        runMsvcX64(["cargo", "test"], {
+          cwd: physicalRoot,
+          env: { CARGO_TARGET_DIR: "existing-target" },
+          programFilesX86: "",
+          spawnSync,
+        }),
+      ).toBe(0);
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "cargo",
+        ["test"],
+        expect.objectContaining({
+          env: expect.objectContaining({
+            CARGO_TARGET_DIR: NodeFS.realpathSync.native(
+              NodePath.join(physicalRoot, "existing-target"),
+            ),
+          }),
+        }),
+      );
+    } finally {
+      NodeFS.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(directoryAliasCapability)(
+    "canonicalizes a real directory-alias Cargo test target",
+    () => {
+      const fixtureRoot = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target-alias-contract-"),
+      );
+      const physicalRoot = NodePath.join(fixtureRoot, "physical");
+      const aliasRoot = NodePath.join(fixtureRoot, "alias");
+      const spawnSync = vi.fn(() => ({ status: 0 }));
+
+      try {
+        NodeFS.mkdirSync(physicalRoot);
+        NodeFS.symlinkSync(physicalRoot, aliasRoot, "junction");
+        expect(
+          runMsvcX64(["cargo", "test"], {
+            env: { CARGO_TARGET_DIR: NodePath.join(aliasRoot, "target") },
+            programFilesX86: "",
+            spawnSync,
+          }),
+        ).toBe(0);
+        expect(spawnSync).toHaveBeenLastCalledWith(
+          "cargo",
+          ["test"],
+          expect.objectContaining({
+            env: expect.objectContaining({
+              CARGO_TARGET_DIR: NodeFS.realpathSync.native(NodePath.join(physicalRoot, "target")),
+            }),
+          }),
+        );
+      } finally {
+        NodeFS.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("writes, runs, and removes an MSVC wrapper even when cleanup fails", () => {
     const writeFileSync = vi.fn();

@@ -151,7 +151,7 @@ describe("repository toolchain contract", () => {
 
     expect(devDependencies["@tauri-apps/cli"]).toBe("2.11.4");
     expect(scripts.dev).toContain("pnpm exec tauri dev");
-    expect(scripts.build).toContain("pnpm exec tauri build");
+    expect(scripts.build).toBe("node ../../scripts/run-tauri-build.mjs");
     expect(Object.values(scripts).join("\n")).not.toContain("pnpm dlx");
   });
 });

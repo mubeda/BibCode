@@ -86,6 +86,26 @@ export function defaultWindowsCargoRunner(options = {}) {
     .join(" ");
 }
 
+export function canonicalizeCargoTestTarget(args, env, options = {}) {
+  if (args[0] !== "cargo" || args[1] !== "test") {
+    return env;
+  }
+
+  const configuredTarget = env.CARGO_TARGET_DIR;
+  if (configuredTarget === undefined || configuredTarget.length === 0) {
+    return env;
+  }
+
+  const targetDirectory = NodePath.resolve(options.cwd ?? process.cwd(), configuredTarget);
+  const mkdirSync = options.mkdirSync ?? NodeFS.mkdirSync;
+  const realpathSync = options.realpathSync ?? NodeFS.realpathSync.native;
+  mkdirSync(targetDirectory, { recursive: true });
+  return {
+    ...env,
+    CARGO_TARGET_DIR: realpathSync(targetDirectory),
+  };
+}
+
 export function runMsvcX64(args, options = {}) {
   const consoleError = options.consoleError ?? console.error;
   const spawnSync = options.spawnSync ?? NodeChildProcess.spawnSync;
@@ -95,7 +115,7 @@ export function runMsvcX64(args, options = {}) {
   }
 
   const cargoRunnerKey = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER";
-  const env = {
+  const configuredEnv = {
     ...process.env,
     [cargoRunnerKey]:
       options.env?.[cargoRunnerKey] ??
@@ -105,6 +125,7 @@ export function runMsvcX64(args, options = {}) {
       }),
     ...options.env,
   };
+  const env = canonicalizeCargoTestTarget(args, configuredEnv, options);
   const vcvarsall = discoverVcVarsAll({
     programFilesX86: options.programFilesX86,
     existsSync: options.existsSync,

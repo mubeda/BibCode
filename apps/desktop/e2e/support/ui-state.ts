@@ -1,4 +1,4 @@
-import { scaleDesktopUiWindowSize } from "./window-size.ts";
+import { correctDesktopUiOuterSize, scaleDesktopUiWindowSize } from "./window-size.ts";
 
 export async function mockDesktopUiFolderPicker(projectPath: string): Promise<void> {
   const picker = await browser.tauri.mock("desktop_bridge_pick_folder");
@@ -7,8 +7,27 @@ export async function mockDesktopUiFolderPicker(projectPath: string): Promise<vo
 
 export async function setDesktopUiWindowSize(width: number, height: number): Promise<void> {
   const devicePixelRatio = await browser.execute(() => window.devicePixelRatio);
-  const physicalSize = scaleDesktopUiWindowSize({ width, height }, devicePixelRatio);
-  await browser.setWindowSize(physicalSize.width, physicalSize.height);
+  const requestedViewportSize = { width, height };
+  let outerSize = scaleDesktopUiWindowSize(requestedViewportSize, devicePixelRatio);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await browser.setWindowSize(outerSize.width, outerSize.height);
+    await browser.executeAsync((done: () => void) => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(done);
+      });
+    });
+    const observedViewportSize = await browser.execute(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+    }));
+    if (observedViewportSize.width === width && observedViewportSize.height === height) return;
+    outerSize = correctDesktopUiOuterSize(
+      outerSize,
+      requestedViewportSize,
+      observedViewportSize,
+      devicePixelRatio,
+    );
+  }
 }
 
 export async function ensureMainSidebarOpen(): Promise<void> {

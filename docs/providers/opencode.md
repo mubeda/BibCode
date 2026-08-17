@@ -49,7 +49,10 @@ opencode serve --hostname=127.0.0.1 --port=<available-port>
 BiBCode generates a temporary password, waits for the loopback endpoint to
 become ready, and stops the child process with the provider session. Inventory
 uses the same managed-server approach to discover authentication state, models,
-agents, and commands.
+agents, and commands. On Windows, a standard npm `opencode.cmd` installation is
+resolved to its packaged native `opencode.exe` for managed launches so the
+server remains inside BiBCode's Job Object through shutdown; custom wrappers
+and non-Windows launch paths remain unchanged.
 
 ## Existing OpenCode server
 

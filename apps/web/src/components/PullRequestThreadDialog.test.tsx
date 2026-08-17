@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { EnvironmentId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId } from "@bibcode/contracts";
 import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -78,7 +78,6 @@ function renderDialog(
     <PullRequestThreadDialog
       open
       environmentId={EnvironmentId.make("local-test")}
-      threadId={ThreadId.make("thread-test")}
       cwd="X:\\bibcode"
       initialReference="#42"
       onOpenChange={vi.fn()}
@@ -228,26 +227,17 @@ describe("PullRequestThreadDialog mounted behavior", () => {
     await click(buttonWithText("Local"));
     expect(testState.action.run).toHaveBeenNthCalledWith(1, {
       reference: "42",
-      mode: "local",
     });
     expect(onPrepared).toHaveBeenNthCalledWith(1, {
       branch: "feature/diagnostics",
-      worktreePath: null,
+      mode: "local",
     });
 
-    testState.action.run.mockResolvedValueOnce({
-      _tag: "Success",
-      value: { branch: "feature/diagnostics", worktreePath: "X:\\worktrees\\diagnostics" },
-    });
     await click(buttonWithText("Worktree"));
-    expect(testState.action.run).toHaveBeenNthCalledWith(2, {
-      reference: "42",
-      mode: "worktree",
-      threadId: ThreadId.make("thread-test"),
-    });
+    expect(testState.action.run).toHaveBeenCalledTimes(1);
     expect(onPrepared).toHaveBeenNthCalledWith(2, {
       branch: "feature/diagnostics",
-      worktreePath: "X:\\worktrees\\diagnostics",
+      mode: "worktree",
     });
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });

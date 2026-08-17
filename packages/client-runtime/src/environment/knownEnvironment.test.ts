@@ -54,6 +54,7 @@ describe("known environment bootstrap helpers", () => {
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       capabilities: {
         repositoryIdentity: true,
+        worktreeCatalog: false,
         activityProtocolVersion: 2,
       },
     } satisfies ExecutionEnvironmentDescriptor;
@@ -80,6 +81,7 @@ describe("known environment bootstrap helpers", () => {
       storageInstanceId: null,
       capabilities: {
         repositoryIdentity: true,
+        worktreeCatalog: false,
         activityProtocolVersion: null,
       },
     } satisfies ExecutionEnvironmentDescriptor;

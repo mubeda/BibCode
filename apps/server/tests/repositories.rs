@@ -5,7 +5,7 @@ use bibcode_server::persistence::{
     ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
     ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
     ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
-    WorktreeRemovalReceipt, run_migrations,
+    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -49,10 +49,166 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
             "nested": { "reasoning": "high" }
         })),
         scripts: json!({"verify": "vp check\nvp run typecheck"}),
+        worktree_discovery: json!({
+            "visibility": "shown",
+            "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
+            "baselinePaths": ["/workspace/project-a", "/workspace/project-a-feature"]
+        }),
+        worktree_repository_key: None,
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
         deleted_at: None,
     }
+}
+
+#[tokio::test]
+async fn worktree_repository_identity_pin_is_compare_and_set_and_cannot_be_replaced() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .upsert_project(project("project-pin", T0))
+        .await
+        .expect("unpinned project");
+
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-a".to_owned(),
+            )
+            .await
+            .expect("establish pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    let mut unrelated_projection_update = project("project-pin", T1);
+    unrelated_projection_update.title = "Updated without identity metadata".to_owned();
+    repositories
+        .upsert_project(unrelated_projection_update)
+        .await
+        .expect("ordinary projection update preserves pin");
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-a".to_owned(),
+            )
+            .await
+            .expect("match pin"),
+        Some(WorktreeRepositoryPinOutcome::Matched)
+    );
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-b".to_owned(),
+            )
+            .await
+            .expect("reject replacement pin"),
+        Some(WorktreeRepositoryPinOutcome::Mismatch {
+            pinned_repository_key: "repository-key-a".to_owned(),
+        })
+    );
+    let project = repositories
+        .get_project("project-pin".to_owned())
+        .await
+        .expect("read pinned project")
+        .expect("project exists");
+    assert_eq!(
+        project.worktree_repository_key.as_deref(),
+        Some("repository-key-a")
+    );
+}
+
+#[tokio::test]
+async fn generic_project_upsert_cannot_establish_or_replace_repository_identity() {
+    let repositories = migrated_repositories().await;
+    let mut arbitrary = project("project-exclusive-pin", T0);
+    arbitrary.worktree_repository_key = Some("repository-key-arbitrary".to_owned());
+    repositories
+        .upsert_project(arbitrary)
+        .await
+        .expect("generic insert ignores arbitrary identity");
+    assert_eq!(
+        repositories
+            .get_project("project-exclusive-pin".to_owned())
+            .await
+            .expect("read unpinned project")
+            .expect("project exists")
+            .worktree_repository_key,
+        None
+    );
+
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-exclusive-pin".to_owned(),
+                "repository-key-trusted".to_owned(),
+            )
+            .await
+            .expect("trusted operation establishes pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    let mut replacement = project("project-exclusive-pin", T1);
+    replacement.worktree_repository_key = Some("repository-key-replacement".to_owned());
+    repositories
+        .upsert_project(replacement)
+        .await
+        .expect("generic update ignores replacement identity");
+    assert_eq!(
+        repositories
+            .get_project("project-exclusive-pin".to_owned())
+            .await
+            .expect("read pinned project")
+            .expect("project exists")
+            .worktree_repository_key
+            .as_deref(),
+        Some("repository-key-trusted")
+    );
+}
+
+#[tokio::test]
+async fn worktree_repository_identity_pin_persists_across_database_restart() {
+    let root = tempfile::tempdir().expect("database directory");
+    let path = root.path().join("catalog.sqlite3");
+    let database = Database::create_new(&path).await.expect("database opens");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations apply");
+    let repositories = Repositories::new(database);
+    repositories
+        .upsert_project(project("project-restart-pin", T0))
+        .await
+        .expect("unpinned project");
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-restart-pin".to_owned(),
+                "repository-key-durable".to_owned(),
+            )
+            .await
+            .expect("establish pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    drop(repositories);
+
+    let reopened = Repositories::new(
+        Database::open_existing(&path)
+            .await
+            .expect("database reopens"),
+    );
+    let project = reopened
+        .get_project("project-restart-pin".to_owned())
+        .await
+        .expect("read project after restart")
+        .expect("project exists after restart");
+
+    assert_eq!(
+        project.worktree_repository_key.as_deref(),
+        Some("repository-key-durable")
+    );
 }
 
 fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
@@ -143,6 +299,7 @@ fn public_repository_api_inventory_is_explicit() {
         "delete_thread",
         "delete_thread_session",
         "delete_turns_by_thread",
+        "finalize_command_receipt",
         "freeze_provider_turn_session",
         "get_auth_pairing_link_by_credential",
         "get_auth_session",
@@ -173,11 +330,16 @@ fn public_repository_api_inventory_is_explicit() {
         "list_provider_turn_deliveries",
         "list_referenced_attachment_ids",
         "list_threads_by_project",
+        "load_worktree_catalog_projection",
         "list_turns_by_thread",
         "max_event_sequence",
         "min_last_applied_sequence",
+        "pin_project_worktree_repository_key",
+        "prepare_reserved_command_receipt",
         "new",
         "read_events_from_sequence",
+        "release_reserved_command_receipt",
+        "reserve_command_receipt",
         "replace_pending_provider_turn_payload",
         "replace_pending_turn_start",
         "prepare_worktree_removal_receipt",
@@ -198,6 +360,7 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_thread",
         "upsert_thread_session",
         "upsert_turn_by_id",
+        "verify_prepared_command_receipt",
         "complete_worktree_removal_receipt",
     ]
     .into_iter()
@@ -206,6 +369,49 @@ fn public_repository_api_inventory_is_explicit() {
     expected.sort();
 
     assert_eq!(methods, expected, "update repository execution coverage");
+}
+
+#[tokio::test]
+async fn worktree_catalog_projection_read_is_consistent_filtered_and_bounded() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .upsert_project(project("project-catalog", T0))
+        .await
+        .expect("catalog project");
+    let mut first = thread("workspace-1", "project-catalog", T0);
+    first.kind = "workspace".to_owned();
+    let mut second = thread("workspace-2", "project-catalog", T1);
+    second.kind = "workspace".to_owned();
+    let mut third = thread("workspace-3", "project-catalog", T2);
+    third.kind = "workspace".to_owned();
+    let mut panel = thread("panel", "project-catalog", T2);
+    panel.kind = "panel".to_owned();
+    let mut deleted = thread("deleted", "project-catalog", T2);
+    deleted.kind = "workspace".to_owned();
+    deleted.deleted_at = Some(T2.to_owned());
+    for row in [first, second, third, panel, deleted] {
+        repositories
+            .upsert_thread(row)
+            .await
+            .expect("catalog thread");
+    }
+
+    let projection = repositories
+        .load_worktree_catalog_projection("project-catalog".to_owned(), 2)
+        .await
+        .expect("catalog projection read")
+        .expect("catalog project exists");
+
+    assert_eq!(projection.project.project_id, "project-catalog");
+    assert_eq!(
+        projection
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        ["workspace-1", "workspace-2"]
+    );
+    assert!(projection.truncated);
 }
 
 #[tokio::test]
@@ -682,6 +888,11 @@ async fn runtime_project_and_thread_repositories_upsert_order_and_delete() {
         .expect("early project insert");
     project_late.title = "Updated title".to_owned();
     project_late.scripts = json!({"test": ["vp", "test"], "env": {"CI": true}});
+    project_late.worktree_discovery = json!({
+        "visibility": "hidden",
+        "initialPromptDismissedAt": null,
+        "baselinePaths": ["/workspace/project-b"]
+    });
     project_late.updated_at = TIME_3.to_owned();
     repositories
         .upsert_project(project_late.clone())
@@ -704,6 +915,31 @@ async fn runtime_project_and_thread_repositories_upsert_order_and_delete() {
             .map(|project| project.project_id.as_str())
             .collect::<Vec<_>>(),
         ["project-a", "project-b"]
+    );
+
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_projects SET worktree_discovery_json = '{\"visibility\":\"not-a-visibility\",\"initialPromptDismissedAt\":null,\"baselinePaths\":[]}' WHERE project_id = 'project-b'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("malformed policy fixture persists without a repository fallback");
+    assert_eq!(
+        repositories
+            .get_project("project-b".to_owned())
+            .await
+            .expect("malformed policy remains readable JSON")
+            .expect("project exists")
+            .worktree_discovery,
+        json!({
+            "visibility": "not-a-visibility",
+            "initialPromptDismissedAt": null,
+            "baselinePaths": []
+        })
     );
 
     let thread_early = thread("thread-a", "project-b", T1);

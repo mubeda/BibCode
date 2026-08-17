@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -27,6 +27,38 @@ const WAL_AUTOCHECKPOINT_PAGES: u32 = 1_000;
 const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 type DatabaseJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+enum DatabaseMessage {
+    Execute(DatabaseJob),
+    Shutdown,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommitFence {
+    acquire: Arc<dyn Fn() -> std::result::Result<Box<dyn Send + 'static>, ()> + Send + Sync>,
+}
+
+pub(crate) struct CommitPermit {
+    _resource: Box<dyn Send + 'static>,
+}
+
+impl CommitFence {
+    pub(crate) fn new(
+        acquire: impl Fn() -> std::result::Result<Box<dyn Send + 'static>, ()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            acquire: Arc::new(acquire),
+        }
+    }
+
+    pub(crate) fn acquire(&self) -> Result<CommitPermit> {
+        (self.acquire)()
+            .map(|resource| CommitPermit {
+                _resource: resource,
+            })
+            .map_err(|()| PersistenceError::CommitRejected)
+    }
+}
 
 /// Snapshot of the SQLite sender state for black-box queue-bound integration tests.
 ///
@@ -338,6 +370,10 @@ pub enum PersistenceError {
     Sql(#[from] rusqlite::Error),
     #[error("SQLite integrity check failed: {0}")]
     Corrupt(String),
+    #[error("transaction commit was rejected by its finalization fence")]
+    CommitRejected,
+    #[error("command receipt ownership changed before finalization ({0})")]
+    CommandReceiptConflict(String),
     #[error("SQLite online backup {0}")]
     BackupStopped(String),
     #[error("the SQLite worker is no longer available")]
@@ -350,7 +386,8 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Clone, Debug)]
 pub struct Database {
-    sender: mpsc::Sender<DatabaseJob>,
+    sender: mpsc::Sender<DatabaseMessage>,
+    closing: Arc<AtomicBool>,
     queue_diagnostics: Arc<DatabaseQueueDiagnostics>,
     worker_closed: watch::Receiver<bool>,
 }
@@ -469,7 +506,8 @@ impl Database {
         expected_identity: Option<FileIdentity>,
         read_only: bool,
     ) -> Result<Self> {
-        let (sender, mut receiver) = mpsc::channel::<DatabaseJob>(DATABASE_QUEUE_CAPACITY);
+        let (sender, mut receiver) = mpsc::channel::<DatabaseMessage>(DATABASE_QUEUE_CAPACITY);
+        let closing = Arc::new(AtomicBool::new(false));
         let queue_diagnostics = Arc::new(DatabaseQueueDiagnostics::new());
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (worker_closed_sender, worker_closed) = watch::channel(false);
@@ -480,8 +518,11 @@ impl Database {
                 match connection {
                     Ok(mut connection) => {
                         if ready_sender.send(Ok(())).is_ok() {
-                            while let Some(job) = receiver.blocking_recv() {
-                                job(&mut connection);
+                            while let Some(message) = receiver.blocking_recv() {
+                                match message {
+                                    DatabaseMessage::Execute(job) => job(&mut connection),
+                                    DatabaseMessage::Shutdown => break,
+                                }
                             }
                         }
                     }
@@ -498,6 +539,7 @@ impl Database {
             .map_err(|_| PersistenceError::WorkerUnavailable)??;
         Ok(Self {
             sender,
+            closing,
             queue_diagnostics,
             worker_closed,
         })
@@ -506,9 +548,13 @@ impl Database {
     pub(crate) async fn close(self) {
         let Self {
             sender,
+            closing,
             queue_diagnostics: _,
             mut worker_closed,
         } = self;
+        if !closing.swap(true, Ordering::AcqRel) {
+            let _ = sender.send(DatabaseMessage::Shutdown).await;
+        }
         drop(sender);
         let already_closed = *worker_closed.borrow();
         if !already_closed {
@@ -521,6 +567,9 @@ impl Database {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
         let (response_sender, response_receiver) = oneshot::channel();
         let mut queue_reservation = self.queue_diagnostics.begin_reservation();
         let permit = match self.sender.reserve().await {
@@ -532,18 +581,26 @@ impl Database {
             }
             Err(_) => return Err(PersistenceError::WorkerUnavailable),
         };
+        if self.closing.load(Ordering::Acquire) {
+            drop(permit);
+            return Err(PersistenceError::WorkerUnavailable);
+        }
         let queue_diagnostics = queue_reservation
             .as_ref()
             .map(QueueReservationObservation::diagnostics);
-        permit.send(Box::new(move |connection| {
+        permit.send(DatabaseMessage::Execute(Box::new(move |connection| {
             if let Some((queue_diagnostics, observer_generation)) = queue_diagnostics {
                 queue_diagnostics.job_started(observer_generation);
             }
             let _ = response_sender.send(operation(connection));
-        }));
-        response_receiver
-            .await
-            .map_err(|_| PersistenceError::ResponseDropped)?
+        })));
+        match response_receiver.await {
+            Ok(result) => result,
+            Err(_) if self.closing.load(Ordering::Acquire) => {
+                Err(PersistenceError::WorkerUnavailable)
+            }
+            Err(_) => Err(PersistenceError::ResponseDropped),
+        }
     }
 
     /// Enables a dormant sender-boundary diagnostic for black-box integration tests.
@@ -911,6 +968,53 @@ fn file_identity(file: &StdFile) -> std::io::Result<FileIdentity> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn explicit_close_stops_the_worker_while_cloned_handles_remain() {
+        let database = Database::open_in_memory().await.expect("database opens");
+        let retained_handle = database.clone();
+
+        tokio::time::timeout(Duration::from_secs(1), database.close())
+            .await
+            .expect("explicit close must not wait for every cloned sender to drop");
+        assert!(matches!(
+            retained_handle.call(|_| Ok(())).await,
+            Err(PersistenceError::WorkerUnavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_close_drains_a_job_admitted_before_shutdown() {
+        let database = Database::open_in_memory().await.expect("database opens");
+        let caller = database.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let call = tokio::spawn(async move {
+            caller
+                .call(move |_| {
+                    entered_tx.send(()).expect("test still observes entry");
+                    release_rx.recv().expect("test releases the database job");
+                    Ok(42)
+                })
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("database job should start");
+
+        let close = tokio::spawn(database.close());
+        release_tx.send(()).expect("database job still running");
+        assert_eq!(
+            call.await
+                .expect("database call task should join")
+                .expect("admitted database job should complete"),
+            42
+        );
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("explicit close should finish after the admitted job")
+            .expect("database close task should join");
+    }
 
     #[tokio::test]
     async fn queue_backpressure_observation_is_exclusive_and_scoped_to_its_guard() {

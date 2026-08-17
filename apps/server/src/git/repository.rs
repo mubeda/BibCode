@@ -6,26 +6,35 @@ use std::{
     io::{self, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::diagnostics::redact_sensitive_text;
 
+use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
-    ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError, OutputPolicy,
-    ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ProviderKind, PullStatus,
-    SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult, VcsListCommitsResult,
-    VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea, VcsStatusLocalResult,
-    VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree, VcsWorkingTreeFile,
-    VcsWorkingTreeFileStatus, VcsWorktree, parse_numstat, parse_porcelain_v2_line,
+    ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
+    GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
+    ManagedWorktreeRollback, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
+    ProcessRunner, ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit,
+    VcsCreateWorktreeResult, VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef,
+    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
+    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
+    git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
+    parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
+const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
 const COMMIT_FIELD_SEPARATOR: char = '\x1f';
 const CLONE_OPERATION: &str = "GitVcsDriver.clone";
 const MAX_AUTOMATIC_WORKTREE_SUFFIX_ATTEMPTS: usize = 100;
@@ -34,6 +43,34 @@ const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const WORKTREE_REMOVAL_IDENTITY_FILE: &str = "bibcode-removal-identity";
 const WORKTREE_REMOVAL_ROOT_IDENTITY_FILE: &str = ".bibcode-removal-identity";
 const WORKTREE_REMOVAL_TOMBSTONE_FILE: &str = ".bibcode-removal-tombstone";
+
+#[derive(Clone, Copy)]
+struct GitExecutionOptions {
+    allow_non_zero_exit: bool,
+    max_output_bytes: usize,
+    output_policy: OutputPolicy,
+}
+
+pub(crate) type BoxGitProcessFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
+
+pub(crate) trait GitProcessRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a>;
+}
+
+impl GitProcessRunner for ProcessRunner {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner::run(self, request, cancellation))
+    }
+}
 
 pub type BoxWorktreeBaseDirectoryFuture<'a> =
     Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>>;
@@ -53,15 +90,17 @@ impl WorktreeBaseDirectoryProvider for DefaultWorktreeBaseDirectory {
 
 #[derive(Clone)]
 pub struct GitRepository {
-    runner: ProcessRunner,
+    runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
+    worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
 }
 
 impl Default for GitRepository {
     fn default() -> Self {
         Self {
-            runner: ProcessRunner,
+            runner: Arc::new(ProcessRunner),
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -97,9 +136,28 @@ impl WorktreePathPolicy {
     }
 }
 
-#[derive(Debug)]
 struct OwnedWorktreePath {
     path: PathBuf,
+    identity: OwnedWorktreePathIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedWorktreePathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+type OwnedWorktreePathIdentity = WindowsFileIdentity;
+
+impl fmt::Debug for OwnedWorktreePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedWorktreePath")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,15 +191,32 @@ impl OwnedWorktreePath {
                 source,
             })?;
         }
-        fs::create_dir(&path).map_err(|source| WorktreePathReservationError {
-            stage: WorktreePathReservationStage::Destination,
-            source,
+        let lease = create_removal_directory_lease(&path).map_err(|source| {
+            WorktreePathReservationError {
+                stage: WorktreePathReservationStage::Destination,
+                source,
+            }
         })?;
-        Ok(Self { path })
+        let identity = match owned_worktree_path_identity(&lease) {
+            Ok(identity) => identity,
+            Err(source) => {
+                let _ = delete_bound_directory_root_blocking(lease, &path);
+                return Err(WorktreePathReservationError {
+                    stage: WorktreePathReservationStage::Destination,
+                    source,
+                });
+            }
+        };
+        drop(lease);
+        Ok(Self { path, identity })
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn identity(&self) -> OwnedWorktreePathIdentity {
+        self.identity
     }
 }
 
@@ -150,8 +225,18 @@ impl GitRepository {
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     ) -> Self {
         Self {
-            runner: ProcessRunner,
+            runner: Arc::new(ProcessRunner),
             worktree_settings,
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runner_for_test(runner: Arc<dyn GitProcessRunner>) -> Self {
+        Self {
+            runner,
+            worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -180,6 +265,28 @@ impl GitRepository {
         allow_non_zero_exit: bool,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_options(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_with_options(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        options: GitExecutionOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
         self.runner
             .run(
                 ProcessRequest {
@@ -190,10 +297,10 @@ impl GitRepository {
                     env: git_environment(),
                     stdin: None,
                     timeout: DEFAULT_TIMEOUT,
-                    max_output_bytes: DEFAULT_OUTPUT_LIMIT,
-                    output_policy: OutputPolicy::Truncate,
+                    max_output_bytes: options.max_output_bytes,
+                    output_policy: options.output_policy,
                     append_truncation_marker: false,
-                    allow_non_zero_exit,
+                    allow_non_zero_exit: options.allow_non_zero_exit,
                 },
                 cancellation,
             )
@@ -246,6 +353,468 @@ impl GitRepository {
             )
             .await?;
         Ok(Some(PathBuf::from(output.stdout.trim())))
+    }
+
+    pub async fn worktree_inventory(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitWorktreeInventory, GitCommandError> {
+        let common_dir_output = self
+            .execute_with_options(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        ensure_authoritative_inventory_output(
+            "GitVcsDriver.worktreeInventory.commonDir",
+            anchor,
+            &common_dir_output,
+        )?;
+        let common_dir_value = git_output_line(&common_dir_output.stdout).ok_or_else(|| {
+            simple_error(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                "Git reported an invalid common Git directory.",
+            )
+        })?;
+        if common_dir_value.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                "Git did not report a common Git directory.",
+            ));
+        }
+        let common_dir_path = PathBuf::from(common_dir_value);
+        let common_dir = if common_dir_path.is_absolute() {
+            common_dir_path
+        } else {
+            normalize_path_lexically(&anchor.join(common_dir_path))
+        };
+
+        let (output, nul_delimited) = self.worktree_porcelain_output(anchor, cancellation).await?;
+        ensure_authoritative_inventory_output(
+            "GitVcsDriver.worktreeInventory.list",
+            anchor,
+            &output,
+        )?;
+        let records = parse_worktree_porcelain(&output.stdout, nul_delimited).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.worktreeInventory.parse",
+                anchor,
+                &format!("Git worktree inventory is malformed: {error}"),
+            )
+        })?;
+        Ok(GitWorktreeInventory {
+            common_dir,
+            records,
+            nul_delimited,
+        })
+    }
+
+    pub async fn inspect_worktree_removal(
+        &self,
+        anchor: &Path,
+        record: &GitWorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<GitWorktreeRemovalInspection, GitCommandError> {
+        validate_removable_worktree(anchor, record)?;
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let fresh = exact_worktree_record(&inventory, record).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.inspectWorktreeRemoval", anchor, record)
+        })?;
+        let inspection = match tokio::fs::symlink_metadata(&fresh.path).await {
+            Ok(_) => {
+                let target_inventory = self.worktree_inventory(&fresh.path, cancellation).await?;
+                let expected_common_dir = canonical_common_dir(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &inventory.common_dir,
+                )
+                .await?;
+                let target_common_dir = canonical_common_dir(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &target_inventory.common_dir,
+                )
+                .await?;
+                if normalized_worktree_path(&target_common_dir)
+                    != normalized_worktree_path(&expected_common_dir)
+                    || exact_worktree_record(&target_inventory, record).is_none()
+                {
+                    return Err(simple_error(
+                        "GitVcsDriver.inspectWorktreeRemoval",
+                        anchor,
+                        "The path currently belongs to a different repository than the registered worktree.",
+                    ));
+                }
+                let output = self
+                    .execute_with_options(
+                        "GitVcsDriver.inspectWorktreeRemoval.status",
+                        &fresh.path,
+                        &strings(&[
+                            "-c",
+                            "core.quotePath=false",
+                            "status",
+                            "--porcelain=v2",
+                            "-z",
+                            "--untracked-files=all",
+                            "--ignored=no",
+                        ]),
+                        GitExecutionOptions {
+                            allow_non_zero_exit: false,
+                            max_output_bytes: WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+                            output_policy: OutputPolicy::Error,
+                        },
+                        cancellation,
+                    )
+                    .await?;
+                parse_worktree_removal_status(anchor, &output.stdout)?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                GitWorktreeRemovalInspection::default()
+            }
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &format!(
+                        "The registered worktree path '{}' could not be inspected: {error}",
+                        display_path(&fresh.path)
+                    ),
+                ));
+            }
+        };
+        let verified = self.worktree_inventory(anchor, cancellation).await?;
+        if exact_worktree_record(&verified, record).is_none() {
+            return Err(worktree_record_mismatch_error(
+                "GitVcsDriver.inspectWorktreeRemoval",
+                anchor,
+                record,
+            ));
+        }
+        Ok(inspection)
+    }
+
+    pub async fn remove_worktree_verified(
+        &self,
+        anchor: &Path,
+        record: &GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        let inspection = self
+            .inspect_worktree_removal(anchor, record, cancellation)
+            .await?;
+        if !force_dirty
+            && (inspection.tracked_change_count != 0 || inspection.untracked_file_count != 0)
+        {
+            return Err(simple_error(
+                "GitVcsDriver.removeWorktreeVerified",
+                anchor,
+                "The worktree is dirty; explicit dirty-worktree confirmation is required.",
+            ));
+        }
+
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let fresh = exact_worktree_record(&inventory, record).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.removeWorktreeVerified", anchor, record)
+        })?;
+        let target_path = fresh.path.clone();
+        match tokio::fs::symlink_metadata(&target_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let impact = self
+                    .worktree_prune_impact(anchor, &inventory, cancellation)
+                    .await?;
+                let exact_target_only = matches!(
+                    impact.as_slice(),
+                    [entry]
+                        if normalized_worktree_path(&entry.path)
+                            == normalized_worktree_path(&target_path)
+                );
+                if !exact_target_only {
+                    return Err(simple_error(
+                        "GitVcsDriver.removeWorktreeVerified",
+                        anchor,
+                        "The missing worktree registration cannot be cleaned without pruning additional registrations.",
+                    ));
+                }
+                let impact_digest = git_worktree_prune_impact_digest(&impact);
+                return self
+                    .prune_worktrees_verified(anchor, fresh, &impact_digest, cancellation)
+                    .await;
+            }
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.removeWorktreeVerified",
+                    anchor,
+                    &format!(
+                        "The registered worktree path '{}' could not be inspected before protected removal: {error}",
+                        display_path(&target_path)
+                    ),
+                ));
+            }
+        }
+        self.remove_worktree(anchor, &target_path, true, cancellation)
+            .await?;
+        let verification = self
+            .worktree_inventory(anchor, &CancellationToken::new())
+            .await?;
+        if !inventory_contains_path(&verification, &target_path) {
+            return Ok(());
+        }
+        Err(simple_error(
+            "GitVcsDriver.removeWorktreeVerified.verify",
+            anchor,
+            "Protected Git worktree removal completed, but the exact target registration survived verification.",
+        ))
+    }
+
+    pub async fn preview_worktree_prune(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<GitPrunableWorktree>, GitCommandError> {
+        let before = self.worktree_inventory(anchor, cancellation).await?;
+        let impact = self
+            .worktree_prune_impact(anchor, &before, cancellation)
+            .await?;
+        let after = self.worktree_inventory(anchor, cancellation).await?;
+        if sorted_prunable_records(&before) != sorted_prunable_records(&after) {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git worktree registrations changed while the prune impact was being inspected.",
+            ));
+        }
+        Ok(impact)
+    }
+
+    pub async fn prune_worktrees_verified(
+        &self,
+        anchor: &Path,
+        target: &GitWorktreeRecord,
+        expected_impact_digest: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        validate_removable_worktree(anchor, target)?;
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let impact = self
+            .worktree_prune_impact(anchor, &inventory, cancellation)
+            .await?;
+        let fresh = exact_worktree_record(&inventory, target).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.pruneWorktreesVerified", anchor, target)
+        })?;
+        if !fresh.is_prunable
+            || !impact.iter().any(|entry| {
+                normalized_worktree_path(&entry.path) == normalized_worktree_path(&fresh.path)
+            })
+        {
+            return Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                "The exact target registration is not part of Git's current prune impact.",
+            ));
+        }
+        if git_worktree_prune_impact_digest(&impact) != expected_impact_digest {
+            return Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                "Git's current prune impact does not match the caller-confirmed impact digest.",
+            ));
+        }
+
+        let target_path = fresh.path.clone();
+        let mutation = self
+            .run(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                &strings(&["worktree", "prune", "--expire", "now"]),
+                cancellation,
+            )
+            .await;
+        let verification = self
+            .worktree_inventory(anchor, &CancellationToken::new())
+            .await?;
+        if !inventory_contains_path(&verification, &target_path) {
+            return Ok(());
+        }
+        match mutation {
+            Ok(_) => Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified.verify",
+                anchor,
+                "Git reported successful worktree pruning, but the exact target registration survived verification.",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn worktree_prune_impact(
+        &self,
+        anchor: &Path,
+        inventory: &GitWorktreeInventory,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<GitPrunableWorktree>, GitCommandError> {
+        let common_dir = canonical_common_dir(
+            "GitVcsDriver.previewWorktreePrune",
+            anchor,
+            &inventory.common_dir,
+        )
+        .await?;
+        let output = self
+            .execute_with_options(
+                "GitVcsDriver.previewWorktreePrune",
+                anchor,
+                &strings(&[
+                    "worktree",
+                    "prune",
+                    "--dry-run",
+                    "--verbose",
+                    "--expire",
+                    "now",
+                ]),
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_PRUNE_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        if !output.stdout.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.parse",
+                anchor,
+                "Git worktree prune preview produced unexpected standard output.",
+            ));
+        }
+        let dry_run_records = parse_worktree_prune_dry_run(&output.stderr).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.previewWorktreePrune.parse",
+                anchor,
+                &format!("Git worktree prune preview is malformed: {error}"),
+            )
+        })?;
+        let resolved =
+            resolve_worktree_prune_paths(anchor, &common_dir, dry_run_records, cancellation)
+                .await?;
+        let mut records = sorted_prunable_records(inventory);
+        if resolved.len() != records.len() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+            ));
+        }
+        let mut impact = Vec::with_capacity(resolved.len());
+        for (dry_run, path) in resolved {
+            let key = normalized_worktree_path(&path);
+            let Some(index) = records.iter().position(|record| {
+                normalized_worktree_path(&record.path) == key
+                    && record.prunable_reason.as_deref() == Some(dry_run.reason.as_str())
+            }) else {
+                return Err(simple_error(
+                    "GitVcsDriver.previewWorktreePrune.verify",
+                    anchor,
+                    "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+                ));
+            };
+            let record = records.remove(index);
+            impact.push(GitPrunableWorktree {
+                path: record.path,
+                prune_reason: dry_run.reason,
+                locked: record.locked,
+                lock_reason: record.lock_reason,
+            });
+        }
+        if !records.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+            ));
+        }
+        impact.sort_by(|left, right| {
+            normalized_worktree_path(&left.path)
+                .cmp(&normalized_worktree_path(&right.path))
+                .then_with(|| left.prune_reason.cmp(&right.prune_reason))
+        });
+        Ok(impact)
+    }
+
+    async fn worktree_porcelain_output(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProcessOutput, bool), GitCommandError> {
+        if self.worktree_porcelain_z_support() != Some(false) {
+            let args = strings(&["worktree", "list", "--porcelain", "-z"]);
+            let output = self
+                .execute_with_options(
+                    "GitVcsDriver.worktreeInventory.listZ",
+                    anchor,
+                    &args,
+                    GitExecutionOptions {
+                        allow_non_zero_exit: true,
+                        max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                        output_policy: OutputPolicy::Error,
+                    },
+                    cancellation,
+                )
+                .await?;
+            if output.exit_code == 0 {
+                self.set_worktree_porcelain_z_support(true);
+                return Ok((output, true));
+            }
+            if !is_unsupported_porcelain_z_diagnostic(&output.stderr) {
+                return Err(command_output_error(
+                    "GitVcsDriver.worktreeInventory.listZ",
+                    anchor,
+                    args.len(),
+                    &output,
+                    &actionable_git_failure(&output.stderr, &output.stdout),
+                ));
+            }
+            self.set_worktree_porcelain_z_support(false);
+        }
+
+        let args = strings(&["worktree", "list", "--porcelain"]);
+        let output = self
+            .execute_with_options(
+                "GitVcsDriver.worktreeInventory.list",
+                anchor,
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        Ok((output, false))
+    }
+
+    fn worktree_porcelain_z_support(&self) -> Option<bool> {
+        self.worktree_porcelain_z_supported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned()
+    }
+
+    fn set_worktree_porcelain_z_support(&self, supported: bool) {
+        *self
+            .worktree_porcelain_z_supported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supported);
     }
 
     pub async fn local_status(
@@ -931,6 +1500,10 @@ impl GitRepository {
                 path: path_string,
                 ref_name: target_ref.to_owned(),
             },
+            rollback: Some(ManagedWorktreeRollback {
+                created_path: canonical_path,
+                created_branch: input.new_ref_name.filter(|_| !new_ref_existed),
+            }),
         })
     }
 
@@ -953,6 +1526,7 @@ impl GitRepository {
                     path: path.clone(),
                     ref_name: target_ref.to_owned(),
                 },
+                rollback: None,
             });
         }
         self.create_worktree(input, cancellation).await
@@ -1015,8 +1589,12 @@ impl GitRepository {
                     return Ok(VcsCreateWorktreeResult {
                         worktree: VcsWorktree {
                             path: display_path(&canonical_path),
-                            ref_name: candidate,
+                            ref_name: candidate.clone(),
                         },
+                        rollback: Some(ManagedWorktreeRollback {
+                            created_path: canonical_path,
+                            created_branch: Some(candidate),
+                        }),
                     });
                 }
                 Err(error) => {
@@ -1134,27 +1712,136 @@ impl GitRepository {
         owned_path: &OwnedWorktreePath,
     ) -> Result<(), GitCommandError> {
         let cleanup_token = CancellationToken::new();
-        self.remove_worktree(cwd, owned_path.path(), true, &cleanup_token)
-            .await?;
-        match tokio::fs::symlink_metadata(owned_path.path()).await {
-            Ok(_) => Err(simple_error(
+        let mut args = strings(&["worktree", "remove", "--force", "--"]);
+        args.push(display_path(owned_path.path()));
+        let removal_error = self
+            .run(
                 "GitVcsDriver.createWorktree.cleanup",
                 cwd,
-                &format!(
-                    "The owned worktree path '{}' still exists after protected cleanup.",
-                    display_path(owned_path.path())
-                ),
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(simple_error(
-                "GitVcsDriver.createWorktree.cleanup",
-                cwd,
-                &format!(
-                    "The owned worktree path '{}' could not be inspected after protected cleanup: {error}",
-                    display_path(owned_path.path())
-                ),
-            )),
+                &args,
+                &cleanup_token,
+            )
+            .await
+            .err();
+        let still_registered = self
+            .worktree_paths(cwd, &cleanup_token)
+            .await?
+            .iter()
+            .any(|registered| same_worktree_path(registered, owned_path.path()));
+        if still_registered {
+            return Err(removal_error.unwrap_or_else(|| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree '{}' is still registered after cleanup.",
+                        display_path(owned_path.path())
+                    ),
+                )
+            }));
         }
+        match tokio::fs::symlink_metadata(owned_path.path()).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be inspected after Git cleanup: {error}",
+                        display_path(owned_path.path())
+                    ),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let lease = open_removal_directory_lease_async(owned_path.path())
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be bound for cleanup: {error}",
+                        display_path(owned_path.path())
+                    ),
+                )
+            })?;
+        verify_owned_worktree_path_identity(&lease, owned_path.identity()).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.createWorktree.cleanup",
+                cwd,
+                &format!(
+                    "The owned worktree path '{}' was replaced before cleanup: {error}",
+                    display_path(owned_path.path())
+                ),
+            )
+        })?;
+        remove_bound_owned_directory_with_lease(owned_path.path(), lease)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.cleanup",
+                    cwd,
+                    &format!(
+                        "The owned worktree path '{}' could not be removed: {error}",
+                        display_path(owned_path.path())
+                    ),
+                )
+            })
+    }
+
+    pub(crate) async fn rollback_managed_worktree_creation(
+        &self,
+        cwd: &Path,
+        rollback: &ManagedWorktreeRollback,
+    ) -> Result<(), GitCommandError> {
+        let cancellation = CancellationToken::new();
+        let created_key = canonical_worktree_path_key(&rollback.created_path)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.rollback",
+                    cwd,
+                    &format!("The created worktree identity could not be verified: {error}"),
+                )
+            })?;
+        let inventory = self.worktree_inventory(cwd, &cancellation).await?;
+        let mut created_record = None;
+        for record in inventory.records {
+            let record_key = canonical_worktree_path_key(&record.path)
+                .await
+                .map_err(|error| {
+                    simple_error(
+                        "GitVcsDriver.createWorktree.rollback",
+                        cwd,
+                        &format!("A registered worktree identity could not be verified: {error}"),
+                    )
+                })?;
+            if record_key == created_key {
+                created_record = Some(record);
+                break;
+            }
+        }
+        let record = created_record.ok_or_else(|| {
+            simple_error(
+                "GitVcsDriver.createWorktree.rollback",
+                cwd,
+                "The exact created worktree is no longer registered.",
+            )
+        })?;
+        if record.is_primary || record.is_bare {
+            return Err(simple_error(
+                "GitVcsDriver.createWorktree.rollback",
+                cwd,
+                "The exact created worktree resolved to a protected checkout.",
+            ));
+        }
+        self.remove_worktree_verified(cwd, &record, true, &cancellation)
+            .await?;
+        if let Some(branch) = rollback.created_branch.as_deref() {
+            self.rollback_created_branch(cwd, branch).await?;
+        }
+        Ok(())
     }
 
     async fn local_branch_exists(
@@ -1217,9 +1904,13 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<(), GitCommandError> {
         let registered_paths = self.worktree_paths(cwd, cancellation).await?;
-        let registered_index = registered_paths
-            .iter()
-            .position(|registered| same_worktree_path(registered, path));
+        let registered_index = registered_worktree_path_index(
+            "GitVcsDriver.removeWorktree.identity",
+            cwd,
+            &registered_paths,
+            path,
+        )
+        .await?;
         let was_registered = registered_index.is_some();
         if force && registered_index.is_some_and(|index| index > 0) {
             let nonce = self
@@ -1252,10 +1943,16 @@ impl GitRepository {
         let Ok(paths) = self.worktree_paths(cwd, cancellation).await else {
             return Err(error);
         };
-        if paths
-            .iter()
-            .any(|registered| same_worktree_path(registered, path))
-        {
+        if !matches!(
+            registered_worktree_path_index(
+                "GitVcsDriver.removeWorktree.verifyIdentity",
+                cwd,
+                &paths,
+                path,
+            )
+            .await,
+            Ok(None)
+        ) {
             return Err(error);
         }
         if !path.exists() {
@@ -1413,9 +2110,14 @@ impl GitRepository {
             .worktree_removal_admin_quarantine_path(cwd, expected_nonce, cancellation)
             .await?;
         let registered_paths = self.worktree_paths(cwd, cancellation).await?;
-        let was_registered = registered_paths
-            .iter()
-            .any(|registered| same_worktree_path(registered, path));
+        let was_registered = registered_worktree_path_index(
+            "GitVcsDriver.removeWorktree.identity",
+            cwd,
+            &registered_paths,
+            path,
+        )
+        .await?
+        .is_some();
         let path_exists = tokio::fs::symlink_metadata(path).await.is_ok();
         let quarantine_exists = tokio::fs::symlink_metadata(&quarantine).await.is_ok();
 
@@ -2842,6 +3544,38 @@ fn verify_removal_directory_lease(
     Ok(())
 }
 
+#[cfg(unix)]
+fn owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+) -> Result<OwnedWorktreePathIdentity, io::Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = lease.handle.metadata()?;
+    Ok(OwnedWorktreePathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+) -> Result<OwnedWorktreePathIdentity, io::Error> {
+    windows_file_identity(&lease.handle)
+}
+
+fn verify_owned_worktree_path_identity(
+    lease: &RemovalDirectoryLease,
+    expected: OwnedWorktreePathIdentity,
+) -> Result<(), io::Error> {
+    if owned_worktree_path_identity(lease)? != expected {
+        return Err(io::Error::other(
+            "the reserved worktree directory identity changed",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_identity_marker_blocking(
     path: &Path,
     marker_name: &str,
@@ -3418,6 +4152,28 @@ async fn remove_bound_identity_directory_with_lease(
     .map_err(|error| io::Error::other(format!("bound directory cleanup task failed: {error}")))?
 }
 
+async fn remove_bound_owned_directory_with_lease(
+    path: &Path,
+    lease: RemovalDirectoryLease,
+) -> Result<(), io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut last_error = None;
+        for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+            match clear_bound_directory_contents(&lease, &path, None) {
+                Ok(()) => return delete_bound_directory_root_blocking(lease, &path),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
+                std::thread::sleep(WORKTREE_REMOVE_RETRY_DELAY);
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("owned directory cleanup failed")))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("owned directory cleanup task failed: {error}")))?
+}
+
 fn clear_bound_identity_directory_once(
     lease: &RemovalDirectoryLease,
     path: &Path,
@@ -3505,6 +4261,8 @@ fn git_environment() -> Vec<(OsString, OsString)> {
         ("GIT_ASKPASS", ""),
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_TERMINAL_PROMPT", "0"),
+        ("LC_ALL", "C"),
+        ("LANG", "C"),
         ("SSH_ASKPASS", ""),
         ("SSH_ASKPASS_REQUIRE", "never"),
     ]
@@ -3562,6 +4320,442 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     } else {
         registered == candidate
     }
+}
+
+async fn registered_worktree_path_index(
+    operation: &str,
+    cwd: &Path,
+    registered_paths: &[String],
+    path: &Path,
+) -> Result<Option<usize>, GitCommandError> {
+    let expected = canonical_worktree_path_key(path).await.map_err(|error| {
+        simple_error(
+            operation,
+            cwd,
+            &format!(
+                "The requested worktree path '{}' could not be resolved to a physical identity: {error}",
+                display_path(path)
+            ),
+        )
+    })?;
+    for (index, registered) in registered_paths.iter().enumerate() {
+        let registered_path = Path::new(registered);
+        let candidate = canonical_worktree_path_key(registered_path)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    operation,
+                    cwd,
+                    &format!(
+                        "The registered worktree path '{}' could not be resolved to a physical identity: {error}",
+                        display_path(registered_path)
+                    ),
+                )
+            })?;
+        if candidate == expected {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn exact_worktree_record<'a>(
+    inventory: &'a GitWorktreeInventory,
+    expected: &GitWorktreeRecord,
+) -> Option<&'a GitWorktreeRecord> {
+    inventory.records.iter().find(|candidate| {
+        normalized_worktree_path(&candidate.path) == normalized_worktree_path(&expected.path)
+            && candidate.head == expected.head
+            && candidate.branch == expected.branch
+            && candidate.is_primary == expected.is_primary
+            && candidate.is_bare == expected.is_bare
+            && candidate.locked == expected.locked
+            && candidate.lock_reason == expected.lock_reason
+            && candidate.is_prunable == expected.is_prunable
+            && candidate.prunable_reason == expected.prunable_reason
+    })
+}
+
+fn inventory_contains_path(inventory: &GitWorktreeInventory, path: &Path) -> bool {
+    let expected = normalized_worktree_path(path);
+    inventory
+        .records
+        .iter()
+        .any(|candidate| normalized_worktree_path(&candidate.path) == expected)
+}
+
+fn sorted_prunable_records(inventory: &GitWorktreeInventory) -> Vec<GitWorktreeRecord> {
+    let mut records = inventory
+        .records
+        .iter()
+        .filter(|record| record.is_prunable && !record.locked)
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        normalized_worktree_path(&left.path).cmp(&normalized_worktree_path(&right.path))
+    });
+    records
+}
+
+fn normalized_worktree_path(path: &Path) -> String {
+    normalize_worktree_path_key(path, host_path_platform())
+}
+
+async fn canonical_common_dir(
+    operation: &str,
+    anchor: &Path,
+    common_dir: &Path,
+) -> Result<PathBuf, GitCommandError> {
+    tokio::fs::canonicalize(common_dir).await.map_err(|error| {
+        simple_error(
+            operation,
+            anchor,
+            &format!(
+                "The common Git directory '{}' could not be verified: {error}",
+                display_path(common_dir)
+            ),
+        )
+    })
+}
+
+async fn resolve_worktree_prune_paths(
+    anchor: &Path,
+    common_dir: &Path,
+    dry_run_records: Vec<WorktreePruneDryRunRecord>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<(WorktreePruneDryRunRecord, PathBuf)>, GitCommandError> {
+    if dry_run_records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worktrees_dir = common_dir.join("worktrees");
+    verify_prune_directory(&worktrees_dir)
+        .await
+        .map_err(|error| {
+            prune_identity_error(
+                anchor,
+                &format!("Git's worktree administration directory could not be verified: {error}"),
+            )
+        })?;
+
+    let mut resolved = Vec::with_capacity(dry_run_records.len());
+    let mut path_keys = HashSet::with_capacity(dry_run_records.len());
+    for record in dry_run_records {
+        if cancellation.is_cancelled() {
+            return Err(prune_identity_error(
+                anchor,
+                "Git worktree prune impact verification was interrupted.",
+            ));
+        }
+        let path = resolve_worktree_prune_path(&worktrees_dir, &record.admin_id, cancellation)
+            .await
+            .map_err(|error| {
+                prune_identity_error(
+                    anchor,
+                    &format!(
+                        "Git's dry-run administration identity '{}' could not be verified: {error}",
+                        record.admin_id
+                    ),
+                )
+            })?;
+        if !path_keys.insert(normalized_worktree_path(&path)) {
+            return Err(prune_identity_error(
+                anchor,
+                "Git's dry-run contains duplicate normalized worktree paths.",
+            ));
+        }
+        resolved.push((record, path));
+    }
+    if cancellation.is_cancelled() {
+        return Err(prune_identity_error(
+            anchor,
+            "Git worktree prune impact verification was interrupted.",
+        ));
+    }
+    Ok(resolved)
+}
+
+async fn verify_prune_directory(path: &Path) -> io::Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a non-symlink directory",
+        ));
+    }
+    if tokio::fs::canonicalize(path).await? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory identity does not match its canonical path",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_worktree_prune_path(
+    worktrees_dir: &Path,
+    admin_id: &str,
+    cancellation: &CancellationToken,
+) -> io::Result<PathBuf> {
+    let admin_dir = worktrees_dir.join(admin_id);
+    verify_prune_directory(&admin_dir).await?;
+    let gitdir_path = admin_dir.join("gitdir");
+    let before = tokio::fs::symlink_metadata(&gitdir_path).await?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a non-symlink gitdir file",
+        ));
+    }
+
+    let file = prune_gitdir_open_options().open(&gitdir_path).await?;
+    let opened = file.metadata().await?;
+    if !opened.is_file() || !same_prune_file_identity(&before, &opened) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity changed while it was opened",
+        ));
+    }
+    let capacity = usize::try_from(opened.len())
+        .unwrap_or(usize::MAX)
+        .min(WORKTREE_PRUNE_GITDIR_LIMIT as usize);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take(WORKTREE_PRUNE_GITDIR_LIMIT + 1);
+    let read = limited.read_to_end(&mut bytes);
+    tokio::select! {
+        result = read => result?,
+        () = cancellation.cancelled() => {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "impact verification cancelled"));
+        }
+    };
+    if bytes.len() as u64 > WORKTREE_PRUNE_GITDIR_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity exceeds its byte limit",
+        ));
+    }
+    let after = tokio::fs::symlink_metadata(&gitdir_path).await?;
+    if !after.is_file()
+        || after.file_type().is_symlink()
+        || !same_prune_file_identity(&opened, &after)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity changed while it was read",
+        ));
+    }
+    verify_prune_directory(&admin_dir).await?;
+    parse_prune_gitdir_path(bytes)
+}
+
+fn prune_gitdir_open_options() -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+#[cfg(unix)]
+fn same_prune_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_prune_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn parse_prune_gitdir_path(mut bytes: Vec<u8>) -> io::Result<PathBuf> {
+    if bytes.pop() != Some(b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is unterminated",
+        ));
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.contains(&b'\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is empty or malformed",
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is not valid UTF-8",
+        )
+    })?;
+    let gitdir = PathBuf::from(value);
+    if !gitdir.is_absolute() || gitdir.file_name().is_none_or(|name| name != ".git") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is not an absolute worktree .git path",
+        ));
+    }
+    gitdir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity has no worktree parent",
+        )
+    })
+}
+
+fn prune_identity_error(anchor: &Path, detail: &str) -> GitCommandError {
+    simple_error("GitVcsDriver.previewWorktreePrune.verify", anchor, detail)
+}
+
+fn validate_removable_worktree(
+    anchor: &Path,
+    record: &GitWorktreeRecord,
+) -> Result<(), GitCommandError> {
+    if record.is_bare {
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            "Bare worktrees are protected and cannot be removed.",
+        ));
+    }
+    if record.is_primary {
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            "The primary worktree is protected and cannot be removed.",
+        ));
+    }
+    if record.locked {
+        let reason = record
+            .lock_reason
+            .as_deref()
+            .unwrap_or("Git did not provide a lock reason");
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            &format!("The worktree registration is locked: {reason}"),
+        ));
+    }
+    Ok(())
+}
+
+fn worktree_record_mismatch_error(
+    operation: &str,
+    anchor: &Path,
+    record: &GitWorktreeRecord,
+) -> GitCommandError {
+    simple_error(
+        operation,
+        anchor,
+        &format!(
+            "The registered worktree record '{}' changed or does not belong to this repository.",
+            display_path(&record.path)
+        ),
+    )
+}
+
+fn parse_worktree_removal_status(
+    anchor: &Path,
+    output: &str,
+) -> Result<GitWorktreeRemovalInspection, GitCommandError> {
+    if output.is_empty() {
+        return Ok(GitWorktreeRemovalInspection::default());
+    }
+    if !output.ends_with('\0') {
+        return Err(simple_error(
+            "GitVcsDriver.inspectWorktreeRemoval.status",
+            anchor,
+            "Git returned an unterminated worktree status record.",
+        ));
+    }
+    let mut inspection = GitWorktreeRemovalInspection::default();
+    let mut records = output.split_terminator('\0');
+    while let Some(record) = records.next() {
+        if record.starts_with("? ") {
+            if parse_porcelain_v2_line(record).is_none() {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.untracked_file_count = inspection
+                .untracked_file_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("1 ") || record.starts_with("u ") {
+            if parse_porcelain_v2_line(record).is_none() {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.tracked_change_count = inspection
+                .tracked_change_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("2 ") {
+            if parse_porcelain_v2_line(record).is_none() || records.next().is_none_or(str::is_empty)
+            {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.tracked_change_count = inspection
+                .tracked_change_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("! ") {
+            continue;
+        }
+        return Err(malformed_worktree_removal_status(anchor));
+    }
+    Ok(inspection)
+}
+
+fn malformed_worktree_removal_status(anchor: &Path) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.inspectWorktreeRemoval.status",
+        anchor,
+        "Git returned a malformed worktree status record.",
+    )
+}
+
+fn ensure_authoritative_inventory_output(
+    operation: &str,
+    cwd: &Path,
+    output: &ProcessOutput,
+) -> Result<(), GitCommandError> {
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git worktree inventory output was truncated and is not authoritative.",
+        ));
+    }
+    Ok(())
+}
+
+fn is_unsupported_porcelain_z_diagnostic(stderr: &str) -> bool {
+    let diagnostic = stderr.to_ascii_lowercase();
+    [
+        "unknown option `z'",
+        "unknown option 'z'",
+        "unknown option: -z",
+        "unknown switch `z'",
+        "unknown switch 'z'",
+        "unrecognized option '-z'",
+    ]
+    .into_iter()
+    .any(|needle| diagnostic.contains(needle))
+}
+
+fn git_output_line(output: &str) -> Option<&str> {
+    let line = output.strip_suffix('\n').unwrap_or(output);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    (!line.contains(['\n', '\r'])).then_some(line)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -3917,20 +5111,35 @@ fn display_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod worktree_ownership_tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::Path,
+        process::Command,
+        sync::{Arc, Mutex},
+    };
 
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CreateWorktreeInput, GitRepository, OwnedWorktreePath, display_path,
-        open_removal_directory_lease, parse_branch_headers, run_worktree_removal_probe_blocking,
+        CreateWorktreeInput, GitProcessRunner, GitPrunableWorktree, GitRepository,
+        GitWorktreeRecord, OutputPolicy, OwnedWorktreePath, ProcessOutput, ProcessRequest,
+        WORKTREE_INVENTORY_OUTPUT_LIMIT, display_path, ensure_authoritative_inventory_output,
+        git_output_line, is_unsupported_porcelain_z_diagnostic, parse_branch_headers,
+        run_worktree_removal_probe_blocking,
     };
+    #[cfg(unix)]
+    use super::{
+        WORKTREE_PRUNE_GITDIR_LIMIT, WorktreePruneDryRunRecord, resolve_worktree_prune_paths,
+    };
+    use crate::git::git_worktree_prune_impact_digest;
 
     #[cfg(windows)]
     use super::{
         clear_windows_directory_bound_after_snapshot, create_removal_directory_lease,
-        delete_bound_directory_root_blocking, rename_bound_directory_blocking,
+        delete_bound_directory_root_blocking, open_removal_directory_lease,
+        rename_bound_directory_blocking,
     };
 
     #[test]
@@ -4069,6 +5278,491 @@ mod worktree_ownership_tests {
             ),
             (Some("main".into()), Some("origin/main".into()), 0, 0)
         );
+    }
+
+    #[test]
+    fn inventory_rejects_truncated_output_and_only_falls_back_for_explicit_z_diagnostics() {
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: "worktree /repo\0\0".to_owned(),
+            stderr: String::new(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+        assert!(
+            ensure_authoritative_inventory_output(
+                "GitVcsDriver.worktreeInventory.list",
+                Path::new("/repo"),
+                &output,
+            )
+            .is_err()
+        );
+        assert!(is_unsupported_porcelain_z_diagnostic(
+            "error: unknown option `z'\nusage: git worktree list"
+        ));
+        assert!(!is_unsupported_porcelain_z_diagnostic(
+            "fatal: not a git repository"
+        ));
+        assert_eq!(
+            git_output_line(" /repo with space \n"),
+            Some(" /repo with space ")
+        );
+        assert_eq!(git_output_line("/one\n/two\n"), None);
+    }
+
+    #[tokio::test]
+    async fn inventory_executes_legacy_fallback_once_and_caches_it_per_repository() {
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(129, "", "error: unknown switch `z'"),
+            process_output(
+                0,
+                "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+                "",
+            ),
+            process_output(0, ".git\n", ""),
+            process_output(
+                0,
+                "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+                "",
+            ),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let anchor = tempfile::tempdir().expect("inventory anchor");
+        let token = CancellationToken::new();
+
+        for _ in 0..2 {
+            let inventory = repository
+                .worktree_inventory(anchor.path(), &token)
+                .await
+                .expect("legacy inventory");
+            assert!(!inventory.nul_delimited);
+        }
+
+        let requests = runner.requests();
+        let nul_request = requests
+            .iter()
+            .find(|request| request.args.iter().any(|argument| argument == "-z"))
+            .expect("one capability probe");
+        assert!(nul_request.allow_non_zero_exit);
+        assert_eq!(nul_request.output_policy, OutputPolicy::Error);
+        assert_eq!(
+            nul_request.max_output_bytes,
+            WORKTREE_INVENTORY_OUTPUT_LIMIT
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.args.iter().any(|argument| argument == "-z"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .args
+                        .iter()
+                        .any(|argument| argument == "--porcelain")
+                        && !request.args.iter().any(|argument| argument == "-z")
+                })
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .args
+                        .iter()
+                        .any(|argument| argument == "--porcelain")
+                        && !request.args.iter().any(|argument| argument == "-z")
+                })
+                .all(|request| !request.allow_non_zero_exit)
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_prune_rejects_a_successful_exit_when_the_target_registration_survives() {
+        let fixture = tempfile::tempdir().expect("surviving target fixture");
+        let admin_dir = fixture.path().join(".git/worktrees/target");
+        fs::create_dir_all(&admin_dir).expect("worktree admin fixture");
+        let target_path = fixture.path().join("target");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}/.git\n", display_path(&target_path)),
+        )
+        .expect("target admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/feature\0prunable stale\0\0",
+            display_path(fixture.path()),
+            display_path(&target_path),
+        );
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, "", "Removing worktrees/target: stale\n"),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, "", "Removing worktrees/target: stale\n"),
+            process_output(0, "", ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: target_path,
+            head: Some("bbb".into()),
+            branch: Some("feature".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let expected = repository
+            .preview_worktree_prune(fixture.path(), &CancellationToken::new())
+            .await
+            .expect("preview");
+        let digest = git_worktree_prune_impact_digest(&expected);
+
+        let error = repository
+            .prune_worktrees_verified(fixture.path(), &target, &digest, &CancellationToken::new())
+            .await
+            .expect_err("surviving target invalidates successful prune exit");
+        assert!(error.detail.to_ascii_lowercase().contains("survived"));
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            1
+        );
+        let requests = runner.requests();
+        let mutation_index = requests
+            .iter()
+            .position(|request| {
+                request.args.iter().any(|argument| argument == "prune")
+                    && !request.args.iter().any(|argument| argument == "--dry-run")
+            })
+            .expect("prune mutation request");
+        assert!(
+            mutation_index > 0
+                && requests[mutation_index - 1]
+                    .args
+                    .iter()
+                    .any(|argument| argument == "--dry-run"),
+            "the confirmed dry-run is the final Git command before prune mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_prune_rejects_a_same_reason_admin_identity_swap_before_mutation() {
+        let fixture = tempfile::tempdir().expect("prune identity fixture");
+        let common_dir = fixture.path().join(".git");
+        let admin_dir = common_dir.join("worktrees/target");
+        fs::create_dir_all(&admin_dir).expect("worktree admin fixture");
+        let old_path = fixture.path().join("old-target");
+        let new_path = fixture.path().join("new-target");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}/.git\n", display_path(&old_path)),
+        )
+        .expect("old admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/feature\0prunable stale\0\0",
+            display_path(fixture.path()),
+            display_path(&old_path),
+        );
+        let after_prune = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0",
+            display_path(fixture.path()),
+        );
+        let replacement_gitdir = admin_dir.join("gitdir");
+        let replacement_path = new_path.clone();
+        let runner = Arc::new(FakeGitRunner::with_dry_run_action(
+            [
+                process_output(0, ".git\n", ""),
+                process_output(0, &inventory, ""),
+                process_output(0, "", "Removing worktrees/target: stale\n"),
+                process_output(0, "", ""),
+                process_output(0, ".git\n", ""),
+                process_output(0, &after_prune, ""),
+            ],
+            Arc::new(move || {
+                fs::write(
+                    &replacement_gitdir,
+                    format!("{}/.git\n", display_path(&replacement_path)),
+                )
+                .expect("swap admin identity");
+            }),
+        ));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: old_path.clone(),
+            head: Some("bbb".into()),
+            branch: Some("feature".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let confirmed = [GitPrunableWorktree {
+            path: old_path,
+            prune_reason: "stale".into(),
+            locked: false,
+            lock_reason: None,
+        }];
+
+        repository
+            .prune_worktrees_verified(
+                fixture.path(),
+                &target,
+                &git_worktree_prune_impact_digest(&confirmed),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("same-reason replacement cannot inherit confirmed impact");
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            0,
+            "identity drift is rejected before repository-wide prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_prune_rejects_same_path_reason_drift_before_mutation() {
+        let fixture = tempfile::tempdir().expect("prune reason fixture");
+        let common_dir = fixture.path().join(".git");
+        let target_admin = common_dir.join("worktrees/target");
+        let other_admin = common_dir.join("worktrees/other");
+        fs::create_dir_all(&target_admin).expect("target admin fixture");
+        fs::create_dir_all(&other_admin).expect("other admin fixture");
+        let target_path = fixture.path().join("target");
+        let other_path = fixture.path().join("other");
+        fs::write(
+            target_admin.join("gitdir"),
+            format!("{}/.git\n", display_path(&target_path)),
+        )
+        .expect("target admin identity");
+        fs::write(
+            other_admin.join("gitdir"),
+            format!("{}/.git\n", display_path(&other_path)),
+        )
+        .expect("other admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/target\0prunable stale\0\0worktree {}\0HEAD ccc\0branch refs/heads/other\0prunable reason-after-preview\0\0",
+            display_path(fixture.path()),
+            display_path(&target_path),
+            display_path(&other_path),
+        );
+        let after_prune = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0",
+            display_path(fixture.path()),
+        );
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(
+                0,
+                "",
+                "Removing worktrees/target: stale\nRemoving worktrees/other: reason-after-preview\n",
+            ),
+            process_output(0, "", ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &after_prune, ""),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: target_path.clone(),
+            head: Some("bbb".into()),
+            branch: Some("target".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let confirmed = [
+            GitPrunableWorktree {
+                path: target_path,
+                prune_reason: "stale".into(),
+                locked: false,
+                lock_reason: None,
+            },
+            GitPrunableWorktree {
+                path: other_path,
+                prune_reason: "reason-before-preview".into(),
+                locked: false,
+                lock_reason: None,
+            },
+        ];
+
+        repository
+            .prune_worktrees_verified(
+                fixture.path(),
+                &target,
+                &git_worktree_prune_impact_digest(&confirmed),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("same-path reason drift invalidates confirmed impact");
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            0,
+            "reason drift is rejected before repository-wide prune"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_admin_identity_resolution_rejects_symlinks_oversize_and_cancellation() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().expect("admin identity fixture");
+        let common_dir = fixture.path().join(".git");
+        let worktrees_dir = common_dir.join("worktrees");
+        let outside_admin = fixture.path().join("outside-admin");
+        fs::create_dir_all(&outside_admin).expect("outside admin fixture");
+        fs::create_dir_all(&worktrees_dir).expect("worktrees admin root");
+        let common_dir = fs::canonicalize(&common_dir).expect("canonical common directory");
+        fs::write(outside_admin.join("gitdir"), "/target/.git\n").expect("outside gitdir fixture");
+        symlink(&outside_admin, worktrees_dir.join("linked")).expect("symlinked admin fixture");
+        let record = |admin_id: &str| WorktreePruneDryRunRecord {
+            admin_id: admin_id.to_owned(),
+            reason: "stale".to_owned(),
+        };
+
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("linked")],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("symlinked admin directory is rejected");
+
+        let oversized_admin = worktrees_dir.join("oversized");
+        fs::create_dir(&oversized_admin).expect("oversized admin fixture");
+        fs::write(
+            oversized_admin.join("gitdir"),
+            vec![b'x'; WORKTREE_PRUNE_GITDIR_LIMIT as usize + 1],
+        )
+        .expect("oversized gitdir fixture");
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("oversized")],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("oversized gitdir identity is rejected");
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("oversized")],
+            &cancellation,
+        )
+        .await
+        .expect_err("cancelled identity resolution cannot approach mutation");
+    }
+
+    struct FakeGitRunner {
+        outputs: Mutex<VecDeque<ProcessOutput>>,
+        requests: Mutex<Vec<ProcessRequest>>,
+        dry_run_action: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl FakeGitRunner {
+        fn new(outputs: impl IntoIterator<Item = ProcessOutput>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+                dry_run_action: None,
+            }
+        }
+
+        fn with_dry_run_action(
+            outputs: impl IntoIterator<Item = ProcessOutput>,
+            dry_run_action: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+                dry_run_action: Some(dry_run_action),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProcessRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl GitProcessRunner for FakeGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> super::BoxGitProcessFuture<'a> {
+            if request.args.iter().any(|argument| argument == "--dry-run")
+                && let Some(action) = self.dry_run_action.as_ref()
+            {
+                action();
+            }
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            let output = self
+                .outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .expect("fake output");
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    fn process_output(exit_code: i32, stdout: &str, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {

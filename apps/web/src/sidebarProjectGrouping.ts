@@ -31,6 +31,29 @@ export interface SidebarProjectSnapshot extends Project {
   remoteEnvironmentLabels: readonly string[];
 }
 
+export function compareSidebarDisplayText(left: string, right: string): number {
+  const foldedLeft = left.toLowerCase();
+  const foldedRight = right.toLowerCase();
+  if (foldedLeft < foldedRight) return -1;
+  if (foldedLeft > foldedRight) return 1;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function compareProjectMembers(
+  left: SidebarProjectGroupMember,
+  right: SidebarProjectGroupMember,
+): number {
+  const leftLabel = left.environmentLabel ?? left.environmentId;
+  const rightLabel = right.environmentLabel ?? right.environmentId;
+  return (
+    compareSidebarDisplayText(leftLabel, rightLabel) ||
+    compareSidebarDisplayText(left.environmentId, right.environmentId) ||
+    compareSidebarDisplayText(left.id, right.id)
+  );
+}
+
 export function buildPhysicalToLogicalProjectKeyMap(input: {
   projects: ReadonlyArray<Project>;
   settings: ProjectGroupingSettings;
@@ -81,7 +104,7 @@ export function buildSidebarProjectSnapshots(input: {
     }
     seen.add(logicalKey);
 
-    const members = groupedMembers.get(logicalKey) ?? [];
+    const members = [...(groupedMembers.get(logicalKey) ?? [])].sort(compareProjectMembers);
     const representative =
       (input.primaryEnvironmentId
         ? members.find((member) => member.environmentId === input.primaryEnvironmentId)

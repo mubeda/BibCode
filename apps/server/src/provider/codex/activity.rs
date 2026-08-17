@@ -627,6 +627,12 @@ impl CodexActivityTracker {
                 item_timestamp_ms(params, emitted_at_ms),
             );
         }
+        if item_type == "commandExecution" && self.is_root_thread(thread_id) {
+            return CodexActivityOutput {
+                request_reconciliation: true,
+                ..CodexActivityOutput::default()
+            };
+        }
         if matches!(
             item_type,
             "dynamicToolCall" | "mcpToolCall" | "commandExecution" | "agentMessage" | "reasoning"
@@ -4119,6 +4125,52 @@ mod tests {
 
         assert_eq!(live_id, live_id_after_pressure);
         assert_ne!(live_id, colliding_id);
+    }
+
+    #[test]
+    fn root_command_start_requests_background_terminal_reconciliation() {
+        let mut tracker = CodexActivityTracker::new(Some("root-1"));
+        let output = tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "status": "inProgress",
+                    "command": "sleep 600"
+                }
+            }),
+            1_000,
+            0,
+        );
+
+        assert!(output.request_reconciliation);
+        assert!(output.mutations.is_empty());
+    }
+
+    #[test]
+    fn root_command_completion_requests_background_terminal_reconciliation() {
+        let mut tracker = CodexActivityTracker::new(Some("root-1"));
+        let output = tracker.handle_notification(
+            "item/completed",
+            &serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "status": "completed",
+                    "command": "sleep 600"
+                }
+            }),
+            2_000,
+            1,
+        );
+
+        assert!(output.request_reconciliation);
+        assert!(output.mutations.is_empty());
     }
 
     #[test]

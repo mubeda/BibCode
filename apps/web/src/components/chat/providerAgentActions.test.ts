@@ -50,6 +50,7 @@ const disabledOpenCode = provider({
   driver: "opencode",
   displayName: "OpenCode",
 });
+const readyGrok = provider({ instanceId: "grok", driver: "grok", displayName: "Grok" });
 const unreadyCodex = provider({
   instanceId: "codex",
   driver: "codex",
@@ -70,6 +71,18 @@ describe("buildProviderAgentActions", () => {
       "terminal:codex",
       "terminal:claudeAgent",
     ]);
+  });
+
+  it("never exposes Grok chat or terminal actions even if legacy settings enable it", () => {
+    const actions = buildProviderAgentActions([readyCodex, readyGrok], {
+      ...settings,
+      providers: {
+        ...settings.providers,
+        grok: { ...settings.providers.grok, enabled: true },
+      },
+    });
+
+    expect(actions.map(({ value }) => value)).toEqual(["chat:codex", "terminal:codex"]);
   });
 
   it("keeps visible but unready providers disabled", () => {

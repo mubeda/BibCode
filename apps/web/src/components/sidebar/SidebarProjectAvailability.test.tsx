@@ -38,10 +38,18 @@ function view(
   }
 }
 
-function render(kind: Parameters<typeof view>[0]) {
+function render(
+  kind: Parameters<typeof view>[0],
+  actions: { readonly showRetry: boolean; readonly showConnectionSettings: boolean } = {
+    showRetry: true,
+    showConnectionSettings: true,
+  },
+) {
   return renderToStaticMarkup(
     <SidebarProjectAvailability
       view={view(kind)}
+      showRetry={actions.showRetry}
+      showConnectionSettings={actions.showConnectionSettings}
       onRetry={vi.fn()}
       onOpenSettings={vi.fn()}
       onViewDiagnostics={vi.fn()}
@@ -83,6 +91,8 @@ describe("SidebarProjectAvailability", () => {
     const onAdoptStorage = vi.fn();
     const element = SidebarProjectAvailability({
       view: view("storage-changed"),
+      showRetry: true,
+      showConnectionSettings: true,
       onRetry,
       onOpenSettings,
       onViewDiagnostics,
@@ -117,6 +127,31 @@ describe("SidebarProjectAvailability", () => {
     expect(render("available")).toBe("");
   });
 
+  it("renders only explicitly permitted recovery actions", () => {
+    const desktopRemote = render("unavailable", {
+      showRetry: false,
+      showConnectionSettings: false,
+    });
+    expect(desktopRemote).toContain("Projects are unavailable");
+    expect(desktopRemote).toContain("Diagnostics");
+    expect(desktopRemote).not.toContain("Retry");
+    expect(desktopRemote).not.toContain("Settings");
+
+    const desktopLocal = render("unavailable", {
+      showRetry: true,
+      showConnectionSettings: false,
+    });
+    expect(desktopLocal).toContain("Retry");
+    expect(desktopLocal).not.toContain("Settings");
+
+    const browserRemote = render("unavailable", {
+      showRetry: true,
+      showConnectionSettings: true,
+    });
+    expect(browserRemote).toContain("Retry");
+    expect(browserRemote).toContain("Settings");
+  });
+
   it("labels retained rows as cached while storage adoption is blocked", () => {
     const markup = renderToStaticMarkup(
       <SidebarProjectAvailability
@@ -126,6 +161,8 @@ describe("SidebarProjectAvailability", () => {
           error: null,
           hasCachedProjects: true,
         }}
+        showRetry
+        showConnectionSettings
         onRetry={vi.fn()}
         onOpenSettings={vi.fn()}
         onViewDiagnostics={vi.fn()}

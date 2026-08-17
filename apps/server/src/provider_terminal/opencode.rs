@@ -13,34 +13,45 @@ use std::{
 };
 
 use base64::Engine as _;
+use futures_util::FutureExt as _;
+use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    process::Child,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinHandle,
 };
 
+#[cfg(test)]
+use super::TerminalObserverGeneration;
+use super::model::TerminalObserverGenerationLease;
 use super::{
     PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalObserverFactory,
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityAdmission,
     TerminalAgentActivityControl, TerminalAgentActivityObservation,
     TerminalAgentActivityObservationKind, TerminalAgentActivityState,
     TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
-    TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalObserverWorkerContext,
 };
 #[cfg(test)]
 use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
 use crate::{
     activity::{ActivityCapabilities, ActivityHistoryRecovery, ProviderActivityMutation},
+    diagnostics::{
+        AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
+        ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
+        RegistrationSource,
+    },
     process::{
-        configure_background_command,
+        Platform, configure_supervised_background_command_wrap,
         supervised::{SupervisedOverflow, SupervisedRunRequest, run_supervised},
     },
-    provider::opencode::activity::{
-        MAX_RECONCILED_CHILDREN, OpenCodeActivityOutput, OpenCodeActivityTracker,
-    },
     provider::opencode::sse::OpenCodeSseDecoder,
+    provider::opencode::{
+        self,
+        activity::{MAX_RECONCILED_CHILDREN, OpenCodeActivityOutput, OpenCodeActivityTracker},
+    },
 };
 
 const OPENCODE_PROBE_OUTPUT_LIMIT: usize = 128 * 1024;
@@ -50,6 +61,8 @@ const OPENCODE_HTTP_BODY_LIMIT: usize = 1024 * 1024;
 const OPENCODE_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const OPENCODE_HELPER_TERM_GRACE: Duration = Duration::from_millis(100);
 const OPENCODE_HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(100);
+const OPENCODE_HELPER_WAIT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const OPENCODE_HELPER_REAPER_CAPACITY: usize = 16;
 #[cfg(unix)]
 const OPENCODE_WAITID_EINTR_RETRY_LIMIT: usize = 8;
 const OPENCODE_PRE_SPAWN_DELETE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -284,6 +297,7 @@ pub struct OpenCodeHelperLaunch {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    pub process_attribution: ProcessAttributionRegistry,
 }
 
 impl fmt::Debug for OpenCodeHelperLaunch {
@@ -360,6 +374,11 @@ pub trait OpenCodeHelperLauncher: Send + Sync + fmt::Debug {
         &self,
         launch: OpenCodeHelperLaunch,
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeHelperReady, String>> + Send + '_>>;
+
+    #[doc(hidden)]
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 pub trait OpenCodeEventStream: Send {
@@ -473,7 +492,7 @@ impl OpenCodeTerminalObserverFactory {
             Arc::new(CachedOpenCodeCapabilityProbe::new(Arc::new(
                 SystemOpenCodeCapabilityProbeRunner,
             ))),
-            Arc::new(SystemOpenCodeHelperLauncher),
+            Arc::new(SystemOpenCodeHelperLauncher::default()),
             Arc::new(SystemOpenCodeRemoteClientFactory),
             Duration::from_secs(10),
         )
@@ -495,6 +514,12 @@ impl OpenCodeTerminalObserverFactory {
     ) -> Option<PreparedTerminalLaunch> {
         let model = opencode_model_arg(&input.launch.args)?;
         validate_opencode_config(input.launch.launch_env.get("OPENCODE_CONFIG_CONTENT"))?;
+        let executable = opencode::resolve_owned_executable(
+            Platform::current(),
+            Path::new(&input.launch.executable),
+        )
+        .to_string_lossy()
+        .into_owned();
         let password = random_secret()?;
         let mut helper_env = input.launch.launch_env.clone();
         helper_env.insert(
@@ -503,7 +528,7 @@ impl OpenCodeTerminalObserverFactory {
         );
         helper_env.insert("OPENCODE_SERVER_PASSWORD".to_owned(), password.clone());
         let helper_launch = OpenCodeHelperLaunch {
-            executable: input.launch.executable.clone(),
+            executable: executable.clone(),
             args: vec![
                 "serve".to_owned(),
                 "--hostname".to_owned(),
@@ -516,8 +541,10 @@ impl OpenCodeTerminalObserverFactory {
             ],
             cwd: input.launch.cwd.clone(),
             env: helper_env,
+            process_attribution: input.process_attribution.clone(),
         };
-        let cleanup_generation = input.launch.generation.clone();
+        let cleanup_generation = input.launch.generation.observation();
+        let cleanup_workers = input.launch.generation.worker_context();
         let helper = async {
             let ready = self.helper.start(helper_launch).await?;
             let resources = Arc::new(OpenCodeObserverResources {
@@ -529,8 +556,7 @@ impl OpenCodeTerminalObserverFactory {
             });
             let cleanup_resources = resources.clone();
             let worker_generation = cleanup_generation.clone();
-            if cleanup_generation
-                .worker_context()
+            if cleanup_workers
                 .spawn(async move {
                     monitor_opencode_pre_spawn(cleanup_resources, worker_generation).await;
                 })
@@ -541,10 +567,7 @@ impl OpenCodeTerminalObserverFactory {
             }
             Ok((ready.endpoint, resources))
         };
-        let (capabilities, ready) = tokio::join!(
-            self.probe.probe(Path::new(&input.launch.executable)),
-            helper,
-        );
+        let (capabilities, ready) = tokio::join!(self.probe.probe(Path::new(&executable)), helper,);
         let (endpoint, resources) = ready.ok()?;
         let capabilities = capabilities?;
         if !capabilities.serve || !capabilities.attach {
@@ -593,7 +616,7 @@ impl OpenCodeTerminalObserverFactory {
             }),
         };
         Some(PreparedTerminalLaunch {
-            executable: input.launch.executable,
+            executable,
             args: vec![
                 "attach".to_owned(),
                 endpoint,
@@ -620,6 +643,10 @@ impl ProviderTerminalObserverFactory for OpenCodeTerminalObserverFactory {
         input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(self.prepare_inner(input))
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.helper.shutdown()
     }
 }
 
@@ -692,7 +719,7 @@ impl PreparedTerminalObserver for OpenCodePreparedTerminalObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         if self.inner.spawned.swap(true, Ordering::AcqRel) {
@@ -712,7 +739,7 @@ impl PreparedTerminalObserver for OpenCodePreparedTerminalObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -852,7 +879,7 @@ impl Drop for OpenCodeCleanupClaim<'_> {
 
 async fn monitor_opencode_pre_spawn(
     resources: Arc<OpenCodeObserverResources>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 ) {
     if resources.launched.load(Ordering::Acquire) {
         return;
@@ -929,7 +956,7 @@ enum OpenCodeLiveData {
 #[derive(Clone, Copy)]
 struct OpenCodeLiveFence<'a> {
     activity: &'a TerminalAgentActivityControl,
-    generation: &'a TerminalObserverGeneration,
+    generation: &'a TerminalObserverGenerationLease,
     state: TerminalAgentActivityState,
 }
 
@@ -955,7 +982,7 @@ impl OpenCodeLivePublication<'_> {
 
 async fn wait_for_opencode_live_work<T>(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     work: impl Future<Output = T>,
 ) -> OpenCodeLiveWork<T> {
     tokio::pin!(work);
@@ -1008,7 +1035,7 @@ fn decode_and_track_opencode_live_data(
 
 async fn run_opencode_observer(
     inner: Arc<OpenCodeObserverInner>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 ) {
     let mut activity = inner.activity.subscribe();
     let owned_root = inner
@@ -1411,7 +1438,7 @@ async fn stop_opencode_observer(
 
 async fn establish_opencode_event_stream(
     remote: &mut dyn OpenCodeRemoteClient,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     timeout: Duration,
 ) -> Option<Box<dyn OpenCodeEventStream>> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1443,7 +1470,7 @@ async fn establish_opencode_event_stream(
 
 async fn wait_for_opencode_connected(
     stream: &mut dyn OpenCodeEventStream,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> bool {
     loop {
@@ -1469,7 +1496,7 @@ async fn prepare_opencode_replacement(
     dormant_stream: &mut dyn OpenCodeEventStream,
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     expected_state: TerminalAgentActivityState,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> OpenCodeReplacementOutcome {
     let mut dormant_stream_healthy = true;
@@ -1563,7 +1590,7 @@ async fn prepare_opencode_replacement(
 
 async fn keep_attach_until_cancellation(
     resources: &OpenCodeObserverResources,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     remote: &mut dyn OpenCodeRemoteClient,
     root_session_id: &str,
 ) {
@@ -1575,7 +1602,7 @@ async fn keep_attach_until_cancellation(
 async fn wait_for_owned_root(
     remote: &mut dyn OpenCodeRemoteClient,
     root_session_id: &str,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
 ) -> Option<bool> {
     loop {
         if !generation.is_current() {
@@ -1780,7 +1807,119 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
 }
 
 #[derive(Debug)]
-struct SystemOpenCodeHelperLauncher;
+struct SystemOpenCodeHelperLauncher {
+    readiness_timeout: Duration,
+    reaper: Arc<OpenCodeRetainedReaper>,
+    #[cfg(test)]
+    fixture_events: Option<OpenCodeHelperFixtureEvents>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct OpenCodeHelperFixtureEvents {
+    spawned: Arc<crate::test_support::FixtureEvent>,
+    release: Arc<crate::test_support::FixtureEvent>,
+    admission_race: Option<Arc<OpenCodeHelperAdmissionRace>>,
+    reaped: Arc<crate::test_support::FixtureEvent>,
+    pid_path: PathBuf,
+    reap_timeout: Option<OpenCodeHelperReapTimeoutEvents>,
+    stdout_join: Option<OpenCodeHelperStdoutJoinEvents>,
+    wait_error: Option<OpenCodeHelperWaitErrorEvents>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct OpenCodeHelperAdmissionRace {
+    spawned: crate::test_support::FixtureEvent,
+    release: crate::test_support::FixtureEvent,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct OpenCodeHelperReapTimeoutEvents {
+    foreground_wait_started: Arc<crate::test_support::FixtureEvent>,
+    foreground_return_release: Arc<crate::test_support::FixtureEvent>,
+    background_wait_started: Arc<crate::test_support::FixtureEvent>,
+    background_wait_release: Arc<crate::test_support::FixtureEvent>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct OpenCodeHelperStdoutJoinEvents {
+    ownership_registered: Arc<crate::test_support::FixtureEvent>,
+    join_started: Arc<crate::test_support::FixtureEvent>,
+    join_release: Arc<crate::test_support::FixtureEvent>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct OpenCodeHelperWaitErrorEvents {
+    failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    fail_persistently: Arc<AtomicBool>,
+    injected: Arc<crate::test_support::FixtureEvent>,
+    recorded: Arc<crate::test_support::FixtureEvent>,
+    retry_started: Arc<crate::test_support::FixtureEvent>,
+}
+
+#[cfg(test)]
+impl OpenCodeHelperWaitErrorEvents {
+    fn should_inject(&self) -> bool {
+        self.fail_persistently.load(Ordering::Acquire)
+            || self
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+    }
+}
+
+#[cfg(test)]
+impl OpenCodeHelperFixtureEvents {
+    fn publish_pid(&self, process_id: Option<u32>) -> Result<(), String> {
+        let process_id =
+            process_id.ok_or_else(|| "OpenCode helper PID is unavailable".to_owned())?;
+        let mut temporary_name = self.pid_path.as_os_str().to_owned();
+        temporary_name.push(".tmp");
+        let temporary_path = PathBuf::from(temporary_name);
+        std::fs::write(&temporary_path, process_id.to_string())
+            .map_err(|error| format!("failed staging OpenCode helper PID: {error}"))?;
+        std::fs::rename(&temporary_path, &self.pid_path)
+            .map_err(|error| format!("failed publishing OpenCode helper PID: {error}"))?;
+        Ok(())
+    }
+
+    fn publish_spawned(&self, process_id: Option<u32>) -> Result<(), String> {
+        self.publish_pid(process_id)?;
+        self.spawned.publish();
+        Ok(())
+    }
+}
+
+impl Default for SystemOpenCodeHelperLauncher {
+    fn default() -> Self {
+        Self {
+            readiness_timeout: OPENCODE_HELPER_READY_TIMEOUT,
+            reaper: Arc::new(OpenCodeRetainedReaper::default()),
+            #[cfg(test)]
+            fixture_events: None,
+        }
+    }
+}
+
+impl SystemOpenCodeHelperLauncher {
+    #[cfg(all(test, unix))]
+    fn with_fixture_events(
+        readiness_timeout: Duration,
+        fixture_events: OpenCodeHelperFixtureEvents,
+    ) -> Self {
+        Self {
+            readiness_timeout,
+            reaper: Arc::new(OpenCodeRetainedReaper::default()),
+            fixture_events: Some(fixture_events),
+        }
+    }
+}
 
 impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
     fn start(
@@ -1788,51 +1927,136 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
         launch: OpenCodeHelperLaunch,
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeHelperReady, String>> + Send + '_>> {
         Box::pin(async move {
-            let mut command = tokio::process::Command::new(&launch.executable);
-            configure_background_command(&mut command);
-            command
-                .args(&launch.args)
-                .current_dir(&launch.cwd)
-                .envs(&launch.env)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            #[cfg(unix)]
-            command.process_group(0);
+            let reaper_permit = self.reaper.reserve()?;
+            let mut command = CommandWrap::with_new(&launch.executable, |command| {
+                command
+                    .args(&launch.args)
+                    .current_dir(&launch.cwd)
+                    .envs(&launch.env)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+            });
+            configure_supervised_background_command_wrap(&mut command);
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| "OpenCode helper stdout is unavailable".to_owned())?;
+            #[cfg(test)]
+            if let Some(events) = self.fixture_events.as_ref()
+                && let Some(race) = events.admission_race.as_ref()
+            {
+                if let Err(error) = events.publish_pid(child.id()) {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    return Err(error);
+                }
+                race.spawned.publish();
+                race.release.wait_after(0).await;
+            }
+            let identity = child
+                .id()
+                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok());
+            let Some(identity) = identity else {
+                terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                return Err("spawned OpenCode helper has no stable process identity".to_owned());
+            };
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    return Err("OpenCode helper exited before ownership admission".to_owned());
+                }
+                Err(error) => {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    return Err(format!(
+                        "failed to revalidate OpenCode helper process identity: {error}"
+                    ));
+                }
+            }
+            let process_registration = match launch.process_attribution.register_identity(
+                identity,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Helper,
+                    label: "OpenCode server helper".to_owned(),
+                    source: RegistrationSource::Helper,
+                },
+            ) {
+                Ok(registration) => registration,
+                Err(
+                    error @ (ProcessRegistrationError::Shutdown
+                    | ProcessRegistrationError::Capacity),
+                ) => {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    return Err(error.to_string());
+                }
+            };
+            let stdout = match child.stdout().take() {
+                Some(stdout) => stdout,
+                None => {
+                    terminate_and_reap_unregistered_opencode_helper(&mut *child).await;
+                    drop(process_registration);
+                    return Err("OpenCode helper stdout is unavailable".to_owned());
+                }
+            };
             let process = Arc::new(SystemOpenCodeHelperProcess {
                 process_group_id: child.id().and_then(|pid| i32::try_from(pid).ok()),
                 #[cfg(unix)]
                 process_group_identity_reserved: AtomicBool::new(child.id().is_some()),
                 child: Mutex::new(Some(child)),
+                process_registration: Mutex::new(Some(process_registration)),
                 stdout_task: Mutex::new(None),
+                reaper: self.reaper.clone(),
+                reaper_permit: Mutex::new(Some(reaper_permit)),
+                #[cfg(test)]
+                fixture_events: self.fixture_events.clone(),
             });
+            #[cfg(test)]
+            if let Some(events) = self.fixture_events.as_ref() {
+                if let Err(error) = events.publish_spawned(
+                    process
+                        .process_group_id
+                        .and_then(|pid| u32::try_from(pid).ok()),
+                ) {
+                    process.terminate_and_reap().await;
+                    return Err(error);
+                }
+                events.release.wait_after(0).await;
+            }
+            #[cfg(test)]
+            if let Some(stdout_join) = self
+                .fixture_events
+                .as_ref()
+                .and_then(|events| events.stdout_join.as_ref())
+            {
+                let stdout_join = stdout_join.clone();
+                let stdout_task = tokio::spawn(async move {
+                    stdout_join.join_started.publish();
+                    stdout_join.join_release.wait_after(0).await;
+                });
+                *process
+                    .stdout_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stdout_task);
+            }
             let mut stdout = BufReader::new(stdout);
             let endpoint = match tokio::time::timeout(
-                OPENCODE_HELPER_READY_TIMEOUT,
+                self.readiness_timeout,
                 read_opencode_readiness(&mut stdout),
             )
             .await
             {
                 Ok(Ok(endpoint)) => endpoint,
                 Ok(Err(error)) => {
-                    process.terminate();
+                    process.terminate_and_reap().await;
                     return Err(error);
                 }
                 Err(_) => {
-                    process.terminate();
+                    process.terminate_and_reap().await;
                     return Err("OpenCode helper readiness timed out".to_owned());
                 }
             };
             if !valid_loopback_endpoint(&endpoint) {
-                process.terminate();
+                process.terminate_and_reap().await;
                 return Err("OpenCode helper advertised an invalid endpoint".to_owned());
             }
             let stdout_task = tokio::spawn(drain_opencode_stdout(stdout));
@@ -1842,6 +2066,10 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stdout_task);
             Ok(OpenCodeHelperReady { endpoint, process })
         })
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.reaper.shutdown())
     }
 }
 
@@ -1872,6 +2100,20 @@ async fn read_opencode_readiness(
     }
 }
 
+async fn terminate_and_reap_unregistered_opencode_helper(child: &mut dyn ChildWrapper) {
+    let _ = child.start_kill();
+    if tokio::time::timeout(OPENCODE_HELPER_REAP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_ms = OPENCODE_HELPER_REAP_TIMEOUT.as_millis(),
+            "unregistered OpenCode helper reap exceeded its bounded cleanup window"
+        );
+        let _ = child.wait().await;
+    }
+}
+
 async fn drain_opencode_stdout(mut stdout: BufReader<tokio::process::ChildStdout>) {
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -1886,8 +2128,13 @@ struct SystemOpenCodeHelperProcess {
     process_group_id: Option<i32>,
     #[cfg(unix)]
     process_group_identity_reserved: AtomicBool,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<Box<dyn ChildWrapper>>>,
+    process_registration: Mutex<Option<ProcessRegistration>>,
     stdout_task: Mutex<Option<JoinHandle<()>>>,
+    reaper: Arc<OpenCodeRetainedReaper>,
+    reaper_permit: Mutex<Option<OwnedSemaphorePermit>>,
+    #[cfg(test)]
+    fixture_events: Option<OpenCodeHelperFixtureEvents>,
 }
 
 impl fmt::Debug for SystemOpenCodeHelperProcess {
@@ -1909,7 +2156,7 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
         };
         #[cfg(unix)]
         {
-            match child_has_exited_without_reaping(child) {
+            match child_has_exited_without_reaping(child.as_ref()) {
                 Ok(exited) => exited,
                 Err(_) => {
                     // An uncertain observation no longer proves that the
@@ -1928,7 +2175,7 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
     }
 
     fn terminate(&self) {
-        let mut child = self
+        let child = self
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1938,14 +2185,28 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(stdout_task) = stdout_task {
-            stdout_task.abort();
-        }
-        let Some(child) = child.as_mut() else {
+        let permit = self
+            .reaper_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let process_registration = self
+            .process_registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(mut child) = child else {
+            return;
+        };
+        let Some(permit) = permit else {
             return;
         };
         #[cfg(unix)]
-        if let Some(process_group_id) = self.reserved_process_group_id() {
+        let process_group_id = self.reserved_process_group_id();
+        #[cfg(not(unix))]
+        let process_group_id = self.process_group_id;
+        #[cfg(unix)]
+        if let Some(process_group_id) = process_group_id {
             // SAFETY: the process-group ID was captured from this owned helper
             // and non-reaping observation still proves its leader identity is
             // reserved.
@@ -1954,61 +2215,91 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
             }
         }
         let _ = child.start_kill();
+        self.reaper.submit(
+            child,
+            process_group_id,
+            permit,
+            process_registration,
+            stdout_task,
+            #[cfg(test)]
+            self.fixture_events.clone(),
+        );
     }
 
     fn terminate_and_reap(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let child = self
-                .child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            #[cfg(unix)]
-            let process_group_id = self.reserved_process_group_id();
-            #[cfg(not(unix))]
-            let process_group_id = self.process_group_id;
-            let mut cleanup = child.map(|child| SystemOpenCodeReapGuard {
-                child: Some(child),
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(unix)]
+        let process_group_id = self.reserved_process_group_id();
+        #[cfg(not(unix))]
+        let process_group_id = self.process_group_id;
+        let stdout_task = self
+            .stdout_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let permit = self
+            .reaper_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let process_registration = self
+            .process_registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let foreground_done = match (child, permit) {
+            (Some(child), Some(permit)) => {
                 #[cfg(unix)]
-                process_group_id,
-            });
-            let stdout_task = self
-                .stdout_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(stdout_task) = stdout_task {
-                stdout_task.abort();
-                let _ = stdout_task.await;
+                if let Some(process_group_id) = process_group_id {
+                    // SAFETY: the process-group ID was captured from this owned
+                    // helper and its leader identity is still reserved.
+                    unsafe {
+                        libc::kill(-process_group_id, libc::SIGTERM);
+                    }
+                }
+                #[cfg(test)]
+                let fixture_events = self.fixture_events.clone();
+                Some(self.reaper.submit(
+                    child,
+                    process_group_id,
+                    permit,
+                    process_registration,
+                    stdout_task,
+                    #[cfg(test)]
+                    fixture_events,
+                ))
             }
-            let Some(cleanup) = cleanup.as_mut() else {
+            _ => None,
+        };
+        Box::pin(async move {
+            let Some(mut foreground_done) = foreground_done else {
                 return;
             };
-            #[cfg(unix)]
-            if let Some(process_group_id) = process_group_id {
-                // SAFETY: the process-group ID was captured from this owned
-                // helper and its leader identity is still reserved.
-                unsafe {
-                    libc::kill(-process_group_id, libc::SIGTERM);
+            while !*foreground_done.borrow() {
+                if foreground_done.changed().await.is_err() {
+                    break;
                 }
             }
-            reap_opencode_helper(cleanup.child_mut(), process_group_id).await;
-            cleanup.disarm();
         })
     }
 }
 
 struct SystemOpenCodeReapGuard {
-    child: Option<Child>,
+    child: Option<Box<dyn ChildWrapper>>,
     #[cfg(unix)]
     process_group_id: Option<i32>,
 }
 
 impl SystemOpenCodeReapGuard {
-    fn child_mut(&mut self) -> &mut Child {
+    fn child_mut(&mut self) -> &mut dyn ChildWrapper {
         self.child
             .as_mut()
             .expect("OpenCode reap guard owns a child")
+            .as_mut()
     }
 
     fn disarm(&mut self) {
@@ -2045,7 +2336,7 @@ impl SystemOpenCodeHelperProcess {
 }
 
 #[cfg(unix)]
-fn child_has_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+fn child_has_exited_without_reaping(child: &dyn ChildWrapper) -> std::io::Result<bool> {
     let Some(process_id) = child.id() else {
         return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
     };
@@ -2110,7 +2401,19 @@ fn waitid_child_once(process_id: u32) -> std::io::Result<Option<libc::pid_t>> {
     Ok(Some(observed_process_id))
 }
 
-async fn reap_opencode_helper(child: &mut Child, process_group_id: Option<i32>) {
+enum OpenCodeForegroundReap {
+    Reaped,
+    #[cfg(test)]
+    TimedOut,
+    WaitFailed(String),
+}
+
+async fn reap_opencode_helper(
+    cleanup: &mut SystemOpenCodeReapGuard,
+    process_group_id: Option<i32>,
+    foreground_done: &watch::Sender<bool>,
+    #[cfg(test)] fixture_events: Option<&OpenCodeHelperFixtureEvents>,
+) -> OpenCodeForegroundReap {
     tokio::time::sleep(OPENCODE_HELPER_TERM_GRACE).await;
     #[cfg(not(unix))]
     let _ = process_group_id;
@@ -2122,12 +2425,641 @@ async fn reap_opencode_helper(child: &mut Child, process_group_id: Option<i32>) 
             libc::kill(-process_group_id, libc::SIGKILL);
         }
     }
-    let _ = child.start_kill();
-    if tokio::time::timeout(OPENCODE_HELPER_REAP_TIMEOUT, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.wait().await;
+    let _ = cleanup.child_mut().start_kill();
+    #[cfg(test)]
+    if let Some(reap_timeout) = fixture_events.and_then(|events| events.reap_timeout.as_ref()) {
+        reap_timeout.foreground_wait_started.publish();
+        let _ = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
+        return OpenCodeForegroundReap::TimedOut;
+    }
+    let mut wait = Box::pin(wait_opencode_child(
+        cleanup.child_mut(),
+        #[cfg(test)]
+        fixture_events,
+    ));
+    match tokio::time::timeout(OPENCODE_HELPER_REAP_TIMEOUT, wait.as_mut()).await {
+        Ok(Ok(_)) => {
+            drop(wait);
+            cleanup.disarm();
+            OpenCodeForegroundReap::Reaped
+        }
+        Ok(Err(error)) => {
+            OpenCodeForegroundReap::WaitFailed(format!("OpenCode helper wait failed: {error}"))
+        }
+        Err(_) => {
+            // `process-wrap` job/process-group waits may own kernel observation state that is not
+            // cancellation-safe. Publish the foreground budget without dropping that in-flight
+            // wait, then let the retained reaper finish the same future in the background.
+            foreground_done.send_replace(true);
+            let result = wait.as_mut().await;
+            drop(wait);
+            match result {
+                Ok(_) => {
+                    cleanup.disarm();
+                    OpenCodeForegroundReap::Reaped
+                }
+                Err(error) => OpenCodeForegroundReap::WaitFailed(format!(
+                    "OpenCode helper wait failed: {error}"
+                )),
+            }
+        }
+    }
+}
+
+async fn wait_opencode_child(
+    child: &mut dyn ChildWrapper,
+    #[cfg(test)] fixture_events: Option<&OpenCodeHelperFixtureEvents>,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        #[cfg(test)]
+        if let Some(wait_error) = fixture_events.and_then(|events| events.wait_error.as_ref())
+            && wait_error.should_inject()
+        {
+            wait_error.injected.publish();
+            return Err(std::io::Error::other(
+                "injected OpenCode helper wait failure",
+            ));
+        }
+        match child.wait().await {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenCodeRetainedReaperTask {
+    join: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    join_succeeded: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl OpenCodeRetainedReaperTask {
+    fn try_join_finished(&self) -> bool {
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Ok(mut join) = self.join.try_lock() else {
+            return false;
+        };
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(handle) = join.as_mut() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let result = (&mut *handle)
+            .now_or_never()
+            .expect("a finished OpenCode retained reaper join is ready");
+        join.take();
+        self.record_join_result(result)
+    }
+
+    async fn join_completed(&self) -> bool {
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut join = self.join.lock().await;
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(handle) = join.as_mut() else {
+            return false;
+        };
+        let result = (&mut *handle).await;
+        join.take();
+        self.record_join_result(result)
+    }
+
+    fn record_join_result(&self, result: Result<(), tokio::task::JoinError>) -> bool {
+        match result {
+            Ok(()) => {
+                self.join_succeeded.store(true, Ordering::Release);
+                true
+            }
+            Err(error) => {
+                *self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                    "OpenCode helper retained reaper task join failed: {error}"
+                ));
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OpenCodeRetainedReaperEntry {
+    Pending,
+    Running(OpenCodeRetainedReaperTask),
+}
+
+#[derive(Debug)]
+struct OpenCodeRetainedReaperRegistryState {
+    next_task_id: u64,
+    next_drain_epoch: u64,
+    active_drain_epoch: Option<u64>,
+    entries: BTreeMap<u64, OpenCodeRetainedReaperEntry>,
+}
+
+#[derive(Debug)]
+struct OpenCodeRetainedReaper {
+    permits: Arc<Semaphore>,
+    registry: Mutex<OpenCodeRetainedReaperRegistryState>,
+    changed: Arc<tokio::sync::Notify>,
+    drain_epoch: watch::Sender<Option<u64>>,
+}
+
+#[derive(Debug)]
+struct OpenCodePendingReaperRegistration {
+    reaper: Arc<OpenCodeRetainedReaper>,
+    task_id: u64,
+    promoted: bool,
+}
+
+impl Default for OpenCodeRetainedReaper {
+    fn default() -> Self {
+        let (drain_epoch, _) = watch::channel(None);
+        Self {
+            permits: Arc::new(Semaphore::new(OPENCODE_HELPER_REAPER_CAPACITY)),
+            registry: Mutex::new(OpenCodeRetainedReaperRegistryState {
+                next_task_id: 1,
+                next_drain_epoch: 1,
+                active_drain_epoch: None,
+                entries: BTreeMap::new(),
+            }),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            drain_epoch,
+        }
+    }
+}
+
+impl OpenCodeRetainedReaper {
+    fn reserve(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "OpenCode helper cleanup capacity is exhausted".to_owned())
+    }
+
+    fn reserve_pending(self: &Arc<Self>) -> OpenCodePendingReaperRegistration {
+        let terminal_tasks = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .entries
+                .iter()
+                .filter_map(|(task_id, entry)| match entry {
+                    OpenCodeRetainedReaperEntry::Running(task)
+                        if task.completed.load(Ordering::Acquire) =>
+                    {
+                        Some((*task_id, task.clone()))
+                    }
+                    OpenCodeRetainedReaperEntry::Pending
+                    | OpenCodeRetainedReaperEntry::Running(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let joined = terminal_tasks
+            .into_iter()
+            .filter_map(|(task_id, task)| {
+                task.try_join_finished()
+                    .then(|| (task_id, task.join.clone()))
+            })
+            .collect::<Vec<_>>();
+        let task_id = {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (task_id, join) in joined {
+                let remove = matches!(
+                    registry.entries.get(&task_id),
+                    Some(OpenCodeRetainedReaperEntry::Running(task))
+                        if task.join_succeeded.load(Ordering::Acquire)
+                            && Arc::ptr_eq(&task.join, &join)
+                );
+                if remove {
+                    registry.entries.remove(&task_id);
+                }
+            }
+            if registry.entries.is_empty() && registry.active_drain_epoch.take().is_some() {
+                self.drain_epoch.send_replace(None);
+            }
+            let task_id = loop {
+                let task_id = registry.next_task_id;
+                registry.next_task_id = registry.next_task_id.wrapping_add(1);
+                if !registry.entries.contains_key(&task_id) {
+                    break task_id;
+                }
+            };
+            let replaced = registry
+                .entries
+                .insert(task_id, OpenCodeRetainedReaperEntry::Pending);
+            debug_assert!(replaced.is_none(), "new retained reaper task ID is vacant");
+            task_id
+        };
+        self.changed.notify_waiters();
+        OpenCodePendingReaperRegistration {
+            reaper: self.clone(),
+            task_id,
+            promoted: false,
+        }
+    }
+
+    fn submit(
+        self: &Arc<Self>,
+        child: Box<dyn ChildWrapper>,
+        process_group_id: Option<i32>,
+        permit: OwnedSemaphorePermit,
+        process_registration: Option<ProcessRegistration>,
+        stdout_task: Option<JoinHandle<()>>,
+        #[cfg(test)] fixture_events: Option<OpenCodeHelperFixtureEvents>,
+    ) -> watch::Receiver<bool> {
+        let registration = self.reserve_pending();
+        self.submit_reserved(
+            registration,
+            OpenCodeReapSubmission {
+                child,
+                process_group_id,
+                permit,
+                process_registration,
+                stdout_task,
+                #[cfg(test)]
+                fixture_events,
+            },
+        )
+    }
+
+    fn submit_reserved(
+        self: &Arc<Self>,
+        mut registration: OpenCodePendingReaperRegistration,
+        submission: OpenCodeReapSubmission,
+    ) -> watch::Receiver<bool> {
+        let OpenCodeReapSubmission {
+            child,
+            process_group_id,
+            permit,
+            process_registration,
+            stdout_task,
+            #[cfg(test)]
+            fixture_events,
+        } = submission;
+        let cleanup = SystemOpenCodeReapGuard {
+            child: Some(child),
+            #[cfg(unix)]
+            process_group_id,
+        };
+        assert!(
+            Arc::ptr_eq(self, &registration.reaper),
+            "OpenCode retained reaper registration belongs to a different registry"
+        );
+        let (foreground_done, foreground_wait) = watch::channel(false);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let task_failure = failure.clone();
+        let changed = self.changed.clone();
+        let mut drain_epoch = self.drain_epoch.subscribe();
+        #[cfg(test)]
+        let ownership_registered = fixture_events
+            .as_ref()
+            .and_then(|events| events.stdout_join.as_ref())
+            .map(|events| events.ownership_registered.clone());
+        let join = tokio::spawn(async move {
+            let _permit = permit;
+            let _process_registration = process_registration;
+            let mut cleanup = cleanup;
+            let mut consumed_drain_epoch = None;
+            if let Some(stdout_task) = stdout_task {
+                #[cfg(test)]
+                let retain_stdout_join = fixture_events
+                    .as_ref()
+                    .and_then(|events| events.stdout_join.as_ref())
+                    .is_some();
+                #[cfg(not(test))]
+                let retain_stdout_join = false;
+                if !retain_stdout_join {
+                    stdout_task.abort();
+                }
+                let _ = stdout_task.await;
+            }
+            let foreground_reap = reap_opencode_helper(
+                &mut cleanup,
+                process_group_id,
+                &foreground_done,
+                #[cfg(test)]
+                fixture_events.as_ref(),
+            )
+            .await;
+            let mut wait_failed = match foreground_reap {
+                OpenCodeForegroundReap::Reaped => {
+                    #[cfg(test)]
+                    if let Some(events) = fixture_events.as_ref() {
+                        events.reaped.publish();
+                    }
+                    foreground_done.send_replace(true);
+                    task_completed.store(true, Ordering::Release);
+                    changed.notify_waiters();
+                    return;
+                }
+                OpenCodeForegroundReap::WaitFailed(error) => {
+                    let first_failure = {
+                        let mut failure = task_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let first_failure = failure.is_none();
+                        *failure = Some(error);
+                        first_failure
+                    };
+                    #[cfg(test)]
+                    if let Some(wait_error) = fixture_events
+                        .as_ref()
+                        .and_then(|events| events.wait_error.as_ref())
+                    {
+                        wait_error.recorded.publish();
+                    }
+                    if first_failure {
+                        changed.notify_waiters();
+                    }
+                    true
+                }
+                #[cfg(test)]
+                OpenCodeForegroundReap::TimedOut => false,
+            };
+            #[cfg(test)]
+            if let Some(reap_timeout) = fixture_events
+                .as_ref()
+                .and_then(|events| events.reap_timeout.as_ref())
+            {
+                reap_timeout.background_wait_started.publish();
+                reap_timeout.foreground_return_release.wait_after(0).await;
+            }
+            foreground_done.send_replace(true);
+            #[cfg(test)]
+            if let Some(reap_timeout) = fixture_events
+                .as_ref()
+                .and_then(|events| events.reap_timeout.as_ref())
+            {
+                reap_timeout.background_wait_release.wait_after(0).await;
+            }
+            loop {
+                if wait_failed {
+                    let retry_delay = tokio::time::sleep(OPENCODE_HELPER_WAIT_RETRY_DELAY);
+                    tokio::pin!(retry_delay);
+                    loop {
+                        let active_drain_epoch = *drain_epoch.borrow_and_update();
+                        if active_drain_epoch.is_some()
+                            && active_drain_epoch != consumed_drain_epoch
+                        {
+                            consumed_drain_epoch = active_drain_epoch;
+                            #[cfg(test)]
+                            if let Some(wait_error) = fixture_events
+                                .as_ref()
+                                .and_then(|events| events.wait_error.as_ref())
+                            {
+                                wait_error.retry_started.publish();
+                            }
+                            break;
+                        }
+                        tokio::select! {
+                            _ = &mut retry_delay => {
+                                #[cfg(test)]
+                                if let Some(wait_error) = fixture_events
+                                    .as_ref()
+                                    .and_then(|events| events.wait_error.as_ref())
+                                {
+                                    wait_error.retry_started.publish();
+                                }
+                                break;
+                            }
+                            changed = drain_epoch.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                    }
+                }
+                match wait_opencode_child(
+                    cleanup.child_mut(),
+                    #[cfg(test)]
+                    fixture_events.as_ref(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        *task_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        break;
+                    }
+                    Err(error) => {
+                        let first_failure = {
+                            let mut failure = task_failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let first_failure = failure.is_none();
+                            *failure = Some(format!("OpenCode helper wait failed: {error}"));
+                            first_failure
+                        };
+                        #[cfg(test)]
+                        if let Some(wait_error) = fixture_events
+                            .as_ref()
+                            .and_then(|events| events.wait_error.as_ref())
+                        {
+                            wait_error.recorded.publish();
+                        }
+                        if first_failure {
+                            changed.notify_waiters();
+                        }
+                        wait_failed = true;
+                    }
+                }
+            }
+            cleanup.disarm();
+            #[cfg(test)]
+            if let Some(events) = fixture_events.as_ref() {
+                events.reaped.publish();
+            }
+            task_completed.store(true, Ordering::Release);
+            changed.notify_waiters();
+        });
+        let mut retained_task = Some(OpenCodeRetainedReaperTask {
+            join: Arc::new(tokio::sync::Mutex::new(Some(join))),
+            join_succeeded: Arc::new(AtomicBool::new(false)),
+            completed,
+            failure,
+        });
+        let promotion_error = {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match registry.entries.get_mut(&registration.task_id) {
+                Some(entry @ OpenCodeRetainedReaperEntry::Pending) => {
+                    *entry = OpenCodeRetainedReaperEntry::Running(
+                        retained_task
+                            .take()
+                            .expect("retained reaper task is promoted exactly once"),
+                    );
+                    registration.promoted = true;
+                    None
+                }
+                Some(OpenCodeRetainedReaperEntry::Running(_)) => {
+                    Some("OpenCode retained reaper pending registration was already promoted")
+                }
+                None => Some(
+                    "OpenCode retained reaper pending registration disappeared before promotion",
+                ),
+            }
+        };
+        if let Some(message) = promotion_error {
+            let retained_task = retained_task
+                .take()
+                .expect("failed retained reaper promotion keeps the spawned task");
+            let mut join = retained_task
+                .join
+                .try_lock()
+                .expect("unpublished retained reaper join owner is uncontended");
+            join.take()
+                .expect("failed retained reaper promotion keeps its join handle")
+                .abort();
+            panic!("{message}");
+        }
+        self.changed.notify_waiters();
+        #[cfg(test)]
+        if let Some(ownership_registered) = ownership_registered {
+            ownership_registered.publish();
+        }
+        foreground_wait
+    }
+
+    async fn shutdown(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let completed = {
+                let registry = self
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .entries
+                    .iter()
+                    .filter_map(|(task_id, entry)| match entry {
+                        OpenCodeRetainedReaperEntry::Running(task)
+                            if task.completed.load(Ordering::Acquire) =>
+                        {
+                            Some((*task_id, task.clone()))
+                        }
+                        OpenCodeRetainedReaperEntry::Pending
+                        | OpenCodeRetainedReaperEntry::Running(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut joined = Vec::with_capacity(completed.len());
+            for (task_id, task) in completed {
+                if task.join_completed().await {
+                    joined.push((task_id, task.join));
+                }
+            }
+            let (failure, linearized_empty) = {
+                let mut registry = self
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (task_id, join) in joined {
+                    let remove = matches!(
+                        registry.entries.get(&task_id),
+                        Some(OpenCodeRetainedReaperEntry::Running(task))
+                            if task.join_succeeded.load(Ordering::Acquire)
+                                && Arc::ptr_eq(&task.join, &join)
+                    );
+                    if remove {
+                        registry.entries.remove(&task_id);
+                    }
+                }
+                let failure = registry.entries.values().find_map(|entry| match entry {
+                    OpenCodeRetainedReaperEntry::Pending => None,
+                    OpenCodeRetainedReaperEntry::Running(task) => task
+                        .failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                });
+                let linearized_empty = registry.entries.is_empty();
+                if linearized_empty {
+                    if registry.active_drain_epoch.take().is_some() {
+                        self.drain_epoch.send_replace(None);
+                    }
+                } else if registry.active_drain_epoch.is_none() {
+                    let drain_epoch = registry.next_drain_epoch;
+                    registry.next_drain_epoch = registry
+                        .next_drain_epoch
+                        .checked_add(1)
+                        .expect("OpenCode retained reaper drain epoch exhausted");
+                    registry.active_drain_epoch = Some(drain_epoch);
+                    self.drain_epoch.send_replace(Some(drain_epoch));
+                }
+                (failure, linearized_empty)
+            };
+            if linearized_empty {
+                return;
+            }
+            if let Some(error) = failure {
+                tracing::warn!(%error, "OpenCode helper retained reaper drain is waiting for a successful kernel wait");
+            }
+            notified.await;
+        }
+    }
+}
+
+struct OpenCodeReapSubmission {
+    child: Box<dyn ChildWrapper>,
+    process_group_id: Option<i32>,
+    permit: OwnedSemaphorePermit,
+    process_registration: Option<ProcessRegistration>,
+    stdout_task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    fixture_events: Option<OpenCodeHelperFixtureEvents>,
+}
+
+impl Drop for OpenCodePendingReaperRegistration {
+    fn drop(&mut self) {
+        if self.promoted {
+            return;
+        }
+        let removed = {
+            let mut registry = self
+                .reaper
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let removed = matches!(
+                registry.entries.get(&self.task_id),
+                Some(OpenCodeRetainedReaperEntry::Pending)
+            );
+            if removed {
+                registry.entries.remove(&self.task_id);
+                if registry.entries.is_empty() && registry.active_drain_epoch.take().is_some() {
+                    self.reaper.drain_epoch.send_replace(None);
+                }
+            }
+            removed
+        };
+        if removed {
+            self.reaper.changed.notify_waiters();
+        }
     }
 }
 
@@ -2483,7 +3415,7 @@ async fn read_bounded_json(mut response: reqwest::Response) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{convert::Infallible, process::ExitStatus, sync::atomic::AtomicUsize};
 
     use axum::{
         Router,
@@ -2495,6 +3427,1162 @@ mod tests {
     use futures_util::{StreamExt, stream};
 
     use super::*;
+    #[cfg(unix)]
+    use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[derive(Debug)]
+    struct CancellationSensitiveWaitState {
+        wait_calls: AtomicUsize,
+        cancelled_waits: AtomicUsize,
+        wait_started: watch::Sender<bool>,
+        release: watch::Sender<bool>,
+    }
+
+    impl CancellationSensitiveWaitState {
+        fn new() -> Self {
+            let (wait_started, _) = watch::channel(false);
+            let (release, _) = watch::channel(false);
+            Self {
+                wait_calls: AtomicUsize::new(0),
+                cancelled_waits: AtomicUsize::new(0),
+                wait_started,
+                release,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancellationSensitiveWaitChild {
+        state: Arc<CancellationSensitiveWaitState>,
+    }
+
+    impl ChildWrapper for CancellationSensitiveWaitChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send + '_>> {
+            self.state.wait_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.wait_started.send_replace(true);
+            let mut release = self.state.release.subscribe();
+            let cancelled_waits = &self.state.cancelled_waits;
+            Box::pin(async move {
+                struct CancellationGuard<'a> {
+                    cancelled_waits: &'a AtomicUsize,
+                    completed: bool,
+                }
+
+                impl Drop for CancellationGuard<'_> {
+                    fn drop(&mut self) {
+                        if !self.completed {
+                            self.cancelled_waits.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+
+                let mut guard = CancellationGuard {
+                    cancelled_waits,
+                    completed: false,
+                };
+                while !*release.borrow() {
+                    release.changed().await.map_err(|_| {
+                        std::io::Error::other("cancellation-sensitive wait release closed")
+                    })?;
+                }
+                guard.completed = true;
+                Ok(successful_exit_status())
+            })
+        }
+    }
+
+    fn successful_exit_status() -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(0)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_reaper_continues_the_same_wait_after_its_foreground_budget() {
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
+        let state = Arc::new(CancellationSensitiveWaitState::new());
+        let mut wait_started = state.wait_started.subscribe();
+        let mut foreground_done = reaper.submit(
+            Box::new(CancellationSensitiveWaitChild {
+                state: state.clone(),
+            }),
+            None,
+            reaper.reserve().expect("reserve retained reaper capacity"),
+            None,
+            None,
+            None,
+        );
+
+        while !*wait_started.borrow_and_update() {
+            wait_started
+                .changed()
+                .await
+                .expect("wait-start publisher remains live");
+        }
+        tokio::time::advance(OPENCODE_HELPER_TERM_GRACE).await;
+        assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(OPENCODE_HELPER_REAP_TIMEOUT).await;
+        while !*foreground_done.borrow_and_update() {
+            foreground_done
+                .changed()
+                .await
+                .expect("foreground completion publisher remains live");
+        }
+
+        assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
+
+        state.release.send_replace(true);
+        reaper.shutdown().await;
+        assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct InvalidReadinessFixture {
+        sandbox: TestSandbox,
+        executable: PathBuf,
+        pid_path: PathBuf,
+        events: OpenCodeHelperFixtureEvents,
+        pair_started: Arc<tokio::sync::Barrier>,
+    }
+
+    #[cfg(unix)]
+    fn invalid_readiness_fixture(
+        sandbox: TestSandbox,
+        pair_started: Arc<tokio::sync::Barrier>,
+    ) -> InvalidReadinessFixture {
+        let pid_path = sandbox.path("helper.pid");
+        let executable = sandbox.executable_script(
+            "invalid-opencode-helper",
+            "printf 'opencode server listening on http://0.0.0.0:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        InvalidReadinessFixture {
+            sandbox,
+            executable,
+            pid_path: pid_path.clone(),
+            events: OpenCodeHelperFixtureEvents {
+                spawned: Arc::new(FixtureEvent::default()),
+                release: Arc::new(FixtureEvent::default()),
+                admission_race: None,
+                reaped: Arc::new(FixtureEvent::default()),
+                pid_path,
+                reap_timeout: None,
+                stdout_join: None,
+                wait_error: None,
+            },
+            pair_started,
+        }
+    }
+
+    #[cfg(unix)]
+    impl InvalidReadinessFixture {
+        async fn start_and_release(&self) -> (String, i32) {
+            let launcher = SystemOpenCodeHelperLauncher::with_fixture_events(
+                OPENCODE_HELPER_READY_TIMEOUT,
+                self.events.clone(),
+            );
+            let launch = OpenCodeHelperLaunch {
+                executable: self.executable.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: self.sandbox.root().to_path_buf(),
+                env: self
+                    .sandbox
+                    .environment(std::iter::empty::<(String, String)>()),
+                process_attribution: ProcessAttributionRegistry::new(),
+            };
+            let start = tokio::spawn(async move { launcher.start(launch).await });
+            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
+                .await
+                .expect("OpenCode PID publication outer watchdog");
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("OpenCode helper PID")
+                .parse::<i32>()
+                .expect("numeric OpenCode helper PID");
+            self.pair_started.wait().await;
+            self.events.release.publish();
+            let error = tokio::time::timeout(Duration::from_secs(10), start)
+                .await
+                .expect("OpenCode invalid readiness outer watchdog")
+                .expect("OpenCode helper start task")
+                .expect_err("invalid OpenCode readiness must fail");
+            (error, pid)
+        }
+
+        async fn wait_reaped(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
+                .await
+                .expect("OpenCode helper reap outer watchdog");
+        }
+    }
+
+    #[cfg(unix)]
+    struct RetainedReapFixture {
+        _sandbox: TestSandbox,
+        pid_path: PathBuf,
+        events: OpenCodeHelperFixtureEvents,
+        timeout_events: OpenCodeHelperReapTimeoutEvents,
+        launcher: Arc<SystemOpenCodeHelperLauncher>,
+        launch: OpenCodeHelperLaunch,
+    }
+
+    #[cfg(unix)]
+    struct PreparedRetainedSubmission {
+        child: Box<dyn ChildWrapper>,
+        process_group_id: Option<i32>,
+        permit: OwnedSemaphorePermit,
+        pid: u32,
+    }
+
+    #[cfg(unix)]
+    fn retained_reap_fixture(name: &str) -> RetainedReapFixture {
+        let sandbox = TestSandbox::new(name);
+        let pid_path = sandbox.path("helper.pid");
+        let executable = sandbox.executable_script(
+            "invalid-opencode-helper",
+            "printf 'opencode server listening on http://0.0.0.0:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let timeout_events = OpenCodeHelperReapTimeoutEvents {
+            foreground_wait_started: Arc::new(FixtureEvent::default()),
+            foreground_return_release: Arc::new(FixtureEvent::default()),
+            background_wait_started: Arc::new(FixtureEvent::default()),
+            background_wait_release: Arc::new(FixtureEvent::default()),
+        };
+        let events = OpenCodeHelperFixtureEvents {
+            spawned: Arc::new(FixtureEvent::default()),
+            release: Arc::new(FixtureEvent::default()),
+            admission_race: None,
+            reaped: Arc::new(FixtureEvent::default()),
+            pid_path: pid_path.clone(),
+            reap_timeout: Some(timeout_events.clone()),
+            stdout_join: None,
+            wait_error: None,
+        };
+        let launcher = Arc::new(SystemOpenCodeHelperLauncher::with_fixture_events(
+            OPENCODE_HELPER_READY_TIMEOUT,
+            events.clone(),
+        ));
+        let launch = OpenCodeHelperLaunch {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: sandbox.root().to_path_buf(),
+            env: sandbox.environment(std::iter::empty::<(String, String)>()),
+            process_attribution: ProcessAttributionRegistry::new(),
+        };
+        RetainedReapFixture {
+            _sandbox: sandbox,
+            pid_path,
+            events,
+            timeout_events,
+            launcher,
+            launch,
+        }
+    }
+
+    #[cfg(unix)]
+    impl RetainedReapFixture {
+        fn with_stdout_join(mut self, stdout_join: OpenCodeHelperStdoutJoinEvents) -> Self {
+            Arc::get_mut(&mut self.launcher)
+                .expect("fixture launcher is uniquely owned")
+                .fixture_events
+                .as_mut()
+                .expect("fixture events")
+                .stdout_join = Some(stdout_join);
+            self
+        }
+
+        fn with_wait_error(mut self, wait_error: OpenCodeHelperWaitErrorEvents) -> Self {
+            Arc::get_mut(&mut self.launcher)
+                .expect("fixture launcher is uniquely owned")
+                .fixture_events
+                .as_mut()
+                .expect("fixture events")
+                .wait_error = Some(wait_error);
+            self
+        }
+
+        fn without_reap_timeout(mut self) -> Self {
+            self.events.reap_timeout = None;
+            Arc::get_mut(&mut self.launcher)
+                .expect("fixture launcher is uniquely owned")
+                .fixture_events
+                .as_mut()
+                .expect("fixture events")
+                .reap_timeout = None;
+            self
+        }
+
+        async fn prepare_retained_submission(&self) -> PreparedRetainedSubmission {
+            let permit = self
+                .launcher
+                .reaper
+                .reserve()
+                .expect("retained submission permit");
+            self.spawn_prepared_retained_submission(permit)
+        }
+
+        async fn prepare_retained_submission_waiting_for_permit(
+            &self,
+        ) -> PreparedRetainedSubmission {
+            let permit = self
+                .launcher
+                .reaper
+                .permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("retained submission semaphore remains open");
+            self.spawn_prepared_retained_submission(permit)
+        }
+
+        fn spawn_prepared_retained_submission(
+            &self,
+            permit: OwnedSemaphorePermit,
+        ) -> PreparedRetainedSubmission {
+            let mut command = CommandWrap::with_new("/bin/sleep", |command| {
+                command
+                    .arg("3600")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+            });
+            configure_supervised_background_command_wrap(&mut command);
+            let child = command.spawn().expect("retained submission child");
+            let pid = child.id().expect("retained submission child PID");
+            PreparedRetainedSubmission {
+                child,
+                process_group_id: i32::try_from(pid).ok(),
+                permit,
+                pid,
+            }
+        }
+
+        fn submit_reserved_real_child(
+            &self,
+            registration: OpenCodePendingReaperRegistration,
+            prepared: PreparedRetainedSubmission,
+        ) -> watch::Receiver<bool> {
+            self.launcher.reaper.submit_reserved(
+                registration,
+                OpenCodeReapSubmission {
+                    child: prepared.child,
+                    process_group_id: prepared.process_group_id,
+                    permit: prepared.permit,
+                    process_registration: None,
+                    stdout_task: None,
+                    fixture_events: Some(
+                        self.launcher
+                            .fixture_events
+                            .clone()
+                            .expect("retained fixture events"),
+                    ),
+                },
+            )
+        }
+
+        fn release_foreground_and_background_waits(&self) {
+            self.timeout_events.foreground_return_release.publish();
+            self.timeout_events.background_wait_release.publish();
+        }
+
+        async fn reach_background_owner(
+            &self,
+        ) -> (
+            tokio::task::JoinHandle<Result<OpenCodeHelperReady, String>>,
+            u32,
+        ) {
+            let launcher = self.launcher.clone();
+            let launch = self.launch.clone();
+            let start = tokio::spawn(async move { launcher.start(launch).await });
+            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
+                .await
+                .expect("OpenCode PID publication outer watchdog");
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("OpenCode helper PID")
+                .parse::<u32>()
+                .expect("numeric OpenCode helper PID");
+            self.events.release.publish();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.timeout_events.foreground_wait_started.wait_after(0),
+            )
+            .await
+            .expect("foreground reap attempt outer watchdog");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.timeout_events.background_wait_started.wait_after(0),
+            )
+            .await
+            .expect("retained reaper ownership outer watchdog");
+            (start, pid)
+        }
+
+        async fn assert_reaped(&self, pid: u32) {
+            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
+                .await
+                .expect("retained reap completion outer watchdog");
+            assert!(matches!(
+                waitid_child_once(pid),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+            ));
+            assert_eq!(
+                self.launcher.reaper.permits.available_permits(),
+                OPENCODE_HELPER_REAPER_CAPACITY,
+                "every retained cleanup permit must return after the final wait"
+            );
+            let registry = self
+                .launcher
+                .reaper
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.entries.is_empty(),
+                "retained registry must be empty after shutdown joins completion"
+            );
+            assert_eq!(
+                registry.active_drain_epoch, None,
+                "empty retained registry must reset its drain epoch"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn next_active_drain_epoch(epoch: &mut watch::Receiver<Option<u64>>) -> u64 {
+        loop {
+            if let Some(epoch) = *epoch.borrow_and_update() {
+                return epoch;
+            }
+            epoch
+                .changed()
+                .await
+                .expect("drain epoch sender remains live");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn next_completed_join_owner(
+        reaper: &Arc<OpenCodeRetainedReaper>,
+    ) -> (u64, Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>) {
+        loop {
+            let notified = reaper.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let completed = {
+                let registry = reaper
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry.entries.iter().find_map(|(task_id, entry)| {
+                    let OpenCodeRetainedReaperEntry::Running(task) = entry else {
+                        return None;
+                    };
+                    task.completed
+                        .load(Ordering::Acquire)
+                        .then(|| (*task_id, task.join.clone()))
+                })
+            };
+            if let Some(completed) = completed {
+                return completed;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completed_submissions_are_pruned_without_shutdown() {
+        let fixture =
+            retained_reap_fixture("opencode-completed-submission-pruning").without_reap_timeout();
+        let submission_count = OPENCODE_HELPER_REAPER_CAPACITY * 2;
+        let mut process_ids = Vec::with_capacity(submission_count);
+        let mut reaped_checkpoint = fixture.events.reaped.checkpoint();
+
+        for _ in 0..submission_count {
+            let prepared = fixture
+                .prepare_retained_submission_waiting_for_permit()
+                .await;
+            process_ids.push(prepared.pid);
+            let registration = fixture.launcher.reaper.reserve_pending();
+            assert!(
+                fixture
+                    .launcher
+                    .reaper
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .len()
+                    <= OPENCODE_HELPER_REAPER_CAPACITY,
+                "each normal reservation keeps retained records within live capacity"
+            );
+            let mut foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+            fixture.events.reaped.wait_after(reaped_checkpoint).await;
+            reaped_checkpoint = fixture.events.reaped.checkpoint();
+            while !*foreground_done.borrow_and_update() {
+                foreground_done
+                    .changed()
+                    .await
+                    .expect("retained foreground completion sender remains live");
+            }
+        }
+        let mut returned_permits = Vec::with_capacity(OPENCODE_HELPER_REAPER_CAPACITY);
+        for _ in 0..OPENCODE_HELPER_REAPER_CAPACITY {
+            returned_permits.push(
+                fixture
+                    .launcher
+                    .reaper
+                    .permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("all retained cleanup permits return"),
+            );
+        }
+
+        let registry = fixture
+            .launcher
+            .reaper
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            registry.entries.len() <= OPENCODE_HELPER_REAPER_CAPACITY,
+            "terminal retained records must remain bounded by live cleanup capacity"
+        );
+        drop(registry);
+        for pid in process_ids {
+            assert!(matches!(
+                waitid_child_once(pid),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+            ));
+        }
+        drop(returned_permits);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_completed_join_keeps_shared_registry_owner() {
+        let fixture =
+            retained_reap_fixture("opencode-cancelled-completed-join").without_reap_timeout();
+        let prepared = fixture.prepare_retained_submission().await;
+        let pid = prepared.pid;
+        let registration = fixture.launcher.reaper.reserve_pending();
+        let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+        let (task_id, join_owner) = next_completed_join_owner(&fixture.launcher.reaper).await;
+        let join_guard = join_owner.lock().await;
+        assert!(join_guard.is_some(), "registry owns the terminal task join");
+
+        let mut cancelled_shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(cancelled_shutdown.as_mut().poll(context))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "shutdown waits at the completed-entry join boundary"
+        );
+        {
+            let registry = fixture
+                .launcher
+                .reaper
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.entries.contains_key(&task_id),
+                "the registry remains the shared join owner while shutdown waits"
+            );
+        }
+        drop(cancelled_shutdown);
+        assert!(
+            join_guard.is_some(),
+            "cancelling shutdown leaves the join handle in its shared owner"
+        );
+        drop(join_guard);
+
+        let shutdowns = (0..8)
+            .map(|_| {
+                let launcher = fixture.launcher.clone();
+                tokio::spawn(async move { launcher.shutdown().await })
+            })
+            .collect::<Vec<_>>();
+        for shutdown in shutdowns {
+            shutdown
+                .await
+                .expect("concurrent replacement shutdown task");
+        }
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_observes_pending_submission_and_new_task_consumes_active_epoch() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            fail_persistently: Arc::new(AtomicBool::new(false)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-pending-drain-epoch")
+            .with_wait_error(wait_error.clone());
+        let prepared = fixture.prepare_retained_submission().await;
+        let pid = prepared.pid;
+        let registration = fixture.launcher.reaper.reserve_pending();
+        let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
+        let shutdown = tokio::spawn({
+            let launcher = fixture.launcher.clone();
+            async move { launcher.shutdown().await }
+        });
+        let active_epoch = next_active_drain_epoch(&mut epoch).await;
+        assert!(active_epoch > 0, "drain epochs start with a positive value");
+        assert!(
+            !shutdown.is_finished(),
+            "pending registration is live drain work"
+        );
+
+        let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+        fixture.release_foreground_and_background_waits();
+        wait_error.injected.wait_after(0).await;
+        wait_error.retry_started.wait_after(0).await;
+        assert_eq!(
+            wait_error.retry_started.checkpoint(),
+            1,
+            "a task promoted after epoch publication consumes that epoch once"
+        );
+
+        shutdown.await.expect("retained reaper shutdown task");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_pending_registration_unblocks_shutdown_and_releases_its_child() {
+        let fixture = retained_reap_fixture("opencode-dropped-pending-registration");
+        let prepared = fixture.prepare_retained_submission().await;
+        let pid = prepared.pid;
+        let registration = fixture.launcher.reaper.reserve_pending();
+        let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
+        let shutdown = tokio::spawn({
+            let launcher = fixture.launcher.clone();
+            async move { launcher.shutdown().await }
+        });
+        let _active_epoch = next_active_drain_epoch(&mut epoch).await;
+        assert!(
+            !shutdown.is_finished(),
+            "an armed pending registration keeps shutdown live"
+        );
+
+        drop(registration);
+        shutdown.await.expect("pending rollback shutdown task");
+        assert_eq!(
+            *epoch.borrow(),
+            None,
+            "pending rollback resets the active drain epoch"
+        );
+
+        drop(prepared);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    waitid_child_once(pid),
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rolled-back prepared child reap outer watchdog");
+        assert_eq!(
+            fixture.launcher.reaper.permits.available_permits(),
+            OPENCODE_HELPER_REAPER_CAPACITY,
+            "pending rollback releases its reserved cleanup permit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn foreground_wait_error_obeys_the_finite_retry_boundary() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-foreground-wait-error")
+            .with_wait_error(wait_error.clone())
+            .without_reap_timeout();
+        let prepared = fixture.prepare_retained_submission().await;
+        let pid = prepared.pid;
+        let registration = fixture.launcher.reaper.reserve_pending();
+        let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+
+        wait_error.injected.wait_after(0).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            1,
+            "a foreground wait failure must not start an ungated second wait"
+        );
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            1,
+            "the foreground wait failure remains parked through 99 ms"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error.retry_started.wait_after(0).await;
+        wait_error.injected.wait_after(1).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "the foreground wait failure retries once at 100 ms"
+        );
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        fixture.launcher.shutdown().await;
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreground_timeout_transfers_exact_child_before_error_return() {
+        let fixture = retained_reap_fixture("opencode-background-transfer");
+        let (start, pid) = fixture.reach_background_owner().await;
+        assert_eq!(fixture.events.reaped.checkpoint(), 0);
+        fixture.timeout_events.foreground_return_release.publish();
+
+        let error = tokio::time::timeout(Duration::from_secs(10), start)
+            .await
+            .expect("bounded OpenCode readiness error return")
+            .expect("OpenCode start task")
+            .expect_err("invalid endpoint must fail");
+        assert!(
+            error == "OpenCode helper advertised an invalid endpoint"
+                || error == "OpenCode helper readiness timed out"
+        );
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
+            .await
+            .expect("retained reaper shutdown outer watchdog");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_foreground_waiter_does_not_lose_reaper_ownership() {
+        let fixture = retained_reap_fixture("opencode-aborted-waiter");
+        let (start, pid) = fixture.reach_background_owner().await;
+        start.abort();
+        assert!(
+            start
+                .await
+                .expect_err("foreground waiter is aborted")
+                .is_cancelled()
+        );
+
+        fixture.timeout_events.foreground_return_release.publish();
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
+            .await
+            .expect("retained reaper drain after waiter abort");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launcher_shutdown_waits_for_retained_child_true_reap() {
+        let fixture = retained_reap_fixture("opencode-shutdown-drain");
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode start task");
+
+        let shutdown = fixture.launcher.shutdown();
+        tokio::pin!(shutdown);
+        let first_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(shutdown.as_mut().poll(context)))
+                .await;
+        assert!(
+            first_poll.is_pending(),
+            "shutdown must retain the pending reap"
+        );
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("launcher shutdown drains retained child");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_stdout_join_cannot_preempt_registry_ownership() {
+        let stdout_join = OpenCodeHelperStdoutJoinEvents {
+            ownership_registered: Arc::new(FixtureEvent::default()),
+            join_started: Arc::new(FixtureEvent::default()),
+            join_release: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-stdout-join-transfer")
+            .with_stdout_join(stdout_join.clone());
+        let launcher = fixture.launcher.clone();
+        let launch = fixture.launch.clone();
+        let start = tokio::spawn(async move { launcher.start(launch).await });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.events.spawned.wait_after(0),
+        )
+        .await
+        .expect("OpenCode PID publication outer watchdog");
+        let pid = std::fs::read_to_string(&fixture.pid_path)
+            .expect("OpenCode helper PID")
+            .parse::<u32>()
+            .expect("numeric OpenCode helper PID");
+        fixture.events.release.publish();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stdout_join.ownership_registered.wait_after(0),
+        )
+        .await
+        .expect("registry ownership before stdout join");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stdout_join.join_started.wait_after(0),
+        )
+        .await
+        .expect("retained stdout join begins");
+
+        start.abort();
+        assert!(start.await.expect_err("launch waiter abort").is_cancelled());
+        assert_eq!(fixture.events.reaped.checkpoint(), 0);
+        stdout_join.join_release.publish();
+        fixture.timeout_events.foreground_return_release.publish();
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
+            .await
+            .expect("shutdown drains stdout-join transfer");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn transient_wait_error_recovers_automatically_at_retry_boundary() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            fail_persistently: Arc::new(AtomicBool::new(false)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-transient-wait-error")
+            .with_wait_error(wait_error.clone());
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode launch task");
+        fixture.timeout_events.background_wait_release.publish();
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        assert_eq!(fixture.events.reaped.checkpoint(), 0);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert_eq!(
+            wait_error.retry_started.checkpoint(),
+            0,
+            "retry must not hot-loop before its backoff expires"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error.retry_started.wait_after(0).await;
+        fixture.launcher.shutdown().await;
+        fixture.assert_reaped(pid).await;
+        assert_eq!(
+            wait_error.retry_started.checkpoint(),
+            1,
+            "a retained transient wait failure retries automatically at its boundary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn persistent_wait_error_retries_at_finite_cadence_during_shutdown() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-persistent-wait-error")
+            .with_wait_error(wait_error.clone());
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode launch task");
+        fixture.timeout_events.background_wait_release.publish();
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
+        let launcher = fixture.launcher.clone();
+        let shutdown = tokio::spawn(async move { launcher.shutdown().await });
+        let active_epoch = next_active_drain_epoch(&mut epoch).await;
+        assert!(
+            active_epoch > 0,
+            "shutdown publishes a positive drain epoch"
+        );
+        wait_error.retry_started.wait_after(0).await;
+        wait_error.injected.wait_after(1).await;
+        wait_error.recorded.wait_after(1).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "shutdown may drive one immediate retry but not a hot loop"
+        );
+
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "persistent failure must stay parked without time or a new signal"
+        );
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert_eq!(wait_error.injected.checkpoint(), 2);
+        let retry_checkpoint = wait_error.retry_started.checkpoint();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error.retry_started.wait_after(retry_checkpoint).await;
+        wait_error.injected.wait_after(2).await;
+        wait_error.recorded.wait_after(2).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            3,
+            "persistent failure retries once at the finite cadence"
+        );
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        shutdown.await.expect("retained reaper shutdown task");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn empty_registry_reset_starts_a_distinct_drain_epoch() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-distinct-drain-epochs")
+            .with_wait_error(wait_error.clone());
+        fixture.release_foreground_and_background_waits();
+        let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
+
+        let first = fixture.prepare_retained_submission().await;
+        let first_pid = first.pid;
+        let first_registration = fixture.launcher.reaper.reserve_pending();
+        let _first_foreground = fixture.submit_reserved_real_child(first_registration, first);
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        let first_shutdown = tokio::spawn({
+            let launcher = fixture.launcher.clone();
+            async move { launcher.shutdown().await }
+        });
+        let first_epoch = next_active_drain_epoch(&mut epoch).await;
+        wait_error.retry_started.wait_after(0).await;
+        wait_error.injected.wait_after(1).await;
+        wait_error.recorded.wait_after(1).await;
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        first_shutdown
+            .await
+            .expect("first retained reaper shutdown task");
+        fixture.assert_reaped(first_pid).await;
+        assert_eq!(
+            *epoch.borrow(),
+            None,
+            "empty-state linearization resets the published drain epoch"
+        );
+
+        wait_error.fail_persistently.store(true, Ordering::Release);
+        let second = fixture.prepare_retained_submission().await;
+        let second_pid = second.pid;
+        let second_registration = fixture.launcher.reaper.reserve_pending();
+        let injected_before_second = wait_error.injected.checkpoint();
+        let recorded_before_second = wait_error.recorded.checkpoint();
+        let retry_before_second = wait_error.retry_started.checkpoint();
+        let _second_foreground = fixture.submit_reserved_real_child(second_registration, second);
+        wait_error.injected.wait_after(injected_before_second).await;
+        wait_error.recorded.wait_after(recorded_before_second).await;
+
+        let second_shutdown = tokio::spawn({
+            let launcher = fixture.launcher.clone();
+            async move { launcher.shutdown().await }
+        });
+        let second_epoch = next_active_drain_epoch(&mut epoch).await;
+        assert!(
+            second_epoch > first_epoch,
+            "a later non-empty registry phase receives a distinct epoch"
+        );
+        wait_error
+            .retry_started
+            .wait_after(retry_before_second)
+            .await;
+        wait_error
+            .injected
+            .wait_after(injected_before_second + 1)
+            .await;
+        wait_error
+            .recorded
+            .wait_after(recorded_before_second + 1)
+            .await;
+        let injected_after_immediate_retry = wait_error.injected.checkpoint();
+
+        let mut repeated_shutdowns = Vec::new();
+        for _ in 0..8 {
+            let mut shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(shutdown.as_mut().poll(context))
+            })
+            .await;
+            assert!(first_poll.is_pending(), "second drain phase remains live");
+            assert_eq!(
+                *epoch.borrow(),
+                Some(second_epoch),
+                "repeated shutdown callers reuse the active epoch"
+            );
+            repeated_shutdowns.push(shutdown);
+        }
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            injected_after_immediate_retry,
+            "repeated callers cannot add a second immediate retry in one epoch"
+        );
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        let retry_before_cadence = wait_error.retry_started.checkpoint();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error
+            .retry_started
+            .wait_after(retry_before_cadence)
+            .await;
+        second_shutdown
+            .await
+            .expect("second retained reaper shutdown task");
+        for shutdown in repeated_shutdowns {
+            shutdown.await;
+        }
+        fixture.assert_reaped(second_pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_and_repeated_shutdowns_coalesce_one_immediate_wait_retry() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-coalesced-shutdown-retry")
+            .with_wait_error(wait_error.clone());
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode launch task");
+        fixture.timeout_events.background_wait_release.publish();
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        let mut epoch = fixture.launcher.reaper.drain_epoch.subscribe();
+        let mut initial_shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(initial_shutdown.as_mut().poll(context))
+        })
+        .await;
+        assert!(first_poll.is_pending(), "persistent wait keeps drain live");
+        let active_epoch = next_active_drain_epoch(&mut epoch).await;
+        wait_error.retry_started.wait_after(0).await;
+        wait_error.injected.wait_after(1).await;
+        wait_error.recorded.wait_after(1).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "the active drain epoch permits one immediate retry"
+        );
+
+        drop(initial_shutdown);
+        let mut repeated_shutdowns = Vec::new();
+        for _ in 0..8 {
+            let mut shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(shutdown.as_mut().poll(context))
+            })
+            .await;
+            assert!(first_poll.is_pending(), "repeated drain remains live");
+            assert_eq!(
+                *epoch.borrow(),
+                Some(active_epoch),
+                "replacement shutdown callers reuse the cancelled caller's epoch"
+            );
+            repeated_shutdowns.push(shutdown);
+        }
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "replacement callers cannot bypass 99 ms of the fixed cadence"
+        );
+        let retry_checkpoint = wait_error.retry_started.checkpoint();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error.retry_started.wait_after(retry_checkpoint).await;
+        wait_error.injected.wait_after(2).await;
+        wait_error.recorded.wait_after(2).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            3,
+            "persistent failure attempts exactly once at 100 ms"
+        );
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        fixture.events.reaped.wait_after(0).await;
+        for shutdown in repeated_shutdowns {
+            shutdown.await;
+        }
+        fixture.assert_reaped(pid).await;
+    }
 
     #[derive(Debug, Default)]
     struct RecordingOpenCodeHelper {
@@ -2538,7 +4626,8 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         };
-        let waiting = wait_for_opencode_live_work(&mut changes, &generation, reconciliation);
+        let observation = generation.observation();
+        let waiting = wait_for_opencode_live_work(&mut changes, &observation, reconciliation);
         tokio::pin!(waiting);
         let first_poll =
             std::future::poll_fn(|context| std::task::Poll::Ready(waiting.as_mut().poll(context)))
@@ -2584,7 +4673,7 @@ mod tests {
         let outcome = decode_and_track_opencode_live_data(
             OpenCodeLiveFence {
                 activity: &activity,
-                generation: &generation,
+                generation: &generation.observation(),
                 state: selected_state,
             },
             &mut tracker,
@@ -2668,11 +4757,16 @@ mod tests {
         command.process_group(0);
         let child = command.spawn().expect("actual exited helper");
         let process_id = child.id().expect("actual helper process ID");
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
         let helper = SystemOpenCodeHelperProcess {
             process_group_id: i32::try_from(process_id).ok(),
             process_group_identity_reserved: AtomicBool::new(true),
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(Some(Box::new(child))),
+            process_registration: Mutex::new(None),
             stdout_task: Mutex::new(None),
+            reaper_permit: Mutex::new(Some(reaper.reserve().expect("helper reap permit"))),
+            reaper,
+            fixture_events: None,
         };
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2745,11 +4839,16 @@ mod tests {
             );
         }
 
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
         let helper = SystemOpenCodeHelperProcess {
             process_group_id: i32::try_from(sentinel_process_group).ok(),
             process_group_identity_reserved: AtomicBool::new(true),
-            child: Mutex::new(Some(exited_child)),
+            child: Mutex::new(Some(Box::new(exited_child))),
+            process_registration: Mutex::new(None),
             stdout_task: Mutex::new(None),
+            reaper_permit: Mutex::new(Some(reaper.reserve().expect("helper reap permit"))),
+            reaper,
+            fixture_events: None,
         };
         let observed_exited = helper.has_exited();
 
@@ -2766,7 +4865,7 @@ mod tests {
         *helper
             .child
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replacement);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(replacement));
         helper.terminate();
 
         let sentinel_was_signaled =
@@ -2777,6 +4876,7 @@ mod tests {
             let _ = sentinel.start_kill();
             let _ = sentinel.wait().await;
         }
+        helper.reaper.shutdown().await;
 
         assert!(
             observed_exited,
@@ -2841,7 +4941,7 @@ mod tests {
         generation.request_cancellation(
             super::super::TerminalObserverCancellationReason::PreparationRejected,
         );
-        monitor_opencode_pre_spawn(resources.clone(), generation).await;
+        monitor_opencode_pre_spawn(resources.clone(), generation.observation()).await;
 
         assert!(
             !helper.terminated.load(Ordering::Acquire),
@@ -3098,50 +5198,93 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn invalid_helper_readiness_is_killed_and_reaped_before_error_returns() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let root = tempfile::tempdir().expect("OpenCode helper process root");
-        let executable = root.path().join("invalid-opencode-helper");
-        let pid_path = root.path().join("helper.pid");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$OPENCODE_TEST_PID_PATH\"\nprintf 'opencode server listening on http://0.0.0.0:43127\\n'\nsleep 60\n",
-        )
-        .expect("OpenCode helper script");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-            .expect("OpenCode helper script permissions");
-        let launcher = SystemOpenCodeHelperLauncher;
-        let result = launcher
-            .start(OpenCodeHelperLaunch {
-                executable: executable.to_string_lossy().into_owned(),
-                args: Vec::new(),
-                cwd: root.path().to_path_buf(),
-                env: BTreeMap::from([(
-                    "OPENCODE_TEST_PID_PATH".to_owned(),
-                    pid_path.to_string_lossy().into_owned(),
-                )]),
-            })
-            .await;
-
-        assert!(result.is_err());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ownership_freeze_rejects_and_reaps_an_opencode_helper_before_admission() {
+        let sandbox = TestSandbox::new("opencode-helper-owned-freeze");
+        let pid_path = sandbox.path("helper.pid");
+        let executable = sandbox.executable_script(
+            "opencode-helper",
+            "printf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let admission_race = Arc::new(OpenCodeHelperAdmissionRace {
+            spawned: FixtureEvent::default(),
+            release: FixtureEvent::default(),
+        });
+        let events = OpenCodeHelperFixtureEvents {
+            spawned: Arc::new(FixtureEvent::default()),
+            release: Arc::new(FixtureEvent::default()),
+            admission_race: Some(admission_race.clone()),
+            reaped: Arc::new(FixtureEvent::default()),
+            pid_path: pid_path.clone(),
+            reap_timeout: None,
+            stdout_join: None,
+            wait_error: None,
+        };
+        let registry = ProcessAttributionRegistry::new();
+        let launcher = SystemOpenCodeHelperLauncher::with_fixture_events(
+            OPENCODE_HELPER_READY_TIMEOUT,
+            events,
+        );
+        let launch = OpenCodeHelperLaunch {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: sandbox.root().to_path_buf(),
+            env: sandbox.environment(std::iter::empty::<(String, String)>()),
+            process_attribution: registry.clone(),
+        };
+        let start = tokio::spawn(async move { launcher.start(launch).await });
+        admission_race.spawned.wait_after(0).await;
         let pid = std::fs::read_to_string(&pid_path)
             .expect("OpenCode helper PID")
-            .parse::<i32>()
+            .parse::<u32>()
             .expect("numeric OpenCode helper PID");
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                // SAFETY: signal zero only checks the exact test-child PID and
-                // does not change process state.
-                if unsafe { libc::kill(pid, 0) } == -1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("failed OpenCode helper must be reaped before returning");
+        let identity = NativeProcessSampler::process_identity(pid).expect("helper identity");
+
+        assert!(registry.freeze_and_snapshot_identities().is_empty());
+        admission_race.release.publish();
+        let error = start
+            .await
+            .expect("OpenCode helper start task")
+            .expect_err("frozen runtime rejects inflight helper admission");
+        assert!(
+            error.contains("closed for shutdown"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !matches!(
+                NativeProcessSampler::process_identity(pid),
+                Ok(current) if current == identity
+            ),
+            "rejected OpenCode helper survived exact cleanup"
+        );
+        assert!(matches!(
+            waitid_child_once(pid),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_invalid_helper_readiness_children_reap_in_parallel() {
+        let pair_started = Arc::new(tokio::sync::Barrier::new(2));
+        let left = invalid_readiness_fixture(
+            TestSandbox::new("opencode-invalid-left"),
+            pair_started.clone(),
+        );
+        let right =
+            invalid_readiness_fixture(TestSandbox::new("opencode-invalid-right"), pair_started);
+
+        let ((left_error, left_pid), (right_error, right_pid)) =
+            tokio::join!(left.start_and_release(), right.start_and_release());
+
+        assert!(
+            left_error.contains("invalid endpoint") || left_error.contains("readiness timed out")
+        );
+        assert!(
+            right_error.contains("invalid endpoint") || right_error.contains("readiness timed out")
+        );
+        assert_ne!(left_pid, right_pid);
+        tokio::join!(left.wait_reaped(), right.wait_reaped());
     }
 }

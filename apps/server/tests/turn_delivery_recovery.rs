@@ -71,6 +71,58 @@ fn attachment_upload_stages_absent(attachments_dir: &Path) -> bool {
     }
 }
 
+struct DatabasePhaseGate {
+    entered: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+fn queue_database_phase_gate(database: Database) -> DatabasePhaseGate {
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _ = database
+            .call(move |_connection| {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("database phase gate release");
+                Ok(())
+            })
+            .await;
+    });
+    DatabasePhaseGate { entered, release }
+}
+
+async fn await_database_phase_gate(gate: &mut DatabasePhaseGate, context: &str) {
+    tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
+        .await
+        .unwrap_or_else(|_| panic!("{context} database phase gate enters"))
+        .unwrap_or_else(|_| panic!("{context} database phase gate signal"));
+}
+
+async fn advance_one_database_call(
+    database: &Database,
+    current: DatabasePhaseGate,
+    context: &str,
+) -> DatabasePhaseGate {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while database
+            .queue_backpressure_snapshot_for_integration_test()
+            .reserved_or_queued_jobs
+            < 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context} database call queues behind phase gate"));
+    let mut next = queue_database_phase_gate(database.clone());
+    current
+        .release
+        .send(())
+        .unwrap_or_else(|_| panic!("release {context} database phase gate"));
+    await_database_phase_gate(&mut next, context).await;
+    next
+}
+
 #[tokio::test]
 async fn attachment_abort_child() {
     let Some(state) = std::env::var_os(ATTACHMENT_ABORT_CHILD_STATE).map(PathBuf::from) else {
@@ -78,10 +130,11 @@ async fn attachment_abort_child() {
     };
     let attachment_config = ServerConfig::new(&state);
     let state_dir = attachment_config.state_dir();
+    let database_path = attachment_config.database_path();
     let attachments_dir = state_dir.join("attachments");
     let final_path = attachments_dir.join("aborted-final");
     std::fs::create_dir_all(&state_dir).expect("attachment crash state directory");
-    let database = Database::open_in_memory()
+    let database = Database::create_new(database_path.clone())
         .await
         .expect("attachment crash database");
     database
@@ -125,29 +178,15 @@ async fn attachment_abort_child() {
         .await
         .expect("attachment crash RPC websocket");
 
-    // Hold the worker, queue the RPC's preflight read, then queue a permanent blocker behind it.
-    // Releasing this first gate lets FIFO execute the preflight and blocker in that order. The
-    // handler can then publish through the production materializer, but its post-publication
-    // identity read cannot run and therefore admission cannot commit before the child aborts.
+    // Step the single SQLite worker through the receipt preflight and the three durable-reservation
+    // calls. The final gate then blocks the post-publication identity read, proving the production
+    // materializer publishes only after the command identity is durably owned and before the
+    // command/outbox transaction commits.
     let observer = database
         .enable_queue_backpressure_observation_for_integration_test()
         .expect("attachment crash queue observer");
-    let (phase_entered_tx, phase_entered_rx) = tokio::sync::oneshot::channel();
-    let (phase_release_tx, phase_release_rx) = std::sync::mpsc::channel();
-    let phase_database = database.clone();
-    tokio::spawn(async move {
-        let _ = phase_database
-            .call(move |_connection| {
-                let _ = phase_entered_tx.send(());
-                phase_release_rx.recv().expect("phase gate release");
-                Ok(())
-            })
-            .await;
-    });
-    tokio::time::timeout(Duration::from_secs(5), phase_entered_rx)
-        .await
-        .expect("database phase gate enters")
-        .expect("database phase gate signal");
+    let mut phase = queue_database_phase_gate(database.clone());
+    await_database_phase_gate(&mut phase, "initial").await;
     socket
         .send(Message::Text(
             serde_json::json!({
@@ -175,49 +214,21 @@ async fn attachment_abort_child() {
         ))
         .await
         .expect("attachment crash RPC request");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while database
-            .queue_backpressure_snapshot_for_integration_test()
-            .reserved_or_queued_jobs
-            < 1
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("RPC preflight queues behind phase gate");
-    let (blocker_entered_tx, blocker_entered_rx) = tokio::sync::oneshot::channel();
-    let blocker_database = database.clone();
-    tokio::spawn(async move {
-        let _ = blocker_database
-            .call(move |_connection| {
-                let _ = blocker_entered_tx.send(());
-                loop {
-                    std::thread::park();
-                }
-                #[allow(unreachable_code)]
-                Ok(())
-            })
-            .await;
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while database
-            .queue_backpressure_snapshot_for_integration_test()
-            .reserved_or_queued_jobs
-            < 2
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("permanent blocker queues after RPC preflight");
-    phase_release_tx
-        .send(())
-        .expect("release database phase gate");
-    tokio::time::timeout(Duration::from_secs(5), blocker_entered_rx)
-        .await
-        .expect("permanent database blocker enters")
-        .expect("permanent database blocker signal");
+    phase = advance_one_database_call(&database, phase, "receipt preflight").await;
+    phase = advance_one_database_call(&database, phase, "reservation timestamp").await;
+    phase = advance_one_database_call(&database, phase, "reservation sequence").await;
+    let _post_reservation_gate =
+        advance_one_database_call(&database, phase, "durable receipt reservation").await;
+
+    let receipt_status = rusqlite::Connection::open(database_path)
+        .expect("reservation observer connection")
+        .query_row(
+            "SELECT status FROM orchestration_command_receipts WHERE command_id = ?",
+            ["attachment-crash-turn"],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("durable attachment command reservation");
+    assert_eq!(receipt_status, "reserved");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let post_publication_read_is_blocked = database
@@ -239,13 +250,13 @@ async fn attachment_abort_child() {
         }
     })
     .await
-    .expect("production materializer atomically publishes before DB admission");
+    .expect("production materializer atomically publishes after reservation and before DB commit");
     assert!(
         database
             .queue_backpressure_snapshot_for_integration_test()
             .reserved_or_queued_jobs
             >= 1,
-        "the post-publication admission read remains queued behind the permanent blocker"
+        "the post-publication admission read remains queued behind the database phase gate"
     );
     drop(observer);
     assert_eq!(
@@ -258,7 +269,7 @@ async fn attachment_abort_child() {
     );
     std::fs::write(
         std::env::var_os(ATTACHMENT_ABORT_CHILD_READY).expect("ready marker"),
-        "production-materializer-published-before-db-commit",
+        "production-materializer-published-after-reservation-before-db-commit",
     )
     .expect("ready marker write");
     std::process::abort();

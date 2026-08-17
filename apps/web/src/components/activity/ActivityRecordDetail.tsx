@@ -8,6 +8,7 @@ import {
   type ActivitySection,
   type ActivitySnapshot,
 } from "@bibcode/contracts";
+import type { TimestampFormat } from "@bibcode/contracts/settings";
 import { ArrowLeftIcon } from "lucide-react";
 import { useMemo, type RefObject } from "react";
 
@@ -17,8 +18,13 @@ import { Spinner } from "~/components/ui/spinner";
 import { activityStatusLabel, compareActivityTimestamps } from "./activityPresentation";
 import { ActivityEntryRow } from "./ActivityEntryRow";
 import type { ActivityDetailPageData, ActivityDetailQueryResult } from "./ActivityPanel";
+import { formatChatTimestampTooltip } from "~/timestampFormat";
 
 const WINDOW_GROUP_SIZE = 50;
+
+function formatActivityTimestamp(value: string, timestampFormat: TimestampFormat): string {
+  return formatChatTimestampTooltip(value, timestampFormat) || value;
+}
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -112,6 +118,7 @@ function relation(
 }
 
 export interface ActivityRecordDetailProps {
+  readonly timestampFormat: TimestampFormat;
   readonly section: ActivitySection;
   readonly snapshot: ActivitySnapshot;
   readonly query: ActivityDetailQueryResult;
@@ -123,6 +130,7 @@ export interface ActivityRecordDetailProps {
 }
 
 export function ActivityRecordDetail({
+  timestampFormat,
   section,
   snapshot,
   query,
@@ -211,7 +219,9 @@ export function ActivityRecordDetail({
             <div className="flex gap-2 text-xs">
               <dt className="text-muted-foreground">Started</dt>
               <dd>
-                <time dateTime={record.startedAt}>{record.startedAt}</time>
+                <time dateTime={record.startedAt} title={record.startedAt}>
+                  {formatActivityTimestamp(record.startedAt, timestampFormat)}
+                </time>
               </dd>
             </div>
             <div className="flex gap-2 text-xs">
@@ -220,7 +230,9 @@ export function ActivityRecordDetail({
                 {record.terminalAt === null ? (
                   "—"
                 ) : (
-                  <time dateTime={record.terminalAt}>{record.terminalAt}</time>
+                  <time dateTime={record.terminalAt} title={record.terminalAt}>
+                    {formatActivityTimestamp(record.terminalAt, timestampFormat)}
+                  </time>
                 )}
               </dd>
             </div>
@@ -258,7 +270,7 @@ export function ActivityRecordDetail({
               key={window[0]?.id}
             >
               {window.map((entry) => (
-                <ActivityEntryRow entry={entry} key={entry.id} />
+                <ActivityEntryRow entry={entry} key={entry.id} timestampFormat={timestampFormat} />
               ))}
             </div>
           ))

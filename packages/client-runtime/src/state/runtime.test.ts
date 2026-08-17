@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, WS_METHODS } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -356,7 +357,13 @@ describe("executeAtomQuery", () => {
     const secondLatch = Latch.makeUnsafe();
     const firstAtom = Atom.make(firstLatch.await.pipe(Effect.as("first")));
     const secondAtom = Atom.make(secondLatch.await.pipe(Effect.as("second")));
-    const registry = AtomRegistry.make();
+    const scheduled = new Set<() => void>();
+    const registry = AtomRegistry.make({
+      scheduleTask: (task) => {
+        scheduled.add(task);
+        return () => scheduled.delete(task);
+      },
+    });
 
     const firstResult = executeAtomQuery(registry, firstAtom);
     const secondResult = executeAtomQuery(registry, secondAtom);
@@ -371,12 +378,67 @@ describe("executeAtomQuery", () => {
       expect(first.value).toBe("first");
       expect(second.value).toBe("second");
     }
+    while (scheduled.size > 0) {
+      const current = [...scheduled];
+      scheduled.clear();
+      for (const task of current) task();
+    }
+    expect(registry.getNodes().size).toBe(0);
 
     registry.dispose();
   });
 });
 
 describe("runtime command runner", () => {
+  const expectRegistryCancellationToSettle = Effect.fn(
+    "TestRuntime.expectRegistryCancellationToSettle",
+  )(function* (action: "reset" | "dispose") {
+    const acquired = yield* Deferred.make<void>();
+    const finalized = yield* Deferred.make<void>();
+    let finalizers = 0;
+    const runtime = Atom.runtime(Layer.empty);
+    const command = createRuntimeCommand(runtime, {
+      label: `test.${action}`,
+      execute: () =>
+        Effect.acquireUseRelease(
+          Deferred.succeed(acquired, undefined),
+          () => Effect.never,
+          () =>
+            Effect.sync(() => {
+              finalizers += 1;
+            }).pipe(Effect.andThen(Deferred.succeed(finalized, undefined))),
+        ),
+    });
+    const registry = AtomRegistry.make();
+    const settled = yield* Deferred.make<Awaited<ReturnType<typeof command.run>>>();
+    void command.run(registry, undefined).then((result) => {
+      Deferred.doneUnsafe(settled, Effect.succeed(result));
+    });
+    yield* Deferred.await(acquired);
+
+    registry[action]();
+    yield* Deferred.await(finalized);
+    const result = yield* Deferred.await(settled);
+
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(Cause.hasInterruptsOnly(result.cause)).toBe(true);
+    }
+    expect(finalizers).toBe(1);
+    expect(registry.getNodes().size).toBe(0);
+    if (action === "reset") {
+      registry.dispose();
+    }
+  });
+
+  it.effect("settles an interrupted command when its registry resets", () =>
+    expectRegistryCancellationToSettle("reset"),
+  );
+
+  it.effect("settles an interrupted command when its registry disposes", () =>
+    expectRegistryCancellationToSettle("dispose"),
+  );
+
   it("encodes custom command rejections as defects", async () => {
     const defect = new Error("custom command rejected");
     const registry = AtomRegistry.make();

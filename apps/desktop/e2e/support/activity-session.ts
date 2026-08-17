@@ -124,7 +124,7 @@ async function dispatchDesktopActivityCommands(
 
         let requestSequence = 0;
         interface PendingRequest {
-          readonly mode: "chunk" | "exit";
+          readonly mode: "chunk" | "exit" | "thread-ready";
           readonly reject: (error: Error) => void;
           readonly resolve: (value: Record<string, unknown>) => void;
           readonly timeout: number;
@@ -158,13 +158,37 @@ async function dispatchDesktopActivityCommands(
           if (typeof message.requestId !== "string") return;
           const request = pending.get(message.requestId);
           if (!request) return;
-          if (request.mode === "chunk" && message._tag === "Chunk") {
+          if (
+            (request.mode === "chunk" || request.mode === "thread-ready") &&
+            message._tag === "Chunk"
+          ) {
             const first = Array.isArray(message.values) ? message.values[0] : null;
             if (first === null || typeof first !== "object") {
               window.clearTimeout(request.timeout);
               pending.delete(message.requestId);
               request.reject(new Error("Activity fixture RPC stream returned an invalid chunk."));
               return;
+            }
+            if (request.mode === "thread-ready") {
+              const envelope = first as Record<string, unknown>;
+              const snapshot =
+                envelope.kind === "snapshot" &&
+                envelope.snapshot !== null &&
+                typeof envelope.snapshot === "object"
+                  ? (envelope.snapshot as Record<string, unknown>)
+                  : null;
+              const thread =
+                snapshot?.thread !== null && typeof snapshot?.thread === "object"
+                  ? (snapshot.thread as Record<string, unknown>)
+                  : null;
+              const session =
+                thread?.session !== null && typeof thread?.session === "object"
+                  ? (thread.session as Record<string, unknown>)
+                  : null;
+              if (typeof session?.providerInstanceId !== "string") {
+                socket.send(JSON.stringify({ _tag: "Ack", requestId: message.requestId }));
+                return;
+              }
             }
             window.clearTimeout(request.timeout);
             pending.delete(message.requestId);
@@ -205,7 +229,7 @@ async function dispatchDesktopActivityCommands(
         const request = (
           tag: string,
           payload: Record<string, unknown>,
-          mode: "chunk" | "exit" = "exit",
+          mode: "chunk" | "exit" | "thread-ready" = "exit",
         ): Promise<Record<string, unknown>> =>
           new Promise((resolve, reject) => {
             const requestId = String(requestSequence++);
@@ -246,7 +270,7 @@ async function dispatchDesktopActivityCommands(
         const envelope = await request(
           "orchestration.subscribeThread",
           { threadId: input.threadId },
-          "chunk",
+          "thread-ready",
         );
         const streamSnapshot =
           envelope.kind === "snapshot" &&

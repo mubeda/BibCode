@@ -4,6 +4,7 @@ mod model;
 mod osc;
 mod pty;
 
+pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     SubprocessInspection, TerminalAttachment, TerminalError, TerminalManager,
     TerminalManagerOptions, TerminalMetadataAttachment, TerminalSubprocessInspector,

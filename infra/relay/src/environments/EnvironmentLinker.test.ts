@@ -79,7 +79,11 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
         platform: { os: "darwin", arch: "arm64" },
         serverVersion: "0.0.0-test",
         storageInstanceId: "019c18d0-26b2-7a35-9e06-8568e640f44f",
-        capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+        capabilities: {
+          repositoryIdentity: true,
+          worktreeCatalog: false,
+          activityProtocolVersion: null,
+        },
       },
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
       endpoint: {

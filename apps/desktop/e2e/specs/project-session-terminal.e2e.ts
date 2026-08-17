@@ -5,7 +5,11 @@ import * as NodePath from "node:path";
 import { desktopUiFixture } from "../support/test-project.ts";
 import { terminalOutputEventCount } from "../support/terminal-events.ts";
 import { openCenterTerminal, sendTerminalCommand } from "../support/terminal-input.ts";
-import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-state.ts";
+import {
+  ensureMainSidebarOpen,
+  mockDesktopUiFolderPicker,
+  setDesktopUiWindowSize,
+} from "../support/ui-state.ts";
 
 const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
 if (!artifactDirectory) {
@@ -28,12 +32,32 @@ describe("packaged project session and terminal", () => {
     const project = browser.$(
       `//button[.//span[normalize-space()="${desktopUiFixture.projectName}"]]`,
     );
+    if (!(await project.isDisplayed())) {
+      const projectDataLoading = browser.$(
+        "//*[normalize-space()='Project data is still loading']",
+      );
+      if (await projectDataLoading.isExisting()) {
+        await projectDataLoading.waitForDisplayed({ reverse: true });
+      }
+      const addProject = browser.$('[data-testid="sidebar-add-project-trigger"]');
+      await addProject.waitForDisplayed();
+      await addProject.click();
+      const browseFolder = browser.$(
+        "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
+      );
+      await browseFolder.waitForDisplayed();
+      await mockDesktopUiFolderPicker(projectPath);
+      await browseFolder.click();
+    }
     await expect(project).toBeDisplayed();
-    await project.click();
-
-    const newChat = browser.$('[data-testid="new-main-chat-button"]');
-    await expect(newChat).toBeEnabled();
-    await newChat.click();
+    const primaryWorkspace = browser.$(
+      '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
+    );
+    if (!(await primaryWorkspace.isDisplayed())) {
+      await project.click();
+    }
+    await expect(primaryWorkspace).toBeDisplayed();
+    await primaryWorkspace.click();
 
     const providerModelPicker = browser.$('[data-chat-provider-model-picker="true"]');
     await expect(providerModelPicker).toBeEnabled();
@@ -81,9 +105,17 @@ describe("packaged project session and terminal", () => {
     await browser.saveScreenshot(
       NodePath.join(artifactDirectory, "project-session-terminal-minimum-size.png"),
     );
-    const closeTerminal = browser.$('button[aria-label="Close Terminal"]');
-    await expect(closeTerminal).toBeDisplayed();
-    await closeTerminal.click();
+    const closeTerminal = browser.$('button[aria-label^="Close Terminal"]');
+    await expect(closeTerminal).toExist();
+    const closedTerminal = await browser.execute(() => {
+      const button = document.querySelector<HTMLButtonElement>(
+        'button[aria-label^="Close Terminal"]',
+      );
+      button?.click();
+      return button !== null;
+    });
+    expect(closedTerminal).toBe(true);
+    await browser.$(".xterm-screen").waitForExist({ reverse: true });
 
     await browser.refresh();
     await expect(

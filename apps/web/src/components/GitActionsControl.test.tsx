@@ -1522,7 +1522,6 @@ staticDescribe("stacked action results", () => {
       input: {
         threadId: THREAD_REF.threadId,
         branch: "feature/auto",
-        worktreePath: "/wt",
       },
     });
   });
@@ -1723,7 +1722,6 @@ staticDescribe("status refresh on focus", () => {
       input: {
         threadId: THREAD_REF.threadId,
         branch: "feature/live",
-        worktreePath: "/wt",
       },
     });
   });
@@ -2270,5 +2268,23 @@ if (browserRuntime) {
         container.remove();
       },
     );
+
+    it("renders one disabled Git control with the shared workspace reason", async () => {
+      const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+      testState.gitStatus = status();
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await React.act(async () => {
+        root.render(<GitActionsControl {...buildProps({ workspaceUnavailable: reason })} />);
+      });
+
+      const disabled = container.querySelector<HTMLButtonElement>("button[disabled]");
+      expect(disabled?.title).toBe(reason);
+      expect(container.querySelector('[aria-label="Git action options"]')).toBeNull();
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
   });
 }

@@ -213,6 +213,55 @@ supervisor. Disconnect and scope closure interrupt in-flight work.
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
 
+## Worktree catalog subscriptions
+
+The worktree catalog is capability gated through one exported policy selector.
+The client reads `worktreeCatalog` from the connected session's negotiated
+configuration and uses that same session for the request, so reconnect cannot
+pair an old capability decision with a new socket. A false or missing capability
+starts no catalog subscription and makes no catalog refresh, policy, managed-
+create, panel-create, retarget, adoption, plan, detach, destructive-removal, or
+bulk RPC call. Discovery and destructive-removal controls remain hidden. The
+only older-server fallback is an explicitly confirmed legacy detach through
+ordinary thread deletion; it leaves Git and files untouched and never invokes a
+raw-path destructive method. Active, archived, direct, and bulk entry points use
+this same policy.
+
+For a capable environment, `state/worktrees` owns one catalog atom per
+`(environmentId, projectId)` with no client idle grace period. The server view
+itself owns bounded sharing and pointer-checked 60-second idle eviction after
+the final subscription or unary operation releases it.
+
+The RPC stream is latest-value state. Client state accepts only a current
+authoritative generation as new catalog content. If a later scan is degraded,
+it retains the last authoritative candidate and adopted-workspace arrays while
+publishing the new health status. Environment and project grouping in React is
+presentation only; it does not merge the scoped catalog sources or grant the
+browser authority over paths.
+
+One client-runtime presentation selector governs workspace-action availability.
+A cold/no-status row, `present`, and retained `verification-unavailable` remain
+usable because none proves absence. Only authoritative `missing-registered`,
+`missing-unregistered`, and `removing` disable path-dependent actions. Sidebar,
+chat, and panel surfaces call this selector rather than reimplementing the
+decision.
+
+Subscription acquisition resolves the current supervisor session. When a
+connection is replaced after disconnect or reconnect, the session switch ends
+the old stream and subscribes again through the new session. Replacing an
+environment registration follows the same scoped switch. Window focus and
+document visibility request one single-flight refresh per distinct physical
+project, even if several rows or panels render it.
+
+Managed creation, panel creation, retargeting, adoption, policy, and removal
+updates are serialized in the appropriate project/host lanes in the client
+runtime; **Add all** is also bounded to four concurrent candidate operations and
+one bulk lane per environment. These are responsiveness bounds, not correctness
+locks: the server's command receipts, mutation locks, generation checks,
+physical identity, and repository verification remain authoritative.
+
+## Shell projection authority
+
 Shell projection keeps connection availability separate from project count.
 Each desired environment is `starting`, `synchronizing`, `live`, `degraded`,
 `storage-changed`, `recovery-required`, `unavailable`, or
@@ -262,4 +311,5 @@ synchronization, lease publication, or cache consumption. Neither decision is
 inferred by the bootstrap helper or authorization token cache.
 
 See [Remote architecture](./remote.md) for access methods and
-[RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.
+[RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and
+[Worktree catalog](./worktree-catalog.md) for discovery and lifecycle rules.

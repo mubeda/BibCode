@@ -5,6 +5,8 @@ import { Button } from "../ui/button";
 
 export interface SidebarProjectAvailabilityProps {
   readonly view: SidebarProjectAvailabilityView;
+  readonly showRetry: boolean;
+  readonly showConnectionSettings: boolean;
   readonly onRetry: (environmentId: EnvironmentId) => void;
   readonly onOpenSettings: () => void;
   readonly onViewDiagnostics: () => void;
@@ -35,6 +37,8 @@ function availabilityCopy(view: SidebarProjectAvailabilityView): string | null {
 
 export function SidebarProjectAvailability({
   view,
+  showRetry,
+  showConnectionSettings,
   onRetry,
   onOpenSettings,
   onViewDiagnostics,
@@ -64,7 +68,7 @@ export function SidebarProjectAvailability({
       ) : null}
       {showRecoveryActions ? (
         <div className="mt-2 flex flex-wrap justify-center gap-1">
-          {canActOnEnvironment ? (
+          {canActOnEnvironment && showRetry ? (
             <Button size="xs" variant="ghost" onClick={() => onRetry(view.environmentId!)}>
               Retry
             </Button>
@@ -76,9 +80,11 @@ export function SidebarProjectAvailability({
               Recover data
             </Button>
           ) : null}
-          <Button size="xs" variant="ghost" onClick={onOpenSettings}>
-            Settings
-          </Button>
+          {showConnectionSettings ? (
+            <Button size="xs" variant="ghost" onClick={onOpenSettings}>
+              Settings
+            </Button>
+          ) : null}
           <Button size="xs" variant="ghost" onClick={onViewDiagnostics}>
             Diagnostics
           </Button>

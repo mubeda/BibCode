@@ -31,9 +31,17 @@ class FixtureWebSocket {
   readonly errorListeners = new Set<EventListener>();
   readonly openListeners = new Set<EventListener>();
   readonly url: string;
+  readonly controlTags: string[] = [];
   closeCalls = 0;
+  private pendingReadyPublisher: (() => void) | null = null;
   static instances: FixtureWebSocket[] = [];
-  static responseMode: "close" | "malformed" | "server-error" | "silent" | "success" = "success";
+  static responseMode:
+    | "close"
+    | "malformed"
+    | "pending-then-success"
+    | "server-error"
+    | "silent"
+    | "success" = "success";
 
   constructor(url: string) {
     this.url = url;
@@ -82,7 +90,15 @@ class FixtureWebSocket {
     const request = JSON.parse(encoded) as (typeof sentRequests)[number] & {
       readonly requestId?: string;
     };
-    if (request._tag === "Eof" || request._tag === "Ack" || request._tag === "Interrupt") return;
+    if (request._tag === "Eof" || request._tag === "Ack" || request._tag === "Interrupt") {
+      this.controlTags.push(request._tag);
+      if (request._tag === "Ack" && this.pendingReadyPublisher !== null) {
+        const publishReady = this.pendingReadyPublisher;
+        this.pendingReadyPublisher = null;
+        queueMicrotask(publishReady);
+      }
+      return;
+    }
     sentRequests.push(request);
     if (FixtureWebSocket.responseMode === "silent") return;
     if (FixtureWebSocket.responseMode === "close") {
@@ -110,7 +126,7 @@ class FixtureWebSocket {
       return;
     }
     if (request.tag === "orchestration.subscribeThread") {
-      queueMicrotask(() => {
+      const publishSnapshot = (providerInstanceId: string | null) => {
         const event = new MessageEvent("message", {
           data: JSON.stringify({
             _tag: "Chunk",
@@ -123,16 +139,19 @@ class FixtureWebSocket {
                   thread: {
                     id: "server-resolved-thread",
                     projectId: "server-resolved-project",
-                    session: {
-                      activeTurnId: null,
-                      lastError: null,
-                      providerInstanceId: "server-resolved-codex",
-                      providerName: "codex",
-                      runtimeMode: "full-access",
-                      status: "ready",
-                      threadId: "server-resolved-thread",
-                      updatedAt: "2026-07-29T19:00:00.000Z",
-                    },
+                    session:
+                      providerInstanceId === null
+                        ? null
+                        : {
+                            activeTurnId: null,
+                            lastError: null,
+                            providerInstanceId,
+                            providerName: "codex",
+                            runtimeMode: "full-access",
+                            status: "ready",
+                            threadId: "server-resolved-thread",
+                            updatedAt: "2026-07-29T19:00:00.000Z",
+                          },
                   },
                 },
               },
@@ -140,6 +159,14 @@ class FixtureWebSocket {
           }),
         });
         for (const listener of this.messageListeners) listener(event);
+      };
+      queueMicrotask(() => {
+        if (FixtureWebSocket.responseMode === "pending-then-success") {
+          this.pendingReadyPublisher = () => publishSnapshot("server-resolved-codex");
+          publishSnapshot(null);
+          return;
+        }
+        publishSnapshot("server-resolved-codex");
       });
       return;
     }
@@ -260,6 +287,25 @@ describe("materializeDesktopActivitySession", () => {
     expect(socket.openListeners.size).toBe(0);
   });
 
+  it("waits on the retained thread stream until provider ownership is projected", async () => {
+    vi.useFakeTimers();
+    installHarness();
+    FixtureWebSocket.responseMode = "pending-then-success";
+
+    const materialization = materializeDesktopActivitySession("/fixture/project");
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(materialization).resolves.toEqual({
+      projectId: "server-resolved-project",
+      providerInstanceId: "server-resolved-codex",
+      threadId: "server-resolved-thread",
+    });
+
+    expect(sentRequests.filter(({ tag }) => tag === "orchestration.subscribeThread")).toHaveLength(
+      1,
+    );
+    expect(FixtureWebSocket.instances[0]?.controlTags).toEqual(["Ack", "Interrupt", "Eof"]);
+  });
+
   it("can publish a later provider update without rebuilding project or thread state", async () => {
     Object.defineProperty(window, "desktopBridge", {
       configurable: true,
@@ -304,14 +350,11 @@ describe("materializeDesktopActivitySession", () => {
       modelSelection: {
         instanceId: "codex",
         model: "gpt-5.4",
-        options: [
-          { id: "reasoningEffort", value: "medium" },
-          { id: "serviceTier", value: "default" },
-        ],
+        options: [{ id: "reasoningEffort", value: "medium" }],
       },
       runtimeMode: "full-access",
       interactionMode: "default",
-      createdAt: "2026-07-29T18:00:03.000Z",
+      createdAt: expect.any(String),
     });
   });
 
@@ -330,7 +373,7 @@ describe("materializeDesktopActivitySession", () => {
           messageId: "bibcode-ui-activity-composer-followup-message",
           text: "publish deterministic composer activity update",
         }),
-        createdAt: "2026-07-29T18:00:04.000Z",
+        createdAt: expect.any(String),
       }),
     );
   });

@@ -3,9 +3,13 @@
  *
  * Given the already-derived provider instance entries (settings overlaid onto
  * the streamed snapshots), produce the ordered list of provider menu items.
- * Only settings-enabled instances are visible; each is selectable only when the
- * instance is picker-ready, otherwise it renders disabled with a reason.
+ * Only supported, settings-enabled instances are visible; each is selectable
+ * only when the instance is picker-ready, otherwise it renders disabled with a
+ * reason. Grok remains an internal compatibility driver and is intentionally
+ * excluded from user-facing agent and terminal actions.
  */
+import { ProviderDriverKind } from "@bibcode/contracts";
+
 import {
   isProviderInstancePickerReady,
   isProviderInstancePickerVisible,
@@ -15,6 +19,7 @@ import {
 /** Reason shown on a visible-but-not-ready provider item. */
 export const PROVIDER_NOT_READY_REASON =
   "This provider isn't ready yet — check its connection in Settings.";
+const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 
 export interface PanelMenuProviderItem {
   readonly entry: ProviderInstanceEntry;
@@ -24,19 +29,22 @@ export interface PanelMenuProviderItem {
 
 /**
  * Build the ordered provider items for the "+" panel menu. Ordering follows
- * the incoming entry order (the server's cross-driver order); visibility and
- * readiness reuse the shared picker predicates so the menu matches every other
- * provider surface.
+ * the incoming entry order (the server's cross-driver order); readiness reuses
+ * the shared picker predicate after unsupported UI drivers are removed.
  */
 export function buildPanelMenuModel(
   entries: ReadonlyArray<ProviderInstanceEntry>,
 ): ReadonlyArray<PanelMenuProviderItem> {
-  return entries.filter(isProviderInstancePickerVisible).map((entry) => {
-    const ready = isProviderInstancePickerReady(entry);
-    return {
-      entry,
-      disabled: !ready,
-      ...(ready ? {} : { disabledReason: PROVIDER_NOT_READY_REASON }),
-    } satisfies PanelMenuProviderItem;
-  });
+  return entries
+    .filter(
+      (entry) => entry.driverKind !== GROK_DRIVER_KIND && isProviderInstancePickerVisible(entry),
+    )
+    .map((entry) => {
+      const ready = isProviderInstancePickerReady(entry);
+      return {
+        entry,
+        disabled: !ready,
+        ...(ready ? {} : { disabledReason: PROVIDER_NOT_READY_REASON }),
+      } satisfies PanelMenuProviderItem;
+    });
 }

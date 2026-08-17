@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     git::{OutputPolicy, ProcessRequest, ProcessRunner},
     process::{
-        configure_supervised_background_command_wrap,
+        Platform, configure_supervised_background_command_wrap,
         supervised::{log_cleanup_failures, terminate_and_wait},
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
@@ -161,6 +161,14 @@ fn provider_is_enabled(driver: &str, configured: bool) -> bool {
     configured && driver != "grok"
 }
 
+fn default_provider_binary(driver: &str) -> &str {
+    if driver == "cursor" {
+        "cursor-agent"
+    } else {
+        driver
+    }
+}
+
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
     let legacy = settings.get("providers").and_then(Value::as_object);
     let instances = settings.get("providerInstances").and_then(Value::as_object);
@@ -198,7 +206,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                         ),
                         binary_path: string_setting(config, "binaryPath")
                             .or_else(|| string_setting(legacy_settings, "binaryPath"))
-                            .unwrap_or(driver)
+                            .unwrap_or_else(|| default_provider_binary(driver))
                             .to_owned(),
                         available: is_builtin_driver(driver),
                         custom_models: string_array(config, "customModels")
@@ -242,10 +250,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 driver_settings
                     .and_then(|value| value.get("enabled"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(driver != "cursor"),
+                    .unwrap_or(true),
             ),
             binary_path: string_setting(driver_settings, "binaryPath")
-                .unwrap_or(driver)
+                .unwrap_or_else(|| default_provider_binary(driver))
                 .to_owned(),
             available: true,
             custom_models: string_array(driver_settings, "customModels").unwrap_or_default(),
@@ -410,7 +418,15 @@ pub(crate) async fn probe_maintenance_target_version(
             .iter()
             .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
     )?;
-    let version_output = run_command(&executable, &["--version"], cwd, &target.environment).await;
+    let version_probe = run_command(&executable, &["--version"], cwd, &target.environment);
+    let about_probe = async {
+        if target.driver == "cursor" {
+            run_command(&executable, &["about"], cwd, &target.environment).await
+        } else {
+            None
+        }
+    };
+    let (version_output, about_output) = tokio::join!(version_probe, about_probe);
     let version = normalize_provider_version(
         &target.driver,
         version_output
@@ -421,8 +437,7 @@ pub(crate) async fn probe_maintenance_target_version(
     if target.driver != "cursor" {
         return version;
     }
-    let about = run_command(&executable, &["about"], cwd, &target.environment)
-        .await
+    let about = about_output
         .filter(|output| output.success)
         .map(|output| cursor::parse_about_output(output.code, &output.stdout, &output.stderr));
     about.and_then(|about| about.version).or(version)
@@ -1341,13 +1356,14 @@ async fn probe_local_opencode(
     custom_models: &[String],
     environment: &[(OsString, OsString)],
 ) -> Option<opencode::OpenCodeInventorySnapshot> {
+    let executable = opencode::resolve_owned_executable(Platform::current(), executable);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let port = listener.local_addr().ok()?.port();
     drop(listener);
     let endpoint = format!("http://127.0.0.1:{port}");
     let port_argument = format!("--port={port}");
     let launch = prepare_provider_launch(
-        executable,
+        &executable,
         ["serve", "--hostname=127.0.0.1", port_argument.as_str()],
     )
     .ok()?;
@@ -1595,6 +1611,8 @@ fn is_builtin_driver(driver: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use crate::test_support::TestSandbox;
     use axum::{Json, Router, routing::get};
 
     #[cfg(unix)]
@@ -1620,48 +1638,85 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inventory_probes_the_instance_path_executable_instead_of_ambient_path() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let ambient = tempfile::tempdir().expect("ambient executable directory");
-        let instance = tempfile::tempdir().expect("instance executable directory");
-        write_version_fixture(ambient.path(), "cursor-agent", "2026.01.02-ambient");
-        write_version_fixture(instance.path(), "cursor-agent", "2026.03.04-instance");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", ambient.path()) };
-        let settings = json!({
-            "enableProviderUpdateChecks": false,
-            "providerInstances": {
-                "cursor-work": {
-                    "driver": "cursor",
-                    "enabled": true,
-                    "config": { "binaryPath": "cursor-agent" },
-                    "environment": [
-                        { "name": "pAtH", "value": instance.path(), "valueRedacted": false }
-                    ]
+    async fn inventory_instance_path_outranks_ambient_path_in_an_isolated_process() {
+        const CASE: &str = "provider-inventory-path-precedence";
+        const TEST_NAME: &str = "production::provider_inventory::tests::inventory_instance_path_outranks_ambient_path_in_an_isolated_process";
+        const SENTINEL: &str = "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-inventory-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let root = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_ROOT").expect("isolated inventory root"),
+            );
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            assert_eq!(
+                resolve_provider_executable_with_environment(
+                    "cursor-agent",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let settings = json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": "cursor-agent" },
+                        "environment": [
+                            { "name": "pAtH", "value": instance, "valueRedacted": false }
+                        ]
+                    }
                 }
-            }
-        });
+            });
 
-        let providers = probe_full(
-            &settings,
-            Some("cursor-work"),
-            instance.path(),
-            &ProviderMaintenance::new(),
-        )
-        .await;
+            let providers = probe_full(
+                &settings,
+                Some("cursor-work"),
+                &root,
+                &ProviderMaintenance::new(),
+            )
+            .await;
 
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
+            assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+            println!("{SENTINEL}");
+            return;
         }
-        assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+
+        let sandbox = TestSandbox::new("provider-inventory-path");
+        let ambient = sandbox.path("ambient");
+        let instance = sandbox.path("instance");
+        std::fs::create_dir(&ambient).expect("ambient executable directory");
+        std::fs::create_dir(&instance).expect("instance executable directory");
+        let ambient_executable =
+            write_version_fixture(&ambient, "cursor-agent", "2026.01.02-ambient");
+        write_version_fixture(&instance, "cursor-agent", "2026.03.04-instance");
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                ("BIBCODE_TEST_ROOT", sandbox.root().as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "isolated inventory PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 
     #[cfg(unix)]
@@ -1669,7 +1724,6 @@ mod tests {
     async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().expect("inventory PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
@@ -1748,6 +1802,33 @@ mod tests {
     fn provider_probe_timeouts_allow_slow_windows_cli_startup() {
         assert!(PROBE_TIMEOUT >= Duration::from_secs(10));
         assert!(LOCAL_OPENCODE_INVENTORY_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn fresh_cursor_inventory_is_enabled_with_the_supported_binary() {
+        let fresh_definitions = definitions(&json!({}));
+        let cursor = fresh_definitions
+            .iter()
+            .find(|definition| definition.instance_id == "cursor")
+            .expect("built-in Cursor definition");
+
+        assert!(cursor.enabled);
+        assert_eq!(cursor.binary_path, "cursor-agent");
+
+        let explicit = definitions(&json!({
+            "providerInstances": {
+                "cursor": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": {}
+                }
+            }
+        }));
+        let explicit_cursor = explicit
+            .iter()
+            .find(|definition| definition.instance_id == "cursor")
+            .expect("explicit Cursor definition");
+        assert_eq!(explicit_cursor.binary_path, "cursor-agent");
     }
 
     #[test]
@@ -2143,6 +2224,13 @@ mod tests {
         });
         let settings = json!({
             "enableProviderUpdateChecks": false,
+            "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            },
             "providerInstances": {
                 "first": {
                     "driver": "opencode",

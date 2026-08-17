@@ -24,6 +24,7 @@ interface CenterTerminalPanelProps {
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   /** Invoked when the terminal is closed from within its own chrome. */
   onClose: () => void;
+  workspaceUnavailable?: string | null;
 }
 
 const noop = () => undefined;
@@ -48,6 +49,7 @@ export function CenterTerminalPanel({
   focusEligible,
   onAddTerminalContext,
   onClose,
+  workspaceUnavailable = null,
 }: CenterTerminalPanelProps) {
   const { terminalId, command, label } = surface;
   const knownTerminalSessions = useKnownTerminalSessions({
@@ -89,6 +91,7 @@ export function CenterTerminalPanel({
       terminalLabelsById={terminalLabelsById}
       {...(terminalCommandsById ? { terminalCommandsById } : {})}
       keybindings={keybindings}
+      workspaceUnavailable={workspaceUnavailable}
     />
   );
 }

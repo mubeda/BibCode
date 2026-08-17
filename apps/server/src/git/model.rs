@@ -196,6 +196,48 @@ pub struct VcsWorktree {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VcsCreateWorktreeResult {
     pub worktree: VcsWorktree,
+    #[serde(skip)]
+    pub(crate) rollback: Option<ManagedWorktreeRollback>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedWorktreeRollback {
+    pub(crate) created_path: PathBuf,
+    pub(crate) created_branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeRecord {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub is_primary: bool,
+    pub is_bare: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub is_prunable: bool,
+    pub prunable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeInventory {
+    pub common_dir: PathBuf,
+    pub records: Vec<GitWorktreeRecord>,
+    pub nul_delimited: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitWorktreeRemovalInspection {
+    pub tracked_change_count: u64,
+    pub untracked_file_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPrunableWorktree {
+    pub path: PathBuf,
+    pub prune_reason: String,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

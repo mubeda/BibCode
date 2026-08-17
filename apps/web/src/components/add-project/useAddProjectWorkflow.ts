@@ -20,6 +20,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isDesktopLocalConnectionTarget, desktopLocalBackendId } from "~/connection/desktopLocal";
+import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
 import { useDesktopLocalBootstraps } from "~/connection/useDesktopLocalBootstraps";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { readLocalApi } from "~/localApi";
@@ -55,8 +56,11 @@ import { createAddProjectOperations, type AddProjectCommandResult } from "./addP
 import { readPrimaryRunningDistro } from "../hostFolderPicker";
 import { pickAddProjectFolder, type PickAddProjectFolderResult } from "./pickAddProjectFolder";
 
+export type AddProjectLocationLabel = "Host" | "Location" | null;
+
 export interface AddProjectWorkflow {
   readonly hosts: ReadonlyArray<AddProjectHostOption>;
+  readonly locationLabel: AddProjectLocationLabel;
   readonly selectedHost: AddProjectHostOption;
   readonly step: AddProjectStep;
   readonly busy: boolean;
@@ -88,6 +92,7 @@ export interface AddProjectWorkflowStateInput {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly hosts: ReadonlyArray<AddProjectHostOption>;
+  readonly locationLabel: AddProjectLocationLabel;
   readonly primaryEnvironmentId: EnvironmentId;
   readonly operations: Pick<
     ReturnType<typeof createAddProjectOperations>,
@@ -503,6 +508,7 @@ export function useAddProjectWorkflowState(
 
   return {
     hosts: input.hosts,
+    locationLabel: input.locationLabel,
     selectedHost,
     step,
     busy,
@@ -557,9 +563,13 @@ export function useAddProjectWorkflow(input: {
   const cloneRepository = useAtomCommand(vcsEnvironment.clone, { reportFailure: false });
   const primaryEnvironmentId =
     primaryEnvironment?.environmentId ?? EnvironmentId.make(PRIMARY_LOCAL_ENVIRONMENT_ID);
+  const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
 
   const hosts = useMemo((): ReadonlyArray<AddProjectHostOption> => {
-    const catalogHosts = environments.map((environment): AddProjectHostOption => {
+    const presentedEnvironments = environments.filter((environment) =>
+      presentation.presentsTarget(environment.entry.target),
+    );
+    const catalogHosts = presentedEnvironments.map((environment): AddProjectHostOption => {
       const isPrimary = environment.environmentId === primaryEnvironment?.environmentId;
       const desktopInstanceId = isDesktopLocalConnectionTarget(environment.entry.target)
         ? (desktopLocalBootstraps.find(
@@ -582,13 +592,24 @@ export function useAddProjectWorkflow(input: {
         nativePickerAvailable: typeof window !== "undefined" && window.desktopBridge !== undefined,
       };
     });
-    return catalogHosts.length > 0 ? catalogHosts : [fallbackHost(primaryEnvironmentId)];
+    const usableHosts = catalogHosts.filter(
+      (host) =>
+        presentation.surface === "browser" || host.isPrimary || host.desktopInstanceId !== null,
+    );
+    return usableHosts.length > 0 ? usableHosts : [fallbackHost(primaryEnvironmentId)];
   }, [
     desktopLocalBootstraps,
     environments,
+    presentation,
     primaryEnvironment?.environmentId,
     primaryEnvironmentId,
   ]);
+  const locationLabel: AddProjectLocationLabel =
+    presentation.surface === "browser"
+      ? "Host"
+      : presentation.platform === "windows" && hosts.length > 1
+        ? "Location"
+        : null;
 
   const operations = useMemo(
     () =>
@@ -686,9 +707,7 @@ export function useAddProjectWorkflow(input: {
                     modelSelection: resolution.modelSelection,
                     runtimeMode: DEFAULT_RUNTIME_MODE,
                     interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                    kind: "default",
                     branch: null,
-                    worktreePath: null,
                   },
                 }),
                 () => undefined,
@@ -779,6 +798,7 @@ export function useAddProjectWorkflow(input: {
   return useAddProjectWorkflowState({
     ...input,
     hosts,
+    locationLabel,
     primaryEnvironmentId,
     operations,
     pickFolder,

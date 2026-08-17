@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
+import { isFinalDesktopUiSpec, requestDesktopUiApplicationExit } from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
   prepareDesktopUiTestContext,
@@ -28,6 +29,18 @@ const appBinaryPath = resolveDesktopAppPath({
   environment: process.env,
 });
 const requestedSpec = process.env.BIBCODE_E2E_SPEC?.trim();
+const desktopUiSpecFiles =
+  requestedSpec && requestedSpec.length > 0
+    ? [requestedSpec]
+    : [
+        "./specs/main-window.e2e.ts",
+        "./specs/project-session-terminal.e2e.ts",
+        "./specs/platform-capabilities.e2e.ts",
+        "./specs/terminal-font.e2e.ts",
+        "./specs/composer-native-triggers.e2e.ts",
+        "./specs/chat-activity-panel.e2e.ts",
+      ];
+const desktopUiSpecs = requestedSpec ? desktopUiSpecFiles : [desktopUiSpecFiles];
 
 if (!NodeFS.existsSync(appBinaryPath)) {
   throw new Error(`Packaged BiBCode application does not exist: ${appBinaryPath}`);
@@ -42,19 +55,62 @@ const screenshotPath = (title: string): string =>
       .toLowerCase()}.png`,
   );
 
+async function resetDesktopUiConnectionCache(): Promise<void> {
+  const resetResult = await browser.executeAsync(
+    (done: (result: { readonly error: string | null }) => void) => {
+      window.localStorage.clear();
+      window.sessionStorage.clear();
+      let settled = false;
+      const finish = (error: string | null) => {
+        if (settled) return;
+        settled = true;
+        done({ error });
+      };
+      const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
+      openRequest.addEventListener("error", () => {
+        finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
+      });
+      openRequest.addEventListener("upgradeneeded", () => {
+        finish("The E2E connection catalog schema was unexpectedly missing.");
+      });
+      openRequest.addEventListener("success", () => {
+        const database = openRequest.result;
+        const storeNames = ["catalog", "shell", "thread"];
+        const transaction = database.transaction(storeNames, "readwrite");
+        transaction.addEventListener("error", () => {
+          database.close();
+          finish(String(transaction.error ?? "Could not reset the E2E connection catalog."));
+        });
+        transaction.addEventListener("complete", () => {
+          database.close();
+          finish(null);
+        });
+        for (const storeName of storeNames) {
+          transaction.objectStore(storeName).clear();
+        }
+      });
+    },
+  );
+  if (resetResult.error !== null) {
+    throw new Error(resetResult.error);
+  }
+  await browser.refresh();
+  await waitForDesktopUiDocumentLoad();
+}
+
+async function waitForDesktopUiDocumentLoad(): Promise<void> {
+  await browser.executeAsync((done: (result: string) => void) => {
+    if (document.readyState === "complete") {
+      done("ready");
+      return;
+    }
+    window.addEventListener("load", () => done("ready"), { once: true });
+  });
+}
+
 export const config = {
   runner: "local",
-  specs:
-    requestedSpec && requestedSpec.length > 0
-      ? [requestedSpec]
-      : [
-          "./specs/main-window.e2e.ts",
-          "./specs/project-session-terminal.e2e.ts",
-          "./specs/platform-capabilities.e2e.ts",
-          "./specs/terminal-font.e2e.ts",
-          "./specs/composer-native-triggers.e2e.ts",
-          "./specs/chat-activity-panel.e2e.ts",
-        ],
+  specs: desktopUiSpecs,
   maxInstances: 1,
   services: [
     [
@@ -83,7 +139,7 @@ export const config = {
   bail: 0,
   waitforTimeout: 20_000,
   connectionRetryTimeout: 120_000,
-  connectionRetryCount: 1,
+  connectionRetryCount: 0,
   transformRequest: normalizeWebDriverRequest,
   framework: "mocha",
   reporters: ["spec"],
@@ -92,6 +148,24 @@ export const config = {
     timeout: 120_000,
   },
   before: async () => {
+    const pluginReady = await browser.execute(() => {
+      const host = window as Window & {
+        readonly wdioTauri?: {
+          readonly execute?: unknown;
+          readonly waitForInit?: unknown;
+        };
+      };
+      return (
+        typeof host.wdioTauri?.execute === "function" &&
+        typeof host.wdioTauri.waitForInit === "function"
+      );
+    });
+    if (!pluginReady) {
+      throw new Error("The packaged Tauri WebDriver plugin did not initialize.");
+    }
+  },
+  beforeTest: async () => {
+    await resetDesktopUiConnectionCache();
     await browser.execute(() => {
       const sheet = [...document.styleSheets].find((candidate) => {
         try {
@@ -150,6 +224,12 @@ export const config = {
         await browser.getPageSource(),
       );
     }
+  },
+  after: async (_result: unknown, _capabilities: unknown, currentSpecs: ReadonlyArray<string>) => {
+    if (!isFinalDesktopUiSpec(currentSpecs, desktopUiSpecFiles)) return;
+    // Ask Tauri to run its normal ExitRequested path so the in-process backend and provider
+    // children release Windows filesystem handles before the launcher service stops the driver.
+    await requestDesktopUiApplicationExit();
   },
   onComplete: () => {
     // WDIO invokes configuration hooks before launcher service hooks. Defer shared fixture cleanup

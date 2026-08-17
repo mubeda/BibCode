@@ -1,8 +1,14 @@
-use std::{io::ErrorKind, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io::ErrorKind,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
-    RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime,
+    RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime, logging,
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, redirect::Policy};
@@ -18,9 +24,22 @@ use url::Url;
 use uuid::Uuid;
 
 const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "opencode"];
+const SAME_LOG_PATH_CHILD_ENV: &str = "BIBCODE_TEST_SAME_LOG_PATH_CHILD_ROOT";
+const SAME_LOG_PATH_TEST: &str = "public_and_runtime_initializers_share_one_physical_log_writer";
 
 fn test_config(temp: &TempDir) -> ServerConfig {
     ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0)
+}
+
+async fn assert_log_contains(path: &Path, marker: &str) {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(
+        contents.contains(marker),
+        "{} does not contain {marker:?}: {contents}",
+        path.display()
+    );
 }
 
 fn endpoint(address: SocketAddr, path: &str) -> String {
@@ -260,6 +279,120 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
         .await
         .expect("shutdown timeout")
         .expect("server joins");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_runtimes_retain_owned_log_sinks_without_retargeting() {
+    let left_root = TempDir::new().expect("left runtime root");
+    let right_root = TempDir::new().expect("right runtime root");
+    let left_log = left_root.path().join("userdata/logs/server.log");
+    let right_log = right_root.path().join("userdata/logs/server.log");
+    let (left, right) = tokio::join!(
+        ServerRuntime::start_with_registry(test_config(&left_root), RpcRegistry::empty()),
+        ServerRuntime::start_with_registry(test_config(&right_root), RpcRegistry::empty()),
+    );
+    let left = left.expect("left runtime");
+    let right = right.expect("right runtime");
+
+    let marker_a = format!("runtime-log-sink-a-{}", Uuid::new_v4());
+    tracing::warn!(target: "runtime_log_sink_registry_test", marker = %marker_a);
+    assert_log_contains(&left_log, &marker_a).await;
+    assert_log_contains(&right_log, &marker_a).await;
+
+    left.shutdown();
+    left.join().await.expect("left runtime joins");
+    let left_before = tokio::fs::read(&left_log)
+        .await
+        .expect("snapshot joined left runtime log");
+
+    let marker_b = format!("runtime-log-sink-b-{}", Uuid::new_v4());
+    tracing::warn!(target: "runtime_log_sink_registry_test", marker = %marker_b);
+    assert_log_contains(&right_log, &marker_b).await;
+    assert_eq!(
+        tokio::fs::read(&left_log)
+            .await
+            .expect("read unchanged left runtime log"),
+        left_before,
+        "a joined runtime sink must not receive later process events"
+    );
+    left_root.close().expect("remove joined left runtime root");
+
+    right.shutdown();
+    right.join().await.expect("right runtime joins");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_and_runtime_initializers_share_one_physical_log_writer() {
+    if let Some(root) = std::env::var_os(SAME_LOG_PATH_CHILD_ENV) {
+        let root = PathBuf::from(root);
+        let log_path = root.join("userdata/logs/server.log");
+        assert_eq!(
+            logging::initialize(&log_path).expect("public logging initialization"),
+            logging::Init::Installed
+        );
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(&root).with_bind("127.0.0.1", 0),
+            RpcRegistry::empty(),
+        )
+        .await
+        .expect("runtime with the public log path starts");
+
+        let marker = format!("same-public-runtime-log-sink-{}", Uuid::new_v4());
+        tracing::warn!(target: "runtime_log_sink_registry_test", marker = %marker);
+        let contents = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("shared public and runtime log");
+        assert_eq!(
+            contents.matches(&marker).count(),
+            1,
+            "one process record must be written exactly once through one physical writer"
+        );
+
+        handle.shutdown();
+        handle.join().await.expect("same-path runtime joins");
+        let retained_marker = format!("retained-public-log-sink-{}", Uuid::new_v4());
+        tracing::warn!(target: "runtime_log_sink_registry_test", marker = %retained_marker);
+        let contents = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("process-owned log after runtime join");
+        assert_eq!(
+            contents.matches(&retained_marker).count(),
+            1,
+            "dropping the runtime lease must retain exactly one process-owned writer"
+        );
+        println!("BIBCODE_TEST_SAME_LOG_PATH_CHILD_DONE");
+        return;
+    }
+
+    let root = TempDir::new().expect("same-path subprocess root");
+    let output = timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                SAME_LOG_PATH_TEST,
+                "--nocapture",
+                "--test-threads=8",
+            ])
+            .env(SAME_LOG_PATH_CHILD_ENV, root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("same-path child timeout")
+    .expect("run same-path child");
+    assert!(
+        output.status.success(),
+        "same-path child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("BIBCODE_TEST_SAME_LOG_PATH_CHILD_DONE"),
+        "same-path child did not confirm completion"
+    );
 }
 
 #[tokio::test]

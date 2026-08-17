@@ -49,7 +49,11 @@ function prepared(
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
-      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+      capabilities: {
+        repositoryIdentity: true,
+        worktreeCatalog: false,
+        activityProtocolVersion: null,
+      },
     },
     httpBaseUrl: connectionTarget.httpBaseUrl,
     socketUrl: `${connectionTarget.wsBaseUrl}/ws`,

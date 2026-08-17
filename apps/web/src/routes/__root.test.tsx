@@ -40,6 +40,7 @@ const s = vi.hoisted(() => ({
   hostedPairing: false,
   hostedStatic: false,
   buttonClicks: [] as Array<() => void>,
+  showRemoteDeviceControls: true,
 }));
 
 // ── React hook instrumentation ───────────────────────────────────────
@@ -167,6 +168,12 @@ vi.mock("../hostedPairing", () => ({
   isHostedStaticApp: () => s.hostedStatic,
 }));
 
+vi.mock("../connection/currentEnvironmentPresentation", () => ({
+  readCurrentEnvironmentPresentationPolicy: () => ({
+    showRemoteDeviceControls: s.showRemoteDeviceControls,
+  }),
+}));
+
 vi.mock("../logicalProject", () => ({
   deriveLogicalProjectKeyFromSettings: () => s.logicalKey,
   derivePhysicalProjectKeyFromPath: () => s.physicalKey,
@@ -234,10 +241,6 @@ vi.mock("../components/status-bar/AppStatusBar", () => ({
 
 vi.mock("../components/cloud/RelayClientInstallDialog", () => ({
   RelayClientInstallDialog: () => <div data-mock="relay-install" />,
-}));
-
-vi.mock("../components/desktop/SshPasswordPromptDialog", () => ({
-  SshPasswordPromptDialog: () => <div data-mock="ssh-password" />,
 }));
 
 vi.mock("../components/ProviderUpdateLaunchNotification", () => ({
@@ -308,6 +311,7 @@ beforeEach(() => {
   s.hostedPairing = false;
   s.hostedStatic = false;
   s.buttonClicks.length = 0;
+  s.showRemoteDeviceControls = true;
   reloadCalls = 0;
   hk.reset();
 
@@ -471,6 +475,43 @@ describe("RootRouteView", () => {
     expect(markup).toContain('data-mock="relay-install"');
     expect(markup).toContain('data-mock="provider-update"');
     runEffects();
+  });
+
+  it("mounts the relay installer in the browser but not the authenticated desktop shell", () => {
+    s.routeContext = { authGateState: { status: "authenticated" } };
+    s.showRemoteDeviceControls = false;
+    expect(renderComponent()).not.toContain('data-mock="relay-install"');
+
+    s.showRemoteDeviceControls = true;
+    expect(renderComponent()).toContain('data-mock="relay-install"');
+  });
+
+  it("does not subscribe to SSH password prompts in the authenticated desktop shell", () => {
+    s.routeContext = { authGateState: { status: "authenticated" } };
+    s.showRemoteDeviceControls = false;
+    const subscribe = vi.fn(() => () => undefined);
+    Object.assign(window, {
+      desktopBridge: { onSshPasswordPrompt: subscribe },
+    });
+
+    renderComponent();
+    runEffects();
+
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("retains the SSH password prompt subscription in the browser shell", () => {
+    s.routeContext = { authGateState: { status: "authenticated" } };
+    s.showRemoteDeviceControls = true;
+    const subscribe = vi.fn(() => () => undefined);
+    Object.assign(window, {
+      desktopBridge: { onSshPasswordPrompt: subscribe },
+    });
+
+    renderComponent();
+    runEffects();
+
+    expect(subscribe).toHaveBeenCalledOnce();
   });
 
   it("renders the hosted-static shell without the authenticated-only bootstraps", () => {

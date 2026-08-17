@@ -1,5 +1,11 @@
 # Remote Access
 
+The v0.3.14 macOS, Linux, and Windows desktop UI is presented as local-only.
+Remote connection, pairing, SSH, Tailscale, network-exposure, and BiBCode
+Connect controls are hidden without removing their underlying implementation.
+Windows keeps **Settings → Local environment** for WSL. The browser/hosted UI
+retains the full remote workflow described below.
+
 Remote access connects a browser or another desktop app to the BiBCode server
 running on a different machine. That server owns projects, files, Git state,
 terminals, provider CLIs, credentials, and agent sessions.
@@ -7,9 +13,10 @@ terminals, provider CLIs, credentials, and agent sessions.
 Use a trusted private network such as a LAN or tailnet. Do not expose a plain
 BiBCode HTTP endpoint directly to the public internet.
 
-## Desktop network access
+## Browser/hosted and future re-enabled desktop network access
 
-To expose the backend embedded in the desktop app:
+In the browser/hosted UI, or when this desktop presentation is re-enabled, use
+these controls to expose the backend embedded in the desktop app:
 
 1. Open **Settings → Connections**.
 2. Under **Manage Local Backend**, enable **Network access**. The desktop app
@@ -95,10 +102,10 @@ The hosted app saves the backend address, but it does not proxy traffic. The
 browser still connects directly to the backend, which must therefore be
 reachable over HTTPS/WSS from that browser.
 
-Create and revoke additional access from **Settings → Connections**. There is no
-current CLI access-management command.
+In the browser/hosted UI, create and revoke additional access from
+**Settings → Connections**. There is no current CLI access-management command.
 
-## Desktop-managed SSH status
+## Browser/hosted and future re-enabled desktop-managed SSH status
 
 The desktop contains an SSH launcher that can install a small runner under
 `~/.bibcode-ssh-launch/<state-key>`, start or reuse `bibcode serve` on remote
@@ -143,7 +150,7 @@ wsl.exe -d <distribution> -- /path/to/bibcode --version
 
 When **WSL only** is enabled, a missing distribution, binary, or failed WSL
 startup leaves the local backend unavailable; the desktop does not silently
-start the Windows backend. In **Settings → Connections**, choose another
+start the Windows backend. In **Settings → Local environment**, choose another
 distribution or **Retry WSL** after correcting the prerequisite. Use
 **Diagnostics** to save diagnostic logs. **Switch to Windows** is the explicit
 way to make the native Windows backend primary; the normal restart and storage
@@ -154,6 +161,7 @@ identity checks then apply.
 - Bind the server only to a trusted private address.
 - Prefer HTTPS/WSS whenever the browser page itself is served over HTTPS.
 - Treat pairing URLs and credentials as secrets.
-- Review and revoke sessions you no longer trust in **Settings → Connections**.
+- In the browser/hosted UI, review and revoke sessions you no longer trust in
+  **Settings → Connections**.
 - Credentials can leak through browser history, screenshots, logs, or copied
   text even when they are placed in a URL fragment.
