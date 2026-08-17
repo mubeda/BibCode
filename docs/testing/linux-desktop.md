@@ -44,7 +44,8 @@ Select focused tests from affected source and verify at least:
 - destructive worktree removal validates the registered physical identity and
   fails closed on replacement;
 - Unix process groups retain one signal/wait/reap owner through cancellation,
-  natural root exit, and late descendants;
+  natural root exit, and late descendants, independently of the Windows-only
+  Job implementation;
 - independent runtimes cannot terminate each other's process roots;
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
@@ -111,8 +112,13 @@ Build and run packaged E2E with:
 ```sh
 export BIBCODE_E2E_PLATFORM=linux
 vp run test:ui:desktop:build
+export BIBCODE_E2E_APP_PATH="$(find "$PWD/target/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
+test -n "$BIBCODE_E2E_APP_PATH"
 xvfb-run --auto-servernum vp run test:ui:desktop
 ```
+
+`BIBCODE_E2E_APP_PATH` deliberately selects the AppImage produced by the E2E
+build in the current worktree, not an installed production copy.
 
 Use the direct E2E command instead of Xvfb when a verified interactive display
 is required and available. Isolate BiBCode application data and XDG config,

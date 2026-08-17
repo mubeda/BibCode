@@ -1,9 +1,14 @@
-#[cfg(windows)]
-use process_wrap::tokio::CommandWrapper;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrapper};
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
+#[cfg(windows)]
+use std::{future::Future, pin::Pin, process::ExitStatus, sync::Arc, time::Duration};
 use tokio::process::Command;
+
+#[cfg(windows)]
+use super::WindowsJob;
 
 /// Configures a non-interactive Tokio child process so a GUI parent does not
 /// flash a console window on Windows.
@@ -29,19 +34,95 @@ pub fn configure_background_std_command(command: &mut std::process::Command) {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-struct WindowsSupervisedCreationFlags;
+struct WindowsSupervisedJob;
 
 #[cfg(windows)]
-impl CommandWrapper for WindowsSupervisedCreationFlags {
+impl CommandWrapper for WindowsSupervisedJob {
     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> std::io::Result<()> {
         use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
-        // This wrapper must run after process-wrap's JobObject. JobObject
-        // overwrites Tokio's creation flags while preparing its suspended
-        // launch, so applying the complete flag set last preserves both the
-        // race-free Job assignment and the GUI no-window policy.
         command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
         Ok(())
+    }
+
+    fn wrap_child(
+        &mut self,
+        inner: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        let process_handle = inner
+            .inner_child()
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("supervised child has no process handle"))?;
+        let job = Arc::new(WindowsJob::new()?);
+        job.assign_process(process_handle)?;
+        WindowsJob::resume_process_threads(process_handle)?;
+        Ok(Box::new(WindowsSupervisedChild {
+            inner,
+            job,
+            exit_status: None,
+        }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSupervisedChild {
+    inner: Box<dyn ChildWrapper>,
+    job: Arc<WindowsJob>,
+    exit_status: Option<ExitStatus>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for WindowsSupervisedChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.inner.as_ref()
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.inner.as_mut()
+    }
+
+    fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+        let Self { inner, .. } = *self;
+        inner
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        self.job.terminate()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
+        }
+        let Some(status) = self.inner.try_wait()? else {
+            return Ok(None);
+        };
+        self.job.terminate()?;
+        if !self.job.wait_for_exit(Duration::ZERO)? {
+            return Ok(None);
+        }
+        self.exit_status = Some(status);
+        Ok(Some(status))
+    }
+
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(status) = self.exit_status {
+                return Ok(status);
+            }
+            let status = self.inner.wait().await?;
+            self.job.terminate()?;
+            if !self.job.wait_for_exit(Duration::ZERO)? {
+                let job = Arc::clone(&self.job);
+                tokio::task::spawn_blocking(move || job.wait_for_exit_unbounded())
+                    .await
+                    .map_err(std::io::Error::other)??;
+            }
+            self.exit_status = Some(status);
+            Ok(status)
+        })
     }
 }
 
@@ -50,10 +131,7 @@ impl CommandWrapper for WindowsSupervisedCreationFlags {
 pub fn configure_supervised_background_command_wrap(command: &mut CommandWrap) {
     command.wrap(KillOnDrop);
     #[cfg(windows)]
-    {
-        command.wrap(process_wrap::tokio::JobObject);
-        command.wrap(WindowsSupervisedCreationFlags);
-    }
+    command.wrap(WindowsSupervisedJob);
     #[cfg(unix)]
     command.wrap(ProcessGroup::leader());
 }
@@ -70,6 +148,7 @@ mod tests {
 
     const CONSOLE_PROBE_ENV: &str = "BIBCODE_WINDOWS_CONSOLE_PROBE";
     const CONSOLE_PROBE_MARKER: &str = "BIBCODE_HAS_CONSOLE=";
+    const WAIT_PROBE_ENV: &str = "BIBCODE_WINDOWS_JOB_WAIT_PROBE";
 
     #[test]
     fn windows_child_console_probe() {
@@ -79,6 +158,55 @@ mod tests {
             let has_console = !unsafe { GetConsoleWindow() }.is_null();
             println!("{CONSOLE_PROBE_MARKER}{has_console}");
         }
+    }
+
+    #[test]
+    fn windows_child_job_wait_probe() {
+        if std::env::var_os(WAIT_PROBE_ENV).is_some() {
+            std::thread::park();
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_background_wait_survives_post_kill_status_probes() {
+        let executable = std::env::current_exe().expect("current test executable should resolve");
+        let mut command = CommandWrap::with_new(executable, |command| {
+            command
+                .args([
+                    "--exact",
+                    "process::background::tests::windows_child_job_wait_probe",
+                    "--nocapture",
+                ])
+                .env(WAIT_PROBE_ENV, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        });
+        configure_supervised_background_command_wrap(&mut command);
+
+        let mut child = command.spawn().expect("wrapped wait probe should start");
+        child
+            .start_kill()
+            .expect("wrapped wait probe job should terminate");
+        // SAFETY: this test deliberately reaps only the raw root while retaining
+        // the wrapper so repeated non-consuming tree-status probes can be verified.
+        unsafe { child.inner_child_mut() }
+            .wait()
+            .await
+            .expect("wrapped wait probe root should exit");
+        for _ in 0..16 {
+            assert!(
+                child
+                    .try_wait()
+                    .expect("wrapped wait probe status should be readable")
+                    .is_some()
+            );
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), child.wait())
+            .await
+            .expect("wrapped job wait must not lose its terminal notification")
+            .expect("wrapped job should finish reaping");
     }
 
     #[tokio::test]

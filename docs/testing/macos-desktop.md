@@ -43,7 +43,8 @@ Select focused tests from affected source and verify at least:
 - external-worktree adoption and restart remain idempotent;
 - worktree removal fails closed when physical identity cannot be proven;
 - Unix process-group ownership survives cancellation and natural leader exit,
-  reaps late descendants, and does not signal peer-runtime roots;
+  reaps late descendants, does not signal peer-runtime roots, and remains
+  independent of the Windows-only Job implementation;
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
 - Activity observation timestamps and keyboard navigation remain correct; and
@@ -121,8 +122,13 @@ Build and run packaged E2E with:
 ```sh
 export BIBCODE_E2E_PLATFORM=mac
 vp run test:ui:desktop:build
+export BIBCODE_E2E_APP_PATH="$PWD/target/release/bundle/macos/BiBCode.app"
+test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
+
+`BIBCODE_E2E_APP_PATH` deliberately selects the application bundle produced by
+the E2E build in the current worktree, not an installed production copy.
 
 ## Renderer-data isolation
 

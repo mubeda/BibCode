@@ -90,6 +90,8 @@ export function useCenterPanelActions({
       const { hostRef, modelSelection, providerLabel } = input;
       const environmentId = hostRef.environmentId;
       const threadId = newThreadId();
+      const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
+      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
       const result = await createPanel({
         environmentId,
         input: {
@@ -105,19 +107,20 @@ export function useCenterPanelActions({
         },
       });
       if (result._tag === "Failure") {
-        if (!isAtomCommandInterrupted(result)) {
-          const error = squashAtomCommandFailure(result);
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Failed to open chat panel",
-              description: error instanceof Error ? error.message : "An error occurred.",
-            }),
-          );
+        if (isAtomCommandInterrupted(result)) {
+          return threadId;
         }
+        useCenterPanelStore.getState().removeThread(panelRef);
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Failed to open chat panel",
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+        );
         return null;
       }
-      useCenterPanelStore.getState().openChatPanel(hostRef, threadId, providerLabel);
       return threadId;
     },
     [createPanel],
@@ -127,6 +130,10 @@ export function useCenterPanelActions({
     (hostRef: ScopedThreadRef, removed: readonly CenterSurface[]) => {
       for (const surface of removed) {
         if (surface.kind === "chat") {
+          useCenterPanelStore.getState().releaseChatPanelReservation({
+            environmentId: hostRef.environmentId,
+            threadId: surface.threadId,
+          });
           deletePanelThread(hostRef.environmentId, surface.threadId);
         } else if (surface.kind === "terminal") {
           onCloseTerminal(hostRef, surface);

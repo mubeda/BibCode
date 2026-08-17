@@ -418,7 +418,15 @@ pub(crate) async fn probe_maintenance_target_version(
             .iter()
             .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
     )?;
-    let version_output = run_command(&executable, &["--version"], cwd, &target.environment).await;
+    let version_probe = run_command(&executable, &["--version"], cwd, &target.environment);
+    let about_probe = async {
+        if target.driver == "cursor" {
+            run_command(&executable, &["about"], cwd, &target.environment).await
+        } else {
+            None
+        }
+    };
+    let (version_output, about_output) = tokio::join!(version_probe, about_probe);
     let version = normalize_provider_version(
         &target.driver,
         version_output
@@ -429,8 +437,7 @@ pub(crate) async fn probe_maintenance_target_version(
     if target.driver != "cursor" {
         return version;
     }
-    let about = run_command(&executable, &["about"], cwd, &target.environment)
-        .await
+    let about = about_output
         .filter(|output| output.success)
         .map(|output| cursor::parse_about_output(output.code, &output.stdout, &output.stderr));
     about.and_then(|about| about.version).or(version)

@@ -47,6 +47,14 @@ simultaneous wake. At the timeout boundary, an execution whose process wait and
 pipe collection are already complete returns that result; only an execution
 that remains pending is terminated as timed out.
 
+On Windows, that shared owner assigns the suspended root to a kill-on-close Job
+before allowing it to execute. Status probes inspect the Job's signaled state
+without consuming completion notifications. Once the root exits, the owner
+reaps it, terminates any residual descendants, and waits for the Job to become
+empty. This keeps repeated status probes from losing the terminal Job state.
+Unix supervision continues to use one process-group leader and a single
+signal/wait/reap owner.
+
 Long-lived provider roots register their exact process identity in the owning
 server runtime before publication. Runtime shutdown freezes this admission
 before provider supervision drains. A root that races the freeze is not
@@ -56,6 +64,21 @@ same per-runtime registry is shared with terminal roots, independently spawned
 provider-terminal helpers, and the managed endpoint tunnel and is the only input
 to residual runtime cleanup; provider shutdown never infers ownership from the
 shared application PID.
+
+After admission closes, the provider supervisor detaches every live session
+from shared activity state and drains independent driver shutdowns with a fixed
+concurrency bound. Each driver retains its native process-group or Windows Job
+kill-and-reap owner, while one slow provider cannot serially consume the desktop
+runtime's entire shutdown deadline. No detached session is reported stopped
+until its driver cleanup and persisted runtime-row removal both complete.
+Codex additionally bounds its graceful App Server shutdown handshake before it
+uses that same owned process cleanup path, so an unresponsive provider cannot
+hold the server runtime open indefinitely on Windows, macOS, or Linux.
+OpenCode terminal-observer helpers likewise publish their bounded foreground
+cleanup result without cancelling the in-flight kernel wait. The retained
+reaper continues that exact wait future until the Windows Job or Unix process
+group is fully reaped; it never restarts a cancellation-sensitive ownership
+wait after its foreground budget expires.
 
 The canonical `thread.token-usage.updated` event describes two distinct values:
 `usedTokens` is active context-window usage, while optional
@@ -124,6 +147,12 @@ Enabled instances appear in the center-panel add menu. A ready instance can
 create a provider panel thread; an unready instance remains visible with its
 readiness reason. The same menu exposes provider-terminal actions for enabled
 instances.
+
+Panel selection reserves the client tab before the create-panel RPC settles.
+An explicit failure rolls the reservation back, while interruption retains it
+because the server may already have durably created the thread. This prevents a
+successful provider panel from becoming hidden when response delivery and
+thread projection updates overlap.
 
 A provider-terminal action resolves the configured executable and built-in
 arguments, then sends the structured executable/argument vector to the Rust PTY

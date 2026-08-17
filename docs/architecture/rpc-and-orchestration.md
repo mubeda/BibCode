@@ -585,7 +585,10 @@ Unary command acceptance is not a promise that an external provider process
 will finish successfully. Provider delivery and completion are reflected by
 subsequent durable orchestration events. Streaming subscriptions can be
 re-established after reconnect from snapshots or replay methods rather than
-depending on connection-local push caches.
+depending on connection-local push caches. `subscribeThread` and
+`subscribeShell` register their durable-event receiver before reading the
+initial snapshot, so a commit concurrent with that read is queued and then
+projected instead of being lost between snapshot and live delivery.
 
 ### Assistant message identity
 

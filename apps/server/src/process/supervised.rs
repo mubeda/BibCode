@@ -75,7 +75,6 @@ pub(crate) async fn run_supervised(
     run_supervised_with_observer(request, cancellation, None, |_| {}).await
 }
 
-#[cfg(test)]
 pub(crate) async fn run_supervised_with_spawn_observer<F>(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
@@ -128,6 +127,16 @@ where
     };
     let mut command = CommandWrap::from(command);
     configure_supervised_background_command_wrap(&mut command);
+    #[cfg(windows)]
+    let mut child = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command))
+        .await
+        .map_err(|error| {
+            SupervisedRunError::Spawn(io::Error::other(format!(
+                "supervised process spawn task failed: {error}"
+            )))
+        })?
+        .map_err(SupervisedRunError::Spawn)?;
+    #[cfg(not(windows))]
     let mut child = spawn_wrapped(&mut command).map_err(SupervisedRunError::Spawn)?;
     observer(child.id());
 

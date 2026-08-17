@@ -30,7 +30,9 @@ const surfaceIds = (ref = HOST) => stateOf(ref).surfaces.map((surface) => surfac
 const rootGroup = () => stateOf().groups.find((group) => group.id === CENTER_PANEL_ROOT_GROUP_ID)!;
 
 describe("centerPanelStore", () => {
-  beforeEach(() => useCenterPanelStore.setState({ byThreadKey: {} }));
+  beforeEach(() =>
+    useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() }),
+  );
   afterEach(() => vi.restoreAllMocks());
 
   describe("default / host surface", () => {

@@ -2403,6 +2403,7 @@ fn waitid_child_once(process_id: u32) -> std::io::Result<Option<libc::pid_t>> {
 
 enum OpenCodeForegroundReap {
     Reaped,
+    #[cfg(test)]
     TimedOut,
     WaitFailed(String),
 }
@@ -2410,6 +2411,7 @@ enum OpenCodeForegroundReap {
 async fn reap_opencode_helper(
     cleanup: &mut SystemOpenCodeReapGuard,
     process_group_id: Option<i32>,
+    foreground_done: &watch::Sender<bool>,
     #[cfg(test)] fixture_events: Option<&OpenCodeHelperFixtureEvents>,
 ) -> OpenCodeForegroundReap {
     tokio::time::sleep(OPENCODE_HELPER_TERM_GRACE).await;
@@ -2430,24 +2432,37 @@ async fn reap_opencode_helper(
         let _ = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
         return OpenCodeForegroundReap::TimedOut;
     }
-    match tokio::time::timeout(
-        OPENCODE_HELPER_REAP_TIMEOUT,
-        wait_opencode_child(
-            cleanup.child_mut(),
-            #[cfg(test)]
-            fixture_events,
-        ),
-    )
-    .await
-    {
+    let mut wait = Box::pin(wait_opencode_child(
+        cleanup.child_mut(),
+        #[cfg(test)]
+        fixture_events,
+    ));
+    match tokio::time::timeout(OPENCODE_HELPER_REAP_TIMEOUT, wait.as_mut()).await {
         Ok(Ok(_)) => {
+            drop(wait);
             cleanup.disarm();
             OpenCodeForegroundReap::Reaped
         }
         Ok(Err(error)) => {
             OpenCodeForegroundReap::WaitFailed(format!("OpenCode helper wait failed: {error}"))
         }
-        Err(_) => OpenCodeForegroundReap::TimedOut,
+        Err(_) => {
+            // `process-wrap` job/process-group waits may own kernel observation state that is not
+            // cancellation-safe. Publish the foreground budget without dropping that in-flight
+            // wait, then let the retained reaper finish the same future in the background.
+            foreground_done.send_replace(true);
+            let result = wait.as_mut().await;
+            drop(wait);
+            match result {
+                Ok(_) => {
+                    cleanup.disarm();
+                    OpenCodeForegroundReap::Reaped
+                }
+                Err(error) => OpenCodeForegroundReap::WaitFailed(format!(
+                    "OpenCode helper wait failed: {error}"
+                )),
+            }
+        }
     }
 }
 
@@ -2740,6 +2755,7 @@ impl OpenCodeRetainedReaper {
             let foreground_reap = reap_opencode_helper(
                 &mut cleanup,
                 process_group_id,
+                &foreground_done,
                 #[cfg(test)]
                 fixture_events.as_ref(),
             )
@@ -2776,6 +2792,7 @@ impl OpenCodeRetainedReaper {
                     }
                     true
                 }
+                #[cfg(test)]
                 OpenCodeForegroundReap::TimedOut => false,
             };
             #[cfg(test)]
@@ -3398,7 +3415,7 @@ async fn read_bounded_json(mut response: reqwest::Response) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{convert::Infallible, process::ExitStatus, sync::atomic::AtomicUsize};
 
     use axum::{
         Router,
@@ -3412,6 +3429,138 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[derive(Debug)]
+    struct CancellationSensitiveWaitState {
+        wait_calls: AtomicUsize,
+        cancelled_waits: AtomicUsize,
+        wait_started: watch::Sender<bool>,
+        release: watch::Sender<bool>,
+    }
+
+    impl CancellationSensitiveWaitState {
+        fn new() -> Self {
+            let (wait_started, _) = watch::channel(false);
+            let (release, _) = watch::channel(false);
+            Self {
+                wait_calls: AtomicUsize::new(0),
+                cancelled_waits: AtomicUsize::new(0),
+                wait_started,
+                release,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancellationSensitiveWaitChild {
+        state: Arc<CancellationSensitiveWaitState>,
+    }
+
+    impl ChildWrapper for CancellationSensitiveWaitChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send + '_>> {
+            self.state.wait_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.wait_started.send_replace(true);
+            let mut release = self.state.release.subscribe();
+            let cancelled_waits = &self.state.cancelled_waits;
+            Box::pin(async move {
+                struct CancellationGuard<'a> {
+                    cancelled_waits: &'a AtomicUsize,
+                    completed: bool,
+                }
+
+                impl Drop for CancellationGuard<'_> {
+                    fn drop(&mut self) {
+                        if !self.completed {
+                            self.cancelled_waits.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+
+                let mut guard = CancellationGuard {
+                    cancelled_waits,
+                    completed: false,
+                };
+                while !*release.borrow() {
+                    release.changed().await.map_err(|_| {
+                        std::io::Error::other("cancellation-sensitive wait release closed")
+                    })?;
+                }
+                guard.completed = true;
+                Ok(successful_exit_status())
+            })
+        }
+    }
+
+    fn successful_exit_status() -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(0)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_reaper_continues_the_same_wait_after_its_foreground_budget() {
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
+        let state = Arc::new(CancellationSensitiveWaitState::new());
+        let mut wait_started = state.wait_started.subscribe();
+        let mut foreground_done = reaper.submit(
+            Box::new(CancellationSensitiveWaitChild {
+                state: state.clone(),
+            }),
+            None,
+            reaper.reserve().expect("reserve retained reaper capacity"),
+            None,
+            None,
+            None,
+        );
+
+        while !*wait_started.borrow_and_update() {
+            wait_started
+                .changed()
+                .await
+                .expect("wait-start publisher remains live");
+        }
+        tokio::time::advance(OPENCODE_HELPER_TERM_GRACE).await;
+        assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(OPENCODE_HELPER_REAP_TIMEOUT).await;
+        while !*foreground_done.borrow_and_update() {
+            foreground_done
+                .changed()
+                .await
+                .expect("foreground completion publisher remains live");
+        }
+
+        assert_eq!(state.wait_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
+
+        state.release.send_replace(true);
+        reaper.shutdown().await;
+        assert_eq!(state.cancelled_waits.load(Ordering::SeqCst), 0);
+    }
 
     #[cfg(unix)]
     #[derive(Debug)]
