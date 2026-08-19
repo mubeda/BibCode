@@ -7,6 +7,7 @@ import {
   createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentRpcSubscriptionAtomFamily,
 } from "./runtime.ts";
 import {
   type CreateProjectInput,
@@ -60,6 +61,16 @@ export function createProjectEnvironmentAtoms<R, E>(
       tag: WS_METHODS.projectsSearchEntries,
       staleTimeMs: 15_000,
     }),
+    /**
+     * Signals that the workspace changed on disk outside the application.
+     *
+     * The stream carries no entry data — the server's index remains the source of truth — so a
+     * subscriber refreshes `listEntries` when this fires.
+     */
+    subscribeEntries: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:projects:subscribe-entries",
+      tag: WS_METHODS.projectsSubscribeEntries,
+    }),
     listEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:list-entries",
       tag: WS_METHODS.projectsListEntries,
@@ -105,6 +116,15 @@ export function createProjectEnvironmentAtoms<R, E>(
     createEntry: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:create-entry",
       tag: WS_METHODS.projectsCreateEntry,
+      scheduler: fileScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.cwd]),
+      },
+    }),
+    refreshEntries: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:refresh-entries",
+      tag: WS_METHODS.projectsListEntries,
       scheduler: fileScheduler,
       concurrency: {
         mode: "serial",

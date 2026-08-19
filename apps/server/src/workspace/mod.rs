@@ -10,12 +10,14 @@ mod watcher;
 pub use entries::{BrowseEntry, BrowseResult};
 pub use error::WorkspaceError;
 pub use rpc::{
-    AssetContextResolver, TASK_SIX_RPC_METHODS, WorkspaceMutationFuture, WorkspaceMutationObserver,
-    WorkspaceRpc, WorkspaceRpcDependencies,
+    AssetContextResolver, EntryChangeSubscription, TASK_SIX_RPC_METHODS, WorkspaceMutationFuture,
+    WorkspaceMutationObserver, WorkspaceRpc, WorkspaceRpcDependencies,
 };
 #[allow(unused_imports)]
 pub use search::{EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceSearchIndex};
 #[allow(unused_imports)]
 pub use service::{ReadFileResult, WorkspaceService};
 #[allow(unused_imports)]
-pub use watcher::{WatchEvent, WatchSubscription, WorkspaceWatcher};
+pub use watcher::{
+    WatchEvent, WatchScope, WatchScopeFuture, WatchSubscription, WorkspaceWatcher, directory_stamps,
+};

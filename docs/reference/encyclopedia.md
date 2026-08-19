@@ -86,7 +86,10 @@ publishing is available from the chat-header Git actions control.
 The right-panel filesystem UI for the active project/worktree. It supports
 context menus for files, folders, and background space; create, rename, delete,
 duplicate, copy path, add folder as project, external editor, preview, and
-explicit Ctrl/Cmd+S saves.
+explicit Ctrl/Cmd+S saves. Each directory is one expandable row, entries move by
+dragging them onto a folder row or the tree root, and Refresh rescans the
+workspace on the server so externally created files appear. Expansion state
+survives refreshes and mutations.
 
 ### Custom Action
 

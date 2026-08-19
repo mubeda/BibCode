@@ -89,6 +89,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     stream("subscribeAuthAccess"),
     stream("subscribeDiscoveredLocalServers"),
     stream("subscribePreviewEvents"),
+    stream("subscribeProjectEntries"),
     stream("subscribeServerConfig"),
     stream("subscribeServerLifecycle"),
     stream("subscribeTerminalEvents"),

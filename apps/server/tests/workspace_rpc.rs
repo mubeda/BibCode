@@ -285,38 +285,443 @@ async fn workspace_rpc_bounds_list_entries_and_preserves_unbounded_calls() {
     assert_eq!(unbounded["truncated"], false);
 }
 
+fn git_in(cwd: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "BiBCode Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "BiBCode Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .output()
+        .expect("git must be installed for integration tests");
+    assert!(output.status.success(), "git {args:?} failed");
+}
+
+/// A directory holding no files is still a directory the user created and can see on disk.
+///
+/// `git ls-files` only reports files, so a git-backed scan that infers directories from file paths
+/// alone cannot see one — while the non-git walk does. The tree must not disagree with the disk just
+/// because the workspace happens to be a repository.
 #[tokio::test]
-async fn watcher_coalesces_bursts_and_stops_when_subscription_is_cancelled() {
+async fn empty_directories_are_listed_in_a_git_workspace() {
     let root = TempDir::new().expect("root");
-    write(root.path(), "baseline.txt", b"baseline").await;
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), "tracked.txt", b"tracked").await;
+    git_in(root.path(), &["add", "-A"]);
+    git_in(root.path(), &["commit", "-m", "init"]);
+
+    // Exactly what "New Folder…" produces, and what an mkdir in a file manager produces.
+    tokio::fs::create_dir_all(root.path().join("docs/screenshots/empty-child"))
+        .await
+        .expect("create empty directory");
+
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let result = rpc
+        .handle(
+            "projects.listEntries",
+            json!({ "cwd": path_string(root.path()) }),
+        )
+        .await
+        .expect("list entries");
+    let paths = result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        paths.contains(&"docs/screenshots/empty-child"),
+        "an empty directory on disk must appear in the tree; got {paths:?}"
+    );
+}
+
+/// Every path on disk, excluding `.git`, as workspace-relative posix strings.
+fn disk_paths(root: &Path) -> std::collections::BTreeSet<String> {
+    fn walk(root: &Path, current: &Path, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(children) = std::fs::read_dir(current) else {
+            return;
+        };
+        for child in children.filter_map(Result::ok) {
+            let path = child.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if relative == ".git" || relative.starts_with(".git/") {
+                continue;
+            }
+            let Ok(file_type) = child.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            out.insert(relative);
+            if file_type.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The tree must show exactly what is on disk.
+///
+/// Guards the whole listing against divergence rather than one shape of it: empty directories,
+/// nested empty chains, ignored directories and their contents, and ordinary files all have to
+/// round-trip. `.git` is the only deliberate omission.
+#[tokio::test]
+async fn listed_entries_match_the_filesystem_exactly() {
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(
+        root.path(),
+        ".gitignore",
+        b"ignored-tree/
+",
+    )
+    .await;
+    write(root.path(), "src/app.ts", b"export {}").await;
+    write(root.path(), "docs/guide.md", b"# guide").await;
+    write(root.path(), "ignored-tree/cache/blob.bin", b"blob").await;
+    git_in(root.path(), &["add", "-A"]);
+    git_in(root.path(), &["commit", "-m", "init"]);
+
+    // Shapes git cannot see on its own: an empty directory, and a nested chain of them.
+    tokio::fs::create_dir_all(root.path().join("docs/screenshots"))
+        .await
+        .expect("empty directory");
+    tokio::fs::create_dir_all(root.path().join("deep/empty/chain"))
+        .await
+        .expect("empty chain");
+    // An untracked file, and an empty directory inside an ignored tree.
+    write(root.path(), "src/untracked.ts", b"export {}").await;
+    tokio::fs::create_dir_all(root.path().join("ignored-tree/empty-inside"))
+        .await
+        .expect("empty directory inside an ignored tree");
+
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let result = rpc
+        .handle(
+            "projects.listEntries",
+            json!({ "cwd": path_string(root.path()) }),
+        )
+        .await
+        .expect("list entries");
+    assert_eq!(result["truncated"], false, "fixture must fit the budget");
+    let listed = result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let on_disk = disk_paths(root.path());
+    let missing = on_disk.difference(&listed).collect::<Vec<_>>();
+    let phantom = listed.difference(&on_disk).collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "these exist on disk but are missing from the tree: {missing:?}"
+    );
+    assert!(
+        phantom.is_empty(),
+        "these are in the tree but not on disk: {phantom:?}"
+    );
+}
+
+#[tokio::test]
+async fn subscribed_roots_pick_up_outside_changes_without_an_explicit_refresh() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(50));
+    let cwd = path_string(root.path());
+
+    let lists = |payload| {
+        let rpc = rpc.clone();
+        async move {
+            let result = rpc
+                .handle("projects.listEntries", payload)
+                .await
+                .expect("list entries");
+            result["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["path"] == "nested/pasted.txt")
+        }
+    };
+
+    assert!(!lists(json!({ "cwd": cwd })).await, "cache is warmed");
+    let mut changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+
+    // The paste an Explorer window would make: no workspace RPC is involved.
+    write(root.path(), "nested/pasted.txt", b"pasted").await;
+
+    tokio::time::timeout(Duration::from_secs(10), changes.recv())
+        .await
+        .expect("change signal timeout")
+        .expect("change signal");
+
+    // No refresh flag: the sweep must already have dropped the stale snapshot.
+    assert!(
+        lists(json!({ "cwd": cwd })).await,
+        "a subscribed root reflects outside changes without an explicit refresh"
+    );
+}
+
+/// An unavailable workspace must not acquire a sweep.
+///
+/// Every other request against a workspace path goes through admission; a subscription that skipped
+/// it could start sweeping a root the availability guard has already fenced for removal.
+#[tokio::test]
+async fn subscribing_is_refused_while_the_workspace_is_unavailable() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let registry = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-1".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 3,
+                path: root.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_availability_registry(registry)
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+
+    let Err(error) = rpc.subscribe_entry_changes(root.path()).await else {
+        panic!("an unavailable workspace must refuse a subscription");
+    };
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert_eq!(
+        rpc.active_entry_watches().await,
+        0,
+        "a refused subscription must not leave a sweep behind"
+    );
+}
+
+/// Concurrent listers of a cold root must share one scan.
+///
+/// A scan runs outside the cache lock, so without single-flight every caller that misses the cache
+/// starts its own full scan of the same tree -- seconds of duplicated work each, on exactly the
+/// paths a large workspace makes expensive.
+#[tokio::test]
+async fn concurrent_listers_share_a_single_workspace_scan() {
+    let root = TempDir::new().expect("root");
+    for index in 0..40 {
+        write(root.path(), &format!("src/module-{index}.ts"), b"export {}").await;
+    }
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+    assert_eq!(rpc.index_scans(), 0);
+
+    let listers = (0..6)
+        .map(|_| {
+            let rpc = rpc.clone();
+            let cwd = cwd.clone();
+            tokio::spawn(async move {
+                rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    for lister in listers {
+        lister
+            .await
+            .expect("lister task")
+            .expect("concurrent list succeeds");
+    }
+
+    assert_eq!(
+        rpc.index_scans(),
+        1,
+        "six concurrent listers of one cold root must produce one scan"
+    );
+}
+
+/// Subscribing must resync, not trust a snapshot older than the sweep.
+///
+/// A change made while no sweep existed is already on disk when the baseline is stamped, so it can
+/// never appear as a difference. If the cached snapshot predates that change, the tree stays stale
+/// until something else changes or the user refreshes by hand.
+#[tokio::test]
+async fn subscribing_resyncs_a_snapshot_that_predates_the_sweep() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+    let cwd = path_string(root.path());
+
+    // Warm the cache, then change the workspace while nothing is watching it.
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm the cache");
+    write(root.path(), "nested/added-while-unwatched.txt", b"added").await;
+
+    let _changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+
+    // No refresh flag: subscribing is itself a resync point.
+    let result = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("list entries");
+    let present = result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .any(|entry| entry["path"] == "nested/added-while-unwatched.txt");
+    assert!(
+        present,
+        "starting a sweep must resync the snapshot it is about to track"
+    );
+}
+
+/// A sweep must not outlive its subscribers on a quiet workspace.
+///
+/// Losing the last receiver is invisible to a loop parked on the watcher, so without an independent
+/// idle check the sweep survives panel closure until some unrelated path changes — which on a quiet
+/// workspace never happens, leaving one two-second sweep per root running for the process lifetime.
+#[tokio::test]
+async fn idle_sweeps_are_retired_without_waiting_for_a_filesystem_change() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+
+    let changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+    assert_eq!(rpc.active_entry_watches().await, 1);
+
+    // The panel closes. Nothing on disk changes afterwards.
+    drop(changes);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rpc.active_entry_watches().await > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        rpc.active_entry_watches().await,
+        0,
+        "the sweep must retire once nothing is listening"
+    );
+
+    // A later subscriber gets a working sweep rather than the retired one.
+    let mut resubscribed = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("second subscription");
+    assert_eq!(rpc.active_entry_watches().await, 1);
+    write(root.path(), "nested/after-resubscribe.txt", b"after").await;
+    tokio::time::timeout(Duration::from_secs(10), resubscribed.recv())
+        .await
+        .expect("resubscribed signal timeout")
+        .expect("resubscribed signal");
+}
+
+#[tokio::test]
+async fn entry_change_subscribers_share_one_sweep_per_root() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(50));
+    let noncanonical = root.path().join(".");
+
+    let mut first = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("first subscription");
+    let mut second = rpc
+        .subscribe_entry_changes(&noncanonical)
+        .await
+        .expect("second subscription");
+
+    write(root.path(), "nested/pasted.txt", b"pasted").await;
+
+    // Both receivers see the same signal, which is what proves they share a sweep rather than each
+    // starting one; the noncanonical path must resolve onto the same root.
+    tokio::time::timeout(Duration::from_secs(10), first.recv())
+        .await
+        .expect("first signal timeout")
+        .expect("first signal");
+    tokio::time::timeout(Duration::from_secs(10), second.recv())
+        .await
+        .expect("second signal timeout")
+        .expect("second signal");
+}
+
+/// Supplies a fixed directory set, standing in for the workspace index.
+struct FixedScope(Vec<String>);
+
+impl workspace::WatchScope for FixedScope {
+    fn directories(&self, _root: PathBuf) -> workspace::WatchScopeFuture {
+        let directories = self.0.clone();
+        Box::pin(async move { directories })
+    }
+}
+
+#[tokio::test]
+async fn watcher_reports_directories_whose_contents_changed_and_coalesces_bursts() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/baseline.txt", b"baseline").await;
     let coalesce_window = Duration::from_millis(500);
     let watcher = WorkspaceWatcher::new(Duration::from_millis(20), coalesce_window, 2);
-    let mut subscription = watcher.watch(root.path().to_path_buf());
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
 
-    let baseline = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
-        .await
-        .expect("baseline timeout")
-        .expect("baseline event");
+    // Everything that already existed is the baseline, so a quiet workspace must stay silent
+    // rather than reporting a change that would rebuild a freshly built index.
+    tokio::time::sleep(coalesce_window + Duration::from_millis(200)).await;
     assert!(
-        baseline
-            .changed_paths
-            .iter()
-            .any(|path| path.ends_with("baseline.txt"))
+        subscription.try_recv().is_err(),
+        "an unchanged workspace must not report a change"
     );
 
     for sequence in 0..8 {
-        write(root.path(), "burst.txt", sequence.to_string().as_bytes()).await;
+        write(
+            root.path(),
+            &format!("nested/burst-{sequence}.txt"),
+            sequence.to_string().as_bytes(),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
         .await
         .expect("watch timeout")
         .expect("watch event");
+    // The sweep stats directories, so a new file surfaces as its parent directory moving.
     assert!(
         event
             .changed_paths
             .iter()
-            .any(|path| path.ends_with("burst.txt"))
+            .any(|path| path.ends_with("nested")),
+        "expected the containing directory, got {:?}",
+        event.changed_paths
     );
     tokio::time::sleep(coalesce_window + Duration::from_millis(150)).await;
     assert!(
@@ -329,6 +734,100 @@ async fn watcher_coalesces_bursts_and_stops_when_subscription_is_cancelled() {
         .await
         .expect("watcher cancellation");
     assert_eq!(watcher.active_watchers(), 0);
+}
+
+/// Sustained change must not starve notifications.
+///
+/// Production runs a coalesce window shorter than the poll interval, so a deadline reset on every
+/// observed change is always pushed past the current tick. A long build or an agent writing files
+/// touches a directory on every poll, which would suppress every signal for as long as it runs —
+/// exactly when the tree most needs to update.
+#[tokio::test]
+async fn watcher_flushes_during_sustained_change_instead_of_starving() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/seed.txt", b"seed").await;
+    // Same relationship as production: the coalesce window is shorter than the poll interval.
+    let poll_interval = Duration::from_millis(60);
+    let coalesce_window = Duration::from_millis(20);
+    let watcher = WorkspaceWatcher::new(poll_interval, coalesce_window, 4);
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
+
+    // Churn until aborted, so the changes outlast the window we assert over: the point is that a
+    // signal arrives *while* changes are still arriving, not once they stop.
+    let churn_root = root.path().to_path_buf();
+    let churn = tokio::spawn(async move {
+        let mut sequence = 0u32;
+        loop {
+            let path = churn_root.join(format!("nested/churn-{sequence}.txt"));
+            let _ = tokio::fs::write(path, b"churn").await;
+            sequence += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv()).await;
+    churn.abort();
+    assert!(
+        event.is_ok_and(|received| received.is_some()),
+        "a signal must arrive while changes are still arriving"
+    );
+    subscription.cancel();
+}
+
+#[tokio::test]
+async fn watcher_ignores_in_place_edits_that_cannot_change_the_index() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/stable.txt", b"before").await;
+    let coalesce_window = Duration::from_millis(300);
+    let watcher = WorkspaceWatcher::new(Duration::from_millis(20), coalesce_window, 2);
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
+    tokio::time::sleep(coalesce_window + Duration::from_millis(200)).await;
+    let _ = subscription.try_recv();
+
+    // The index stores paths and kinds, never contents, so rewriting a file in place cannot
+    // invalidate it and must not cost a rebuild.
+    write(root.path(), "nested/stable.txt", b"after-the-edit").await;
+    tokio::time::sleep(coalesce_window + Duration::from_millis(400)).await;
+
+    assert!(
+        subscription.try_recv().is_err(),
+        "an in-place edit must not report a path-set change"
+    );
+    subscription.cancel();
+}
+
+#[tokio::test]
+async fn directory_stamps_cover_the_root_and_skip_missing_directories() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "present/file.txt", b"x").await;
+    let stamps =
+        workspace::directory_stamps(root.path(), &["present".to_owned(), "absent".to_owned()])
+            .await;
+
+    assert!(
+        stamps.get(root.path()).is_some_and(Option::is_some),
+        "the root is always swept so top-level creations are seen"
+    );
+    assert!(
+        stamps
+            .get(&root.path().join("present"))
+            .is_some_and(Option::is_some)
+    );
+    assert_eq!(
+        stamps.get(&root.path().join("absent")),
+        Some(&None),
+        "a missing directory is a distinct state, not an omission"
+    );
 }
 
 #[tokio::test]
@@ -696,6 +1195,52 @@ async fn explicit_index_refresh_replaces_a_cached_snapshot() {
             .any(|entry| entry["path"] == "after.txt")
     );
 }
+
+#[tokio::test]
+async fn list_entries_refreshes_only_when_the_request_opts_in() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "tracked.txt", b"").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let noncanonical_root = root.path().join(".");
+    let cwd = path_string(&noncanonical_root);
+    let lists = |payload| {
+        let rpc = rpc.clone();
+        async move {
+            let result = rpc
+                .handle("projects.listEntries", payload)
+                .await
+                .expect("list entries");
+            result["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["path"] == "pasted.txt")
+        }
+    };
+
+    assert!(!lists(json!({ "cwd": cwd })).await, "cache is warmed");
+
+    // Simulate an out-of-band paste: the file appears without any workspace RPC.
+    write(root.path(), "pasted.txt", b"").await;
+
+    assert!(
+        !lists(json!({ "cwd": cwd })).await,
+        "cached snapshots stay stale without an explicit refresh"
+    );
+    assert!(
+        !lists(json!({ "cwd": cwd, "refresh": false })).await,
+        "an explicit refresh: false keeps the cached snapshot"
+    );
+    assert!(
+        lists(json!({ "cwd": cwd, "refresh": true })).await,
+        "refresh: true rebuilds the index from the filesystem"
+    );
+    assert!(
+        lists(json!({ "cwd": cwd })).await,
+        "the refreshed snapshot repopulates the cache for later requests"
+    );
+}
+
 #[tokio::test]
 async fn workspace_rpc_invalidates_cached_indexes_after_mutations() {
     let root = TempDir::new().expect("root");
