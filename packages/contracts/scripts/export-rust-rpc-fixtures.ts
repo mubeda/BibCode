@@ -704,16 +704,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 95) {
-  throw new Error(`Expected 95 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 96) {
+  throw new Error(`Expected 96 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
-if (streamMethodCount !== 16) {
-  throw new Error(`Expected 16 streaming RPC methods, found ${streamMethodCount}.`);
+if (streamMethodCount !== 17) {
+  throw new Error(`Expected 17 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 59) {
+if (topLevelStreamShapeCount !== 60) {
   throw new Error(
-    `Expected 59 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 60 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {

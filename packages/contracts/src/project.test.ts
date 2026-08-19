@@ -42,6 +42,27 @@ describe("project RPC inputs", () => {
   it.each([0, -1, 1.5, 201])("rejects the invalid list limit %s", (limit) => {
     expect(() => decodeListEntriesInput({ cwd: "/workspace", limit })).toThrow();
   });
+
+  it("accepts an omitted refresh opt-in and both explicit refresh values", () => {
+    expect(decodeListEntriesInput({ cwd: "/workspace" })).not.toHaveProperty("refresh");
+    expect(decodeListEntriesInput({ cwd: "/workspace", refresh: true })).toEqual({
+      cwd: "/workspace",
+      refresh: true,
+    });
+    expect(decodeListEntriesInput({ cwd: "/workspace", refresh: false })).toEqual({
+      cwd: "/workspace",
+      refresh: false,
+    });
+    expect(decodeListEntriesInput({ cwd: "/workspace", limit: 50, refresh: true })).toEqual({
+      cwd: "/workspace",
+      limit: 50,
+      refresh: true,
+    });
+  });
+
+  it.each(["true", 1, null])("rejects the invalid refresh value %s", (refresh) => {
+    expect(() => decodeListEntriesInput({ cwd: "/workspace", refresh })).toThrow();
+  });
 });
 
 describe("project RPC errors", () => {

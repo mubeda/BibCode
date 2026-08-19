@@ -691,6 +691,54 @@ only bounded target-free scope/actor revision tombstones so a stable public
 scope cannot reuse a stale pre-restart control fence; no operation or
 provider-native identity survives.
 
+## Workspace entry index and refresh
+
+`projects.listEntries` and `projects.searchEntries` are served from one
+server-owned entry index per canonical workspace root, built on first use and
+retained for later requests. In a Git workspace the scan lists tracked and
+untracked files, walks the contents of ignored directories, and separately walks
+for directories: `git ls-files` reports only files, so a directory holding no
+files — one just created, or one whose contents are all elsewhere — would
+otherwise be absent from the tree despite existing on disk. The scan is bounded by entry count, total memory,
+and path length; exceeding a bound returns the entries scanned so far with
+`truncated: true` rather than growing without limit.
+
+The index is the server's cached view of the tree. A cached root is rebuilt when
+something invalidates it:
+
+- the in-app mutations `projects.writeFile`, `projects.createEntry`,
+  `projects.renameEntry`, `projects.deleteEntry`, and `projects.duplicateEntry`
+  drop the cached index for their root after a successful mutation, so the next
+  list or search rebuilds it; and
+- `subscribeProjectEntries` streams a signal whenever a periodic sweep observes
+  that the path set under `cwd` changed outside the application. The sweep stats
+  the directories the snapshot already lists rather than walking the tree,
+  because adding, renaming, or removing an entry moves its parent directory's
+  mtime while an in-place content edit does not. The first subscriber for a root
+  starts the sweep and the last one to leave stops it; the cached index is
+  dropped before the signal is sent, so a subscriber that re-lists on the signal
+  sees the new state. The event carries only `cwd` — the index stays the single
+  source of truth for entry data, so subscribers re-list rather than apply a
+  diff, which also keeps the payload independent of how many files changed;
+- `projects.listEntries` accepts an optional boolean `refresh`. Omitting it, or
+  sending `false`, serves the retained index and preserves compatibility for
+  older clients. `refresh: true` drops the cached index before listing, so the
+  result includes files and directories created or removed outside the
+  application.
+
+A client that changes the workspace only through this RPC surface therefore
+never needs `refresh`; it exists so an explicit user-initiated rescan can
+observe external changes without waiting for the next periodic check. The flag changes cache admission only. It does not
+widen the path boundary, bypass the workspace-availability guard, or otherwise
+change what the caller may read.
+
+Moving an entry is a rename. The file tree's drag-and-drop move sends
+`projects.renameEntry` with the source and destination as workspace-relative
+paths under the request's workspace root; there is no separate move method.
+Every method on this surface holds a path admission lease for the whole
+operation, and the mutations additionally cross the finalization fence described
+in [Missing-workspace runtime guard](#missing-workspace-runtime-guard).
+
 ## Provider usage refresh
 
 `server.getProviderUsage` reads the server's current provider-usage snapshots.

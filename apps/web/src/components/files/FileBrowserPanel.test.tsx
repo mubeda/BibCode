@@ -85,6 +85,7 @@ const testState = vi.hoisted(() => ({
   remapFileSurfaces: (() => {}) as (...args: unknown[]) => void,
   closeFileSurfacesUnder: (() => {}) as (...args: unknown[]) => void,
   vcsStatus: null as VcsStatusResult | null,
+  entryChangeSignal: null as { cwd: string } | null,
   openFileInPreview: (async () => ({ _tag: "Success" })) as (input: unknown) => Promise<{
     _tag: string;
     error?: unknown;
@@ -93,9 +94,10 @@ const testState = vi.hoisted(() => ({
   commandResults: {} as Record<string, unknown>,
   toastAdd: (() => {}) as (toast: unknown) => void,
   fileTree: {
-    resetPaths: (() => {}) as (paths: readonly string[]) => void,
+    resetPaths: (() => {}) as (paths: readonly string[], options?: Record<string, unknown>) => void,
     setGitStatus: (() => {}) as (entries: readonly unknown[]) => void,
     openSearch: (() => {}) as () => void,
+    getItem: (() => null) as (path: string) => unknown,
     options: null as Record<string, unknown> | null,
   },
   newProjectId: "generated-project-id",
@@ -141,9 +143,11 @@ vi.mock("@pierre/trees/react", () => ({
     testState.fileTree.options = options;
     return {
       model: {
-        resetPaths: (paths: readonly string[]) => testState.fileTree.resetPaths(paths),
+        resetPaths: (paths: readonly string[], resetOptions?: Record<string, unknown>) =>
+          testState.fileTree.resetPaths(paths, resetOptions),
         setGitStatus: (entries: readonly unknown[]) => testState.fileTree.setGitStatus(entries),
         openSearch: () => testState.fileTree.openSearch(),
+        getItem: (path: string) => testState.fileTree.getItem(path),
       },
     };
   },
@@ -212,14 +216,21 @@ vi.mock("~/state/preview", () => ({
   previewEnvironment: { open: { label: "openPreview" } },
 }));
 
+// Two subscriptions run in the panel: vcs status and the out-of-band entry-change signal. They are
+// told apart by the atom each returns so a test can move one without disturbing the other.
 vi.mock("~/state/query", () => ({
-  useEnvironmentQuery: () => ({ data: testState.vcsStatus }),
+  useEnvironmentQuery: (atom: { kind?: string } | null) =>
+    atom?.kind === "entry-changes"
+      ? { data: testState.entryChangeSignal }
+      : { data: testState.vcsStatus },
 }));
 
 vi.mock("~/state/projects", () => ({
   projectEnvironment: {
     create: { label: "create" },
     createEntry: { label: "createEntry" },
+    refreshEntries: { label: "refreshEntries" },
+    subscribeEntries: () => ({ kind: "entry-changes" }),
     renameEntry: { label: "renameEntry" },
     deleteEntry: { label: "deleteEntry" },
     duplicateEntry: { label: "duplicateEntry" },
@@ -231,7 +242,7 @@ vi.mock("~/state/shell", () => ({
 }));
 
 vi.mock("~/state/vcs", () => ({
-  vcsEnvironment: { status: () => ({}) },
+  vcsEnvironment: { status: () => ({ kind: "vcs-status" }) },
 }));
 
 vi.mock("~/state/use-atom-command", () => ({
@@ -280,6 +291,7 @@ vi.mock("./projectFilesQueryState", () => ({
 import type { FileTreeMenuActions } from "./FileTreeContextMenu";
 import FileBrowserPanel, {
   collapseDirectoryTreePaths,
+  currentlyExpandedTreePaths,
   expandedDirectoryTreePaths,
 } from "./FileBrowserPanel";
 import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
@@ -345,10 +357,9 @@ function renderPanel(props: PanelProps = baseProps()): string {
   return renderToStaticMarkup(<FileBrowserPanel {...props} />);
 }
 
+/** Enough microtask turns for a mutation to settle and its refresh (rebuild + query) to run. */
 async function flushPromises(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let turn = 0; turn < 6; turn += 1) await Promise.resolve();
 }
 
 function deferred<T>() {
@@ -427,11 +438,13 @@ beforeEach(() => {
   testState.vcsStatus = null;
   testState.openFileInPreview = vi.fn(async () => ({ _tag: "Success" }));
   testState.commandCalls = [];
+  testState.entryChangeSignal = null;
   testState.commandResults = {};
   testState.toastAdd = vi.fn();
   testState.fileTree.resetPaths = vi.fn();
   testState.fileTree.setGitStatus = vi.fn();
   testState.fileTree.openSearch = vi.fn();
+  testState.fileTree.getItem = vi.fn(() => null);
   testState.fileTree.options = null;
 
   vi.stubGlobal("navigator", {
@@ -555,6 +568,27 @@ describe("collapseDirectoryTreePaths", () => {
   });
 });
 
+describe("currentlyExpandedTreePaths", () => {
+  it("keeps only the directories the model reports as expanded", () => {
+    const expansion: Record<string, boolean> = { "src/": true, "docs/": false };
+    const model = {
+      getItem: vi.fn(
+        (path: string): { isDirectory: () => boolean; isExpanded?: () => boolean } | null => {
+          if (path in expansion) {
+            return { isDirectory: () => true, isExpanded: () => expansion[path]! };
+          }
+          if (path === "README.md") return { isDirectory: () => false };
+          return null;
+        },
+      ),
+    };
+
+    expect(currentlyExpandedTreePaths(model, ["src/", "docs/", "README.md", "gone/"])).toEqual([
+      "src/",
+    ]);
+  });
+});
+
 describe("path reset effect", () => {
   it("starts with every folder collapsed", () => {
     setEntries([entry("src", "directory"), entry("src/app.ts", "file")]);
@@ -562,11 +596,312 @@ describe("path reset effect", () => {
     expect(testState.fileTree.options?.["initialExpansion"]).toBe(0);
   });
 
+  it("renders nested folder rows instead of flattened single-child chains", () => {
+    setEntries([entry("src", "directory"), entry("src/app.ts", "file")]);
+    renderPanel();
+    expect(testState.fileTree.options?.["flattenEmptyDirectories"]).toBe(false);
+  });
+
   it("resets the tree paths to the current entries", () => {
     setEntries([entry("src", "directory"), entry("src/app.ts", "file")]);
     renderPanel();
     harness.runEffects();
-    expect(testState.fileTree.resetPaths).toHaveBeenCalledWith(["src/", "src/app.ts"]);
+    expect(testState.fileTree.resetPaths).toHaveBeenCalledWith(["src/", "src/app.ts"], {
+      initialExpandedPaths: [],
+    });
+  });
+
+  it("keeps the expanded folders expanded across a refresh", () => {
+    setEntries([
+      entry("src", "directory"),
+      entry("src/components", "directory"),
+      entry("docs", "directory"),
+      entry("src/app.ts", "file"),
+    ]);
+    testState.fileTree.getItem = vi.fn((path: string) => {
+      if (path === "src/") return { isDirectory: () => true as const, isExpanded: () => true };
+      if (path === "docs/") return { isDirectory: () => true as const, isExpanded: () => true };
+      if (path === "src/components/") {
+        return { isDirectory: () => true as const, isExpanded: () => false };
+      }
+      return null;
+    });
+
+    renderPanel();
+    harness.runEffects();
+
+    expect(testState.fileTree.resetPaths).toHaveBeenCalledWith(
+      ["src/", "src/components/", "docs/", "src/app.ts"],
+      { initialExpandedPaths: ["src/", "docs/"] },
+    );
+  });
+});
+
+describe("drag and drop", () => {
+  interface DropTarget {
+    directoryPath: string | null;
+    flattenedSegmentPath: string | null;
+    hoveredPath: string | null;
+    kind: "directory" | "root";
+  }
+
+  function dragAndDrop() {
+    return testState.fileTree.options!["dragAndDrop"] as {
+      canDrag: (paths: readonly string[]) => boolean;
+      onDropComplete: (event: {
+        draggedPaths: readonly string[];
+        operation: "batch" | "move";
+        target: DropTarget;
+      }) => void;
+      onDropError: (error: string) => void;
+    };
+  }
+
+  function directoryTarget(directoryPath: string): DropTarget {
+    return {
+      directoryPath,
+      flattenedSegmentPath: null,
+      hoveredPath: directoryPath,
+      kind: "directory",
+    };
+  }
+
+  const rootTarget: DropTarget = {
+    directoryPath: null,
+    flattenedSegmentPath: null,
+    hoveredPath: null,
+    kind: "root",
+  };
+
+  it("moves a dropped file into the target folder under a mutation lease", async () => {
+    setEntries([entry("docs", "directory"), entry("src/app.ts", "file")]);
+    testState.commandResults["renameEntry"] = {
+      _tag: "Success",
+      value: { relativePath: "docs/app.ts" },
+    };
+    const lease = mutationLease();
+    const onBeginPathMutation = vi.fn(async () => lease);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel(baseProps({ onBeginPathMutation }));
+
+    dragAndDrop().onDropComplete({
+      draggedPaths: ["src/app.ts"],
+      operation: "move",
+      target: directoryTarget("docs/"),
+    });
+    await flushPromises();
+
+    expect(onBeginPathMutation).toHaveBeenCalledWith({
+      kind: "rename",
+      fromRelativePath: "src/app.ts",
+      toRelativePath: "docs/app.ts",
+    });
+    expect(testState.commandCalls.find((call) => call.label === "renameEntry")?.input).toEqual({
+      environmentId,
+      input: {
+        cwd: "/workspace/demo",
+        fromRelativePath: "src/app.ts",
+        toRelativePath: "docs/app.ts",
+      },
+    });
+    expect(lease.commitRename).toHaveBeenCalledWith("docs/app.ts");
+    expect(testState.remapFileSurfaces).toHaveBeenCalledWith(
+      threadRef,
+      "src/app.ts",
+      "docs/app.ts",
+    );
+    expect(lease.release).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("moves a dropped folder to the workspace root", async () => {
+    setEntries([entry("src/nested", "directory")]);
+    testState.commandResults["renameEntry"] = {
+      _tag: "Success",
+      value: { relativePath: "nested" },
+    };
+    renderPanel();
+
+    dragAndDrop().onDropComplete({
+      draggedPaths: ["src/nested/"],
+      operation: "move",
+      target: rootTarget,
+    });
+    await flushPromises();
+
+    expect(testState.commandCalls.find((call) => call.label === "renameEntry")?.input).toEqual({
+      environmentId,
+      input: { cwd: "/workspace/demo", fromRelativePath: "src/nested", toRelativePath: "nested" },
+    });
+  });
+
+  it("moves every dragged path but skips entries already in the target folder", async () => {
+    setEntries([entry("docs", "directory"), entry("docs/a.ts", "file"), entry("src/b.ts", "file")]);
+    testState.commandResults["renameEntry"] = {
+      _tag: "Success",
+      value: { relativePath: "docs/b.ts" },
+    };
+    renderPanel();
+
+    dragAndDrop().onDropComplete({
+      draggedPaths: ["docs/a.ts", "src/b.ts"],
+      operation: "batch",
+      target: directoryTarget("docs/"),
+    });
+    await flushPromises();
+
+    const renames = testState.commandCalls.filter((call) => call.label === "renameEntry");
+    expect(renames).toHaveLength(1);
+    expect((renames[0]!.input as { input: { toRelativePath: string } }).input.toRelativePath).toBe(
+      "docs/b.ts",
+    );
+  });
+
+  it("resyncs the tree when the server rejects the move", async () => {
+    setEntries([entry("docs", "directory"), entry("src/app.ts", "file")]);
+    testState.commandResults["renameEntry"] = { _tag: "Failure", error: new Error("busy") };
+    const lease = mutationLease();
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel(baseProps({ onBeginPathMutation: vi.fn(async () => lease) }));
+
+    dragAndDrop().onDropComplete({
+      draggedPaths: ["src/app.ts"],
+      operation: "move",
+      target: directoryTarget("docs/"),
+    });
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Failed to move "app.ts"', description: "busy" }),
+    );
+    expect(lease.commitRename).not.toHaveBeenCalled();
+    expect(lease.release).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("resyncs the tree when Pierre rejects its own optimistic move", async () => {
+    setEntries([entry("docs", "directory"), entry("src/app.ts", "file")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    dragAndDrop().onDropError("docs/app.ts already exists");
+    await flushPromises();
+
+    expect(testState.commandCalls.some((call) => call.label === "renameEntry")).toBe(false);
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Failed to move files",
+        description: "docs/app.ts already exists",
+      }),
+    );
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("blocks dragging while the workspace is unavailable", () => {
+    setEntries([entry("src/app.ts", "file")]);
+    renderPanel();
+    expect(dragAndDrop().canDrag(["src/app.ts"])).toBe(true);
+
+    renderPanel(baseProps({ workspaceUnavailable: "Workspace unavailable." }));
+    expect(dragAndDrop().canDrag(["src/app.ts"])).toBe(false);
+  });
+});
+
+describe("refresh", () => {
+  it("rebuilds the server index before refreshing the entries query", async () => {
+    setEntries([entry("src/app.ts", "file")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    harness.seedState((initial) => initial === null, null);
+    harness.seedState((initial) => initial === null, { x: 5, y: 6 });
+    renderPanel();
+
+    const menus = ui.filter("FileTreeContextMenu");
+    (menus[menus.length - 1]!["actions"] as { onRefresh: () => void }).onRefresh();
+    await flushPromises();
+
+    expect(testState.commandCalls.find((call) => call.label === "refreshEntries")?.input).toEqual({
+      environmentId,
+      input: { cwd: "/workspace/demo", refresh: true },
+    });
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("re-lists when the server signals an out-of-band workspace change", () => {
+    harness.persistRefs = true;
+    setEntries([entry("src", "directory")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+
+    renderPanel();
+    harness.runEffects();
+    // The signal already present on the first read is the current state, not a change; refreshing
+    // for it would cost an extra list every time the panel mounts.
+    expect(refresh).not.toHaveBeenCalled();
+
+    testState.entryChangeSignal = { cwd: "/workspace/demo" };
+    renderPanel();
+    harness.runEffects();
+
+    expect(refresh).toHaveBeenCalled();
+    // The signal carries no entries, so the panel re-reads rather than asking for another rescan:
+    // the server already dropped its cached index before signalling.
+    expect(testState.commandCalls.some((call) => call.label === "refreshEntries")).toBe(false);
+  });
+
+  // A refresh re-renders, and `useProjectEntriesQuery` hands back a fresh object each render. An
+  // effect keyed on that object re-runs every render, so acting on a signal more than once turns
+  // into a hot loop that hammers the server for as long as the panel is open.
+  it("re-lists once per signal, not once per render", () => {
+    harness.persistRefs = true;
+    setEntries([entry("src", "directory")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+
+    renderPanel();
+    harness.runEffects();
+    expect(refresh).not.toHaveBeenCalled();
+
+    testState.entryChangeSignal = { cwd: "/workspace/demo" };
+    renderPanel();
+    harness.runEffects();
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    // Re-renders carrying the same signal must not refresh again, however many arrive.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      renderPanel();
+      harness.runEffects();
+    }
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    // A genuinely new signal still refreshes.
+    testState.entryChangeSignal = { cwd: "/workspace/demo" };
+    renderPanel();
+    harness.runEffects();
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  // projects.createEntry and friends already drop the server's cached index, so asking for a second
+  // rebuild would ship the whole entry list twice per mutation.
+  it("does not ask the server to rescan after a mutation that already invalidated its index", async () => {
+    setEntries([entry("src", "directory")]);
+    testState.commandResults["createEntry"] = {
+      _tag: "Success",
+      value: { relativePath: "src/created.ts" },
+    };
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+
+    rowActionsFor("src", "directory").onNewFile();
+    (lastDialogRequest()["onSubmit"] as (name: string) => void)("created.ts");
+    await flushPromises();
+
+    expect(refresh).toHaveBeenCalled();
+    expect(testState.commandCalls.some((call) => call.label === "refreshEntries")).toBe(false);
   });
 });
 
@@ -1497,6 +1832,7 @@ describe("background context menu", () => {
     actions.onCopyPath();
     expect(writeText).toHaveBeenCalledWith("/workspace/demo");
     actions.onRefresh();
+    await flushPromises();
     expect(refresh).toHaveBeenCalled();
 
     actions.onNewFile();

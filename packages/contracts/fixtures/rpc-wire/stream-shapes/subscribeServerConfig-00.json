@@ -72,7 +72,7 @@
               "launchArgs": ""
             },
             "cursor": {
-              "enabled": false,
+              "enabled": true,
               "binaryPath": "cursor-agent",
               "apiEndpoint": "",
               "customModels": []
