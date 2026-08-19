@@ -3,16 +3,21 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
-use crate::worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry};
+use crate::worktree_catalog::{
+    WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use super::paths::normalize_root;
+use super::watcher::{WatchScope, WatchScopeFuture, WatchSubscription, WorkspaceWatcher};
 use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, WorkspaceService};
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
@@ -51,12 +56,102 @@ pub struct WorkspaceRpcDependencies {
     pub mutation_observer: Option<Arc<dyn WorkspaceMutationObserver>>,
 }
 
+/// How often a watched root is swept, and how long a burst is collected before it is reported.
+///
+/// The sweep stats directories rather than files, so the interval trades latency against a cost
+/// proportional to the workspace's directory count.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_COALESCE_WINDOW: Duration = Duration::from_millis(750);
+const WATCH_CHANNEL_CAPACITY: usize = 8;
+const WATCH_BROADCAST_CAPACITY: usize = 8;
+
+/// Cached workspace snapshots plus the invalidation counter that fences them.
+///
+/// A scan runs outside this lock, so an invalidation can arrive while one is in flight. The counter
+/// records that, letting a finished scan tell whether the state it observed is still the current one
+/// before it publishes.
+#[derive(Default)]
+struct IndexCache {
+    snapshots: HashMap<PathBuf, WorkspaceSearchIndex>,
+    generations: HashMap<PathBuf, u64>,
+}
+
+impl IndexCache {
+    fn invalidate(&mut self, canonical: &Path) {
+        self.snapshots.remove(canonical);
+        let generation = self.generations.entry(canonical.to_path_buf()).or_default();
+        *generation = generation.wrapping_add(1);
+    }
+
+    fn generation(&self, canonical: &Path) -> u64 {
+        self.generations.get(canonical).copied().unwrap_or_default()
+    }
+}
+
+/// A live entry-change subscription, together with the workspace admission it runs under.
+///
+/// The lease is held for the subscription's lifetime so a sweep cannot outlive the availability
+/// guard, and `loss_cancellation` is how the caller learns the workspace was fenced -- dropping this
+/// releases the lease so a pending removal can proceed.
+pub struct EntryChangeSubscription {
+    changes: broadcast::Receiver<()>,
+    admission: Option<WorkspaceAdmissionLease>,
+}
+
+impl EntryChangeSubscription {
+    pub async fn recv(&mut self) -> Result<(), broadcast::error::RecvError> {
+        self.changes.recv().await
+    }
+
+    #[must_use]
+    pub fn loss_cancellation(&self) -> Option<WorkspaceAdmissionCancellation> {
+        self.admission
+            .as_ref()
+            .map(WorkspaceAdmissionLease::loss_cancellation)
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceRpc {
     service: WorkspaceService,
-    indexes: Arc<Mutex<HashMap<PathBuf, WorkspaceSearchIndex>>>,
+    indexes: Arc<Mutex<IndexCache>>,
+    /// One lock per root, held across a scan so concurrent callers wait rather than each scanning.
+    index_builds: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    index_scans: Arc<AtomicU64>,
     dependencies: WorkspaceRpcDependencies,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
+    watches: Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
+    watch_timing: (Duration, Duration),
+}
+
+/// Supplies the swept directories from the cached index for a root.
+///
+/// The last non-empty set is retained because invalidating the index empties the cache until a
+/// client lists again. Falling back to an empty set in that window would narrow the sweep to the
+/// root alone and miss a second change arriving in a nested directory.
+struct IndexWatchScope {
+    indexes: Arc<Mutex<IndexCache>>,
+    last: Arc<Mutex<Vec<String>>>,
+}
+
+impl WatchScope for IndexWatchScope {
+    fn directories(&self, root: PathBuf) -> WatchScopeFuture {
+        let indexes = Arc::clone(&self.indexes);
+        let last = Arc::clone(&self.last);
+        Box::pin(async move {
+            let index = indexes.lock().await.snapshots.get(&root).cloned();
+            let directories = match index {
+                Some(index) => index.directory_paths().await,
+                None => Vec::new(),
+            };
+            let mut last = last.lock().await;
+            if directories.is_empty() {
+                return last.clone();
+            }
+            *last = directories.clone();
+            directories
+        })
+    }
 }
 
 impl WorkspaceRpc {
@@ -70,10 +165,24 @@ impl WorkspaceRpc {
     ) -> Self {
         Self {
             service,
-            indexes: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(Mutex::new(IndexCache::default())),
+            index_builds: Arc::new(Mutex::new(HashMap::new())),
+            index_scans: Arc::new(AtomicU64::new(0)),
             dependencies,
             availability_registry: None,
+            watches: Arc::new(Mutex::new(HashMap::new())),
+            watch_timing: (WATCH_POLL_INTERVAL, WATCH_COALESCE_WINDOW),
         }
+    }
+
+    /// Overrides the change-sweep cadence.
+    ///
+    /// Exists so tests can drive the sweep faster than the production interval instead of sleeping
+    /// on it; production callers keep the defaults.
+    #[must_use]
+    pub fn with_watch_timing(mut self, poll_interval: Duration, coalesce_window: Duration) -> Self {
+        self.watch_timing = (poll_interval, coalesce_window);
+        self
     }
 
     #[must_use]
@@ -212,6 +321,11 @@ impl WorkspaceRpc {
             "projects.listEntries" => {
                 let input: ListInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
+                // Out-of-band filesystem changes are invisible to the cached snapshot, so a
+                // request must opt in before paying for a full rebuild.
+                if input.refresh == Some(true) {
+                    self.refresh_index(Path::new(&input.cwd)).await;
+                }
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectListEntriesError", &input.cwd, &error)
                 })?;
@@ -269,11 +383,175 @@ impl WorkspaceRpc {
         }
     }
 
+    /// How many full workspace scans have run.
+    ///
+    /// Concurrent listers of the same cold root must share one scan, and this is the value that
+    /// proves it rather than inferring it from timing.
+    pub fn index_scans(&self) -> u64 {
+        self.index_scans.load(Ordering::Relaxed)
+    }
+
+    /// Number of workspace roots currently being swept for out-of-band changes.
+    ///
+    /// A sweep is only meant to exist while something is subscribed to it, so this is the value that
+    /// proves sweeps are retired rather than accumulating for the process lifetime.
+    pub async fn active_entry_watches(&self) -> usize {
+        self.watches.lock().await.len()
+    }
+
+    /// Subscribes to out-of-band changes under `cwd`.
+    ///
+    /// The signal carries no paths: the index remains the single source of truth for entry data, so
+    /// a subscriber re-reads it rather than applying a diff that could drift out of agreement with
+    /// it. The first subscriber for a root starts the sweep; it stops once the last one goes away.
+    pub async fn subscribe_entry_changes(
+        &self,
+        cwd: &Path,
+    ) -> Result<EntryChangeSubscription, Value> {
+        // Admission first, like every other request against a workspace path: a root that is being
+        // removed, or already lost, must not acquire a sweep at all.
+        let admission = self.acquire_path(&cwd.to_string_lossy()).await?;
+        let changes = self
+            .subscribe_entry_change_signal(cwd)
+            .await
+            .map_err(|error| {
+                entries_wire_error("ProjectListEntriesError", &cwd.to_string_lossy(), &error)
+            })?;
+        Ok(EntryChangeSubscription { changes, admission })
+    }
+
+    async fn subscribe_entry_change_signal(
+        &self,
+        cwd: &Path,
+    ) -> Result<broadcast::Receiver<()>, WorkspaceError> {
+        let canonical = normalize_root(cwd, false).await?;
+        // An existing sweep is already tracking this root, so its baseline and the snapshot are
+        // already consistent; join it without paying for another scan.
+        if let Some(sender) = self.watches.lock().await.get(&canonical) {
+            return Ok(sender.subscribe());
+        }
+        // Starting a sweep is a resync point. The sweep derives its directories from the snapshot,
+        // so the snapshot has to exist -- and it has to be no older than the baseline about to be
+        // stamped. A cached snapshot may predate changes made while nothing was watching, and those
+        // are already on disk when the baseline is taken, so they could never surface as a
+        // difference. Rebuild rather than inherit that blind spot.
+        self.refresh_index(cwd).await;
+        self.index(&cwd.to_string_lossy()).await?;
+        let mut watches = self.watches.lock().await;
+        // Re-check: another subscriber may have installed a sweep while this one was scanning.
+        if let Some(sender) = watches.get(&canonical) {
+            return Ok(sender.subscribe());
+        }
+        let (sender, receiver) = broadcast::channel(WATCH_BROADCAST_CAPACITY);
+        watches.insert(canonical.clone(), sender.clone());
+        drop(watches);
+
+        let (poll_interval, coalesce_window) = self.watch_timing;
+        let watcher = WorkspaceWatcher::new(poll_interval, coalesce_window, WATCH_CHANNEL_CAPACITY);
+        let scope = Arc::new(IndexWatchScope {
+            indexes: Arc::clone(&self.indexes),
+            last: Arc::new(Mutex::new(Vec::new())),
+        });
+        let subscription = watcher.watch(canonical.clone(), scope).await;
+        let indexes = Arc::clone(&self.indexes);
+        let watches = Arc::clone(&self.watches);
+        tokio::spawn(async move {
+            Self::run_watch(
+                canonical,
+                subscription,
+                sender,
+                indexes,
+                watches,
+                poll_interval,
+            )
+            .await;
+        });
+        Ok(receiver)
+    }
+
+    async fn run_watch(
+        canonical: PathBuf,
+        mut subscription: WatchSubscription,
+        sender: broadcast::Sender<()>,
+        indexes: Arc<Mutex<IndexCache>>,
+        watches: Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
+        poll_interval: Duration,
+    ) {
+        let mut idle_check = tokio::time::interval(poll_interval);
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = subscription.recv() => {
+                    if event.is_none() {
+                        break;
+                    }
+                    // Drop the snapshot before announcing, so a subscriber that lists immediately
+                    // cannot be served the stale index the signal is telling it to replace.
+                    indexes.lock().await.invalidate(&canonical);
+                    // A send failure means every receiver has gone; nothing is left to serve.
+                    if sender.send(()).is_err() {
+                        break;
+                    }
+                }
+                // Losing the last receiver is otherwise invisible until the next filesystem event,
+                // which on a quiet workspace never comes — the sweep would outlive the panel that
+                // asked for it, and on an in-process server the whole run.
+                _ = idle_check.tick() => {
+                    if Self::retire_idle_watch(&canonical, &sender, &watches).await {
+                        subscription.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+        subscription.cancel();
+        Self::retire_watch(&canonical, &sender, &watches).await;
+    }
+
+    /// Retires the watch when nothing is listening. Returns whether it was retired.
+    ///
+    /// The receiver count is re-checked while holding the registry lock, which is the same lock a
+    /// new subscriber takes before calling `subscribe`, so a subscriber arriving concurrently either
+    /// keeps this watch alive or installs its own.
+    async fn retire_idle_watch(
+        canonical: &Path,
+        sender: &broadcast::Sender<()>,
+        watches: &Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
+    ) -> bool {
+        let mut watches = watches.lock().await;
+        if sender.receiver_count() > 0 {
+            return false;
+        }
+        if watches
+            .get(canonical)
+            .is_some_and(|current| current.same_channel(sender))
+        {
+            watches.remove(canonical);
+        }
+        true
+    }
+
+    async fn retire_watch(
+        canonical: &Path,
+        sender: &broadcast::Sender<()>,
+        watches: &Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
+    ) {
+        let mut watches = watches.lock().await;
+        // Only retire the entry still registered for this root: a later subscriber may already have
+        // replaced it after the last receiver went away.
+        if watches
+            .get(canonical)
+            .is_some_and(|current| current.same_channel(sender))
+        {
+            watches.remove(canonical);
+        }
+    }
+
     pub async fn refresh_index(&self, cwd: &Path) {
         let Ok(canonical) = normalize_root(cwd, false).await else {
             return;
         };
-        self.indexes.lock().await.remove(&canonical);
+        self.indexes.lock().await.invalidate(&canonical);
     }
 
     async fn acquire_path(&self, cwd: &str) -> Result<Option<WorkspaceAdmissionLease>, Value> {
@@ -312,12 +590,31 @@ impl WorkspaceRpc {
 
     async fn index(&self, cwd: &str) -> Result<WorkspaceSearchIndex, WorkspaceError> {
         let canonical = normalize_root(Path::new(cwd), false).await?;
-        if let Some(index) = self.indexes.lock().await.get(&canonical).cloned() {
+        if let Some(index) = self.indexes.lock().await.snapshots.get(&canonical).cloned() {
             return Ok(index);
         }
+        // Single-flight per root. Without it every concurrent lister runs its own full scan of the
+        // same tree, which on a large workspace is seconds of duplicated work per caller.
+        let build = {
+            let mut builds = self.index_builds.lock().await;
+            Arc::clone(builds.entry(canonical.clone()).or_default())
+        };
+        let _building = build.lock().await;
+        // The caller that held the lock may have finished while this one waited.
+        if let Some(index) = self.indexes.lock().await.snapshots.get(&canonical).cloned() {
+            return Ok(index);
+        }
+        let generation = self.indexes.lock().await.generation(&canonical);
         let index = WorkspaceSearchIndex::new(canonical.clone(), SearchLimits::default());
+        self.index_scans.fetch_add(1, Ordering::Relaxed);
         index.refresh(CancellationToken::new()).await?;
-        self.indexes.lock().await.insert(canonical, index.clone());
+        let mut cache = self.indexes.lock().await;
+        // Publish only when nothing invalidated while the scan ran. An invalidation that arrived
+        // mid-scan describes a state this snapshot never observed, so caching it would serve data
+        // already known to be stale; leaving the slot empty makes the next request rebuild.
+        if cache.generation(&canonical) == generation {
+            cache.snapshots.insert(canonical, index.clone());
+        }
         Ok(index)
     }
 
@@ -325,7 +622,7 @@ impl WorkspaceRpc {
         let Ok(canonical) = tokio::fs::canonicalize(cwd).await else {
             return;
         };
-        self.indexes.lock().await.remove(&canonical);
+        self.indexes.lock().await.invalidate(&canonical);
     }
 
     async fn handle_asset_create_url(&self, input: AssetCreateUrlInput) -> Result<Value, Value> {
@@ -541,6 +838,7 @@ fn defect(message: &str) -> Value {
 struct ListInput {
     cwd: String,
     limit: Option<usize>,
+    refresh: Option<bool>,
 }
 
 #[derive(Deserialize)]

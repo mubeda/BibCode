@@ -107,6 +107,7 @@ pub fn register_workspace_preview_rpc(
         });
     }
     let preview = services.preview.clone();
+    let workspace = services.workspace.clone();
     registry.register_stream("previewAutomation.connect", move |request, cancellation| {
         services.automation_connect(request, cancellation)
     });
@@ -114,6 +115,84 @@ pub fn register_workspace_preview_rpc(
     registry.register_stream("subscribePreviewEvents", move |_request, cancellation| {
         preview_event_stream(preview.clone(), cancellation)
     });
+
+    registry.register_stream("subscribeProjectEntries", move |request, cancellation| {
+        project_entries_stream(workspace.clone(), request, cancellation)
+    });
+}
+
+/// Streams a signal whenever the workspace path set under `cwd` changes outside the application.
+///
+/// The signal carries only `cwd`: the server's entry index stays the single source of truth, so the
+/// subscriber re-lists rather than applying a diff. The index is already invalidated by the time the
+/// signal arrives, so that re-list sees the new state.
+fn project_entries_stream(
+    workspace: WorkspaceRpc,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> mpsc::Receiver<RpcStreamChunk> {
+    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    tokio::spawn(async move {
+        let input: SubscribeEntriesInput = match serde_json::from_value(request.payload) {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = sender
+                    .send(Err(json!({
+                        "_tag": "Defect",
+                        "message": error.to_string(),
+                    })))
+                    .await;
+                return;
+            }
+        };
+        let mut changes = match workspace
+            .subscribe_entry_changes(std::path::Path::new(&input.cwd))
+            .await
+        {
+            Ok(changes) => changes,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        };
+        // The sweep must not outlive the availability guard: when the workspace is fenced for
+        // removal this token fires, and dropping the subscription releases the lease that removal
+        // is waiting on.
+        let loss = changes.loss_cancellation();
+        let loss_token = loss
+            .as_ref()
+            .map(|loss| loss.cancellation_token())
+            .unwrap_or_default();
+        let event = json!({ "cwd": input.cwd });
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                () = loss_token.cancelled() => break,
+                change = changes.recv() => match change {
+                    Ok(()) => {
+                        if sender.send(Ok(vec![event.clone()])).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Lagging is not a loss here: the signal is idempotent, so one delivery after
+                    // any number of skipped ones still tells the subscriber to re-list.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if sender.send(Ok(vec![event.clone()])).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+    receiver
+}
+
+#[derive(Deserialize)]
+struct SubscribeEntriesInput {
+    cwd: String,
 }
 
 fn preview_event_stream(

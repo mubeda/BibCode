@@ -291,10 +291,33 @@ behavior for this pass.
 
 The Files surface is a full file manager for the active workspace:
 
+- Every directory is its own row with its own expand arrow. A folder whose only
+  child is another folder is not merged into a single combined row, so each row
+  names exactly one directory.
 - Right-click files, folders, or the tree background to create files/folders,
   rename, delete, duplicate, copy paths, add a folder as a project, open in an
   external editor, or open previewable files in the preview browser.
-- Open file tabs follow renames and close when their file is deleted.
+- **New File…** and **New Folder…** create the entry in the clicked folder. On a
+  file row they use that file's parent directory, and on the tree background
+  they use the workspace root.
+- Drag one or more files and folders onto a folder row, or onto the tree's root
+  area, to move them there. Entries already in the target folder stay put. A
+  move the server rejects is reported and the tree resyncs to the server's state
+  rather than keeping the dragged row in its new place. Dragging is disabled
+  while the workspace is unavailable. Dragging entries to or from the operating
+  system's file manager is not supported.
+- Open file tabs follow renames and moves, and close when their file is deleted.
+- The tree follows changes made outside BiBCode. While the Files surface is open,
+  the server watches the workspace and the tree picks up files and folders
+  created, renamed, or removed by other tools within a few seconds. Editing a
+  file's contents outside BiBCode does not change the tree, because the tree
+  lists paths rather than contents.
+- The panel header offers collapse all folders, expand all folders, search, and
+  Refresh. **Refresh** rescans the workspace on the server immediately, rather
+  than waiting for the next check. The tree background context menu offers the
+  same Refresh.
+- Expanded folders stay expanded. Refreshing, and creating, renaming, deleting,
+  duplicating, or moving an entry, does not collapse the tree.
 - Every selected file shows a Save, Undo, and Redo toolbar below its
   breadcrumbs. Markdown files also show their rendered/source toggle in this
   toolbar. While a file is active, edits remain pending until Save or
@@ -303,6 +326,8 @@ The Files surface is a full file manager for the active workspace:
   native history for each open source file. Read-only views keep unavailable
   actions visible but disabled.
 
-## Current limitation
+## Current limitations
 
 - Staged-row diff viewing does not yet use a true `git diff --cached` source.
+- Outside changes are detected by a periodic check, so the tree updates within
+  seconds rather than instantly. Use Refresh when you want it immediately.

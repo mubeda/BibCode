@@ -118,6 +118,23 @@ impl WorkspaceSearchIndex {
         }
     }
 
+    /// Workspace-relative paths of every directory in the current snapshot.
+    ///
+    /// Change detection stats these directories rather than walking the tree: the snapshot is a set
+    /// of paths, and adding, renaming, or removing an entry moves its parent directory's mtime.
+    /// Deriving the set from the snapshot also keeps the sweep inside the same bounds the scan
+    /// already spent, including which ignored directories it walked into.
+    pub async fn directory_paths(&self) -> Vec<String> {
+        self.snapshot
+            .read()
+            .await
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Directory)
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     pub async fn search(&self, query: &str, limit: usize) -> SearchResult {
         let normalized = query
             .trim()
@@ -220,6 +237,7 @@ async fn scan_git(
                 true,
             ));
     }
+    let ignored_directory_prefixes = ignored_directories.clone();
     let remaining = limits.max_entries.saturating_sub(candidates.len());
     let scan_root = root.to_path_buf();
     let scan_cancellation = cancellation.clone();
@@ -248,6 +266,35 @@ async fn scan_git(
             .and_modify(|candidate| candidate.1 = true)
             .or_insert((kind, true));
     }
+    // `git ls-files` reports files, so directories are only inferred from the paths of the files
+    // inside them. A directory holding no files is therefore invisible to the listing above even
+    // though it exists on disk, which is what "New Folder…" creates. Walk for directories to close
+    // that gap; the walk prunes at ignored roots, so its cost tracks the directory count rather
+    // than the file count.
+    let remaining_directories = limits.max_entries.saturating_sub(candidates.len());
+    let scan_root = root.to_path_buf();
+    let scan_cancellation = cancellation.clone();
+    let ignored_prefixes = ignored_directory_prefixes.clone();
+    let walked_directories = tokio::task::spawn_blocking(move || {
+        scan_directories(
+            &scan_root,
+            &ignored_prefixes,
+            remaining_directories,
+            &scan_cancellation,
+        )
+    })
+    .await
+    .map_err(|error| {
+        WorkspaceError::operation("scan-directories", root, std::io::Error::other(error))
+    })?;
+    if cancellation.is_cancelled() {
+        return Err(WorkspaceError::Cancelled);
+    }
+    for path in walked_directories {
+        candidates
+            .entry(path)
+            .or_insert((EntryKind::Directory, false));
+    }
     let mut entries = BTreeMap::new();
     let mut memory_bytes = 0;
     let mut truncated = false;
@@ -267,6 +314,55 @@ async fn scan_git(
         memory_bytes,
         truncated,
     }))
+}
+
+/// Relative paths of every directory under `root`, pruning `.git` and ignored roots.
+///
+/// Only directories are recorded. Ignored roots are skipped because their contents are already
+/// walked separately, and descending into them here would pay for `node_modules` twice.
+fn scan_directories(
+    root: &Path,
+    ignored_directories: &[String],
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Vec<String> {
+    let mut directories = Vec::new();
+    let mut queue = VecDeque::from([root.to_path_buf()]);
+    while let Some(directory) = queue.pop_front() {
+        if cancellation.is_cancelled() || directories.len() >= limit {
+            break;
+        }
+        let Ok(children) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for child in children.filter_map(Result::ok) {
+            if cancellation.is_cancelled() || directories.len() >= limit {
+                break;
+            }
+            let Ok(file_type) = child.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let path = child.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = to_posix(relative);
+            if relative == ".git"
+                || relative.starts_with(".git/")
+                || ignored_directories.iter().any(|ignored| {
+                    relative == *ignored || relative.starts_with(&format!("{ignored}/"))
+                })
+            {
+                continue;
+            }
+            queue.push_back(path);
+            directories.push(relative);
+        }
+    }
+    directories
 }
 
 fn scan_ignored_directory_contents(

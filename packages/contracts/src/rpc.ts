@@ -104,6 +104,7 @@ import {
   ProjectDuplicateEntryError,
   ProjectDuplicateEntryInput,
   ProjectDuplicateEntryResult,
+  ProjectEntriesChangedEvent,
   ProjectListEntriesError,
   ProjectListEntriesInput,
   ProjectListEntriesResult,
@@ -116,6 +117,7 @@ import {
   ProjectSearchEntriesError,
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
+  ProjectSubscribeEntriesInput,
   ProjectWriteFileError,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
@@ -309,6 +311,7 @@ export const WS_METHODS = {
   projectsAdd: "projects.add",
   projectsRemove: "projects.remove",
   projectsListEntries: "projects.listEntries",
+  projectsSubscribeEntries: "subscribeProjectEntries",
   projectsReadFile: "projects.readFile",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
@@ -593,6 +596,18 @@ export const WsProjectsListEntriesRpc = Rpc.make(WS_METHODS.projectsListEntries,
     WorkspaceIdentityError,
     EnvironmentAuthorizationError,
   ]),
+});
+
+export const WsProjectsSubscribeEntriesRpc = Rpc.make(WS_METHODS.projectsSubscribeEntries, {
+  payload: ProjectSubscribeEntriesInput,
+  success: ProjectEntriesChangedEvent,
+  error: Schema.Union([
+    ProjectListEntriesError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+  stream: true,
 });
 
 export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
@@ -1272,6 +1287,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,
   WsProjectsListEntriesRpc,
+  WsProjectsSubscribeEntriesRpc,
   WsProjectsReadFileRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,

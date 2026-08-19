@@ -31,6 +31,7 @@ export type ProjectSearchEntriesResult = typeof ProjectSearchEntriesResult.Type;
 export const ProjectListEntriesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(PROJECT_ENTRIES_MAX_LIMIT))),
+  refresh: Schema.optional(Schema.Boolean),
 });
 export type ProjectListEntriesInput = typeof ProjectListEntriesInput.Type;
 
@@ -39,6 +40,24 @@ export const ProjectListEntriesResult = Schema.Struct({
   truncated: Schema.Boolean,
 });
 export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
+
+/** Input for subscribing to out-of-band workspace changes under `cwd`. */
+export const ProjectSubscribeEntriesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+});
+export type ProjectSubscribeEntriesInput = typeof ProjectSubscribeEntriesInput.Type;
+
+/**
+ * Signals that the workspace path set under `cwd` may have changed on disk.
+ *
+ * Deliberately carries no paths: the server's entry index stays the single source of truth, so a
+ * subscriber re-reads it with `projects.listEntries` rather than applying a diff that could drift
+ * out of agreement with it. That also keeps the payload independent of how many files changed.
+ */
+export const ProjectEntriesChangedEvent = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+});
+export type ProjectEntriesChangedEvent = typeof ProjectEntriesChangedEvent.Type;
 
 export const ProjectEntriesFailure = Schema.Literals([
   "workspace_root_not_found",

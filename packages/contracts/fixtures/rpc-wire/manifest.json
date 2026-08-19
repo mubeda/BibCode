@@ -246,6 +246,10 @@
       "mode": "stream"
     },
     {
+      "name": "subscribeProjectEntries",
+      "mode": "stream"
+    },
+    {
       "name": "subscribeServerConfig",
       "mode": "stream"
     },
@@ -382,8 +386,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 16,
-  "expectedTopLevelStreamShapes": 59,
+  "streamMethodCount": 17,
+  "expectedTopLevelStreamShapes": 60,
   "expectedOrchestrationEventShapes": 23,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -416,6 +420,7 @@
     "stream-shapes/subscribePreviewEvents-02.json",
     "stream-shapes/subscribePreviewEvents-03.json",
     "stream-shapes/subscribePreviewEvents-04.json",
+    "stream-shapes/subscribeProjectEntries-00.json",
     "stream-shapes/subscribeServerConfig-00.json",
     "stream-shapes/subscribeServerConfig-01.json",
     "stream-shapes/subscribeServerConfig-02.json",
@@ -832,6 +837,7 @@
     "stream-shapes/subscribePreviewEvents-02.json": "a9155fa3b7f9ed0a7d4f19829706871b9e3ef6eed400bc42f4aeb9120d729266",
     "stream-shapes/subscribePreviewEvents-03.json": "7947087b321306f787116a440dfeb5989e3c7df94c93c1d5e4055be8e8675008",
     "stream-shapes/subscribePreviewEvents-04.json": "ed7f7da557fdef705eb2acde898c3de69b2905cd09d157bda233c625f43f3f7a",
+    "stream-shapes/subscribeProjectEntries-00.json": "f8e51ca4bd07059c32d9bca97762f2d2d3708c58b413257e0de4c8ec3f5d53d8",
     "stream-shapes/subscribeServerConfig-00.json": "9dd3d1e0956b42d6d8cbe07fa1a772d5bc14912497a51f0c7d30c27223c9518a",
     "stream-shapes/subscribeServerConfig-01.json": "019f5108a45914098d10ea3047c6f190c843ec5192f54b0de04dc6e1d62409e8",
     "stream-shapes/subscribeServerConfig-02.json": "03d94022a1cef50a2030f7f07affe8a46f1ba8a24f691027d660f5add212f252",
@@ -1010,6 +1016,7 @@
     "stream-shapes/subscribePreviewEvents-02.json",
     "stream-shapes/subscribePreviewEvents-03.json",
     "stream-shapes/subscribePreviewEvents-04.json",
+    "stream-shapes/subscribeProjectEntries-00.json",
     "stream-shapes/subscribeServerConfig-00.json",
     "stream-shapes/subscribeServerConfig-01.json",
     "stream-shapes/subscribeServerConfig-02.json",
