@@ -1,0 +1,71 @@
+i want to create a git manager for BibBode. The idea is to add a new button before the new worktree button in the left panel project card. This button will open a popup window with the git manager for that project only. Only one instace of this dialog is allow per project.
+The screenshots as examples and references are placed at .plans/git-manager/screenshots.
+We are not going to display local changes there, neither stash and submodules , just branches, remote branches, and tags.
+We are going to support git history 
+We are going to support branch creation and checkout creation.
+We are going to support, Fetch, Pull, Push.
+We are going to support Merge
+We are going to list worktress, but no operation will be allowed for them. they are going to be listed and you will be able to see the path to the worktree.
+Were are not going to allow to activate a branch that already has a worktree created for the moment. That branches will be marqued with a color to know the state .
+We need to support hint messages on mouse over to display any blocking condition and the reason.
+
+
+
+## Interview Notes
+
+Captured 2026-08-18 during `/create-master-plan` (no Jira; this file is the spec).
+Decisions below are the author's answers and govern `master-plan.md`.
+
+### Surface and visibility
+- The Git Manager is a **project-scoped center-panel view**, not a modal and not a
+  native OS window. One per project; only one visible at a time.
+- The new project-card button opens it. Clicking any thread card navigates away and
+  hides it. Clicking the project card again restores that project's view (and still
+  toggles the thread list).
+- View state (graph pages, scroll, selected ref/commit, filter) is cached for the
+  **two** most recently used projects; return paints instantly, then revalidates.
+- Available for projects in **all environments** (local, desktop-local sandbox,
+  remote); a disconnected environment shows an unavailable state.
+
+### History
+- **Full Fork-style lane graph**, not a flat list.
+- The server pages commits **with parent SHAs and ref decorations**; the client
+  computes lane layout incrementally and virtualizes rows. Server does not lay out lanes.
+- Commit detail pane shows metadata + changed files + **inline diff** of the selected file.
+
+### Operations in v1
+Beyond the issue.specs core (fetch/pull/push, merge, branch create + checkout,
+list branches/remote branches/tags/worktrees, history):
+- Create tag, with optional push.
+- Checkout a remote branch as a new local tracking branch.
+- Force push and push-all-tags options.
+- Delete / rename branch, delete tag (local refs only; remote ref deletion is out).
+
+### Merge conflicts
+- Local changes are out of scope, so conflicts cannot be resolved in the panel.
+- On conflict the panel **asks each time**: Abort the merge (restores the pre-merge
+  state) or Keep the conflicted state and resolve outside BiBCode.
+
+### Progress and errors
+- Inline progress banner inside the panel with the operation name, Cancel, and a
+  collapsible "show full output" area streaming git stdout/stderr. Errors stay pinned.
+- Git already runs non-interactively (`GIT_TERMINAL_PROMPT=0`, empty askpass), so
+  credential prompts fail fast rather than hanging; the banner explains that a
+  credential helper or SSH agent must be configured.
+
+### Live updates
+- The panel stays current with **repository change events**, not just manual refresh.
+- Mechanism: the existing `StatusBroadcaster` poller gains a cheap refs/HEAD/worktree
+  signature per repository and emits a new generation when it changes. No second
+  poller, no new filesystem watcher.
+
+### Guards (disabled control + hover reason, all computed server-side)
+- Branch already has a worktree — cannot be checked out; colour-marked; tooltip names the path.
+- Dirty working tree blocks checkout / merge / pull.
+- Another git operation already running for the repository.
+- Default/protected-branch guard for force push, delete and rename (and current branch for delete).
+
+### Explicitly out
+Local changes / staging / commit / discard, stash, submodules, rebase (plain and
+interactive), cherry-pick, revert, reset, blame, any worktree mutation, remote branch
+and remote tag deletion, and conflict-resolution UI.
