@@ -67,6 +67,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Exact executable launched:
 - Exact PID/start identity:
 - Other installed or development copies excluded:
+- External tool, command, and path used for the Files Refresh rescan:
 - Authentication-dependent scenarios unavailable:
 
 ## External-worktree scenario

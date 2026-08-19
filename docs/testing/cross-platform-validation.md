@@ -185,6 +185,16 @@ sizes. Cover relevant:
 - discovered and adopted external worktrees;
 - thread creation, switching, persistence, and streaming;
 - terminal input/output and panel switching;
+- Files tree nesting, mutations, and moves: one row per directory with its own
+  expand arrow rather than merged directory chains, **New File…** creating the
+  entry in the clicked nested folder while expanded folders stay expanded, a
+  drag-move onto a folder row and onto the tree root, and a refused move (a name
+  the target already holds) reported as an error with the tree resynced;
+- Files picking up a file created in the workspace by another tool while the
+  packaged application stays open, both on its own within seconds and
+  immediately via **Refresh**; on Windows, cover a WSL-hosted workspace as well
+  as a native one, because directory-timestamp fidelity differs across that
+  boundary;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation;
 - responsive menus, overlays, narrow panels, and focus states; and

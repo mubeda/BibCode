@@ -41,6 +41,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
         | "subscribePreviewEvents"
+        | "subscribeProjectEntries"
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
         | "subscribeVcsStatus"

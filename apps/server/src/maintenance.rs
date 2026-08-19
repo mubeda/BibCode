@@ -64,6 +64,7 @@ pub fn rpc_mutability(method: &str) -> RpcMutability {
         | "subscribeActivity"
         | "subscribeAuthAccess"
         | "subscribeDiscoveredLocalServers"
+        | "subscribeProjectEntries"
         | "subscribePreviewEvents"
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
