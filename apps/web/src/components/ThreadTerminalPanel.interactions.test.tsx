@@ -19,7 +19,7 @@ import {
   type TerminalLaunchCommand,
   type TerminalSessionSnapshot,
 } from "@bibcode/contracts";
-import type { TerminalFontPreference } from "@bibcode/contracts/settings";
+import type { TerminalFontPreference, TerminalThemePreference } from "@bibcode/contracts/settings";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -440,6 +440,7 @@ const testState = vi.hoisted(() => ({
   webglEnabled: false,
   resolvedTheme: "light" as TerminalThemeMode,
   terminalFontPreference: { mode: "bundled" } as TerminalFontPreference,
+  terminalThemePreference: "app" as TerminalThemePreference,
   fontLoad: vi.fn(() => Promise.resolve()),
   activityStateTargets: [] as unknown[],
   activityState: null as unknown,
@@ -513,11 +514,13 @@ vi.mock("../hooks/useSettings", () => ({
     selector: (settings: {
       terminal: { webglEnabled: boolean };
       terminalFontPreference: TerminalFontPreference;
+      terminalThemePreference: TerminalThemePreference;
     }) => unknown,
   ) =>
     selector({
       terminal: { webglEnabled: testState.webglEnabled },
       terminalFontPreference: testState.terminalFontPreference,
+      terminalThemePreference: testState.terminalThemePreference,
     }),
 }));
 vi.mock("../hooks/useTheme", () => ({

@@ -83,7 +83,9 @@ import { useTheme } from "../hooks/useTheme";
 import { ensureBundledTerminalFontLoaded, resolveTerminalFontFamily } from "../lib/terminalFont";
 import {
   mergeTerminalSpawnEnv,
+  resolveTerminalThemeMode,
   retainTerminalLaunchTheme,
+  terminalExtendedAnsiPalette,
   type TerminalLaunchThemeState,
   type TerminalThemeMode,
 } from "./terminalTheme";
@@ -424,6 +426,23 @@ export function normalizeComputedColor(value: string | null | undefined, fallbac
 function terminalThemesEqual(left: ITheme, right: ITheme): boolean {
   const keys = new Set([...Object.keys(left), ...Object.keys(right)] as Array<keyof ITheme>);
   for (const key of keys) {
+    // `extendedAnsi` is a freshly built array on every theme compose, so an
+    // identity check would report a change on each call and rebuild the glyph
+    // atlas for nothing. Compare it by value.
+    if (key === "extendedAnsi") {
+      const leftPalette = left.extendedAnsi;
+      const rightPalette = right.extendedAnsi;
+      if (leftPalette === rightPalette) continue;
+      if (
+        leftPalette === undefined ||
+        rightPalette === undefined ||
+        leftPalette.length !== rightPalette.length ||
+        leftPalette.some((color, index) => color !== rightPalette[index])
+      ) {
+        return false;
+      }
+      continue;
+    }
     if (left[key] !== right[key]) return false;
   }
   return true;
@@ -482,6 +501,7 @@ function terminalThemeFromApp(
     return {
       background,
       foreground,
+      extendedAnsi: terminalExtendedAnsiPalette("dark"),
       cursor: "rgb(180, 203, 255)",
       selectionBackground: "rgba(180, 203, 255, 0.25)",
       scrollbarSliderBackground: "rgba(255, 255, 255, 0.1)",
@@ -509,6 +529,7 @@ function terminalThemeFromApp(
   return {
     background,
     foreground,
+    extendedAnsi: terminalExtendedAnsiPalette("light"),
     cursor: "rgb(38, 56, 78)",
     selectionBackground: "rgba(37, 63, 99, 0.2)",
     scrollbarSliderBackground: "rgba(0, 0, 0, 0.15)",
@@ -662,7 +683,16 @@ export function TerminalViewport({
   keybindings,
   workspaceUnavailable = null,
 }: TerminalViewportProps) {
-  const { resolvedTheme } = useTheme();
+  const { resolvedTheme: appTheme } = useTheme();
+  const terminalThemePreference = usePrimarySettings(
+    (settings) => settings.terminalThemePreference,
+  );
+  // The terminal surface owns its theme. Provider TUIs paint their own dark
+  // panels with hardcoded 256-colour indices and never ask the terminal what
+  // colours it uses, so a light terminal renders those panels as dark blocks.
+  // Everything downstream — the xterm theme and the OSC colours the PTY reports
+  // to providers — is derived from this, never from the app theme directly.
+  const resolvedTheme = resolveTerminalThemeMode(terminalThemePreference, appTheme);
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
