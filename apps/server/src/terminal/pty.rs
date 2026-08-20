@@ -342,6 +342,22 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
+/// Collapses a burst of queued resizes down to the newest one.
+///
+/// A window drag emits many sizes while a single `master.resize` is still in
+/// flight — on Windows that call is a cross-process `ResizePseudoConsole` and
+/// takes milliseconds. Only the newest size describes the terminal the user is
+/// actually looking at, so intermediate sizes are skipped rather than replayed.
+/// Skipping them must never skip the last one: a PTY left at an intermediate
+/// size strands every full-screen TUI that anchors to the reported row count.
+fn coalesce_pending_resizes(first: PtySize, requests: &mpsc::Receiver<PtySize>) -> PtySize {
+    let mut newest = first;
+    while let Ok(size) = requests.try_recv() {
+        newest = size;
+    }
+    newest
+}
+
 impl PortablePtyBackend {
     fn spawn_command(
         &self,
@@ -400,7 +416,7 @@ impl PortablePtyBackend {
         let killer = child.child().clone_killer();
         let (output, initial_output) = broadcast::channel(256);
         let (exit, _) = watch::channel(None);
-        let (resize, resize_requests) = mpsc::sync_channel(1);
+        let (resize, resize_requests) = mpsc::channel();
 
         // Answer OSC color queries (e.g. OpenCode's OSC 11 light/dark probe) at
         // the PTY layer, using the app's resolved theme colors, so detection
@@ -421,7 +437,19 @@ impl PortablePtyBackend {
             .name(format!("bibcode-pty-resize-{pid}"))
             .spawn(move || {
                 while let Ok(size) = resize_requests.recv() {
-                    let _ = pair.master.resize(size);
+                    let size = coalesce_pending_resizes(size, &resize_requests);
+                    if let Err(error) = pair.master.resize(size) {
+                        // A dropped resize strands full-screen TUIs at a stale
+                        // row count, so make the failure visible instead of
+                        // leaving the PTY silently out of sync with the client.
+                        tracing::warn!(
+                            %error,
+                            pid,
+                            cols = size.cols,
+                            rows = size.rows,
+                            "failed to resize PTY"
+                        );
+                    }
                 }
             })
         {
@@ -778,7 +806,7 @@ fn retain_captured_identity_if_child_live(
 struct PortablePtyProcess {
     pid: u32,
     process_identity: Option<ProcessIdentity>,
-    resize: mpsc::SyncSender<PtySize>,
+    resize: mpsc::Sender<PtySize>,
     writer: SharedPtyWriter,
     #[cfg(not(windows))]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
@@ -838,16 +866,17 @@ impl PtyProcess for PortablePtyProcess {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        match self.resize.try_send(PtySize {
+        // Never drop a request: callers and `TerminalSession` both record the
+        // requested size as applied, so a discarded resize desyncs the PTY from
+        // the client permanently. The worker coalesces any backlog instead.
+        match self.resize.send(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         }) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                Err("PTY resize worker is not available".to_string())
-            }
+            Ok(()) => Ok(()),
+            Err(mpsc::SendError(_)) => Err("PTY resize worker is not available".to_string()),
         }
     }
 
@@ -2323,10 +2352,81 @@ mod tests {
         assert!(error.contains("terminal executable was not found"));
     }
 
+    #[test]
+    fn coalescing_pending_resizes_keeps_the_newest_size() {
+        let (resize, requests) = mpsc::channel();
+        let size = |cols, rows| PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        // A window drag queues a burst while one resize is still in flight.
+        resize.send(size(186, 57)).unwrap();
+        resize.send(size(196, 63)).unwrap();
+        resize.send(size(206, 69)).unwrap();
+
+        let first = requests.recv().unwrap();
+        assert_eq!(coalesce_pending_resizes(first, &requests), size(206, 69));
+        assert!(requests.try_recv().is_err(), "backlog must be drained");
+    }
+
+    #[test]
+    fn coalescing_pending_resizes_passes_through_a_lone_size() {
+        let (resize, requests) = mpsc::channel::<PtySize>();
+        let only = PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        resize.send(only).unwrap();
+
+        let first = requests.recv().unwrap();
+        assert_eq!(coalesce_pending_resizes(first, &requests), only);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn portable_process_queues_every_resize_including_the_final_size() {
+        // Regression: a bounded queue silently discarded requests once full and
+        // still reported success, leaving the PTY at an intermediate size while
+        // the session recorded the requested one. A full-screen TUI then anchors
+        // its bottom rows to the stale row count and never repaints.
+        let (resize, resize_requests) = mpsc::channel();
+        let (output, initial_output) = broadcast::channel(1);
+        let (exit, _) = watch::channel(None);
+        let process = PortablePtyProcess {
+            pid: 44,
+            process_identity: None,
+            resize,
+            writer: Arc::new(Mutex::new(Box::new(TestWriter::WriteError))),
+            killer: Mutex::new(Box::new(TestKiller { fail: false })),
+            output,
+            initial_output: Mutex::new(Some(initial_output)),
+            exit,
+            #[cfg(unix)]
+            process_group: None,
+            #[cfg(unix)]
+            process_group_ownership: Arc::new(Mutex::new(UnixProcessGroupOwnership::Released)),
+        };
+
+        // Nothing drains while these are issued, exactly as when the worker is
+        // blocked inside a slow ConPTY resize.
+        process.resize(186, 57).unwrap();
+        process.resize(196, 63).unwrap();
+        process.resize(206, 69).unwrap();
+
+        let first = resize_requests.recv().unwrap();
+        let applied = coalesce_pending_resizes(first, &resize_requests);
+        assert_eq!((applied.cols, applied.rows), (206, 69));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn portable_process_reports_writer_resize_and_killer_failures() {
-        let (resize, resize_requests) = mpsc::sync_channel(1);
+        let (resize, resize_requests) = mpsc::channel();
         let (output, initial_output) = broadcast::channel(1);
         let (exit, _) = watch::channel(None);
         let process = PortablePtyProcess {
@@ -2372,7 +2472,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn portable_process_reports_poisoned_writer_and_killer_locks() {
-        let (resize, _resize_requests) = mpsc::sync_channel(1);
+        let (resize, _resize_requests) = mpsc::channel();
         let (output, initial_output) = broadcast::channel(1);
         let (exit, _) = watch::channel(None);
         let process = PortablePtyProcess {

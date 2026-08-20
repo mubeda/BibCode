@@ -52,11 +52,13 @@ vi.mock("../hooks/useSettings", () => ({
     selector: (settings: {
       terminal: { webglEnabled: boolean };
       terminalFontPreference: { mode: "bundled" };
+      terminalThemePreference: "app" | "dark" | "light";
     }) => unknown,
   ) =>
     selector({
       terminal: { webglEnabled: false },
       terminalFontPreference: { mode: "bundled" },
+      terminalThemePreference: "app",
     }),
 }));
 

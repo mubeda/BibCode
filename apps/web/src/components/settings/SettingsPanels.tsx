@@ -144,6 +144,21 @@ function isSettingsUpdateFailure(result: unknown): boolean {
   );
 }
 
+const TERMINAL_THEME_OPTIONS = [
+  {
+    value: "dark",
+    label: "Always dark",
+  },
+  {
+    value: "light",
+    label: "Always light",
+  },
+  {
+    value: "app",
+    label: "Follow app theme",
+  },
+] as const;
+
 const TERMINAL_FONT_OPTIONS = [
   {
     value: "bundled",
@@ -1118,6 +1133,49 @@ export function TerminalSettingsPanel() {
   return (
     <SettingsPageContainer>
       <SettingsSection title="Terminal">
+        <SettingsRow
+          title="Terminal theme"
+          description="Agent TUIs such as Codex paint their own dark panels and never ask the terminal which colours it uses, so a light terminal shows those panels as dark blocks. Keep the terminal dark unless you do not run them. This preference is stored only on this device."
+          resetAction={
+            settings.terminalThemePreference !==
+            DEFAULT_UNIFIED_SETTINGS.terminalThemePreference ? (
+              <SettingResetButton
+                label="terminal theme"
+                onClick={() =>
+                  updateSettings({
+                    terminalThemePreference: DEFAULT_UNIFIED_SETTINGS.terminalThemePreference,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.terminalThemePreference}
+              onValueChange={(value) => {
+                const option = TERMINAL_THEME_OPTIONS.find((entry) => entry.value === value);
+                if (option) {
+                  updateSettings({ terminalThemePreference: option.value });
+                }
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-48" aria-label="Terminal theme">
+                <SelectValue>
+                  {TERMINAL_THEME_OPTIONS.find(
+                    (option) => option.value === settings.terminalThemePreference,
+                  )?.label ?? "Always dark"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                {TERMINAL_THEME_OPTIONS.map((option) => (
+                  <SelectItem hideIndicator key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          }
+        />
         <SettingsRow
           title="Terminal font"
           description="The bundled monospaced Nerd Font keeps prompt icons aligned with the cursor. This preference is stored only on this device."
