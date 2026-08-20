@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   buildSmartRows,
+  canReuseBranch,
   detectSmartMode,
   filterRefsByQuery,
   findExactRefMatch,
@@ -9,6 +10,8 @@ import {
   parseGitHubWorkItem,
   resolveWorktreeCreateInput,
   sanitizeBranchName,
+  suggestNextAvailableBranchName,
+  suggestWorktreeNameFromRef,
   type RefLike,
 } from "./CreateWorktreeDialog.logic";
 
@@ -101,6 +104,42 @@ describe("filterRefsByQuery", () => {
   });
 });
 
+describe("canReuseBranch", () => {
+  it("accepts only a free local branch", () => {
+    expect(canReuseBranch({ name: "feature" })).toBe(true);
+    expect(canReuseBranch({ name: "origin/feature", isRemote: true })).toBe(false);
+    expect(canReuseBranch({ name: "main", current: true })).toBe(false);
+    expect(canReuseBranch({ name: "feature", worktreePath: "/repo-feature" })).toBe(false);
+  });
+});
+
+describe("suggestNextAvailableBranchName", () => {
+  it("uses the first available numeric suffix", () => {
+    expect(
+      suggestNextAvailableBranchName("feature/login", [
+        { name: "feature/login" },
+        { name: "feature/login-2" },
+        { name: "origin/feature/login-3", isRemote: true },
+      ]),
+    ).toBe("feature/login-3");
+  });
+});
+
+describe("suggestWorktreeNameFromRef", () => {
+  it("drops only the remote name prefix", () => {
+    expect(suggestWorktreeNameFromRef({ name: "origin/feature/login", isRemote: true })).toBe(
+      "feature/login",
+    );
+    expect(
+      suggestWorktreeNameFromRef({
+        name: "team/origin/feature/login",
+        isRemote: true,
+        remoteName: "team/origin",
+      }),
+    ).toBe("feature/login");
+  });
+});
+
 describe("findExactRefMatch", () => {
   const refs: RefLike[] = [{ name: "main" }, { name: "feature/login" }];
 
@@ -130,10 +169,9 @@ describe("buildSmartRows", () => {
     expect(rows[0]).toEqual({ kind: "github", item: { number: 123, kind: "unknown" } });
   });
 
-  it("pins a use-name row first otherwise, followed by matching branches", () => {
+  it("shows only matching branches when the query is not a GitHub item", () => {
     const rows = buildSmartRows({ query: "feature", refs });
-    expect(rows[0]).toEqual({ kind: "use-name", name: "feature" });
-    expect(rows.slice(1)).toEqual([
+    expect(rows).toEqual([
       { kind: "branch", refName: "feature/login" },
       { kind: "branch", refName: "feature/logout" },
     ]);
@@ -149,8 +187,8 @@ describe("buildSmartRows", () => {
 describe("detectSmartMode", () => {
   const refs: RefLike[] = [{ name: "feature/login" }, { name: "main" }];
 
-  it("returns name for empty query", () => {
-    expect(detectSmartMode("", refs)).toBe("name");
+  it("returns search for empty query", () => {
+    expect(detectSmartMode("", refs)).toBe("search");
   });
 
   it("detects github pattern", () => {
@@ -165,44 +203,62 @@ describe("detectSmartMode", () => {
     expect(detectSmartMode("feature/lo", refs)).toBe("branch");
   });
 
-  it("falls back to name when nothing matches", () => {
-    expect(detectSmartMode("brand-new-thing", refs)).toBe("name");
+  it("falls back to search when nothing matches", () => {
+    expect(detectSmartMode("brand-new-thing", refs)).toBe("search");
   });
 });
 
 describe("resolveWorktreeCreateInput", () => {
   const base = {
     nameText: "",
+    sourceText: "",
     selectedBranchRefName: null,
+    selectedBranchRef: null,
+    reuseSelectedBranch: false,
     githubItem: null,
     advancedBaseBranchOverride: null,
     defaultBaseBranch: "main",
   };
 
-  it("resolves name mode from sanitized text", () => {
-    const result = resolveWorktreeCreateInput({ ...base, mode: "name", nameText: "My Feature" });
-    expect(result).toEqual({
-      kind: "new-branch",
-      branchName: "My-Feature",
+  it("creates a named branch from the default base when Create From is empty", () => {
+    const result = resolveWorktreeCreateInput({ ...base, mode: "smart", nameText: "My Feature" });
+    expect(result).toMatchObject({
+      title: "My Feature",
       refName: "main",
       newRefName: "My-Feature",
       baseRefName: "main",
     });
   });
 
-  it("returns null for name mode with empty text", () => {
-    expect(resolveWorktreeCreateInput({ ...base, mode: "name", nameText: "   " })).toBeNull();
+  it("returns null when Name is empty", () => {
+    expect(resolveWorktreeCreateInput({ ...base, mode: "smart", nameText: "   " })).toBeNull();
+  });
+
+  it("requires Name even when a reusable branch is selected", () => {
+    expect(
+      resolveWorktreeCreateInput({
+        ...base,
+        mode: "branch",
+        selectedBranchRefName: "feature/login",
+        selectedBranchRef: { name: "feature/login" },
+        reuseSelectedBranch: true,
+      }),
+    ).toBeNull();
   });
 
   it("resolves branch mode as an existing ref", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
       mode: "branch",
+      nameText: "feature--login",
       selectedBranchRefName: "feature--login",
+      selectedBranchRef: { name: "feature--login" },
+      reuseSelectedBranch: true,
       advancedBaseBranchOverride: "develop",
     });
     expect(result).toEqual({
       kind: "existing-ref",
+      title: "feature--login",
       branchName: "feature--login",
       refName: "feature--login",
       newRefName: null,
@@ -210,18 +266,65 @@ describe("resolveWorktreeCreateInput", () => {
     });
   });
 
+  it("creates a named branch from a selected reusable branch when reuse is off", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "branch",
+      nameText: "Login polish",
+      selectedBranchRefName: "feature/login",
+      selectedBranchRef: { name: "feature/login", isRemote: false },
+    });
+    expect(result).toMatchObject({
+      title: "Login polish",
+      refName: "feature/login",
+      newRefName: "Login-polish",
+      baseRefName: "feature/login",
+    });
+  });
+
+  it("never reuses a remote branch even when stale UI state says reuse is on", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "branch",
+      nameText: "Login polish",
+      selectedBranchRefName: "origin/feature/login",
+      selectedBranchRef: { name: "origin/feature/login", isRemote: true },
+      reuseSelectedBranch: true,
+    });
+    expect(result).toMatchObject({
+      refName: "origin/feature/login",
+      newRefName: "Login-polish",
+      baseRefName: "origin/feature/login",
+    });
+  });
+
   it("returns null for branch mode with no selection", () => {
     expect(resolveWorktreeCreateInput({ ...base, mode: "branch" })).toBeNull();
+  });
+
+  it("treats an empty Create From branch search as optional", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "branch",
+      nameText: "New workspace",
+    });
+    expect(result).toMatchObject({
+      refName: "main",
+      newRefName: "New-workspace",
+      baseRefName: "main",
+    });
   });
 
   it("resolves github mode from the parsed item", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
       mode: "github",
+      nameText: "pr-42",
       githubItem: { number: 42, kind: "pr" },
     });
     expect(result).toEqual({
       kind: "new-branch",
+      title: "pr-42",
       branchName: "pr-42",
       refName: "main",
       newRefName: "pr-42",
@@ -229,19 +332,59 @@ describe("resolveWorktreeCreateInput", () => {
     });
   });
 
+  it("uses an edited Name for a GitHub source", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "github",
+      nameText: "Fix login",
+      sourceText: "#42",
+      githubItem: { number: 42, kind: "pr" },
+    });
+    expect(result).toMatchObject({
+      title: "Fix login",
+      newRefName: "Fix-login",
+    });
+  });
+
   it("returns null for github mode with no parsed item", () => {
     expect(resolveWorktreeCreateInput({ ...base, mode: "github" })).toBeNull();
+  });
+
+  it("requires Name when a GitHub source resolves", () => {
+    expect(
+      resolveWorktreeCreateInput({
+        ...base,
+        mode: "github",
+        sourceText: "#42",
+        githubItem: { number: 42, kind: "pr" },
+      }),
+    ).toBeNull();
+  });
+
+  it("treats an empty Create From GitHub input as optional", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "github",
+      nameText: "New workspace",
+    });
+    expect(result).toMatchObject({
+      refName: "main",
+      newRefName: "New-workspace",
+      baseRefName: "main",
+    });
   });
 
   it("smart mode prefers a github item over a branch selection", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
       mode: "smart",
+      nameText: "pr-7",
       githubItem: { number: 7, kind: "issue" },
       selectedBranchRefName: "feature/login",
     });
     expect(result).toEqual({
       kind: "new-branch",
+      title: "pr-7",
       branchName: "pr-7",
       refName: "main",
       newRefName: "pr-7",
@@ -253,11 +396,15 @@ describe("resolveWorktreeCreateInput", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
       mode: "smart",
+      nameText: "feature--login",
       selectedBranchRefName: "feature--login",
+      selectedBranchRef: { name: "feature--login" },
+      reuseSelectedBranch: true,
       advancedBaseBranchOverride: "develop",
     });
     expect(result).toEqual({
       kind: "existing-ref",
+      title: "feature--login",
       branchName: "feature--login",
       refName: "feature--login",
       newRefName: null,
@@ -265,10 +412,26 @@ describe("resolveWorktreeCreateInput", () => {
     });
   });
 
+  it("smart mode creates from its selected branch when reuse is off", () => {
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "smart",
+      nameText: "Login polish",
+      selectedBranchRefName: "feature/login",
+      selectedBranchRef: { name: "feature/login" },
+    });
+    expect(result).toMatchObject({
+      refName: "feature/login",
+      newRefName: "Login-polish",
+      baseRefName: "feature/login",
+    });
+  });
+
   it("smart mode falls back to sanitized text when nothing else resolves", () => {
     const result = resolveWorktreeCreateInput({ ...base, mode: "smart", nameText: "brand new" });
     expect(result).toEqual({
       kind: "new-branch",
+      title: "brand new",
       branchName: "brand-new",
       refName: "main",
       newRefName: "brand-new",
@@ -276,15 +439,27 @@ describe("resolveWorktreeCreateInput", () => {
     });
   });
 
+  it("rejects a non-empty Smart search without a current source selection", () => {
+    expect(
+      resolveWorktreeCreateInput({
+        ...base,
+        mode: "smart",
+        nameText: "Workspace",
+        sourceText: "feature/login",
+      }),
+    ).toBeNull();
+  });
+
   it("uses HEAD as the base when no default base branch is available", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
-      mode: "name",
+      mode: "smart",
       nameText: "feature",
       defaultBaseBranch: null,
     });
     expect(result).toEqual({
       kind: "new-branch",
+      title: "feature",
       branchName: "feature",
       refName: "HEAD",
       newRefName: "feature",
@@ -295,12 +470,13 @@ describe("resolveWorktreeCreateInput", () => {
   it("prefers the advanced base-branch override over the default", () => {
     const result = resolveWorktreeCreateInput({
       ...base,
-      mode: "name",
+      mode: "smart",
       nameText: "feature",
       advancedBaseBranchOverride: "develop",
     });
     expect(result).toEqual({
       kind: "new-branch",
+      title: "feature",
       branchName: "feature",
       refName: "develop",
       newRefName: "feature",
@@ -312,6 +488,7 @@ describe("resolveWorktreeCreateInput", () => {
 describe("getCreateWorktreeDisabled", () => {
   const resolution = {
     kind: "new-branch" as const,
+    title: "feature",
     branchName: "feature",
     refName: "main",
     newRefName: "feature",
