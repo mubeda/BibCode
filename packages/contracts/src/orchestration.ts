@@ -6,6 +6,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity } from "./environment.ts";
+import { RuntimeErrorClass } from "./providerRuntime.ts";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -360,6 +361,12 @@ export const OrchestrationSession = Schema.Struct({
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
+  /**
+   * Which side reported `lastError`. `lastError` is mixed-provenance — it
+   * carries both a provider's own failure and BiBCode's restart notice — so
+   * this is what lets a surface attribute the error instead of guessing.
+   */
+  lastErrorClass: Schema.optional(Schema.NullOr(RuntimeErrorClass)),
   updatedAt: IsoDateTime,
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
@@ -390,6 +397,12 @@ export const OrchestrationThreadActivityTone = Schema.Literals([
   "info",
   "tool",
   "approval",
+  /**
+   * A provider reported something the user should see but that did not fail the
+   * turn — an upstream retry, a rate limit, an auth warning on stderr. Without
+   * this these arrived as `tool`, presenting a 429 as an ordinary tool call.
+   */
+  "warning",
   "error",
 ]);
 export type OrchestrationThreadActivityTone = typeof OrchestrationThreadActivityTone.Type;
@@ -502,6 +515,21 @@ export const OrchestrationThreadShell = Schema.Struct({
   hasPendingApprovals: Schema.Boolean,
   hasPendingUserInput: Schema.Boolean,
   hasActionableProposedPlan: Schema.Boolean,
+  /**
+   * The newest delivery on this thread the user still has to resolve — one the
+   * provider refused (`failed`) or whose fate is unknown (`uncertain`). Derived
+   * from the delivery outbox on every delivery transition, so it clears itself on
+   * retry, dismissal or success. Present so surfaces outside the open chat — the
+   * sidebar in particular — can show that a send did not land.
+   */
+  unresolvedDelivery: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        state: Schema.Literals(["failed", "uncertain"]),
+        detail: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+      }),
+    ),
+  ),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 

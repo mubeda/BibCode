@@ -2529,6 +2529,8 @@ mod tests {
                     pending_approval_count: 0,
                     pending_user_input_count: 0,
                     has_actionable_proposed_plan: 0,
+                    unresolved_delivery_state: None,
+                    unresolved_delivery_detail: None,
                     deleted_at: None,
                 })
                 .await

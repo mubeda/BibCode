@@ -136,7 +136,19 @@ export type MessagesTimelineRow =
       createdAt: string;
       proposedPlan: ProposedPlan;
     }
-  | { kind: "working"; id: string; createdAt: string | null };
+  | {
+      kind: "working";
+      id: string;
+      createdAt: string | null;
+      /**
+       * The turn already produced its terminal assistant message and is only
+       * waiting for the provider to close it. Codex routinely takes tens of
+       * seconds to send `turn/completed` after the final answer (measured
+       * 19.8s-114.9s; claude and cursor are ~0s), and reporting that as an
+       * undifferentiated wait made the provider's lag look like BiBCode hanging.
+       */
+      answerDelivered: boolean;
+    };
 
 export interface StableMessagesTimelineRowsState {
   byId: Map<string, MessagesTimelineRow>;
@@ -525,10 +537,21 @@ export function deriveMessagesTimelineRows(input: {
   }
 
   if (input.isWorking) {
+    const answerDelivered =
+      unsettledTurnId !== null &&
+      input.timelineEntries.some(
+        (entry) =>
+          entry.kind === "message" &&
+          entry.message.role === "assistant" &&
+          entry.message.turnId === unsettledTurnId &&
+          !entry.message.streaming &&
+          terminalAssistantMessageIds.has(entry.message.id),
+      );
     nextRows.push({
       kind: "working",
       id: "working-indicator-row",
       createdAt: input.activeTurnStartedAt,
+      answerDelivered,
     });
   }
 
@@ -560,8 +583,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
   switch (a.kind) {
-    case "working":
-      return a.createdAt === (b as typeof a).createdAt;
+    case "working": {
+      const bw = b as typeof a;
+      return a.createdAt === bw.createdAt && a.answerDelivered === bw.answerDelivered;
+    }
 
     case "turn-fold": {
       const bf = b as typeof a;

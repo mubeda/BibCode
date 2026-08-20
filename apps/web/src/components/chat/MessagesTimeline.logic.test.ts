@@ -1254,9 +1254,88 @@ describe("deriveMessagesTimelineRows", () => {
   });
 });
 
+describe("working row answer delivery", () => {
+  const workingRowFor = (streaming: boolean) => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "assistant-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:05Z",
+          message: {
+            id: "assistant-1" as never,
+            role: "assistant" as const,
+            text: "Hi! I'm doing well.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:05Z",
+            updatedAt: "2026-01-01T00:00:05Z",
+            streaming,
+          },
+        },
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "running",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: null,
+      },
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+    return rows.find(
+      (row): row is Extract<(typeof rows)[number], { kind: "working" }> => row.kind === "working",
+    );
+  };
+
+  it("reports a settled answer on a turn the provider has not closed", () => {
+    // Codex sends `turn/completed` tens of seconds after the final answer
+    // (measured 19.8s-114.9s), so the turn is still running while the answer is
+    // already on screen. Reporting that as a plain wait blamed BiBCode for the
+    // provider's lag.
+    expect(workingRowFor(false)?.answerDelivered).toBe(true);
+  });
+
+  it("still reports a plain wait while the answer is streaming", () => {
+    expect(workingRowFor(true)?.answerDelivered).toBe(false);
+  });
+});
+
 describe("computeStableMessagesTimelineRows", () => {
+  it("treats a working row whose answer just landed as changed", () => {
+    // `answerDelivered` flips mid-turn while `id` and `createdAt` stay put. If
+    // stability compared only those, the row object would be reused and the new
+    // label would be computed but never rendered.
+    const before: MessagesTimelineRow = {
+      kind: "working",
+      id: "working-indicator-row",
+      createdAt: "2026-08-20T12:00:00.000Z",
+      answerDelivered: false,
+    };
+    const stable = computeStableMessagesTimelineRows([before], {
+      byId: new Map(),
+      result: [],
+    });
+    expect(stable.result[0]).toBe(before);
+
+    const after: MessagesTimelineRow = { ...before, answerDelivered: true };
+    const next = computeStableMessagesTimelineRows([after], stable);
+    expect(next).not.toBe(stable);
+    expect(next.result[0]).toBe(after);
+
+    // An identical row is still reused, so the fix does not defeat stability.
+    const unchanged = computeStableMessagesTimelineRows([{ ...after }], next);
+    expect(unchanged.result[0]).toBe(after);
+  });
+
   it("stabilizes working and proposed-plan rows by their variant fields", () => {
-    const working: MessagesTimelineRow = { kind: "working", id: "working", createdAt: null };
+    const working: MessagesTimelineRow = {
+      kind: "working",
+      id: "working",
+      createdAt: null,
+      answerDelivered: false,
+    };
     const plan = { steps: [] } as never;
     const proposed: MessagesTimelineRow = {
       kind: "proposed-plan",
@@ -1302,7 +1381,10 @@ describe("computeStableMessagesTimelineRows", () => {
       computeStableMessagesTimelineRows([{ ...toggle, onlyToolEntries: false }], initial),
     ).not.toBe(initial);
     expect(
-      computeStableMessagesTimelineRows([{ kind: "working", id: "shared", createdAt }], initial),
+      computeStableMessagesTimelineRows(
+        [{ kind: "working", id: "shared", createdAt, answerDelivered: false }],
+        initial,
+      ),
     ).not.toBe(initial);
   });
 

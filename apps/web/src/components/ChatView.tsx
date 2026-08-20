@@ -288,6 +288,7 @@ import {
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
+  threadErrorAttribution,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -1601,6 +1602,17 @@ function ChatViewContent(props: ChatViewProps) {
   const threadError = isServerThread
     ? (localServerError ?? serverThread?.session?.lastError ?? null)
     : localDraftError;
+  // Attribute the banner. `session.lastError` is mixed-provenance and
+  // `localServerError` is a BiBCode command that failed, so rendering them
+  // identically made a provider outage read as a BiBCode defect.
+  const threadErrorAttributionText =
+    threadError === null || !isServerThread
+      ? null
+      : threadErrorAttribution({
+          isBiBCodeAction: localServerError !== null,
+          errorClass: serverThread?.session?.lastErrorClass ?? null,
+          providerName: serverThread?.session?.providerName ?? null,
+        });
   const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const interactionMode =
     composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
@@ -5916,6 +5928,7 @@ function ChatViewContent(props: ChatViewProps) {
               <ProviderStatusBanner status={activeProviderStatus} />
               <ThreadErrorBanner
                 error={threadError}
+                attribution={threadErrorAttributionText}
                 onDismiss={() => setThreadError(activeThread.id, null)}
               />
               <div className="flex min-h-0 min-w-0 flex-1">

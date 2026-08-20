@@ -9,7 +9,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::acp::{AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape};
+use super::acp::{
+    AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
+    acp_turn_state,
+};
 
 const PROVIDER: &str = "grok";
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
@@ -251,19 +254,20 @@ impl GrokSessionRuntime {
                         .get("stopReason")
                         .and_then(Value::as_str)
                         .unwrap_or("end_turn");
+                    let (state, failure_message) = acp_turn_state(stop_reason);
+                    let mut payload = json!({
+                        "state": state,
+                        "stopReason": stop_reason,
+                    });
+                    if let Some(message) = failure_message {
+                        payload["errorMessage"] = json!(message);
+                    }
                     runtime
-                        .emit(
-                            "turn.completed",
-                            Some(background_turn_id),
-                            None,
-                            json!({
-                                "state": if stop_reason == "cancelled" { "cancelled" } else { "completed" },
-                                "stopReason": stop_reason,
-                            }),
-                        )
+                        .emit("turn.completed", Some(background_turn_id), None, payload)
                         .await;
                 }
                 Err(error) => {
+                    let class = acp_error_class(&error);
                     runtime
                         .emit(
                             "turn.completed",
@@ -272,7 +276,8 @@ impl GrokSessionRuntime {
                             json!({
                                 "state": "failed",
                                 "stopReason": "error",
-                                "error": { "message": error.to_string() },
+                                "errorMessage": error.to_string(),
+                                "errorClass": class,
                             }),
                         )
                         .await;
@@ -568,7 +573,16 @@ impl GrokSessionRuntime {
                 )
                 .await;
             }
-            _ => {}
+            unhandled => {
+                // The last silent drop in the ACP path: unhandled
+                // `sessionUpdate` variants. Variant name only — the update body
+                // carries conversation content.
+                tracing::debug!(
+                    provider = PROVIDER,
+                    session_update = unhandled.unwrap_or("<absent>"),
+                    "dropped an unhandled ACP session update"
+                );
+            }
         }
     }
 
