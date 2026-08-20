@@ -536,7 +536,7 @@ function SplitNode(
         <span
           aria-hidden="true"
           className={cn(
-            "pointer-events-none absolute bg-border transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring",
+            "pointer-events-none absolute bg-ring transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring",
             horizontal
               ? "inset-y-0 left-1/2 w-px -translate-x-1/2"
               : "inset-x-0 top-1/2 h-px -translate-y-1/2",
