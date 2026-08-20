@@ -12,7 +12,10 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    acp::{AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape},
+    acp::{
+        AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
+        acp_turn_state,
+    },
     model::{
         acp_config_option_current_value, resolve_acp_config_updates_with_baseline,
         resolve_acp_default_model_config,
@@ -547,21 +550,24 @@ impl CursorSessionRuntime {
                         .get("stopReason")
                         .and_then(Value::as_str)
                         .unwrap_or("end_turn");
+                    let (state, failure_message) = acp_turn_state(stop_reason);
+                    let mut payload = json!({
+                        "state": state,
+                        "stopReason": stop_reason,
+                    });
+                    if let Some(message) = failure_message {
+                        payload["errorMessage"] = json!(message);
+                    }
                     runtime
-                        .emit(
-                            "turn.completed",
-                            Some(background_turn_id),
-                            None,
-                            json!({
-                                "state": if stop_reason == "cancelled" { "cancelled" } else { "completed" },
-                                "stopReason": stop_reason,
-                            }),
-                        )
+                        .emit("turn.completed", Some(background_turn_id), None, payload)
                         .await;
                     let _ = completion_tx.send(Ok(()));
                 }
                 Err(error) => {
                     let detail = error.to_string();
+                    // Attribute from the variant, not the flattened string: a
+                    // JSON-RPC error is the agent's, a broken pipe is ours.
+                    let class = acp_error_class(&error);
                     runtime
                         .emit(
                             "turn.completed",
@@ -570,7 +576,8 @@ impl CursorSessionRuntime {
                             json!({
                                 "state": "failed",
                                 "stopReason": "error",
-                                "error": { "message": detail },
+                                "errorMessage": detail,
+                                "errorClass": class,
                             }),
                         )
                         .await;
@@ -824,6 +831,11 @@ impl CursorSessionRuntime {
             return;
         }
         if method != "session/update" {
+            tracing::debug!(
+                provider = PROVIDER,
+                %method,
+                "dropped an unhandled ACP notification"
+            );
             return;
         }
         let turn_id = self.inner.active_turn_id.lock().await.clone();
@@ -913,7 +925,16 @@ impl CursorSessionRuntime {
                 )
                 .await;
             }
-            _ => {}
+            unhandled => {
+                // The last silent drop in the ACP path: unhandled
+                // `sessionUpdate` variants. Variant name only — the update body
+                // carries conversation content.
+                tracing::debug!(
+                    provider = PROVIDER,
+                    session_update = unhandled.unwrap_or("<absent>"),
+                    "dropped an unhandled ACP session update"
+                );
+            }
         }
     }
 

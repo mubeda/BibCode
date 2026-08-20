@@ -1277,6 +1277,35 @@ staticDescribe("Sidebar full render", () => {
     );
   });
 
+  it("surfaces a failed session in the sidebar instead of hiding it as disconnected", () => {
+    // `derivePhase` collapses `status: "error"` into `disconnected`, so without
+    // an explicit branch an errored thread is indistinguishable from a stopped
+    // one and the failure is invisible outside the open chat.
+    baseScenario();
+    h.state.threads = [
+      threadDefault,
+      makeThread("thread-failed", {
+        title: "Failed worktree",
+        branch: "feat/y",
+        worktreePath: "C:/wt/y",
+        session: {
+          threadId: ThreadId.make("thread-failed"),
+          status: "error",
+          providerName: "Claude Code",
+          activeTurnId: null,
+          lastError: "The upstream API returned an error (HTTP 401).",
+          updatedAt: iso(30),
+          runtimeMode: "full-access",
+        },
+      }),
+    ];
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("thread-agent-row-thread-failed");
+    expect(markup).toContain("Failed");
+    expect(markup).not.toContain("Connecting");
+  });
+
   it("renders the project header, primary row, and workspace thread rows", () => {
     baseScenario();
     const markup = render(<Sidebar />);

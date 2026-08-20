@@ -670,6 +670,8 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(41, "ProjectionProjectWorktreeRepositoryKey", migration_041),
     Migration::new(42, "ProjectWorktreeRepositoryPins", migration_042),
     Migration::new(43, "DurableWorktreeRemovalReceipts", migration_043),
+    Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
+    Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
 ];
 
 impl Migration {
@@ -2341,6 +2343,57 @@ fn migration_043(transaction: &Transaction<'_>) -> Result<()> {
     )
 }
 
+fn migration_044(transaction: &Transaction<'_>) -> Result<()> {
+    // `last_error` alone cannot say who reported the failure: it carries both a
+    // provider's own message and BiBCode's restart notice. The class travels
+    // beside it so the UI can attribute the error instead of guessing.
+    // Guarded the same way as migration 028: a database restored from a
+    // trusted-ledger path may not carry this rebuildable projection table, and
+    // an unconditional ALTER would fail the whole migration.
+    if table_exists(transaction, "projection_thread_sessions")?
+        && !table_has_column(
+            transaction,
+            "projection_thread_sessions",
+            "last_error_class",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_thread_sessions ADD COLUMN last_error_class TEXT",
+        )?;
+    }
+    Ok(())
+}
+
+fn migration_045(transaction: &Transaction<'_>) -> Result<()> {
+    // A delivery the provider refused, or one whose fate is unknown, was only
+    // visible inside the open chat. Deriving it onto the thread shell lets the
+    // sidebar show it, and because it is recomputed from the outbox on every
+    // delivery transition it clears itself on retry, dismissal or success.
+    // Guarded like 044: a trusted-ledger restore may not carry this rebuildable
+    // projection table.
+    if table_exists(transaction, "projection_threads")? {
+        if !table_has_column(
+            transaction,
+            "projection_threads",
+            "unresolved_delivery_state",
+        )? {
+            transaction.execute_batch(
+                "ALTER TABLE projection_threads ADD COLUMN unresolved_delivery_state TEXT",
+            )?;
+        }
+        if !table_has_column(
+            transaction,
+            "projection_threads",
+            "unresolved_delivery_detail",
+        )? {
+            transaction.execute_batch(
+                "ALTER TABLE projection_threads ADD COLUMN unresolved_delivery_detail TEXT",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2861,7 +2914,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=43).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=45).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2965,9 +3018,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 27);
+        assert_eq!(second.len(), 29);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[26].id, 43);
+        assert_eq!(second[28].id, 45);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3074,7 +3127,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43]
+            [40, 41, 42, 43, 44, 45]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3111,7 +3164,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43]
+            [41, 42, 43, 44, 45]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3139,7 +3192,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43]
+            [42, 43, 44, 45]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3208,7 +3261,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 10);
+        assert_eq!(applied.len(), 12);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3219,6 +3272,8 @@ mod tests {
         assert_eq!(applied[7].id, 41);
         assert_eq!(applied[8].id, 42);
         assert_eq!(applied[9].id, 43);
+        assert_eq!(applied[10].id, 44);
+        assert_eq!(applied[11].id, 45);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

@@ -1138,7 +1138,10 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
       <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70 tabular-nums">
         <WorkingIndicatorIcon />
         <span>
-          Waiting for <WorkingTimer createdAt={row.createdAt} />
+          {row.answerDelivered
+            ? "Answer delivered — waiting for the provider to close the turn "
+            : "Waiting for "}
+          <WorkingTimer createdAt={row.createdAt} />
         </span>
       </div>
     </div>
@@ -1859,6 +1862,14 @@ function workToneIcon(tone: TimelineWorkEntry["tone"]): {
     return {
       iconName: "circle-alert",
       className: "text-foreground/92",
+    };
+  }
+  if (tone === "warning") {
+    // Distinct from `error` (the turn survived) and from `tool` (this is not a
+    // tool call): an upstream retry or rate limit the user should notice.
+    return {
+      iconName: "circle-alert",
+      className: "text-warning-foreground",
     };
   }
   if (tone === "thinking") {

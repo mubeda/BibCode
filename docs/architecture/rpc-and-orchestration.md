@@ -590,6 +590,16 @@ depending on connection-local push caches. `subscribeThread` and
 initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery.
 
+A turn whose delivery was refused, or whose fate the provider never confirmed,
+is reported in the open thread by the delivery notice and, independently, as an
+unresolved-delivery field on the thread shell. `OrchestrationEngine` derives that
+field from the durable outbox inside the same transaction that commits the
+delivery transition, so it is atomic with the transition and is recomputed —
+and therefore cleared — by every later transition to pending, delivered or
+dismissed. Deriving it keeps the projection owner unchanged: no delivery
+component writes the provider session, and the field never alters session
+`status`, provider identity, runtime mode, the active turn, or any turn row.
+
 ### Assistant message identity
 
 Provider assistant text preserves a native runtime `itemId` when the provider
@@ -823,3 +833,6 @@ replacement that now occupies the old path.
   is never the deletion safety boundary.
 - Durable orchestration state, not a WebSocket connection, is the recovery
   boundary.
+- A refused or unconfirmed turn delivery is visible outside the open thread as
+  engine-derived thread state, never by a delivery component writing the
+  provider session.

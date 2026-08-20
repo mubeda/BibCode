@@ -1620,6 +1620,8 @@ async fn reconcile_abandoned_provider_session(
                     runtime_mode: runtime.runtime_mode.clone(),
                     active_turn_id: None,
                     last_error: Some(restart_error.to_owned()),
+                    // BiBCode restarted; the provider did not fail.
+                    last_error_class: Some("transport_error".to_owned()),
                     updated_at: projected_at.clone(),
                 },
                 created_at: projected_at,
@@ -2868,7 +2870,8 @@ async fn spawn_delivery(
                 tracing::warn!(%error, "accepted provider delivery runtime state was not persisted");
             }
             if let Err(error) =
-                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None).await
+                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None, None)
+                    .await
             {
                 tracing::warn!(%error, "accepted provider delivery session state was not projected");
             }
@@ -3296,7 +3299,7 @@ async fn launch_session(
         started.runtime_payload.clone(),
     )
     .await?;
-    dispatch_session_state(engine, &request, "ready", None, None).await?;
+    dispatch_session_state(engine, &request, "ready", None, None, None).await?;
 
     if !activity_controller.snapshot().enabled {
         activity_control.write().await.take();
@@ -3416,7 +3419,7 @@ async fn handle_command(
                 .send(message.text, message.attachments, interaction_mode)
                 .await?;
             persist_entry(&engine.repositories(), entry, "running").await?;
-            dispatch_session_state(engine, &entry.launch, "running", turn_id, None).await
+            dispatch_session_state(engine, &entry.launch, "running", turn_id, None, None).await
         }
         OrchestrationCommand::ThreadTurnInterrupt { turn_id, .. } => {
             entry.driver.interrupt(turn_id).await?;
@@ -3964,6 +3967,10 @@ fn spawn_event_pump(
 ) -> JoinHandle<()> {
     let activity_controller = activity.agent_activity_controller();
     tokio::spawn(async move {
+        // Providers announce why they are going away in `session.exited` just
+        // before their stream ends. Remember it so the synthesized stream-end
+        // failure can say what actually happened instead of a fixed string.
+        let mut last_exit_reason: Option<String> = None;
         loop {
             tokio::select! {
                 biased;
@@ -4007,6 +4014,14 @@ fn spawn_event_pump(
                         if !cancellation.is_cancelled() {
                             const STREAM_END_ERROR: &str =
                                 "Provider event stream ended unexpectedly.";
+                            let stream_end_message = last_exit_reason.as_deref().map_or_else(
+                                || STREAM_END_ERROR.to_owned(),
+                                |reason| {
+                                    format!(
+                                        "Provider event stream ended unexpectedly: {reason}"
+                                    )
+                                },
+                            );
                             let active_turn_id = match engine
                                 .repositories()
                                 .get_thread_session(launch.thread_id.clone())
@@ -4032,7 +4047,11 @@ fn spawn_event_pump(
                                 request_id: None,
                                 payload: json!({
                                     "state": "failed",
-                                    "error": { "message": STREAM_END_ERROR },
+                                    "errorMessage": stream_end_message,
+                                    // The provider's stream died under BiBCode;
+                                    // that is our transport, not a fault the
+                                    // provider reported about the work itself.
+                                    "errorClass": "transport_error",
                                 }),
                                 activity: Vec::new(),
                                 activity_controls: Default::default(),
@@ -4067,6 +4086,15 @@ fn spawn_event_pump(
                     let mut event = event;
                     if let Some(log) = &operational_log {
                         let _ = log.record(&event);
+                    }
+                    if event.event_type == "session.exited" {
+                        last_exit_reason = event
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .map(str::to_owned);
                     }
                     let activity_state = activity_controller.snapshot();
                     if activity_capable
@@ -4287,6 +4315,7 @@ async fn project_provider_event(
             .unwrap_or("completed");
         let failed = state == "failed";
         let last_error = failed.then(|| provider_completion_error(&event.payload));
+        let last_error_class = failed.then(|| provider_completion_error_class(&event.payload));
         let status = if failed { "error" } else { "ready" };
         persist_runtime(
             &engine.repositories(),
@@ -4296,7 +4325,7 @@ async fn project_provider_event(
             runtime_payload,
         )
         .await?;
-        dispatch_session_state(engine, launch, status, None, last_error).await?;
+        dispatch_session_state(engine, launch, status, None, last_error, last_error_class).await?;
         if let Err(error) = settle_streaming_assistant_messages(
             engine,
             &event.thread_id,
@@ -4605,16 +4634,50 @@ fn assistant_message_id(event: &ProviderEvent) -> String {
 }
 
 fn provider_completion_error(payload: &Value) -> String {
+    // `errorMessage` is the canonical `turn.completed` field in
+    // `packages/contracts/src/providerRuntime.ts`, but the runtimes do not agree
+    // yet, so every shape they actually emit is read here:
+    //   - claude: `errorMessage` (both the result-frame and transport paths)
+    //   - codex: `errorMessage` when the transport dies, but a verbatim
+    //     `error` object copied from `turn.error` for a normal failing turn
+    //   - cursor, opencode: `error: { message }`
+    // Normalising the runtimes onto `errorMessage` is tracked in
+    // `docs/plans/2026-08-18-provider-error-attribution-design.md`; until then
+    // dropping any of these branches silently loses the provider's message.
     payload
-        .get("error")
-        .and_then(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload.get("error").and_then(|error| {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.as_str())
+            })
         })
         .or_else(|| payload.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
         .unwrap_or("Provider turn failed.")
+        .to_owned()
+}
+
+/// Which side reported the failure, as a `RuntimeErrorClass`
+/// (`packages/contracts/src/providerRuntime.ts`).
+///
+/// Runtimes that classify their own failure say so in `errorClass`. Everything
+/// else reaching this projection came off a provider's wire, so it is reported
+/// by the provider — BiBCode's own failures take the separate paths that set
+/// the class explicitly. This says who *reported* the error, never who is to
+/// blame: a provider rejecting a malformed BiBCode request is still
+/// provider-reported.
+fn provider_completion_error_class(payload: &Value) -> String {
+    payload
+        .get("errorClass")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|class| !class.is_empty())
+        .unwrap_or("provider_error")
         .to_owned()
 }
 
@@ -4625,6 +4688,11 @@ fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
         "user-input.requested" => ("approval", "user-input.requested"),
         "user-input.resolved" => ("approval", "user-input.resolved"),
         event if event.contains("error") || event.contains("failed") => ("error", "provider.error"),
+        // Provider stderr and upstream retries arrive as `runtime.warning`.
+        // Without this arm they fell through to the catch-all and were filed as
+        // tool-toned events, so an upstream 401 or 429 was presented to the user
+        // as an ordinary tool call.
+        "runtime.warning" => ("warning", "provider.warning"),
         event if event.starts_with("turn.") => ("info", "provider.turn"),
         event if event.starts_with("session.") => ("info", "provider.session"),
         _ => ("tool", "provider.event"),
@@ -4637,6 +4705,7 @@ async fn dispatch_session_state(
     status: &str,
     active_turn_id: Option<String>,
     last_error: Option<String>,
+    last_error_class: Option<String>,
 ) -> Result<(), ProviderRuntimeError> {
     let created_at = now();
     engine
@@ -4651,6 +4720,7 @@ async fn dispatch_session_state(
                 runtime_mode: request.runtime_mode.clone(),
                 active_turn_id,
                 last_error,
+                last_error_class,
                 updated_at: created_at.clone(),
             },
             created_at,
@@ -6211,9 +6281,21 @@ impl OpenCodeDriver {
             "--hostname=127.0.0.1".to_owned(),
             format!("--port={port}"),
         ];
-        let child = Arc::new(Mutex::new(
-            spawn_child(&request, &args, false, attribution).await?,
-        ));
+        // Pipe opencode's output instead of discarding it: this was the only
+        // driver of five spawning with `pipe_output = false`, which sent both
+        // streams to the null device and made any panic, auth diagnostic or
+        // crash message unrecoverable. Both streams must then be drained or a
+        // full pipe buffer would block the child.
+        let mut spawned = spawn_child(&request, &args, true, attribution).await?;
+        let server_stdout = spawned.stdout().take();
+        let server_stderr = spawned.stderr().take();
+        let child = Arc::new(Mutex::new(spawned));
+        if let Some(stdout) = server_stdout {
+            drain_opencode_output(stdout, "stdout");
+        }
+        if let Some(stderr) = server_stderr {
+            drain_opencode_output(stderr, "stderr");
+        }
         wait_for_endpoint(&endpoint, &child).await?;
         let runtime =
             OpenCodeSessionRuntime::new_with_options_reconciliation_revision_and_agent_activity(
@@ -7163,8 +7245,8 @@ mod claude_stop_task_control_tests {
 mod claude_context_query_tests {
     use super::{
         ClaudeControlResponseRoute, ClaudeControlResponseRouter, ProviderEvent,
-        claude_completion_query_turn_id, claude_provider_event, query_claude_context_usage,
-        query_claude_mcp_status,
+        claude_completion_query_turn_id, claude_provider_event, provider_completion_error,
+        query_claude_context_usage, query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -7498,7 +7580,151 @@ mod claude_context_query_tests {
             completion.payload["errorMessage"],
             "Reached the maximum number of turns."
         );
+        assert_eq!(
+            provider_completion_error(&completion.payload),
+            "Reached the maximum number of turns.",
+            "the session's last error must carry the provider's message, not the generic fallback"
+        );
         assert_eq!(claude_completion_query_turn_id(&completion), None);
+    }
+
+    #[test]
+    fn claude_failure_names_the_upstream_api_error_it_was_retrying() {
+        // The originating incident: the API dropped the stream and the result
+        // frame carried no `errors`, so the only evidence of an upstream fault
+        // was the retry frames Claude had already sent.
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "trigger an upstream outage".to_owned(),
+        });
+
+        let retry = runtime.handle_raw_value(
+            &json!({
+                "type": "system",
+                "subtype": "api_retry",
+                "attempt": 3,
+                "max_retries": 10,
+                "retry_delay_ms": 573,
+                "error_status": 529,
+                "error": "overloaded",
+                "session_id": "session-1",
+                "uuid": "retry-1"
+            }),
+            500,
+        );
+        let warning = claude_provider_event(
+            retry.events.into_iter().next().expect("retry event"),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(warning.event_type, "runtime.warning");
+        assert_eq!(warning.payload["class"], "provider_error");
+        assert_eq!(warning.payload["status"], 529);
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result",
+                "subtype": "error_during_api_call",
+                "is_error": true,
+                "stop_reason": null,
+                "session_id": "session-1",
+                "uuid": "result-error-3"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(completion.payload["state"], "failed");
+        assert_eq!(completion.payload["errorClass"], "provider_error");
+        let message = completion.payload["errorMessage"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("529") && message.contains("overloaded"),
+            "the failure must name the upstream API error, got {message:?}"
+        );
+        assert_eq!(provider_completion_error(&completion.payload), message);
+    }
+
+    #[test]
+    fn claude_upstream_api_error_does_not_leak_into_a_later_turn() {
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "first".to_owned(),
+        });
+        runtime.handle_raw_value(
+            &json!({
+                "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+                "error_status": 429, "error": "rate_limited",
+                "session_id": "session-1", "uuid": "retry-1"
+            }),
+            500,
+        );
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-2".to_owned(),
+            input: "second".to_owned(),
+        });
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result", "subtype": "error_max_turns", "is_error": true,
+                "stop_reason": null, "session_id": "session-1", "uuid": "result-error-4"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+        let message = completion.payload["errorMessage"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            !message.contains("429"),
+            "a retry from an earlier turn must not be blamed for this one, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn claude_error_result_without_errors_still_reports_its_subtype() {
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "lose the upstream connection".to_owned(),
+        });
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result",
+                "subtype": "error_api",
+                "is_error": true,
+                "stop_reason": null,
+                "session_id": "session-1",
+                "uuid": "result-error-2"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(completion.payload["state"], "failed");
+        assert_eq!(
+            completion.payload["errorMessage"],
+            "Claude turn failed (error_api)."
+        );
+        assert_eq!(
+            provider_completion_error(&completion.payload),
+            "Claude turn failed (error_api)."
+        );
     }
 }
 
@@ -9554,6 +9780,27 @@ fn reject_unsupported_options(
                 .unwrap_or("unknown"),
         ))
     })
+}
+
+/// Drain one of the opencode server's output streams, logging each line.
+///
+/// The streams must be consumed once piped, otherwise a full pipe buffer blocks
+/// the child. Logging is the point as well as the mechanism: opencode has no
+/// `session.stderr` event, so before this its diagnostics were simply lost.
+fn drain_opencode_output(
+    stream: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+    stream_name: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            tracing::debug!(provider = "opencode", stream = stream_name, %line, "opencode output");
+        }
+    });
 }
 
 async fn wait_for_endpoint(
@@ -16642,6 +16889,24 @@ done
             "assistant:thread-1"
         );
 
+        // `errorMessage` is what every provider runtime actually writes into a
+        // failed `turn.completed` payload, so it must win over the raw shapes.
+        assert_eq!(
+            super::provider_completion_error(
+                &json!({"state":"failed","errorMessage":"Reached the maximum number of turns."})
+            ),
+            "Reached the maximum number of turns."
+        );
+        assert_eq!(
+            super::provider_completion_error(
+                &json!({"errorMessage":"canonical","error":{"message":"nested"},"message":"top-level"})
+            ),
+            "canonical"
+        );
+        assert_eq!(
+            super::provider_completion_error(&json!({"errorMessage":"   "})),
+            "Provider turn failed."
+        );
         assert_eq!(
             super::provider_completion_error(&json!({"error":{"message":"nested"}})),
             "nested"
@@ -16665,6 +16930,8 @@ done
             ("user-input.requested", ("approval", "user-input.requested")),
             ("user-input.resolved", ("approval", "user-input.resolved")),
             ("provider.failed", ("error", "provider.error")),
+            // Provider warnings must not be filed as tool events.
+            ("runtime.warning", ("warning", "provider.warning")),
             ("provider.error", ("error", "provider.error")),
             ("turn.started", ("info", "provider.turn")),
             ("session.ready", ("info", "provider.session")),

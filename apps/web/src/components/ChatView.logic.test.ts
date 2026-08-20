@@ -49,6 +49,7 @@ import {
   shouldWriteThreadErrorToCurrentServerThread,
   threadHasStarted,
   waitForStartedServerThread,
+  threadErrorAttribution,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -1092,4 +1093,71 @@ describe("findActiveDeliveryMessage", () => {
       ).toBeNull();
     },
   );
+});
+
+describe("threadErrorAttribution", () => {
+  it("names the provider that reported the failure", () => {
+    expect(
+      threadErrorAttribution({
+        isBiBCodeAction: false,
+        errorClass: "provider_error",
+        providerName: "claudeAgent",
+      }),
+    ).toBe("Claude reported an error");
+  });
+
+  it("attributes a failed BiBCode command to BiBCode without blaming it", () => {
+    // The command is BiBCode's, but it may have failed because the provider
+    // refused it, so the wording says what BiBCode could not do, not whose
+    // fault it was.
+    expect(
+      threadErrorAttribution({
+        isBiBCodeAction: true,
+        errorClass: "provider_error",
+        providerName: "codex",
+      }),
+    ).toBe("BiBCode could not complete this action");
+  });
+
+  it("distinguishes a lost connection from a provider failure", () => {
+    expect(
+      threadErrorAttribution({
+        isBiBCodeAction: false,
+        errorClass: "transport_error",
+        providerName: "codex",
+      }),
+    ).toBe("BiBCode lost its connection to Codex");
+  });
+
+  it("separates credential rejection from a generic provider error", () => {
+    expect(
+      threadErrorAttribution({
+        isBiBCodeAction: false,
+        errorClass: "permission_error",
+        providerName: "opencode",
+      }),
+    ).toBe("OpenCode rejected the credentials");
+  });
+
+  it("says nothing rather than guessing when the class is absent or unknown", () => {
+    for (const errorClass of [null, undefined, "unknown", "a_class_from_a_newer_server"]) {
+      expect(
+        threadErrorAttribution({
+          isBiBCodeAction: false,
+          errorClass,
+          providerName: "claudeAgent",
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("falls back to a generic agent noun when the provider is unknown", () => {
+    expect(
+      threadErrorAttribution({
+        isBiBCodeAction: false,
+        errorClass: "provider_error",
+        providerName: null,
+      }),
+    ).toBe("The agent reported an error");
+  });
 });

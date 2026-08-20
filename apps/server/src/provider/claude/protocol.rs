@@ -116,6 +116,11 @@ pub struct ResultMessage {
     pub is_error: bool,
     #[serde(default)]
     pub errors: Vec<String>,
+    /// Claude's own name for why the run ended (e.g. `max_turns`). Present on
+    /// error results that carry no `errors`, where it is the only description
+    /// of the failure.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
     pub stop_reason: Option<String>,
     pub session_id: String,
     pub uuid: String,
