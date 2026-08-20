@@ -1,3 +1,5 @@
+import type { TerminalThemePreference } from "@bibcode/contracts/settings";
+
 export type TerminalThemeMode = "light" | "dark";
 
 export interface TerminalLaunchThemeState {
@@ -24,6 +26,64 @@ function withoutReservedTerminalThemeEnv(
   return Object.fromEntries(
     Object.entries(env ?? {}).filter(([key]) => !RESERVED_TERMINAL_THEME_ENV.has(key)),
   );
+}
+
+/**
+ * Resolves the theme the terminal surface renders with.
+ *
+ * The terminal is deliberately decoupled from the app theme. Provider TUIs such
+ * as Codex paint their own surfaces with hardcoded dark 256-colour indices and
+ * never query the terminal for its colours, so forcing a light terminal renders
+ * their panels as dark blocks. `app` is the opt-in for users who want the
+ * terminal to track the app instead.
+ */
+export function resolveTerminalThemeMode(
+  preference: TerminalThemePreference,
+  appTheme: TerminalThemeMode,
+): TerminalThemeMode {
+  return preference === "app" ? appTheme : preference;
+}
+
+const XTERM_CUBE_LEVELS = [0, 95, 135, 175, 215, 255] as const;
+const GRAYSCALE_RAMP_START = 232;
+const GRAYSCALE_RAMP_STEPS = 24;
+
+function rgbHex(red: number, green: number, blue: number): string {
+  const channel = (value: number) => value.toString(16).padStart(2, "0");
+  return `#${channel(red)}${channel(green)}${channel(blue)}`;
+}
+
+/**
+ * The 240 colours xterm indexes from 16 to 255, with the grayscale ramp flipped
+ * for a light terminal.
+ *
+ * Full-screen TUIs paint their own surfaces from the grayscale ramp with
+ * hardcoded indices — Codex fills its panels with 235 (#262626) — and never ask
+ * the terminal which colours it uses. Serving the standard ramp to a light
+ * terminal therefore renders those panels as dark blocks. Flipping only the
+ * ramp turns a TUI's "darkest surface" into the lightest one, so the same
+ * hardcoded index lands on a surface that suits the terminal. The 6x6x6 colour
+ * cube is left untouched: those are chosen hues, not surface shades, and
+ * altering them would misrepresent real content.
+ */
+export function terminalExtendedAnsiPalette(mode: TerminalThemeMode): Array<string> {
+  const palette: Array<string> = [];
+  for (let index = 16; index < GRAYSCALE_RAMP_START; index += 1) {
+    const offset = index - 16;
+    palette.push(
+      rgbHex(
+        XTERM_CUBE_LEVELS[Math.floor(offset / 36) % 6]!,
+        XTERM_CUBE_LEVELS[Math.floor(offset / 6) % 6]!,
+        XTERM_CUBE_LEVELS[offset % 6]!,
+      ),
+    );
+  }
+  for (let step = 0; step < GRAYSCALE_RAMP_STEPS; step += 1) {
+    const position = mode === "light" ? GRAYSCALE_RAMP_STEPS - 1 - step : step;
+    const level = 8 + position * 10;
+    palette.push(rgbHex(level, level, level));
+  }
+  return palette;
 }
 
 export function terminalOscColorEnv(mode: TerminalThemeMode): Record<string, string> {
