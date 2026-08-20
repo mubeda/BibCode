@@ -230,6 +230,8 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         pending_approval_count: 0,
         pending_user_input_count: 0,
         has_actionable_proposed_plan: 0,
+        unresolved_delivery_state: None,
+        unresolved_delivery_detail: None,
         deleted_at: None,
     }
 }
@@ -1140,6 +1142,7 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         runtime_mode: "full-access".to_owned(),
         active_turn_id: None,
         last_error: None,
+        last_error_class: None,
         updated_at: T1.to_owned(),
     };
     repositories

@@ -1227,6 +1227,7 @@ async fn project_session(engine: &OrchestrationEngine, thread_id: &str, status: 
                 runtime_mode: "full-access".to_owned(),
                 active_turn_id: None,
                 last_error: None,
+                last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
             created_at: NOW.to_owned(),
@@ -5151,8 +5152,11 @@ async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
             let provider_error = snapshot.activities.iter().any(|activity| {
                 activity.thread_id == "t1"
                     && activity.kind == "provider.error"
-                    && activity.payload["error"]["message"]
+                    && activity.payload["errorMessage"]
                         == "Provider event stream ended unexpectedly."
+                    // The stream dying under BiBCode is our transport, not a
+                    // fault the provider reported about the work itself.
+                    && activity.payload["errorClass"] == "transport_error"
             });
             let failed_runtime = engine
                 .repositories()
@@ -5301,7 +5305,8 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
                 let provider_error = snapshot.activities.iter().any(|activity| {
                     activity.thread_id == "t1"
                         && activity.kind == "provider.error"
-                        && activity.payload["error"]["message"] == STREAM_END_ERROR
+                        && activity.payload["errorMessage"] == STREAM_END_ERROR
+                        && activity.payload["errorClass"] == "transport_error"
                 });
                 let runtime_failed = engine
                     .repositories()
@@ -5412,7 +5417,7 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
             .filter(|activity| {
                 activity.thread_id == "t1"
                     && activity.kind == "provider.error"
-                    && activity.payload["error"]["message"] == STREAM_END_ERROR
+                    && activity.payload["errorMessage"] == STREAM_END_ERROR
             })
             .count(),
         1
@@ -9201,6 +9206,7 @@ async fn restart_reconciles_abandoned_running_provider_sessions() {
                 runtime_mode: "full-access".to_owned(),
                 active_turn_id: Some("provider-turn-1".to_owned()),
                 last_error: None,
+                last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
             created_at: NOW.to_owned(),
@@ -9269,6 +9275,7 @@ async fn restart_reconciles_abandoned_ready_provider_sessions() {
                 runtime_mode: "full-access".to_owned(),
                 active_turn_id: None,
                 last_error: None,
+                last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
             created_at: NOW.to_owned(),

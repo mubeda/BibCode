@@ -2343,6 +2343,48 @@ fn aborted_results_map_to_interrupted_turn_completion() {
 }
 
 #[test]
+fn a_failed_result_without_errors_reports_claude_terminal_reason() {
+    // Claude names why a run ended in `terminal_reason`, snake_case like its
+    // sibling `is_error` and `stop_reason`. On an error result that carries no
+    // `errors`, that name is the only description of the failure, so decoding
+    // it under the wrong key would silently fall back to the bare subtype.
+    let message: ClaudeMessage = serde_json::from_value(json!({
+        "type": "result",
+        // Not `error_during_execution`: that subtype is Claude's user-abort
+        // shape and maps to `interrupted`.
+        "subtype": "error_max_turns",
+        "is_error": true,
+        "terminal_reason": "max_turns",
+        "stop_reason": Value::Null,
+        "session_id": "sdk-session-terminal",
+        "uuid": "uuid-terminal",
+    }))
+    .expect("result frame decodes with a terminal reason");
+
+    let mut runtime = ClaudeProviderRuntime::new(
+        "provider-thread-1".to_owned(),
+        "sdk-session-terminal".to_owned(),
+    );
+    runtime.start_session(RuntimeMode::FullAccess, None);
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "hello".to_owned(),
+    });
+
+    let events = runtime.handle_message(message);
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == "turn.completed")
+        .expect("failing result completes the turn");
+    assert_eq!(completed.payload["state"], "failed");
+    assert_eq!(
+        completed.payload["errorMessage"],
+        "Claude turn failed (max_turns)."
+    );
+    assert_eq!(completed.payload["errorClass"], "provider_error");
+}
+
+#[test]
 fn permission_requests_round_trip_through_open_and_resolved_events() {
     let fixture: PermissionFixture = load_fixture("permission-flow.json");
     let mut runtime = ClaudeProviderRuntime::new(fixture.thread_id, fixture.startup.session_id);

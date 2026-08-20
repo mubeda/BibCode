@@ -4,6 +4,7 @@ import {
   type EnvironmentId,
   type MessageId,
   isProviderDriverKind,
+  PROVIDER_DISPLAY_NAMES,
   ProjectId,
   type ModelSelection,
   type ProviderDriverKind,
@@ -13,6 +14,7 @@ import {
   type TurnId,
 } from "@bibcode/contracts";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
+import { formatProviderDriverKindLabel } from "../providerModels";
 import { type ComposerAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -613,4 +615,48 @@ export function hasServerAcknowledgedLocalDispatch(input: {
     input.localDispatch.sessionStatus !== (session?.status ?? null) ||
     input.localDispatch.sessionUpdatedAt !== (session?.updatedAt ?? null)
   );
+}
+
+/**
+ * Who reported the error shown in the thread error banner.
+ *
+ * `session.lastError` is mixed-provenance: it carries both a provider's own
+ * failure and BiBCode's restart notice, and `localServerError` carries a
+ * BiBCode command that could not be completed. Rendering all of them
+ * identically made an upstream provider outage read as a BiBCode defect.
+ *
+ * This states who *reported* the failure, never who is to blame — a provider
+ * rejecting a malformed BiBCode request is still provider-reported, and a
+ * failed BiBCode command may have failed because the provider refused it.
+ * Returns `null` when nothing truthful can be said, in which case the banner
+ * renders exactly as before.
+ */
+export function threadErrorAttribution(input: {
+  readonly isBiBCodeAction: boolean;
+  readonly errorClass: string | null | undefined;
+  readonly providerName: string | null | undefined;
+}): string | null {
+  if (input.isBiBCodeAction) {
+    return "BiBCode could not complete this action";
+  }
+  const provider =
+    input.providerName && isProviderDriverKind(input.providerName)
+      ? (PROVIDER_DISPLAY_NAMES[input.providerName] ??
+        formatProviderDriverKindLabel(input.providerName))
+      : null;
+  const agent = provider ?? "The agent";
+  switch (input.errorClass) {
+    case "provider_error":
+      return `${agent} reported an error`;
+    case "transport_error":
+      return `BiBCode lost its connection to ${provider ?? "the agent"}`;
+    case "permission_error":
+      return `${agent} rejected the credentials`;
+    case "validation_error":
+      return `${agent} rejected the request`;
+    default:
+      // "unknown", absent, or a class from a newer server: say nothing rather
+      // than guess. An unattributed banner is better than a wrong attribution.
+      return null;
+  }
 }

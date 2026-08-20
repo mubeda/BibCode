@@ -40,6 +40,32 @@ Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
 
+### Failure attribution
+
+A failed turn carries both a message and a class. `turn.completed` uses the
+contract-canonical `errorMessage`, and `errorClass` — a `RuntimeErrorClass` of
+`provider_error`, `transport_error`, `permission_error`, `validation_error` or
+`unknown` — records **who reported** the failure. Both are projected onto the
+thread session as `lastError` and `lastErrorClass`.
+
+The class is required because `lastError` is mixed-provenance: it carries a
+provider's own failure and also BiBCode's restart notice, which is classified
+`transport_error`. Without it a surface cannot tell an upstream outage from a
+BiBCode defect. A driver that does not classify its failure projects as
+`provider_error`, since anything reaching that projection came off a provider's
+wire.
+
+Attribution states who reported an error, never who is to blame — a provider
+rejecting a malformed BiBCode request is still provider-reported. Surfaces that
+cannot say something truthful show the message without attribution.
+
+Drivers must not report a failed turn as a success. A turn carrying an error is
+projected as `failed` even when the provider's own status field is absent or
+unrecognised, and terminal stop reasons that are not completions — an ACP
+`refusal`, `max_tokens` or `max_turn_requests`, or opencode's
+`MessageOutputLengthError` and `ContentFilterError` — map to `failed` with an
+explanatory message. Provider-reported aborts map to `cancelled`, not `failed`.
+
 Provider subprocess probes use the server's shared supervised execution owner,
 which collects both output streams within byte limits and retains kill-and-reap
 ownership on cancellation or timeout. Cancellation takes precedence at a

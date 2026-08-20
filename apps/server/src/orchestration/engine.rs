@@ -146,6 +146,15 @@ pub struct SessionInput {
     pub active_turn_id: Option<String>,
     #[serde(rename = "lastError")]
     pub last_error: Option<String>,
+    /// Which side reported `last_error` — a `RuntimeErrorClass`. `last_error`
+    /// alone is mixed-provenance: it carries both a provider's own failure and
+    /// BiBCode's restart notice, so the UI cannot attribute it without this.
+    #[serde(
+        rename = "lastErrorClass",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_error_class: Option<String>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
 }
@@ -5507,11 +5516,11 @@ fn apply_sessions_projector_tx(
         .get("session")
         .ok_or_else(|| PersistenceError::Corrupt("missing session payload".to_owned()))?;
     transaction.execute(
-        "INSERT INTO projection_thread_sessions (thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_sessions (thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (thread_id) DO UPDATE SET \
            status = excluded.status, provider_name = excluded.provider_name, provider_instance_id = excluded.provider_instance_id, \
-           runtime_mode = excluded.runtime_mode, active_turn_id = excluded.active_turn_id, last_error = excluded.last_error, updated_at = excluded.updated_at",
+           runtime_mode = excluded.runtime_mode, active_turn_id = excluded.active_turn_id, last_error = excluded.last_error, last_error_class = excluded.last_error_class, updated_at = excluded.updated_at",
         params![
             required_str(payload, "threadId")?,
             required_str(session, "status")?,
@@ -5520,6 +5529,7 @@ fn apply_sessions_projector_tx(
             session.get("runtimeMode").and_then(Value::as_str).unwrap_or("full-access"),
             optional_string(session.get("activeTurnId")),
             optional_string(session.get("lastError")),
+            optional_string(session.get("lastErrorClass")),
             required_str(session, "updatedAt")?,
         ],
     )?;
@@ -5904,6 +5914,26 @@ fn rebuild_thread_derived_fields_tx(
         [thread_id],
         |row| row.get::<_, i64>(0),
     )?;
+    // A refused or unknown-fate delivery was only visible inside the open chat.
+    // Deriving it here — in the same transaction as the delivery transition that
+    // triggered this rebuild — makes it atomic with that transition, keeps the
+    // projection engine its owner, and clears it automatically once the row moves
+    // to pending, delivered or dismissed. Nothing about the provider session,
+    // its active turn, or any turn row is touched.
+    let unresolved_delivery = transaction
+        .query_row(
+            "SELECT state, last_error FROM provider_turn_outbox WHERE thread_id = ? AND state IN ('failed', 'uncertain') ORDER BY updated_at DESC, command_id DESC LIMIT 1",
+            [thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (unresolved_delivery_state, unresolved_delivery_detail) =
+        unresolved_delivery.map_or((None, None), |(state, detail)| (Some(state), detail));
     let session_updated_at = transaction
         .query_row(
             "SELECT updated_at FROM projection_thread_sessions WHERE thread_id = ? LIMIT 1",
@@ -5924,12 +5954,14 @@ fn rebuild_thread_derived_fields_tx(
         .or(latest_turn_updated_at)
         .or_else(|| latest_user_message_at.clone());
     transaction.execute(
-        "UPDATE projection_threads SET latest_turn_id = ?, latest_user_message_at = ?, pending_approval_count = ?, pending_user_input_count = 0, has_actionable_proposed_plan = ?, updated_at = COALESCE(?, updated_at) WHERE thread_id = ?",
+        "UPDATE projection_threads SET latest_turn_id = ?, latest_user_message_at = ?, pending_approval_count = ?, pending_user_input_count = 0, has_actionable_proposed_plan = ?, unresolved_delivery_state = ?, unresolved_delivery_detail = ?, updated_at = COALESCE(?, updated_at) WHERE thread_id = ?",
         params![
             latest_turn_id,
             latest_user_message_at,
             pending_approval_count,
             has_actionable_proposed_plan,
+            unresolved_delivery_state,
+            unresolved_delivery_detail,
             updated_at,
             thread_id,
         ],
@@ -7938,6 +7970,100 @@ mod tests {
             .expect("message");
         assert_eq!(message.delivery_state.as_deref(), Some("delivered"));
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unresolved_delivery_is_derived_onto_the_thread_and_clears_itself() {
+        // A refused or unknown-fate delivery used to be visible only inside the
+        // open chat. This field is derived in the same transaction as the
+        // delivery transition, so it must appear when the delivery stops being
+        // resolvable and disappear again the moment it is resolved — without any
+        // separate command, and without touching session or turn state.
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let before = engine
+            .repositories()
+            .get_thread(thread_id.clone())
+            .await
+            .expect("thread")
+            .expect("projected thread");
+        assert_eq!(before.unresolved_delivery_state, None);
+
+        admit_delivery(
+            &engine,
+            "derived-delivery",
+            &thread_id,
+            "derived-delivery-message",
+            "2026-08-01T00:00:01Z",
+        )
+        .await;
+        let claimed = engine
+            .repositories()
+            .claim_provider_turn(
+                "derived-delivery".to_owned(),
+                "2026-08-01T00:00:02Z".to_owned(),
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+        assert!(
+            engine
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: claimed.command_id.clone(),
+                    expected_states: vec![TurnDeliveryState::Sending],
+                    expected_attempt: 1,
+                    next_state: TurnDeliveryState::Failed,
+                    detail: Some("the provider refused this message".to_owned()),
+                    updated_at: "2026-08-01T00:00:03Z".to_owned(),
+                })
+                .await
+                .expect("mark failed")
+        );
+
+        let failed = engine
+            .repositories()
+            .get_thread(thread_id.clone())
+            .await
+            .expect("thread")
+            .expect("projected thread");
+        assert_eq!(failed.unresolved_delivery_state.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.unresolved_delivery_detail.as_deref(),
+            Some("the provider refused this message")
+        );
+        // The provider session and its active turn must be untouched: this is a
+        // delivery fact, not a provider-session fact.
+        let session = engine
+            .repositories()
+            .get_thread_session(thread_id.clone())
+            .await
+            .expect("session read");
+        assert!(
+            session.is_none_or(|session| session.status != "error"),
+            "a rejected delivery must not mark the provider session errored"
+        );
+
+        // Resolving it clears the derived field with no extra command.
+        assert!(
+            engine
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: claimed.command_id,
+                    expected_states: vec![TurnDeliveryState::Failed],
+                    expected_attempt: 1,
+                    next_state: TurnDeliveryState::Dismissed,
+                    detail: None,
+                    updated_at: "2026-08-01T00:00:04Z".to_owned(),
+                })
+                .await
+                .expect("dismiss")
+        );
+        let cleared = engine
+            .repositories()
+            .get_thread(thread_id)
+            .await
+            .expect("thread")
+            .expect("projected thread");
+        assert_eq!(cleared.unresolved_delivery_state, None);
+        assert_eq!(cleared.unresolved_delivery_detail, None);
     }
 
     #[tokio::test]

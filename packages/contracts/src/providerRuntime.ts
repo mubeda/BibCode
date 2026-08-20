@@ -92,7 +92,7 @@ export type RuntimeContentStreamKind = typeof RuntimeContentStreamKind.Type;
 const RuntimeSessionExitKind = Schema.Literals(["graceful", "error"]);
 export type RuntimeSessionExitKind = typeof RuntimeSessionExitKind.Type;
 
-const RuntimeErrorClass = Schema.Literals([
+export const RuntimeErrorClass = Schema.Literals([
   "provider_error",
   "transport_error",
   "permission_error",
@@ -366,6 +366,8 @@ const TurnCompletedPayload = Schema.Struct({
   modelUsage: Schema.optional(UnknownRecordSchema),
   totalCostUsd: Schema.optional(Schema.Number),
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Which side reported the failure. See `RuntimeErrorClass`. */
+  errorClass: Schema.optional(RuntimeErrorClass),
 });
 export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;
 

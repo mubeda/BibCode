@@ -634,16 +634,27 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   // for any workspace row with an active/connecting session, broader than
   // `isThreadRunning` above (which additionally requires an active turn and
   // only gates the archive-button swap).
+  // `error` is included deliberately: `derivePhase` collapses it into
+  // `disconnected`, so without this an errored thread looks identical to one
+  // that was simply stopped and the failure is invisible outside the open chat.
   const agentSubRowStatus =
-    thread.session?.status === "running" || thread.session?.status === "starting"
+    thread.session?.status === "running" ||
+    thread.session?.status === "starting" ||
+    thread.session?.status === "error"
       ? thread.session.status
       : null;
-  const agentSubRowDuration = agentSubRowStatus
-    ? formatSessionDuration({
-        sessionUpdatedAt: thread.session?.updatedAt,
-        latestTurnStartedAt: thread.latestTurn?.startedAt,
-      })
-    : null;
+  const agentSubRowFailed = agentSubRowStatus === "error";
+  // A delivery the provider refused, or one whose fate is unknown, never reached
+  // the session at all — it lives on the thread shell. Surface it here so a send
+  // that did not land is visible without opening the thread.
+  const unresolvedDelivery = thread.unresolvedDelivery ?? null;
+  const agentSubRowDuration =
+    agentSubRowStatus && !agentSubRowFailed
+      ? formatSessionDuration({
+          sessionUpdatedAt: thread.session?.updatedAt,
+          latestTurnStartedAt: thread.latestTurn?.startedAt,
+        })
+      : null;
   const threadStatus = resolveThreadStatusPill({
     thread: {
       ...thread,
@@ -1118,17 +1129,55 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           }}
         />
       ) : null}
+      {!agentSubRowStatus && unresolvedDelivery ? (
+        <div
+          data-thread-selection-safe
+          data-testid={`thread-delivery-row-${thread.id}`}
+          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-[10px] text-muted-foreground/70"
+        >
+          <span
+            className={
+              unresolvedDelivery.state === "failed"
+                ? "size-1.5 shrink-0 rounded-full bg-destructive"
+                : "size-1.5 shrink-0 rounded-full bg-warning"
+            }
+          />
+          <span
+            className={
+              unresolvedDelivery.state === "failed"
+                ? "min-w-0 truncate text-destructive"
+                : "min-w-0 truncate text-warning-foreground"
+            }
+          >
+            {thread.session?.providerName ?? "Agent"}
+            {" – "}
+            {unresolvedDelivery.state === "failed" ? "Delivery failed" : "Delivery uncertain"}
+          </span>
+        </div>
+      ) : null}
       {agentSubRowStatus && (
         <div
           data-thread-selection-safe
           data-testid={`thread-agent-row-${thread.id}`}
           className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-[10px] text-muted-foreground/70"
         >
-          <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-sky-500 dark:bg-sky-300/80" />
-          <span className="min-w-0 truncate">
+          <span
+            className={
+              agentSubRowFailed
+                ? "size-1.5 shrink-0 rounded-full bg-destructive"
+                : "size-1.5 shrink-0 animate-pulse rounded-full bg-sky-500 dark:bg-sky-300/80"
+            }
+          />
+          <span
+            className={agentSubRowFailed ? "min-w-0 truncate text-destructive" : "min-w-0 truncate"}
+          >
             {thread.session?.providerName ?? "Agent"}
             {" – "}
-            {agentSubRowStatus === "running" ? "Running" : "Connecting"}
+            {agentSubRowFailed
+              ? "Failed"
+              : agentSubRowStatus === "running"
+                ? "Running"
+                : "Connecting"}
             {agentSubRowDuration ? ` · ${agentSubRowDuration}` : ""}
           </span>
         </div>
