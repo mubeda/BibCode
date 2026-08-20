@@ -2479,22 +2479,43 @@ impl CodexSessionRuntime {
                     .and_then(|turn| turn.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let state = params
+                let reported_state = params
                     .get("turn")
                     .and_then(|turn| turn.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed");
+                    .and_then(Value::as_str);
                 let error = params
                     .get("turn")
                     .and_then(|turn| turn.get("error"))
+                    .filter(|error| codex_error_is_informative(error))
                     .cloned();
+                // A turn carrying an error is never a success. `status` used to
+                // default to "completed", so a frame with a missing,
+                // non-string, or unrecognised status reported the provider's
+                // own failure to the user as a completed turn.
+                //
+                // The documented codex vocabulary is `completed | interrupted |
+                // failed`; an interrupt is the user's doing and keeps its state
+                // even when codex attaches an error explaining the abort.
+                let state = if error.is_some()
+                    && !matches!(reported_state, Some("interrupted" | "cancelled"))
+                {
+                    "failed"
+                } else {
+                    reported_state.unwrap_or("completed")
+                };
                 let mut session = self.inner.session.lock().await;
                 session.status = if state == "failed" { "error" } else { "ready" }.to_owned();
                 session.active_turn_id = None;
                 drop(session);
                 let mut payload = json!({ "state": state });
                 if let Some(error) = error {
-                    payload["error"] = error;
+                    // Codex classifies its own failures in `codexErrorInfo`.
+                    // Copying the wire object verbatim leaked a provider shape
+                    // into the payload and discarded that classification, so the
+                    // user saw neither what failed nor whose fault it was.
+                    let classified = classify_codex_error(&error);
+                    payload["errorMessage"] = json!(classified.message);
+                    payload["errorClass"] = json!(classified.class);
                 }
                 self.emit("turn.completed", turn_id, None, payload).await;
             }
@@ -2555,7 +2576,16 @@ impl CodexSessionRuntime {
                         .await;
                 }
             }
-            _ => {}
+            unhandled => {
+                // Unknown notification methods were dropped in total silence,
+                // so we had no field evidence of what codex sends that BiBCode
+                // ignores. Method names only — params carry conversation content.
+                tracing::debug!(
+                    provider = PROVIDER,
+                    method = unhandled,
+                    "dropped an unhandled codex notification"
+                );
+            }
         }
     }
 
@@ -3336,6 +3366,104 @@ fn format_observation_timestamp(timestamp: OffsetDateTime) -> String {
         .expect("current UTC observation time must format as RFC 3339")
 }
 
+/// A classified codex failure.
+pub(crate) struct CodexFailure {
+    pub(crate) class: &'static str,
+    pub(crate) message: String,
+}
+
+/// Classify a codex `turn.error` using its documented `codexErrorInfo`
+/// discriminator.
+///
+/// Variants come from the Codex App Server documentation:
+/// `ContextWindowExceeded`, `UsageLimitExceeded`, `HttpConnectionFailed`,
+/// `ResponseStreamConnectionFailed`, `ResponseStreamDisconnected`,
+/// `ResponseTooManyFailedAttempts`, `BadRequest`, `Unauthorized`,
+/// `SandboxError`, `InternalServerError`, `Other`. An `httpStatusCode` rides
+/// alongside the discriminator when an upstream status is available.
+/// Whether a `turn/completed` error field actually describes a failure.
+///
+/// `Value::get` yields `Some(Null)` for a present-but-null key and codex emits
+/// `"error": null` on a healthy turn, so treating the option itself as "a
+/// failure happened" reported every successful turn as failed — with the
+/// generic fallback text, precisely because there was nothing to describe.
+///
+/// Requiring real content is also the safer rule rather than a looser one: a
+/// turn that codex genuinely failed still says so in `status`, which
+/// `reported_state` honours on its own. This clause exists only to catch a
+/// missing or unrecognised status, and for that an empty error carries no
+/// signal at all.
+fn codex_error_is_informative(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::String(message) => !message.trim().is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }
+}
+
+pub(crate) fn classify_codex_error(error: &Value) -> CodexFailure {
+    let info = error.get("codexErrorInfo").and_then(|info| {
+        info.as_str()
+            .or_else(|| info.get("type").and_then(Value::as_str))
+    });
+    let (class, fallback) = match info {
+        Some("Unauthorized") => (
+            "permission_error",
+            "Codex is not authorized to reach the upstream API.",
+        ),
+        Some("BadRequest") => ("validation_error", "The upstream API rejected the request."),
+        Some("UsageLimitExceeded") => (
+            "provider_error",
+            "The upstream API usage limit was exceeded.",
+        ),
+        Some("ContextWindowExceeded") => (
+            "provider_error",
+            "The conversation exceeded the model's context window.",
+        ),
+        Some("HttpConnectionFailed") => (
+            "provider_error",
+            "Codex could not connect to the upstream API.",
+        ),
+        Some("ResponseStreamConnectionFailed" | "ResponseStreamDisconnected") => (
+            "provider_error",
+            "The upstream API response stream was interrupted.",
+        ),
+        Some("ResponseTooManyFailedAttempts") => (
+            "provider_error",
+            "The upstream API failed repeatedly and Codex stopped retrying.",
+        ),
+        Some("SandboxError") => ("provider_error", "Codex's sandbox reported an error."),
+        Some("InternalServerError") => (
+            "provider_error",
+            "The upstream API reported an internal error.",
+        ),
+        _ => ("provider_error", "Codex reported a failed turn."),
+    };
+    let mut message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback)
+        .to_owned();
+    if let Some(info) = info
+        && !message.contains(info)
+    {
+        message.push_str(&format!(" ({info})"));
+    }
+    if let Some(status) = error
+        .get("httpStatusCode")
+        .or_else(|| error.pointer("/codexErrorInfo/httpStatusCode"))
+        .and_then(Value::as_i64)
+    {
+        message.push_str(&format!(" (HTTP {status})"));
+    }
+    CodexFailure { class, message }
+}
+
 fn request_type(kind: PendingRequestKind) -> &'static str {
     match kind {
         PendingRequestKind::CommandApproval => "command_execution_approval",
@@ -3766,6 +3894,239 @@ mod tests {
                 | crate::activity::ProviderActivityControlUpdate::WorkTarget { .. } => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_completed_carrying_an_error_is_never_reported_as_success() {
+        // `status` used to default to "completed", so any frame whose status was
+        // missing, non-string, or unrecognised projected the provider's own
+        // failure to the user as a completed turn.
+        for status in [
+            None,
+            Some(json!(null)),
+            Some(json!(7)),
+            Some(json!("something-this-build-does-not-know")),
+            Some(json!("completed")),
+        ] {
+            let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+            let runtime = CodexSessionRuntime::new(
+                reconciliation_test_options(),
+                connection.clone(),
+                incoming,
+            );
+            let mut turn = serde_json::Map::new();
+            turn.insert("id".to_owned(), json!("turn-1"));
+            turn.insert("error".to_owned(), json!({ "message": "upstream refused" }));
+            if let Some(status) = status.clone() {
+                turn.insert("status".to_owned(), status);
+            }
+
+            runtime
+                .handle_notification(
+                    "turn/completed".to_owned(),
+                    json!({ "turn": Value::Object(turn) }),
+                    1_000,
+                )
+                .await;
+
+            let events = drain_runtime_events(&runtime).await;
+            let completion = events
+                .iter()
+                .find(|event| event.event_type == "turn.completed")
+                .expect("completion event");
+            assert_eq!(
+                completion.payload["state"], "failed",
+                "a turn carrying an error must not be reported as success (status {status:?})"
+            );
+            assert_eq!(
+                runtime.inner.session.lock().await.status,
+                "error",
+                "session status must follow the failed turn (status {status:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_completed_without_an_error_keeps_its_reported_state() {
+        for (status, expected) in [
+            (Some(json!("completed")), "completed"),
+            (Some(json!("cancelled")), "cancelled"),
+            (None, "completed"),
+        ] {
+            let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+            let runtime = CodexSessionRuntime::new(
+                reconciliation_test_options(),
+                connection.clone(),
+                incoming,
+            );
+            let mut turn = serde_json::Map::new();
+            turn.insert("id".to_owned(), json!("turn-1"));
+            if let Some(status) = status.clone() {
+                turn.insert("status".to_owned(), status);
+            }
+
+            runtime
+                .handle_notification(
+                    "turn/completed".to_owned(),
+                    json!({ "turn": Value::Object(turn) }),
+                    1_000,
+                )
+                .await;
+
+            let events = drain_runtime_events(&runtime).await;
+            let completion = events
+                .iter()
+                .find(|event| event.event_type == "turn.completed")
+                .expect("completion event");
+            assert_eq!(completion.payload["state"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_codex_turn_carrying_an_error_stays_interrupted() {
+        // `interrupted` is codex's documented status for a user abort; flipping
+        // it to `failed` because codex attached an explanation would report the
+        // user's own interrupt as a provider failure.
+        let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+        let runtime =
+            CodexSessionRuntime::new(reconciliation_test_options(), connection.clone(), incoming);
+
+        runtime
+            .handle_notification(
+                "turn/completed".to_owned(),
+                json!({
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "interrupted",
+                        "error": { "message": "aborted by user" }
+                    }
+                }),
+                1_000,
+            )
+            .await;
+
+        let events = drain_runtime_events(&runtime).await;
+        let completion = events
+            .iter()
+            .find(|event| event.event_type == "turn.completed")
+            .expect("completion event");
+        assert_eq!(completion.payload["state"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn a_successful_codex_turn_with_an_explicit_null_error_stays_completed() {
+        // codex emits `"error": null` on a healthy turn. `Value::get` returns
+        // `Some(Null)` for a present-but-null key, so treating the option as
+        // "an error exists" reported every successful turn as failed — with the
+        // generic fallback message, because there was no error to describe.
+        for error in [json!(null), json!(""), json!("   "), json!({})] {
+            let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+            let runtime = CodexSessionRuntime::new(
+                reconciliation_test_options(),
+                connection.clone(),
+                incoming,
+            );
+
+            runtime
+                .handle_notification(
+                    "turn/completed".to_owned(),
+                    json!({ "turn": { "id": "turn-1", "status": "completed", "error": error } }),
+                    1_000,
+                )
+                .await;
+
+            let events = drain_runtime_events(&runtime).await;
+            let completion = events
+                .iter()
+                .find(|event| event.event_type == "turn.completed")
+                .expect("completion event");
+            assert_eq!(completion.payload["state"], "completed", "error={error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_failure_carries_its_documented_error_classification() {
+        for (info, status, expected_class) in [
+            ("Unauthorized", None, "permission_error"),
+            ("BadRequest", None, "validation_error"),
+            ("UsageLimitExceeded", Some(429), "provider_error"),
+            ("ResponseStreamDisconnected", Some(529), "provider_error"),
+        ] {
+            let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+            let runtime = CodexSessionRuntime::new(
+                reconciliation_test_options(),
+                connection.clone(),
+                incoming,
+            );
+            let mut error = serde_json::Map::new();
+            error.insert("message".to_owned(), json!("upstream said no"));
+            error.insert("codexErrorInfo".to_owned(), json!(info));
+            if let Some(status) = status {
+                error.insert("httpStatusCode".to_owned(), json!(status));
+            }
+
+            runtime
+                .handle_notification(
+                    "turn/completed".to_owned(),
+                    json!({
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "failed",
+                            "error": Value::Object(error)
+                        }
+                    }),
+                    1_000,
+                )
+                .await;
+
+            let events = drain_runtime_events(&runtime).await;
+            let completion = events
+                .iter()
+                .find(|event| event.event_type == "turn.completed")
+                .expect("completion event");
+            assert_eq!(completion.payload["state"], "failed");
+            assert_eq!(completion.payload["errorClass"], expected_class, "{info}");
+            let message = completion.payload["errorMessage"]
+                .as_str()
+                .expect("error message");
+            assert!(message.contains(info), "{info} missing from {message:?}");
+            if let Some(status) = status {
+                assert!(
+                    message.contains(&status.to_string()),
+                    "HTTP {status} missing from {message:?}"
+                );
+            }
+            // The provider's wire object must not leak into the payload.
+            assert!(completion.payload.get("error").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_carrying_an_error_stays_cancelled() {
+        let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+        let runtime =
+            CodexSessionRuntime::new(reconciliation_test_options(), connection.clone(), incoming);
+
+        runtime
+            .handle_notification(
+                "turn/completed".to_owned(),
+                json!({
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "cancelled",
+                        "error": { "message": "aborted by user" }
+                    }
+                }),
+                1_000,
+            )
+            .await;
+
+        let events = drain_runtime_events(&runtime).await;
+        let completion = events
+            .iter()
+            .find(|event| event.event_type == "turn.completed")
+            .expect("completion event");
+        assert_eq!(completion.payload["state"], "cancelled");
     }
 
     #[tokio::test]

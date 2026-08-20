@@ -759,6 +759,50 @@ fn trim_newline(bytes: Vec<u8>) -> String {
     text
 }
 
+/// Which side a failed ACP turn should be attributed to.
+///
+/// `RemoteRequest` is the agent answering with a JSON-RPC error — the provider
+/// reported it. Every other variant is BiBCode's own stdio transport to the
+/// agent. The discriminant exists here and used to die at the `to_string()`
+/// boundary, leaving a provider outage and a broken pipe indistinguishable.
+/// The same split already drives delivery outcomes in
+/// `provider_runtime::deliver`. Shared with grok, which re-exports this module.
+pub(crate) fn acp_error_class(error: &AcpProtocolError) -> &'static str {
+    match error {
+        AcpProtocolError::RemoteRequest { .. } => "provider_error",
+        AcpProtocolError::Closed { .. }
+        | AcpProtocolError::LineTooLong { .. }
+        | AcpProtocolError::ReadFailure { .. }
+        | AcpProtocolError::WriteFailure { .. }
+        | AcpProtocolError::InvalidMessage { .. }
+        | AcpProtocolError::UnknownResponse { .. } => "transport_error",
+    }
+}
+
+/// Map an ACP `stopReason` to a canonical turn state and, when the turn did not
+/// succeed, a message explaining why.
+///
+/// Every reason other than `cancelled` was previously mapped to `completed`, so
+/// a refusal or a truncated turn was reported to the user as a successful one.
+/// Unrecognised reasons stay `completed` so a future benign reason does not
+/// raise a false failure; the raw `stopReason` travels in the payload either
+/// way. Shared with grok, which re-exports this module.
+pub(crate) fn acp_turn_state(stop_reason: &str) -> (&'static str, Option<&'static str>) {
+    match stop_reason {
+        "cancelled" => ("cancelled", None),
+        "refusal" => ("failed", Some("The agent refused to continue this turn.")),
+        "max_tokens" => (
+            "failed",
+            Some("The agent stopped early: the model's output limit was reached."),
+        ),
+        "max_turn_requests" => (
+            "failed",
+            Some("The agent stopped early: the turn's request limit was reached."),
+        ),
+        _ => ("completed", None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,6 +811,74 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[test]
+    fn acp_failures_are_attributed_by_variant_not_by_their_string() {
+        // A JSON-RPC error is the agent answering; everything else is our stdio
+        // transport. Both used to collapse into one string, so a provider
+        // outage and a broken pipe were indistinguishable.
+        assert_eq!(
+            acp_error_class(&AcpProtocolError::RemoteRequest {
+                method: "session/prompt".to_owned(),
+                request_id: "1".to_owned(),
+                code: -32000,
+                message: "prompt rejected".to_owned(),
+                data: None,
+            }),
+            "provider_error"
+        );
+        for transport in [
+            AcpProtocolError::Closed {
+                reason: "stdout ended".to_owned(),
+            },
+            AcpProtocolError::ReadFailure {
+                stream: "stdout",
+                message: "pipe".to_owned(),
+            },
+            AcpProtocolError::WriteFailure {
+                message: "pipe".to_owned(),
+            },
+            AcpProtocolError::LineTooLong {
+                stream: "stdout",
+                maximum: 1,
+            },
+            AcpProtocolError::InvalidMessage {
+                message: "bad".to_owned(),
+            },
+            AcpProtocolError::UnknownResponse {
+                request_id: "9".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                acp_error_class(&transport),
+                "transport_error",
+                "{transport:?} is BiBCode's transport, not the agent's fault"
+            );
+        }
+    }
+
+    #[test]
+    fn unsuccessful_acp_stop_reasons_are_not_reported_as_completed() {
+        // Every reason other than `cancelled` used to map to `completed`, so a
+        // refusal or a truncated turn reached the user as a successful turn.
+        for reason in ["refusal", "max_tokens", "max_turn_requests"] {
+            let (state, message) = acp_turn_state(reason);
+            assert_eq!(state, "failed", "{reason} must not be reported as success");
+            assert!(
+                message.is_some(),
+                "{reason} must explain why the turn stopped"
+            );
+        }
+
+        assert_eq!(acp_turn_state("cancelled"), ("cancelled", None));
+        assert_eq!(acp_turn_state("end_turn"), ("completed", None));
+        // An unrecognised future reason stays a completion rather than raising a
+        // false failure; the raw stopReason still travels in the payload.
+        assert_eq!(
+            acp_turn_state("a_reason_from_a_later_agent"),
+            ("completed", None)
+        );
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadBuf, duplex};
 
     struct FailingReader;

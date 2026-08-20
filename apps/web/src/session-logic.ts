@@ -52,7 +52,7 @@ export interface WorkLogEntry {
   command?: string;
   rawCommand?: string;
   changedFiles?: ReadonlyArray<string>;
-  tone: "thinking" | "tool" | "info" | "error";
+  tone: "thinking" | "tool" | "info" | "warning" | "error";
   toolTitle?: string;
   toolData?: unknown;
   itemType?: ToolLifecycleItemType;

@@ -8884,7 +8884,8 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     })
     .await;
     assert_eq!(failed.payload["state"], "failed");
-    assert_eq!(failed.payload["error"]["message"], "provider failed");
+    assert_eq!(failed.payload["errorMessage"], "provider failed");
+    assert_eq!(failed.payload["errorClass"], "provider_error");
 
     runtime
         .send_turn(Some("user input".to_owned()), Vec::new(), None, None)
