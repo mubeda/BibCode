@@ -25,8 +25,11 @@ visible during those conditions and are replaced only after a newly accepted
 environment completes synchronization.
 
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
-project selector, Smart/GitHub/Branch/Name modes, an agent picker, advanced
-options, a Create more toggle, and Ctrl+Enter submit.
+permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
+an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
+Selecting a free local branch suggests its name and enables **Reuse branch** by
+default; edited names are preserved, and branches already checked out elsewhere
+continue through the server's safe suffixed-branch flow.
 
 Use Add Project to open one existing project folder, clone a Git URL, or create
 a new Git repository. On macOS and Linux desktop, Add Project uses this device
