@@ -82,7 +82,7 @@ fn rust_registry_matches_the_active_typescript_rpc_group() {
         .collect::<Vec<_>>();
 
     assert_eq!(rust_methods, manifest.methods);
-    assert_eq!(rust_methods.len(), 95);
+    assert_eq!(rust_methods.len(), 96);
     assert_eq!(
         rust_methods
             .iter()
@@ -90,9 +90,9 @@ fn rust_registry_matches_the_active_typescript_rpc_group() {
             .count(),
         manifest.stream_method_count
     );
-    assert_eq!(manifest.expected_top_level_stream_shapes, 59);
+    assert_eq!(manifest.expected_top_level_stream_shapes, 60);
     assert_eq!(manifest.expected_orchestration_event_shapes, 23);
-    assert_eq!(manifest.stream_shape_fixtures.len(), 59);
+    assert_eq!(manifest.stream_shape_fixtures.len(), 60);
     assert!(!manifest.typed_failure_fixtures.is_empty());
     assert_eq!(
         manifest.stale_method_identifiers,
