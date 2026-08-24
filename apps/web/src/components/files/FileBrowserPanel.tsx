@@ -667,14 +667,14 @@ export default function FileBrowserPanel({
   useEffect(() => model.setGitStatus(gitStatus), [gitStatus, model]);
 
   const entryChangeSignal = entryChanges.data;
-  // Tracks the signal already acted on, starting at whichever value was present on first read: that
-  // one describes the state the list was just built from, not a change.
+  // Tracks the signal already acted on. The server starts each subscription with a resync signal
+  // after establishing the watcher, so the first value must refresh a list that may have raced it.
   //
   // Recording it is what makes the effect idempotent. `entriesQuery` is a fresh object on every
   // render, so an effect depending on it re-runs constantly; without this the refresh it triggers
   // re-renders, re-runs the effect, and refreshes again in a hot loop. Depend on the stable
   // `refresh` callback rather than the wrapper object for the same reason.
-  const handledEntryChangeRef = useRef(entryChangeSignal);
+  const handledEntryChangeRef = useRef<typeof entryChangeSignal>(null);
   const refreshEntries = entriesQuery.refresh;
   useEffect(() => {
     if (entryChangeSignal === null || entryChangeSignal === handledEntryChangeRef.current) {

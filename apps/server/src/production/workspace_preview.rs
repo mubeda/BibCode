@@ -164,6 +164,9 @@ fn project_entries_stream(
             .map(|loss| loss.cancellation_token())
             .unwrap_or_default();
         let event = json!({ "cwd": input.cwd });
+        if sender.send(Ok(vec![event.clone()])).await.is_err() {
+            return;
+        }
         loop {
             tokio::select! {
                 biased;
