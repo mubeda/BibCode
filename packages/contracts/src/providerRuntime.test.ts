@@ -182,6 +182,28 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.usage.usedTokens).toBe(31251);
   });
 
+  it("normalizes a newer runtime error class instead of rejecting the event", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "turn.completed",
+      eventId: "event-forward-error-class",
+      provider: "opencode",
+      createdAt: "2026-02-28T00:00:04.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        state: "failed",
+        errorMessage: "A newer server classified this failure.",
+        errorClass: "rate_limit_error",
+      },
+    });
+
+    expect(parsed.type).toBe("turn.completed");
+    if (parsed.type !== "turn.completed") {
+      throw new Error("expected turn.completed");
+    }
+    expect(parsed.payload.errorClass).toBe("unknown");
+  });
+
   it("decodes complete normalized MCP server status snapshots", () => {
     const parsed = decodeRuntimeEvent({
       type: "mcp.status.updated",

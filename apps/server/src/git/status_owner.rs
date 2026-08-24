@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -214,6 +214,7 @@ struct Inner {
 struct State {
     closed: bool,
     next_read_id: u64,
+    next_worktree_epoch: u64,
     worktrees: HashMap<PathBuf, WorktreeStatusState>,
 }
 
@@ -227,16 +228,18 @@ struct WorktreeStatusState {
     in_flight: HashMap<StatusOutputKind, SharedStatusRead>,
     local_refresh_requests: watch::Sender<u64>,
     trailing_refresh_pending: bool,
+    physical_reads_active: usize,
+    retire_when_idle: bool,
     #[cfg(test)]
     physical_reads_started: HashMap<StatusOutputKind, usize>,
 }
 
-impl Default for WorktreeStatusState {
-    fn default() -> Self {
+impl WorktreeStatusState {
+    fn new(epoch: u64) -> Self {
         let (local_refresh_requests, _) = watch::channel(0);
         let (read_gate, _) = watch::channel(0);
         Self {
-            epoch: 0,
+            epoch,
             mutation_lock: Arc::new(AsyncMutex::new(())),
             mutation_active: false,
             pending_mutations: 0,
@@ -245,6 +248,8 @@ impl Default for WorktreeStatusState {
             in_flight: HashMap::new(),
             local_refresh_requests,
             trailing_refresh_pending: false,
+            physical_reads_active: 0,
+            retire_when_idle: false,
             #[cfg(test)]
             physical_reads_started: HashMap::new(),
         }
@@ -400,7 +405,7 @@ impl StatusReadOwner {
         let current = state
             .worktrees
             .get(&read.key.canonical_cwd)
-            .is_none_or(|worktree| !worktree.mutation_active && worktree.epoch == read.epoch);
+            .is_some_and(|worktree| !worktree.mutation_active && worktree.epoch == read.epoch);
         if !current {
             return Err(read_error(
                 &read.key,
@@ -425,10 +430,7 @@ impl StatusReadOwner {
                         "status read owner stopped",
                     ));
                 }
-                let worktree = state
-                    .worktrees
-                    .entry(canonical_cwd.to_path_buf())
-                    .or_default();
+                let worktree = activate_worktree(&mut state, canonical_cwd);
                 if worktree.read_gate_closed {
                     Some(worktree.read_gate.subscribe())
                 } else {
@@ -462,7 +464,7 @@ impl StatusReadOwner {
         let current = state
             .worktrees
             .get(&fence.canonical_cwd)
-            .is_none_or(|worktree| !worktree.mutation_active && worktree.epoch == fence.epoch);
+            .is_some_and(|worktree| !worktree.mutation_active && worktree.epoch == fence.epoch);
         if !current {
             return Err(status_owner_error(
                 &fence.canonical_cwd,
@@ -475,7 +477,7 @@ impl StatusReadOwner {
     pub(crate) async fn begin_mutation(&self, canonical_cwd: PathBuf) -> StatusMutationGuard {
         let (mutation_lock, mut pending) = {
             let mut state = self.lock_state();
-            let worktree = state.worktrees.entry(canonical_cwd.clone()).or_default();
+            let worktree = activate_worktree(&mut state, &canonical_cwd);
             worktree.pending_mutations = worktree
                 .pending_mutations
                 .checked_add(1)
@@ -493,7 +495,10 @@ impl StatusReadOwner {
         let mutation_guard = mutation_lock.lock_owned().await;
         {
             let mut state = self.lock_state();
-            let worktree = state.worktrees.entry(canonical_cwd.clone()).or_default();
+            let worktree = state
+                .worktrees
+                .get_mut(&canonical_cwd)
+                .expect("pending mutation retains its worktree state");
             worktree.pending_mutations = worktree
                 .pending_mutations
                 .checked_sub(1)
@@ -511,19 +516,13 @@ impl StatusReadOwner {
     }
 
     pub(crate) fn subscribe_local_refresh(&self, canonical_cwd: &Path) -> watch::Receiver<u64> {
-        self.lock_state()
-            .worktrees
-            .entry(canonical_cwd.to_path_buf())
-            .or_default()
+        activate_worktree(&mut self.lock_state(), canonical_cwd)
             .local_refresh_requests
             .subscribe()
     }
 
     pub(crate) fn request_local_refresh(&self, canonical_cwd: &Path) {
-        self.lock_state()
-            .worktrees
-            .entry(canonical_cwd.to_path_buf())
-            .or_default()
+        activate_worktree(&mut self.lock_state(), canonical_cwd)
             .local_refresh_requests
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         #[cfg(test)]
@@ -532,9 +531,16 @@ impl StatusReadOwner {
 
     pub(crate) fn cancel_reads(&self, canonical_cwd: &Path) {
         let mut state = self.lock_state();
-        if let Some(worktree) = state.worktrees.get_mut(canonical_cwd) {
+        let retire = if let Some(worktree) = state.worktrees.get_mut(canonical_cwd) {
             worktree.epoch = worktree.epoch.wrapping_add(1);
             retire_reads(worktree);
+            worktree.retire_when_idle = true;
+            worktree_can_retire(worktree)
+        } else {
+            false
+        };
+        if retire {
+            state.worktrees.remove(canonical_cwd);
         }
     }
 
@@ -593,6 +599,11 @@ impl StatusReadOwner {
     }
 
     #[cfg(test)]
+    fn worktree_state_count_for_test(&self) -> usize {
+        self.lock_state().worktrees.len()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_for_local_refresh_generation_after_for_test(
         &self,
         canonical_cwd: &Path,
@@ -637,8 +648,14 @@ impl StatusReadOwner {
         let Some(worktree) = state.worktrees.get_mut(canonical_cwd) else {
             return;
         };
-        if worktree.pending_mutations != 0 || worktree.mutation_active || !worktree.read_gate_closed
-        {
+        if worktree.pending_mutations != 0 || worktree.mutation_active {
+            return;
+        }
+        if worktree_can_retire(worktree) {
+            state.worktrees.remove(canonical_cwd);
+            return;
+        }
+        if !worktree.read_gate_closed {
             return;
         }
         if std::mem::take(&mut worktree.trailing_refresh_pending) {
@@ -695,10 +712,7 @@ impl StatusReadOwner {
         if state.closed {
             return ReadAdmission::Shutdown;
         }
-        let worktree = state
-            .worktrees
-            .entry(key.canonical_cwd.clone())
-            .or_default();
+        let worktree = activate_worktree(&mut state, &key.canonical_cwd);
         if worktree.read_gate_closed {
             return ReadAdmission::Waiting(worktree.read_gate.subscribe());
         }
@@ -725,14 +739,18 @@ impl StatusReadOwner {
         state.next_read_id = state.next_read_id.wrapping_add(1);
         let worktree = state
             .worktrees
-            .entry(key.canonical_cwd.clone())
-            .or_default();
+            .get_mut(&key.canonical_cwd)
+            .expect("active worktree status state remains present");
         let epoch = worktree.epoch;
         let cancellation = CancellationToken::new();
         let (sender, receiver) = watch::channel(None);
         let load = load
             .take()
             .expect("status read loader is consumed only by its physical leader");
+        worktree.physical_reads_active = worktree
+            .physical_reads_active
+            .checked_add(1)
+            .expect("active physical status read count exhausted");
         #[cfg(test)]
         {
             *worktree
@@ -830,19 +848,30 @@ impl StatusReadOwner {
         let current = state
             .worktrees
             .get(&key.canonical_cwd)
-            .is_none_or(|worktree| !worktree.mutation_active && worktree.epoch == epoch);
+            .is_some_and(|worktree| !worktree.mutation_active && worktree.epoch == epoch);
         let result = if current {
             result
         } else {
             Err(read_error(key, "status read was retired by a mutation"))
         };
-        if let Some(worktree) = state.worktrees.get_mut(&key.canonical_cwd)
-            && worktree
+        let retire = if let Some(worktree) = state.worktrees.get_mut(&key.canonical_cwd) {
+            worktree.physical_reads_active = worktree
+                .physical_reads_active
+                .checked_sub(1)
+                .expect("active physical status read count remains positive");
+            if worktree
                 .in_flight
                 .get(&key.output_kind)
                 .is_some_and(|shared| shared.id == read_id)
-        {
-            worktree.in_flight.remove(&key.output_kind);
+            {
+                worktree.in_flight.remove(&key.output_kind);
+            }
+            worktree_can_retire(worktree)
+        } else {
+            false
+        };
+        if retire {
+            state.worktrees.remove(&key.canonical_cwd);
         }
         #[cfg(test)]
         self.inner.lease_changed.notify_waiters();
@@ -1097,6 +1126,35 @@ impl Drop for PendingMutation {
         self.owner
             .finish_mutation_burst_if_idle(&self.canonical_cwd);
     }
+}
+
+fn activate_worktree<'a>(
+    state: &'a mut State,
+    canonical_cwd: &Path,
+) -> &'a mut WorktreeStatusState {
+    let State {
+        next_worktree_epoch,
+        worktrees,
+        ..
+    } = state;
+    let worktree = match worktrees.entry(canonical_cwd.to_path_buf()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let epoch = *next_worktree_epoch;
+            *next_worktree_epoch = next_worktree_epoch.wrapping_add(1);
+            entry.insert(WorktreeStatusState::new(epoch))
+        }
+    };
+    worktree.retire_when_idle = false;
+    worktree
+}
+
+fn worktree_can_retire(worktree: &WorktreeStatusState) -> bool {
+    worktree.retire_when_idle
+        && worktree.pending_mutations == 0
+        && !worktree.mutation_active
+        && worktree.physical_reads_active == 0
+        && worktree.in_flight.is_empty()
 }
 
 fn retire_reads(worktree: &mut WorktreeStatusState) {
@@ -1878,6 +1936,32 @@ mod tests {
         drop(lease);
 
         assert!(physical_cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn final_lifecycle_cancellation_releases_idle_worktree_state() {
+        let owner = StatusReadOwner::new();
+        let cwd = PathBuf::from("/repo/retired");
+        let _refresh = owner.subscribe_local_refresh(&cwd);
+        assert_eq!(owner.worktree_state_count_for_test(), 1);
+
+        owner.cancel_reads(&cwd);
+
+        assert_eq!(owner.worktree_state_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cancellation_releases_state_after_an_active_mutation_finishes() {
+        let owner = StatusReadOwner::new();
+        let cwd = PathBuf::from("/repo/mutating");
+        let mutation = owner.begin_mutation(cwd.clone()).await;
+
+        owner.cancel_reads(&cwd);
+        assert_eq!(owner.worktree_state_count_for_test(), 1);
+
+        mutation.finish().await;
+
+        assert_eq!(owner.worktree_state_count_for_test(), 0);
     }
 
     #[tokio::test]

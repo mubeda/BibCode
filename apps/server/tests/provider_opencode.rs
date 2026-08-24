@@ -2497,16 +2497,11 @@ async fn opencode_runtime_surfaces_session_errors_and_removes_the_unanswered_pro
     // looking like a hung BiBCode. Nothing else may follow it, because idle
     // after an error must not emit a second successful completion.
     let mut saw_exit = false;
-    while let Ok(Some(event)) = timeout(
-        if saw_exit {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(2)
-        },
-        runtime.next_event(),
-    )
-    .await
-    {
+    while !saw_exit {
+        let event = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("terminal OpenCode event")
+            .expect("session exit before stream termination");
         assert_eq!(
             event.event_type, "session.exited",
             "idle after an error must not emit a second successful completion"
@@ -2516,6 +2511,13 @@ async fn opencode_runtime_surfaces_session_errors_and_removes_the_unanswered_pro
     assert!(
         saw_exit,
         "a closed opencode event stream is reported as session.exited"
+    );
+    assert!(
+        timeout(Duration::from_secs(1), runtime.next_event())
+            .await
+            .expect("closed OpenCode stream becomes terminal")
+            .is_none(),
+        "the supervisor must observe EOF after the final session.exited event"
     );
 
     runtime.stop().await.expect("stop");
@@ -6506,7 +6508,11 @@ async fn subscribe_reconciliation_events(
                     .into_iter()
                     .map(|chunk| Ok::<Bytes, std::convert::Infallible>(Bytes::from(chunk))),
             )
-        });
+        })
+        // This endpoint models a live provider subscription. The reconnect
+        // burst is finite, but the SSE connection itself must remain open
+        // until the client cancels it.
+        .chain(stream::pending());
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -6546,7 +6552,10 @@ async fn subscribe_reconciliation_events(
                 Ok::<Event, std::convert::Infallible>(Event::default().data(payload))
             }
         })
-    });
+    })
+    // A finite test burst is not provider EOF. Keep the subscription alive so
+    // tests exercise reconnect reconciliation without racing stream teardown.
+    .chain(stream::pending());
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()

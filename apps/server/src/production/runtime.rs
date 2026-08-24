@@ -102,6 +102,7 @@ pub struct ProductionRuntime {
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
     status_broadcaster: crate::git::StatusBroadcaster,
+    workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
     update_quiesced: tokio::sync::Mutex<bool>,
 }
@@ -307,8 +308,11 @@ impl ProductionRuntime {
         let workspace_for_effects = workspace.clone();
         let preview = PreviewManager::new();
         let preview_automation = PreviewAutomationBroker::new();
-        let workspace_preview =
-            WorkspacePreviewRpcServices::new(workspace, preview, preview_automation.clone());
+        let workspace_preview = WorkspacePreviewRpcServices::new(
+            workspace.clone(),
+            preview,
+            preview_automation.clone(),
+        );
 
         let process_monitor = Arc::new(DiagnosticsMonitor::new(
             resource_sampler.clone(),
@@ -409,6 +413,7 @@ impl ProductionRuntime {
             worktree_runtime,
             worktree_removal_tasks,
             status_broadcaster,
+            workspace,
             _resource_sampler: resource_sampler,
             update_quiesced: tokio::sync::Mutex::new(false),
         })
@@ -535,6 +540,7 @@ impl ProductionRuntime {
         }
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.managed_endpoint.shutdown().await;
+        self.workspace.shutdown().await;
         self.status_broadcaster.shutdown().await;
         self.worktree_catalog_operations.shutdown().await;
         self._worktree_catalog.shutdown().await;

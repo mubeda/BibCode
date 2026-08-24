@@ -4741,13 +4741,17 @@ fn provider_completion_error(payload: &Value) -> String {
 /// blame: a provider rejecting a malformed BiBCode request is still
 /// provider-reported.
 fn provider_completion_error_class(payload: &Value) -> String {
-    payload
+    match payload
         .get("errorClass")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|class| !class.is_empty())
         .unwrap_or("provider_error")
-        .to_owned()
+    {
+        class @ ("provider_error" | "transport_error" | "permission_error" | "validation_error"
+        | "unknown") => class.to_owned(),
+        _ => "unknown".to_owned(),
+    }
 }
 
 fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
@@ -7315,7 +7319,7 @@ mod claude_context_query_tests {
     use super::{
         ClaudeControlResponseRoute, ClaudeControlResponseRouter, ProviderEvent,
         claude_completion_query_turn_id, claude_provider_event, provider_completion_error,
-        query_claude_context_usage, query_claude_mcp_status,
+        provider_completion_error_class, query_claude_context_usage, query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -7655,6 +7659,18 @@ mod claude_context_query_tests {
             "the session's last error must carry the provider's message, not the generic fallback"
         );
         assert_eq!(claude_completion_query_turn_id(&completion), None);
+    }
+
+    #[test]
+    fn newer_provider_error_classes_are_persisted_as_unknown() {
+        assert_eq!(
+            provider_completion_error_class(&json!({ "errorClass": "rate_limit_error" })),
+            "unknown"
+        );
+        assert_eq!(
+            provider_completion_error_class(&json!({ "errorClass": "transport_error" })),
+            "transport_error"
+        );
     }
 
     #[test]

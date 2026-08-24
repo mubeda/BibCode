@@ -811,6 +811,29 @@ impl StatusBroadcaster {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn publish_status_event_for_test(
+        &self,
+        cwd: &Path,
+        event: VcsStatusStreamEvent,
+    ) {
+        let cwd = tokio::fs::canonicalize(cwd)
+            .await
+            .unwrap_or_else(|_| cwd.to_path_buf());
+        let fence = self
+            .inner
+            .status_owner
+            .acquire_read_fence(&cwd, &CancellationToken::new())
+            .await
+            .expect("test status fence");
+        let mut state = self.lock_state();
+        let entry = state
+            .repositories
+            .get_mut(&cwd)
+            .expect("test status subscription exists");
+        publish(entry, event, &fence);
+    }
+
     async fn refresh_remote_for_lifecycle(
         &self,
         cwd: &Path,
@@ -1164,6 +1187,7 @@ impl StatusBroadcaster {
         for retired in retiring.into_values() {
             tasks.extend(retired);
         }
+        self.inner.fetch_owner.shutdown().await;
         self.inner.watcher.shutdown().await;
         #[cfg(test)]
         self.inner.subscription_setup_wait_started.notify_one();

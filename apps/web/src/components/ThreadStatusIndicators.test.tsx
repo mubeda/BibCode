@@ -132,6 +132,14 @@ describe("thread status indicators", () => {
     expect(
       resolveThreadPr("main", {
         refName: "main",
+        sourceControlProvider: { kind: "github" },
+        pr,
+        stale: true,
+      } as never),
+    ).toBeNull();
+    expect(
+      resolveThreadPr("main", {
+        refName: "main",
         sourceControlProvider: { kind: "gitlab" },
         pr,
       } as never),

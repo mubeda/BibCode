@@ -1686,7 +1686,7 @@ mod tests {
             let sandbox = TestSandbox::new(label);
             let command = sandbox.executable_script(
                 "gh",
-                &format!("printf '%s\\n' '{{\"number\":42,\"title\":\"{label}\",\"url\":\"https://example.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"state\":\"OPEN\"}}'"),
+                &format!("printf '%s\\n' '[{{\"number\":42,\"title\":\"{label}\",\"url\":\"https://example.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"state\":\"OPEN\"}}]'"),
                 "",
             );
             PullRequestService::with_provider_commands(

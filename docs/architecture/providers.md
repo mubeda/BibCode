@@ -48,6 +48,10 @@ contract-canonical `errorMessage`, and `errorClass` — a `RuntimeErrorClass` of
 `unknown` — records **who reported** the failure. Both are projected onto the
 thread session as `lastError` and `lastErrorClass`.
 
+Decoders accept a newer, unrecognized provider class as `unknown` so a newer
+server cannot make an older client reject the entire live event or persisted
+session. Encoders remain strict and emit only the canonical values above.
+
 The class is required because `lastError` is mixed-provenance: it carries a
 provider's own failure and also BiBCode's restart notice, which is classified
 `transport_error`. Without it a surface cannot tell an upstream outage from a
@@ -104,7 +108,11 @@ OpenCode terminal-observer helpers likewise publish their bounded foreground
 cleanup result without cancelling the in-flight kernel wait. The retained
 reaper continues that exact wait future until the Windows Job or Unix process
 group is fully reaped; it never restarts a cancellation-sensitive ownership
-wait after its foreground budget expires.
+wait after its foreground budget expires. An OpenCode session publishes its
+terminal error or exit event and then closes its provider-event stream on
+connect failure, non-success HTTP response, clean event-stream EOF, chunk
+failure, or explicit stop. The supervisor can therefore retire the session
+without waiting forever on an open sender retained by the runtime.
 
 The canonical `thread.token-usage.updated` event describes two distinct values:
 `usedTokens` is active context-window usage, while optional

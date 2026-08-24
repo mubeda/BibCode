@@ -1355,6 +1355,20 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("abc1234");
   });
 
+  it("does not present a stale passive branch as the current primary branch", () => {
+    baseScenario();
+    h.state.vcsStatusByCwd["C:/repo-a"] = {
+      refName: "feature/stale-only",
+      detachedHead: null,
+      stale: true,
+    };
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).not.toContain("feature/stale-only");
+    expect(markup).toContain("Repo A");
+  });
+
   it("renders the settings navigation when routed to /settings", () => {
     baseScenario();
     h.state.pathname = "/settings/appearance";
@@ -3647,9 +3661,20 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       branch: "feature/delivery",
       worktreePath: "C:/wt/delivery",
       unresolvedDelivery: { state: "uncertain" },
+      session: {
+        threadId: ThreadId.make("thread-delivery-uncertain"),
+        status: "starting",
+        providerName: "OpenCode",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: iso(2),
+        runtimeMode: "full-access",
+      },
     } as never);
     h.state.vcsStatusByCwd["C:/wt/delivery"] = { refName: "feature/updated" };
-    expect(render(<SidebarThreadRow {...rowProps(unresolved)} />)).toContain("Delivery uncertain");
+    const unresolvedMarkup = render(<SidebarThreadRow {...rowProps(unresolved)} />);
+    expect(unresolvedMarkup).toContain("Delivery uncertain");
+    expect(unresolvedMarkup).toContain("OpenCode – Connecting");
     expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.summary");
   });
 

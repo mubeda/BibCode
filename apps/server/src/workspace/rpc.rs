@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::paths::normalize_root;
 use super::search::emit_index_phase;
@@ -96,6 +97,12 @@ struct WorkspaceIndexTestHooks {
     build_wait_started: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     build_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     build_gate: Option<Arc<tokio::sync::Semaphore>>,
+    watch_handoff_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    watch_handoff_gate: Option<Arc<tokio::sync::Semaphore>>,
+    watch_event_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    watch_event_gate: Option<Arc<tokio::sync::Semaphore>>,
+    watch_send_failure_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    watch_send_failure_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl IndexCache {
@@ -147,6 +154,8 @@ pub struct WorkspaceRpc {
     dependencies: WorkspaceRpcDependencies,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
     watches: Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
+    watch_tasks: TaskTracker,
+    watch_shutdown: CancellationToken,
     watch_timing: (Duration, Duration),
 }
 
@@ -201,6 +210,8 @@ impl WorkspaceRpc {
             dependencies,
             availability_registry: None,
             watches: Arc::new(Mutex::new(HashMap::new())),
+            watch_tasks: TaskTracker::new(),
+            watch_shutdown: CancellationToken::new(),
             watch_timing: (WATCH_POLL_INTERVAL, WATCH_COALESCE_WINDOW),
         }
     }
@@ -230,6 +241,32 @@ impl WorkspaceRpc {
         self.index_test_hooks.build_gate = Some(gate);
         self.index_test_hooks.build_wait_started = Some(wait_started);
         self.index_test_hooks.build_entered = Some(entered);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_watch_handoff_gate_for_test(
+        mut self,
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.index_test_hooks.watch_handoff_gate = Some(gate);
+        self.index_test_hooks.watch_handoff_entered = Some(entered);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_watch_delivery_gates_for_test(
+        mut self,
+        event_gate: Arc<tokio::sync::Semaphore>,
+        event_entered: tokio::sync::mpsc::UnboundedSender<()>,
+        send_failure_gate: Arc<tokio::sync::Semaphore>,
+        send_failure_entered: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.index_test_hooks.watch_event_gate = Some(event_gate);
+        self.index_test_hooks.watch_event_entered = Some(event_entered);
+        self.index_test_hooks.watch_send_failure_gate = Some(send_failure_gate);
+        self.index_test_hooks.watch_send_failure_entered = Some(send_failure_entered);
         self
     }
 
@@ -595,35 +632,64 @@ impl WorkspaceRpc {
         let canonical = normalize_root(cwd, false).await?;
         // An existing sweep is already tracking this root, so its baseline and the snapshot are
         // already consistent; join it without paying for another scan.
-        if let Some(sender) = self.watches.lock().await.get(&canonical) {
-            return Ok(sender.subscribe());
+        let watches = self.watches.lock().await;
+        if self.watch_shutdown.is_cancelled() {
+            return Err(WorkspaceError::Cancelled);
         }
-        // Starting a sweep is a resync point. The sweep derives its directories from the snapshot,
-        // so the snapshot has to exist -- and it has to be no older than the baseline about to be
-        // stamped. A cached snapshot may predate changes made while nothing was watching, and those
-        // are already on disk when the baseline is taken, so they could never surface as a
-        // difference. Rebuild rather than inherit that blind spot.
-        self.refresh_index(cwd).await;
-        self.index(&cwd.to_string_lossy()).await?;
-        let mut watches = self.watches.lock().await;
-        // Re-check: another subscriber may have installed a sweep while this one was scanning.
         if let Some(sender) = watches.get(&canonical) {
             return Ok(sender.subscribe());
         }
-        let (sender, receiver) = broadcast::channel(WATCH_BROADCAST_CAPACITY);
-        watches.insert(canonical.clone(), sender.clone());
         drop(watches);
-
         let (poll_interval, coalesce_window) = self.watch_timing;
         let watcher = WorkspaceWatcher::new(poll_interval, coalesce_window, WATCH_CHANNEL_CAPACITY);
         let scope = Arc::new(IndexWatchScope {
             indexes: Arc::clone(&self.indexes),
             last: Arc::new(Mutex::new(Vec::new())),
         });
-        let subscription = watcher.watch(canonical.clone(), scope).await;
+        // Install the sweep before rebuilding. A mutation after this baseline is either included in
+        // the rebuild or remains observable as a later directory-stamp change; it cannot be
+        // absorbed into a post-scan baseline while the old snapshot stays cached.
+        let mut subscription = watcher.watch(canonical.clone(), scope).await;
+        #[cfg(test)]
+        pause_workspace_watch_test(
+            self.index_test_hooks.watch_handoff_entered.as_ref(),
+            self.index_test_hooks.watch_handoff_gate.as_ref(),
+        )
+        .await;
+        // Starting a sweep is a resync point. The sweep derives its directories from the snapshot,
+        // so the snapshot has to exist -- and it has to be no older than the baseline about to be
+        // stamped. A cached snapshot may predate changes made while nothing was watching, and those
+        // are already on disk when the baseline is taken, so they could never surface as a
+        // difference. Rebuild rather than inherit that blind spot.
+        self.refresh_index(cwd).await;
+        if let Err(error) = self.index(&cwd.to_string_lossy()).await {
+            subscription.cancel();
+            subscription.stopped().await;
+            return Err(error);
+        }
+        let mut registry = self.watches.lock().await;
+        if self.watch_shutdown.is_cancelled() {
+            drop(registry);
+            subscription.cancel();
+            subscription.stopped().await;
+            return Err(WorkspaceError::Cancelled);
+        }
+        // Re-check: another subscriber may have installed a sweep while this one was scanning.
+        if let Some(sender) = registry.get(&canonical) {
+            let receiver = sender.subscribe();
+            drop(registry);
+            subscription.cancel();
+            subscription.stopped().await;
+            return Ok(receiver);
+        }
+        let (sender, receiver) = broadcast::channel(WATCH_BROADCAST_CAPACITY);
+        registry.insert(canonical.clone(), sender.clone());
         let indexes = Arc::clone(&self.indexes);
         let watches = Arc::clone(&self.watches);
-        tokio::spawn(async move {
+        let shutdown = self.watch_shutdown.clone();
+        #[cfg(test)]
+        let index_test_hooks = self.index_test_hooks.clone();
+        let task = self.watch_tasks.spawn(async move {
             Self::run_watch(
                 canonical,
                 subscription,
@@ -631,12 +697,18 @@ impl WorkspaceRpc {
                 indexes,
                 watches,
                 poll_interval,
+                shutdown,
+                #[cfg(test)]
+                index_test_hooks,
             )
             .await;
         });
+        drop(task);
+        drop(registry);
         Ok(receiver)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_watch(
         canonical: PathBuf,
         mut subscription: WatchSubscription,
@@ -644,11 +716,14 @@ impl WorkspaceRpc {
         indexes: Arc<Mutex<IndexCache>>,
         watches: Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
         poll_interval: Duration,
+        shutdown: CancellationToken,
+        #[cfg(test)] index_test_hooks: WorkspaceIndexTestHooks,
     ) {
         let mut idle_check = tokio::time::interval(poll_interval);
         idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                () = shutdown.cancelled() => break,
                 event = subscription.recv() => {
                     if event.is_none() {
                         break;
@@ -656,9 +731,25 @@ impl WorkspaceRpc {
                     // Drop the snapshot before announcing, so a subscriber that lists immediately
                     // cannot be served the stale index the signal is telling it to replace.
                     indexes.lock().await.invalidate(&canonical);
+                    #[cfg(test)]
+                    pause_workspace_watch_test(
+                        index_test_hooks.watch_event_entered.as_ref(),
+                        index_test_hooks.watch_event_gate.as_ref(),
+                    )
+                    .await;
                     // A send failure means every receiver has gone; nothing is left to serve.
                     if sender.send(()).is_err() {
-                        break;
+                        #[cfg(test)]
+                        pause_workspace_watch_test(
+                            index_test_hooks.watch_send_failure_entered.as_ref(),
+                            index_test_hooks.watch_send_failure_gate.as_ref(),
+                        )
+                        .await;
+                        if Self::retire_idle_watch(&canonical, &sender, &watches).await {
+                            subscription.cancel();
+                            subscription.stopped().await;
+                            return;
+                        }
                     }
                 }
                 // Losing the last receiver is otherwise invisible until the next filesystem event,
@@ -667,13 +758,28 @@ impl WorkspaceRpc {
                 _ = idle_check.tick() => {
                     if Self::retire_idle_watch(&canonical, &sender, &watches).await {
                         subscription.cancel();
+                        subscription.stopped().await;
                         return;
                     }
                 }
             }
         }
         subscription.cancel();
+        subscription.stopped().await;
         Self::retire_watch(&canonical, &sender, &watches).await;
+    }
+
+    /// Stops new entry-change subscriptions, cancels every active sweep, and waits for their
+    /// filesystem watcher tasks to exit.
+    pub async fn shutdown(&self) {
+        let registered = {
+            let mut watches = self.watches.lock().await;
+            self.watch_shutdown.cancel();
+            self.watch_tasks.close();
+            std::mem::take(&mut *watches)
+        };
+        drop(registered);
+        self.watch_tasks.wait().await;
     }
 
     /// Retires the watch when nothing is listening. Returns whether it was retired.
@@ -988,6 +1094,22 @@ impl WorkspaceRpc {
             .await
             .map_err(review_wire_error)?;
         encode(result).map_err(|error| defect(&error.to_string()))
+    }
+}
+
+#[cfg(test)]
+async fn pause_workspace_watch_test(
+    entered: Option<&tokio::sync::mpsc::UnboundedSender<()>>,
+    gate: Option<&Arc<tokio::sync::Semaphore>>,
+) {
+    if let Some(entered) = entered {
+        let _ = entered.send(());
+    }
+    if let Some(gate) = gate {
+        let _permit = gate
+            .acquire()
+            .await
+            .expect("workspace watch test gate open");
     }
 }
 
@@ -1311,6 +1433,125 @@ mod tests {
         }
         run_index_git(root.path(), &["add", "--", ".gitignore", "tracked"]);
         root
+    }
+
+    #[tokio::test]
+    async fn watch_handoff_cannot_absorb_a_change_after_the_resync_snapshot() {
+        let root = tempfile::tempdir().expect("workspace root");
+        std::fs::create_dir_all(root.path().join("nested")).expect("nested directory");
+        std::fs::write(root.path().join("nested/tracked.txt"), "tracked").expect("tracked fixture");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rpc = WorkspaceRpc::new(WorkspaceService::default())
+            .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20))
+            .with_watch_handoff_gate_for_test(Arc::clone(&gate), entered_tx);
+        let cwd = root.path().to_string_lossy().into_owned();
+
+        rpc.handle("projects.listEntries", json!({"cwd": cwd}))
+            .await
+            .expect("warm snapshot");
+        let subscribing_rpc = rpc.clone();
+        let subscribing_root = root.path().to_path_buf();
+        let subscribing = tokio::spawn(async move {
+            subscribing_rpc
+                .subscribe_entry_changes(&subscribing_root)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("watch handoff entered deadline")
+            .expect("watch handoff entered");
+
+        std::fs::write(root.path().join("nested/during-handoff.txt"), "created")
+            .expect("handoff mutation");
+        gate.add_permits(1);
+        let _subscription = subscribing
+            .await
+            .expect("subscription task")
+            .expect("subscription succeeds");
+
+        let entries = rpc
+            .handle("projects.listEntries", json!({"cwd": cwd}))
+            .await
+            .expect("list after subscription");
+        assert!(entries["entries"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["path"] == "nested/during-handoff.txt")
+        }));
+    }
+
+    #[tokio::test]
+    async fn subscriber_arriving_after_a_failed_send_keeps_the_watch_alive() {
+        let root = tempfile::tempdir().expect("workspace root");
+        std::fs::create_dir_all(root.path().join("nested")).expect("nested directory");
+        std::fs::write(root.path().join("nested/tracked.txt"), "tracked").expect("tracked fixture");
+        let event_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let failure_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rpc = WorkspaceRpc::new(WorkspaceService::default())
+            .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20))
+            .with_watch_delivery_gates_for_test(
+                Arc::clone(&event_gate),
+                event_tx,
+                Arc::clone(&failure_gate),
+                failure_tx,
+            );
+        let first = rpc
+            .subscribe_entry_changes(root.path())
+            .await
+            .expect("first subscription");
+
+        std::fs::write(root.path().join("nested/first-change.txt"), "first")
+            .expect("first outside change");
+        tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("watch event entered deadline")
+            .expect("watch event entered");
+        drop(first);
+        event_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+            .await
+            .expect("send failure entered deadline")
+            .expect("send failure entered");
+
+        let mut replacement = rpc
+            .subscribe_entry_changes(root.path())
+            .await
+            .expect("replacement subscription");
+        failure_gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(rpc.active_entry_watches().await, 1);
+
+        std::fs::write(root.path().join("nested/second-change.txt"), "second")
+            .expect("second outside change");
+        tokio::time::timeout(Duration::from_secs(5), replacement.recv())
+            .await
+            .expect("replacement signal deadline")
+            .expect("replacement signal");
+    }
+
+    #[tokio::test]
+    async fn workspace_shutdown_rejects_reattachment_and_awaits_every_watch_task() {
+        let root = tempfile::tempdir().expect("workspace root");
+        std::fs::write(root.path().join("tracked.txt"), "tracked").expect("tracked fixture");
+        let rpc = WorkspaceRpc::new(WorkspaceService::default())
+            .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+        let _subscription = rpc
+            .subscribe_entry_changes(root.path())
+            .await
+            .expect("active subscription");
+        assert_eq!(rpc.watch_tasks.len(), 1);
+
+        rpc.shutdown().await;
+
+        assert_eq!(rpc.active_entry_watches().await, 0);
+        assert!(rpc.watch_tasks.is_empty());
+        assert!(
+            rpc.subscribe_entry_changes(root.path()).await.is_err(),
+            "shutdown must close subscription admission"
+        );
     }
 
     fn nearest_rank(values: &[u64], percentile: usize) -> u64 {

@@ -1044,6 +1044,65 @@ async fn existing_branch_worktree_can_be_force_removed_when_dirty() {
 }
 
 #[tokio::test]
+async fn create_worktree_reuses_a_local_branch_that_appeared_after_remote_selection() {
+    if relaunch_with_isolated_git_config(
+        "create_worktree_reuses_a_local_branch_that_appeared_after_remote_selection",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/feature/remote-only",
+            &head,
+        ],
+    );
+
+    // The dialog selected the remote-only ref, then another Git client created
+    // the matching local branch before the RPC reached the server.
+    git(
+        repo.path(),
+        &[
+            "branch",
+            "feature/remote-only",
+            "origin/feature/remote-only",
+        ],
+    );
+
+    let worktree_root = tempfile::tempdir().expect("worktree parent");
+    let worktree_path = worktree_root.path().join("remote-only");
+    let created = GitRepository::default()
+        .create_worktree(
+            CreateWorktreeInput {
+                cwd: repo.path().to_path_buf(),
+                ref_name: "origin/feature/remote-only".into(),
+                new_ref_name: Some("feature/remote-only".into()),
+                base_ref_name: Some("origin/feature/remote-only".into()),
+                path: Some(worktree_path.clone()),
+            },
+            &cancellation(),
+        )
+        .await
+        .expect("reuse the newly visible local branch");
+
+    assert_eq!(created.worktree.ref_name, "feature/remote-only");
+    assert_eq!(
+        git(&worktree_path, &["branch", "--show-current"]),
+        "feature/remote-only"
+    );
+    assert_eq!(
+        git(repo.path(), &["worktree", "list", "--porcelain"])
+            .matches("branch refs/heads/feature/remote-only")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn worktree_inventory_returns_authoritative_primary_and_linked_records() {
     if relaunch_with_isolated_git_config(
         "worktree_inventory_returns_authoritative_primary_and_linked_records",

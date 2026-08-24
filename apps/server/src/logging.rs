@@ -1573,7 +1573,6 @@ fn install_subscriber(
 #[cfg(test)]
 mod tests {
     use std::{
-        io::Write as _,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Barrier,

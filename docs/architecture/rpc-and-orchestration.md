@@ -91,7 +91,9 @@ provider or open-PR absence clears the corresponding fields on the next fresh
 value.
 Final-subscriber release cancels and awaits the in-flight read before removing
 the generation, so an immediate alias reattachment cannot inherit or be erased
-by old lifecycle cleanup.
+by old lifecycle cleanup. Final worktree-lifecycle cancellation also retires the
+status-owner entry once active mutations and cancellation-ignoring physical
+reads finish, so paths that are never reattached do not accumulate owner state.
 
 The first active status subscriber resolves worktree, Git directory, and common
 directory with one bounded, cancellation-aware Git command. The server installs
@@ -122,8 +124,12 @@ old lifecycle tasks before retrying subscription setup with a fresh watcher
 generation. First-lifecycle task insertion is reserved atomically with
 registration, including concurrent backpressure removal. Shutdown closes the
 broadcaster and status-read admission fences, rejects later subscribers, and
-awaits subscription setup, physical status workers, retired generations, and
-active lifecycle tasks; late reads cannot publish into a later lifecycle.
+awaits subscription setup, physical status workers, shared
+physical-repository fetch workers, retired generations, and active lifecycle
+tasks; late reads cannot publish into a later lifecycle. Fetch shutdown clears
+repository and worktree ownership only after closing admission, cancels every
+worker, and retains join ownership even when an injected process runner ignores
+cancellation.
 
 `ProductionRuntime` connects only the structured `TerminalManager` process-exit
 callback to local invalidation. An explicit worktree path has priority;

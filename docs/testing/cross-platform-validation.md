@@ -348,6 +348,9 @@ sizes. Cover relevant:
 - Add Project and environment presentation;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
+- Create Worktree exact local and remote ref selection: the exact value appears
+  once, the derived name remains correct, and a remote-to-local race succeeds
+  without duplicate branch creation;
 - thread creation, switching, persistence, and streaming;
 - terminal input/output and panel switching;
 - Files tree nesting, mutations, and moves: one row per directory with its own
@@ -357,9 +360,10 @@ sizes. Cover relevant:
   the target already holds) reported as an error with the tree resynced;
 - Files picking up a file created in the workspace by another tool while the
   packaged application stays open, both on its own within seconds and
-  immediately via **Refresh**; on Windows, cover a WSL-hosted workspace as well
-  as a native one, because directory-timestamp fidelity differs across that
-  boundary;
+  immediately via **Refresh**; while a controlled rescan is pending, verify the
+  visible **Refreshing…** state and repeated-request coalescing; on Windows,
+  cover a WSL-hosted workspace as well as a native one, because
+  directory-timestamp fidelity differs across that boundary;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation;
 - responsive menus, overlays, narrow panels, and focus states; and

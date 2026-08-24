@@ -175,6 +175,7 @@ pub struct AcpRequestReceipt {
 }
 
 impl AcpRequestReceipt {
+    #[allow(clippy::result_large_err)]
     pub async fn written(&mut self) -> Result<(), AcpRequestWriteFailure> {
         let Some(written) = self.written.take() else {
             return Ok(());

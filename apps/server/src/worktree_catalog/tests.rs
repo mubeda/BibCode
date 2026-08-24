@@ -4070,6 +4070,7 @@ fn test_repository_fixture() -> (TempDir, PathBuf, PathBuf) {
             .expect("fingerprint fixture Git");
         assert!(output.status.success(), "fingerprint fixture Git failed");
     }
+    let primary = std::fs::canonicalize(primary).expect("canonical primary directory");
     let common_dir = std::fs::canonicalize(primary.join(".git")).expect("common directory");
     (fixture, primary, common_dir)
 }
