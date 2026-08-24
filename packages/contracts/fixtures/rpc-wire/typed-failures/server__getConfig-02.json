@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "keyca",
-          "requiredScope": "orchestration:operate"
+          "message": "? WjA",
+          "requiredScope": "orchestration:read"
         }
       }
     ]

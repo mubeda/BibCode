@@ -73,6 +73,35 @@ async fn admission_gate_drains_existing_mutations_and_rejects_new_ones() {
     assert_eq!(drain.await.expect("drain task").expect("drained"), 1);
 }
 
+#[tokio::test]
+async fn admission_timeout_reports_named_blockers_without_request_payloads() {
+    let gate = RpcAdmissionGate::new();
+    let untrusted_operation = format!("server.updateSettings\n{}", "x".repeat(256));
+    let permit = gate
+        .admit_named(RpcMutability::Mutation, untrusted_operation)
+        .expect("open gate admits named mutation");
+
+    let snapshot = gate.snapshot();
+    assert_eq!(snapshot.in_flight, 1);
+    assert_eq!(snapshot.blockers.len(), 1);
+    assert!(
+        snapshot.blockers[0]
+            .operation
+            .starts_with("server.updateSettings ")
+    );
+    assert!(!snapshot.blockers[0].operation.contains('\n'));
+    assert!(snapshot.blockers[0].operation.chars().count() <= 160);
+
+    let error = gate
+        .close_and_drain(Instant::now() + Duration::from_millis(10))
+        .await
+        .expect_err("retained named permit must time out");
+    assert!(error.to_string().contains("server.updateSettings "));
+
+    drop(permit);
+    assert_eq!(gate.snapshot().in_flight, 0);
+}
+
 #[test]
 fn every_public_mutation_boundary_is_classified_centrally() {
     assert_eq!(rpc_mutability("server.getConfig"), RpcMutability::Read);
@@ -104,6 +133,11 @@ fn every_public_mutation_boundary_is_classified_centrally() {
     assert_eq!(
         rpc_mutability("subscribeVcsStatusSummary"),
         RpcMutability::Read
+    );
+    assert_eq!(
+        rpc_mutability("subscribeWorktreeCatalog"),
+        RpcMutability::Read,
+        "a passive worktree catalog subscription must not hold update protection open"
     );
 
     assert_eq!(

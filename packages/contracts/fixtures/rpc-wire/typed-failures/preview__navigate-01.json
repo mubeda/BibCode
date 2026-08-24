@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "0caller",
-          "requiredScope": "review:write"
+          "message": "liD<0hc",
+          "requiredScope": "relay:write"
         }
       }
     ]

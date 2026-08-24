@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "has",
-          "requiredScope": "access:read"
+          "message": "~}$##$\"{",
+          "requiredScope": "terminal:operate"
         }
       }
     ]

@@ -147,22 +147,34 @@ describe("Desktop update protection contract", () => {
           {
             environmentId: "primary",
             label: "Local",
-            status: "protected",
+            status: "pending",
             message: null,
+            stage: "waiting-for-mutations",
+            elapsedMs: 12_000,
+            blockedOperationCount: 1,
           },
           {
             environmentId: "wsl:Ubuntu",
             label: "WSL (Ubuntu)",
-            status: "failed",
-            message: "Backup failed.",
+            status: "skipped",
+            message: "Backup protection was skipped for this update.",
+            stage: null,
+            elapsedMs: null,
+            blockedOperationCount: null,
           },
         ],
       }),
     ).toMatchObject({
       phase: "protecting",
       protection: [
-        { environmentId: "primary", status: "protected" },
-        { environmentId: "wsl:Ubuntu", status: "failed" },
+        {
+          environmentId: "primary",
+          status: "pending",
+          stage: "waiting-for-mutations",
+          elapsedMs: 12_000,
+          blockedOperationCount: 1,
+        },
+        { environmentId: "wsl:Ubuntu", status: "skipped" },
       ],
     });
   });
@@ -195,6 +207,29 @@ describe("Desktop update protection contract", () => {
 
     await expect(installUpdate({ excludedEnvironmentIds: ["wsl:Ubuntu"] })).resolves.toMatchObject({
       state: { protection: [{ environmentId: "wsl:Ubuntu", status: "excluded" }] },
+    });
+  });
+
+  it("exposes an explicit per-attempt protection bypass on the asynchronous install command", async () => {
+    const installUpdate: Pick<DesktopBridge, "installUpdate">["installUpdate"] = async (input) => ({
+      accepted: true,
+      completed: false,
+      state: {
+        ...legacyUpdateState,
+        phase: "failed",
+        protection: [
+          {
+            environmentId: "primary",
+            label: "Local",
+            status: input?.skipProtection ? "skipped" : "failed",
+            message: null,
+          },
+        ],
+      },
+    });
+
+    await expect(installUpdate({ skipProtection: true })).resolves.toMatchObject({
+      state: { protection: [{ environmentId: "primary", status: "skipped" }] },
     });
   });
 });

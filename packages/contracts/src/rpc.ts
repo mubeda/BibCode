@@ -3,11 +3,7 @@ import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
-import {
-  AuthAccessStreamError,
-  AuthAccessStreamEvent,
-  EnvironmentAuthorizationError,
-} from "./auth.ts";
+import { AuthAccessStreamError, AuthAccessStreamEvent, EnvironmentRpcError } from "./auth.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -429,19 +425,19 @@ export const WS_METHODS = {
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
   success: ServerUpsertKeybindingResult,
-  error: Schema.Union([KeybindingsConfigError, EnvironmentAuthorizationError]),
+  error: Schema.Union([KeybindingsConfigError, EnvironmentRpcError]),
 });
 
 export const WsServerRemoveKeybindingRpc = Rpc.make(WS_METHODS.serverRemoveKeybinding, {
   payload: ServerRemoveKeybindingInput,
   success: ServerRemoveKeybindingResult,
-  error: Schema.Union([KeybindingsConfigError, EnvironmentAuthorizationError]),
+  error: Schema.Union([KeybindingsConfigError, EnvironmentRpcError]),
 });
 
 export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
-  error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+  error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentRpcError]),
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -455,43 +451,43 @@ export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProv
     instanceId: Schema.optional(ProviderInstanceId),
   }),
   success: ServerProviderUpdatedPayload,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
   payload: ServerProviderUpdateInput,
   success: ServerProviderUpdatedPayload,
-  error: Schema.Union([ServerProviderUpdateError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ServerProviderUpdateError, EnvironmentRpcError]),
 });
 
 export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
   payload: Schema.Struct({}),
   success: ServerSettings,
-  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ServerSettingsError, EnvironmentRpcError]),
 });
 
 export const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
   payload: Schema.Struct({ patch: ServerSettingsPatch }),
   success: ServerSettings,
-  error: Schema.Union([ServerSettingsError, WorktreeWorkspaceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ServerSettingsError, WorktreeWorkspaceError, EnvironmentRpcError]),
 });
 
 export const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
   payload: Schema.Struct({}),
   success: SourceControlDiscoveryResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTraceDiagnostics, {
   payload: Schema.Struct({}),
   success: ServerTraceDiagnosticsResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerGetProcessDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetProcessDiagnostics, {
   payload: Schema.Struct({}),
   success: ServerProcessDiagnosticsResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
@@ -499,26 +495,26 @@ export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
   {
     payload: ServerProcessResourceHistoryInput,
     success: ServerProcessResourceHistoryResult,
-    error: EnvironmentAuthorizationError,
+    error: EnvironmentRpcError,
   },
 );
 
 export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
   payload: ServerSignalProcessInput,
   success: ServerSignalProcessResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerGetProviderUsageRpc = Rpc.make(WS_METHODS.serverGetProviderUsage, {
   payload: Schema.Struct({}),
   success: ServerProviderUsageResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerRefreshProviderUsageRpc = Rpc.make(WS_METHODS.serverRefreshProviderUsage, {
   payload: ServerProviderUsageRefreshInput,
   success: ServerProviderUsageResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsServerConsumeCodexRateLimitResetRpc = Rpc.make(
@@ -526,20 +522,20 @@ export const WsServerConsumeCodexRateLimitResetRpc = Rpc.make(
   {
     payload: ConsumeCodexRateLimitResetInput,
     success: ConsumeCodexRateLimitResetResult,
-    error: Schema.Union([ServerProviderUsageResetError, EnvironmentAuthorizationError]),
+    error: Schema.Union([ServerProviderUsageResetError, EnvironmentRpcError]),
   },
 );
 
 export const WsCloudGetRelayClientStatusRpc = Rpc.make(WS_METHODS.cloudGetRelayClientStatus, {
   payload: Schema.Struct({}),
   success: RelayClientStatusSchema,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsCloudInstallRelayClientRpc = Rpc.make(WS_METHODS.cloudInstallRelayClient, {
   payload: Schema.Struct({}),
   success: RelayClientInstallProgressEventSchema,
-  error: Schema.Union([RelayClientInstallFailedError, EnvironmentAuthorizationError]),
+  error: Schema.Union([RelayClientInstallFailedError, EnvironmentRpcError]),
   stream: true,
 });
 
@@ -552,7 +548,7 @@ export const WsSourceControlLookupRepositoryRpc = Rpc.make(
       SourceControlRepositoryError,
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
-      EnvironmentAuthorizationError,
+      EnvironmentRpcError,
     ]),
   },
 );
@@ -560,7 +556,7 @@ export const WsSourceControlLookupRepositoryRpc = Rpc.make(
 export const WsSourceControlCloneRepositoryRpc = Rpc.make(WS_METHODS.sourceControlCloneRepository, {
   payload: SourceControlCloneRepositoryInput,
   success: SourceControlCloneRepositoryResult,
-  error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([SourceControlRepositoryError, EnvironmentRpcError]),
 });
 
 export const WsSourceControlPublishRepositoryRpc = Rpc.make(
@@ -572,7 +568,7 @@ export const WsSourceControlPublishRepositoryRpc = Rpc.make(
       SourceControlRepositoryError,
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
-      EnvironmentAuthorizationError,
+      EnvironmentRpcError,
     ]),
   },
 );
@@ -584,7 +580,7 @@ export const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntr
     ProjectSearchEntriesError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -595,7 +591,7 @@ export const WsProjectsListEntriesRpc = Rpc.make(WS_METHODS.projectsListEntries,
     ProjectListEntriesError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -606,7 +602,7 @@ export const WsProjectsSubscribeEntriesRpc = Rpc.make(WS_METHODS.projectsSubscri
     ProjectListEntriesError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
   stream: true,
 });
@@ -618,7 +614,7 @@ export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
     ProjectReadFileError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -629,7 +625,7 @@ export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
     ProjectWriteFileError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -640,7 +636,7 @@ export const WsProjectsCreateEntryRpc = Rpc.make(WS_METHODS.projectsCreateEntry,
     ProjectCreateEntryError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -651,7 +647,7 @@ export const WsProjectsRenameEntryRpc = Rpc.make(WS_METHODS.projectsRenameEntry,
     ProjectRenameEntryError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -662,7 +658,7 @@ export const WsProjectsDeleteEntryRpc = Rpc.make(WS_METHODS.projectsDeleteEntry,
     ProjectDeleteEntryError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -673,7 +669,7 @@ export const WsProjectsDuplicateEntryRpc = Rpc.make(WS_METHODS.projectsDuplicate
     ProjectDuplicateEntryError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -683,7 +679,7 @@ export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
     ExternalLauncherError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -694,7 +690,7 @@ export const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
     FilesystemBrowseError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -705,7 +701,7 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
     AssetAccessError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -716,7 +712,7 @@ export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
   stream: true,
 });
@@ -728,7 +724,7 @@ export const WsSubscribeVcsStatusSummaryRpc = Rpc.make(WS_METHODS.subscribeVcsSt
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
   stream: true,
 });
@@ -740,7 +736,7 @@ export const WsVcsPullRpc = Rpc.make(WS_METHODS.vcsPull, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -751,7 +747,7 @@ export const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -762,7 +758,7 @@ export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction,
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
   stream: true,
 });
@@ -774,7 +770,7 @@ export const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequ
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -785,7 +781,7 @@ export const WsGitPreparePullRequestThreadRpc = Rpc.make(WS_METHODS.gitPreparePu
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -796,7 +792,7 @@ export const WsVcsListRefsRpc = Rpc.make(WS_METHODS.vcsListRefs, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -807,7 +803,7 @@ export const WsVcsListCommitsRpc = Rpc.make(WS_METHODS.vcsListCommits, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -818,7 +814,7 @@ export const WsVcsCloneRpc = Rpc.make(WS_METHODS.vcsClone, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -829,7 +825,7 @@ export const WsVcsCreateRefRpc = Rpc.make(WS_METHODS.vcsCreateRef, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -840,7 +836,7 @@ export const WsVcsSwitchRefRpc = Rpc.make(WS_METHODS.vcsSwitchRef, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -850,7 +846,7 @@ export const WsVcsInitRpc = Rpc.make(WS_METHODS.vcsInit, {
     VcsError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -860,7 +856,7 @@ export const WsVcsStageFilesRpc = Rpc.make(WS_METHODS.vcsStageFiles, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -870,7 +866,7 @@ export const WsVcsUnstageFilesRpc = Rpc.make(WS_METHODS.vcsUnstageFiles, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -880,7 +876,7 @@ export const WsVcsDiscardFilesRpc = Rpc.make(WS_METHODS.vcsDiscardFiles, {
     GitCommandError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -891,21 +887,21 @@ export const WsVcsGenerateCommitMessageRpc = Rpc.make(WS_METHODS.vcsGenerateComm
     GitManagerServiceError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
 export const WsSubscribeWorktreeCatalogRpc = Rpc.make(WS_METHODS.subscribeWorktreeCatalog, {
   payload: WorktreeCatalogInput,
   success: VcsWorktreeCatalogSnapshot,
-  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+  error: Schema.Union([WorktreeCatalogError, EnvironmentRpcError]),
   stream: true,
 });
 
 export const WsVcsRefreshWorktreeCatalogRpc = Rpc.make(WS_METHODS.vcsRefreshWorktreeCatalog, {
   payload: WorktreeCatalogRefreshInput,
   success: VcsWorktreeCatalogSnapshot,
-  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+  error: Schema.Union([WorktreeCatalogError, EnvironmentRpcError]),
 });
 
 export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
@@ -913,22 +909,14 @@ export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
   {
     payload: WorktreeDiscoveryPolicyUpdateInput,
     success: ProjectWorktreeDiscoveryPolicy,
-    error: Schema.Union([
-      WorktreeCatalogError,
-      WorktreeOperationError,
-      EnvironmentAuthorizationError,
-    ]),
+    error: Schema.Union([WorktreeCatalogError, WorktreeOperationError, EnvironmentRpcError]),
   },
 );
 
 export const WsWorktreeAdoptRpc = Rpc.make(WS_METHODS.worktreeAdopt, {
   payload: WorktreeAdoptInput,
   success: WorktreeAdoptResult,
-  error: Schema.Union([
-    WorktreeAdoptionError,
-    WorktreeOperationError,
-    EnvironmentAuthorizationError,
-  ]),
+  error: Schema.Union([WorktreeAdoptionError, WorktreeOperationError, EnvironmentRpcError]),
 });
 
 export const WsWorktreeCreateManagedRpc = Rpc.make(WS_METHODS.worktreeCreateManaged, {
@@ -938,38 +926,26 @@ export const WsWorktreeCreateManagedRpc = Rpc.make(WS_METHODS.worktreeCreateMana
     WorktreeAdoptionError,
     WorktreeOperationError,
     GitCommandError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
 export const WsWorktreeCreatePanelRpc = Rpc.make(WS_METHODS.worktreeCreatePanel, {
   payload: WorktreeCreatePanelInput,
   success: WorktreeThreadResult,
-  error: Schema.Union([
-    WorktreeAdoptionError,
-    WorktreeOperationError,
-    EnvironmentAuthorizationError,
-  ]),
+  error: Schema.Union([WorktreeAdoptionError, WorktreeOperationError, EnvironmentRpcError]),
 });
 
 export const WsWorktreeRetargetRpc = Rpc.make(WS_METHODS.worktreeRetarget, {
   payload: WorktreeRetargetInput,
   success: WorktreeThreadResult,
-  error: Schema.Union([
-    WorktreeAdoptionError,
-    WorktreeOperationError,
-    EnvironmentAuthorizationError,
-  ]),
+  error: Schema.Union([WorktreeAdoptionError, WorktreeOperationError, EnvironmentRpcError]),
 });
 
 export const WsWorktreeGetRemovalPlanRpc = Rpc.make(WS_METHODS.worktreeGetRemovalPlan, {
   payload: WorktreeGetRemovalPlanInput,
   success: WorktreeRemovalPlan,
-  error: Schema.Union([
-    WorktreeRemovalError,
-    WorktreeOperationError,
-    EnvironmentAuthorizationError,
-  ]),
+  error: Schema.Union([WorktreeRemovalError, WorktreeOperationError, EnvironmentRpcError]),
 });
 
 export const WsWorktreeRemoveFromBibCodeRpc = Rpc.make(WS_METHODS.worktreeRemoveFromBibCode, {
@@ -979,7 +955,7 @@ export const WsWorktreeRemoveFromBibCodeRpc = Rpc.make(WS_METHODS.worktreeRemove
     WorktreeRemovalError,
     WorktreeOperationError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -990,7 +966,7 @@ export const WsWorktreeRemoveRpc = Rpc.make(WS_METHODS.worktreeRemove, {
     WorktreeRemovalError,
     WorktreeOperationError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -1006,7 +982,7 @@ export const WsReviewGetDiffPreviewRpc = Rpc.make(WS_METHODS.reviewGetDiffPrevie
     ReviewDiffPreviewError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -1017,7 +993,7 @@ export const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
     TerminalError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
@@ -1028,7 +1004,7 @@ export const WsTerminalAttachRpc = Rpc.make(WS_METHODS.terminalAttach, {
     TerminalError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
   stream: true,
 });
@@ -1039,18 +1015,18 @@ export const WsTerminalWriteRpc = Rpc.make(WS_METHODS.terminalWrite, {
     TerminalError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
 export const WsTerminalResizeRpc = Rpc.make(WS_METHODS.terminalResize, {
   payload: TerminalResizeInput,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });
 
 export const WsTerminalClearRpc = Rpc.make(WS_METHODS.terminalClear, {
   payload: TerminalClearInput,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });
 
 export const WsTerminalRestartRpc = Rpc.make(WS_METHODS.terminalRestart, {
@@ -1060,75 +1036,75 @@ export const WsTerminalRestartRpc = Rpc.make(WS_METHODS.terminalRestart, {
     TerminalError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
-    EnvironmentAuthorizationError,
+    EnvironmentRpcError,
   ]),
 });
 
 export const WsTerminalCloseRpc = Rpc.make(WS_METHODS.terminalClose, {
   payload: TerminalCloseInput,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([TerminalError, EnvironmentRpcError]),
 });
 
 export const WsPreviewOpenRpc = Rpc.make(WS_METHODS.previewOpen, {
   payload: PreviewOpenInput,
   success: PreviewSessionSnapshot,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewNavigateRpc = Rpc.make(WS_METHODS.previewNavigate, {
   payload: PreviewNavigateInput,
   success: PreviewSessionSnapshot,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewResizeRpc = Rpc.make(WS_METHODS.previewResize, {
   payload: PreviewResizeInput,
   success: PreviewSessionSnapshot,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewRefreshRpc = Rpc.make(WS_METHODS.previewRefresh, {
   payload: PreviewRefreshInput,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewCloseRpc = Rpc.make(WS_METHODS.previewClose, {
   payload: PreviewCloseInput,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewListRpc = Rpc.make(WS_METHODS.previewList, {
   payload: PreviewListInput,
   success: PreviewListResult,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsPreviewReportStatusRpc = Rpc.make(WS_METHODS.previewReportStatus, {
   payload: PreviewReportStatusInput,
-  error: Schema.Union([PreviewError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
 export const WsPreviewAutomationConnectRpc = Rpc.make(WS_METHODS.previewAutomationConnect, {
   payload: PreviewAutomationHost,
   success: PreviewAutomationStreamEvent,
-  error: Schema.Union([PreviewAutomationError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewAutomationError, EnvironmentRpcError]),
   stream: true,
 });
 
 export const WsPreviewAutomationRespondRpc = Rpc.make(WS_METHODS.previewAutomationRespond, {
   payload: PreviewAutomationResponse,
-  error: Schema.Union([PreviewAutomationError, EnvironmentAuthorizationError]),
+  error: Schema.Union([PreviewAutomationError, EnvironmentRpcError]),
 });
 
 export const WsPreviewAutomationFocusHostRpc = Rpc.make(WS_METHODS.previewAutomationFocusHost, {
   payload: PreviewAutomationHostFocus,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
 });
 
 export const WsSubscribePreviewEventsRpc = Rpc.make(WS_METHODS.subscribePreviewEvents, {
   payload: Schema.Struct({}),
   success: PreviewEvent,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
   stream: true,
 });
 
@@ -1137,7 +1113,7 @@ export const WsSubscribeDiscoveredLocalServersRpc = Rpc.make(
   {
     payload: Schema.Struct({}),
     success: DiscoveredLocalServerList,
-    error: EnvironmentAuthorizationError,
+    error: EnvironmentRpcError,
     stream: true,
   },
 );
@@ -1151,7 +1127,7 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
       OrchestrationDispatchCommandError,
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
-      EnvironmentAuthorizationError,
+      EnvironmentRpcError,
     ]),
   },
 );
@@ -1159,7 +1135,7 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
 export const WsOrchestrationGetTurnDiffRpc = Rpc.make(ORCHESTRATION_WS_METHODS.getTurnDiff, {
   payload: OrchestrationGetTurnDiffInput,
   success: OrchestrationRpcSchemas.getTurnDiff.output,
-  error: Schema.Union([OrchestrationGetTurnDiffError, EnvironmentAuthorizationError]),
+  error: Schema.Union([OrchestrationGetTurnDiffError, EnvironmentRpcError]),
 });
 
 export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
@@ -1167,14 +1143,14 @@ export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
   {
     payload: OrchestrationGetFullThreadDiffInput,
     success: OrchestrationRpcSchemas.getFullThreadDiff.output,
-    error: Schema.Union([OrchestrationGetFullThreadDiffError, EnvironmentAuthorizationError]),
+    error: Schema.Union([OrchestrationGetFullThreadDiffError, EnvironmentRpcError]),
   },
 );
 
 export const WsOrchestrationReplayEventsRpc = Rpc.make(ORCHESTRATION_WS_METHODS.replayEvents, {
   payload: OrchestrationReplayEventsInput,
   success: OrchestrationRpcSchemas.replayEvents.output,
-  error: Schema.Union([OrchestrationReplayEventsError, EnvironmentAuthorizationError]),
+  error: Schema.Union([OrchestrationReplayEventsError, EnvironmentRpcError]),
 });
 
 export const WsOrchestrationGetArchivedShellSnapshotRpc = Rpc.make(
@@ -1182,14 +1158,14 @@ export const WsOrchestrationGetArchivedShellSnapshotRpc = Rpc.make(
   {
     payload: OrchestrationRpcSchemas.getArchivedShellSnapshot.input,
     success: OrchestrationRpcSchemas.getArchivedShellSnapshot.output,
-    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentRpcError]),
   },
 );
 
 export const WsOrchestrationSubscribeShellRpc = Rpc.make(ORCHESTRATION_WS_METHODS.subscribeShell, {
   payload: OrchestrationRpcSchemas.subscribeShell.input,
   success: OrchestrationRpcSchemas.subscribeShell.output,
-  error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+  error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentRpcError]),
   stream: true,
 });
 
@@ -1198,7 +1174,7 @@ export const WsOrchestrationSubscribeThreadRpc = Rpc.make(
   {
     payload: OrchestrationRpcSchemas.subscribeThread.input,
     success: OrchestrationRpcSchemas.subscribeThread.output,
-    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentRpcError]),
     stream: true,
   },
 );
@@ -1206,60 +1182,60 @@ export const WsOrchestrationSubscribeThreadRpc = Rpc.make(
 export const WsSubscribeTerminalEventsRpc = Rpc.make(WS_METHODS.subscribeTerminalEvents, {
   payload: Schema.Struct({}),
   success: TerminalEvent,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
   stream: true,
 });
 
 export const WsSubscribeTerminalMetadataRpc = Rpc.make(WS_METHODS.subscribeTerminalMetadata, {
   payload: Schema.Struct({}),
   success: TerminalMetadataStreamEvent,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
   stream: true,
 });
 
 export const WsSubscribeServerConfigRpc = Rpc.make(WS_METHODS.subscribeServerConfig, {
   payload: Schema.Struct({}),
   success: ServerConfigStreamEvent,
-  error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+  error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentRpcError]),
   stream: true,
 });
 
 export const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecycle, {
   payload: Schema.Struct({}),
   success: ServerLifecycleStreamEvent,
-  error: EnvironmentAuthorizationError,
+  error: EnvironmentRpcError,
   stream: true,
 });
 
 export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
-  error: Schema.Union([AuthAccessStreamError, EnvironmentAuthorizationError]),
+  error: Schema.Union([AuthAccessStreamError, EnvironmentRpcError]),
   stream: true,
 });
 
 export const WsActivityGetSnapshotRpc = Rpc.make(WS_METHODS.activityGetSnapshot, {
   payload: ActivityGetSnapshotInput,
   success: ActivitySnapshot,
-  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ActivityError, EnvironmentRpcError]),
 });
 
 export const WsActivityListRosterRpc = Rpc.make(WS_METHODS.activityListRoster, {
   payload: ActivityListRosterInput,
   success: ActivityRosterPage,
-  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ActivityError, EnvironmentRpcError]),
 });
 
 export const WsActivityListDetailRpc = Rpc.make(WS_METHODS.activityListDetail, {
   payload: ActivityListDetailInput,
   success: ActivityDetailPage,
-  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ActivityError, EnvironmentRpcError]),
 });
 
 export const WsActivityCancelSubtreeRpc = Rpc.make(WS_METHODS.activityCancelSubtree, {
   payload: ActivityCancelSubtreeInput,
   success: ActivitySubtreeCancellationResult,
-  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ActivityError, EnvironmentRpcError]),
 });
 
 export const WsActivityRetrySubtreeCancellationRpc = Rpc.make(
@@ -1267,14 +1243,14 @@ export const WsActivityRetrySubtreeCancellationRpc = Rpc.make(
   {
     payload: ActivityRetrySubtreeCancellationInput,
     success: ActivitySubtreeCancellationResult,
-    error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+    error: Schema.Union([ActivityError, EnvironmentRpcError]),
   },
 );
 
 export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
   payload: ActivityScopeRef,
   success: ActivityStreamItem,
-  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ActivityError, EnvironmentRpcError]),
   stream: true,
 });
 

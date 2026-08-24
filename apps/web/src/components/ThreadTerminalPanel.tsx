@@ -467,7 +467,110 @@ function repaintTerminalTheme(
   if (currentTheme && terminalThemesEqual(currentTheme, nextTheme)) return;
   terminal.options.theme = nextTheme;
   terminal.refresh(0, terminal.rows - 1);
+  // #region agent log
+  fetch("http://127.0.0.1:7890/ingest/64e5ced0-6f9d-44ce-b4fc-1ae27fd2cb15", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "c03592" },
+    body: JSON.stringify({
+      sessionId: "c03592",
+      hypothesisId: "D",
+      location: "ThreadTerminalPanel.tsx:repaintTerminalTheme",
+      message: "xterm theme applied",
+      data: {
+        resolvedTheme,
+        background: nextTheme.background ?? null,
+        foreground: nextTheme.foreground ?? null,
+        black: nextTheme.black ?? null,
+        extendedAnsi0: nextTheme.extendedAnsi?.[0] ?? null,
+        extendedAnsi235: nextTheme.extendedAnsi?.[235 - 16] ?? null,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
 }
+
+// #region agent log
+function debugSampleComposerCells(
+  terminal: Terminal,
+  meta: { readonly effectiveTheme: TerminalThemeMode; readonly webglActive: boolean },
+): void {
+  const buffer = terminal.buffer.active;
+  const needle = "Ask Codex";
+  let found: {
+    y: number;
+    x: number;
+    bgMode: number;
+    bg: number;
+    fgMode: number;
+    fg: number;
+    dim: boolean;
+    inverse: boolean;
+    isBgDefault: boolean;
+    isBgPalette: boolean;
+    isBgRGB: boolean;
+    chars: string;
+  } | null = null;
+  const darkPaletteHits: Array<{ y: number; x: number; bgMode: number; bg: number }> = [];
+  for (let y = 0; y < terminal.rows; y += 1) {
+    const line = buffer.getLine(buffer.viewportY + y);
+    if (!line) continue;
+    let rowText = "";
+    for (let x = 0; x < terminal.cols; x += 1) {
+      const cell = line.getCell(x);
+      if (!cell) continue;
+      rowText += cell.getChars() || " ";
+      const bgMode = cell.getBgColorMode();
+      const bg = cell.getBgColor();
+      const isDark =
+        (cell.isBgRGB() && bg <= 0x202020) ||
+        (cell.isBgPalette() && (bg <= 16 || (bg >= 232 && bg <= 239)));
+      if (isDark && darkPaletteHits.length < 8) {
+        darkPaletteHits.push({ y, x, bgMode, bg });
+      }
+    }
+    const at = rowText.indexOf(needle);
+    if (at >= 0 && found === null) {
+      const cell = line.getCell(at);
+      if (cell) {
+        found = {
+          y,
+          x: at,
+          bgMode: cell.getBgColorMode(),
+          bg: cell.getBgColor(),
+          fgMode: cell.getFgColorMode(),
+          fg: cell.getFgColor(),
+          dim: cell.isDim() !== 0,
+          inverse: cell.isInverse() !== 0,
+          isBgDefault: cell.isBgDefault(),
+          isBgPalette: cell.isBgPalette(),
+          isBgRGB: cell.isBgRGB(),
+          chars: cell.getChars(),
+        };
+      }
+    }
+  }
+  fetch("http://127.0.0.1:7890/ingest/64e5ced0-6f9d-44ce-b4fc-1ae27fd2cb15", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "c03592" },
+    body: JSON.stringify({
+      sessionId: "c03592",
+      hypothesisId: "C",
+      location: "ThreadTerminalPanel.tsx:debugSampleComposerCells",
+      message: "Composer cell color sample",
+      data: {
+        ...meta,
+        themeBackground: terminal.options.theme?.background ?? null,
+        foundAskCodex: found,
+        darkPaletteHits,
+        rows: terminal.rows,
+        cols: terminal.cols,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
 
 function terminalThemeFromApp(
   resolvedTheme: TerminalThemeMode,
@@ -805,8 +908,40 @@ export function TerminalViewport({
       resolvedTheme: attachmentLaunchTheme,
       windowsConsoleTheme: hasPersistentWindowsConsoleTheme,
     });
+    // #region agent log
+    fetch("http://127.0.0.1:7890/ingest/64e5ced0-6f9d-44ce-b4fc-1ae27fd2cb15", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "c03592" },
+      body: JSON.stringify({
+        sessionId: "c03592",
+        hypothesisId: "B",
+        location: "ThreadTerminalPanel.tsx:spawnEnv",
+        message: "Terminal spawn theme env",
+        data: {
+          terminalThemePreference,
+          appTheme,
+          resolvedTheme,
+          attachmentLaunchTheme,
+          effectiveWouldBe: resolvedTheme,
+          oscBg: merged.BIBCODE_OSC_BACKGROUND ?? null,
+          oscFg: merged.BIBCODE_OSC_FOREGROUND ?? null,
+          hasPersistentWindowsConsoleTheme,
+          executable: command?.executable ?? null,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     return Object.keys(merged).length > 0 ? merged : undefined;
-  }, [attachmentLaunchTheme, command, hasPersistentWindowsConsoleTheme, runtimeEnv]);
+  }, [
+    attachmentLaunchTheme,
+    command,
+    hasPersistentWindowsConsoleTheme,
+    runtimeEnv,
+    terminalThemePreference,
+    appTheme,
+    resolvedTheme,
+  ]);
   const terminalSession = useAttachedTerminalSession({
     environmentId,
     terminal: {
@@ -1083,9 +1218,30 @@ export function TerminalViewport({
         write: (data) => terminal.write(data),
       });
     let outputSink = createOutputSink();
+    // #region agent log
+    let debugSampleScheduled = false;
+    const scheduleDebugComposerSample = () => {
+      if (debugSampleScheduled) return;
+      debugSampleScheduled = true;
+      window.setTimeout(() => {
+        debugSampleScheduled = false;
+        const active = terminalRef.current;
+        if (!active) return;
+        debugSampleComposerCells(active, {
+          effectiveTheme: effectiveTerminalThemeRef.current,
+          webglActive: webglLifecycleRef.current?.terminal === active,
+        });
+      }, 400);
+    };
+    // #endregion
     const rendererAttachment = transcriptRuntime.attachRenderer((signal) => {
       if (signal.type === "delta") {
         outputSink.push(signal.data);
+        // #region agent log
+        if (signal.data.includes("Ask Codex") || signal.data.includes("Claude")) {
+          scheduleDebugComposerSample();
+        }
+        // #endregion
         return;
       }
 
@@ -1095,6 +1251,9 @@ export function TerminalViewport({
       outputSink = createOutputSink();
       writeTerminalBuffer(terminal, signal.snapshot);
       terminal.clearSelection();
+      // #region agent log
+      scheduleDebugComposerSample();
+      // #endregion
     });
 
     const clearSelectionAction = () => {

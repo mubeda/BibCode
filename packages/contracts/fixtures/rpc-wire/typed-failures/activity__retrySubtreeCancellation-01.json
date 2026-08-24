@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "toString",
+          "message": "O0gIQ.0B",
           "requiredScope": "terminal:operate"
         }
       }

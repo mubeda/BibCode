@@ -91,15 +91,15 @@ export const TerminalFontPreference = TerminalFontPreferenceValue.pipe(
  *
  * Full-screen provider TUIs (Codex most visibly) paint their own dark surfaces
  * with hardcoded 256-colour indices and never query the terminal for its
- * colours, so a light terminal shows their panels as dark blocks. Keeping the
- * terminal on its own theme — dark by default, following the app only when the
- * user asks — lets those TUIs render as designed. `app` tracks the resolved app
- * theme for users who prefer a light terminal and do not run such TUIs.
+ * colours, so a light terminal shows their panels as dark blocks. Following
+ * the app by default keeps terminal surfaces visually consistent, while the
+ * explicit dark preference lets users who run those TUIs render them as
+ * designed. `app` tracks the resolved app theme.
  */
 export const TerminalThemePreferenceValue = Schema.Literals(["app", "dark", "light"]);
 export type TerminalThemePreference = typeof TerminalThemePreferenceValue.Type;
 
-export const DEFAULT_TERMINAL_THEME_PREFERENCE: TerminalThemePreference = "dark";
+export const DEFAULT_TERMINAL_THEME_PREFERENCE: TerminalThemePreference = "app";
 
 export const TerminalThemePreference = TerminalThemePreferenceValue.pipe(
   Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_TERMINAL_THEME_PREFERENCE)),

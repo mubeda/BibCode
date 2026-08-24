@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "r|=&",
-          "requiredScope": "relay:write"
+          "message": "scrj",
+          "requiredScope": "review:write"
         }
       }
     ]

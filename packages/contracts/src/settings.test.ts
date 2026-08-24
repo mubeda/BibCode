@@ -225,6 +225,26 @@ describe("ClientSettings terminal font", () => {
   });
 });
 
+describe("ClientSettings terminal theme", () => {
+  it("follows the app theme for fresh, legacy, and malformed device settings", () => {
+    expect(decodeClientSettings({}).terminalThemePreference).toBe("app");
+    expect(
+      decodeClientSettings({ terminalThemePreference: "obsolete" }).terminalThemePreference,
+    ).toBe("app");
+    expect(DEFAULT_CLIENT_SETTINGS.terminalThemePreference).toBe("app");
+    expect(DEFAULT_UNIFIED_SETTINGS.terminalThemePreference).toBe("app");
+  });
+
+  it("preserves explicit dark and light terminal theme choices", () => {
+    expect(decodeClientSettings({ terminalThemePreference: "dark" }).terminalThemePreference).toBe(
+      "dark",
+    );
+    expect(decodeClientSettings({ terminalThemePreference: "light" }).terminalThemePreference).toBe(
+      "light",
+    );
+  });
+});
+
 describe("ClientSettings word wrap", () => {
   it("defaults word wrap on", () => {
     expect(decodeClientSettings({}).wordWrap).toBe(true);

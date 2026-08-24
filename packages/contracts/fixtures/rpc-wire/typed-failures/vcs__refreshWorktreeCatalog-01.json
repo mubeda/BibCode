@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "",
+          "message": "s",
           "requiredScope": "relay:read"
         }
       }

@@ -152,7 +152,8 @@ async fn request_admission(
     next: Next,
 ) -> Response {
     let mutability = http_mutability(request.method().as_str(), request.uri().path());
-    let Ok(_permit) = gate.admit(mutability) else {
+    let operation = format!("HTTP {} {}", request.method(), request.uri().path());
+    let Ok(_permit) = gate.admit_named(mutability, operation) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(CACHE_CONTROL, "no-store")],

@@ -38,7 +38,39 @@ function protectionLabel(entry: DesktopUpdateProtection, protecting: boolean): s
       return `Could not protect ${entry.label}`;
     case "excluded":
       return `Excluded ${entry.label}`;
+    case "skipped":
+      return `Skipped backup for ${entry.label}`;
   }
+}
+
+function protectionProgress(entry: DesktopUpdateProtection): string | null {
+  if (entry.stage === undefined || entry.stage === null) return null;
+  const stage = (() => {
+    switch (entry.stage) {
+      case "waiting-for-mutations":
+        return "Waiting for active operations";
+      case "quiescing-runtime":
+        return "Stopping active tasks";
+      case "acquiring-store-lock":
+        return "Preparing the project database";
+      case "checkpointing-database":
+        return "Checkpointing the project database";
+      case "creating-verified-backup":
+        return "Creating and verifying the backup";
+      case "stopping-backend":
+        return "Stopping the local backend";
+    }
+  })();
+  const details = [stage];
+  if (entry.blockedOperationCount !== undefined && entry.blockedOperationCount !== null) {
+    details.push(
+      `${entry.blockedOperationCount} active operation${entry.blockedOperationCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (entry.elapsedMs !== undefined && entry.elapsedMs !== null) {
+    details.push(`${Math.floor(entry.elapsedMs / 1_000)}s elapsed`);
+  }
+  return details.join(" · ");
 }
 
 export function UpdateProtectionDialog({
@@ -53,6 +85,7 @@ export function UpdateProtectionDialog({
     () => new Set(),
   );
   const [submitting, setSubmitting] = useState(false);
+  const [skipProtectionAcknowledged, setSkipProtectionAcknowledged] = useState(false);
   const protection = state.protection ?? [];
   const phase = state.phase ?? "idle";
   const protecting = phase === "protecting";
@@ -63,16 +96,18 @@ export function UpdateProtectionDialog({
   const failedSecondaries = protection.filter(
     (entry) => entry.environmentId !== "primary" && entry.status === "failed",
   );
+  const hasProtectionFailure = primaryFailure !== undefined || failedSecondaries.length > 0;
   const exclusionsComplete = failedSecondaries.every((entry) =>
     excludedEnvironmentIds.has(entry.environmentId),
   );
 
   useEffect(() => {
-    if (!open) {
+    if (!open || protecting) {
       setExcludedEnvironmentIds(new Set());
       setSubmitting(false);
+      setSkipProtectionAcknowledged(false);
     }
-  }, [open]);
+  }, [open, protecting]);
 
   const installLabel = useMemo(() => {
     if (working) return protecting ? "Protecting projects…" : "Installing update…";
@@ -100,6 +135,21 @@ export function UpdateProtectionDialog({
     }
   };
 
+  const startUnprotectedInstall = async () => {
+    if (working || !hasProtectionFailure || !skipProtectionAcknowledged) return;
+    setSubmitting(true);
+    try {
+      const result = await installUpdate({ skipProtection: true });
+      if (!result.completed && result.state.message) {
+        onError?.(result.state.message);
+      }
+    } catch (error) {
+      onError?.(error instanceof Error ? error.message : "An unexpected error occurred.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <Dialog
       open={open}
@@ -111,8 +161,8 @@ export function UpdateProtectionDialog({
         <DialogHeader>
           <DialogTitle>Protect projects before updating</DialogTitle>
           <DialogDescription>
-            BiBCode will stop each included local backend only after its project database has a
-            verified backup. Running tasks will be interrupted.
+            BiBCode creates a verified project database backup by default before stopping each
+            included local backend. Running tasks will be interrupted.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-3">
@@ -127,6 +177,11 @@ export function UpdateProtectionDialog({
                   <div className="font-medium">{protectionLabel(entry, protecting)}</div>
                   {entry.message ? (
                     <p className="mt-1 text-xs text-muted-foreground">{entry.message}</p>
+                  ) : null}
+                  {entry.status === "pending" && protectionProgress(entry) ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {protectionProgress(entry)}
+                    </p>
                   ) : null}
                   {entry.status === "failed" && entry.environmentId !== "primary" ? (
                     <label className="mt-2 flex items-center gap-2">
@@ -150,6 +205,37 @@ export function UpdateProtectionDialog({
               ))}
             </ul>
           )}
+          {hasProtectionFailure ? (
+            <div
+              aria-label="Continue without a backup"
+              className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm"
+              role="group"
+            >
+              <p className="font-medium">Continue without a backup</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                This update will stop local backends without creating a verified rollback backup.
+              </p>
+              <label className="mt-2 flex items-center gap-2">
+                <Checkbox
+                  aria-label="Acknowledge update without backup"
+                  checked={skipProtectionAcknowledged}
+                  disabled={working}
+                  onCheckedChange={setSkipProtectionAcknowledged}
+                />
+                <span>I understand that this update will not create a backup</span>
+              </label>
+              <div className="mt-3 flex justify-end">
+                <Button
+                  className="w-full sm:w-auto"
+                  variant="destructive"
+                  disabled={working || !skipProtectionAcknowledged}
+                  onClick={() => void startUnprotectedInstall()}
+                >
+                  Install without backup
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </DialogPanel>
         <DialogFooter>
           <Button variant="outline" disabled={working} onClick={() => onOpenChange(false)}>

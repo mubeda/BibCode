@@ -2,7 +2,8 @@ use std::{collections::BTreeSet, sync::Mutex, time::Duration};
 
 use bibcode_server::{
     DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
-    MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH, PrepareForUpdateResult,
+    MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
+    MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +29,8 @@ const STATUS_DOWNLOADED: &str = "downloaded";
 const STATUS_ERROR: &str = "error";
 const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(15);
 const BACKGROUND_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const UPDATE_PROTECTION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const UPDATE_PROTECTION_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +51,29 @@ enum ProtectionStatus {
     Protected,
     Failed,
     Excluded,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProtectionStage {
+    WaitingForMutations,
+    QuiescingRuntime,
+    AcquiringStoreLock,
+    CheckpointingDatabase,
+    CreatingVerifiedBackup,
+    StoppingBackend,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct UpdateMaintenanceProgress {
+    #[serde(default)]
+    stage: Option<ProtectionStage>,
+    #[serde(default)]
+    elapsed_ms: Option<u64>,
+    #[serde(default)]
+    in_flight_mutations: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -59,6 +85,9 @@ struct DesktopUpdateProtection {
     primary: bool,
     status: ProtectionStatus,
     message: Option<String>,
+    stage: Option<ProtectionStage>,
+    elapsed_ms: Option<u64>,
+    blocked_operation_count: Option<u64>,
 }
 
 fn apply_named_secondary_exclusions(
@@ -87,6 +116,13 @@ fn apply_named_secondary_exclusions(
     Ok(())
 }
 
+fn protection_bypass_allowed(phase: UpdatePhase, protection: &[DesktopUpdateProtection]) -> bool {
+    phase == UpdatePhase::Failed
+        && protection
+            .iter()
+            .any(|entry| entry.status == ProtectionStatus::Failed)
+}
+
 struct DownloadedUpdate {
     update: Update,
     version: String,
@@ -98,6 +134,8 @@ struct DownloadedUpdate {
 pub(crate) struct DesktopUpdateInstallInput {
     #[serde(default)]
     excluded_environment_ids: Vec<String>,
+    #[serde(default)]
+    skip_protection: bool,
 }
 
 struct PreparedBackend {
@@ -451,16 +489,25 @@ impl DesktopUpdateManager {
         backend: &BackendSupervisor,
         input: DesktopUpdateInstallInput,
     ) -> Value {
-        let busy_state = {
+        let unavailable_state = {
             let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
             if inner.install_in_flight {
                 Some(update_state_value(app, true, &inner))
+            } else if input.skip_protection
+                && !protection_bypass_allowed(inner.phase, &inner.protection)
+            {
+                let mut state = update_state_value(app, true, &inner);
+                state["message"] = Value::String(
+                    "Backup protection can be skipped only after a protection attempt fails."
+                        .to_owned(),
+                );
+                Some(state)
             } else {
                 inner.install_in_flight = true;
                 None
             }
         };
-        if let Some(state) = busy_state {
+        if let Some(state) = unavailable_state {
             return json!({
                 "accepted": false,
                 "completed": false,
@@ -520,6 +567,11 @@ impl DesktopUpdateManager {
                     ProtectionStatus::Failed
                 },
                 message: environment.unprotected_reason.clone(),
+                stage: environment
+                    .running
+                    .then_some(ProtectionStage::WaitingForMutations),
+                elapsed_ms: None,
+                blocked_operation_count: None,
             })
             .collect::<Vec<_>>();
         if !protection.iter().any(|entry| entry.primary) {
@@ -531,6 +583,9 @@ impl DesktopUpdateManager {
                     primary: true,
                     status: ProtectionStatus::Failed,
                     message: Some("The primary desktop backend is not running.".to_string()),
+                    stage: None,
+                    elapsed_ms: None,
+                    blocked_operation_count: None,
                 },
             );
         }
@@ -551,69 +606,89 @@ impl DesktopUpdateManager {
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut prepared = Vec::new();
-        for environment in &snapshot.environments {
-            if !environment.running {
-                continue;
+        if input.skip_protection {
+            for entry in &mut protection {
+                entry.status = ProtectionStatus::Skipped;
+                entry.message = Some("Backup protection was skipped for this update.".to_owned());
+                entry.stage = Some(ProtectionStage::StoppingBackend);
+                entry.elapsed_ms = None;
+                entry.blocked_operation_count = None;
             }
-            let Some(config) = environment.config.clone() else {
-                set_protection_failure(
-                    &mut protection,
-                    &environment.environment_id,
-                    "The running backend has no launch configuration.".to_string(),
-                );
-                continue;
-            };
-            if !environment.primary && exclusions.contains(&environment.environment_id) {
-                set_protection_failure(
-                    &mut protection,
-                    &environment.environment_id,
-                    "This secondary environment was explicitly excluded.".to_string(),
-                );
-                continue;
-            }
-            match prepare_backend_for_update(&config).await {
-                Ok(result) => {
-                    set_protection_status(
+        } else {
+            for environment in &snapshot.environments {
+                if !environment.running {
+                    continue;
+                }
+                let Some(config) = environment.config.clone() else {
+                    set_protection_failure(
                         &mut protection,
                         &environment.environment_id,
-                        ProtectionStatus::Protected,
-                        None,
+                        "The running backend has no launch configuration.".to_string(),
                     );
-                    prepared.push(PreparedBackend {
-                        config,
-                        operation_id: result.operation_id,
-                    });
+                    continue;
+                };
+                if !environment.primary && exclusions.contains(&environment.environment_id) {
+                    set_protection_failure(
+                        &mut protection,
+                        &environment.environment_id,
+                        "This secondary environment was explicitly excluded.".to_string(),
+                    );
+                    continue;
                 }
-                Err(error) => {
-                    set_protection_failure(&mut protection, &environment.environment_id, error);
-                }
-            }
-            self.replace_inner(|inner| inner.protection = protection.clone())
-                .emit(app);
-        }
-
-        if let Err(error) = apply_named_secondary_exclusions(&mut protection, &exclusions) {
-            let recovery_error = cancel_stop_and_restart(backend, &snapshot, &prepared)
+                let environment_id = environment.environment_id.clone();
+                match prepare_backend_for_update(&config, |progress| {
+                    if set_protection_progress(&mut protection, &environment_id, &progress) {
+                        self.replace_inner(|inner| inner.protection = protection.clone())
+                            .emit(app);
+                    }
+                })
                 .await
-                .err();
-            let message = append_recovery_error(error, recovery_error);
-            return self.finish_failed_install(app, downloaded, protection, message);
+                {
+                    Ok(result) => {
+                        set_protection_status(
+                            &mut protection,
+                            &environment.environment_id,
+                            ProtectionStatus::Protected,
+                            None,
+                        );
+                        prepared.push(PreparedBackend {
+                            config,
+                            operation_id: result.operation_id,
+                        });
+                    }
+                    Err(error) => {
+                        set_protection_failure(&mut protection, &environment.environment_id, error);
+                    }
+                }
+                self.replace_inner(|inner| inner.protection = protection.clone())
+                    .emit(app);
+            }
+
+            if let Err(error) = apply_named_secondary_exclusions(&mut protection, &exclusions) {
+                let recovery_error = cancel_stop_and_restart(backend, &snapshot, &prepared)
+                    .await
+                    .err();
+                let message = append_recovery_error(error, recovery_error);
+                return self.finish_failed_install(app, downloaded, protection, message);
+            }
         }
 
         self.replace_inner(|inner| inner.protection = protection.clone())
             .emit(app);
         backend.expect_update_snapshot_exit(&snapshot);
         let mut commit_error = None;
-        for operation in &prepared {
-            if let Err(error) = finish_backend_update(
-                &operation.config,
-                MAINTENANCE_UPDATE_COMMIT_PATH,
-                &operation.operation_id,
-            )
-            .await
-                && commit_error.is_none()
-            {
-                commit_error = Some(error);
+        if !input.skip_protection {
+            for operation in &prepared {
+                if let Err(error) = finish_backend_update(
+                    &operation.config,
+                    MAINTENANCE_UPDATE_COMMIT_PATH,
+                    &operation.operation_id,
+                )
+                .await
+                    && commit_error.is_none()
+                {
+                    commit_error = Some(error);
+                }
             }
         }
 
@@ -862,10 +937,32 @@ fn set_protection_failure(
     );
 }
 
+fn set_protection_progress(
+    protection: &mut [DesktopUpdateProtection],
+    environment_id: &str,
+    progress: &UpdateMaintenanceProgress,
+) -> bool {
+    let Some(entry) = protection
+        .iter_mut()
+        .find(|entry| entry.environment_id == environment_id)
+    else {
+        return false;
+    };
+    let changed = entry.stage != progress.stage
+        || entry.elapsed_ms != progress.elapsed_ms
+        || entry.blocked_operation_count != progress.in_flight_mutations;
+    entry.stage = progress.stage;
+    entry.elapsed_ms = progress.elapsed_ms;
+    entry.blocked_operation_count = progress.in_flight_mutations;
+    changed
+}
+
 async fn prepare_backend_for_update(
     config: &BackendRunConfig,
+    mut on_progress: impl FnMut(UpdateMaintenanceProgress),
 ) -> Result<PrepareForUpdateResult, String> {
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let prepare = client
         .post(format!(
             "{}{}",
             config.http_base_url(),
@@ -876,15 +973,58 @@ async fn prepare_backend_for_update(
             &config.desktop_bootstrap_token,
         )
         .timeout(Duration::from_secs(45))
+        .send();
+    tokio::pin!(prepare);
+    let first_progress_poll = tokio::time::Instant::now() + UPDATE_PROTECTION_PROGRESS_INTERVAL;
+    let mut progress_interval =
+        tokio::time::interval_at(first_progress_poll, UPDATE_PROTECTION_PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = progress_interval.tick() => {
+                if let Ok(progress) = fetch_update_maintenance_progress(&client, config).await
+                    && progress.stage.is_some()
+                {
+                    on_progress(progress);
+                }
+            }
+            response = &mut prepare => {
+                let response = response.map_err(|error| {
+                    format!(
+                        "Could not prepare {} for update protection: {error}",
+                        config.label
+                    )
+                })?;
+                return decode_maintenance_response(config, "prepare", response).await;
+            }
+        }
+    }
+}
+
+async fn fetch_update_maintenance_progress(
+    client: &reqwest::Client,
+    config: &BackendRunConfig,
+) -> Result<UpdateMaintenanceProgress, String> {
+    let response = client
+        .get(format!(
+            "{}{}",
+            config.http_base_url(),
+            MAINTENANCE_UPDATE_STATUS_PATH
+        ))
+        .header(
+            DESKTOP_MAINTENANCE_TOKEN_HEADER,
+            &config.desktop_bootstrap_token,
+        )
+        .timeout(UPDATE_PROTECTION_STATUS_TIMEOUT)
         .send()
         .await
-        .map_err(|error| {
-            format!(
-                "Could not prepare {} for update protection: {error}",
-                config.label
-            )
-        })?;
-    decode_maintenance_response(config, "prepare", response).await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status().as_u16()));
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
 
 async fn finish_backend_update(
@@ -1213,6 +1353,9 @@ mod tests {
             primary: true,
             status: ProtectionStatus::Failed,
             message: Some("backup failed".to_string()),
+            stage: None,
+            elapsed_ms: None,
+            blocked_operation_count: None,
         }];
 
         let error = apply_named_secondary_exclusions(
@@ -1233,6 +1376,9 @@ mod tests {
             primary: false,
             status: ProtectionStatus::Failed,
             message: Some("backup failed".to_string()),
+            stage: None,
+            elapsed_ms: None,
+            blocked_operation_count: None,
         };
         let mut without_exclusion = vec![failed.clone()];
         assert!(
@@ -1262,15 +1408,181 @@ mod tests {
             primary: true,
             status: ProtectionStatus::Pending,
             message: None,
+            stage: Some(ProtectionStage::WaitingForMutations),
+            elapsed_ms: Some(12_000),
+            blocked_operation_count: Some(1),
         });
 
         let protecting = update_state_value(handle, true, &state);
         assert_eq!(protecting["phase"], "protecting");
         assert_eq!(protecting["protection"][0]["status"], "pending");
+        assert_eq!(
+            protecting["protection"][0]["stage"],
+            "waiting-for-mutations"
+        );
+        assert_eq!(protecting["protection"][0]["elapsedMs"], 12_000);
+        assert_eq!(protecting["protection"][0]["blockedOperationCount"], 1);
 
         state.phase = UpdatePhase::Installing;
         let installing = update_state_value(handle, true, &state);
         assert_eq!(installing["phase"], "installing");
+    }
+
+    #[test]
+    fn protection_bypass_requires_a_previous_failed_attempt() {
+        let failed = DesktopUpdateProtection {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            primary: true,
+            status: ProtectionStatus::Failed,
+            message: Some("backup failed".to_string()),
+            stage: None,
+            elapsed_ms: None,
+            blocked_operation_count: None,
+        };
+
+        assert!(!protection_bypass_allowed(
+            UpdatePhase::Available,
+            std::slice::from_ref(&failed)
+        ));
+        assert!(protection_bypass_allowed(UpdatePhase::Failed, &[failed]));
+    }
+
+    #[tokio::test]
+    async fn install_command_rejects_a_forged_first_attempt_bypass() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
+        let manager = DesktopUpdateManager::new();
+        manager.replace_inner(|inner| {
+            inner.phase = UpdatePhase::Available;
+            inner.protection = vec![DesktopUpdateProtection {
+                environment_id: "primary".to_string(),
+                label: "Local".to_string(),
+                primary: true,
+                status: ProtectionStatus::Failed,
+                message: Some("forged renderer state".to_string()),
+                stage: None,
+                elapsed_ms: None,
+                blocked_operation_count: None,
+            }];
+        });
+
+        let result = manager
+            .install_update(
+                app.handle(),
+                &BackendSupervisor::new(),
+                DesktopUpdateInstallInput {
+                    skip_protection: true,
+                    ..DesktopUpdateInstallInput::default()
+                },
+            )
+            .await;
+
+        assert_eq!(result["accepted"], false);
+        assert!(
+            result["state"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("only after a protection attempt fails"))
+        );
+        assert!(
+            !manager
+                .inner
+                .lock()
+                .expect("desktop update mutex poisoned")
+                .install_in_flight
+        );
+    }
+
+    #[test]
+    fn maintenance_status_decodes_live_prepare_progress() {
+        let progress: UpdateMaintenanceProgress = serde_json::from_value(json!({
+            "phase": "preparing",
+            "stage": "quiescing-runtime",
+            "elapsedMs": 750,
+            "remainingMs": 29_250,
+            "inFlightMutations": 0,
+            "blockers": []
+        }))
+        .expect("maintenance progress should decode");
+
+        assert_eq!(progress.stage, Some(ProtectionStage::QuiescingRuntime));
+        assert_eq!(progress.elapsed_ms, Some(750));
+        assert_eq!(progress.in_flight_mutations, Some(0));
+    }
+
+    #[tokio::test]
+    async fn prepare_polls_status_and_publishes_progress_before_completion() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("maintenance server should bind");
+        let port = listener
+            .local_addr()
+            .expect("maintenance server address")
+            .port();
+        let server = thread::spawn(move || {
+            let mut prepare_stream = None;
+            for _ in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("maintenance request should arrive");
+                let mut request = [0_u8; 4096];
+                let length = stream
+                    .read(&mut request)
+                    .expect("maintenance request should read");
+                let request = String::from_utf8_lossy(&request[..length]);
+                if request.starts_with("GET /api/maintenance/update/status") {
+                    let body = json!({
+                        "phase": "preparing",
+                        "stage": "checkpointing-database",
+                        "elapsedMs": 500,
+                        "remainingMs": 29_500,
+                        "inFlightMutations": 0,
+                        "blockers": []
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .expect("status response should write");
+                } else {
+                    assert!(request.starts_with("POST /api/maintenance/update/prepare"));
+                    prepare_stream = Some(stream);
+                }
+            }
+            let body = json!({
+                "operationId": "00000000-0000-4000-8000-000000000001",
+                "storageInstanceId": "00000000-0000-4000-8000-000000000002",
+                "backupId": "00000000-0000-4000-8000-000000000003",
+                "drainedOperations": 0,
+                "expiresAt": "2026-08-24T21:00:00Z"
+            })
+            .to_string();
+            let mut stream = prepare_stream.expect("prepare request should be retained");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("prepare response should write");
+        });
+        let mut config = test_backend_config();
+        config.port = port;
+        let mut progress = Vec::new();
+
+        let result = prepare_backend_for_update(&config, |update| progress.push(update))
+            .await
+            .expect("prepare should complete");
+
+        server.join().expect("maintenance server should stop");
+        assert_eq!(result.operation_id, "00000000-0000-4000-8000-000000000001");
+        assert!(
+            progress.iter().any(|update| {
+                update.stage == Some(ProtectionStage::CheckpointingDatabase)
+                    && update.elapsed_ms == Some(500)
+            }),
+            "progress updates: {progress:?}"
+        );
     }
 
     #[tokio::test]
@@ -1303,7 +1615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secondary_exclusion_commits_primary_and_installer_failure_restarts_prior_set() {
+    async fn protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure() {
         let (base_url, update_server) = spawn_update_server("test");
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let handle = app.handle();
@@ -1358,15 +1670,20 @@ mod tests {
                 handle,
                 &supervisor,
                 DesktopUpdateInstallInput {
-                    excluded_environment_ids: vec!["wsl:Ubuntu".to_string()],
+                    excluded_environment_ids: Vec::new(),
+                    skip_protection: true,
                 },
             )
             .await;
         assert_eq!(failed_install["completed"], false);
         assert_eq!(failed_install["state"]["phase"], "failed");
         assert_eq!(
+            failed_install["state"]["protection"][0]["status"],
+            "skipped"
+        );
+        assert_eq!(
             failed_install["state"]["protection"][1]["status"],
-            "excluded"
+            "skipped"
         );
         assert!(
             failed_install["state"]["message"]

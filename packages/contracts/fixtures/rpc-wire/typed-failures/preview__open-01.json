@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "mzP}",
-          "requiredScope": "relay:read"
+          "message": "2XmD",
+          "requiredScope": "orchestration:read"
         }
       }
     ]

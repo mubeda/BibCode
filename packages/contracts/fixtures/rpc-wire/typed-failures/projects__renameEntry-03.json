@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "zGTz",
-          "requiredScope": "review:write"
+          "message": "!AOS",
+          "requiredScope": "orchestration:operate"
         }
       }
     ]

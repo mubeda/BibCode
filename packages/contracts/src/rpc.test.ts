@@ -8,6 +8,7 @@ import {
   WsServerGetConfigRpc,
   WsServerConsumeCodexRateLimitResetRpc,
   WsServerRefreshProvidersRpc,
+  WsServerRefreshProviderUsageRpc,
   WsVcsPullRpc,
   WsVcsInitRpc,
   WsShellOpenInEditorRpc,
@@ -61,6 +62,9 @@ const decodeWorktreeRemovalResult = Schema.decodeUnknownSync(
   WsWorktreeRemoveFromBibCodeRpc.successSchema,
 );
 const decodeWorktreeRemovalError = Schema.decodeUnknownSync(WsWorktreeRemoveRpc.errorSchema);
+const decodeRefreshProviderUsageError = Schema.decodeUnknownSync(
+  WsServerRefreshProviderUsageRpc.errorSchema,
+);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -109,6 +113,15 @@ describe("WS_METHODS", () => {
 });
 
 describe("individual RPC definitions", () => {
+  it("decodes update-maintenance rejection as an expected provider refresh failure", () => {
+    expect(
+      decodeRefreshProviderUsageError({
+        _tag: "UpdateMaintenanceActiveError",
+        message: "Persistent mutations are temporarily closed.",
+      }),
+    ).toMatchObject({ _tag: "UpdateMaintenanceActiveError" });
+  });
+
   it("accepts workspace-unavailable failures at guarded unary boundaries", () => {
     const unavailable = {
       _tag: "WorkspaceUnavailableError",

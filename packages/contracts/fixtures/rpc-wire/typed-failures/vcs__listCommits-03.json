@@ -7,9 +7,8 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "dJI{Kfs",
-          "requiredScope": "orchestration:operate"
+          "_tag": "UpdateMaintenanceActiveError",
+          "message": "JI{Kfsr^9C"
         }
       }
     ]
