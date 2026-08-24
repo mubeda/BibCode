@@ -285,7 +285,10 @@ export function applyGitStatusStreamEvent(
     case "snapshot":
       return mergeGitStatusParts(event.local, event.remote);
     case "localUpdated":
-      return mergeGitStatusParts(event.local, current ? toRemoteStatusPart(current) : null);
+      return mergeGitStatusParts(
+        event.local,
+        current?.refName === event.local.refName ? toRemoteStatusPart(current) : null,
+      );
     case "remoteUpdated":
       if (current === null) {
         return mergeGitStatusParts(

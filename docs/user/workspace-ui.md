@@ -297,6 +297,9 @@ The Files surface is a full file manager for the active workspace:
 - Every directory is its own row with its own expand arrow. A folder whose only
   child is another folder is not merged into a single combined row, so each row
   names exactly one directory.
+- Git-ignored files and directory roots remain visible with ignored styling,
+  and the contents below an ignored directory are loaded eagerly with the rest
+  of the tree.
 - Right-click files, folders, or the tree background to create files/folders,
   rename, delete, duplicate, copy paths, add a folder as a project, open in an
   external editor, or open previewable files in the preview browser.
@@ -319,6 +322,12 @@ The Files surface is a full file manager for the active workspace:
   Refresh. **Refresh** rescans the workspace on the server immediately, rather
   than waiting for the next check. The tree background context menu offers the
   same Refresh.
+- Saves to built-in Git classification controls such as `.gitignore` and files
+  under `.git` automatically rescan the tree. If the repository configures an
+  arbitrary custom `core.excludesFile`, editing that custom file is not detected
+  from the current cache; use **Refresh** after changing it. Saving content to
+  an existing ordinary file keeps the cached path list, while creating a file or
+  parent folder rebuilds it.
 - Expanded folders stay expanded. Refreshing, and creating, renaming, deleting,
   duplicating, or moving an entry, does not collapse the tree.
 - Every selected file shows a Save, Undo, and Redo toolbar below its
@@ -334,3 +343,10 @@ The Files surface is a full file manager for the active workspace:
 - Staged-row diff viewing does not yet use a true `git diff --cached` source.
 - Outside changes are detected by a periodic check, so the tree updates within
   seconds rather than instantly. Use Refresh when you want it immediately.
+- Changes to an arbitrary custom Git `core.excludesFile` require **Refresh**;
+  automatic classification-control provenance is not yet cached.
+- File mutations validate the workspace-relative target before the later
+  path-based filesystem call; they do not yet use an anchored, no-follow handle.
+  A dangling symlink or concurrently rebound ancestor can therefore race that
+  validation. Do not mutate a workspace whose path topology is controlled by
+  untrusted concurrent software.

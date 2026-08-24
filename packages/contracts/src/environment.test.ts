@@ -41,6 +41,15 @@ const legacyClientDecoders = {
 } as const;
 
 describe("execution environment contracts", () => {
+  it("defaults passive VCS summary support to false for an old descriptor", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true },
+      }).capabilities.vcsStatusSummary,
+    ).toBe(false);
+  });
+
   it("defaults worktree catalog support to false for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
@@ -56,6 +65,28 @@ describe("execution environment contracts", () => {
         ...descriptor,
         capabilities: { repositoryIdentity: true, worktreeCatalog: true },
       }).capabilities.worktreeCatalog,
+    ).toBe(true);
+  });
+
+  it("defaults worktree catalog refresh-reason support to false for an old descriptor", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true, worktreeCatalog: true },
+      }).capabilities.worktreeCatalogRefreshReason,
+    ).toBe(false);
+  });
+
+  it("decodes advertised worktree catalog refresh-reason support", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: {
+          repositoryIdentity: true,
+          worktreeCatalog: true,
+          worktreeCatalogRefreshReason: true,
+        },
+      }).capabilities.worktreeCatalogRefreshReason,
     ).toBe(true);
   });
 

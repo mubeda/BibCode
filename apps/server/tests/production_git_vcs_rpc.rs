@@ -28,6 +28,8 @@ use bibcode_server::production::git_vcs::{
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 const GIT_STATUS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(15);
+const STACKED_ACTION_COMPLETION_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+const GIT_RPC_RESPONSE_DEADLOCK_BOUND: Duration = Duration::from_secs(60);
 const MAX_PARALLEL_GIT_RPC_FIXTURES: usize = 12;
 
 fn start_git_status_integration_deadline() -> (Instant, Instant) {
@@ -80,6 +82,11 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
         ),
         ("3", "subscribeVcsStatus", json!({"cwd":workspace.path()})),
         (
+            "5",
+            "subscribeVcsStatusSummary",
+            json!({"cwd":workspace.path()}),
+        ),
+        (
             "4",
             "git.runStackedAction",
             json!({
@@ -100,8 +107,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 }
 
 impl GitServerHarness {
-    async fn start(temp: &TempDir) -> Self {
-        let parallelism_permit = acquire_git_rpc_fixture().await;
+    async fn start(temp: &TempDir, parallelism_permit: OwnedSemaphorePermit) -> Self {
         let mut registry = RpcRegistry::empty();
         register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
@@ -168,18 +174,23 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
     );
     assert_eq!(
         GIT_VCS_STREAM_METHODS,
-        ["subscribeVcsStatus", "git.runStackedAction"]
+        [
+            "subscribeVcsStatus",
+            "subscribeVcsStatusSummary",
+            "git.runStackedAction"
+        ]
     );
 }
 
 #[tokio::test]
 async fn raw_vcs_create_worktree_is_unavailable_without_git_side_effects() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
     commit_file(repository.path(), "tracked.txt", "base\n", "initial");
     let worktree_path = temp.path().join("raw-created");
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
 
     request(
         server.socket(),
@@ -253,10 +264,12 @@ async fn registers_native_vcs_handlers_with_unchanged_wire_shapes() {
 
 #[tokio::test]
 async fn generate_commit_message_is_empty_when_there_are_no_changes() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
 
     request(
         &mut socket,
@@ -321,6 +334,66 @@ async fn vcs_status_stream_is_bounded_and_cancellable() {
         next_server_message(&mut socket).await,
         ServerMessage::Exit { request_id, exit: RpcExit::Failure { cause } }
             if request_id.as_str() == "7"
+                && cause == vec![CauseItem::Interrupt { fiber_id: None }]
+    ));
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn vcs_summary_stream_publishes_the_lightweight_shape_and_is_cancellable() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    initialize_repository(&repository);
+    commit_file(repository.path(), "tracked.txt", "base\n", "initial");
+    fs::write(repository.path().join("tracked.txt"), "changed\n").expect("dirty fixture");
+
+    let mut registry = RpcRegistry::empty();
+    register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+
+    request(
+        &mut socket,
+        "71",
+        "subscribeVcsStatusSummary",
+        json!({ "cwd": repository.path() }),
+    )
+    .await;
+    let summary = next_server_message(&mut socket).await;
+    assert!(
+        matches!(
+            &summary,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == "71"
+                    && values.len() == 1
+                    && values[0]["isRepo"] == true
+                    && values[0]["refName"] == "main"
+                    && values[0]["detachedHead"].is_null()
+                    && values[0]["hasWorkingTreeChanges"] == true
+                    && values[0]["pr"].is_null()
+                    && values[0]["stale"] == false
+                    && values[0].get("workingTree").is_none()
+        ),
+        "unexpected summary response: {summary:?}"
+    );
+
+    send_json(
+        &mut socket,
+        json!({ "_tag": "Interrupt", "requestId": "71" }),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(&mut socket).await,
+        ServerMessage::Exit { request_id, exit: RpcExit::Failure { cause } }
+            if request_id.as_str() == "71"
                 && cause == vec![CauseItem::Interrupt { fiber_id: None }]
     ));
 
@@ -416,17 +489,25 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
     .await;
     let _updated_settings = success_value(&mut socket, "9").await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        if git_stdout_in(&consumer, &["rev-parse", "origin/main"]) != initial_remote_ref {
-            break;
+    timeout(GIT_STATUS_INTEGRATION_DEADLINE, async {
+        loop {
+            let message = next_server_message(&mut socket).await;
+            send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "8" })).await;
+            if let ServerMessage::Chunk { request_id, values } = message
+                && request_id.as_str() == "8"
+                && values[0]["_tag"] == "remoteUpdated"
+            {
+                break;
+            }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "changing the automatic fetch interval must take effect without restarting"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
+    .expect("changing the automatic fetch interval must publish remote reconciliation");
+    assert_ne!(
+        git_stdout_in(&consumer, &["rev-parse", "origin/main"]),
+        initial_remote_ref,
+        "changing the automatic fetch interval must take effect without restarting"
+    );
 
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
@@ -434,15 +515,14 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
 }
 
 #[tokio::test]
-async fn refresh_status_publishes_external_branch_changes_to_status_subscribers() {
+async fn native_watcher_publishes_external_worktree_and_head_changes_to_status_subscribers() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
     commit_file(repository.path(), "tracked.txt", "base\n", "initial");
-    let (_parallelism_permit, handle, mut status_socket) = start_git_server(&temp).await;
-    let (mut refresh_socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
-        .await
-        .expect("refresh WebSocket connects");
+    let (_parallelism_permit, handle, mut status_socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let cwd = repository.path().to_string_lossy();
 
     request(
@@ -478,29 +558,87 @@ async fn refresh_status_publishes_external_branch_changes_to_status_subscribers(
     )
     .await;
 
+    use std::io::Write;
+    let mut tracked = fs::OpenOptions::new()
+        .append(true)
+        .open(repository.path().join("tracked.txt"))
+        .expect("open tracked worktree file");
+    tracked
+        .write_all(b"changed externally\n")
+        .expect("size-changing external worktree edit");
+    tracked.sync_all().expect("durable external worktree edit");
+    drop(tracked);
+    let dirty_update = timeout(GIT_STATUS_INTEGRATION_DEADLINE, async {
+        loop {
+            let message = next_server_message(&mut status_socket).await;
+            send_json(
+                &mut status_socket,
+                json!({ "_tag": "Ack", "requestId": "701" }),
+            )
+            .await;
+            if let ServerMessage::Chunk { request_id, values } = message
+                && request_id.as_str() == "701"
+                && values[0]["_tag"] == "localUpdated"
+                && values[0]["local"]["hasWorkingTreeChanges"] == true
+            {
+                break values;
+            }
+        }
+    })
+    .await
+    .expect("native watcher should publish an external worktree edit");
+    assert!(
+        dirty_update[0]["local"]["workingTree"]["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"] == "tracked.txt"))
+    );
+
+    run_git(&repository, &["add", "--", "tracked.txt"]);
+    let index_update = timeout(GIT_STATUS_INTEGRATION_DEADLINE, async {
+        loop {
+            let message = next_server_message(&mut status_socket).await;
+            send_json(
+                &mut status_socket,
+                json!({ "_tag": "Ack", "requestId": "701" }),
+            )
+            .await;
+            if let ServerMessage::Chunk { request_id, values } = message
+                && request_id.as_str() == "701"
+                && values[0]["_tag"] == "localUpdated"
+                && values[0]["local"]["workingTree"]["files"]
+                    .as_array()
+                    .is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|file| file["path"] == "tracked.txt" && file["area"] == "staged")
+                    })
+            {
+                break values;
+            }
+        }
+    })
+    .await
+    .expect("native watcher should publish an external index change");
+    assert_eq!(
+        index_update[0]["local"]["workingTree"]["files"][0]["area"],
+        "staged"
+    );
+
     run_git(
         &repository,
         &["switch", "--quiet", "-c", "feature/external"],
     );
-    request(
-        &mut refresh_socket,
-        "702",
-        "vcs.refreshStatus",
-        json!({ "cwd": cwd }),
-    )
-    .await;
-    let refreshed = success_value(&mut refresh_socket, "702").await;
-    assert_eq!(refreshed["refName"], "feature/external");
-
-    let local_update = timeout(Duration::from_secs(2), async {
+    let head_update = timeout(GIT_STATUS_INTEGRATION_DEADLINE, async {
         loop {
             let message = next_server_message(&mut status_socket).await;
+            send_json(
+                &mut status_socket,
+                json!({ "_tag": "Ack", "requestId": "701" }),
+            )
+            .await;
             if let ServerMessage::Chunk { request_id, values } = message
                 && request_id.as_str() == "701"
-                && matches!(
-                    values[0]["_tag"].as_str(),
-                    Some("localUpdated" | "snapshot")
-                )
+                && values[0]["_tag"] == "localUpdated"
                 && values[0]["local"]["refName"] == "feature/external"
             {
                 break values;
@@ -508,13 +646,9 @@ async fn refresh_status_publishes_external_branch_changes_to_status_subscribers(
         }
     })
     .await
-    .expect("vcs.refreshStatus should publish a local status update");
-    assert_eq!(local_update[0]["local"]["refName"], "feature/external");
+    .expect("native watcher should publish an external HEAD/index change");
+    assert_eq!(head_update[0]["local"]["refName"], "feature/external");
 
-    refresh_socket
-        .close(None)
-        .await
-        .expect("close refresh socket");
     status_socket
         .close(None)
         .await
@@ -541,49 +675,50 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
         .await
         .expect("write WebSocket connects");
     let cwd = repository.path().to_string_lossy();
+
+    request(
+        &mut status_socket,
+        "703",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let snapshot = next_server_message_for(
+        &mut status_socket,
+        "initial clean VCS status snapshot after subscription",
+    )
+    .await;
+    assert!(matches!(
+        snapshot,
+        ServerMessage::Chunk { request_id, values }
+            if request_id.as_str() == "703"
+                && values[0]["_tag"] == "snapshot"
+                && values[0]["local"]["hasWorkingTreeChanges"] == false
+    ));
+    send_json(
+        &mut status_socket,
+        json!({ "_tag": "Ack", "requestId": "703" }),
+    )
+    .await;
+
+    let initial_remote = next_server_message_for(
+        &mut status_socket,
+        "initial remote VCS status after subscription",
+    )
+    .await;
+    assert!(matches!(
+        initial_remote,
+        ServerMessage::Chunk { request_id, values }
+            if request_id.as_str() == "703" && values[0]["_tag"] == "remoteUpdated"
+    ));
+    send_json(
+        &mut status_socket,
+        json!({ "_tag": "Ack", "requestId": "703" }),
+    )
+    .await;
+
     let (publication_started, publication_deadline) = start_git_status_integration_deadline();
-
     let local_update = timeout_at(publication_deadline, async {
-        request(
-            &mut status_socket,
-            "703",
-            "subscribeVcsStatus",
-            json!({ "cwd": cwd }),
-        )
-        .await;
-        let snapshot = next_server_message_for(
-            &mut status_socket,
-            "initial clean VCS status snapshot after subscription",
-        )
-        .await;
-        assert!(matches!(
-            snapshot,
-            ServerMessage::Chunk { request_id, values }
-                if request_id.as_str() == "703"
-                    && values[0]["_tag"] == "snapshot"
-                    && values[0]["local"]["hasWorkingTreeChanges"] == false
-        ));
-        send_json(
-            &mut status_socket,
-            json!({ "_tag": "Ack", "requestId": "703" }),
-        )
-        .await;
-
-        let initial_remote = next_server_message_for(
-            &mut status_socket,
-            "initial remote VCS status after subscription",
-        )
-        .await;
-        assert!(matches!(
-            initial_remote,
-            ServerMessage::Chunk { request_id, values }
-                if request_id.as_str() == "703" && values[0]["_tag"] == "remoteUpdated"
-        ));
-        send_json(
-            &mut status_socket,
-            json!({ "_tag": "Ack", "requestId": "703" }),
-        )
-        .await;
 
         request(
             &mut write_socket,
@@ -626,7 +761,7 @@ async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback
     })
     .await
     .expect(
-        "subscription setup and a successful project file save should publish Git status within one integration deadline before the 30-second fallback",
+        "a successful project file save should publish Git status within one integration deadline before the 60-second safety read",
     );
     eprintln!(
         "event-driven project file Git status published in {:?}",
@@ -831,7 +966,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     for args in [
-        vec!["init", "--quiet"],
+        vec!["init", "--quiet", "--initial-branch=main"],
         vec!["config", "user.name", "BiBCode Test"],
         vec!["config", "user.email", "bibcode@example.invalid"],
         vec!["config", "core.autocrlf", "false"],
@@ -849,6 +984,11 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
     for args in [
         vec!["add", "base.txt"],
         vec!["commit", "--quiet", "-m", "base"],
+        vec![
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
     ] {
         assert!(
             std::process::Command::new("git")
@@ -895,6 +1035,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
             "actionId": "wire-action-feature",
             "cwd": cwd,
             "action": "commit",
+            "commitMessage": "Update feature.txt",
             "featureBranch": true,
             "commitStagedIndexAsIs": true,
         }),
@@ -902,7 +1043,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
     .await;
 
     assert!(matches!(
-        next_server_message(&mut socket).await,
+        next_server_message_for(&mut socket, "feature-branch action_started").await,
         ServerMessage::Chunk { request_id, values }
             if request_id.as_str() == "10"
                 && values.len() == 1
@@ -910,7 +1051,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
                 && values[0]["phases"] == json!(["branch", "commit"])
     ));
     send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "10" })).await;
-    let finished = next_server_message(&mut socket).await;
+    let finished = next_server_message_for(&mut socket, "feature-branch action_finished").await;
     let ServerMessage::Chunk { request_id, values } = finished else {
         panic!("expected action_finished chunk");
     };
@@ -1019,7 +1160,11 @@ async fn stacked_commit_as_is_preserves_newer_unstaged_edits() {
     ));
     send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "11" })).await;
     assert!(matches!(
-        next_server_message(&mut socket).await,
+        next_server_message_with_timeout(
+            &mut socket,
+            STACKED_ACTION_COMPLETION_INTEGRATION_DEADLINE,
+        )
+        .await,
         ServerMessage::Chunk { request_id, values }
             if request_id.as_str() == "11"
                 && values.len() == 1
@@ -1045,6 +1190,7 @@ async fn stacked_commit_as_is_preserves_newer_unstaged_edits() {
 
 #[tokio::test]
 async fn stacked_selected_commit_excludes_unrelated_staged_files() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -1057,7 +1203,8 @@ async fn stacked_selected_commit_excludes_unrelated_staged_files() {
     std::fs::write(repository.path().join("b.txt"), "unrelated b\n").expect("write unrelated b");
     run_git(&repository, &["add", "b.txt"]);
 
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let result = run_stacked_action(
         &mut socket,
         "12",
@@ -1090,6 +1237,7 @@ async fn stacked_selected_commit_excludes_unrelated_staged_files() {
 
 #[tokio::test]
 async fn stacked_commit_without_paths_stages_all_changes() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -1099,7 +1247,8 @@ async fn stacked_commit_without_paths_stages_all_changes() {
     std::fs::write(repository.path().join("tracked.txt"), "updated\n").expect("update tracked");
     std::fs::write(repository.path().join("untracked.txt"), "new\n").expect("write untracked");
 
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let result = run_stacked_action(
         &mut socket,
         "13",
@@ -1130,6 +1279,7 @@ async fn stacked_commit_without_paths_stages_all_changes() {
 
 #[tokio::test]
 async fn stacked_clean_commit_is_a_successful_no_op() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -1137,7 +1287,8 @@ async fn stacked_clean_commit_is_a_successful_no_op() {
     run_git(&repository, &["add", "tracked.txt"]);
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
 
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let result = run_stacked_action(
         &mut socket,
         "14",
@@ -1164,6 +1315,7 @@ async fn stacked_clean_commit_is_a_successful_no_op() {
 
 #[tokio::test]
 async fn stacked_feature_branch_rejects_a_clean_worktree_without_creating_a_branch() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -1172,7 +1324,8 @@ async fn stacked_feature_branch_rejects_a_clean_worktree_without_creating_a_bran
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
     let original_branch = git_stdout(&repository, &["branch", "--show-current"]);
 
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let result = run_stacked_action(
         &mut socket,
         "15",
@@ -1209,6 +1362,7 @@ async fn stacked_feature_branch_rejects_a_clean_worktree_without_creating_a_bran
 
 #[tokio::test]
 async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -1217,7 +1371,8 @@ async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
     run_git(&repository, &["commit", "--quiet", "-m", "base"]);
     std::fs::write(repository.path().join("tracked.txt"), "dirty\n").expect("dirty worktree");
 
-    let (_parallelism_permit, handle, mut socket) = start_git_server(&temp).await;
+    let (_parallelism_permit, handle, mut socket) =
+        start_git_server(&temp, parallelism_permit).await;
     let result = run_stacked_action(
         &mut socket,
         "16",
@@ -1241,6 +1396,7 @@ async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
 
 #[tokio::test]
 async fn list_refs_commits_and_ref_lifecycle_round_trip_over_rpc() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config("list_refs_commits_and_ref_lifecycle_round_trip_over_rpc")
     {
         return;
@@ -1270,7 +1426,7 @@ async fn list_refs_commits_and_ref_lifecycle_round_trip_over_rpc() {
     fs::create_dir(&worktree_parent).expect("create worktree parent");
     let worktree_path = worktree_parent.join("feature-worktree");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     let cwd = repository.to_string_lossy();
 
     request(
@@ -1470,6 +1626,7 @@ async fn list_refs_commits_and_ref_lifecycle_round_trip_over_rpc() {
 
 #[tokio::test]
 async fn stage_unstage_discard_and_invalid_pathspecs_round_trip_over_rpc() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "stage_unstage_discard_and_invalid_pathspecs_round_trip_over_rpc",
     ) {
@@ -1488,7 +1645,7 @@ async fn stage_unstage_discard_and_invalid_pathspecs_round_trip_over_rpc() {
         .expect("write selected fixture");
     fs::write(repository.join("keep.txt"), "keep\n").expect("write keep fixture");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     let cwd = repository.to_string_lossy();
 
     request(
@@ -1613,6 +1770,7 @@ async fn stage_unstage_discard_and_invalid_pathspecs_round_trip_over_rpc() {
 
 #[tokio::test]
 async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config("clone_pull_and_worktree_lifecycle_round_trip_over_rpc") {
         return;
     }
@@ -1637,7 +1795,7 @@ async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
     fs::create_dir(&worktree_parent).expect("create worktree parent");
     let worktree_path = worktree_parent.join("feature-pull-worktree");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
 
     request(
         server.socket(),
@@ -1751,6 +1909,7 @@ async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
 
 #[tokio::test]
 async fn clone_retry_reuses_an_existing_repository_with_the_same_origin() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "clone_retry_reuses_an_existing_repository_with_the_same_origin",
     ) {
@@ -1766,7 +1925,7 @@ async fn clone_retry_reuses_an_existing_repository_with_the_same_origin() {
     let clone_parent = root.path().join("clones");
     fs::create_dir(&clone_parent).expect("clone parent");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     request(
         server.socket(),
         "406",
@@ -1813,6 +1972,7 @@ async fn clone_retry_reuses_an_existing_repository_with_the_same_origin() {
 
 #[tokio::test]
 async fn clone_retry_reuses_an_existing_repository_with_an_instead_of_alias_origin() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "clone_retry_reuses_an_existing_repository_with_an_instead_of_alias_origin",
     ) {
@@ -1834,7 +1994,7 @@ async fn clone_retry_reuses_an_existing_repository_with_an_instead_of_alias_orig
     let clone_parent = root.path().join("clones");
     fs::create_dir(&clone_parent).expect("clone parent");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     request(
         server.socket(),
         "407",
@@ -1886,6 +2046,7 @@ async fn clone_retry_reuses_an_existing_repository_with_an_instead_of_alias_orig
 
 #[tokio::test]
 async fn clone_rejects_an_existing_non_repository_destination() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config("clone_rejects_an_existing_non_repository_destination") {
         return;
     }
@@ -1899,7 +2060,7 @@ async fn clone_rejects_an_existing_non_repository_destination() {
     let destination = clone_parent.join("consumer");
     fs::create_dir_all(&destination).expect("existing empty destination");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     request(
         server.socket(),
         "408",
@@ -1927,6 +2088,7 @@ async fn clone_rejects_an_existing_non_repository_destination() {
 
 #[tokio::test]
 async fn clone_rejects_an_existing_repository_with_a_different_origin() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "clone_rejects_an_existing_repository_with_a_different_origin",
     ) {
@@ -1946,7 +2108,7 @@ async fn clone_rejects_an_existing_repository_with_a_different_origin() {
     let clone_parent = root.path().join("clones");
     fs::create_dir(&clone_parent).expect("clone parent");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     request(
         server.socket(),
         "409",
@@ -1991,6 +2153,7 @@ async fn clone_rejects_an_existing_repository_with_a_different_origin() {
 
 #[tokio::test]
 async fn clone_resolves_a_home_relative_parent_before_running_git() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config("clone_resolves_a_home_relative_parent_before_running_git")
     {
         return;
@@ -2014,7 +2177,7 @@ async fn clone_resolves_a_home_relative_parent_before_running_git() {
     initialize_repository(&remote);
     commit_file(remote.path(), "tracked.txt", "base\n", "initial");
 
-    let mut server = GitServerHarness::start(&server_temp).await;
+    let mut server = GitServerHarness::start(&server_temp, parallelism_permit).await;
     request(
         server.socket(),
         "411",
@@ -2066,6 +2229,7 @@ async fn clone_resolves_a_home_relative_parent_before_running_git() {
 
 #[tokio::test]
 async fn source_control_discovery_and_typed_errors_are_deterministic() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config(
         "source_control_discovery_and_typed_errors_are_deterministic",
     ) {
@@ -2083,7 +2247,7 @@ async fn source_control_discovery_and_typed_errors_are_deterministic() {
     initialize_repository_in(&repository);
     commit_file(&repository, "tracked.txt", "base\n", "initial");
 
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
     let cwd = repository.to_string_lossy();
 
     request(
@@ -2274,12 +2438,13 @@ async fn source_control_discovery_and_typed_errors_are_deterministic() {
 
 #[tokio::test]
 async fn pull_request_rpc_adapters_execute_resolution_and_preparation_paths() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
     commit_file(repository.path(), "tracked.txt", "base\n", "initial");
     let cwd = repository.path().to_string_lossy();
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
 
     request(
         server.socket(),
@@ -2310,12 +2475,13 @@ async fn pull_request_rpc_adapters_execute_resolution_and_preparation_paths() {
 
 #[tokio::test]
 async fn pull_request_preparation_rejects_client_directed_worktree_ownership_fields() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
     commit_file(repository.path(), "tracked.txt", "base\n", "initial");
     let cwd = repository.path().to_string_lossy();
-    let mut server = GitServerHarness::start(&temp).await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
 
     for (request_id, payload) in [
         (
@@ -2476,12 +2642,12 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
 
 async fn start_git_server(
     temp: &TempDir,
+    parallelism_permit: OwnedSemaphorePermit,
 ) -> (
     OwnedSemaphorePermit,
     bibcode_server::ServerHandle,
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
-    let parallelism_permit = acquire_git_rpc_fixture().await;
     let mut registry = RpcRegistry::empty();
     register_git_vcs_rpc(&mut registry, GitVcsRpcServices::default());
     let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
@@ -2623,14 +2789,14 @@ async fn next_server_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessag
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    next_server_message_with_timeout(socket, Duration::from_secs(15)).await
+    next_server_message_with_timeout(socket, GIT_RPC_RESPONSE_DEADLOCK_BOUND).await
 }
 
 async fn next_server_message_for<S>(socket: &mut WebSocketStream<S>, context: &str) -> ServerMessage
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(15), socket.next())
+    let frame = timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, socket.next())
         .await
         .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
         .expect("WebSocket remains open")

@@ -72,6 +72,11 @@ pub struct ServerTerminalServices {
 }
 
 impl ServerTerminalServices {
+    #[cfg(test)]
+    pub(crate) fn terminal_manager_for_test(&self) -> TerminalManager {
+        self.terminal.clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         terminal: TerminalManager,

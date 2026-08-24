@@ -27,6 +27,8 @@ const BASE_ENVIRONMENT = {
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
+    worktreeCatalogRefreshReason: false,
+    vcsStatusSummary: false,
     activityProtocolVersion: null,
   },
 } satisfies ExecutionEnvironmentDescriptor;
@@ -95,6 +97,8 @@ describe("environmentBootstrap", () => {
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
+        worktreeCatalogRefreshReason: false,
+        vcsStatusSummary: false,
         activityProtocolVersion: null,
       },
     } satisfies ExecutionEnvironmentDescriptor;

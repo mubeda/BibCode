@@ -63,6 +63,9 @@ pub trait TerminalSubprocessInspector: std::fmt::Debug + Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspection, String>> + Send + '_>>;
 }
 
+pub(crate) type TerminalProcessExitCallback =
+    Arc<dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 #[derive(Debug, Default)]
 struct NativeTerminalSubprocessInspector {
     sampler: NativeProcessSampler,
@@ -1494,7 +1497,6 @@ impl Session {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     backend: Arc<dyn PtyBackend>,
     attribution: ProcessAttributionRegistry,
@@ -1508,6 +1510,7 @@ struct Inner {
     sessions: RwLock<HashMap<SessionKey, SharedSession>>,
     events: broadcast::Sender<TerminalEvent>,
     metadata: broadcast::Sender<TerminalMetadataEvent>,
+    process_exit_callback: std::sync::RwLock<Option<TerminalProcessExitCallback>>,
     cancellation: CancellationToken,
     #[cfg(test)]
     restart_after_exact_cleanup_barrier: std::sync::Mutex<Option<Arc<PublisherBarrier>>>,
@@ -1568,6 +1571,7 @@ impl TerminalManager {
                 sessions: RwLock::new(HashMap::new()),
                 events,
                 metadata,
+                process_exit_callback: std::sync::RwLock::new(None),
                 cancellation: CancellationToken::new(),
                 #[cfg(test)]
                 restart_after_exact_cleanup_barrier: std::sync::Mutex::new(None),
@@ -1577,6 +1581,14 @@ impl TerminalManager {
 
     pub(crate) fn process_attribution_registry(&self) -> ProcessAttributionRegistry {
         self.inner.attribution.clone()
+    }
+
+    pub(crate) fn set_process_exit_callback(&self, callback: TerminalProcessExitCallback) {
+        *self
+            .inner
+            .process_exit_callback
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(callback);
     }
 
     pub async fn set_agent_activity_enabled(
@@ -2415,7 +2427,7 @@ impl TerminalManager {
         generation
             .cancel_and_invalidate(TerminalObserverCancellationReason::ProcessExited)
             .await;
-        let (event, summary) = {
+        let (event, summary, status_cwd) = {
             let mut session = session.lock().await;
             session.status = TerminalStatus::Exited;
             session.attribution_registration.take();
@@ -2436,12 +2448,27 @@ impl TerminalManager {
                     exit_signal: exit.signal,
                 },
                 session.summary(),
+                PathBuf::from(
+                    session
+                        .worktree_path
+                        .as_deref()
+                        .unwrap_or(session.cwd.as_str()),
+                ),
             )
         };
         let _ = inner.events.send(event);
         let _ = inner
             .metadata
             .send(TerminalMetadataEvent::Upsert { terminal: summary });
+        drop(_publication);
+        let callback = inner
+            .process_exit_callback
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(callback) = callback {
+            callback(status_cwd).await;
+        }
     }
 
     async fn publish_output_chunk(
@@ -3908,6 +3935,103 @@ mod tests {
             processes.push(process.clone());
             Ok(process)
         }
+    }
+
+    #[tokio::test]
+    async fn process_exit_observer_is_not_lost_without_terminal_broadcast_subscribers() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&worktree).expect("worktree fixture");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+        let (observed, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_process_exit_callback(Arc::new(move |cwd| {
+            let _ = observed.send(cwd);
+            Box::pin(std::future::ready(()))
+        }));
+        let mut input = TerminalOpenInput::new(
+            "thread",
+            "structured-command",
+            root.path().to_path_buf(),
+            80,
+            24,
+        );
+        input.worktree_path = Some(worktree.clone());
+        manager.open(input).await.expect("terminal starts");
+
+        backend
+            .latest()
+            .exit
+            .send(Some(PtyExit {
+                exit_code: Some(0),
+                signal: None,
+            }))
+            .expect("terminal exit publishes");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), observed_rx.recv())
+                .await
+                .expect("process-exit observer deadline")
+                .expect("process-exit observer remains installed"),
+            worktree
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retained_process_exit_callback_does_not_hold_terminal_publication() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+        let (callback_started, mut callback_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release_callback = Arc::new(tokio::sync::Semaphore::new(0));
+        manager.set_process_exit_callback(Arc::new({
+            let release_callback = Arc::clone(&release_callback);
+            move |_| {
+                let _ = callback_started.send(());
+                let release_callback = Arc::clone(&release_callback);
+                Box::pin(async move {
+                    release_callback
+                        .acquire()
+                        .await
+                        .expect("process-exit callback release remains open")
+                        .forget();
+                })
+            }
+        }));
+        let input = TerminalOpenInput::new(
+            "thread",
+            "retained-exit-callback",
+            root.path().to_path_buf(),
+            80,
+            24,
+        );
+        manager.open(input.clone()).await.expect("terminal starts");
+        let session = manager
+            .require_session("thread", "retained-exit-callback")
+            .await
+            .expect("terminal session");
+        let generation = session.lock().await.generation.clone();
+
+        backend.latest().exit(0);
+        callback_started_rx
+            .recv()
+            .await
+            .expect("retained callback starts");
+        let publication_available = generation.publication.try_lock().is_ok();
+        if !publication_available {
+            release_callback.add_permits(16);
+            manager.shutdown().await;
+            panic!("process-exit callback retained terminal publication ownership");
+        }
+
+        release_callback.add_permits(16);
+        manager
+            .restart(input)
+            .await
+            .expect("restart publishes while prior exit callback settles");
+        assert_eq!(backend.processes.lock().expect("processes lock").len(), 2);
+        manager.shutdown().await;
     }
 
     #[tokio::test]

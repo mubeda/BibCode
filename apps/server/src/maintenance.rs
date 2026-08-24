@@ -71,6 +71,7 @@ pub fn rpc_mutability(method: &str) -> RpcMutability {
         | "subscribeTerminalEvents"
         | "subscribeTerminalMetadata"
         | "subscribeVcsStatus"
+        | "subscribeVcsStatusSummary"
         | "vcs.listCommits"
         | "vcs.listRefs"
         | "vcs.refreshStatus" => RpcMutability::Read,

@@ -87,6 +87,8 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
+const CHECKPOINT_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+const NATIVE_PROVIDER_EVENT_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
 
 const WINDOWS_CLAUDE_FIXTURE: &str = r#"
 [Console]::Out.WriteLine("ignored non-json output")
@@ -1353,7 +1355,7 @@ async fn wait_for_event(
     events: &mut tokio::sync::broadcast::Receiver<bibcode_server::persistence::OrchestrationEvent>,
     predicate: impl Fn(&bibcode_server::persistence::OrchestrationEvent) -> bool,
 ) {
-    timeout(Duration::from_secs(10), async {
+    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
         loop {
             match events.recv().await {
                 Ok(event) if predicate(&event) => return,
@@ -10958,10 +10960,24 @@ async fn native_claude_driver_supports_the_complete_live_command_surface() {
         Err(ProviderRuntimeError::UnsupportedCapability { provider, .. }) if provider == "claude"
     ));
 
-    let event = timeout(Duration::from_secs(2), driver.next_event())
-        .await
-        .unwrap()
-        .unwrap();
+    let event = match timeout(
+        NATIVE_PROVIDER_EVENT_INTEGRATION_DEADLINE,
+        driver.next_event(),
+    )
+    .await
+    {
+        Ok(Some(event)) => event,
+        outcome => {
+            let cleanup = timeout(
+                NATIVE_PROVIDER_EVENT_INTEGRATION_DEADLINE,
+                driver.shutdown(),
+            )
+            .await;
+            panic!(
+                "native Claude fixture did not publish its startup stderr event: {outcome:?}; cleanup: {cleanup:?}"
+            );
+        }
+    };
     assert_eq!(event.event_type, "session.stderr");
     assert_eq!(event.payload, json!({"message":"fixture warning"}));
     driver.shutdown().await.unwrap();

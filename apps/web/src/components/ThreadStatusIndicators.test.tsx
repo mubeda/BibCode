@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
   gitStatus: null as Record<string, unknown> | null,
+  vcsQueries: [] as unknown[],
   runningIds: [] as string[],
   environment: null as { label: string } | null,
   primaryEnvironmentId: null as string | null,
@@ -19,13 +20,19 @@ vi.mock("../state/environments", () => ({
 }));
 vi.mock("../state/entities", () => ({ useProject: () => harness.project }));
 vi.mock("../state/query", () => ({
-  useEnvironmentQuery: () => ({ data: harness.gitStatus }),
+  useEnvironmentQuery: (query: unknown) => {
+    harness.vcsQueries.push(query);
+    return { data: harness.gitStatus };
+  },
 }));
 vi.mock("../state/terminalSessions", () => ({
   useThreadRunningTerminalIds: () => harness.runningIds,
 }));
 vi.mock("../state/vcs", () => ({
-  vcsEnvironment: { status: (input: unknown) => input },
+  vcsEnvironment: {
+    status: (input: unknown) => ({ kind: "status", input }),
+    summary: (input: unknown) => ({ kind: "summary", input }),
+  },
 }));
 vi.mock("../uiStateStore", () => ({
   useUiStateStore: (selector: (state: Record<string, unknown>) => unknown) =>
@@ -75,6 +82,7 @@ const thread = {
 
 beforeEach(() => {
   harness.gitStatus = null;
+  harness.vcsQueries.length = 0;
   harness.runningIds = [];
   harness.environment = null;
   harness.primaryEnvironmentId = null;
@@ -111,6 +119,7 @@ describe("thread status indicators", () => {
 
   it("resolves a change request only for a matching branch", () => {
     const pr = {
+      provider: "github" as const,
       number: 1,
       title: "PR",
       url: "https://example.test/1",
@@ -120,7 +129,20 @@ describe("thread status indicators", () => {
     expect(resolveThreadPr("main", null)).toBeNull();
     expect(resolveThreadPr("main", { refName: "other", pr } as never)).toBeNull();
     expect(resolveThreadPr("main", { refName: "main", pr: null } as never)).toBeNull();
-    expect(resolveThreadPr("main", { refName: "main", pr } as never)).toBe(pr);
+    expect(
+      resolveThreadPr("main", {
+        refName: "main",
+        sourceControlProvider: { kind: "gitlab" },
+        pr,
+      } as never),
+    ).toBeNull();
+    expect(
+      resolveThreadPr("main", {
+        refName: "main",
+        sourceControlProvider: { kind: "github" },
+        pr,
+      } as never),
+    ).toBe(pr);
   });
 
   it("maps running terminal IDs", () => {
@@ -172,11 +194,14 @@ describe("thread status indicators", () => {
     harness.project = { workspaceRoot: "/repo" };
     harness.gitStatus = {
       refName: "feature/test",
-      sourceControlProvider: "github",
+      sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
       pr: {
+        provider: "github",
         number: 4,
         title: "Ready",
         url: "https://example.test/4",
+        baseRefName: "main",
+        headRefName: "feature/test",
         state: "open",
       },
     };
@@ -187,6 +212,7 @@ describe("thread status indicators", () => {
       pulse: false,
     };
     const both = renderToStaticMarkup(<ThreadRowLeadingStatus thread={thread} />);
+    expect(harness.vcsQueries.at(-1)).toMatchObject({ kind: "summary" });
     expect(both).toContain("#4 PR open: Ready");
     expect(both).toContain("Unread");
 

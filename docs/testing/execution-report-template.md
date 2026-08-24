@@ -40,17 +40,33 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | ------- | ---------------- | -------- | --------------------- |
 |         |                  |          |                       |
 
+## VCS observation evidence
+
+- Execution host and route: Native | WSL direct | SSH/server | Unavailable
+- Physical repositories/worktrees/active full subscribers/passive subscribers:
+- Watcher health and fallback state:
+- Automatic-fetch interval and passive-summary interval:
+
+| Scenario                           | Signal source | Git launches after baseline | Publication result | Evidence class |
+| ---------------------------------- | ------------- | --------------------------- | ------------------ | -------------- |
+| Idle through 59 seconds            |               |                             |                    |                |
+| 60-second safety boundary          |               |                             |                    |                |
+| Worktree/index/HEAD/refs           |               |                             |                    |                |
+| Structured terminal exit           |               |                             |                    |                |
+| Overflow/setup unavailable         |               |                             |                    |                |
+| Reconnect/hidden/reveal/focus/menu |               |                             |                    |                |
+
 ## Workspace and static gates
 
-| Command                                                       | Result/exit code | Duration | Test totals or warning summary |
-| ------------------------------------------------------------- | ---------------- | -------- | ------------------------------ |
-| `vp run test`                                                 |                  |          |                                |
-| `cargo test --workspace -j 2` or documented native equivalent |                  |          |                                |
-| `vp check`                                                    |                  |          |                                |
-| `vp run typecheck`                                            |                  |          |                                |
-| `cargo fmt --all --check`                                     |                  |          |                                |
-| Relevant Clippy with `-D warnings`                            |                  |          |                                |
-| `git diff --check`                                            |                  |          |                                |
+| Command                                                                           | Result/exit code | Duration | Test totals or warning summary |
+| --------------------------------------------------------------------------------- | ---------------- | -------- | ------------------------------ |
+| `vp run test`                                                                     |                  |          |                                |
+| `cargo test --workspace -j 2 -- --test-threads=2` or documented native equivalent |                  |          |                                |
+| `vp check`                                                                        |                  |          |                                |
+| `vp run typecheck`                                                                |                  |          |                                |
+| `cargo fmt --all --check`                                                         |                  |          |                                |
+| Relevant Clippy with `-D warnings`                                                |                  |          |                                |
+| `git diff --check`                                                                |                  |          |                                |
 
 ## Native package artifacts
 

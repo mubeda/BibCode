@@ -105,11 +105,15 @@ const hiddenPolicy = {
   baselinePaths: [],
 };
 
-function session(client: WsRpcProtocolClient, worktreeCatalog = true): RpcSession {
+function session(
+  client: WsRpcProtocolClient,
+  worktreeCatalog = true,
+  worktreeCatalogRefreshReason = true,
+): RpcSession {
   return {
     client,
     initialConfig: Effect.succeed({
-      environment: { capabilities: { worktreeCatalog } },
+      environment: { capabilities: { worktreeCatalog, worktreeCatalogRefreshReason } },
     } as never),
     ready: Effect.void,
     probe: Effect.void,
@@ -162,11 +166,18 @@ const makeAtomHarness = Effect.fn("TestWorktrees.makeAtomHarness")(function* (
 const makeCommandHarness = Effect.fn("TestWorktrees.makeCommandHarness")(function* (
   clients: ReadonlyMap<EnvironmentId, WsRpcProtocolClient>,
   catalogCapabilities: ReadonlyMap<EnvironmentId, boolean> = new Map(),
+  refreshReasonCapabilities: ReadonlyMap<EnvironmentId, boolean> = new Map(),
 ) {
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const [environmentId, client] of clients) {
     const supervisorSession = yield* SubscriptionRef.make<Option.Option<RpcSession>>(
-      Option.some(session(client, catalogCapabilities.get(environmentId) ?? true)),
+      Option.some(
+        session(
+          client,
+          catalogCapabilities.get(environmentId) ?? true,
+          refreshReasonCapabilities.get(environmentId) ?? true,
+        ),
+      ),
     );
     supervisors.set(
       environmentId,
@@ -235,14 +246,23 @@ describe("deriveWorktreeDiscoveryState", () => {
   it("derives catalog RPC and legacy detach strategies from one capability policy", () => {
     expect(
       selectWorktreeCatalogCapabilityPolicy({
+        capabilities: { worktreeCatalog: true, worktreeCatalogRefreshReason: true },
+      } as never),
+    ).toEqual({ catalogRpc: "enabled", refreshReason: "enabled", removal: "catalog" });
+    expect(
+      selectWorktreeCatalogCapabilityPolicy({
         capabilities: { worktreeCatalog: true },
       } as never),
-    ).toEqual({ catalogRpc: "enabled", removal: "catalog" });
+    ).toEqual({ catalogRpc: "enabled", refreshReason: "disabled", removal: "catalog" });
     expect(
       selectWorktreeCatalogCapabilityPolicy({
         capabilities: { worktreeCatalog: false },
       } as never),
-    ).toEqual({ catalogRpc: "disabled", removal: "legacy-detach-only" });
+    ).toEqual({
+      catalogRpc: "disabled",
+      refreshReason: "disabled",
+      removal: "legacy-detach-only",
+    });
   });
 
   it("gates catalog support from the decoded environment capability", () => {
@@ -875,7 +895,101 @@ describe("worktree catalog capability enforcement", () => {
 });
 
 describe("worktree adoption commands", () => {
-  it.effect("coalesces concurrent refreshes for one physical project", () =>
+  it.effect("sends the focus reason when the negotiated server supports it", () =>
+    Effect.gen(function* () {
+      const inputs: unknown[] = [];
+      const client = {
+        [WS_METHODS.vcsRefreshWorktreeCatalog]: (input: unknown) =>
+          Effect.sync(() => {
+            inputs.push(input);
+            return snapshot({ generation: 8 });
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+
+      yield* Effect.promise(() =>
+        harness.worktrees.refresh.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: { projectId: PROJECT_ID, reason: "focus" },
+        }),
+      );
+
+      expect(inputs).toEqual([{ projectId: PROJECT_ID, reason: "focus" }]);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("omits the focus reason for a catalog server that predates reason support", () =>
+    Effect.gen(function* () {
+      const inputs: unknown[] = [];
+      const client = {
+        [WS_METHODS.vcsRefreshWorktreeCatalog]: (input: unknown) =>
+          Effect.sync(() => {
+            inputs.push(input);
+            return snapshot({ generation: 8 });
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(
+        new Map([[ENVIRONMENT_ONE, client]]),
+        new Map([[ENVIRONMENT_ONE, true]]),
+        new Map([[ENVIRONMENT_ONE, false]]),
+      );
+
+      yield* Effect.promise(() =>
+        harness.worktrees.refresh.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: { projectId: PROJECT_ID, reason: "focus" },
+        }),
+      );
+
+      expect(inputs).toEqual([{ projectId: PROJECT_ID }]);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("does not coalesce an explicit refresh with an in-flight focus refresh", () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>();
+      const firstEntered = yield* Deferred.make<void>();
+      const inputs: unknown[] = [];
+      const refreshed = snapshot({ generation: 8 });
+      const client = {
+        [WS_METHODS.vcsRefreshWorktreeCatalog]: (input: unknown) =>
+          Effect.sync(() => {
+            inputs.push(input);
+          }).pipe(
+            Effect.tap(() => Deferred.succeed(firstEntered, undefined)),
+            Effect.andThen(Deferred.await(gate)),
+            Effect.as(refreshed),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(
+        new Map([[ENVIRONMENT_ONE, client]]),
+        new Map([[ENVIRONMENT_ONE, true]]),
+        new Map([[ENVIRONMENT_ONE, false]]),
+      );
+
+      const focus = harness.worktrees.refresh.run(harness.atomRegistry, {
+        environmentId: ENVIRONMENT_ONE,
+        input: { projectId: PROJECT_ID, reason: "focus" },
+      });
+      yield* Deferred.await(firstEntered);
+      const explicit = harness.worktrees.refresh.run(harness.atomRegistry, {
+        environmentId: ENVIRONMENT_ONE,
+        input: { projectId: PROJECT_ID },
+      });
+      yield* Effect.yieldNow;
+      const callsBeforeRelease = inputs.length;
+      yield* Deferred.succeed(gate, undefined);
+      yield* Effect.promise(() => Promise.all([focus, explicit]));
+
+      expect(callsBeforeRelease).toBe(2);
+      expect(inputs).toEqual([{ projectId: PROJECT_ID }, { projectId: PROJECT_ID }]);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("coalesces concurrent focus refreshes for one physical project", () =>
     Effect.gen(function* () {
       const gate = yield* Deferred.make<void>();
       const entered = yield* Deferred.make<void>();
@@ -894,7 +1008,7 @@ describe("worktree adoption commands", () => {
       const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
       const input = {
         environmentId: ENVIRONMENT_ONE,
-        input: { projectId: PROJECT_ID },
+        input: { projectId: PROJECT_ID, reason: "focus" as const },
       };
 
       const first = harness.worktrees.refresh.run(harness.atomRegistry, input);

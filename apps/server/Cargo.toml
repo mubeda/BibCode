@@ -24,6 +24,7 @@ getrandom.workspace = true
 hmac.workspace = true
 httpdate.workspace = true
 mime_guess.workspace = true
+notify.workspace = true
 open.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true

@@ -3,7 +3,7 @@ import {
   scopedThreadKey,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
-import type { VcsStatusResult } from "@bibcode/contracts";
+import type { VcsStatusResult, VcsStatusSummary } from "@bibcode/contracts";
 import { CloudIcon, FolderGit2Icon, GitPullRequestIcon, TerminalIcon } from "lucide-react";
 import { useMemo } from "react";
 import { useEnvironment, usePrimaryEnvironmentId } from "../state/environments";
@@ -31,7 +31,8 @@ export interface TerminalStatusIndicator {
   pulse: boolean;
 }
 
-export type ThreadPr = VcsStatusResult["pr"];
+type ThreadVcsStatus = VcsStatusResult | VcsStatusSummary;
+export type ThreadPr = ThreadVcsStatus["pr"];
 
 export function prStatusIndicator(
   pr: ThreadPr,
@@ -73,13 +74,20 @@ export function ChangeRequestStatusIcon({ className }: { className?: string }) {
 
 export function resolveThreadPr(
   threadBranch: string | null,
-  gitStatus: VcsStatusResult | null,
+  gitStatus: ThreadVcsStatus | null,
 ): ThreadPr | null {
   if (threadBranch === null || gitStatus === null || gitStatus.refName !== threadBranch) {
     return null;
   }
 
-  return gitStatus.pr ?? null;
+  const pr = gitStatus.pr;
+  if (pr === null) {
+    return null;
+  }
+  if ("provider" in pr && gitStatus.sourceControlProvider?.kind !== pr.provider) {
+    return null;
+  }
+  return pr;
 }
 
 export function terminalStatusFromRunningIds(
@@ -200,7 +208,7 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
   const gitCwd = thread.worktreePath ?? threadProjectCwd;
   const gitStatus = useEnvironmentQuery(
     thread.branch != null && gitCwd !== null
-      ? vcsEnvironment.status({
+      ? vcsEnvironment.summary({
           environmentId: thread.environmentId,
           input: { cwd: gitCwd },
         })

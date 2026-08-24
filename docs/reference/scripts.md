@@ -40,7 +40,10 @@ state kind.
   modern RELR-enabled system libraries; Windows and macOS inherit the caller's
   environment unchanged.
 - `vp run build:marketing`: build the Astro marketing site.
-- `vp run build:contracts`: build the schema-only contracts package.
+- `vp run check:contracts`: typecheck the schema-only contracts package, verify
+  deterministic RPC fixture export, regenerate the fixtures, and run the
+  TypeScript/Rust RPC parity and Rust fixture round-trip checks. It does not
+  create a distributable contracts build.
 - `vp check`: run the Vite+ formatting and lint checks.
 - `vp run fmt` / `vp run fmt:check`: write or verify Vite+ formatting.
 - `vp run lint`: run Vite+ linting with unused-disable reporting.
@@ -96,6 +99,13 @@ web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.
   under `.repos`; pass `-- --repo <id>` to synchronize one entry.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
   process-tree measurements.
+- `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the
+  current-source server VCS idle-process measurement plus the production-Atom
+  foreground queue benchmark. It defaults to 600 seconds and writes all
+  machine-specific evidence and an isolated Cargo target to a unique temporary
+  directory, selecting exact executables from Cargo artifact JSON even when a
+  target triple is configured; use `--duration-ms` only for short harness
+  validation.
 - `vp run clean`: remove generated dependency, build, target, and Vite+ cache
   directories. This is destructive to local build output.
 

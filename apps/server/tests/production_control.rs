@@ -386,7 +386,7 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
 
     assert_eq!(settings["enableAssistantStreaming"], false);
     assert_eq!(settings["enableProviderUpdateChecks"], true);
-    assert_eq!(settings["automaticGitFetchInterval"], 30_000);
+    assert_eq!(settings["automaticGitFetchInterval"], 180_000);
     assert_eq!(
         settings["textGenerationModelSelection"]["model"],
         "gpt-5.4-mini"

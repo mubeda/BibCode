@@ -248,7 +248,7 @@ impl WorkspacePreviewRpcServices {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(interrupted_error(&method)),
-            result = self.workspace.handle(&method, payload) => {
+            result = self.workspace.handle_with_cancellation(&method, payload, cancellation.clone()) => {
                 if method == "review.getDiffPreview" {
                     result.and_then(normalize_review_result)
                 } else {

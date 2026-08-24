@@ -19,6 +19,9 @@
           "storageInstanceId": "00000000-0000-4000-8000-000000000002",
           "capabilities": {
             "repositoryIdentity": true,
+            "worktreeCatalog": true,
+            "worktreeCatalogRefreshReason": true,
+            "vcsStatusSummary": true,
             "activityProtocolVersion": 2
           }
         }

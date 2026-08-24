@@ -365,6 +365,7 @@ describe("Rust RPC fixture parity", () => {
         { name: "activity.cancelSubtree", mode: "unary" },
         { name: "activity.retrySubtreeCancellation", mode: "unary" },
         { name: "subscribeActivity", mode: "stream" },
+        { name: "subscribeVcsStatusSummary", mode: "stream" },
         { name: "subscribeWorktreeCatalog", mode: "stream" },
         { name: "vcs.refreshWorktreeCatalog", mode: "unary" },
         { name: "worktree.updateDiscoveryPolicy", mode: "unary" },

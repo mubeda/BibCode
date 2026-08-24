@@ -2222,9 +2222,10 @@ async fn modified_submodule_is_reported_and_malformed_metadata_has_diagnostics()
 }
 
 #[tokio::test]
-async fn broadcaster_cancellation_closes_subscription_and_missing_paths_report_errors() {
+async fn broadcaster_cancellation_closes_subscription_and_missing_paths_report_local_status_errors()
+{
     if relaunch_with_isolated_git_config(
-        "broadcaster_cancellation_closes_subscription_and_missing_paths_report_errors",
+        "broadcaster_cancellation_closes_subscription_and_missing_paths_report_local_status_errors",
     ) {
         return;
     }
@@ -2257,7 +2258,10 @@ async fn broadcaster_cancellation_closes_subscription_and_missing_paths_report_e
         Ok(_) => panic!("missing repository path cannot start a subscription"),
         Err(error) => error,
     };
-    assert_eq!(error.operation.as_ref(), "GitVcsDriver.detectRepository");
+    assert_eq!(
+        error.operation.as_ref(),
+        "GitVcsDriver.statusDetailsLocal.status"
+    );
     assert!(error.detail.contains("failed to spawn git"));
 }
 

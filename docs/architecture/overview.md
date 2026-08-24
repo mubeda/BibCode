@@ -57,11 +57,95 @@ flowchart TB
   idle eviction. Project and repository lifecycle epochs make poller
   initialization transferable across subscriber aborts and prevent canceled
   prior-lifecycle work from publishing into an immediate reattachment.
-  Each live VCS-status repository entry gives coalesced local mutation
-  invalidations and its delayed fallback scan one local worker independent of
-  remote and ref refresh work. A slow fetch or remote probe therefore cannot
-  delay editor-save status publication; the final subscriber cancels both
-  worker lifecycles through the repository entry's shared cancellation owner.
+  For an already trusted repository, Focus may reuse that observation when two
+  bounded, no-follow Git-admin fingerprint passes match the proof captured
+  before its last successful real scan. Unknown or changed proofs fail open to
+  Git; Explicit requests always scan; and Focus reconciles with real inventory
+  at exactly five minutes from the last successful real-scan completion. Reuse
+  still rebuilds the project join, suppressions, availability, generation, and
+  healthy-publication effects. Managed create, retarget, and removal invalidate
+  the shared proof only after their terminal durable settlement, while managed
+  creation retains its bounded path suppression.
+  VCS status has one server-owned coordination entry per canonical worktree.
+  Local and full reads are shared independently, each caller retains its own
+  cancellation lease, and only final-lease release or a lifecycle/mutation
+  fence cancels the physical read. A read gate and checked mutation epoch
+  prevent work admitted before or during a mutation from publishing afterward;
+  post-fetch remote reads and pull-request enrichment carry that same epoch
+  through their final internal publication or delivery check without changing
+  public status schemas. Cached remote state additionally carries its producing
+  ref identity; an external ref change clears it and resets branch-specific
+  client remote fields before reconciliation;
+  the final idle transition across a queued mutation burst requests one
+  coalesced trailing local refresh before reopening the gate. The local fallback
+  scheduler remains independent from remote reconciliation, so a slow fetch or
+  remote probe cannot delay editor-save status publication.
+
+  Active status subscriptions resolve the canonical worktree, Git directory,
+  and common directory in one bounded Git read, then install execution-host
+  native watches before the initial local snapshot read. Working-tree and Git
+  metadata signals collapse at a 125 ms trailing edge, with exactly one trailing
+  read retained when signals arrive during a physical read. Overflow, watcher
+  loss, and setup unavailability are sticky fallback states; they preserve the
+  subscription and cannot be cleared by a later ordinary event. Active
+  subscriptions also retain a completion-based safety read after the greater of
+  60 seconds or four times the last completed read duration, capped at 300
+  seconds. Explicit mutation, workspace, focus/menu catch-up, and structured
+  terminal-process exit invalidations remain immediate; automatic fetch and
+  post-fetch remote reconciliation remain independent. There is no periodic
+  `symbolic-ref` worker; watcher and safety local observations carry branch
+  identity in their porcelain result.
+
+  Final status-subscriber release retires the worktree epoch, scheduler,
+  watcher, reads, and lifecycle tasks before an immediate reattachment may
+  create a fresh watcher generation. Server shutdown closes subscription and
+  read admission and awaits owned setup, physical reads, and lifecycle tasks.
+  A completed terminal launched as a structured BiBCode command notifies the
+  deepest active canonical worktree ancestor after terminal exit publication;
+  provider, session, and delivery events do not. Commands typed inside a
+  persistent interactive shell have no structured completion boundary and
+  therefore converge through native watcher events or the safety read. Native
+  watching covers only filesystem paths visible to the server execution host;
+  remote-host changes outside that boundary require an explicit invalidation or
+  safety convergence.
+
+  One status observation reads porcelain-v2 branch and file state once and runs
+  staged or unstaged numstat only for areas that are present. A failed porcelain
+  read becomes the compatible non-repository result only after the existing
+  repository probe confirms that state; malformed metadata, permissions,
+  cancellation, and other actionable failures remain errors. Status and
+  background-observation Git reads set `GIT_OPTIONAL_LOCKS=0`; fetch and
+  mutations keep the ordinary Git environment.
+
+  Passive VCS summaries use a separate latest-value producer per canonical
+  worktree. One porcelain-v2 status read supplies repository, named/detached or
+  unborn identity, and dirty state without numstat or file-row materialization;
+  the existing bounded origin-provider read and pull-request service add
+  provider and matching named-branch PR state. Each producer cycle publishes
+  its fresh base before optional PR enrichment. A PR completed in cycle N may
+  be carried only into cycle N+1 for the same ref and provider while that
+  cycle's enrichment is pending or fails; the publication keeps the PR's
+  original `observedAt` and sets `stale: true`, then expires it in cycle N+2
+  unless enrichment refreshed it. The carried value is only the prior PR, not
+  necessarily the exact prior summary: current local and provider base fields
+  still come from the fresh cycle. Missing provider configuration and an empty
+  provider PR list are successful absence. An operational Git or provider-
+  discovery failure before a fresh base retains the exact prior summary and
+  observation time as stale. Subscribers share the producer, refresh after 30
+  seconds, and cancel and await in-flight Git or provider work when the final
+  subscriber leaves. This path never starts automatic fetch.
+
+  Automatic fetch has a separate owner per canonical Git common directory. A
+  subscribed worktree resolves that identity with one bounded read for its
+  lifecycle. Each interval performs at most one repository-wide upstream
+  discovery and one exact single- or multi-remote fetch, then signals every
+  attached worktree to compute its own branch, upstream, default-ref, provider,
+  and pull-request result. The default interval is 180 seconds; live changes,
+  bounded failure backoff, and `0 = disabled` remain supported. The client keeps
+  serial mutation ordering but runs
+  `vcs.refreshStatus` on a separate latest-per-environment/worktree lane, so
+  focus, visible-document, menu-open, and post-action freshness cannot queue a
+  mutation behind an active read.
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment. A
   scan leader moves the repository single-flight guard into repository-owned
@@ -92,6 +176,7 @@ flowchart TB
   therefore skip that sweep: provider and terminal owners still stop their
   registered processes, while host-owned children remain under the host
   lifecycle.
+
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

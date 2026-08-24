@@ -1,4 +1,5 @@
 mod availability;
+pub(crate) mod fingerprint;
 mod model;
 mod service;
 

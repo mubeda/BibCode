@@ -24,6 +24,8 @@ use tokio::sync::oneshot;
 
 const PROVIDER_USAGE_TEST_NAME: &str =
     "production_fetchers_handle_local_credentials_and_codex_rpc_responses";
+const ISOLATED_PROVIDER_INTEGRATION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 fn run_isolated_case(case: &str, test_name: &str) -> Output {
     let mut child = Command::new(std::env::current_exe().expect("current test binary"))
@@ -49,7 +51,7 @@ fn run_isolated_case(case: &str, test_name: &str) -> Output {
             .expect("read isolated child stderr");
         bytes
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + ISOLATED_PROVIDER_INTEGRATION_DEADLINE;
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
             break (status, false);

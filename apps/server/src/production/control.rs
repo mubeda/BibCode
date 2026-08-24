@@ -1585,7 +1585,7 @@ fn automatic_git_fetch_interval(settings: &Value) -> Duration {
         .get("automaticGitFetchInterval")
         .and_then(Value::as_f64)
     else {
-        return Duration::from_secs(30);
+        return Duration::from_secs(180);
     };
     Duration::try_from_secs_f64(milliseconds / 1_000.0).unwrap_or(Duration::MAX)
 }
@@ -1927,7 +1927,7 @@ fn apply_settings_defaults(settings: &mut Value) {
             "enableProviderUpdateChecks": true,
             "enableChatAgentActivity": true,
             "enableTerminalAgentActivity": false,
-            "automaticGitFetchInterval": 30_000,
+            "automaticGitFetchInterval": 180_000,
             "defaultThreadEnvMode": "local",
             "newWorktreesStartFromOrigin": false,
             "worktreeBaseDirectory": "",
@@ -2149,6 +2149,8 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "capabilities": {
             "repositoryIdentity": true,
             "worktreeCatalog": true,
+            "worktreeCatalogRefreshReason": true,
+            "vcsStatusSummary": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
         },
     })
@@ -2368,6 +2370,28 @@ mod tests {
         executable: PathBuf,
     }
 
+    async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
+        let release_directory =
+            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
+        tokio::fs::create_dir_all(&release_directory)
+            .await
+            .expect("create Cursor release directory");
+        tokio::fs::write(release_directory.join("version-state"), version)
+            .await
+            .expect("write Cursor version state");
+        let executable =
+            release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
+        let fixture = compiled_cursor_update_fixture().await;
+        tokio::fs::copy(&fixture.executable, &executable)
+            .await
+            .expect("copy compiled Cursor update fixture");
+        executable
+    }
+
+    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+        compile_cursor_update_fixture(directory, "9.8.7").await
+    }
+
     static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
         OnceCell::const_new();
 
@@ -2401,24 +2425,6 @@ mod tests {
                 }
             })
             .await
-    }
-
-    async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
-        let release_directory =
-            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
-        tokio::fs::create_dir_all(&release_directory)
-            .await
-            .expect("create Cursor release directory");
-        tokio::fs::write(release_directory.join("version-state"), version)
-            .await
-            .expect("write Cursor version state");
-        let executable =
-            release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
-        let fixture = compiled_cursor_update_fixture().await;
-        tokio::fs::copy(&fixture.executable, &executable)
-            .await
-            .expect("copy compiled Cursor update fixture");
-        executable
     }
 
     #[tokio::test]
@@ -2455,10 +2461,6 @@ mod tests {
             String::from_utf8_lossy(&after.stdout).trim(),
             r#"{"cliVersion":"2026.08.04-aaa8809"}"#
         );
-    }
-
-    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
-        compile_cursor_update_fixture(directory, "9.8.7").await
     }
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
@@ -4997,6 +4999,11 @@ mod tests {
         let descriptor = environment_descriptor(&config, false);
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["worktreeCatalog"], true);
+        assert_eq!(
+            descriptor["capabilities"]["worktreeCatalogRefreshReason"],
+            true
+        );
+        assert_eq!(descriptor["capabilities"]["vcsStatusSummary"], true);
     }
 
     #[tokio::test]
@@ -5048,6 +5055,10 @@ mod tests {
 
         let snapshot = control.config_snapshot().await;
         assert_eq!(snapshot["environment"]["environmentId"], "environment-1");
+        assert_eq!(
+            snapshot["environment"]["capabilities"]["worktreeCatalogRefreshReason"],
+            true
+        );
         assert_eq!(snapshot["auth"]["policy"], "test");
         assert!(!current_directory(&config).is_empty());
         assert!(!platform_os().is_empty());
@@ -5057,6 +5068,10 @@ mod tests {
         );
         assert_eq!(
             environment_descriptor(&config, false)["capabilities"]["worktreeCatalog"],
+            true
+        );
+        assert_eq!(
+            environment_descriptor(&config, false)["capabilities"]["worktreeCatalogRefreshReason"],
             true
         );
         let _ = available_editors();
