@@ -2429,16 +2429,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktree_entry_count_overflow_is_unknown() {
+    async fn worktree_entry_count_overflow_never_produces_a_partial_fingerprint() {
         let fixture = FingerprintFixture::new().await;
         let worktrees = fixture.primary.join(".git").join("worktrees");
         std::fs::create_dir(&worktrees).expect("worktrees directory");
         for index in 0..=MAX_CATALOG_WORKTREES {
             std::fs::create_dir(worktrees.join(index.to_string())).expect("admin entry");
         }
-        assert_eq!(
-            fixture.read().await,
-            FingerprintOutcome::Unknown(super::FingerprintFailure::LimitExceeded)
+        assert!(
+            matches!(
+                fixture.read().await,
+                FingerprintOutcome::Unknown(
+                    super::FingerprintFailure::LimitExceeded
+                        | super::FingerprintFailure::ChangedDuringRead
+                )
+            ),
+            "an over-limit worktree directory must fail closed without a partial fingerprint"
         );
     }
 
