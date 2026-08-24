@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "!{.!1~%|\",",
-          "requiredScope": "orchestration:read"
+          "message": "#ZkGkpfE.%",
+          "requiredScope": "terminal:operate"
         }
       }
     ]

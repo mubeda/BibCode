@@ -96,7 +96,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId } from "./baseSchemas.ts";
+import { EnvironmentId, NonNegativeInt } from "./baseSchemas.ts";
 import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
@@ -166,17 +166,34 @@ export type DesktopUpdatePhase =
   | "installing"
   | "failed";
 
-export type DesktopUpdateProtectionStatus = "pending" | "protected" | "failed" | "excluded";
+export type DesktopUpdateProtectionStatus =
+  | "pending"
+  | "protected"
+  | "failed"
+  | "excluded"
+  | "skipped";
+
+export type DesktopUpdateProtectionStage =
+  | "waiting-for-mutations"
+  | "quiescing-runtime"
+  | "acquiring-store-lock"
+  | "checkpointing-database"
+  | "creating-verified-backup"
+  | "stopping-backend";
 
 export interface DesktopUpdateProtection {
   environmentId: string;
   label: string;
   status: DesktopUpdateProtectionStatus;
   message: string | null;
+  stage?: DesktopUpdateProtectionStage | null;
+  elapsedMs?: number | null;
+  blockedOperationCount?: number | null;
 }
 
 export interface DesktopUpdateInstallInput {
   excludedEnvironmentIds?: readonly string[];
+  skipProtection?: boolean;
 }
 
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
@@ -202,11 +219,26 @@ export const DesktopUpdatePhaseSchema = Schema.Literals([
   "installing",
   "failed",
 ]);
+export const DesktopUpdateProtectionStageSchema = Schema.Literals([
+  "waiting-for-mutations",
+  "quiescing-runtime",
+  "acquiring-store-lock",
+  "checkpointing-database",
+  "creating-verified-backup",
+  "stopping-backend",
+]);
 export const DesktopUpdateProtectionSchema = Schema.Struct({
   environmentId: Schema.String,
   label: Schema.String,
-  status: Schema.Literals(["pending", "protected", "failed", "excluded"]),
+  status: Schema.Literals(["pending", "protected", "failed", "excluded", "skipped"]),
   message: Schema.NullOr(Schema.String),
+  stage: Schema.NullOr(DesktopUpdateProtectionStageSchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  elapsedMs: Schema.NullOr(NonNegativeInt).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  blockedOperationCount: Schema.NullOr(NonNegativeInt).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 
 export type DesktopProjectDataStatus =

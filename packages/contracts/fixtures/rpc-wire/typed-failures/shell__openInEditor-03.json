@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "arguments",
-          "requiredScope": "access:write"
+          "message": "BWT43-{p8",
+          "requiredScope": "terminal:operate"
         }
       }
     ]

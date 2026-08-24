@@ -560,7 +560,7 @@ async fn process_client_message(
             let admission = match dispatch
                 .registry
                 .admission_gate
-                .admit(rpc_mutability(&request.tag))
+                .admit_named(rpc_mutability(&request.tag), request.tag.clone())
             {
                 Ok(admission) => admission,
                 Err(error) => {

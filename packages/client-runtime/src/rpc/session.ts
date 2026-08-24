@@ -50,6 +50,11 @@ function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptErro
         reason: "permission",
         detail: error.message,
       });
+    case "UpdateMaintenanceActiveError":
+      return new ConnectionTransientErrorClass({
+        reason: "remote-unavailable",
+        detail: error.message,
+      });
     case "KeybindingsConfigParseError":
     case "ServerSettingsError":
       return new ConnectionTransientErrorClass({

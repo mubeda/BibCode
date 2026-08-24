@@ -291,6 +291,18 @@ export class EnvironmentAuthorizationError extends Schema.TaggedErrorClass<Envir
   },
 ) {}
 
+export class UpdateMaintenanceActiveError extends Schema.TaggedErrorClass<UpdateMaintenanceActiveError>()(
+  "UpdateMaintenanceActiveError",
+  {
+    message: Schema.String,
+  },
+) {}
+
+export const EnvironmentRpcError = Schema.Union([
+  EnvironmentAuthorizationError,
+  UpdateMaintenanceActiveError,
+]);
+
 export const AuthAccessStreamClientUpsertedEvent = Schema.Struct({
   version: Schema.Literal(1),
   revision: Schema.Number,

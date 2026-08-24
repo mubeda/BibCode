@@ -94,6 +94,7 @@ afterEach(async () => {
 describe("UpdateProtectionDialog", () => {
   it("never offers exclusion when primary protection failed", async () => {
     const onDiagnostics = vi.fn();
+    const installUpdate = vi.fn();
     await render(
       {
         ...baseState,
@@ -106,7 +107,7 @@ describe("UpdateProtectionDialog", () => {
           },
         ],
       },
-      vi.fn(),
+      installUpdate,
       onDiagnostics,
     );
 
@@ -114,6 +115,21 @@ describe("UpdateProtectionDialog", () => {
     expect(container.textContent).toContain("Retry protection");
     expect(container.textContent).toContain("Diagnostics");
     expect(container.textContent).not.toContain("Exclude Local");
+    const installWithoutBackup = button("Install without backup");
+    const unprotectedInstallGroup = container.querySelector<HTMLElement>(
+      '[role="group"][aria-label="Continue without a backup"]',
+    );
+    expect(unprotectedInstallGroup).not.toBeNull();
+    expect(unprotectedInstallGroup!.contains(installWithoutBackup)).toBe(true);
+    expect(installWithoutBackup.disabled).toBe(true);
+    const acknowledgement = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Acknowledge update without backup"]',
+    );
+    expect(acknowledgement).not.toBeNull();
+    await act(async () => acknowledgement!.click());
+    expect(installWithoutBackup.disabled).toBe(false);
+    await act(async () => installWithoutBackup.click());
+    expect(installUpdate).toHaveBeenCalledWith({ skipProtection: true });
     await act(async () => button("Diagnostics").click());
     expect(onDiagnostics).toHaveBeenCalledOnce();
   });
@@ -148,10 +164,23 @@ describe("UpdateProtectionDialog", () => {
     await render({
       ...baseState,
       phase: "protecting",
-      protection: [{ environmentId: "primary", label: "Local", status: "pending", message: null }],
+      protection: [
+        {
+          environmentId: "primary",
+          label: "Local",
+          status: "pending",
+          message: null,
+          stage: "waiting-for-mutations",
+          elapsedMs: 12_000,
+          blockedOperationCount: 1,
+        },
+      ],
     });
 
     expect(container.textContent).toContain("Protecting Local");
+    expect(container.textContent).toContain("Waiting for active operations");
+    expect(container.textContent).toContain("1 active operation");
+    expect(container.textContent).toContain("12s elapsed");
     expect(button("Protecting projects").disabled).toBe(true);
   });
 });

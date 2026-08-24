@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "e",
-          "requiredScope": "access:write"
+          "message": "apply",
+          "requiredScope": "relay:read"
         }
       }
     ]

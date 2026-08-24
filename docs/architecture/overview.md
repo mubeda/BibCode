@@ -435,10 +435,15 @@ identity and clears its environment cache.
 The Tauri host coordinates update installation across the complete local
 backend topology. It atomically snapshots the running primary and secondary
 backends, prevents a new backend start from entering that snapshot, and keeps
-configured-but-unavailable secondaries visible as unprotected. The primary is
-always required. A user may proceed past a failed secondary only by selecting
-that exact environment in the typed protection dialog; the primary can never
-be excluded.
+configured-but-unavailable secondaries visible as unprotected. Verified backup
+protection is the default and cannot be bypassed on the first install attempt.
+A user may proceed past a failed secondary by selecting that exact environment,
+or proceed without any verified backup only after a protection attempt fails
+and the user explicitly acknowledges the unsafe fallback. The Tauri host, not
+the renderer, enforces that transition. A bypassed attempt still snapshots and
+stops the exact running backend set before invoking the installer, and restarts
+that set if installation fails; it does not call the prepare or commit APIs and
+reports every environment as skipped rather than protected.
 
 Each included backend exposes an authenticated maintenance API only in desktop
 mode. Native desktop runtimes must be loopback-bound. An external WSL runtime
@@ -446,10 +451,18 @@ may use its wildcard bind only when its desktop bootstrap explicitly marks the
 transport as WSL-owned; the ordinary native wildcard case remains denied. The
 maintenance owner admits status and other read traffic, rejects new mutating
 HTTP and WebSocket RPC operations, and keeps a permit until every admitted
-mutation has committed or failed. Preparation then drains existing mutation
-permits with a bound, quiesces runtime-owned writers, queues, providers,
-terminals, and background tasks, checkpoints SQLite's WAL, and publishes and
-reloads a verified `PreUpdate` backup while holding the store-operation lock.
+mutation has committed or failed. RPC mutability comes from the typed method
+inventory; long-lived read streams therefore never hold a mutation permit, and
+unknown methods fail closed as mutations. Each admitted mutation has a bounded,
+sanitized operation label and age for diagnostics, without arguments, query
+values, or payloads. Preparation then drains existing mutation permits with a
+bound, quiesces runtime-owned writers, queues, providers, terminals, and
+background tasks, checkpoints SQLite's WAL, and publishes and reloads a
+verified `PreUpdate` backup while holding the store-operation lock. The host
+polls authenticated maintenance status while preparation is pending and emits
+the current stage, elapsed time, and active-mutation count to the protection
+dialog. A failed status poll does not cancel or replace the authoritative
+prepare request.
 
 Each in-process server runtime owns a distinct bounded process-attribution
 registry shared by its provider, terminal, provider-helper, and managed-endpoint
@@ -605,8 +618,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   topology with stable identity and no endpoint/session. They do not remove
   cached project/thread state; explicit disable or distro replacement does.
 - Desktop update installation requires a verified pre-update backup for the
-  primary and every non-excluded running secondary, stops the captured running
-  set before invoking the installer, and restarts that exact set on failure.
+  primary and every non-excluded running secondary by default. Only a failed
+  protection attempt followed by explicit user acknowledgement may bypass all
+  backups. Protected and bypassed attempts both stop the captured running set
+  before invoking the installer and restart that exact set on failure.
   In-process backend shutdown preserves desktop-owned WebView descendants.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.

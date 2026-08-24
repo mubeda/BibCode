@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use crate::{
         StoreOperationGuard, create_verified_backup,
     },
     production::runtime::ProductionRuntime,
+    rpc::{MethodMutability, method_mutability},
 };
 
 pub const MAINTENANCE_UPDATE_PREPARE_PATH: &str = "/api/maintenance/update/prepare";
@@ -25,6 +26,8 @@ pub const MAINTENANCE_UPDATE_STATUS_PATH: &str = "/api/maintenance/update/status
 pub const DESKTOP_MAINTENANCE_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
 
 const SHUTDOWN_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(25);
+const MAX_ADMISSION_BLOCKERS: usize = 16;
+const MAX_OPERATION_LABEL_CHARS: usize = 160;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RpcMutability {
@@ -35,47 +38,9 @@ pub enum RpcMutability {
 /// Central classification for the typed RPC inventory. Unknown methods fail safe as mutations.
 #[must_use]
 pub fn rpc_mutability(method: &str) -> RpcMutability {
-    match method {
-        "activity.getSnapshot"
-        | "activity.listDetail"
-        | "activity.listRoster"
-        | "assets.createUrl"
-        | "cloud.getRelayClientStatus"
-        | "filesystem.browse"
-        | "orchestration.getArchivedShellSnapshot"
-        | "orchestration.getFullThreadDiff"
-        | "orchestration.getTurnDiff"
-        | "orchestration.replayEvents"
-        | "orchestration.subscribeShell"
-        | "orchestration.subscribeThread"
-        | "preview.list"
-        | "projects.listEntries"
-        | "projects.readFile"
-        | "projects.searchEntries"
-        | "review.getDiffPreview"
-        | "server.discoverSourceControl"
-        | "server.getConfig"
-        | "server.getProcessDiagnostics"
-        | "server.getProcessResourceHistory"
-        | "server.getProviderUsage"
-        | "server.getSettings"
-        | "server.getTraceDiagnostics"
-        | "sourceControl.lookupRepository"
-        | "subscribeActivity"
-        | "subscribeAuthAccess"
-        | "subscribeDiscoveredLocalServers"
-        | "subscribeProjectEntries"
-        | "subscribePreviewEvents"
-        | "subscribeServerConfig"
-        | "subscribeServerLifecycle"
-        | "subscribeTerminalEvents"
-        | "subscribeTerminalMetadata"
-        | "subscribeVcsStatus"
-        | "subscribeVcsStatusSummary"
-        | "vcs.listCommits"
-        | "vcs.listRefs"
-        | "vcs.refreshStatus" => RpcMutability::Read,
-        _ => RpcMutability::Mutation,
+    match method_mutability(method) {
+        Some(MethodMutability::Read) => RpcMutability::Read,
+        Some(MethodMutability::Mutation) | None => RpcMutability::Mutation,
     }
 }
 
@@ -102,8 +67,10 @@ pub fn http_mutability(method: &str, path: &str) -> RpcMutability {
 pub enum MaintenanceError {
     #[error("persistent mutations are closed for desktop update maintenance")]
     AdmissionClosed,
-    #[error("timed out while draining {in_flight} admitted mutations")]
-    DrainTimeout { in_flight: u64 },
+    #[error(
+        "timed out while draining {in_flight} admitted mutations; blocking operations: {blockers}"
+    )]
+    DrainTimeout { in_flight: u64, blockers: String },
     #[error("update preparation failed: {0}")]
     Preparation(String),
     #[error("the update maintenance operation does not match the active operation")]
@@ -127,6 +94,28 @@ struct AdmissionState {
     closed: bool,
     in_flight: u64,
     drain_count: u64,
+    next_permit_id: u64,
+    active: BTreeMap<u64, ActiveMutation>,
+}
+
+#[derive(Debug)]
+struct ActiveMutation {
+    operation: String,
+    admitted_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionBlocker {
+    pub operation: String,
+    pub age_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionSnapshot {
+    pub in_flight: u64,
+    pub blockers: Vec<AdmissionBlocker>,
 }
 
 impl Default for RpcAdmissionGate {
@@ -144,6 +133,8 @@ impl RpcAdmissionGate {
                     closed: false,
                     in_flight: 0,
                     drain_count: 0,
+                    next_permit_id: 0,
+                    active: BTreeMap::new(),
                 }),
                 drained: Notify::new(),
             }),
@@ -151,6 +142,14 @@ impl RpcAdmissionGate {
     }
 
     pub fn admit(&self, mutability: RpcMutability) -> Result<RpcPermit, MaintenanceError> {
+        self.admit_named(mutability, "unnamed mutation")
+    }
+
+    pub fn admit_named(
+        &self,
+        mutability: RpcMutability,
+        operation: impl Into<String>,
+    ) -> Result<RpcPermit, MaintenanceError> {
         if mutability == RpcMutability::Read {
             return Ok(RpcPermit { _lease: None });
         }
@@ -162,10 +161,32 @@ impl RpcAdmissionGate {
         if state.closed {
             return Err(MaintenanceError::AdmissionClosed);
         }
+        state.next_permit_id = state.next_permit_id.wrapping_add(1).max(1);
+        let permit_id = state.next_permit_id;
         state.in_flight = state.in_flight.saturating_add(1);
+        state.active.insert(
+            permit_id,
+            ActiveMutation {
+                operation: normalized_operation_label(operation.into()),
+                admitted_at: Instant::now(),
+            },
+        );
         Ok(RpcPermit {
-            _lease: Some(Arc::new(RpcPermitLease { gate: self.clone() })),
+            _lease: Some(Arc::new(RpcPermitLease {
+                gate: self.clone(),
+                permit_id,
+            })),
         })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("RPC admission mutex poisoned");
+        admission_snapshot(&state)
     }
 
     pub async fn close_and_drain(&self, deadline: Instant) -> Result<u64, MaintenanceError> {
@@ -196,7 +217,22 @@ impl RpcAdmissionGate {
                 return Ok(drain_count);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Err(MaintenanceError::DrainTimeout { in_flight });
+                let snapshot = self.snapshot();
+                let blockers = snapshot
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{} ({}ms)", blocker.operation, blocker.age_ms))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    in_flight = snapshot.in_flight,
+                    blockers,
+                    "desktop update maintenance mutation drain timed out"
+                );
+                return Err(MaintenanceError::DrainTimeout {
+                    in_flight: snapshot.in_flight,
+                    blockers,
+                });
             }
         }
     }
@@ -212,20 +248,54 @@ impl RpcAdmissionGate {
         Ok(())
     }
 
-    fn permit_released(&self) {
+    fn permit_released(&self, permit_id: u64) {
         let notify = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .expect("RPC admission mutex poisoned");
-            debug_assert!(state.in_flight > 0);
-            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.active.remove(&permit_id).is_some() {
+                debug_assert!(state.in_flight > 0);
+                state.in_flight = state.in_flight.saturating_sub(1);
+            }
             state.in_flight == 0
         };
         if notify {
             self.inner.drained.notify_waiters();
         }
+    }
+}
+
+fn normalized_operation_label(operation: String) -> String {
+    let single_line = operation.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return "unknown mutation".to_owned();
+    }
+    if single_line.chars().count() <= MAX_OPERATION_LABEL_CHARS {
+        return single_line;
+    }
+    let mut bounded = single_line
+        .chars()
+        .take(MAX_OPERATION_LABEL_CHARS - 1)
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn admission_snapshot(state: &AdmissionState) -> AdmissionSnapshot {
+    AdmissionSnapshot {
+        in_flight: state.in_flight,
+        blockers: state
+            .active
+            .values()
+            .take(MAX_ADMISSION_BLOCKERS)
+            .map(|mutation| AdmissionBlocker {
+                operation: mutation.operation.clone(),
+                age_ms: u64::try_from(mutation.admitted_at.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            })
+            .collect(),
     }
 }
 
@@ -236,11 +306,12 @@ pub struct RpcPermit {
 
 struct RpcPermitLease {
     gate: RpcAdmissionGate,
+    permit_id: u64,
 }
 
 impl Drop for RpcPermitLease {
     fn drop(&mut self) {
-        self.gate.permit_released();
+        self.gate.permit_released(self.permit_id);
     }
 }
 
@@ -257,12 +328,30 @@ pub struct PrepareForUpdateResult {
 #[derive(Clone, Debug)]
 enum UpdatePhase {
     Idle,
-    Preparing(Uuid),
+    Preparing(PreparingUpdate),
     Prepared(PrepareForUpdateResult),
     Committed(Uuid),
     Cancelled(Uuid),
     Failed,
     Expired(Uuid),
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum UpdatePreparationStage {
+    WaitingForMutations,
+    QuiescingRuntime,
+    AcquiringStoreLock,
+    CheckpointingDatabase,
+    CreatingVerifiedBackup,
+}
+
+#[derive(Clone, Debug)]
+struct PreparingUpdate {
+    operation_id: Uuid,
+    stage: UpdatePreparationStage,
+    started_at: Instant,
+    deadline: Instant,
 }
 
 pub struct UpdateMaintenance {
@@ -312,7 +401,7 @@ impl UpdateMaintenance {
     }
 
     pub async fn prepare(self: &Arc<Self>) -> Result<PrepareForUpdateResult, MaintenanceError> {
-        let operation_id = loop {
+        let preparing = loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -325,8 +414,18 @@ impl UpdateMaintenance {
                 }
                 UpdatePhase::Idle => {
                     let operation_id = Uuid::new_v4();
-                    *state = UpdatePhase::Preparing(operation_id);
-                    break operation_id;
+                    let started_at = Instant::now();
+                    let deadline = started_at.checked_add(self.drain_timeout).ok_or_else(|| {
+                        MaintenanceError::Preparation("deadline overflow".to_owned())
+                    })?;
+                    let preparing = PreparingUpdate {
+                        operation_id,
+                        stage: UpdatePreparationStage::WaitingForMutations,
+                        started_at,
+                        deadline,
+                    };
+                    *state = UpdatePhase::Preparing(preparing.clone());
+                    break preparing;
                 }
                 UpdatePhase::Committed(_)
                 | UpdatePhase::Cancelled(_)
@@ -335,12 +434,12 @@ impl UpdateMaintenance {
             }
         };
 
-        let prepared = self.prepare_once(operation_id).await;
+        let prepared = self.prepare_once(&preparing).await;
         match prepared {
             Ok(result) => {
                 *self.state.lock().await = UpdatePhase::Prepared(result.clone());
                 self.changed.notify_waiters();
-                self.spawn_lease_expiry(operation_id);
+                self.spawn_lease_expiry(preparing.operation_id);
                 Ok(result)
             }
             Err(error) => {
@@ -354,27 +453,45 @@ impl UpdateMaintenance {
 
     async fn prepare_once(
         &self,
-        operation_id: Uuid,
+        preparing: &PreparingUpdate,
     ) -> Result<PrepareForUpdateResult, MaintenanceError> {
-        let deadline = Instant::now()
-            .checked_add(self.drain_timeout)
-            .ok_or_else(|| MaintenanceError::Preparation("deadline overflow".to_owned()))?;
+        let deadline = preparing.deadline;
         let drained_operations = self.admission.close_and_drain(deadline).await?;
+        self.set_preparing_stage(
+            preparing.operation_id,
+            UpdatePreparationStage::QuiescingRuntime,
+        )
+        .await;
         tokio::time::timeout_at(deadline, self.runtime.quiesce_for_update())
             .await
             .map_err(|_| MaintenanceError::Preparation("runtime quiesce timed out".to_owned()))?
             .map_err(MaintenanceError::Preparation)?;
 
+        self.set_preparing_stage(
+            preparing.operation_id,
+            UpdatePreparationStage::AcquiringStoreLock,
+        )
+        .await;
         let cancellation = CancellationToken::new();
         let remaining = deadline.saturating_duration_since(Instant::now());
         let _operation_guard =
             StoreOperationGuard::acquire(&self.paths.base_dir, cancellation.clone(), remaining)
                 .await
                 .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
+        self.set_preparing_stage(
+            preparing.operation_id,
+            UpdatePreparationStage::CheckpointingDatabase,
+        )
+        .await;
         self.database
             .checkpoint_wal()
             .await
             .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
+        self.set_preparing_stage(
+            preparing.operation_id,
+            UpdatePreparationStage::CreatingVerifiedBackup,
+        )
+        .await;
         let context = PreparedStore {
             database: self.database.clone(),
             storage_instance_id: self.storage_instance_id,
@@ -399,12 +516,21 @@ impl UpdateMaintenance {
         .format(&Rfc3339)
         .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
         Ok(PrepareForUpdateResult {
-            operation_id: operation_id.to_string(),
+            operation_id: preparing.operation_id.to_string(),
             storage_instance_id: self.storage_instance_id,
             backup_id: backup.manifest.backup_id.to_string(),
             drained_operations,
             expires_at,
         })
+    }
+
+    async fn set_preparing_stage(&self, operation_id: Uuid, stage: UpdatePreparationStage) {
+        let mut state = self.state.lock().await;
+        if let UpdatePhase::Preparing(preparing) = &mut *state
+            && preparing.operation_id == operation_id
+        {
+            preparing.stage = stage;
+        }
     }
 
     fn spawn_lease_expiry(self: &Arc<Self>, operation_id: Uuid) {
@@ -459,24 +585,45 @@ impl UpdateMaintenance {
     }
 
     pub async fn status(&self) -> Value {
-        match &*self.state.lock().await {
-            UpdatePhase::Idle => json!({"phase":"idle","result":null}),
-            UpdatePhase::Preparing(operation_id) => {
-                json!({"phase":"preparing","operationId":operation_id.to_string(),"result":null})
-            }
-            UpdatePhase::Prepared(result) => json!({"phase":"prepared","result":result}),
-            UpdatePhase::Committed(operation_id) => {
-                json!({"phase":"committed","operationId":operation_id.to_string(),"result":null})
-            }
-            UpdatePhase::Cancelled(operation_id) => {
-                json!({"phase":"cancelled","operationId":operation_id.to_string(),"result":null})
-            }
-            UpdatePhase::Failed => json!({"phase":"failed","result":null}),
-            UpdatePhase::Expired(operation_id) => {
-                json!({"phase":"expired","operationId":operation_id.to_string(),"result":null})
-            }
+        let phase = self.state.lock().await.clone();
+        update_status_value(&phase, &self.admission.snapshot(), Instant::now())
+    }
+}
+
+fn update_status_value(phase: &UpdatePhase, admission: &AdmissionSnapshot, now: Instant) -> Value {
+    match phase {
+        UpdatePhase::Idle => json!({"phase":"idle","result":null}),
+        UpdatePhase::Preparing(preparing) => json!({
+            "phase":"preparing",
+            "operationId":preparing.operation_id.to_string(),
+            "stage":preparing.stage,
+            "elapsedMs":duration_millis(now.saturating_duration_since(preparing.started_at)),
+            "remainingMs":duration_millis(preparing.deadline.saturating_duration_since(now)),
+            "inFlightMutations":admission.in_flight,
+            "blockers":admission.blockers,
+            "result":null,
+        }),
+        UpdatePhase::Prepared(result) => json!({"phase":"prepared","result":result}),
+        UpdatePhase::Committed(operation_id) => {
+            json!({"phase":"committed","operationId":operation_id.to_string(),"result":null})
+        }
+        UpdatePhase::Cancelled(operation_id) => {
+            json!({"phase":"cancelled","operationId":operation_id.to_string(),"result":null})
+        }
+        UpdatePhase::Failed => json!({
+            "phase":"failed",
+            "inFlightMutations":admission.in_flight,
+            "blockers":admission.blockers,
+            "result":null,
+        }),
+        UpdatePhase::Expired(operation_id) => {
+            json!({"phase":"expired","operationId":operation_id.to_string(),"result":null})
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[must_use]
@@ -492,4 +639,38 @@ pub(crate) fn maintenance_routes_enabled(config: &ServerConfig) -> bool {
     let desktop_owned_wsl_bind =
         config.desktop_wsl_transport && matches!(config.host.as_str(), "0.0.0.0" | "::");
     local_bind || desktop_owned_wsl_bind
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparing_status_reports_stage_timing_and_bounded_blockers() {
+        let now = Instant::now();
+        let phase = UpdatePhase::Preparing(PreparingUpdate {
+            operation_id: Uuid::nil(),
+            stage: UpdatePreparationStage::WaitingForMutations,
+            started_at: now - Duration::from_millis(250),
+            deadline: now + Duration::from_secs(1),
+        });
+        let admission = AdmissionSnapshot {
+            in_flight: 1,
+            blockers: vec![AdmissionBlocker {
+                operation: "server.updateSettings".to_owned(),
+                age_ms: 500,
+            }],
+        };
+
+        let status = update_status_value(&phase, &admission, now);
+
+        assert_eq!(status["phase"], "preparing");
+        assert_eq!(status["stage"], "waiting-for-mutations");
+        assert_eq!(status["elapsedMs"], 250);
+        assert_eq!(status["remainingMs"], 1_000);
+        assert_eq!(status["inFlightMutations"], 1);
+        assert_eq!(status["blockers"][0]["operation"], "server.updateSettings");
+        assert_eq!(status["blockers"][0]["ageMs"], 500);
+        assert!(status["blockers"][0].get("payload").is_none());
+    }
 }

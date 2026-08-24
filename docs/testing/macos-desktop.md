@@ -48,6 +48,10 @@ Select focused tests from affected source and verify at least:
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
 - Activity observation timestamps and keyboard navigation remain correct; and
+- update protection treats long-lived read subscriptions as reads, reports
+  staged progress and active mutation counts while preparing, rejects a forged
+  first-attempt bypass, and offers the acknowledged no-backup path only after a
+  real protection failure; and
 - app/DMG identity and updater security tests remain green.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
@@ -90,6 +94,15 @@ Run the shared focused and sequential broad/static gate set. Record macOS
 linker, compact-unwind, process-signal, WebKit, signing, and DMG diagnostics
 with their affected test or artifact. Do not suppress a warning without
 classifying it.
+
+For update validation, use an isolated `BIBCODE_HOME` and disposable project.
+Keep a read subscription open while installing an available test update and
+confirm it does not block protection. During a deliberately held mutation,
+confirm the dialog promptly shows the waiting stage, elapsed time, and an
+active-operation count. After the bounded failure, verify that normal retry is
+still the primary action, the no-backup action requires acknowledgement, a
+forged first-attempt bypass is rejected by the native host, and an installer
+failure restarts the exact pre-update backend set.
 
 ## Application and DMG build inspection
 

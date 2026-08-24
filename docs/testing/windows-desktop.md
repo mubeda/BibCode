@@ -62,6 +62,10 @@ Select focused tests from affected source and verify at least:
 - local Windows and WSL presentation follows current environment capability;
 - remote device, SSH, Tailscale, relay, and connection actions do not mount in
   ordinary desktop presentation; and
+- update protection treats long-lived read subscriptions as reads, reports
+  staged progress and active mutation counts while preparing, rejects a forged
+  first-attempt bypass, and offers the acknowledged no-backup path only after a
+  real protection failure; and
 - Claude, Codex, Cursor, and OpenCode are visible while Grok is absent.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
@@ -228,6 +232,16 @@ When WSL is unavailable:
 Do not install a distribution or change system WSL configuration without
 permission. SSH, Tailscale, relay, and remote-device targets remain absent in
 both branches of the matrix.
+
+For update validation, use an isolated `BIBCODE_HOME` and disposable native
+project; include a disposable WSL project when WSL is usable. Keep a read
+subscription open while installing an available test update and confirm it
+does not block protection. During a deliberately held mutation, confirm the
+dialog promptly shows the waiting stage, elapsed time, and an active-operation
+count. After the bounded failure, verify that normal retry is still the primary
+action, the no-backup action requires acknowledgement, a forged first-attempt
+bypass is rejected by the native host, and an installer failure restarts the
+exact pre-update native and WSL backend set.
 
 ## Native tests and static gates
 

@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "_",
+          "message": "\"&(%&=Wzc",
           "requiredScope": "relay:write"
         }
       }

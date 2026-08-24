@@ -1023,12 +1023,20 @@ describe("tauriDesktopBridge", () => {
         state: { status: "disabled" },
       },
     );
+    await expect(bridge.installUpdate({ skipProtection: true })).resolves.toEqual({
+      accepted: false,
+      completed: false,
+      state: { status: "disabled" },
+    });
 
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_check_for_update", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_download_update", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_update", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_update", {
       input: { excludedEnvironmentIds: ["wsl:Ubuntu"] },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_update", {
+      input: { skipProtection: true },
     });
   });
 

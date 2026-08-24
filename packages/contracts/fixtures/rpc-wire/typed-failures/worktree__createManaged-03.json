@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "EnvironmentAuthorizationError",
-          "message": "__proto__",
-          "requiredScope": "relay:write"
+          "message": "dzf&0BfpD",
+          "requiredScope": "orchestration:operate"
         }
       }
     ]

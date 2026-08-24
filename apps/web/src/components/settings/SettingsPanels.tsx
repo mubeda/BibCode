@@ -1135,7 +1135,7 @@ export function TerminalSettingsPanel() {
       <SettingsSection title="Terminal">
         <SettingsRow
           title="Terminal theme"
-          description="Agent TUIs such as Codex paint their own dark panels and never ask the terminal which colours it uses, so a light terminal shows those panels as dark blocks. Keep the terminal dark unless you do not run them. This preference is stored only on this device."
+          description="Agent TUIs such as Codex paint their own dark panels and never ask the terminal which colours it uses, so a light terminal can show those panels as dark blocks. Choose Always dark if you run them. This preference is stored only on this device."
           resetAction={
             settings.terminalThemePreference !==
             DEFAULT_UNIFIED_SETTINGS.terminalThemePreference ? (
@@ -1163,7 +1163,7 @@ export function TerminalSettingsPanel() {
                 <SelectValue>
                   {TERMINAL_THEME_OPTIONS.find(
                     (option) => option.value === settings.terminalThemePreference,
-                  )?.label ?? "Always dark"}
+                  )?.label ?? "Follow app theme"}
                 </SelectValue>
               </SelectTrigger>
               <SelectPopup align="end" alignItemWithTrigger={false}>

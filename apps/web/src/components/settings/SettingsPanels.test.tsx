@@ -668,6 +668,26 @@ describe("GeneralSettingsPanel", () => {
 });
 
 describe("TerminalSettingsPanel", () => {
+  it("renders Follow app theme as the default terminal theme", () => {
+    render(<TerminalSettingsPanel />);
+
+    expect(control("select", "app").props.value).toBe("app");
+  });
+
+  it("resets a changed terminal theme to Follow app theme", () => {
+    h.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      terminalThemePreference: "light",
+    };
+
+    render(<TerminalSettingsPanel />);
+
+    invoke(control("button", "Reset terminal theme to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenCalledWith({
+      terminalThemePreference: "app",
+    });
+  });
+
   it("changes the device-local terminal font preset", () => {
     render(<TerminalSettingsPanel />);
 

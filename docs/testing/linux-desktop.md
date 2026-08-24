@@ -49,6 +49,10 @@ Select focused tests from affected source and verify at least:
 - independent runtimes cannot terminate each other's process roots;
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
+- update protection treats long-lived read subscriptions as reads, reports
+  staged progress and active mutation counts while preparing, rejects a forged
+  first-attempt bypass, and offers the acknowledged no-backup path only after a
+  real protection failure; and
 - Linux AppImage/desktop identity and taskbar behavior remain covered.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
@@ -93,6 +97,16 @@ WebKitGTK, X11, or Wayland diagnostic.
 
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
+
+For update validation, isolate `BIBCODE_HOME` plus XDG config, cache, and data
+roots and use a disposable project. Keep a read subscription open while
+installing an available test update and confirm it does not block protection.
+During a deliberately held mutation, confirm the dialog promptly shows the
+waiting stage, elapsed time, and an active-operation count. After the bounded
+failure, verify that normal retry is still the primary action, the no-backup
+action requires acknowledgement, a forged first-attempt bypass is rejected by
+the native host, and an installer failure restarts the exact pre-update backend
+set.
 
 ## AppImage build and inspection
 
