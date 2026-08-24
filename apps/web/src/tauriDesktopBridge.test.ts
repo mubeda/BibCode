@@ -306,6 +306,8 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
+        worktreeCatalogRefreshReason: false,
+        vcsStatusSummary: false,
         activityProtocolVersion: null,
       },
     },

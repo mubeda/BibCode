@@ -227,7 +227,7 @@
           "activities": [
             {
               "id": "p4+up[~\"!@:e",
-              "tone": "tool",
+              "tone": "info",
               "kind": "._ULzC\\,OU",
               "summary": "D",
               "payload": [
@@ -251,7 +251,7 @@
             },
             {
               "id": "zE0",
-              "tone": "approval",
+              "tone": "error",
               "kind": "XLQ",
               "summary": "h-{Jo\\n",
               "payload": {
@@ -271,7 +271,7 @@
             },
             {
               "id": "{-}s$98",
-              "tone": "tool",
+              "tone": "warning",
               "kind": "RY,x!gRj",
               "summary": "|WyK&0k&R=+@",
               "payload": {
@@ -292,7 +292,7 @@
             },
             {
               "id": "\\S",
-              "tone": "error",
+              "tone": "tool",
               "kind": ".mpa9",
               "summary": ";#C\"%?^\"J<",
               "payload": {
@@ -332,7 +332,7 @@
             },
             {
               "id": "U\\\"+K!",
-              "tone": "error",
+              "tone": "approval",
               "kind": "iB:8:9_VGn",
               "summary": "R<]EL'",
               "payload": [
@@ -455,7 +455,8 @@
             "runtimeMode": "auto-accept-edits",
             "activeTurnId": "ALx&J55Z-'yG",
             "lastError": "e",
-            "updatedAt": "{<V}n1"
+            "lastErrorClass": "validation_error",
+            "updatedAt": "n1X"
           }
         }
       }

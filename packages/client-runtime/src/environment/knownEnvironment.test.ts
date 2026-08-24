@@ -55,6 +55,8 @@ describe("known environment bootstrap helpers", () => {
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
+        worktreeCatalogRefreshReason: false,
+        vcsStatusSummary: false,
         activityProtocolVersion: 2,
       },
     } satisfies ExecutionEnvironmentDescriptor;
@@ -82,6 +84,8 @@ describe("known environment bootstrap helpers", () => {
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
+        worktreeCatalogRefreshReason: false,
+        vcsStatusSummary: false,
         activityProtocolVersion: null,
       },
     } satisfies ExecutionEnvironmentDescriptor;

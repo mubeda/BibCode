@@ -24,6 +24,8 @@ use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 const CREATED_AT: &str = "2026-07-14T10:00:00.000Z";
+const RPC_RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
+const REAL_GIT_RPC_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 
 struct Harness {
     _temp: TempDir,
@@ -779,7 +781,7 @@ async fn project_create_can_initialize_git_before_registration() {
         let mut socket = harness.connect().await;
         let workspace = harness._temp.path().join("git-project");
 
-        dispatch_command(
+        dispatch_real_git_command(
             &mut socket,
             "1",
             json!({
@@ -967,7 +969,7 @@ async fn project_create_resolves_home_relative_paths_and_reuses_canonical_duplic
         );
 
         let created = home_temp.path().join("created");
-        let created_result = dispatch_command(
+        let created_result = dispatch_real_git_command(
             &mut socket,
             "13",
             json!({
@@ -986,7 +988,7 @@ async fn project_create_resolves_home_relative_paths_and_reuses_canonical_duplic
         assert!(created.join(".git").is_dir());
 
         let backslash_created = home_temp.path().join("backslash-created");
-        let backslash_created_result = dispatch_command(
+        let backslash_created_result = dispatch_real_git_command(
             &mut socket,
             "16",
             json!({
@@ -1096,7 +1098,8 @@ async fn failed_git_initialization_does_not_register_project() {
             }),
         )
         .await;
-        let error = expect_failure(&mut socket, "1").await;
+        let error =
+            expect_failure_with_deadline(&mut socket, "1", REAL_GIT_RPC_RESPONSE_DEADLINE).await;
         assert_eq!(error["_tag"], json!("InvalidRequest"));
 
         let snapshot = load_snapshot(&harness.engine.repositories())
@@ -2006,6 +2009,15 @@ async fn dispatch_command(
     unary_success(socket, request_id, "orchestration.dispatchCommand", payload).await
 }
 
+async fn dispatch_real_git_command(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    request_id: &str,
+    payload: Value,
+) -> Value {
+    rpc_request(socket, request_id, "orchestration.dispatchCommand", payload).await;
+    expect_success_with_deadline(socket, request_id, REAL_GIT_RPC_RESPONSE_DEADLINE).await
+}
+
 async fn unary_success(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     request_id: &str,
@@ -2067,7 +2079,15 @@ async fn expect_success(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     request_id: &str,
 ) -> Value {
-    let message = next_server_message(socket).await;
+    expect_success_with_deadline(socket, request_id, RPC_RESPONSE_DEADLINE).await
+}
+
+async fn expect_success_with_deadline(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    request_id: &str,
+    deadline: Duration,
+) -> Value {
+    let message = next_server_message_with_deadline(socket, deadline).await;
     match message {
         ServerMessage::Exit {
             request_id: actual_request_id,
@@ -2084,7 +2104,15 @@ async fn expect_failure(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     request_id: &str,
 ) -> Value {
-    let message = next_server_message(socket).await;
+    expect_failure_with_deadline(socket, request_id, RPC_RESPONSE_DEADLINE).await
+}
+
+async fn expect_failure_with_deadline(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    request_id: &str,
+    deadline: Duration,
+) -> Value {
+    let message = next_server_message_with_deadline(socket, deadline).await;
     match message {
         ServerMessage::Exit {
             request_id: actual_request_id,
@@ -2161,7 +2189,14 @@ async fn send_json(
 async fn next_server_message(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
 ) -> ServerMessage {
-    let message = timeout(Duration::from_secs(2), socket.next())
+    next_server_message_with_deadline(socket, RPC_RESPONSE_DEADLINE).await
+}
+
+async fn next_server_message_with_deadline(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    deadline: Duration,
+) -> ServerMessage {
+    let message = timeout(deadline, socket.next())
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")

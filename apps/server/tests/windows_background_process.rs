@@ -1,23 +1,44 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
-use std::{process::Stdio, thread, time::Duration};
+use std::{path::Path, process::Stdio, time::Duration};
 
 use bibcode_server::process::{
     configure_background_command, configure_supervised_background_command_wrap,
 };
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
-use windows_sys::Win32::{
-    Foundation::GetLastError,
-    System::Console::{AttachConsole, FreeConsole, GetConsoleWindow},
-    UI::WindowsAndMessaging::IsWindowVisible,
-};
+use windows_sys::Win32::System::Console::GetConsoleWindow;
+
+const CONSOLE_PROBE_CHILD_ENV: &str = "BIBCODE_TEST_GUI_CONSOLE_PROBE_CHILD";
+const CONSOLE_PROBE_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
+const NO_CONSOLE_MARKER: &str = "no-console";
+
+#[test]
+fn gui_console_probe_child_fixture() {
+    let Ok(marker_path) = std::env::var(CONSOLE_PROBE_CHILD_ENV) else {
+        return;
+    };
+    // SAFETY: GetConsoleWindow takes no arguments and only reads this fixture
+    // process's console association.
+    let marker = if unsafe { GetConsoleWindow() }.is_null() {
+        NO_CONSOLE_MARKER
+    } else {
+        "console"
+    };
+    std::fs::write(marker_path, marker).expect("console probe marker should be written");
+    std::thread::sleep(Duration::from_secs(30));
+}
 
 #[tokio::test]
 async fn direct_background_command_has_no_console_window_from_gui_parent() {
-    let mut command = tokio::process::Command::new("cmd.exe");
+    let directory = tempfile::tempdir().expect("console probe temporary directory");
+    let marker_path = directory.path().join("direct-console-probe.txt");
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("current test executable should resolve"),
+    );
     command
-        .args(["/d", "/s", "/c", "ping -n 30 127.0.0.1 >nul"])
+        .args(["gui_console_probe_child_fixture", "--exact", "--nocapture"])
+        .env(CONSOLE_PROBE_CHILD_ENV, &marker_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -26,14 +47,18 @@ async fn direct_background_command_has_no_console_window_from_gui_parent() {
         .spawn()
         .expect("direct background console probe should start");
 
-    assert_child_has_no_visible_console(&mut child).await;
+    assert_child_has_no_visible_console(&mut child, &marker_path).await;
 }
 
 #[tokio::test]
 async fn supervised_background_command_has_no_console_window_from_gui_parent() {
-    let mut command = CommandWrap::with_new("cmd.exe", |command| {
+    let directory = tempfile::tempdir().expect("console probe temporary directory");
+    let marker_path = directory.path().join("supervised-console-probe.txt");
+    let executable = std::env::current_exe().expect("current test executable should resolve");
+    let mut command = CommandWrap::with_new(executable, |command| {
         command
-            .args(["/d", "/s", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .args(["gui_console_probe_child_fixture", "--exact", "--nocapture"])
+            .env(CONSOLE_PROBE_CHILD_ENV, &marker_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -43,27 +68,21 @@ async fn supervised_background_command_has_no_console_window_from_gui_parent() {
     let mut child = command
         .spawn()
         .expect("background console probe should start");
-    assert_child_has_no_visible_console(&mut *child).await;
+    assert_child_has_no_visible_console(&mut *child, &marker_path).await;
 }
 
-async fn assert_child_has_no_visible_console(child: &mut dyn ChildWrapper) {
-    let child_id = child.id().expect("background child should expose its id");
-    thread::sleep(Duration::from_millis(300));
-
-    // SAFETY: these calls only alter this GUI test process's console
-    // association and take no borrowed pointers.
-    let (attached, has_visible_window, error) = unsafe {
-        FreeConsole();
-        let attached = AttachConsole(child_id) != 0;
-        let error = if attached { 0 } else { GetLastError() };
-        let console_window = GetConsoleWindow();
-        let has_visible_window =
-            attached && !console_window.is_null() && IsWindowVisible(console_window) != 0;
-        if attached {
-            FreeConsole();
+async fn assert_child_has_no_visible_console(child: &mut dyn ChildWrapper, marker_path: &Path) {
+    let observation = tokio::time::timeout(CONSOLE_PROBE_INTEGRATION_DEADLINE, async {
+        loop {
+            if let Ok(marker) = std::fs::read_to_string(marker_path)
+                && matches!(marker.as_str(), NO_CONSOLE_MARKER | "console")
+            {
+                break marker;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        (attached, has_visible_window, error)
-    };
+    })
+    .await;
 
     child
         .start_kill()
@@ -72,13 +91,10 @@ async fn assert_child_has_no_visible_console(child: &mut dyn ChildWrapper) {
         .wait()
         .await
         .expect("background console probe should exit");
+    if marker_path.is_file() {
+        std::fs::remove_file(marker_path).expect("console probe marker should be removed");
+    }
 
-    assert!(
-        attached,
-        "GUI test process could not attach to child console: {error}"
-    );
-    assert!(
-        !has_visible_window,
-        "background child unexpectedly owns a visible console window"
-    );
+    let observation = observation.expect("GUI child console probe should publish its observation");
+    assert_eq!(observation, NO_CONSOLE_MARKER);
 }

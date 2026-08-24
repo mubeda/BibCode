@@ -17,8 +17,14 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
+#[path = "support/activity_time.rs"]
+mod activity_time;
+use activity_time::{activity_timestamp, recent_activity_anchor};
+
 #[tokio::test]
 async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
+    let timeline_start = recent_activity_anchor();
+    let completed_at = activity_timestamp(timeline_start, time::Duration::seconds(1));
     let fixture = Fixture::start(16).await;
     let scope = thread_scope("thread:rpc", "rpc");
     fixture
@@ -45,8 +51,8 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
                     actor(
                         "actor:done",
                         ActivityLifecycle::Completed,
-                        "2026-07-22T12:00:01Z",
-                        Some("2026-07-22T12:00:01Z"),
+                        &completed_at,
+                        Some(&completed_at),
                     )
                     .expect("done actor"),
                 ),

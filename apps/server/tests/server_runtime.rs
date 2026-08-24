@@ -273,6 +273,12 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     let descriptor: Value = response.json().await.expect("environment JSON");
     assert_eq!(descriptor["environmentId"], "local");
     assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+    assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
+    assert!(
+        descriptor["capabilities"]
+            .get("worktreeCatalogRefreshReason")
+            .is_none()
+    );
 
     handle.shutdown();
     timeout(Duration::from_secs(2), handle.join())

@@ -1471,6 +1471,12 @@ pub struct ClaudeProviderRuntime {
     targeted_activity_control_supported: bool,
     token_usage: ClaudeTokenUsageState,
     last_mcp_status: Option<Vec<Value>>,
+    /// The most recent upstream API failure Claude reported for the active
+    /// turn, from its `system`/`api_retry` frames. Claude sends these while it
+    /// retries and then, if it gives up, a result frame with no `errors` — so
+    /// without this the only evidence of an upstream fault is discarded and the
+    /// turn reads as an unexplained failure.
+    last_api_error: Option<String>,
 }
 
 impl ClaudeProviderRuntime {
@@ -1503,6 +1509,7 @@ impl ClaudeProviderRuntime {
             targeted_activity_control_supported: false,
             token_usage: ClaudeTokenUsageState::default(),
             last_mcp_status: None,
+            last_api_error: None,
         }
     }
 
@@ -1587,6 +1594,9 @@ impl ClaudeProviderRuntime {
     pub fn start_turn(&mut self, input: TurnInput) -> Vec<CanonicalEvent> {
         self.token_usage.start_turn();
         self.active_assistant_item_id = None;
+        // Scoped to the turn: a retry observed two turns ago must not be
+        // reported as the cause of this one's failure.
+        self.last_api_error = None;
         self.current_turn_id = Some(input.turn_id.clone());
         vec![self.event(
             "turn.started",
@@ -1742,14 +1752,14 @@ impl ClaudeProviderRuntime {
             let has_control_effects = !effects.is_empty();
             let (activity, activity_controls) =
                 self.apply_task_control_effects(effects, emitted_at_ms);
-            let events = if value.get("subtype").and_then(Value::as_str) == Some("init") {
-                value
+            let events = match value.get("subtype").and_then(Value::as_str) {
+                Some("init") => value
                     .get("mcp_servers")
                     .and_then(|servers| self.mcp_status_event(servers))
                     .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
+                    .collect(),
+                Some("api_retry") => self.api_retry_event(value).into_iter().collect(),
+                _ => Vec::new(),
             };
             return ClaudeRuntimeOutput {
                 events,
@@ -1776,6 +1786,21 @@ impl ClaudeProviderRuntime {
         let (activity, activity_controls) =
             self.apply_task_control_effects(control_effects, emitted_at_ms);
         let Ok(message) = serde_json::from_value::<ClaudeMessage>(value.clone()) else {
+            // Undecodable frames were discarded in total silence, which is why
+            // gaps here could only ever be found by reading the code. Log the
+            // shape, never the payload — it carries conversation content.
+            tracing::debug!(
+                provider = "claude",
+                frame_type = value
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or("<absent>"),
+                frame_subtype = value
+                    .get("subtype")
+                    .and_then(|subtype| subtype.as_str())
+                    .unwrap_or("<absent>"),
+                "dropped an undecodable Claude stream frame"
+            );
             return ClaudeRuntimeOutput {
                 activity,
                 native_event_id: has_control_effects
@@ -2415,13 +2440,38 @@ impl ClaudeProviderRuntime {
         });
         if interrupted || failed {
             let error_message = message.errors.first().cloned().unwrap_or_else(|| {
-                if interrupted {
-                    "Claude runtime interrupted.".to_owned()
+                // With no `errors`, the only descriptions Claude gives are its
+                // `subtype`, its `terminal_reason`, and any upstream API failure
+                // it reported while retrying. Prefer the upstream error: it is
+                // the one that tells the user this was not BiBCode.
+                if let Some(api_error) = self.last_api_error.as_deref() {
+                    return format!("{api_error}.");
+                }
+                let reason = if interrupted {
+                    "Claude runtime interrupted"
                 } else {
-                    "Claude turn failed.".to_owned()
+                    "Claude turn failed"
+                };
+                let detail = message
+                    .terminal_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or(message.subtype.trim());
+                if detail.is_empty() {
+                    format!("{reason}.")
+                } else {
+                    format!("{reason} ({detail}).")
                 }
             });
             payload["errorMessage"] = json!(error_message);
+            if failed {
+                // Everything here came off Claude's wire, so Claude reported
+                // it. An interrupted turn carries a description but is not a
+                // failure, so it is deliberately left unclassified rather than
+                // labelled `unknown`.
+                payload["errorClass"] = json!("provider_error");
+            }
         }
         events.push(self.event(
             "turn.completed",
@@ -2562,6 +2612,44 @@ impl ClaudeProviderRuntime {
             None,
             json!({ "usage": usage }),
         )
+    }
+
+    /// Record an upstream API failure Claude is retrying, and surface it so the
+    /// retry is visible while it happens rather than only after the turn dies.
+    fn api_retry_event(&mut self, value: &Value) -> Option<CanonicalEvent> {
+        let status = value.get("error_status").and_then(Value::as_i64);
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|error| !error.is_empty());
+        if status.is_none() && error.is_none() {
+            return None;
+        }
+        let attempt = value.get("attempt").and_then(Value::as_i64);
+        let max_retries = value.get("max_retries").and_then(Value::as_i64);
+        let mut summary = "The upstream API returned an error".to_owned();
+        if let Some(status) = status {
+            summary.push_str(&format!(" (HTTP {status})"));
+        }
+        if let Some(error) = error {
+            summary.push_str(&format!(": {error}"));
+        }
+        if let (Some(attempt), Some(max_retries)) = (attempt, max_retries) {
+            summary.push_str(&format!("; retry {attempt} of {max_retries}"));
+        }
+        self.last_api_error = Some(summary.clone());
+        let mut payload = json!({ "message": summary, "class": "provider_error" });
+        if let Some(status) = status {
+            payload["status"] = json!(status);
+        }
+        Some(self.event(
+            "runtime.warning",
+            self.current_turn_id.clone(),
+            None,
+            None,
+            payload,
+        ))
     }
 
     fn mcp_status_event(&mut self, value: &Value) -> Option<CanonicalEvent> {

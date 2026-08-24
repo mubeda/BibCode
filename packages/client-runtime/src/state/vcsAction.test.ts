@@ -2,17 +2,30 @@ import {
   EnvironmentId,
   type GitActionProgressEvent,
   type GitRunStackedActionResult,
+  type VcsStatusResult,
+  WS_METHODS,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
-import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { AtomCommandResult } from "./runtime.ts";
+import { createVcsEnvironmentAtoms } from "./vcs.ts";
+import {
+  vcsCommandConcurrency,
+  vcsCommandScheduler,
+  vcsStatusRefreshConcurrency,
+  vcsStatusRefreshScheduler,
+} from "./vcsCommandScheduler.ts";
 import {
   applyVcsActionProgressEvent,
   beginVcsActionState,
@@ -37,6 +50,32 @@ const action = "commit_push" as const;
 const cwd = "/repo";
 const environmentId = EnvironmentId.make("environment-1");
 const isVcsActionUnavailableError = Schema.is(VcsActionUnavailableError);
+
+function status(refName: string): VcsStatusResult {
+  return {
+    isRepo: true,
+    hasPrimaryRemote: true,
+    isDefaultRef: false,
+    refName,
+    hasWorkingTreeChanges: false,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+    hasUpstream: true,
+    aheadCount: 0,
+    behindCount: 0,
+    pr: null,
+  };
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
 const result: GitRunStackedActionResult = {
   action,
   branch: {
@@ -67,6 +106,202 @@ function progress<T extends GitActionProgressEvent>(event: T): T {
 }
 
 describe("vcsActionState", () => {
+  it.effect("wires actual status refreshes independently from actual mutations", () =>
+    Effect.gen(function* () {
+      const firstRefreshStarted = yield* Deferred.make<void>();
+      const firstRefreshResult = yield* Deferred.make<VcsStatusResult>();
+      let refreshExecutions = 0;
+      let mutationExecutions = 0;
+      const session = yield* SubscriptionRef.make(
+        Option.some({
+          client: {
+            [WS_METHODS.vcsRefreshStatus]: () =>
+              Effect.suspend(() => {
+                refreshExecutions += 1;
+                if (refreshExecutions === 1) {
+                  return Deferred.succeed(firstRefreshStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(firstRefreshResult)),
+                  );
+                }
+                return Effect.succeed(status(`refresh-${refreshExecutions}`));
+              }),
+            [WS_METHODS.vcsStageFiles]: () =>
+              Effect.sync(() => {
+                mutationExecutions += 1;
+              }),
+          },
+        } as never),
+      );
+      const supervisor = EnvironmentSupervisor.of({
+        target: { environmentId, label: "VCS scheduler test" },
+        session,
+      } as never);
+      const selectedEnvironments: string[] = [];
+      const run: EnvironmentRegistry["Service"]["run"] = (selectedEnvironmentId, effect) => {
+        selectedEnvironments.push(selectedEnvironmentId);
+        return Effect.provideService(effect, EnvironmentSupervisor, supervisor);
+      };
+      const environmentRegistry = EnvironmentRegistry.of({ run } as never);
+      const atoms = createVcsEnvironmentAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+      );
+      const registry = AtomRegistry.make({
+        scheduleTask: (task) => {
+          task();
+          return () => {};
+        },
+      });
+      const target = { environmentId, input: { cwd } };
+
+      const first = atoms.refreshStatus.run(registry, target);
+      yield* Deferred.await(firstRefreshStarted);
+      const second = atoms.refreshStatus.run(registry, target);
+      const third = atoms.refreshStatus.run(registry, target);
+      const mutation = atoms.stageFiles.run(registry, {
+        environmentId,
+        input: { cwd, filePaths: ["tracked.ts"] },
+      });
+
+      expect(mutationExecutions).toBe(1);
+      expect(yield* Effect.promise(() => mutation)).toMatchObject({ _tag: "Success" });
+      expect(refreshExecutions).toBe(1);
+      expect(mutationExecutions).toBe(1);
+
+      yield* Deferred.succeed(firstRefreshResult, status("refresh-1"));
+      const [firstResult, secondResult, thirdResult] = yield* Effect.promise(() =>
+        Promise.all([first, second, third]),
+      );
+      expect(firstResult).toMatchObject({ _tag: "Success", value: status("refresh-1") });
+      expect(secondResult).toMatchObject({ _tag: "Success", value: status("refresh-2") });
+      expect(thirdResult).toEqual(secondResult);
+      expect(refreshExecutions).toBe(2);
+
+      expect(yield* Effect.promise(() => atoms.refreshStatus.run(registry, target))).toMatchObject({
+        _tag: "Success",
+        value: status("refresh-3"),
+      });
+      expect(refreshExecutions).toBe(3);
+      expect(selectedEnvironments).toEqual([
+        environmentId,
+        environmentId,
+        environmentId,
+        environmentId,
+      ]);
+      registry.dispose();
+    }),
+  );
+
+  it("starts a mutation while a status refresh is active", async () => {
+    const registry = AtomRegistry.make();
+    const refreshResult = deferred<AtomCommandResult<void, never>>();
+    const events: string[] = [];
+    const target = { environmentId, input: { cwd } };
+
+    const refresh = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      () => {
+        events.push("refresh");
+        return refreshResult.promise;
+      },
+    );
+    const mutation = vcsCommandScheduler.schedule(
+      registry,
+      vcsCommandConcurrency,
+      target,
+      async () => {
+        events.push("mutation");
+        return AsyncResult.success(undefined);
+      },
+    );
+
+    expect(events).toEqual(["refresh", "mutation"]);
+    await mutation;
+    refreshResult.resolve(AsyncResult.success(undefined));
+    await refresh;
+    registry.dispose();
+  });
+
+  it("keeps one newest trailing status refresh and shares its result", async () => {
+    const registry = AtomRegistry.make();
+    const activeResult = deferred<AtomCommandResult<string, never>>();
+    const executions: string[] = [];
+    const target = { environmentId, input: { cwd } };
+
+    const active = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      () => {
+        executions.push("focus");
+        return activeResult.promise;
+      },
+    );
+    const visible = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      async () => {
+        executions.push("visible");
+        return AsyncResult.success("visible");
+      },
+    );
+    const menu = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      async () => {
+        executions.push("menu");
+        return AsyncResult.success("menu");
+      },
+    );
+
+    expect(executions).toEqual(["focus"]);
+    activeResult.resolve(AsyncResult.success("focus"));
+    expect(await active).toMatchObject({ _tag: "Success", value: "focus" });
+    expect(await visible).toMatchObject({ _tag: "Success", value: "menu" });
+    expect(await menu).toMatchObject({ _tag: "Success", value: "menu" });
+    expect(executions).toEqual(["focus", "menu"]);
+    registry.dispose();
+  });
+
+  it("runs an explicit post-mutation refresh after a pre-mutation read", async () => {
+    const registry = AtomRegistry.make();
+    const activeResult = deferred<AtomCommandResult<void, never>>();
+    const events: string[] = [];
+    const target = { environmentId, input: { cwd } };
+
+    const active = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      () => {
+        events.push("read");
+        return activeResult.promise;
+      },
+    );
+    await vcsCommandScheduler.schedule(registry, vcsCommandConcurrency, target, async () => {
+      events.push("mutation");
+      return AsyncResult.success(undefined);
+    });
+    const explicit = vcsStatusRefreshScheduler.schedule(
+      registry,
+      vcsStatusRefreshConcurrency,
+      target,
+      async () => {
+        events.push("explicit");
+        return AsyncResult.success(undefined);
+      },
+    );
+
+    expect(events).toEqual(["read", "mutation"]);
+    activeResult.resolve(AsyncResult.success(undefined));
+    await Promise.all([active, explicit]);
+    expect(events).toEqual(["read", "mutation", "explicit"]);
+    registry.dispose();
+  });
+
   it("preserves malformed target key diagnostics and the native cause without copying the key", () => {
     const key = "not-json-with-credential=do-not-log";
     let error: unknown;

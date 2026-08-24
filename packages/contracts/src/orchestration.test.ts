@@ -988,6 +988,21 @@ it.effect("decodes orchestration session runtime mode defaults", () =>
   }),
 );
 
+it.effect("normalizes a newer persisted session error class", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeOrchestrationSession({
+      threadId: "thread-1",
+      status: "error",
+      providerName: "opencode",
+      activeTurnId: null,
+      lastError: "The provider is throttling requests.",
+      lastErrorClass: "rate_limit_error",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(parsed.lastErrorClass, "unknown");
+  }),
+);
+
 it.effect("defaults proposed plan implementation metadata for historical rows", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationProposedPlan({

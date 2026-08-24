@@ -1,0 +1,32 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "isRepo": true,
+      "hasWorkingTreeChanges": true,
+      "observedAt": "2026-08-21T12:00:00.000Z",
+      "stale": false,
+      "refName": "feature/fixture-summary",
+      "detachedHead": null,
+      "sourceControlProvider": {
+        "kind": "github",
+        "name": "GitHub",
+        "baseUrl": "https://github.com"
+      },
+      "pr": {
+        "provider": "github",
+        "number": 42,
+        "title": "Fixture summary pull request",
+        "url": "https://github.com/bibcode/fixture/pull/42",
+        "baseRefName": "main",
+        "headRefName": "feature/fixture-summary",
+        "state": "open",
+        "updatedAt": {
+          "_id": "Option",
+          "_tag": "None"
+        }
+      }
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fmt, fs,
     future::Future,
@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -23,14 +24,16 @@ use super::{
     ManagedWorktreeRollback, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
     ProcessRunner, ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit,
     VcsCreateWorktreeResult, VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef,
-    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
-    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
-    git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
-    parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
+    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusSummary,
+    VcsWorkingTree, VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree,
+    canonical_worktree_path_key, git_worktree_prune_impact_digest, host_path_platform,
+    normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
+const SUMMARY_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
+const WATCH_ROOTS_OUTPUT_LIMIT: usize = 16 * 1024;
 const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
@@ -93,6 +96,28 @@ pub struct GitRepository {
     runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
+}
+
+pub(crate) struct StatusObservation {
+    local: VcsStatusLocalResult,
+    remote: StatusRemoteObservation,
+}
+
+pub(crate) struct GitWatchRoots {
+    pub worktree_root: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+pub(crate) struct ObservedRemoteStatus {
+    pub ref_name: Option<String>,
+    pub remote: Option<VcsStatusRemoteResult>,
+}
+
+struct StatusRemoteObservation {
+    upstream_ref: Option<String>,
+    ahead_count: u64,
+    behind_count: u64,
 }
 
 impl Default for GitRepository {
@@ -287,6 +312,49 @@ impl GitRepository {
         options: GitExecutionOptions,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            options,
+            git_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        allow_non_zero_exit: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_environment(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            git_read_environment(),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_with_environment(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        options: GitExecutionOptions,
+        environment: Vec<(OsString, OsString)>,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
         self.runner
             .run(
                 ProcessRequest {
@@ -294,7 +362,7 @@ impl GitRepository {
                     command: PathBuf::from("git"),
                     args: args.iter().map(OsString::from).collect(),
                     cwd: cwd.to_path_buf(),
-                    env: git_environment(),
+                    env: environment,
                     stdin: None,
                     timeout: DEFAULT_TIMEOUT,
                     max_output_bytes: options.max_output_bytes,
@@ -319,13 +387,24 @@ impl GitRepository {
             .await
     }
 
+    async fn run_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_read(operation, cwd, args, false, cancellation)
+            .await
+    }
+
     pub async fn is_repository(
         &self,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<bool, GitCommandError> {
         let result = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.detectRepository",
                 cwd,
                 &strings(&["rev-parse", "--is-inside-work-tree"]),
@@ -345,7 +424,7 @@ impl GitRepository {
             return Ok(None);
         }
         let output = self
-            .run(
+            .run_read(
                 "GitVcsDriver.repositoryRoot",
                 cwd,
                 &strings(&["rev-parse", "--show-toplevel"]),
@@ -353,6 +432,79 @@ impl GitRepository {
             )
             .await?;
         Ok(Some(PathBuf::from(output.stdout.trim())))
+    }
+
+    pub(crate) async fn resolve_common_dir(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitCommandError> {
+        let output = self
+            .run_read(
+                "GitVcsDriver.resolveCommonDir",
+                cwd,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                cancellation,
+            )
+            .await?;
+        let value = git_output_line(&output.stdout)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                simple_error(
+                    "GitVcsDriver.resolveCommonDir",
+                    cwd,
+                    "Git did not report one common directory.",
+                )
+            })?;
+        let lexical = normalize_path_lexically(&resolve_git_metadata_path(cwd, value));
+        Ok(tokio::fs::canonicalize(&lexical).await.unwrap_or(lexical))
+    }
+
+    pub(crate) async fn resolve_watch_roots(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitWatchRoots, GitCommandError> {
+        const OPERATION: &str = "GitVcsDriver.resolveWatchRoots";
+        let output = self
+            .execute_with_environment(
+                OPERATION,
+                cwd,
+                &strings(&[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-dir",
+                    "--git-common-dir",
+                ]),
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WATCH_ROOTS_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                git_read_environment(),
+                cancellation,
+            )
+            .await?;
+        let values = output.stdout.lines().collect::<Vec<_>>();
+        if values.len() != 3 || values.iter().any(|value| value.is_empty()) {
+            return Err(simple_error(
+                OPERATION,
+                cwd,
+                "Git did not report exactly one worktree, Git directory, and common directory.",
+            ));
+        }
+        let resolve = |value: &str| {
+            let lexical = normalize_path_lexically(&resolve_git_metadata_path(cwd, value));
+            async move { tokio::fs::canonicalize(&lexical).await.unwrap_or(lexical) }
+        };
+        let (worktree_root, git_dir, common_dir) =
+            tokio::join!(resolve(values[0]), resolve(values[1]), resolve(values[2]),);
+        Ok(GitWatchRoots {
+            worktree_root,
+            git_dir,
+            common_dir,
+        })
     }
 
     pub async fn worktree_inventory(
@@ -817,16 +969,13 @@ impl GitRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supported);
     }
 
-    pub async fn local_status(
+    pub(crate) async fn observe_status(
         &self,
         cwd: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<VcsStatusLocalResult, GitCommandError> {
-        if !self.is_repository(cwd, cancellation).await? {
-            return Ok(VcsStatusLocalResult::non_repository());
-        }
-        let status = self
-            .run(
+    ) -> Result<StatusObservation, GitCommandError> {
+        let status = match self
+            .run_read(
                 "GitVcsDriver.statusDetailsLocal.status",
                 cwd,
                 &strings(&[
@@ -839,31 +988,91 @@ impl GitRepository {
                 ]),
                 cancellation,
             )
-            .await?;
-        let staged_numstat = self
-            .run(
-                "GitVcsDriver.statusDetailsLocal.stagedNumstat",
-                cwd,
-                &strings(&[
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                if !matches!(self.is_repository(cwd, cancellation).await, Ok(false)) {
+                    return Err(error);
+                }
+                return Ok(StatusObservation {
+                    local: VcsStatusLocalResult::non_repository(),
+                    remote: StatusRemoteObservation {
+                        upstream_ref: None,
+                        ahead_count: 0,
+                        behind_count: 0,
+                    },
+                });
+            }
+        };
+        let records: Vec<_> = status
+            .stdout
+            .lines()
+            .filter_map(parse_porcelain_v2_line)
+            .collect();
+        let has_staged_changes = records.iter().any(|record| record.index_changed);
+        let has_unstaged_changes = records.iter().any(|record| record.worktree_changed);
+        let (staged_stats, unstaged_stats) = match (has_staged_changes, has_unstaged_changes) {
+            (true, true) => {
+                let staged_args = strings(&[
                     "-c",
                     "core.quotePath=false",
                     "diff",
                     "--cached",
                     "--numstat",
-                ]),
-                cancellation,
-            )
-            .await?;
-        let unstaged_numstat = self
-            .run(
-                "GitVcsDriver.statusDetailsLocal.unstagedNumstat",
-                cwd,
-                &strings(&["-c", "core.quotePath=false", "diff", "--numstat"]),
-                cancellation,
-            )
-            .await?;
+                ]);
+                let unstaged_args = strings(&["-c", "core.quotePath=false", "diff", "--numstat"]);
+                let (staged, unstaged) = tokio::try_join!(
+                    self.run_read(
+                        "GitVcsDriver.statusDetailsLocal.stagedNumstat",
+                        cwd,
+                        &staged_args,
+                        cancellation,
+                    ),
+                    self.run_read(
+                        "GitVcsDriver.statusDetailsLocal.unstagedNumstat",
+                        cwd,
+                        &unstaged_args,
+                        cancellation,
+                    ),
+                )?;
+                (
+                    parse_numstat(&staged.stdout),
+                    parse_numstat(&unstaged.stdout),
+                )
+            }
+            (true, false) => {
+                let staged = self
+                    .run_read(
+                        "GitVcsDriver.statusDetailsLocal.stagedNumstat",
+                        cwd,
+                        &strings(&[
+                            "-c",
+                            "core.quotePath=false",
+                            "diff",
+                            "--cached",
+                            "--numstat",
+                        ]),
+                        cancellation,
+                    )
+                    .await?;
+                (parse_numstat(&staged.stdout), HashMap::new())
+            }
+            (false, true) => {
+                let unstaged = self
+                    .run_read(
+                        "GitVcsDriver.statusDetailsLocal.unstagedNumstat",
+                        cwd,
+                        &strings(&["-c", "core.quotePath=false", "diff", "--numstat"]),
+                        cancellation,
+                    )
+                    .await?;
+                (HashMap::new(), parse_numstat(&unstaged.stdout))
+            }
+            (false, false) => (HashMap::new(), HashMap::new()),
+        };
         let remotes = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.statusDetailsLocal.remotes",
                 cwd,
                 &strings(&["remote"]),
@@ -883,13 +1092,8 @@ impl GitRepository {
         } else {
             None
         };
-        let staged_stats = parse_numstat(&staged_numstat.stdout);
-        let unstaged_stats = parse_numstat(&unstaged_numstat.stdout);
         let mut files = Vec::new();
-        for line in status.stdout.lines() {
-            let Some(record) = parse_porcelain_v2_line(line) else {
-                continue;
-            };
+        for record in records {
             if record.untracked {
                 let insertions = untracked_line_count(&cwd.join(&record.path)).await;
                 files.push(VcsWorkingTreeFile {
@@ -936,16 +1140,100 @@ impl GitRepository {
             insertions,
             deletions,
         };
-        let _ = (upstream_ref, ahead_count, behind_count);
-        Ok(VcsStatusLocalResult {
+        Ok(StatusObservation {
+            local: VcsStatusLocalResult {
+                is_repo: true,
+                source_control_provider,
+                has_primary_remote,
+                is_default_ref: ref_name.is_some() && ref_name == default_ref_name,
+                ref_name,
+                default_ref_name,
+                has_working_tree_changes: !working_tree.files.is_empty(),
+                working_tree,
+            },
+            remote: StatusRemoteObservation {
+                upstream_ref,
+                ahead_count,
+                behind_count,
+            },
+        })
+    }
+
+    pub async fn local_status(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<VcsStatusLocalResult, GitCommandError> {
+        Ok(self.observe_status(cwd, cancellation).await?.local)
+    }
+
+    pub async fn summary_status(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<VcsStatusSummary, GitCommandError> {
+        let args = strings(&[
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=2",
+            "--branch",
+            "--untracked-files=normal",
+        ]);
+        let status = self
+            .execute_with_environment(
+                "GitVcsDriver.summaryStatus.status",
+                cwd,
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: true,
+                    max_output_bytes: SUMMARY_STATUS_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                git_read_environment(),
+                cancellation,
+            )
+            .await?;
+        if status.exit_code != 0 {
+            if status
+                .stderr
+                .to_ascii_lowercase()
+                .contains("not a git repository")
+            {
+                return Ok(VcsStatusSummary {
+                    is_repo: false,
+                    ref_name: None,
+                    detached_head: None,
+                    has_working_tree_changes: false,
+                    source_control_provider: None,
+                    pr: None,
+                    observed_at: summary_observed_at(),
+                    stale: false,
+                });
+            }
+            return Err(command_output_error(
+                "GitVcsDriver.summaryStatus.status",
+                cwd,
+                args.len(),
+                &status,
+                "Git status summary failed.",
+            ));
+        }
+        let (ref_name, detached_head) = parse_summary_identity(cwd, &status.stdout)?;
+        let has_working_tree_changes = status
+            .stdout
+            .lines()
+            .any(|line| parse_porcelain_v2_line(line).is_some());
+        let source_control_provider = self.remote_provider(cwd, cancellation).await?;
+        Ok(VcsStatusSummary {
             is_repo: true,
-            source_control_provider,
-            has_primary_remote,
-            is_default_ref: ref_name.is_some() && ref_name == default_ref_name,
             ref_name,
-            default_ref_name,
-            has_working_tree_changes: !working_tree.files.is_empty(),
-            working_tree,
+            detached_head,
+            has_working_tree_changes,
+            source_control_provider,
+            pr: None,
+            observed_at: summary_observed_at(),
+            stale: false,
         })
     }
 
@@ -954,11 +1242,22 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<VcsStatusRemoteResult>, GitCommandError> {
+        Ok(self.observed_remote_status(cwd, cancellation).await?.remote)
+    }
+
+    pub(crate) async fn observed_remote_status(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ObservedRemoteStatus, GitCommandError> {
         if !self.is_repository(cwd, cancellation).await? {
-            return Ok(None);
+            return Ok(ObservedRemoteStatus {
+                ref_name: None,
+                remote: None,
+            });
         }
         let status = self
-            .run(
+            .run_read(
                 "GitVcsDriver.statusDetailsRemote.status",
                 cwd,
                 &strings(&[
@@ -974,12 +1273,40 @@ impl GitRepository {
         let default_ref = self
             .default_ref(cwd, branch.as_deref(), cancellation)
             .await?;
-        let ahead_of_default_count = match (branch.as_deref(), default_ref.as_deref()) {
+        let observation = StatusRemoteObservation {
+            upstream_ref: upstream,
+            ahead_count,
+            behind_count,
+        };
+        let remote = self
+            .status_remote_result(
+                cwd,
+                branch.as_deref(),
+                default_ref.as_deref(),
+                &observation,
+                cancellation,
+            )
+            .await?;
+        Ok(ObservedRemoteStatus {
+            ref_name: branch,
+            remote: Some(remote),
+        })
+    }
+
+    async fn status_remote_result(
+        &self,
+        cwd: &Path,
+        branch: Option<&str>,
+        default_ref: Option<&str>,
+        observation: &StatusRemoteObservation,
+        cancellation: &CancellationToken,
+    ) -> Result<VcsStatusRemoteResult, GitCommandError> {
+        let ahead_of_default_count = match (branch, default_ref) {
             (Some(current), Some(default)) if current == default => Some(0),
             (Some(_), Some(default)) => {
                 let range = format!("{default}..HEAD");
                 let count = self
-                    .execute(
+                    .execute_read(
                         "GitVcsDriver.statusDetailsRemote.defaultDelta",
                         cwd,
                         &["rev-list".into(), "--count".into(), range],
@@ -989,15 +1316,15 @@ impl GitRepository {
                     .await?;
                 (count.exit_code == 0).then(|| count.stdout.trim().parse::<u64>().unwrap_or(0))
             }
-            _ => Some(ahead_count),
+            _ => Some(observation.ahead_count),
         };
-        Ok(Some(VcsStatusRemoteResult {
-            has_upstream: upstream.is_some(),
-            ahead_count,
-            behind_count,
+        Ok(VcsStatusRemoteResult {
+            has_upstream: observation.upstream_ref.is_some(),
+            ahead_count: observation.ahead_count,
+            behind_count: observation.behind_count,
             ahead_of_default_count,
             pr: None::<ChangeRequest>,
-        }))
+        })
     }
 
     pub async fn refresh_remote_status(
@@ -1009,7 +1336,7 @@ impl GitRepository {
             return Ok(None);
         }
         let upstream = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.refreshRemoteStatus.upstream",
                 cwd,
                 &strings(&["rev-parse", "--abbrev-ref", "@{upstream}"]),
@@ -1020,7 +1347,7 @@ impl GitRepository {
         if upstream.exit_code == 0 {
             let upstream = upstream.stdout.trim();
             let remotes = self
-                .run(
+                .run_read(
                     "GitVcsDriver.refreshRemoteStatus.remotes",
                     cwd,
                     &strings(&["remote"]),
@@ -1050,23 +1377,81 @@ impl GitRepository {
         self.remote_status(cwd, cancellation).await
     }
 
+    pub(crate) async fn automatic_fetch_upstream_remotes(
+        &self,
+        cwd: &Path,
+        ref_names: &BTreeSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        if ref_names.is_empty() {
+            return Ok(());
+        }
+        let upstreams = self
+            .run_read(
+                "GitVcsDriver.automaticFetch.upstreams",
+                cwd,
+                &strings(&[
+                    "for-each-ref",
+                    "--format=%(refname:short)%00%(upstream:remotename)",
+                    "refs/heads",
+                ]),
+                cancellation,
+            )
+            .await?;
+        let remotes = upstreams
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\0'))
+            .filter(|(ref_name, remote)| ref_names.contains(*ref_name) && !remote.is_empty())
+            .map(|(_, remote)| remote.to_owned())
+            .collect::<BTreeSet<_>>();
+        if remotes.is_empty() {
+            return Ok(());
+        }
+        let mut args = strings(&["fetch", "--quiet"]);
+        if remotes.len() > 1 {
+            args.push("--multiple".to_owned());
+        }
+        args.push("--".to_owned());
+        args.extend(remotes);
+        self.run(
+            "GitVcsDriver.automaticFetch.fetch",
+            cwd,
+            &args,
+            cancellation,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn status(
         &self,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<VcsStatusResult, GitCommandError> {
-        let local = self.local_status(cwd, cancellation).await?;
-        let remote =
-            self.remote_status(cwd, cancellation)
-                .await?
-                .unwrap_or(VcsStatusRemoteResult {
-                    has_upstream: false,
-                    ahead_count: 0,
-                    behind_count: 0,
-                    ahead_of_default_count: Some(0),
-                    pr: None,
-                });
-        Ok(VcsStatusResult { local, remote })
+        let observation = self.observe_status(cwd, cancellation).await?;
+        let remote = if observation.local.is_repo {
+            self.status_remote_result(
+                cwd,
+                observation.local.ref_name.as_deref(),
+                observation.local.default_ref_name.as_deref(),
+                &observation.remote,
+                cancellation,
+            )
+            .await?
+        } else {
+            VcsStatusRemoteResult {
+                has_upstream: false,
+                ahead_count: 0,
+                behind_count: 0,
+                ahead_of_default_count: Some(0),
+                pr: None,
+            }
+        };
+        Ok(VcsStatusResult {
+            local: observation.local,
+            remote,
+        })
     }
 
     pub async fn stage_files(
@@ -1313,6 +1698,44 @@ impl GitRepository {
         })
     }
 
+    pub(crate) async fn local_branch_names(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, GitCommandError> {
+        let args = strings(&["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        let output = self
+            .execute_with_environment(
+                "GitVcsDriver.localBranchNames",
+                cwd,
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                git_read_environment(),
+                cancellation,
+            )
+            .await?;
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(command_output_error(
+                "GitVcsDriver.localBranchNames",
+                cwd,
+                args.len(),
+                &output,
+                "Git local-branch output was truncated and is not authoritative.",
+            ));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     pub async fn list_commits(
         &self,
         cwd: &Path,
@@ -1410,6 +1833,23 @@ impl GitRepository {
         } else {
             false
         };
+        if new_ref_existed
+            && let Some(new_ref) = input.new_ref_name.as_deref()
+            && self
+                .worktree_map(&input.cwd, cancellation)
+                .await?
+                .contains_key(new_ref)
+        {
+            return self
+                .create_suffixed_worktree_from_occupied_branch(
+                    &input.cwd,
+                    new_ref,
+                    requested_path.as_ref(),
+                    path_policy.as_ref(),
+                    cancellation,
+                )
+                .await;
+        }
         let owned_path = if requested_path.is_none()
             && path_policy
                 .as_ref()
@@ -1425,10 +1865,20 @@ impl GitRepository {
             None
         };
         let mut args = strings(&["worktree", "add"]);
-        if let Some(new_ref) = input.new_ref_name.as_deref() {
+        if let Some(new_ref) = input.new_ref_name.as_deref()
+            && !new_ref_existed
+        {
             args.extend(["-b".into(), new_ref.into()]);
         }
-        args.extend([path_string, input.ref_name.clone()]);
+        let checkout_ref = if new_ref_existed {
+            input
+                .new_ref_name
+                .as_deref()
+                .expect("an existing requested branch has a name")
+        } else {
+            input.ref_name.as_str()
+        };
+        args.extend([path_string, checkout_ref.into()]);
         if let Err(mut error) = self
             .run(
                 "GitVcsDriver.createWorktree",
@@ -2760,6 +3210,35 @@ impl GitRepository {
         Ok(branch)
     }
 
+    pub async fn push_current_branch_to_remote(
+        &self,
+        cwd: &Path,
+        remote_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitCommandError> {
+        let branch = self.current_ref(cwd, cancellation).await?.ok_or_else(|| {
+            simple_error(
+                "GitVcsDriver.pushCurrentBranchToRemote",
+                cwd,
+                "Cannot push from detached HEAD.",
+            )
+        })?;
+        self.run(
+            "GitVcsDriver.pushCurrentBranchToRemote",
+            cwd,
+            &[
+                "push".into(),
+                "--set-upstream".into(),
+                "--".into(),
+                remote_name.into(),
+                branch.clone(),
+            ],
+            cancellation,
+        )
+        .await?;
+        Ok(branch)
+    }
+
     pub async fn commit_context(
         &self,
         cwd: &Path,
@@ -2793,7 +3272,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, GitCommandError> {
         let result = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.currentRef",
                 cwd,
                 &strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
@@ -2813,7 +3292,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, GitCommandError> {
         let origin_head = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.defaultRef.originHead",
                 cwd,
                 &strings(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
@@ -2833,7 +3312,7 @@ impl GitRepository {
         }
         for candidate in ["main", "master"] {
             let result = self
-                .execute(
+                .execute_read(
                     "GitVcsDriver.defaultRef.candidate",
                     cwd,
                     &[
@@ -2859,7 +3338,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Option<SourceControlProviderInfo>, GitCommandError> {
         let remote = self
-            .execute(
+            .execute_read(
                 "GitVcsDriver.remoteProvider",
                 cwd,
                 &strings(&["config", "--get", "remote.origin.url"]),
@@ -2867,9 +3346,31 @@ impl GitRepository {
                 cancellation,
             )
             .await?;
-        Ok((remote.exit_code == 0)
-            .then(|| provider_info(remote.stdout.trim()))
-            .flatten())
+        if remote.stdout_truncated || remote.stderr_truncated {
+            return Err(command_output_error(
+                "GitVcsDriver.remoteProvider",
+                cwd,
+                3,
+                &remote,
+                "Git remote-provider output was truncated.",
+            ));
+        }
+        if remote.exit_code == 0 {
+            return Ok(provider_info(remote.stdout.trim()));
+        }
+        if remote.exit_code == 1
+            && remote.stdout.trim().is_empty()
+            && remote.stderr.trim().is_empty()
+        {
+            return Ok(None);
+        }
+        Err(command_output_error(
+            "GitVcsDriver.remoteProvider",
+            cwd,
+            3,
+            &remote,
+            "Git could not read the origin provider configuration.",
+        ))
     }
 
     async fn worktree_map(
@@ -4271,6 +4772,12 @@ fn git_environment() -> Vec<(OsString, OsString)> {
     .collect()
 }
 
+fn git_read_environment() -> Vec<(OsString, OsString)> {
+    let mut environment = git_environment();
+    environment.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+    environment
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -4319,6 +4826,826 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
         registered.eq_ignore_ascii_case(&candidate)
     } else {
         registered == candidate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{Arc, Mutex},
+    };
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        GitProcessRunner, GitRepository, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
+        git_read_environment, normalize_path_lexically,
+    };
+    use crate::test_support::TestSandbox;
+
+    const EXPECTED_FUSED_OPERATIONS: [&str; 4] = [
+        "GitVcsDriver.statusDetailsLocal.status",
+        "GitVcsDriver.statusDetailsLocal.remotes",
+        "GitVcsDriver.defaultRef.originHead",
+        "GitVcsDriver.remoteProvider",
+    ];
+
+    struct RecordingGitRunner {
+        outputs: HashMap<String, ProcessOutput>,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum WatchRootFailure {
+        Cancelled,
+        OutputLimit,
+    }
+
+    struct FailingWatchRootRunner {
+        failure: WatchRootFailure,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl GitProcessRunner for FailingWatchRootRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> super::BoxGitProcessFuture<'a> {
+            let operation = request.operation.clone();
+            let max_output_bytes = request.max_output_bytes;
+            if matches!(self.failure, WatchRootFailure::Cancelled) {
+                assert!(cancellation.is_cancelled());
+            }
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            let failure = self.failure;
+            Box::pin(async move {
+                Err(match failure {
+                    WatchRootFailure::Cancelled => ProcessError::Cancelled { operation },
+                    WatchRootFailure::OutputLimit => ProcessError::OutputLimit {
+                        operation,
+                        stream: "stdout",
+                        max_bytes: max_output_bytes,
+                        observed_bytes: max_output_bytes + 1,
+                    },
+                })
+            })
+        }
+    }
+
+    impl RecordingGitRunner {
+        fn status_fixture() -> Self {
+            let status = process_output(
+                "# branch.oid 0000000000000000000000000000000000000000\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
+            );
+            Self {
+                outputs: HashMap::from([
+                    (
+                        "GitVcsDriver.detectRepository".into(),
+                        process_output("true\n"),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.status".into(),
+                        status.clone(),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.stagedNumstat".into(),
+                        process_output(""),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.unstagedNumstat".into(),
+                        process_output(""),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.remotes".into(),
+                        process_output("origin\n"),
+                    ),
+                    (
+                        "GitVcsDriver.defaultRef.originHead".into(),
+                        process_output("refs/remotes/origin/main\n"),
+                    ),
+                    (
+                        "GitVcsDriver.remoteProvider".into(),
+                        process_output("https://github.com/example/repository.git\n"),
+                    ),
+                    ("GitVcsDriver.statusDetailsRemote.status".into(), status),
+                ]),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn dirty_tracked_fixture() -> Self {
+            let status = process_output(
+                "# branch.oid 0000000000000000000000000000000000000000\n# branch.head feature/test\n# branch.upstream origin/feature/test\n# branch.ab +2 -1\n1 MM N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 file.rs\n",
+            );
+            Self {
+                outputs: HashMap::from([
+                    (
+                        "GitVcsDriver.detectRepository".into(),
+                        process_output("true\n"),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.status".into(),
+                        status.clone(),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.stagedNumstat".into(),
+                        process_output("2\t1\tfile.rs\n"),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.unstagedNumstat".into(),
+                        process_output("4\t5\tfile.rs\n"),
+                    ),
+                    (
+                        "GitVcsDriver.statusDetailsLocal.remotes".into(),
+                        process_output("origin\n"),
+                    ),
+                    (
+                        "GitVcsDriver.defaultRef.originHead".into(),
+                        process_output("refs/remotes/origin/main\n"),
+                    ),
+                    (
+                        "GitVcsDriver.remoteProvider".into(),
+                        process_output("https://github.com/example/repository.git\n"),
+                    ),
+                    ("GitVcsDriver.statusDetailsRemote.status".into(), status),
+                    (
+                        "GitVcsDriver.statusDetailsRemote.defaultDelta".into(),
+                        process_output("3\n"),
+                    ),
+                ]),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn clean_fixture() -> Self {
+            Self::status_fixture()
+        }
+
+        fn requests(&self) -> Vec<ProcessRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn operation_names(&self) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .map(|request| request.operation)
+                .collect()
+        }
+
+        fn count_arg(&self, argument: &str) -> usize {
+            self.requests()
+                .iter()
+                .filter(|request| request.args.iter().any(|value| value == argument))
+                .count()
+        }
+    }
+
+    fn process_output(stdout: &str) -> ProcessOutput {
+        ProcessOutput {
+            exit_code: 0,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    fn process_result(exit_code: i32, stdout: &str, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    impl GitProcessRunner for RecordingGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> super::BoxGitProcessFuture<'a> {
+            let output = self
+                .outputs
+                .get(&request.operation)
+                .cloned()
+                .expect("fixture Git output");
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    #[test]
+    fn background_git_reads_disable_optional_locks() {
+        let environment = git_read_environment();
+
+        assert!(
+            environment
+                .iter()
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+        );
+    }
+
+    #[tokio::test]
+    async fn current_ref_uses_the_read_only_git_environment() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.currentRef".into(),
+                process_output("feature/test\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        assert_eq!(
+            repository
+                .current_ref(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .expect("current ref fixture succeeds")
+                .as_deref(),
+            Some("feature/test")
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_remote_push_ignores_existing_upstream_and_terminates_options() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitVcsDriver.currentRef".into(),
+                    process_output("feature/test\n"),
+                ),
+                (
+                    "GitVcsDriver.pushCurrentBranchToRemote".into(),
+                    process_output(""),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        assert_eq!(
+            repository
+                .push_current_branch_to_remote(
+                    Path::new("/repo"),
+                    "upstream",
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("selected remote push succeeds"),
+            "feature/test"
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].args,
+            ["push", "--set-upstream", "--", "upstream", "feature/test"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_status_reuses_one_porcelain_snapshot() {
+        let runner = Arc::new(RecordingGitRunner::dirty_tracked_fixture());
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let result = repository
+            .status(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("status fixture succeeds");
+
+        assert_eq!(result.local.ref_name.as_deref(), Some("feature/test"));
+        assert_eq!(result.remote.ahead_count, 2);
+        assert_eq!(result.remote.behind_count, 1);
+        assert_eq!(runner.count_arg("status"), 1);
+        assert_eq!(runner.count_arg("--numstat"), 2);
+    }
+
+    #[tokio::test]
+    async fn clean_status_starts_no_numstat_process() {
+        let runner = Arc::new(RecordingGitRunner::clean_fixture());
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .status(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("status fixture succeeds");
+
+        assert_eq!(runner.count_arg("--numstat"), 0);
+    }
+
+    #[tokio::test]
+    async fn summary_status_uses_one_porcelain_read_without_numstat_or_file_storage() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([
+                (
+                    "GitVcsDriver.summaryStatus.status".into(),
+                    process_output(
+                        "# branch.oid 0123456789abcdef0123456789abcdef01234567\n# branch.head feature/test\n1 .M N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 tracked.txt\n",
+                    ),
+                ),
+                (
+                    "GitVcsDriver.remoteProvider".into(),
+                    process_output("https://github.com/acme/repo.git\n"),
+                ),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let summary = repository
+            .summary_status(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("summary fixture succeeds");
+
+        assert!(summary.is_repo);
+        assert_eq!(summary.ref_name.as_deref(), Some("feature/test"));
+        assert_eq!(summary.detached_head, None);
+        assert!(summary.has_working_tree_changes);
+        assert_eq!(
+            summary
+                .source_control_provider
+                .as_ref()
+                .map(|provider| provider.kind),
+            Some(crate::git::ProviderKind::Github)
+        );
+        assert!(summary.pr.is_none());
+        assert!(summary.observed_at.contains('T'));
+        assert!(!summary.stale);
+        assert_eq!(
+            runner.operation_names(),
+            [
+                "GitVcsDriver.summaryStatus.status",
+                "GitVcsDriver.remoteProvider"
+            ]
+        );
+        assert_eq!(runner.count_arg("status"), 1);
+        assert_eq!(runner.count_arg("--numstat"), 0);
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            [
+                "-c",
+                "core.quotePath=false",
+                "status",
+                "--porcelain=2",
+                "--branch",
+                "--untracked-files=normal",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(requests[0].max_output_bytes, 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn local_branch_names_uses_one_bounded_read_only_query() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.localBranchNames".into(),
+                process_output("feature/test\nmain\nrelease/2026\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let branches = repository
+            .local_branch_names(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("local branch query succeeds");
+
+        assert_eq!(branches, ["feature/test", "main", "release/2026"]);
+        assert_eq!(runner.operation_names(), ["GitVcsDriver.localBranchNames"]);
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].args,
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads",]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(requests[0].max_output_bytes, 1_000_000);
+        assert_eq!(requests[0].output_policy, OutputPolicy::Error);
+        assert!(
+            requests[0]
+                .env
+                .iter()
+                .any(|(name, value)| name == "GIT_OPTIONAL_LOCKS" && value == "0")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_branch_names_rejects_truncated_output() {
+        let mut output = process_output("main\n");
+        output.stdout_truncated = true;
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([("GitVcsDriver.localBranchNames".into(), output)]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner);
+
+        let error = repository
+            .local_branch_names(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect_err("truncated branch names are not authoritative");
+
+        assert!(error.detail.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn summary_status_distinguishes_detached_unborn_and_non_repository_states() {
+        for (status, expected_ref, expected_detached, expected_repo) in [
+            (
+                process_result(
+                    0,
+                    "# branch.oid fedcba9876543210fedcba9876543210fedcba98\n# branch.head (detached)\n",
+                    "",
+                ),
+                None,
+                Some("fedcba9876543210fedcba9876543210fedcba98"),
+                true,
+            ),
+            (
+                process_result(
+                    0,
+                    "# branch.oid (initial)\n# branch.head main\n? first.txt\n",
+                    "",
+                ),
+                None,
+                None,
+                true,
+            ),
+            (
+                process_result(128, "", "fatal: not a git repository"),
+                None,
+                None,
+                false,
+            ),
+        ] {
+            let mut outputs = HashMap::from([("GitVcsDriver.summaryStatus.status".into(), status)]);
+            if expected_repo {
+                outputs.insert(
+                    "GitVcsDriver.remoteProvider".into(),
+                    process_result(1, "", ""),
+                );
+            }
+            let runner = Arc::new(RecordingGitRunner {
+                outputs,
+                requests: Mutex::new(Vec::new()),
+            });
+            let repository = GitRepository::with_runner_for_test(runner.clone());
+
+            let summary = repository
+                .summary_status(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .expect("summary state succeeds");
+
+            assert_eq!(summary.is_repo, expected_repo);
+            assert_eq!(summary.ref_name.as_deref(), expected_ref);
+            assert_eq!(summary.detached_head.as_deref(), expected_detached);
+            assert_eq!(
+                summary.has_working_tree_changes,
+                expected_repo && expected_ref.is_none() && expected_detached.is_none()
+            );
+            assert_eq!(runner.count_arg("status"), 1);
+            assert_eq!(runner.count_arg("--numstat"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_provider_absence_is_distinct_from_operational_or_truncated_failure() {
+        let status = process_output(
+            "# branch.oid 0123456789abcdef0123456789abcdef01234567\n# branch.head main\n",
+        );
+        for provider in [
+            process_result(2, "", "fatal: invalid Git config"),
+            ProcessOutput {
+                exit_code: 0,
+                stdout: "https://github.com/acme/repository.git\n".to_owned(),
+                stderr: String::new(),
+                stdout_truncated: true,
+                stderr_truncated: false,
+            },
+        ] {
+            let runner = Arc::new(RecordingGitRunner {
+                outputs: HashMap::from([
+                    ("GitVcsDriver.summaryStatus.status".into(), status.clone()),
+                    ("GitVcsDriver.remoteProvider".into(), provider),
+                ]),
+                requests: Mutex::new(Vec::new()),
+            });
+            let error = GitRepository::with_runner_for_test(runner)
+                .summary_status(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .expect_err("provider operation failure must not become absence");
+            assert_eq!(error.operation.as_ref(), "GitVcsDriver.remoteProvider");
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_normal_untracked_mode_reports_a_nested_untracked_directory_dirty() {
+        let sandbox = TestSandbox::new("summary-nested-untracked");
+        let git = sandbox.executable_on_path("git");
+        assert!(
+            Command::new(&git)
+                .args(["init", "--quiet", "-b", "main"])
+                .current_dir(sandbox.root())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .expect("git init starts")
+                .success()
+        );
+        fs::create_dir_all(sandbox.path("nested/deep")).expect("nested untracked directory");
+        fs::write(sandbox.path("nested/deep/file.txt"), "untracked\n")
+            .expect("nested untracked file");
+
+        let summary = GitRepository::default()
+            .summary_status(sandbox.root(), &CancellationToken::new())
+            .await
+            .expect("nested untracked summary");
+
+        assert!(summary.is_repo);
+        assert_eq!(summary.ref_name, None);
+        assert!(summary.has_working_tree_changes);
+        assert!(summary.pr.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_records_fused_physical_git_requests() {
+        let runner = Arc::new(RecordingGitRunner::status_fixture());
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .status(Path::new("/repo"), &CancellationToken::new())
+            .await
+            .expect("status fixture succeeds");
+
+        assert_eq!(runner.operation_names(), EXPECTED_FUSED_OPERATIONS);
+        assert!(runner.requests().iter().all(|request| {
+            request
+                .env
+                .iter()
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0")
+        }));
+    }
+
+    #[tokio::test]
+    async fn common_dir_resolution_is_one_bounded_read_with_canonical_relative_output() {
+        let sandbox = TestSandbox::new("git-common-dir-canonical");
+        let cwd = sandbox.path("worktree");
+        let common_dir = sandbox.path("common.git");
+        fs::create_dir_all(&cwd).expect("worktree fixture");
+        fs::create_dir_all(&common_dir).expect("common-dir fixture");
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.resolveCommonDir".to_owned(),
+                process_output("../common.git\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let resolved = repository
+            .resolve_common_dir(&cwd, &CancellationToken::new())
+            .await
+            .expect("common directory resolves");
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&common_dir).expect("canonical common directory")
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].args,
+            ["rev-parse", "--git-common-dir"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            requests[0]
+                .env
+                .iter()
+                .any(|(key, value)| { key == "GIT_OPTIONAL_LOCKS" && value == "0" })
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_root_resolution_is_one_bounded_optional_lock_free_read() {
+        let sandbox = TestSandbox::new("git-watch-root-resolution");
+        let cwd = sandbox.path("worktree");
+        let git_dir = sandbox.path("common.git/worktrees/worktree");
+        let common_dir = sandbox.path("common.git");
+        fs::create_dir_all(&cwd).expect("worktree fixture");
+        fs::create_dir_all(&git_dir).expect("Git directory fixture");
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.resolveWatchRoots".to_owned(),
+                process_output(&format!(
+                    "{}\n{}\n{}\n",
+                    cwd.display(),
+                    git_dir.display(),
+                    common_dir.display()
+                )),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        let roots = repository
+            .resolve_watch_roots(&cwd, &CancellationToken::new())
+            .await
+            .expect("watch roots resolve");
+
+        assert_eq!(roots.worktree_root, fs::canonicalize(&cwd).unwrap());
+        assert_eq!(
+            roots.git_dir,
+            fs::canonicalize(&git_dir).expect("canonical Git directory")
+        );
+        assert_eq!(roots.common_dir, fs::canonicalize(&common_dir).unwrap());
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].args,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(requests[0].timeout, super::DEFAULT_TIMEOUT);
+        assert_eq!(
+            requests[0].max_output_bytes,
+            super::WATCH_ROOTS_OUTPUT_LIMIT
+        );
+        assert_eq!(requests[0].output_policy, OutputPolicy::Error);
+        assert!(
+            requests[0]
+                .env
+                .iter()
+                .any(|(name, value)| { name == "GIT_OPTIONAL_LOCKS" && value == "0" })
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_root_resolution_rejects_malformed_output_and_keeps_missing_paths_lexical() {
+        let sandbox = TestSandbox::new("git-watch-root-shapes");
+        let cwd = sandbox.path("worktree");
+        fs::create_dir_all(&cwd).expect("worktree fixture");
+        let malformed = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.resolveWatchRoots".to_owned(),
+                process_output("/only/worktree\n/only/git-dir\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        assert!(
+            GitRepository::with_runner_for_test(malformed)
+                .resolve_watch_roots(&cwd, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+
+        let missing = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.resolveWatchRoots".to_owned(),
+                process_output(".\n../missing/admin\n../missing/common\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let roots = GitRepository::with_runner_for_test(missing)
+            .resolve_watch_roots(&cwd, &CancellationToken::new())
+            .await
+            .expect("missing watch roots retain lexical identities");
+        assert_eq!(roots.worktree_root, fs::canonicalize(&cwd).unwrap());
+        assert_eq!(
+            roots.git_dir,
+            normalize_path_lexically(&cwd.join("../missing/admin"))
+        );
+        assert_eq!(
+            roots.common_dir,
+            normalize_path_lexically(&cwd.join("../missing/common"))
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_root_resolution_forwards_cancellation_to_its_only_bounded_read() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let runner = Arc::new(FailingWatchRootRunner {
+            failure: WatchRootFailure::Cancelled,
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let error = match GitRepository::with_runner_for_test(runner.clone())
+            .resolve_watch_roots(Path::new("/repo"), &cancellation)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled watch-root resolution must fail"),
+        };
+
+        assert_eq!(error.operation.as_ref(), "GitVcsDriver.resolveWatchRoots");
+        assert_eq!(error.detail.as_ref(), "Git command was interrupted.");
+        assert_eq!(
+            runner
+                .requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_root_resolution_propagates_its_output_limit_without_retry() {
+        let runner = Arc::new(FailingWatchRootRunner {
+            failure: WatchRootFailure::OutputLimit,
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let error = match GitRepository::with_runner_for_test(runner.clone())
+            .resolve_watch_roots(Path::new("/repo"), &CancellationToken::new())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("oversized watch-root output must fail"),
+        };
+
+        assert_eq!(error.operation.as_ref(), "GitVcsDriver.resolveWatchRoots");
+        assert_eq!(
+            error.detail.as_ref(),
+            "Git command output exceeded its limit."
+        );
+        let requests = runner
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].max_output_bytes,
+            super::WATCH_ROOTS_OUTPUT_LIMIT
+        );
+        assert_eq!(requests[0].output_policy, OutputPolicy::Error);
+    }
+
+    #[tokio::test]
+    async fn common_dir_resolution_uses_lexical_fallback_when_target_is_missing() {
+        let sandbox = TestSandbox::new("git-common-dir-lexical");
+        let cwd = sandbox.path("worktree");
+        fs::create_dir_all(&cwd).expect("worktree fixture");
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitVcsDriver.resolveCommonDir".to_owned(),
+                process_output("../missing/common.git\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner);
+
+        let resolved = repository
+            .resolve_common_dir(&cwd, &CancellationToken::new())
+            .await
+            .expect("missing common directory uses lexical identity");
+
+        assert_eq!(
+            resolved,
+            normalize_path_lexically(&cwd.join(PathBuf::from("../missing/common.git")))
+        );
     }
 }
 
@@ -4807,6 +6134,39 @@ fn parse_branch_headers(stdout: &str) -> (Option<String>, Option<String>, u64, u
     (branch, upstream, ahead, behind)
 }
 
+fn parse_summary_identity(
+    cwd: &Path,
+    stdout: &str,
+) -> Result<(Option<String>, Option<String>), GitCommandError> {
+    let mut oid = None;
+    let mut head = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("# branch.oid ") {
+            oid = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("# branch.head ") {
+            head = Some(value.trim());
+        }
+    }
+    match (oid, head) {
+        (Some("(initial)"), Some(_)) => Ok((None, None)),
+        (Some(oid), Some("(detached)")) if !oid.is_empty() => Ok((None, Some(oid.to_owned()))),
+        (Some(_), Some(head)) if !head.is_empty() && !head.starts_with('(') => {
+            Ok((Some(head.to_owned()), None))
+        }
+        _ => Err(simple_error(
+            "GitVcsDriver.summaryStatus.status",
+            cwd,
+            "Git returned incomplete branch identity in the status summary.",
+        )),
+    }
+}
+
+fn summary_observed_at() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("UTC timestamps are always RFC 3339 representable")
+}
+
 async fn untracked_line_count(path: &Path) -> u64 {
     let Ok(bytes) = tokio::fs::read(path).await else {
         return 0;
@@ -4828,7 +6188,7 @@ fn area_order(area: Option<VcsStagingArea>) -> u8 {
     }
 }
 
-fn validate_pathspecs(
+pub(crate) fn validate_pathspecs(
     operation: &str,
     cwd: &Path,
     paths: &[String],

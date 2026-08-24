@@ -2483,18 +2483,41 @@ async fn opencode_runtime_surfaces_session_errors_and_removes_the_unanswered_pro
         json!({
             "state": "failed",
             "stopReason": "error",
-            "error": { "message": "Model not found: openai/gpt-5" },
+            "errorMessage": "Model not found: openai/gpt-5",
+            "errorClass": "provider_error",
         })
     );
     assert_eq!(
         state.deleted_messages.lock().await.as_slice(),
         ["user-error-1"]
     );
-    assert!(
-        timeout(Duration::from_millis(100), runtime.next_event())
+    // The fixture closes its SSE stream at the end of the scenario, and the pump
+    // reports that teardown as `session.exited`. That event is required, not
+    // merely tolerated: without it a crashed opencode server goes back to
+    // looking like a hung BiBCode. Nothing else may follow it, because idle
+    // after an error must not emit a second successful completion.
+    let mut saw_exit = false;
+    while !saw_exit {
+        let event = timeout(Duration::from_secs(2), runtime.next_event())
             .await
-            .is_err(),
-        "idle after an error must not emit a second successful completion"
+            .expect("terminal OpenCode event")
+            .expect("session exit before stream termination");
+        assert_eq!(
+            event.event_type, "session.exited",
+            "idle after an error must not emit a second successful completion"
+        );
+        saw_exit = true;
+    }
+    assert!(
+        saw_exit,
+        "a closed opencode event stream is reported as session.exited"
+    );
+    assert!(
+        timeout(Duration::from_secs(1), runtime.next_event())
+            .await
+            .expect("closed OpenCode stream becomes terminal")
+            .is_none(),
+        "the supervisor must observe EOF after the final session.exited event"
     );
 
     runtime.stop().await.expect("stop");
@@ -3609,12 +3632,20 @@ async fn opencode_runtime_recovers_a_child_frame_that_arrives_before_lineage_ver
     })]);
     state.reconnect_burst.notify_waiters();
 
-    assert!(
-        timeout(Duration::from_millis(100), runtime.next_event())
-            .await
-            .is_err(),
-        "an unverified child SSE frame is a reconciliation hint, never renderable activity"
-    );
+    // The fixture closes its SSE stream once the reconnect burst is delivered,
+    // and the pump reports that teardown as `session.exited`. That is the only
+    // event permitted here: an unverified child SSE frame is a reconciliation
+    // hint, never renderable activity.
+    while let Ok(Some(event)) = timeout(Duration::from_millis(100), runtime.next_event()).await {
+        assert_eq!(
+            event.event_type, "session.exited",
+            "an unverified child SSE frame is a reconciliation hint, never renderable activity"
+        );
+        assert!(
+            event.activity.is_empty(),
+            "stream teardown carries no renderable activity"
+        );
+    }
     let recovered = next_reconciliation_activity(&runtime).await;
     assert!(recovered.iter().any(|mutation| matches!(
         mutation,
@@ -6477,7 +6508,11 @@ async fn subscribe_reconciliation_events(
                     .into_iter()
                     .map(|chunk| Ok::<Bytes, std::convert::Infallible>(Bytes::from(chunk))),
             )
-        });
+        })
+        // This endpoint models a live provider subscription. The reconnect
+        // burst is finite, but the SSE connection itself must remain open
+        // until the client cancels it.
+        .chain(stream::pending());
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -6517,7 +6552,10 @@ async fn subscribe_reconciliation_events(
                 Ok::<Event, std::convert::Infallible>(Event::default().data(payload))
             }
         })
-    });
+    })
+    // A finite test burst is not provider EOF. Keep the subscription alive so
+    // tests exercise reconnect reconciliation without racing stream teardown.
+    .chain(stream::pending());
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()

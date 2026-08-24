@@ -118,10 +118,12 @@ export function deriveAdoptedWorkspaceStateByThreadId(
 export type WorktreeCatalogCapabilityPolicy =
   | {
       readonly catalogRpc: "enabled";
+      readonly refreshReason: "enabled" | "disabled";
       readonly removal: "catalog";
     }
   | {
       readonly catalogRpc: "disabled";
+      readonly refreshReason: "disabled";
       readonly removal: "legacy-detach-only";
     };
 
@@ -129,8 +131,19 @@ export function selectWorktreeCatalogCapabilityPolicy(
   environmentDescriptor: ExecutionEnvironmentDescriptor | null | undefined,
 ): WorktreeCatalogCapabilityPolicy {
   return environmentDescriptor?.capabilities?.worktreeCatalog === true
-    ? { catalogRpc: "enabled", removal: "catalog" }
-    : { catalogRpc: "disabled", removal: "legacy-detach-only" };
+    ? {
+        catalogRpc: "enabled",
+        refreshReason:
+          environmentDescriptor.capabilities.worktreeCatalogRefreshReason === true
+            ? "enabled"
+            : "disabled",
+        removal: "catalog",
+      }
+    : {
+        catalogRpc: "disabled",
+        refreshReason: "disabled",
+        removal: "legacy-detach-only",
+      };
 }
 
 export function isWorktreeCatalogSupported(
@@ -204,6 +217,22 @@ function requestWithWorktreeCatalogCapability<TTag extends EnvironmentUnaryRpcTa
   return Effect.gen(function* () {
     const negotiated = yield* requireWorktreeCatalog();
     return yield* requestInSession(negotiated.session, negotiated.environmentId, tag, input);
+  });
+}
+
+function requestWorktreeCatalogRefresh(
+  input: EnvironmentRpcInput<typeof WS_METHODS.vcsRefreshWorktreeCatalog>,
+) {
+  return Effect.gen(function* () {
+    const negotiated = yield* requireWorktreeCatalog();
+    const wireInput =
+      negotiated.policy.refreshReason === "enabled" ? input : { projectId: input.projectId };
+    return yield* requestInSession(
+      negotiated.session,
+      negotiated.environmentId,
+      WS_METHODS.vcsRefreshWorktreeCatalog,
+      wireInput,
+    );
   });
 }
 
@@ -308,6 +337,18 @@ export function createWorktreeEnvironmentAtoms<R, E>(
     readonly environmentId: string;
     readonly input: { readonly projectId: string };
   }) => JSON.stringify([environmentId, input.projectId]);
+  const refreshKey = ({
+    environmentId,
+    input,
+  }: {
+    readonly environmentId: string;
+    readonly input: EnvironmentRpcInput<typeof WS_METHODS.vcsRefreshWorktreeCatalog>;
+  }) =>
+    JSON.stringify([
+      environmentId,
+      input.projectId,
+      input.reason === "focus" ? "focus" : "explicit",
+    ]);
 
   const executeAdoption = (target: {
     readonly environmentId: EnvironmentId;
@@ -388,15 +429,11 @@ export function createWorktreeEnvironmentAtoms<R, E>(
     refresh: createRuntimeCommand(runtime, {
       label: "environment-data:worktrees:refresh",
       scheduler: refreshScheduler,
-      concurrency: { mode: "singleFlight", key: projectKey },
+      concurrency: { mode: "singleFlight", key: refreshKey },
       execute: (target: {
         readonly environmentId: EnvironmentId;
         readonly input: EnvironmentRpcInput<typeof WS_METHODS.vcsRefreshWorktreeCatalog>;
-      }) =>
-        runInEnvironment(
-          target.environmentId,
-          requestWithWorktreeCatalogCapability(WS_METHODS.vcsRefreshWorktreeCatalog, target.input),
-        ),
+      }) => runInEnvironment(target.environmentId, requestWorktreeCatalogRefresh(target.input)),
     }),
     updatePolicy: createRuntimeCommand(runtime, {
       label: "environment-data:worktrees:update-policy",

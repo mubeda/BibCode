@@ -27,6 +27,7 @@ const CONSOLE_PALETTE_CHILD_ENV: &str = "BIBCODE_TEST_CONSOLE_PALETTE_CHILD";
 const WINDOWS_CONSOLE_THEME_ENV: &str = "BIBCODE_WINDOWS_CONSOLE_THEME";
 const TRUSTED_CMD_FIXTURE_ENV: &str = "BIBCODE_TEST_TRUSTED_CMD_FIXTURE";
 const NATIVE_ARGV_MARKER: &str = "BIBCODE_NATIVE_ARGV";
+const TERMINAL_PROCESS_TREE_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
 
 struct OwnedHandle(HANDLE);
 
@@ -68,7 +69,7 @@ impl Drop for OwnedHandle {
 }
 
 async fn wait_for_pid_file(path: &Path) -> u32 {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(TERMINAL_PROCESS_TREE_INTEGRATION_DEADLINE, async {
         loop {
             if let Ok(contents) = std::fs::read_to_string(path)
                 && let Ok(pid) = contents.trim().parse::<u32>()

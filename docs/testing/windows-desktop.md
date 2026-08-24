@@ -67,6 +67,99 @@ Select focused tests from affected source and verify at least:
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
 threads. Do not replace the default harness with a serial run.
 
+## VCS idle and foreground measurement
+
+Before measuring an idle window, verify the current event-driven observation
+boundary on native Windows:
+
+```powershell
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::watcher -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_vcs_rpc native_watcher_publishes_external_worktree_and_head_changes_to_status_subscribers -- --exact --nocapture
+vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
+```
+
+Record the idle 59/60-second boundary, native content/index/`HEAD`/refs events,
+watcher fallback and lifecycle outcomes, terminal exit invalidation, reconnect,
+and hidden/reveal/focus/menu catch-up separately. A native Windows pass does not
+claim real WSL, SSH, Linux, or macOS execution. When WSL is usable, repeat the
+disposable-project branch and terminal scenarios in the selected distribution;
+otherwise record them as unavailable.
+
+Run the maintained controller from the repository root. It builds both
+Windows-only examples through the root Cargo workspace and lockfile, then runs
+the complete Git and production-Atom measurements:
+
+```powershell
+node scripts/measure-vcs-runtime.ts
+```
+
+Use a short window only to validate the harness itself, never as default-change
+evidence:
+
+```powershell
+node scripts/measure-vcs-runtime.ts --duration-ms 3000 --queue-warmups 2 --queue-samples 10
+```
+
+The controller pre-resolves the real Git executable, creates a unique
+test-owned data root plus one disposable physical repository/worktree and bare
+origin, and completes fixture Git work before adding the shim to the server's
+PATH. It overrides inherited Cargo target configuration with an isolated target
+inside that evidence root, consumes Cargo `compiler-artifact` JSON, and builds
+and launches the exact resulting `measure_vcs_runtime_server` executable even
+when Cargo uses a configured target-triple directory. The example constructs the production
+`ServerRuntime`, RPC registry,
+`StatusBroadcaster`, and `GitRepository`. The example opens the real WebSocket
+RPC path, keeps exactly one `subscribeVcsStatus` stream alive, acknowledges
+chunks, and makes no focus, menu, mutation, or external Git changes during the
+idle window. Desktop UI automation is not required for this server-owned path.
+
+Record the server PID, creation time, executable path, fixture common directory,
+worktrees, subscribers, exact interval boundaries, and any other process that
+could share attribution. Capture process-start events for direct `git.exe`
+children of that exact server identity. The controller copies the tracked
+`measure_vcs_git_shim` example to the test-owned PATH as `git.exe`. It appends
+the timestamp, PID, process and parent creation identities, and argument vector
+under one named mutex, delegates once to the pre-resolved real Git executable
+with inherited standard handles/environment, and returns its exit status. Count
+the shim launch only; do not also count its delegated Git child.
+
+Before starting the ten-minute clock, run a short probe that proves all of the
+following: the subscription received its snapshot, the physical-repository
+owner attached, the recorder captured a direct Git child with its arguments,
+and the recorded parent still has the same creation identity. Clear the probe
+records. Then keep the verified scenario idle for at least 600 seconds and
+summarize command arguments into discovery, status/diff, and fetch categories.
+If the evidence exposes command lines but not Rust `ProcessRequest.operation`,
+report that exact limitation instead of assigning internal operation names.
+
+On completion or failure the controller uses one bounded cleanup routine. One
+atomic Windows process snapshot binds PID, parent PID, decimal FILETIME, and
+normalized executable before stop. While the root remains alive the controller
+captures its exact child/grandchild closure. Graceful success also reaps and
+verifies captured orphans; timeout revalidates the immutable identities,
+terminates verified descendants leaf-first and the owned server handle last,
+awaits the parent exit, and rejects any survivor. After a clean completion it
+parses only the
+half-open `[start, start + duration)` window, filters the exact direct-parent
+identity, reports non-direct and wrong-identity records, calculates the
+per-minute/per-physical-repository rate, and prints and writes every evidence
+path. A parse, identity, snapshot, common-directory, quiescence, shutdown, or
+queue-summary failure makes the command fail.
+
+`scripts/measure-desktop-runtime.ts` remains the supported startup, memory, and
+point-in-time process-tree sampler. Its Windows ownership monitor does not
+retain process-start history, so it cannot by itself prove the VCS Git-launch
+rate. Use it only as additional current-process identity/memory evidence.
+
+The same controller runs the tracked Vite+ production-Atom benchmark with the
+requested warm-up and sample counts. It uses the real `createVcsEnvironmentAtoms`
+commands, keeps `refreshStatus` deferred while same-key `stageFiles` is
+scheduled, and measures with `performance.now()` until the stage RPC effect
+begins. Record its warm-up and measured sample counts, sorted nearest-rank p95,
+maximum, and the 250 ms comparison.
+
 ## External worktree and junction fixture
 
 Use a unique test-owned root, never a user project. One example shape is:
@@ -143,7 +236,7 @@ the package-specific MSVC launcher. When a direct native Rust command needs the
 same environment, use:
 
 ```powershell
-node scripts/run-msvc-x64.mjs cargo test --workspace -j 2
+node scripts/run-msvc-x64.mjs cargo test --workspace -j 2 -- --test-threads=2
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 

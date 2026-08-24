@@ -672,37 +672,76 @@
             "hasActionableProposedPlan": false
           },
           {
-            "id": "EF.8@>apu1",
-            "projectId": "NNN]rb96by",
-            "title": "gH3",
+            "id": ".8@>",
+            "projectId": "pu1UNNN",
+            "title": "rb96b",
             "modelSelection": {
-              "instanceId": "qI_5324Ub_",
-              "model": "{)T\\asrL"
+              "instanceId": "q-W2I_5324U",
+              "model": "hK?{)T\\asrL",
+              "options": [
+                {
+                  "id": "/r`MNWwp$1X",
+                  "value": true
+                },
+                {
+                  "id": "k]L5.JDf!",
+                  "value": true
+                },
+                {
+                  "id": "Uo)",
+                  "value": true
+                },
+                {
+                  "id": "aVB<QQUK>",
+                  "value": "F1zwm6A"
+                },
+                {
+                  "id": "EJ^7",
+                  "value": "tU5{7Z8|q$"
+                },
+                {
+                  "id": "'4aV&C(\\>",
+                  "value": "1A*gwAN?"
+                },
+                {
+                  "id": "i791?/Rma|",
+                  "value": "NbI"
+                },
+                {
+                  "id": "1",
+                  "value": true
+                },
+                {
+                  "id": "@Rw7",
+                  "value": "0/z5y%'&>A'q"
+                }
+              ]
             },
-            "runtimeMode": "approval-required",
+            "runtimeMode": "auto-accept-edits",
             "interactionMode": "default",
-            "kind": "workspace",
-            "branch": "NWwp$1Xg",
+            "branch": "?kyCg0bY",
             "worktreePath": null,
-            "latestTurn": {
-              "turnId": "k]L5.JDf!",
-              "state": "error",
-              "requestedAt": "ZXUo)BL",
-              "startedAt": null,
-              "completedAt": "VB<QQ",
-              "assistantMessageId": null
+            "latestTurn": null,
+            "createdAt": ";Wf@J+?m",
+            "updatedAt": "XU23'>\"",
+            "archivedAt": "P-N5z>#Yd ",
+            "session": {
+              "threadId": "|a}G03",
+              "status": "starting",
+              "providerName": "8tzq}7",
+              "providerInstanceId": "J-AL_-09",
+              "runtimeMode": "auto-accept-edits",
+              "activeTurnId": null,
+              "lastError": null,
+              "updatedAt": "8T4"
             },
-            "createdAt": "$F",
-            "updatedAt": "zwm6ATh",
-            "archivedAt": "^7%)tU5{7",
-            "session": null,
-            "latestUserMessageAt": "q$a<'4",
+            "latestUserMessageAt": "c~4&_V",
             "hasPendingApprovals": true,
             "hasPendingUserInput": true,
-            "hasActionableProposedPlan": true
+            "hasActionableProposedPlan": false
           }
         ],
-        "updatedAt": ""
+        "updatedAt": "\"-}"
       }
     }
   ]

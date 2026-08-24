@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-server"
-version = "0.4.0"
+version = "0.4.1"
 description = "BiBCode Rust server runtime"
 edition.workspace = true
 rust-version.workspace = true
@@ -24,6 +24,7 @@ getrandom.workspace = true
 hmac.workspace = true
 httpdate.workspace = true
 mime_guess.workspace = true
+notify.workspace = true
 open.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true

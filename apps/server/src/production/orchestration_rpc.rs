@@ -1000,7 +1000,10 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
 
 fn thread_activity_tone(tone: &str) -> &str {
     match tone {
-        "info" | "tool" | "approval" | "error" => tone,
+        // `warning` must be listed: this whitelist is the last hop before the
+        // client, so omitting it silently downgraded provider warnings to
+        // `info` and the new tone never arrived.
+        "info" | "tool" | "approval" | "warning" | "error" => tone,
         _ => "info",
     }
 }
@@ -1037,6 +1040,7 @@ fn thread_shell(thread: &ProjectionThread, snapshot: &crate::orchestration::Snap
                 "runtimeMode": session.runtime_mode,
                 "activeTurnId": session.active_turn_id,
                 "lastError": session.last_error,
+                "lastErrorClass": session.last_error_class,
                 "updatedAt": session.updated_at,
             })
         });
@@ -1059,6 +1063,9 @@ fn thread_shell(thread: &ProjectionThread, snapshot: &crate::orchestration::Snap
         "hasPendingApprovals": thread.pending_approval_count > 0,
         "hasPendingUserInput": thread.pending_user_input_count > 0,
         "hasActionableProposedPlan": thread.has_actionable_proposed_plan != 0,
+        "unresolvedDelivery": thread.unresolved_delivery_state.as_ref().map(|state| {
+            json!({ "state": state, "detail": thread.unresolved_delivery_detail })
+        }),
     })
 }
 

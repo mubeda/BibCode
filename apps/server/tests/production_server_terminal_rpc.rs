@@ -30,6 +30,8 @@ use bibcode_server::{
     },
 };
 
+const TERMINAL_RPC_INTEGRATION_DEADLINE: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 struct GateTestPty {
     identity: diagnostics::ProcessIdentity,
@@ -136,7 +138,7 @@ impl ProductionServerControl for FixtureControl {
         Box::pin(async move {
             Ok(match method {
                 "server.getConfig" => json!({ "source": "rust", "payload": payload }),
-                "server.getSettings" => json!({ "automaticGitFetchInterval": 30000 }),
+                "server.getSettings" => json!({ "automaticGitFetchInterval": 180000 }),
                 _ => json!({ "method": method, "payload": payload }),
             })
         })
@@ -1498,7 +1500,7 @@ async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_int
             .expect("interruptible attach socket");
 
         let settings = success_value(request(control, "1", "server.getSettings", json!({})).await);
-        assert_eq!(settings["automaticGitFetchInterval"], 30000);
+        assert_eq!(settings["automaticGitFetchInterval"], 180000);
 
         let diagnostics =
             success_value(request(control, "2", "server.getProcessDiagnostics", json!({})).await);
@@ -1834,7 +1836,7 @@ async fn send_interrupt(socket: &mut TestSocket, request_id: &str) {
 }
 
 async fn next_message(socket: &mut TestSocket) -> ServerMessage {
-    let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+    let message = tokio::time::timeout(TERMINAL_RPC_INTEGRATION_DEADLINE, socket.next())
         .await
         .expect("response timeout")
         .expect("socket remains open")
@@ -2119,15 +2121,18 @@ fn environment_probe_command(output_path: &std::path::Path) -> (String, Vec<Stri
 }
 
 async fn read_file_with_retry(path: &std::path::Path) -> String {
-    for _ in 0..100 {
-        if let Ok(contents) = tokio::fs::read_to_string(path).await
-            && !contents.is_empty()
-        {
-            return contents;
+    tokio::time::timeout(TERMINAL_RPC_INTEGRATION_DEADLINE, async {
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await
+                && !contents.is_empty()
+            {
+                return contents;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {}", path.display());
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()))
 }
 
 fn long_running_output_marker() -> &'static str {

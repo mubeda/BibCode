@@ -8,6 +8,8 @@ pub use discovery::{
     VcsDiscoveryKind, WireOption,
 };
 #[allow(unused_imports)]
+pub(crate) use pull_request::ProviderCommandSpec;
+#[allow(unused_imports)]
 pub use pull_request::{
     ChangeRequestState, CreatePullRequestInput, PullRequestService, ResolvePullRequestInput,
     ResolvedPullRequest, SourceControlProviderError, parse_github_pull_request,

@@ -18,9 +18,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        ChangeRequest, CreateWorktreeInput, GitRepository, OutputPolicy, ProcessRequest,
-        ProcessRunner, StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult,
-        VcsStatusStreamEvent,
+        ChangeRequest, CreateWorktreeInput, GitCommandError, GitProcessRunner, GitRepository,
+        GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
+        STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
+        VcsStatusRemoteResult, VcsStatusStreamEvent, validate_pathspecs,
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},
@@ -37,8 +38,6 @@ use crate::{
 use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
-const REF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
-const LOCAL_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 pub(crate) struct WorktreeRemovalTaskTracker {
@@ -189,19 +188,59 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "sourceControl.publishRepository",
 ];
 
-pub const GIT_VCS_STREAM_METHODS: &[&str] = &["subscribeVcsStatus", "git.runStackedAction"];
+pub const GIT_VCS_STREAM_METHODS: &[&str] = &[
+    "subscribeVcsStatus",
+    "subscribeVcsStatusSummary",
+    "git.runStackedAction",
+];
 
 #[derive(Clone)]
 pub struct GitVcsRpcServices {
     repository: Arc<GitRepository>,
     broadcaster: StatusBroadcaster,
+    summary: GitStatusSummaryService,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
     github_command: PathBuf,
+    github_runner: Arc<dyn GitProcessRunner>,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
     terminal: Option<TerminalManager>,
     repositories: Option<Repositories>,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    #[cfg(test)]
+    status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
+}
+
+#[cfg(test)]
+struct StatusStreamEnrichmentTestHook {
+    started: Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for StatusStreamEnrichmentTestHook {
+    fn default() -> Self {
+        Self {
+            started: Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl StatusStreamEnrichmentTestHook {
+    async fn block(&self, cancellation: &CancellationToken) {
+        self.started.notify_one();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {}
+            permit = self.release.acquire() => {
+                if let Ok(permit) = permit {
+                    permit.forget();
+                }
+            }
+        }
+    }
 }
 
 impl Default for GitVcsRpcServices {
@@ -212,7 +251,7 @@ impl Default for GitVcsRpcServices {
 
 impl GitVcsRpcServices {
     pub fn with_repository(repository: Arc<GitRepository>) -> Self {
-        let (automatic_remote_refresh_interval, _) = watch::channel(LOCAL_STATUS_REFRESH_INTERVAL);
+        let (automatic_remote_refresh_interval, _) = watch::channel(STATUS_SAFETY_INTERVAL);
         Self::with_repository_and_automatic_fetch_interval(
             repository,
             automatic_remote_refresh_interval,
@@ -235,7 +274,7 @@ impl GitVcsRpcServices {
         repository: Arc<GitRepository>,
         terminal: TerminalManager,
     ) -> Self {
-        let (automatic_remote_refresh_interval, _) = watch::channel(LOCAL_STATUS_REFRESH_INTERVAL);
+        let (automatic_remote_refresh_interval, _) = watch::channel(STATUS_SAFETY_INTERVAL);
         Self::with_repository_dependencies(
             repository,
             automatic_remote_refresh_interval,
@@ -277,22 +316,26 @@ impl GitVcsRpcServices {
         terminal: Option<TerminalManager>,
         repositories: Option<Repositories>,
     ) -> Self {
+        let pull_requests = PullRequestService::default();
         Self {
             broadcaster: StatusBroadcaster::with_automatic_remote_refresh_interval(
                 Arc::clone(&repository),
-                REF_REFRESH_INTERVAL,
-                LOCAL_STATUS_REFRESH_INTERVAL,
+                STATUS_SAFETY_INTERVAL,
                 automatic_remote_refresh_interval,
                 STREAM_CAPACITY,
             ),
+            summary: GitStatusSummaryService::new(Arc::clone(&repository), pull_requests.clone()),
             repository,
             discovery: SourceControlDiscovery::default(),
-            pull_requests: PullRequestService::default(),
+            pull_requests,
             github_command: PathBuf::from("gh"),
+            github_runner: Arc::new(ProcessRunner),
             availability_registry: None,
             terminal,
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
+            #[cfg(test)]
+            status_stream_enrichment_test_hook: None,
         }
     }
 
@@ -304,6 +347,25 @@ impl GitVcsRpcServices {
         let mut services = Self::with_repository(repository);
         services.github_command = github_command;
         services
+    }
+
+    #[cfg(test)]
+    fn with_repository_and_github_runner_for_test(
+        repository: Arc<GitRepository>,
+        github_runner: Arc<dyn GitProcessRunner>,
+    ) -> Self {
+        let mut services = Self::with_repository(repository);
+        services.github_runner = github_runner;
+        services
+    }
+
+    #[cfg(test)]
+    fn with_status_stream_enrichment_test_hook(
+        mut self,
+        hook: Arc<StatusStreamEnrichmentTestHook>,
+    ) -> Self {
+        self.status_stream_enrichment_test_hook = Some(hook);
+        self
     }
 
     #[must_use]
@@ -318,13 +380,15 @@ impl GitVcsRpcServices {
     pub(crate) fn worktree_removal_tasks(&self) -> WorktreeRemovalTaskTracker {
         self.worktree_removal_tasks.clone()
     }
+
+    pub(crate) fn status_broadcaster(&self) -> StatusBroadcaster {
+        self.broadcaster.clone()
+    }
 }
 
 impl WorkspaceMutationObserver for GitVcsRpcServices {
-    fn workspace_mutated<'a>(&'a self, cwd: &'a Path) -> WorkspaceMutationFuture<'a> {
-        Box::pin(async move {
-            self.broadcaster.notify_local_change(cwd).await;
-        })
+    fn begin_workspace_mutation<'a>(&'a self, cwd: &'a Path) -> WorkspaceMutationFuture<'a> {
+        Box::pin(async move { Some(self.broadcaster.begin_mutation(cwd).await) })
     }
 }
 
@@ -345,9 +409,24 @@ pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, services: GitVcsRpcServi
     registry.register_stream(GIT_VCS_STREAM_METHODS[0], move |request, cancellation| {
         stream_services.status_stream(request, cancellation)
     });
-    registry.register_stream(GIT_VCS_STREAM_METHODS[1], move |request, cancellation| {
+    let summary_services = services.clone();
+    registry.register_latest_stream(GIT_VCS_STREAM_METHODS[1], move |request, cancellation| {
+        summary_services.summary_stream(request, cancellation)
+    });
+    registry.register_stream(GIT_VCS_STREAM_METHODS[2], move |request, cancellation| {
         services.stacked_action_stream(request, cancellation)
     });
+}
+
+async fn await_server_owned_rpc(
+    method: &'static str,
+    operation: impl Future<Output = RpcResult> + Send + 'static,
+) -> RpcResult {
+    match tokio::spawn(operation).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(request_error(method, &error.to_string())),
+    }
 }
 
 impl GitVcsRpcServices {
@@ -359,11 +438,239 @@ impl GitVcsRpcServices {
     ) -> RpcResult {
         let workspace_admission = self.guard_payload_cwd(&request.payload).await?;
         let operation_cancellation = cancellation.child_token();
-        await_git_rpc_operation(
-            workspace_admission.as_ref(),
-            operation_cancellation.clone(),
-            self.handle_admitted_unary(request, context, operation_cancellation),
-        )
+        match request.tag.as_str() {
+            "vcs.pull" => {
+                let input: CwdInput = decode(request.payload, "vcs.pull")?;
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "vcs.pull",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        encode_result(repository.pull_current_branch(&input.cwd, &token).await)
+                    },
+                )
+                .await
+            }
+            "vcs.createRef" => {
+                let input: CreateRefInput = decode(request.payload, "vcs.createRef")?;
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "vcs.createRef",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        encode_result(
+                            repository
+                                .create_ref(
+                                    &input.cwd,
+                                    &input.ref_name,
+                                    input.switch_ref.unwrap_or(false),
+                                    &token,
+                                )
+                                .await
+                                .map(|ref_name| json!({ "refName": ref_name })),
+                        )
+                    },
+                )
+                .await
+            }
+            "vcs.switchRef" => {
+                let input: SwitchRefInput = decode(request.payload, "vcs.switchRef")?;
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "vcs.switchRef",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        encode_result(
+                            repository
+                                .switch_ref(&input.cwd, &input.ref_name, &token)
+                                .await
+                                .map(|ref_name| json!({ "refName": ref_name })),
+                        )
+                    },
+                )
+                .await
+            }
+            "vcs.init" => {
+                let input: InitInput = decode(request.payload, "vcs.init")?;
+                if input.kind.as_deref().is_some_and(|kind| kind != "git") {
+                    return Err(vcs_error(
+                        "vcs.init",
+                        &input.cwd,
+                        "Only the git VCS driver can initialize repositories.",
+                    ));
+                }
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "vcs.init",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move { encode_null(repository.init(&input.cwd, &token).await) },
+                )
+                .await
+            }
+            "vcs.stageFiles" | "vcs.unstageFiles" | "vcs.discardFiles" => {
+                let tag = request.tag;
+                let input: FilePathsInput = decode(request.payload, &tag)?;
+                if input.file_paths.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let operation = match tag.as_str() {
+                    "vcs.stageFiles" => "GitVcsDriver.stageFiles",
+                    "vcs.unstageFiles" => "GitVcsDriver.unstageFiles",
+                    _ => "GitVcsDriver.discardFiles",
+                };
+                validate_pathspecs(operation, &input.cwd, &input.file_paths)
+                    .map_err(serialize_error)?;
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                let method = match tag.as_str() {
+                    "vcs.stageFiles" => "vcs.stageFiles",
+                    "vcs.unstageFiles" => "vcs.unstageFiles",
+                    _ => "vcs.discardFiles",
+                };
+                self.run_owned_git_mutation(
+                    method,
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        let result = match tag.as_str() {
+                            "vcs.stageFiles" => {
+                                repository
+                                    .stage_files(&input.cwd, &input.file_paths, &token)
+                                    .await
+                            }
+                            "vcs.unstageFiles" => {
+                                repository
+                                    .unstage_files(&input.cwd, &input.file_paths, &token)
+                                    .await
+                            }
+                            _ => {
+                                repository
+                                    .discard_files(&input.cwd, &input.file_paths, &token)
+                                    .await
+                            }
+                        };
+                        encode_null(result)
+                    },
+                )
+                .await
+            }
+            "git.preparePullRequestThread" => {
+                let input: PreparePullRequestInput =
+                    decode(request.payload, "git.preparePullRequestThread")?;
+                let (pull_request, branch) = await_git_rpc_operation(
+                    workspace_admission.as_ref(),
+                    operation_cancellation.clone(),
+                    self.resolve_pull_request_preparation(&input, &operation_cancellation),
+                )
+                .await?;
+                let repository = Arc::clone(&self.repository);
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "git.preparePullRequestThread",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        repository
+                            .switch_ref(&input.cwd, &branch, &token)
+                            .await
+                            .map_err(serialize_error)?;
+                        Ok(json!({ "pullRequest": pull_request, "branch": branch }))
+                    },
+                )
+                .await
+            }
+            "sourceControl.publishRepository" => {
+                let input: PublishRepositoryInput =
+                    decode(request.payload, "sourceControl.publishRepository")?;
+                let (remote_name, visibility) = preflight_publish_repository(&input)?;
+                let services = self.clone();
+                let token = operation_cancellation.clone();
+                self.run_owned_git_mutation(
+                    "sourceControl.publishRepository",
+                    input.cwd.clone(),
+                    workspace_admission,
+                    operation_cancellation,
+                    async move {
+                        services
+                            .publish_repository(input, remote_name, visibility, &token)
+                            .await
+                    },
+                )
+                .await
+            }
+            _ => {
+                await_git_rpc_operation(
+                    workspace_admission.as_ref(),
+                    operation_cancellation.clone(),
+                    self.handle_admitted_unary(request, context, operation_cancellation),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn run_owned_git_mutation(
+        &self,
+        method: &'static str,
+        cwd: PathBuf,
+        workspace_admission: Option<WorkspaceAdmissionLease>,
+        cancellation: CancellationToken,
+        operation: impl Future<Output = RpcResult> + Send + 'static,
+    ) -> RpcResult {
+        let broadcaster = self.broadcaster.clone();
+        await_server_owned_rpc(method, async move {
+            let loss = workspace_admission
+                .as_ref()
+                .map(WorkspaceAdmissionLease::loss_cancellation);
+            let mutation = match loss {
+                Some(loss) => {
+                    tokio::select! {
+                        biased;
+                        () = loss.cancelled() => {
+                            cancellation.cancel();
+                            return Err(serialize_error(
+                                loss.unavailable().expect("workspace loss retains its error"),
+                            ));
+                        }
+                        () = cancellation.cancelled() => {
+                            return Err(request_error(method, "The Git mutation was cancelled before admission."));
+                        }
+                        mutation = broadcaster.begin_mutation(&cwd) => mutation,
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(request_error(method, "The Git mutation was cancelled before admission."));
+                        }
+                        mutation = broadcaster.begin_mutation(&cwd) => mutation,
+                    }
+                }
+            };
+            let result = await_git_mutation_terminal(
+                workspace_admission.as_ref(),
+                cancellation,
+                operation,
+            )
+            .await;
+            mutation.finish().await;
+            result
+        })
         .await
     }
 
@@ -375,29 +682,28 @@ impl GitVcsRpcServices {
     ) -> RpcResult {
         match request.tag.as_str() {
             "shell.openInEditor" => self.open_in_editor(request.payload).await,
-            "vcs.pull" => {
-                let input: CwdInput = decode(request.payload, "vcs.pull")?;
-                encode_result(
-                    self.repository
-                        .pull_current_branch(&input.cwd, &cancellation)
-                        .await,
-                )
-            }
             "vcs.refreshStatus" => {
                 let input: CwdInput = decode(request.payload, "vcs.refreshStatus")?;
-                let mut status = self
+                let publication = self
                     .broadcaster
                     .refresh_status(&input.cwd, &cancellation)
                     .await
                     .map_err(serialize_error)?;
-                enrich_remote_pull_request(
-                    &self.pull_requests,
-                    &input.cwd,
-                    &status.local,
-                    &mut status.remote,
-                    &cancellation,
-                )
-                .await;
+                let fence = publication.fence;
+                let mut status = publication.value;
+                let status = finish_fenced_enrichment(&self.broadcaster, fence, async {
+                    enrich_remote_pull_request(
+                        &self.pull_requests,
+                        &input.cwd,
+                        &status.local,
+                        &mut status.remote,
+                        &cancellation,
+                    )
+                    .await;
+                    status
+                })
+                .await
+                .map_err(serialize_error)?;
                 serde_json::to_value(status)
                     .map_err(|error| request_error("vcs.refreshStatus", &error.to_string()))
             }
@@ -512,59 +818,6 @@ impl GitVcsRpcServices {
                     .await;
                 encode_result(result.map(|path| json!({ "path": display_path(path) })))
             }
-            "vcs.createRef" => {
-                let input: CreateRefInput = decode(request.payload, "vcs.createRef")?;
-                let result = self
-                    .repository
-                    .create_ref(
-                        &input.cwd,
-                        &input.ref_name,
-                        input.switch_ref.unwrap_or(false),
-                        &cancellation,
-                    )
-                    .await;
-                encode_result(result.map(|ref_name| json!({ "refName": ref_name })))
-            }
-            "vcs.switchRef" => {
-                let input: SwitchRefInput = decode(request.payload, "vcs.switchRef")?;
-                let result = self
-                    .repository
-                    .switch_ref(&input.cwd, &input.ref_name, &cancellation)
-                    .await;
-                encode_result(result.map(|ref_name| json!({ "refName": ref_name })))
-            }
-            "vcs.init" => {
-                let input: InitInput = decode(request.payload, "vcs.init")?;
-                if input.kind.as_deref().is_some_and(|kind| kind != "git") {
-                    return Err(vcs_error(
-                        "vcs.init",
-                        &input.cwd,
-                        "Only the git VCS driver can initialize repositories.",
-                    ));
-                }
-                encode_null(self.repository.init(&input.cwd, &cancellation).await)
-            }
-            "vcs.stageFiles" | "vcs.unstageFiles" | "vcs.discardFiles" => {
-                let input: FilePathsInput = decode(request.payload, &request.tag)?;
-                let result = match request.tag.as_str() {
-                    "vcs.stageFiles" => {
-                        self.repository
-                            .stage_files(&input.cwd, &input.file_paths, &cancellation)
-                            .await
-                    }
-                    "vcs.unstageFiles" => {
-                        self.repository
-                            .unstage_files(&input.cwd, &input.file_paths, &cancellation)
-                            .await
-                    }
-                    _ => {
-                        self.repository
-                            .discard_files(&input.cwd, &input.file_paths, &cancellation)
-                            .await
-                    }
-                };
-                encode_null(result)
-            }
             "vcs.generateCommitMessage" => {
                 let input: CommitMessageInput =
                     decode(request.payload, "vcs.generateCommitMessage")?;
@@ -580,11 +833,6 @@ impl GitVcsRpcServices {
                 let input: PullRequestInput = decode(request.payload, "git.resolvePullRequest")?;
                 let pull_request = self.resolve_pull_request(&input, &cancellation).await?;
                 Ok(json!({ "pullRequest": pull_request }))
-            }
-            "git.preparePullRequestThread" => {
-                let input: PreparePullRequestInput =
-                    decode(request.payload, "git.preparePullRequestThread")?;
-                self.prepare_pull_request(input, &cancellation).await
             }
             "server.discoverSourceControl" => {
                 let _: EmptyInput = decode(request.payload, "server.discoverSourceControl")?;
@@ -603,11 +851,6 @@ impl GitVcsRpcServices {
                 let input: CloneRepositoryInput =
                     decode(request.payload, "sourceControl.cloneRepository")?;
                 self.clone_source_repository(input, &cancellation).await
-            }
-            "sourceControl.publishRepository" => {
-                let input: PublishRepositoryInput =
-                    decode(request.payload, "sourceControl.publishRepository")?;
-                self.publish_repository(input, &cancellation).await
             }
             _ => Err(request_error(
                 &request.tag,
@@ -880,6 +1123,8 @@ impl GitVcsRpcServices {
         let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
         let availability = self.availability_registry.clone();
+        #[cfg(test)]
+        let enrichment_test_hook = self.status_stream_enrichment_test_hook.clone();
         tokio::spawn(async move {
             let input = match decode::<CwdInput>(request.payload, "subscribeVcsStatus") {
                 Ok(input) => input,
@@ -922,7 +1167,7 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let mut current_local = None;
+            let mut enrichment: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
             loop {
                 tokio::select! {
                     biased;
@@ -934,42 +1179,149 @@ impl GitVcsRpcServices {
                         break;
                     }
                     _ = cancellation.cancelled() => break,
-                    event = subscription.recv() => {
-                        let Some(mut event) = event else { break };
-                        match &mut event {
-                            VcsStatusStreamEvent::Snapshot { local, remote } => {
-                                current_local = Some(local.clone());
-                                if let Some(remote) = remote {
-                                    enrich_remote_pull_request(
-                                        &pull_requests,
-                                        &input.cwd,
-                                        local,
-                                        remote,
-                                        &operation_cancellation,
-                                    ).await;
-                                }
-                            }
-                            VcsStatusStreamEvent::LocalUpdated { local } => {
-                                current_local = Some(local.clone());
-                            }
-                            VcsStatusStreamEvent::RemoteUpdated { remote } => {
-                                if let (Some(local), Some(remote)) = (current_local.as_ref(), remote) {
-                                    enrich_remote_pull_request(
-                                        &pull_requests,
-                                        &input.cwd,
-                                        local,
-                                        remote,
-                                        &operation_cancellation,
-                                    ).await;
-                                }
-                            }
+                    publication = subscription.recv_publication() => {
+                        let Some(publication) = publication else { break };
+                        stop_status_stream_enrichment(&mut enrichment).await;
+                        let enrichment_remote = match &publication.value {
+                            VcsStatusStreamEvent::Snapshot { remote, .. }
+                            | VcsStatusStreamEvent::RemoteUpdated { remote } => remote.clone(),
+                            VcsStatusStreamEvent::LocalUpdated { .. } => None,
+                        };
+                        if !send_status_stream_event(
+                            &sender,
+                            &broadcaster,
+                            &publication.fence,
+                            publication.value,
+                        )
+                        .await
+                        {
+                            break;
                         }
-                        let chunk = serde_json::to_value(event).map(|event| vec![event]).map_err(|error| {
-                            request_error("subscribeVcsStatus", &error.to_string())
-                        });
-                        if sender.send(chunk).await.is_err() { break; }
+                        if let Some(remote) = enrichment_remote {
+                            let task_cancellation = operation_cancellation.child_token();
+                            let task_token = task_cancellation.clone();
+                            let task_sender = sender.clone();
+                            let task_broadcaster = broadcaster.clone();
+                            let task_pull_requests = pull_requests.clone();
+                            let task_cwd = input.cwd.clone();
+                            let task_local = publication.local;
+                            let task_fence = publication.fence;
+                            #[cfg(test)]
+                            let task_test_hook = enrichment_test_hook.clone();
+                            let task = tokio::spawn(async move {
+                                #[cfg(test)]
+                                if let Some(hook) = &task_test_hook {
+                                    hook.block(&task_token).await;
+                                }
+                                if task_token.is_cancelled() {
+                                    return;
+                                }
+                                let mut enriched = remote.clone();
+                                enrich_remote_pull_request(
+                                    &task_pull_requests,
+                                    &task_cwd,
+                                    &task_local,
+                                    &mut enriched,
+                                    &task_token,
+                                )
+                                .await;
+                                if task_token.is_cancelled() || enriched == remote {
+                                    return;
+                                }
+                                let _ = send_status_stream_event(
+                                    &task_sender,
+                                    &task_broadcaster,
+                                    &task_fence,
+                                    VcsStatusStreamEvent::RemoteUpdated {
+                                        remote: Some(enriched),
+                                    },
+                                )
+                                .await;
+                            });
+                            enrichment = Some((task_cancellation, task));
+                        }
                     }
                 }
+            }
+            operation_cancellation.cancel();
+            stop_status_stream_enrichment(&mut enrichment).await;
+        });
+        receiver
+    }
+
+    fn summary_stream(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> watch::Receiver<Option<RpcStreamChunk>> {
+        let (sender, receiver) = watch::channel(None);
+        let summary = self.summary.clone();
+        let availability = self.availability_registry.clone();
+        tokio::spawn(async move {
+            let input = match decode::<CwdInput>(request.payload, "subscribeVcsStatusSummary") {
+                Ok(input) => input,
+                Err(error) => {
+                    sender.send_replace(Some(Err(error)));
+                    return;
+                }
+            };
+            let workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    sender.send_replace(Some(Err(error)));
+                    return;
+                }
+            };
+            let loss = workspace_admission
+                .as_ref()
+                .map(WorkspaceAdmissionLease::loss_cancellation);
+            let loss_token = loss
+                .as_ref()
+                .map(|loss| loss.cancellation_token())
+                .unwrap_or_default();
+            let subscription = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                result = summary.subscribe(input.cwd.clone()) => result,
+            };
+            let mut subscription = match subscription {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    sender.send_replace(Some(Err(serialize_error(error))));
+                    return;
+                }
+            };
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    () = sender.closed() => return,
+                    () = loss_token.cancelled() => {
+                        if let Some(error) = loss.as_ref().and_then(|loss| loss.unavailable()) {
+                            sender.send_replace(Some(Err(serialize_error(error))));
+                        }
+                        return;
+                    }
+                    () = cancellation.cancelled() => return,
+                    changed = subscription.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        subscription.borrow_and_update().clone()
+                    }
+                };
+                let Some(item) = item else {
+                    continue;
+                };
+                let chunk = match item {
+                    Ok(summary) => serde_json::to_value(summary)
+                        .map(|summary| vec![summary])
+                        .map_err(|error| {
+                            request_error("subscribeVcsStatusSummary", &error.to_string())
+                        }),
+                    Err(error) => Err(serialize_error(error)),
+                };
+                sender.send_replace(Some(chunk));
             }
         });
         receiver
@@ -982,6 +1334,7 @@ impl GitVcsRpcServices {
     ) -> mpsc::Receiver<RpcStreamChunk> {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let repository = Arc::clone(&self.repository);
+        let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
         let availability = self.availability_registry.clone();
         tokio::spawn(async move {
@@ -1025,12 +1378,28 @@ impl GitVcsRpcServices {
                 }
                 return;
             }
-            let result = await_git_rpc_operation(
-                workspace_admission.as_ref(),
-                operation_cancellation.clone(),
-                run_stacked_action(&repository, &pull_requests, &input, &operation_cancellation),
-            )
-            .await;
+            let result = match validate_stacked_action_input(&input) {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    await_git_rpc_operation(
+                        workspace_admission.as_ref(),
+                        operation_cancellation.clone(),
+                        async {
+                            let mutation = broadcaster.begin_mutation(&input.cwd).await;
+                            let result = run_stacked_action(
+                                &repository,
+                                &pull_requests,
+                                &input,
+                                &operation_cancellation,
+                            )
+                            .await;
+                            mutation.finish().await;
+                            result
+                        },
+                    )
+                    .await
+                }
+            };
             if let Err(error) = &result
                 && is_workspace_unavailable(error)
             {
@@ -1103,17 +1472,17 @@ impl GitVcsRpcServices {
             .map_err(|error| request_error("git.resolvePullRequest", &error.to_string()))
     }
 
-    async fn prepare_pull_request(
+    async fn resolve_pull_request_preparation(
         &self,
-        input: PreparePullRequestInput,
+        input: &PreparePullRequestInput,
         cancellation: &CancellationToken,
-    ) -> RpcResult {
-        let PreparePullRequestMode::Local = input.mode;
+    ) -> Result<(Value, String), Value> {
+        let PreparePullRequestMode::Local = &input.mode;
         let pull_request = self
             .resolve_pull_request(
                 &PullRequestInput {
                     cwd: input.cwd.clone(),
-                    reference: input.reference,
+                    reference: input.reference.clone(),
                 },
                 cancellation,
             )
@@ -1128,11 +1497,7 @@ impl GitVcsRpcServices {
                 "Pull request has no head branch.",
             ));
         }
-        self.repository
-            .switch_ref(&input.cwd, &branch, cancellation)
-            .await
-            .map_err(serialize_error)?;
-        Ok(json!({ "pullRequest": pull_request, "branch": branch }))
+        Ok((pull_request, branch))
     }
 
     async fn lookup_repository(
@@ -1215,45 +1580,25 @@ impl GitVcsRpcServices {
     async fn publish_repository(
         &self,
         input: PublishRepositoryInput,
+        remote_name: String,
+        visibility: &'static str,
         cancellation: &CancellationToken,
     ) -> RpcResult {
-        if input.provider != "github" {
-            return Err(source_control_error(
-                &input.provider,
-                "publishRepository",
-                "Native repository publishing is unavailable for this provider.",
-            ));
-        }
-        let remote_name = input.remote_name.unwrap_or_else(|| "origin".into());
-        let visibility = match input.visibility.as_str() {
-            "private" => "--private",
-            "public" => "--public",
-            _ => {
-                return Err(source_control_error(
-                    &input.provider,
-                    "publishRepository",
-                    "Repository visibility must be private or public.",
-                ));
-            }
-        };
-        let output = ProcessRunner
+        let output = self
+            .github_runner
             .run(
                 ProcessRequest {
                     operation: "source-control.publishRepository.create".into(),
                     command: self.github_command.clone(),
-                    args: [
-                        "repo",
-                        "create",
-                        input.repository.as_str(),
-                        visibility,
-                        "--source",
-                        ".",
-                        "--remote",
-                        remote_name.as_str(),
-                    ]
-                    .into_iter()
-                    .map(OsString::from)
-                    .collect(),
+                    args: vec![
+                        "repo".into(),
+                        "create".into(),
+                        input.repository.clone().into(),
+                        visibility.into(),
+                        "--source".into(),
+                        ".".into(),
+                        format!("--remote={remote_name}").into(),
+                    ],
                     cwd: input.cwd.clone(),
                     env: vec![],
                     stdin: None,
@@ -1278,7 +1623,7 @@ impl GitVcsRpcServices {
         }
         let branch = self
             .repository
-            .push_current_branch(&input.cwd, cancellation)
+            .push_current_branch_to_remote(&input.cwd, &remote_name, cancellation)
             .await
             .map_err(serialize_error)?;
         let repository_url = format!("https://github.com/{}", input.repository);
@@ -1354,6 +1699,30 @@ async fn await_git_rpc_operation<T>(
             ))
         }
         result = operation => result,
+    }
+}
+
+async fn await_git_mutation_terminal(
+    admission: Option<&WorkspaceAdmissionLease>,
+    cancellation: CancellationToken,
+    operation: impl Future<Output = RpcResult>,
+) -> RpcResult {
+    let Some(admission) = admission else {
+        return operation.await;
+    };
+    let loss = admission.loss_cancellation();
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = loss.cancelled() => {
+            cancellation.cancel();
+            let _ = operation.await;
+            Err(serialize_error(
+                loss.unavailable()
+                    .expect("workspace loss cancellation retains its exact error"),
+            ))
+        }
+        result = &mut operation => result,
     }
 }
 
@@ -1596,12 +1965,7 @@ struct LaunchEditorInput {
     editor: String,
 }
 
-async fn run_stacked_action(
-    repository: &GitRepository,
-    pull_requests: &PullRequestService,
-    input: &StackedActionInput,
-    cancellation: &CancellationToken,
-) -> Result<Value, Value> {
+fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value> {
     if !matches!(
         input.action.as_str(),
         "commit" | "push" | "create_pr" | "commit_push" | "commit_push_pr"
@@ -1611,6 +1975,27 @@ async fn run_stacked_action(
             &format!("Unsupported Git action '{}'.", input.action),
         ));
     }
+    if input.feature_branch.unwrap_or(false)
+        && !matches!(
+            input.action.as_str(),
+            "commit" | "commit_push" | "commit_push_pr"
+        )
+    {
+        return Err(request_error(
+            "git.runStackedAction",
+            "Feature-branch checkout is only supported for commit actions.",
+        ));
+    }
+    Ok(())
+}
+
+async fn run_stacked_action(
+    repository: &GitRepository,
+    pull_requests: &PullRequestService,
+    input: &StackedActionInput,
+    cancellation: &CancellationToken,
+) -> Result<Value, Value> {
+    validate_stacked_action_input(input)?;
     let wants_commit = matches!(
         input.action.as_str(),
         "commit" | "commit_push" | "commit_push_pr"
@@ -1618,12 +2003,6 @@ async fn run_stacked_action(
     let wants_pr = matches!(input.action.as_str(), "create_pr" | "commit_push_pr");
     let feature_branch = input.feature_branch.unwrap_or(false);
     let commit_staged_index_as_is = input.commit_staged_index_as_is.unwrap_or(false);
-    if feature_branch && !wants_commit {
-        return Err(request_error(
-            "git.runStackedAction",
-            "Feature-branch checkout is only supported for commit actions.",
-        ));
-    }
     let initial_local = repository
         .local_status(&input.cwd, cancellation)
         .await
@@ -1843,6 +2222,42 @@ fn resolved_pull_request_step(status: &str, pull_request: &ResolvedPullRequest) 
     })
 }
 
+async fn finish_fenced_enrichment<T>(
+    broadcaster: &StatusBroadcaster,
+    fence: StatusReadFence,
+    enrichment: impl Future<Output = T>,
+) -> Result<T, GitCommandError> {
+    let value = enrichment.await;
+    broadcaster.publish_if_fence_current(&fence, || value)
+}
+
+async fn send_status_stream_event(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    broadcaster: &StatusBroadcaster,
+    fence: &StatusReadFence,
+    event: VcsStatusStreamEvent,
+) -> bool {
+    let chunk = serde_json::to_value(event)
+        .map(|event| vec![event])
+        .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
+    let permit = match sender.reserve().await {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    let _ = broadcaster.publish_if_fence_current(fence, || permit.send(chunk));
+    true
+}
+
+async fn stop_status_stream_enrichment(
+    enrichment: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+) {
+    if let Some((cancellation, task)) = enrichment.take() {
+        cancellation.cancel();
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 async fn enrich_remote_pull_request(
     pull_requests: &PullRequestService,
     cwd: &std::path::Path,
@@ -1879,20 +2294,10 @@ async fn local_branch_names(
     cwd: &std::path::Path,
     cancellation: &CancellationToken,
 ) -> Result<Vec<String>, Value> {
-    let mut names = Vec::new();
-    let mut cursor = 0;
-    loop {
-        let page = repository
-            .list_refs(cwd, None, cursor, 200, true, Some("local"), cancellation)
-            .await
-            .map_err(serialize_error)?;
-        names.extend(page.refs.into_iter().map(|reference| reference.name));
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = next_cursor;
-    }
-    Ok(names)
+    repository
+        .local_branch_names(cwd, cancellation)
+        .await
+        .map_err(serialize_error)
 }
 
 fn sanitize_branch_fragment(raw: &str) -> String {
@@ -2079,6 +2484,48 @@ fn source_control_error(provider: &str, operation: &str, detail: &str) -> Value 
 fn display_path(path: impl AsRef<std::path::Path>) -> String {
     path.as_ref().to_string_lossy().into_owned()
 }
+
+fn preflight_publish_repository(
+    input: &PublishRepositoryInput,
+) -> Result<(String, &'static str), Value> {
+    let reject = |detail| source_control_error(&input.provider, "publishRepository", detail);
+    if input.provider != "github" {
+        return Err(reject(
+            "Native repository publishing is unavailable for this provider.",
+        ));
+    }
+    if input.repository.trim().is_empty()
+        || input.repository.trim() != input.repository
+        || input.repository.starts_with('-')
+    {
+        return Err(reject(
+            "Repository name must be a trimmed non-empty non-option string.",
+        ));
+    }
+    let remote_name = input.remote_name.as_deref().unwrap_or("origin");
+    if remote_name.trim().is_empty()
+        || remote_name.trim() != remote_name
+        || remote_name.starts_with('-')
+    {
+        return Err(reject(
+            "Remote name must be a trimmed non-empty non-option string.",
+        ));
+    }
+    if input
+        .protocol
+        .as_deref()
+        .is_some_and(|protocol| !matches!(protocol, "auto" | "ssh" | "https"))
+    {
+        return Err(reject("Repository protocol must be auto, ssh, or https."));
+    }
+    let visibility = match input.visibility.as_str() {
+        "private" => "--private",
+        "public" => "--public",
+        _ => return Err(reject("Repository visibility must be private or public.")),
+    };
+    Ok((remote_name.to_owned(), visibility))
+}
+
 fn summarize_commit_context(context: &str, paths: Option<&[String]>) -> String {
     if let Some(paths) = paths
         && !paths.is_empty()
@@ -2096,6 +2543,1090 @@ fn summarize_commit_context(context: &str, paths: Option<&[String]>) -> String {
             || "Update working tree".into(),
             |path| format!("Update {path}"),
         )
+}
+
+#[cfg(test)]
+mod mutation_ownership_tests {
+    use std::{
+        panic::AssertUnwindSafe,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use futures_util::FutureExt;
+    use serde_json::json;
+    use tokio::sync::{Notify, Semaphore};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{
+        RequestId,
+        git::{
+            BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessOutput, ProcessRequest,
+            VcsStatusStreamEvent,
+        },
+    };
+
+    struct ControlledMutationRunner {
+        local_status_calls: AtomicUsize,
+        local_status_started: Notify,
+        release_stale_status: Semaphore,
+        blocked_operation: Option<&'static str>,
+        mutation_started: Notify,
+        release_mutation: Semaphore,
+    }
+
+    struct SuccessfulGithubRunner;
+
+    impl GitProcessRunner for SuccessfulGithubRunner {
+        fn run<'a>(
+            &'a self,
+            _request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            Box::pin(async {
+                Ok(ProcessOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingGithubRunner {
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl GitProcessRunner for RecordingGithubRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            self.requests
+                .lock()
+                .expect("GitHub requests lock")
+                .push(request);
+            Box::pin(async {
+                Ok(ProcessOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            })
+        }
+    }
+
+    struct PublishGitRunner {
+        requests: Mutex<Vec<ProcessRequest>>,
+        fail_push: bool,
+    }
+
+    impl PublishGitRunner {
+        fn new(fail_push: bool) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                fail_push,
+            }
+        }
+    }
+
+    impl GitProcessRunner for PublishGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            let operation = request.operation.clone();
+            self.requests
+                .lock()
+                .expect("Git requests lock")
+                .push(request);
+            Box::pin(async move {
+                match operation.as_str() {
+                    "GitVcsDriver.currentRef" => Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout: "main\n".to_owned(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    }),
+                    "GitVcsDriver.pushCurrentBranchToRemote" if self.fail_push => {
+                        Err(ProcessError::NonZeroExit {
+                            operation,
+                            exit_code: 1,
+                            stdout_length: 0,
+                            stderr_length: 4,
+                            stdout: String::new().into_boxed_str(),
+                            stderr: "fail".into(),
+                        })
+                    }
+                    "GitVcsDriver.pushCurrentBranchToRemote" => Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    }),
+                    operation => panic!("unexpected publish Git operation {operation}"),
+                }
+            })
+        }
+    }
+
+    impl ControlledMutationRunner {
+        fn new() -> Self {
+            Self {
+                local_status_calls: AtomicUsize::new(0),
+                local_status_started: Notify::new(),
+                release_stale_status: Semaphore::new(0),
+                blocked_operation: None,
+                mutation_started: Notify::new(),
+                release_mutation: Semaphore::new(0),
+            }
+        }
+
+        fn blocking(operation: &'static str) -> Self {
+            Self {
+                blocked_operation: Some(operation),
+                ..Self::new()
+            }
+        }
+
+        async fn wait_for_mutation_start(&self) {
+            self.mutation_started.notified().await;
+        }
+    }
+
+    impl GitProcessRunner for ControlledMutationRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            let local_status_call = (request.operation == "GitVcsDriver.statusDetailsLocal.status")
+                .then(|| {
+                    let call = self.local_status_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.local_status_started.notify_waiters();
+                    call
+                });
+            Box::pin(async move {
+                if self.blocked_operation == Some(request.operation.as_str()) {
+                    self.mutation_started.notify_one();
+                    self.release_mutation
+                        .acquire()
+                        .await
+                        .expect("mutation release remains open")
+                        .forget();
+                    if cancellation.is_cancelled() {
+                        return Err(ProcessError::Cancelled {
+                            operation: request.operation,
+                        });
+                    }
+                }
+                if local_status_call == Some(2) {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(ProcessError::Cancelled { operation: request.operation });
+                        }
+                        permit = self.release_stale_status.acquire() => {
+                            permit.expect("stale status release remains open").forget();
+                        }
+                    }
+                }
+                let (exit_code, stdout) = match request.operation.as_str() {
+                    "GitVcsDriver.statusDetailsLocal.status" => {
+                        let dirty = local_status_call.is_some_and(|call| call >= 3);
+                        let record = dirty.then_some(
+                            "1 .M N... 100644 100644 100644 deadbeef deadbeef tracked.txt\n",
+                        );
+                        (
+                            0,
+                            format!("# branch.head main\n{}", record.unwrap_or_default()),
+                        )
+                    }
+                    "GitVcsDriver.statusDetailsRemote.status" => {
+                        (0, "# branch.head main\n".to_owned())
+                    }
+                    "GitVcsDriver.statusDetailsLocal.unstagedNumstat" => {
+                        (0, "1\t1\ttracked.txt\n".to_owned())
+                    }
+                    "GitVcsDriver.defaultRef.originHead" | "GitVcsDriver.remoteProvider" => {
+                        (1, String::new())
+                    }
+                    "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
+                    "GitVcsDriver.defaultRef.candidate" => {
+                        let is_main = request
+                            .args
+                            .last()
+                            .is_some_and(|value| value == "refs/heads/main");
+                        (i32::from(!is_main), String::new())
+                    }
+                    _ => (0, String::new()),
+                };
+                Ok(ProcessOutput {
+                    exit_code,
+                    stdout,
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            })
+        }
+    }
+
+    fn request(tag: &str, cwd: &Path) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from("1").expect("request id"),
+            tag: tag.to_owned(),
+            payload: json!({ "cwd": cwd }),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    fn publish_request(id: &str, cwd: &Path) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from(id).expect("request id"),
+            tag: "sourceControl.publishRepository".to_owned(),
+            payload: json!({
+                "cwd":cwd,"provider":"github","repository":"owner/name",
+                "visibility":"private"
+            }),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    fn custom_publish_request(id: &str, cwd: &Path, repository: &str, remote: &str) -> RpcRequest {
+        let mut request = publish_request(id, cwd);
+        request.payload["repository"] = json!(repository);
+        request.payload["remoteName"] = json!(remote);
+        request
+    }
+
+    #[tokio::test]
+    async fn blocked_pull_request_enrichment_cannot_delay_base_or_local_publications() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::new());
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner));
+        let hook = Arc::new(StatusStreamEnrichmentTestHook::default());
+        let services = GitVcsRpcServices::with_repository(repository)
+            .with_status_stream_enrichment_test_hook(Arc::clone(&hook));
+        let cancellation = CancellationToken::new();
+        let mut stream = services.status_stream(
+            request("subscribeVcsStatus", root.path()),
+            cancellation.clone(),
+        );
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("initial snapshot deadline")
+            .expect("status stream remains open")
+            .expect("initial snapshot succeeds");
+        assert_eq!(snapshot[0]["_tag"], "snapshot");
+        services
+            .broadcaster
+            .publish_status_event_for_test(
+                root.path(),
+                VcsStatusStreamEvent::RemoteUpdated {
+                    remote: Some(VcsStatusRemoteResult {
+                        has_upstream: true,
+                        ahead_count: 1,
+                        behind_count: 0,
+                        ahead_of_default_count: Some(1),
+                        pr: None,
+                    }),
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), hook.started.notified())
+            .await
+            .expect("enrichment start deadline");
+        let remote = tokio::time::timeout(Duration::from_millis(200), stream.recv())
+            .await
+            .expect("base publication must not wait for PR enrichment")
+            .expect("status stream remains open")
+            .expect("base publication succeeds");
+        assert_eq!(remote[0]["_tag"], "remoteUpdated");
+
+        services
+            .broadcaster
+            .publish_status_event_for_test(
+                root.path(),
+                VcsStatusStreamEvent::LocalUpdated {
+                    local: VcsStatusLocalResult {
+                        is_repo: true,
+                        source_control_provider: None,
+                        has_primary_remote: false,
+                        is_default_ref: false,
+                        ref_name: Some("main".to_owned()),
+                        default_ref_name: Some("main".to_owned()),
+                        has_working_tree_changes: true,
+                        working_tree: Default::default(),
+                    },
+                },
+            )
+            .await;
+        let local = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let chunk = stream
+                    .recv()
+                    .await
+                    .expect("status stream remains open")
+                    .expect("local publication succeeds");
+                if chunk[0]["_tag"] == "localUpdated" {
+                    return chunk;
+                }
+            }
+        })
+        .await
+        .expect("local publication must overtake blocked PR enrichment");
+        assert_eq!(local[0]["_tag"], "localUpdated");
+
+        cancellation.cancel();
+        hook.release.add_permits(1);
+    }
+
+    #[tokio::test]
+    async fn mutation_retires_one_shared_read_for_two_clients_and_publishes_one_trailing_refresh() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::new());
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository(repository);
+        let mut subscription = services
+            .broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("initial status subscription");
+        assert!(matches!(
+            subscription.recv().await,
+            Some(VcsStatusStreamEvent::Snapshot { .. })
+        ));
+        let stale_read_gate = services
+            .broadcaster
+            .install_full_read_execution_gate_for_test();
+
+        let first_services = services.clone();
+        let first_cwd = root.path().to_path_buf();
+        let mut first = tokio::spawn(async move {
+            first_services
+                .handle_unary_with_context(
+                    request("vcs.refreshStatus", &first_cwd),
+                    RpcSessionContext::unauthenticated(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        stale_read_gate.wait_until_entered().await;
+        let second_services = services.clone();
+        let second_cwd = root.path().to_path_buf();
+        let mut second = tokio::spawn(async move {
+            second_services
+                .handle_unary_with_context(
+                    request("vcs.refreshStatus", &second_cwd),
+                    RpcSessionContext::unauthenticated(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        while services
+            .broadcaster
+            .full_read_lease_count_for_test(root.path())
+            .await
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let mutation = services
+            .handle_unary_with_context(
+                request("vcs.init", root.path()),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+            .await;
+        let retired = tokio::time::timeout(Duration::from_millis(200), async {
+            (
+                (&mut first).await.expect("first client task"),
+                (&mut second).await.expect("second client task"),
+            )
+        })
+        .await;
+        let retired_in_time = retired.is_ok();
+        let (first, second) = match retired {
+            Ok(results) => results,
+            Err(_) => {
+                runner.release_stale_status.add_permits(1);
+                (
+                    first.await.expect("released first client task"),
+                    second.await.expect("released second client task"),
+                )
+            }
+        };
+        let trailing = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let event = subscription.recv().await?;
+                if matches!(
+                    event,
+                    VcsStatusStreamEvent::LocalUpdated { ref local }
+                        if local.has_working_tree_changes
+                ) {
+                    break Some(event);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        assert!(mutation.is_ok());
+        assert!(
+            retired_in_time,
+            "mutation must retire the shared pre-mutation read"
+        );
+        assert!(first.is_err() && second.is_err());
+        assert_eq!(runner.local_status_calls.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            trailing,
+            Some(VcsStatusStreamEvent::LocalUpdated { local })
+                if local.has_working_tree_changes
+        ));
+    }
+
+    #[tokio::test]
+    async fn stacked_push_runs_inside_the_shared_mutation_boundary() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::new());
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository(repository);
+        let mut subscription = services
+            .broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("initial status subscription");
+        subscription.recv().await.expect("initial status snapshot");
+        let stale_services = services.clone();
+        let stale_cwd = root.path().to_path_buf();
+        let stale_read_gate = services
+            .broadcaster
+            .install_full_read_execution_gate_for_test();
+        let stale = tokio::spawn(async move {
+            stale_services
+                .handle_unary_with_context(
+                    request("vcs.refreshStatus", &stale_cwd),
+                    RpcSessionContext::unauthenticated(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        stale_read_gate.wait_until_entered().await;
+        assert_eq!(
+            services
+                .broadcaster
+                .full_read_lease_count_for_test(root.path())
+                .await,
+            1
+        );
+        let mut stream = services.stacked_action_stream(
+            RpcRequest {
+                id: RequestId::try_from("2").expect("request id"),
+                tag: "git.runStackedAction".to_owned(),
+                payload: json!({
+                    "actionId":"push-action",
+                    "cwd":root.path(),
+                    "action":"push"
+                }),
+                headers: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                sampled: None,
+            },
+            CancellationToken::new(),
+        );
+
+        let started = stream
+            .recv()
+            .await
+            .expect("stacked start chunk")
+            .expect("stacked start succeeds");
+        assert_eq!(started[0]["kind"], "action_started");
+        let finished = stream
+            .recv()
+            .await
+            .expect("stacked finish chunk")
+            .expect("stacked push succeeds");
+        assert_eq!(finished[0]["kind"], "action_finished");
+        assert_eq!(finished[0]["result"]["push"]["status"], "pushed");
+        assert!(stale.await.expect("stale read task").is_err());
+        let trailing = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let event = subscription.recv().await?;
+                if matches!(
+                    event,
+                    VcsStatusStreamEvent::LocalUpdated { ref local }
+                        if local.has_working_tree_changes
+                ) {
+                    break Some(event);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(trailing.is_some());
+        assert_eq!(runner.local_status_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn publish_repository_retires_a_stale_read_and_publishes_a_trailing_refresh() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::new());
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            repository,
+            Arc::new(SuccessfulGithubRunner),
+        );
+        let mut subscription = services
+            .broadcaster
+            .subscribe(root.path().to_path_buf(), CancellationToken::new())
+            .await
+            .expect("initial status subscription");
+        subscription.recv().await.expect("initial status snapshot");
+        let stale_services = services.clone();
+        let stale_cwd = root.path().to_path_buf();
+        let stale_read_gate = services
+            .broadcaster
+            .install_full_read_execution_gate_for_test();
+        let stale = tokio::spawn(async move {
+            stale_services
+                .handle_unary_with_context(
+                    request("vcs.refreshStatus", &stale_cwd),
+                    RpcSessionContext::unauthenticated(),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        stale_read_gate.wait_until_entered().await;
+        assert_eq!(
+            services
+                .broadcaster
+                .full_read_lease_count_for_test(root.path())
+                .await,
+            1
+        );
+
+        let published = services
+            .handle_unary_with_context(
+                publish_request("5", root.path()),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("publish succeeds");
+
+        assert_eq!(published["status"], "pushed");
+        assert!(stale.await.expect("stale read task").is_err());
+        loop {
+            if matches!(
+                subscription.recv().await,
+                Some(VcsStatusStreamEvent::LocalUpdated { local })
+                    if local.has_working_tree_changes
+            ) {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_publish_repository_outlives_its_cancelled_response_waiter() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(
+            "GitVcsDriver.pushCurrentBranchToRemote",
+        ));
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            repository,
+            Arc::new(SuccessfulGithubRunner),
+        );
+        let cancellation = CancellationToken::new();
+        let task_services = services.clone();
+        let task_cancellation = cancellation.clone();
+        let cwd = root.path().to_path_buf();
+        let response_waiter = tokio::spawn(async move {
+            task_services
+                .handle_unary_with_context(
+                    publish_request("6", &cwd),
+                    RpcSessionContext::unauthenticated(),
+                    task_cancellation,
+                )
+                .await
+        });
+        runner.wait_for_mutation_start().await;
+
+        cancellation.cancel();
+        response_waiter.abort();
+        let _ = response_waiter.await;
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            0
+        );
+        runner.release_mutation.add_permits(1);
+        loop {
+            if services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_repository_partial_push_error_settles_once() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking(
+            "GitVcsDriver.pushCurrentBranchToRemote",
+        ));
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            repository,
+            Arc::new(SuccessfulGithubRunner),
+        );
+        let cancellation = CancellationToken::new();
+        let task_services = services.clone();
+        let task_cancellation = cancellation.clone();
+        let cwd = root.path().to_path_buf();
+        let response = tokio::spawn(async move {
+            task_services
+                .handle_unary_with_context(
+                    publish_request("7", &cwd),
+                    RpcSessionContext::unauthenticated(),
+                    task_cancellation,
+                )
+                .await
+        });
+        runner.wait_for_mutation_start().await;
+        cancellation.cancel();
+        runner.release_mutation.add_permits(1);
+
+        assert!(response.await.expect("publish response joins").is_err());
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_repository_pushes_the_selected_remote_with_exact_arguments() {
+        let root = tempfile::tempdir().expect("repository root");
+        let git = Arc::new(PublishGitRunner::new(false));
+        let github = Arc::new(RecordingGithubRunner::default());
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            Arc::new(GitRepository::with_runner_for_test(git.clone())),
+            github.clone(),
+        );
+
+        let result = services
+            .handle_unary_with_context(
+                custom_publish_request("8", root.path(), "owner/name", "upstream"),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("custom remote publish succeeds");
+
+        assert_eq!(result["remoteName"], "upstream");
+        assert_eq!(result["upstreamBranch"], "upstream/main");
+        let github_requests = github.requests.lock().expect("GitHub requests lock");
+        assert_eq!(github_requests.len(), 1);
+        assert_eq!(
+            github_requests[0].args,
+            [
+                "repo",
+                "create",
+                "owner/name",
+                "--private",
+                "--source",
+                ".",
+                "--remote=upstream"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        let git_requests = git.requests.lock().expect("Git requests lock");
+        assert_eq!(git_requests.len(), 2);
+        assert_eq!(
+            git_requests[1].args,
+            ["push", "--set-upstream", "--", "upstream", "main"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_publish_push_failure_settles_once_after_github_success() {
+        let root = tempfile::tempdir().expect("repository root");
+        let git = Arc::new(PublishGitRunner::new(true));
+        let github = Arc::new(RecordingGithubRunner::default());
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            Arc::new(GitRepository::with_runner_for_test(git)),
+            github.clone(),
+        );
+
+        let result = services
+            .handle_unary_with_context(
+                custom_publish_request("9", root.path(), "owner/name", "upstream"),
+                RpcSessionContext::unauthenticated(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            github.requests.lock().expect("GitHub requests lock").len(),
+            1
+        );
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn option_shaped_publish_inputs_start_no_process_or_mutation() {
+        let root = tempfile::tempdir().expect("repository root");
+        let git = Arc::new(PublishGitRunner::new(false));
+        let github = Arc::new(RecordingGithubRunner::default());
+        let services = GitVcsRpcServices::with_repository_and_github_runner_for_test(
+            Arc::new(GitRepository::with_runner_for_test(git.clone())),
+            github.clone(),
+        );
+
+        for request in [
+            custom_publish_request("10", root.path(), "--public", "upstream"),
+            custom_publish_request("11", root.path(), "owner/name", "--all"),
+        ] {
+            assert!(
+                services
+                    .handle_unary_with_context(
+                        request,
+                        RpcSessionContext::unauthenticated(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(git.requests.lock().expect("Git requests lock").is_empty());
+        assert!(
+            github
+                .requests
+                .lock()
+                .expect("GitHub requests lock")
+                .is_empty()
+        );
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_unary_mutation_outlives_its_cancelled_response_waiter() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::blocking("GitVcsDriver.initRepo"));
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
+        let services = GitVcsRpcServices::with_repository(repository);
+        let cancellation = CancellationToken::new();
+        let task_services = services.clone();
+        let task_cancellation = cancellation.clone();
+        let cwd = root.path().to_path_buf();
+        let response_waiter = tokio::spawn(async move {
+            task_services
+                .handle_unary_with_context(
+                    request("vcs.init", &cwd),
+                    RpcSessionContext::unauthenticated(),
+                    task_cancellation,
+                )
+                .await
+        });
+        runner.wait_for_mutation_start().await;
+
+        cancellation.cancel();
+        response_waiter.abort();
+        let _ = response_waiter.await;
+        tokio::task::yield_now().await;
+        let before_release = services
+            .broadcaster
+            .local_refresh_generation_for_test(root.path())
+            .await;
+        runner.release_mutation.add_permits(1);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if services
+                    .broadcaster
+                    .local_refresh_generation_for_test(root.path())
+                    .await
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned mutation reaches terminal settlement");
+
+        assert_eq!(before_release, 0);
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_and_empty_unary_requests_do_not_fence_status_reads() {
+        let root = tempfile::tempdir().expect("repository root");
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            ControlledMutationRunner::new(),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository);
+        for (tag, payload, succeeds) in [
+            (
+                "vcs.init",
+                json!({"cwd":root.path(),"kind":"mercurial"}),
+                false,
+            ),
+            (
+                "vcs.stageFiles",
+                json!({"cwd":root.path(),"filePaths":[]}),
+                true,
+            ),
+            (
+                "vcs.unstageFiles",
+                json!({"cwd":root.path(),"filePaths":[]}),
+                true,
+            ),
+            (
+                "vcs.discardFiles",
+                json!({"cwd":root.path(),"filePaths":[]}),
+                true,
+            ),
+            (
+                "vcs.stageFiles",
+                json!({"cwd":root.path(),"filePaths":["../escape"]}),
+                false,
+            ),
+            (
+                "git.preparePullRequestThread",
+                json!({"cwd":root.path(),"reference":"current","mode":"unsupported"}),
+                false,
+            ),
+            (
+                "sourceControl.publishRepository",
+                json!({
+                    "cwd":root.path(),"provider":"github","repository":" owner/name",
+                    "visibility":"private"
+                }),
+                false,
+            ),
+            (
+                "sourceControl.publishRepository",
+                json!({
+                    "cwd":root.path(),"provider":"github","repository":"owner/name",
+                    "visibility":"private","protocol":"ftp"
+                }),
+                false,
+            ),
+        ] {
+            let result = services
+                .handle_unary_with_context(
+                    RpcRequest {
+                        id: RequestId::try_from("3").expect("request id"),
+                        tag: tag.to_owned(),
+                        payload,
+                        headers: Vec::new(),
+                        trace_id: None,
+                        span_id: None,
+                        sampled: None,
+                    },
+                    RpcSessionContext::unauthenticated(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{tag}");
+        }
+
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_stacked_action_keeps_action_started_order_without_a_mutation_fence() {
+        let root = tempfile::tempdir().expect("repository root");
+        let services = GitVcsRpcServices::with_repository(Arc::new(
+            GitRepository::with_runner_for_test(Arc::new(ControlledMutationRunner::new())),
+        ));
+        let mut stream = services.stacked_action_stream(
+            RpcRequest {
+                id: RequestId::try_from("4").expect("request id"),
+                tag: "git.runStackedAction".to_owned(),
+                payload: json!({
+                    "actionId":"unsupported-action",
+                    "cwd":root.path(),
+                    "action":"unsupported"
+                }),
+                headers: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                sampled: None,
+            },
+            CancellationToken::new(),
+        );
+
+        assert_eq!(
+            stream.recv().await.expect("start chunk").expect("start")[0]["kind"],
+            "action_started"
+        );
+        assert_eq!(
+            stream
+                .recv()
+                .await
+                .expect("failure chunk")
+                .expect("failure")[0]["kind"],
+            "action_failed"
+        );
+        assert_eq!(
+            services
+                .broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_old_pull_request_enrichment_is_rejected_after_switch_epoch() {
+        let root = tempfile::tempdir().expect("repository root");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let cancellation = CancellationToken::new();
+        let old_fence = broadcaster
+            .acquire_read_fence(root.path(), &cancellation)
+            .await
+            .expect("old status fence");
+        let enrichment_started = Arc::new(Notify::new());
+        let release_enrichment = Arc::new(Semaphore::new(0));
+        let old_enrichment = {
+            let broadcaster = broadcaster.clone();
+            let enrichment_started = Arc::clone(&enrichment_started);
+            let release_enrichment = Arc::clone(&release_enrichment);
+            tokio::spawn(async move {
+                finish_fenced_enrichment(&broadcaster, old_fence, async move {
+                    enrichment_started.notify_one();
+                    release_enrichment
+                        .acquire()
+                        .await
+                        .expect("enrichment release remains open")
+                        .forget();
+                    "old-pr"
+                })
+                .await
+            })
+        };
+        enrichment_started.notified().await;
+
+        let mutation = broadcaster.begin_mutation(root.path()).await;
+        mutation.finish().await;
+        let new_fence = broadcaster
+            .acquire_read_fence(root.path(), &cancellation)
+            .await
+            .expect("new status fence");
+        assert_eq!(
+            finish_fenced_enrichment(&broadcaster, new_fence, async { "new-pr" })
+                .await
+                .expect("new snapshot enrichment is current"),
+            "new-pr"
+        );
+
+        release_enrichment.add_permits(1);
+        assert!(
+            old_enrichment
+                .await
+                .expect("old enrichment task joins")
+                .is_err(),
+            "old enriched result must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_git_task_panic_settles_the_guard_and_reaches_the_outer_unwind_boundary() {
+        let root = tempfile::tempdir().expect("repository root");
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let owned_broadcaster = broadcaster.clone();
+        let cwd = root.path().to_path_buf();
+
+        let panic = AssertUnwindSafe(await_server_owned_rpc("vcs.init", async move {
+            let _mutation = owned_broadcaster.begin_mutation(&cwd).await;
+            panic!("owned Git mutation panic");
+        }))
+        .catch_unwind()
+        .await;
+
+        assert!(panic.is_err());
+        assert_eq!(
+            broadcaster
+                .local_refresh_generation_for_test(root.path())
+                .await,
+            1
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

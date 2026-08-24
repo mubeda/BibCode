@@ -166,7 +166,13 @@ const fixtureEnvironmentDescriptor = {
   platform: { os: "windows", arch: "x64" },
   serverVersion: "0.1.1",
   storageInstanceId: "00000000-0000-4000-8000-000000000002",
-  capabilities: { repositoryIdentity: true, activityProtocolVersion: 2 },
+  capabilities: {
+    repositoryIdentity: true,
+    worktreeCatalog: true,
+    worktreeCatalogRefreshReason: true,
+    vcsStatusSummary: true,
+    activityProtocolVersion: 2,
+  },
 } as const;
 const fixtureServerConfig = {
   environment: fixtureEnvironmentDescriptor,
@@ -460,6 +466,32 @@ const manualStreamSamples = new Map<string, unknown>([
       payload: { sessionId: fixtureClientSession.sessionId },
     },
   ],
+  [
+    "subscribeVcsStatusSummary:2",
+    {
+      isRepo: true,
+      refName: "feature/fixture-summary",
+      detachedHead: null,
+      hasWorkingTreeChanges: true,
+      sourceControlProvider: {
+        kind: "github",
+        name: "GitHub",
+        baseUrl: "https://github.com",
+      },
+      pr: {
+        provider: "github",
+        number: 42,
+        title: "Fixture summary pull request",
+        url: "https://github.com/bibcode/fixture/pull/42",
+        baseRefName: "main",
+        headRefName: "feature/fixture-summary",
+        state: "open",
+        updatedAt: Option.none(),
+      },
+      observedAt: "2026-08-21T12:00:00.000Z",
+      stale: false,
+    },
+  ],
 ]);
 
 const stringSeed = (value: string): number => {
@@ -704,16 +736,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 95) {
-  throw new Error(`Expected 95 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 97) {
+  throw new Error(`Expected 97 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
-if (streamMethodCount !== 16) {
-  throw new Error(`Expected 16 streaming RPC methods, found ${streamMethodCount}.`);
+if (streamMethodCount !== 18) {
+  throw new Error(`Expected 18 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 59) {
+if (topLevelStreamShapeCount !== 65) {
   throw new Error(
-    `Expected 59 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 65 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {

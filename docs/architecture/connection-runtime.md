@@ -227,6 +227,13 @@ ordinary thread deletion; it leaves Git and files untouched and never invokes a
 raw-path destructive method. Active, archived, direct, and bulk entry points use
 this same policy.
 
+Focus refresh reasons are negotiated independently through the default-false
+`worktreeCatalogRefreshReason` capability. The scheduler retains Focus as its
+logical refresh class, but the request builder omits `reason` immediately before
+sending through a session that did not advertise support. This preserves old-
+server Explicit behavior without merging Focus with a concurrent manual Retry
+and without retrying a rejected request on another wire shape.
+
 For a capable environment, `state/worktrees` owns one catalog atom per
 `(environmentId, projectId)` with no client idle grace period. The server view
 itself owns bounded sharing and pointer-checked 60-second idle eviction after

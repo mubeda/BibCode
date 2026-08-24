@@ -63,6 +63,7 @@ const h = vi.hoisted(() => {
     clientSettings: null,
     atomValues: {},
     vcsStatusByCwd: {},
+    vcsQueries: [] as Array<{ __q?: string; args?: { input?: { cwd?: string } } }>,
     worktreeCatalogs: new Map<string, unknown>(),
     discoveryCatalogSubscriptions: [] as Array<unknown>,
     discoveryFocusRefreshCalls: [] as Array<ReadonlyArray<unknown>>,
@@ -206,7 +207,6 @@ const h = vi.hoisted(() => {
     clearProjectDraftThreadId: vi.fn(),
     openDiscoveredPort: vi.fn(),
     useEnvironmentThread: vi.fn(),
-    useProjectBranchPolling: vi.fn(),
     autoAnimate: vi.fn(),
     pointerWithin: vi.fn(),
     closestCorners: vi.fn(),
@@ -373,19 +373,24 @@ vi.mock("../state/query", () => ({
       __q?: string;
       args?: { environmentId?: string; input?: { cwd?: string; projectId?: string } };
     } | null,
-  ) => ({
-    data:
-      atom?.__q === "worktree.catalog"
-        ? (h.state.worktreeCatalogs.get(
-            `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
-          ) ?? null)
-        : atom
-          ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
-          : null,
-    error: null,
-    isPending: false,
-    refresh: () => {},
-  }),
+  ) => {
+    if (atom?.__q?.startsWith("vcs.")) {
+      h.state.vcsQueries.push(atom);
+    }
+    return {
+      data:
+        atom?.__q === "worktree.catalog"
+          ? (h.state.worktreeCatalogs.get(
+              `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
+            ) ?? null)
+          : atom
+            ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
+            : null,
+      error: null,
+      isPending: false,
+      refresh: () => {},
+    };
+  },
 }));
 
 vi.mock("../state/terminalSessions", () => ({
@@ -436,6 +441,7 @@ vi.mock("../state/threads", () => ({
 vi.mock("../state/vcs", () => ({
   vcsEnvironment: {
     status: (args: unknown) => ({ __q: "vcs.status", args }),
+    summary: (args: unknown) => ({ __q: "vcs.summary", args }),
     pull: { label: "vcs.pull" },
     refreshStatus: { label: "vcs.refreshStatus" },
   },
@@ -482,10 +488,6 @@ vi.mock("./desktopUpdate.logic", () => ({
     result?.error ?? null,
   shouldToastDesktopUpdateActionResult: (result: { toast?: boolean } | null | undefined) =>
     result?.toast === true,
-}));
-
-vi.mock("../hooks/useProjectBranchPolling", () => ({
-  useProjectBranchPolling: h.spies.useProjectBranchPolling,
 }));
 
 vi.mock("../hooks/useThreadActions", () => ({
@@ -1047,6 +1049,7 @@ beforeEach(() => {
     primaryServerKeybindings: {},
   };
   h.state.vcsStatusByCwd = {};
+  h.state.vcsQueries = [];
   h.state.worktreeCatalogs = new Map();
   h.state.discoveryCatalogSubscriptions = [];
   h.state.discoveryFocusRefreshCalls = [];
@@ -1277,6 +1280,35 @@ staticDescribe("Sidebar full render", () => {
     );
   });
 
+  it("surfaces a failed session in the sidebar instead of hiding it as disconnected", () => {
+    // `derivePhase` collapses `status: "error"` into `disconnected`, so without
+    // an explicit branch an errored thread is indistinguishable from a stopped
+    // one and the failure is invisible outside the open chat.
+    baseScenario();
+    h.state.threads = [
+      threadDefault,
+      makeThread("thread-failed", {
+        title: "Failed worktree",
+        branch: "feat/y",
+        worktreePath: "C:/wt/y",
+        session: {
+          threadId: ThreadId.make("thread-failed"),
+          status: "error",
+          providerName: "Claude Code",
+          activeTurnId: null,
+          lastError: "The upstream API returned an error (HTTP 401).",
+          updatedAt: iso(30),
+          runtimeMode: "full-access",
+        },
+      }),
+    ];
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("thread-agent-row-thread-failed");
+    expect(markup).toContain("Failed");
+    expect(markup).not.toContain("Connecting");
+  });
+
   it("renders the project header, primary row, and workspace thread rows", () => {
     baseScenario();
     const markup = render(<Sidebar />);
@@ -1297,6 +1329,44 @@ staticDescribe("Sidebar full render", () => {
     // Search entry + shortcut label.
     expect(markup).toContain("Search");
     expect(markup).toContain("Mod+K");
+  });
+
+  it("uses the passive summary for the primary project row", () => {
+    baseScenario();
+    render(<Sidebar />);
+
+    expect(h.state.vcsQueries).toContainEqual(
+      expect.objectContaining({
+        __q: "vcs.summary",
+        args: expect.objectContaining({ input: { cwd: "C:/repo-a" } }),
+      }),
+    );
+  });
+
+  it("uses the detached HEAD identity for the primary project row", () => {
+    baseScenario();
+    h.state.vcsStatusByCwd["C:/repo-a"] = {
+      refName: null,
+      detachedHead: "abc1234",
+    };
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("abc1234");
+  });
+
+  it("does not present a stale passive branch as the current primary branch", () => {
+    baseScenario();
+    h.state.vcsStatusByCwd["C:/repo-a"] = {
+      refName: "feature/stale-only",
+      detachedHead: null,
+      stale: true,
+    };
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).not.toContain("feature/stale-only");
+    expect(markup).toContain("Repo A");
   });
 
   it("renders the settings navigation when routed to /settings", () => {
@@ -3555,6 +3625,57 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
     expect(markup).toContain("thread-unread-thread-a");
     expect(markup).toContain("thread-pinned-thread-a");
     expect(markup).toContain("⌘1");
+  });
+
+  it("uses summary for inactive rows and full status for the active row", () => {
+    const thread = makeThread("thread-passive", {
+      branch: "feature/passive",
+      worktreePath: "C:/wt/passive",
+    });
+    render(<SidebarThreadRow {...rowProps(thread)} />);
+    expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.summary");
+
+    h.state.vcsQueries = [];
+    render(<SidebarThreadRow {...rowProps(thread, { isActive: true })} />);
+    expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.status");
+  });
+
+  it("keeps failure and unresolved-delivery subrows visible with summary updates", () => {
+    const failed = makeThread("thread-provider-failed", {
+      branch: "feature/failure",
+      worktreePath: "C:/wt/failure",
+      session: {
+        threadId: ThreadId.make("thread-provider-failed"),
+        status: "error",
+        providerName: "Claude Code",
+        activeTurnId: null,
+        lastError: "provider exited",
+        updatedAt: iso(1),
+        runtimeMode: "full-access",
+      } as EnvironmentThreadShell["session"],
+    });
+    h.state.vcsStatusByCwd["C:/wt/failure"] = { refName: "feature/failure" };
+    expect(render(<SidebarThreadRow {...rowProps(failed)} />)).toContain("Claude Code – Failed");
+
+    const unresolved = makeThread("thread-delivery-uncertain", {
+      branch: "feature/delivery",
+      worktreePath: "C:/wt/delivery",
+      unresolvedDelivery: { state: "uncertain" },
+      session: {
+        threadId: ThreadId.make("thread-delivery-uncertain"),
+        status: "starting",
+        providerName: "OpenCode",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: iso(2),
+        runtimeMode: "full-access",
+      },
+    } as never);
+    h.state.vcsStatusByCwd["C:/wt/delivery"] = { refName: "feature/updated" };
+    const unresolvedMarkup = render(<SidebarThreadRow {...rowProps(unresolved)} />);
+    expect(unresolvedMarkup).toContain("Delivery uncertain");
+    expect(unresolvedMarkup).toContain("OpenCode – Connecting");
+    expect(h.state.vcsQueries.at(-1)?.__q).toBe("vcs.summary");
   });
 
   it("labels a remote thread with the cloud icon and falls back to 'Remote'", () => {
