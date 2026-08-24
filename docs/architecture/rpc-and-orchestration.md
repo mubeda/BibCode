@@ -66,6 +66,152 @@ authorization mapping is
 [`required_scope`](../../apps/server/src/auth/scope.rs); adding a live method
 without exactly one declared scope fails a server test.
 
+## VCS status and mutation coordination
+
+`subscribeVcsStatus` and `vcs.refreshStatus` keep their existing wire shapes,
+but the production server coordinates their work by canonical worktree path.
+The status owner has independent Local and Full read keys. Concurrent callers
+for one key share one physical load while retaining cancellation leases; one
+caller leaving does not cancel peers, while final-lease release removes and
+cancels that load. Subscription bootstrap, delayed local fallback, workspace
+invalidation, and explicit full refresh all use this owner.
+
+`subscribeVcsStatusSummary` is the read-scoped passive counterpart. Its
+latest-value stream shares one 30-second producer per canonical cwd and emits
+only repository identity, dirty, provider, matching named-branch PR,
+observation time, and stale state. It performs no numstat, full-file storage,
+or fetch. Each successful base cycle publishes current local and provider
+state. A same-ref/provider PR from the immediately prior cycle may be carried
+only into cycle N+1 while enrichment runs or fails, preserving its original
+`observedAt` with `stale: true`; cycle N+2 expires it unless enrichment refreshes
+it. An initial base-load failure with no prior value remains an error. If PR
+enrichment fails without an eligible carried PR, the stream retains the
+just-published current local/provider base as stale with `pr: null`; successful
+provider or open-PR absence clears the corresponding fields on the next fresh
+value.
+Final-subscriber release cancels and awaits the in-flight read before removing
+the generation, so an immediate alias reattachment cannot inherit or be erased
+by old lifecycle cleanup.
+
+The first active status subscriber resolves worktree, Git directory, and common
+directory with one bounded, cancellation-aware Git command. The server installs
+native watches for those admitted execution-host paths before the initial local
+read. Watcher readiness is proved by a final, test-owned-style sentinel watch in
+a unique temporary directory outside all user and Git roots. Setup attempts
+cleanup of that watch and directory on every outcome, never writes into an
+admitted root, and treats cleanup failure as setup unavailability.
+Readiness failure, watcher loss, overflow, or unavailable delivery preserves the
+subscription in sticky fallback health. An ordinary later event cannot mark it
+healthy.
+
+Working-tree and metadata signals use a 125 ms trailing debounce. A signal that
+arrives during a physical local read retains exactly one trailing read. Explicit
+mutation and workspace invalidations bypass that debounce, as do structured
+terminal-process completions; focus, reveal, and Git-menu catch-up retain their
+explicit refresh path. While a subscriber remains active, the local scheduler
+also reads after `max(60 seconds, 4 * last completed read duration)`, capped at
+300 seconds. Remote fetch and post-fetch remote reconciliation have separate
+workers, so blocked remote work does not delay local invalidation. No periodic
+`symbolic-ref` worker remains: watcher and safety local observations read branch
+identity from the authoritative porcelain result.
+
+Each canonical worktree has one lifecycle identifier and owned task tracker.
+Final release advances the shared status-read epoch before its retirement fence
+can admit a replacement, cancels the scheduler and watcher, and waits for all
+old lifecycle tasks before retrying subscription setup with a fresh watcher
+generation. First-lifecycle task insertion is reserved atomically with
+registration, including concurrent backpressure removal. Shutdown closes the
+broadcaster and status-read admission fences, rejects later subscribers, and
+awaits subscription setup, physical status workers, retired generations, and
+active lifecycle tasks; late reads cannot publish into a later lifecycle.
+
+`ProductionRuntime` connects only the structured `TerminalManager` process-exit
+callback to local invalidation. An explicit worktree path has priority;
+otherwise the callback chooses the deepest canonical active worktree ancestor
+of the command cwd and does nothing when none is active. The terminal's Exited
+event and metadata publication complete without holding the generation
+publication lock across that callback. Provider lifecycle, session, completion,
+and delivery events do not enter this path. Commands typed inside a persistent
+interactive shell have no structured completion metadata, so their changes rely
+on execution-host native watching and the 60-second safety fallback. Filesystem
+changes that occur only on an unmounted remote host are outside the native-watch
+boundary and likewise require an explicit invalidation or safety convergence.
+
+Post-fetch remote reconciliation acquires the same worktree epoch before Git
+work and rechecks it around publication. Stream and
+unary pull-request enrichment carry that producing epoch internally through
+their final delivery check; the public status schemas contain no epoch field.
+Cached remote state is reused only with a local snapshot from the same epoch
+and ref identity. A watcher, safety, or explicit local observation of a ref
+change clears server cache,
+requests current-branch reconciliation, and makes the shared stream reducer
+reset upstream, ahead/behind, default-delta, and pull-request fields while
+same-ref local invalidation preserves them.
+
+A physical observation starts with one
+`git -c core.quotePath=false status --porcelain=2 --branch --untracked-files=all`.
+Its headers supply branch, upstream, and ahead/behind state. Staged and
+unstaged numstat commands run concurrently only when the porcelain records show
+those areas. Default-ref, remote-provider, and pull-request enrichment remain
+separate when the requested result needs them. If porcelain fails, only a
+successful existing repository probe returning false maps to the compatible
+non-repository result; otherwise the original structured Git error is returned.
+Status and background-observation Git reads use `GIT_OPTIONAL_LOCKS=0`. Fetch
+and mutation paths do not.
+
+Every effectful registered Git mutation is validated before admission and then
+crosses one status-mutation guard for its whole operation. Admission closes the
+read gate, advances the epoch, and retires Local and Full reads. The server-owned
+continuation retains the workspace admission, process cleanup, terminal result,
+and guard even if the RPC waiter is interrupted or dropped; panic still reaches
+the outer RPC defect boundary after guard settlement. Empty file lists and
+decode, path, mode, or pull-request resolution failures that have not reached a
+Git effect do not fence status. Stacked actions acquire one guard around the
+complete action and repository calls do not reacquire it.
+
+`sourceControl.publishRepository` likewise validates its provider, repository,
+visibility, remote, and protocol before admission, then owns GitHub repository
+creation plus the push as one mutation through terminal success, partial
+failure, panic, or caller disconnect. Repository and remote operands cannot be
+option-shaped; GitHub receives `--remote=<name>`, and the final Git command
+pushes and sets upstream for exactly that selected remote with option
+termination, regardless of an older branch upstream.
+
+`projects.writeFile` uses the same guard. After admission it continues through
+the terminal filesystem result and then settles the status guard. A successful
+content-only write to an existing ordinary file retains the workspace entry
+index; creating a path or writing a built-in Git classification control
+invalidates it. An error or panic after a possible filesystem effect invalidates
+the index before preserving the original failure or unwind. Managed worktree
+create, retarget, detach, and destructive removal do not move under the VCS
+mutation lock: their existing command/project/repository lock order and
+runtime-owned continuation settle first. After terminal durable or Git outcome
+and catalog-lock release, they notify the affected canonical status paths and
+invalidate only their physical-repository fetch-owner keys. Replay-only and
+preflight failures do not notify; partial Git/durable failures that may have
+changed state do.
+
+Automatic fetch is owned separately by canonical `--git-common-dir`. The first
+subscription lifecycle resolves that key with one bounded read. One owner keeps
+the live interval and bounded failure backoff, discovers the attached branches'
+upstream remotes once, and starts at most one exact fetch process per deadline:
+`git fetch --quiet -- <remote>` or
+`git fetch --quiet --multiple -- <sorted-remotes...>`. Successful fetches fan
+out only a coalesced reconciliation signal. Every attached worktree recomputes
+and publishes its own branch-specific remote result. The default interval is
+180 seconds. Live interval changes, bounded failure backoff, and `0 = disabled`
+remain supported, and the last attachment cancels the owner.
+
+The client runtime keeps mutations on the serial `(environmentId, cwd)` lane.
+Only `vcs.refreshStatus` uses a separate `latest` lane with the same key: callers
+share the active refresh and signals during it retain one newest trailing
+refresh. Window focus is still debounced, transition to a visible document and
+Git-menu open still request freshness, and hidden documents request nothing.
+Successful pull, stage, unstage, discard, stacked action, and repository
+publication still trigger their subscription refresh. A post-mutation signal
+therefore cannot be satisfied by an older active read, while the server epoch
+remains the correctness boundary across clients.
+
 ## Worktree catalog flow
 
 The catalog protocol is server-resolved and capability gated:
@@ -103,10 +249,21 @@ bypass the public decoder.
 for one persisted project through a watch-backed RPC stream: the atomic initial
 read is marked seen, and acknowledgement lag replaces pending state instead of
 queueing stale generations. Request cancellation also cancels bootstrap before
-it can retain a catalog view. `vcs.refreshWorktreeCatalog` requests an explicit
-bounded observation and returns the resulting snapshot. Both require
-`orchestration:read`; clients submit only `projectId`, never baseline or
-checkout paths.
+it can retain a catalog view. `vcs.refreshWorktreeCatalog` accepts `projectId`
+plus an optional `reason`. Omission or `explicit` requests an authoritative Git
+observation; only `focus` may reuse a healthy matching repository fingerprint,
+and even then the server performs real inventory at exactly five minutes from
+the last successful real scan. Both methods require `orchestration:read`;
+clients never submit baseline or checkout paths.
+
+The additive reason is gated by the default-false
+`worktreeCatalogRefreshReason` capability. Current catalog-capable servers
+advertise it. New clients keep Focus and Explicit as separate local
+single-flight classes, but omit `reason` for an older server; manual Retry
+remains Explicit. Negotiation never retries a rejected request with a different
+meaning. Fingerprint reuse skips only repository inventory: per-project joins,
+suppressions, availability probes, generation publication, and authoritative
+branch reconciliation still execute from the rebuilt healthy snapshot.
 
 Catalog entry lifetime is shared by subscriptions and unary users. Refresh,
 adoption, retarget, removal, trusted-anchor resolution, and current-snapshot
@@ -343,10 +500,13 @@ reconcile branch state.
 
 The production runtime owns one catalog service built from the same Git
 repository and orchestration repositories used by Git/VCS and project state.
-Successful dedicated managed creation records the exact server-created physical
-path for bounded suppression and invalidates its project catalog; dedicated
-verified removal invalidates every matching live view of the durably pinned
-repository. The public raw-path `vcs.removeWorktree` method is not registered,
+After its Git rollback identity and durable owner receipt settle, successful
+dedicated managed creation records the exact server-created physical path for
+bounded suppression and invalidates the shared repository fingerprint plus its
+project catalog. Retarget invalidates after its durable receipt, and dedicated
+verified Git removal invalidates the fingerprint and every matching live view
+of the durably pinned repository after terminal settlement. The public raw-path
+`vcs.removeWorktree` method is not registered,
 typed, scoped, or bridged; the same is true of raw `vcs.createWorktree`. The
 only rollback removal is a private server call
 for the exact just-created registered checkout when managed owner persistence
@@ -705,21 +865,45 @@ provider-native identity survives.
 
 `projects.listEntries` and `projects.searchEntries` are served from one
 server-owned entry index per canonical workspace root, built on first use and
-retained for later requests. In a Git workspace the scan lists tracked and
-untracked files, walks the contents of ignored directories, and separately walks
-for directories: `git ls-files` reports only files, so a directory holding no
-files — one just created, or one whose contents are all elsewhere — would
-otherwise be absent from the tree despite existing on disk. The scan is bounded by entry count, total memory,
-and path length; exceeding a bound returns the entries scanned so far with
-`truncated: true` rather than growing without limit.
+retained for later requests. Concurrent cold callers share one build, and an
+invalidation generation prevents an older in-flight scan from becoming current.
+
+A Git build starts one concurrent wave of two reads with `GIT_OPTIONAL_LOCKS=0`,
+request cancellation, and a workspace-index-specific ten-second post-spawn
+execution bound:
+
+```text
+git -c core.quotePath=false ls-files -z -t --cached --others --deleted --exclude-standard --
+git -c core.quotePath=false ls-files -z --others --ignored --exclude-standard --directory --
+```
+
+The tagged listing distinguishes cached, deleted, and ordinary untracked paths;
+deleted paths are excluded from the tree. The second listing supplies ignored
+files and directory roots. Ignored roots and every descendant are still loaded
+eagerly. A separate directory walk adds empty directories because `git
+ls-files` reports only files. If either Git read cannot start, times out,
+truncates, exits unsuccessfully, or returns malformed classification data, the
+complete Git snapshot is rejected and that request uses the existing bounded
+filesystem fallback. Non-Git workspaces use the same fallback. Both paths are
+bounded by entry count, total memory, and path length; exceeding a bound returns
+the entries accepted so far with `truncated: true`.
+
+Lazy ignored-directory loading remains a separately reviewed follow-up. It is
+required only if a representative native measurement finds ignored walking
+above 500 ms at p95 or above 50% of p95 cache-build time; until then the eager
+tree is the supported behavior.
 
 The index is the server's cached view of the tree. A cached root is rebuilt when
 something invalidates it:
 
-- the in-app mutations `projects.writeFile`, `projects.createEntry`,
-  `projects.renameEntry`, `projects.deleteEntry`, and `projects.duplicateEntry`
-  drop the cached index for their root after a successful mutation, so the next
-  list or search rebuilds it; and
+- `projects.createEntry`, `projects.renameEntry`, `projects.deleteEntry`, and
+  `projects.duplicateEntry` drop the cached index after a successful mutation;
+- `projects.writeFile` drops it when the write creates a file or parent, or when
+  either the logical path or safely resolved effective target contains a
+  case-insensitive `.gitignore` or `.git` component. An ordinary existing-file
+  content save keeps the index while still notifying VCS status. Arbitrary
+  custom `core.excludesFile` paths are not retained as cache provenance, so
+  changing one requires explicit `refresh: true`;
 - `subscribeProjectEntries` streams a signal whenever a periodic sweep observes
   that the path set under `cwd` changed outside the application. The sweep stats
   the directories the snapshot already lists rather than walking the tree,
@@ -737,10 +921,11 @@ something invalidates it:
   application.
 
 A client that changes the workspace only through this RPC surface therefore
-never needs `refresh`; it exists so an explicit user-initiated rescan can
-observe external changes without waiting for the next periodic check. The flag changes cache admission only. It does not
-widen the path boundary, bypass the workspace-availability guard, or otherwise
-change what the caller may read.
+normally needs no `refresh`; the explicit exceptions are an immediate rescan of
+external changes and a content change to a configured custom
+`core.excludesFile`. The flag changes cache admission only. It does not widen
+the path boundary, bypass the workspace-availability guard, or otherwise change
+what the caller may read.
 
 Moving an entry is a rename. The file tree's drag-and-drop move sends
 `projects.renameEntry` with the source and destination as workspace-relative

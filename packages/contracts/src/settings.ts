@@ -467,7 +467,7 @@ export type ProviderSessionDefault = typeof ProviderSessionDefault.Type;
 export const ProviderSessionDefaultsMap = Schema.Record(ProviderDriverKind, ProviderSessionDefault);
 export type ProviderSessionDefaultsMap = typeof ProviderSessionDefaultsMap.Type;
 
-export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
+export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.minutes(3);
 
 export const ServerSettings = Schema.Struct({
   enableAssistantStreaming: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),

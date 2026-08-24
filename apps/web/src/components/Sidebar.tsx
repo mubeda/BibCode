@@ -108,7 +108,6 @@ import {
   selectIsUnread,
   useSidebarWorkspaceMetaStore,
 } from "../sidebarWorkspaceMetaStore";
-import { useProjectBranchPolling } from "../hooks/useProjectBranchPolling";
 import {
   useProject,
   useProjects,
@@ -596,10 +595,15 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   });
   const gitStatus = useEnvironmentQuery(
     workspaceActionsAvailable && thread.branch != null && gitCwd !== null
-      ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd },
-        })
+      ? isActive
+        ? vcsEnvironment.status({
+            environmentId: thread.environmentId,
+            input: { cwd: gitCwd },
+          })
+        : vcsEnvironment.summary({
+            environmentId: thread.environmentId,
+            input: { cwd: gitCwd },
+          })
       : null,
   );
   const isHighlighted = isActive || isSelected;
@@ -1238,12 +1242,8 @@ interface SidebarProjectThreadListProps {
 /**
  * Orca-parity primary workspace row: the project checkout itself (not a
  * worktree). Title/subtitle track the checkout's LIVE current branch (not
- * `thread.branch`, which the default thread always carries as `null`) —
- * TODO(orca-port): wire `useProjectBranchPolling`'s `branchByProjectKey`
- * through props once the prop-drilling path through
- * SidebarProjectsContent/SidebarProjectListRow is threaded (see
- * w3-progress.md); for now this row queries `vcs.status` directly, the same
- * pattern `SidebarThreadRow` already uses per-thread (see `gitStatus` above).
+ * `thread.branch`, which the default thread always carries as `null`). The
+ * passive summary keeps this label fresh without mounting full status.
  */
 function SidebarPrimaryRow(props: {
   project: SidebarProjectSnapshot;
@@ -1254,12 +1254,14 @@ function SidebarPrimaryRow(props: {
 }) {
   const { project, primaryThread, isActive, onClick, onContextMenu } = props;
   const gitStatus = useEnvironmentQuery(
-    vcsEnvironment.status({
+    vcsEnvironment.summary({
       environmentId: project.environmentId,
       input: { cwd: project.workspaceRoot },
     }),
   );
-  const liveBranch = gitStatus.data?.refName ?? null;
+  const liveBranch =
+    gitStatus.data?.refName ??
+    (gitStatus.data && "detachedHead" in gitStatus.data ? gitStatus.data.detachedHead : null);
   const title = liveBranch ?? primaryThread?.branch ?? project.displayName;
   const statusPill = primaryThread ? resolveThreadStatusPill({ thread: primaryThread }) : null;
   const primaryThreadKey = primaryThread
@@ -4372,26 +4374,6 @@ export default function Sidebar() {
     sidebarProjects,
     visibleThreads,
   ]);
-  // Pinned interface 5: keeps each project checkout's `vcs.status` fresh on
-  // a cadence (3s active / 30s others). We don't need the hook's returned
-  // `branchByProjectKey` here — `SidebarPrimaryRow` already subscribes to
-  // the identical {environmentId, cwd} status query per-row (same pattern
-  // as `SidebarThreadRow`'s `gitStatus` above), and that subscription atom
-  // is shared/keyed by input, so the `refreshStatus` calls this hook makes
-  // land on every row subscribed to the same project without prop-drilling.
-  const branchPollingProjects = useMemo(
-    () =>
-      sortedProjects.map((project) => ({
-        key: project.projectKey,
-        environmentId: project.environmentId,
-        workspaceRoot: project.workspaceRoot,
-      })),
-    [sortedProjects],
-  );
-  useProjectBranchPolling({
-    projects: branchPollingProjects,
-    activeProjectKey: activeRouteProjectKey,
-  });
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
   const visibleSidebarThreadKeys = useMemo(
     () =>

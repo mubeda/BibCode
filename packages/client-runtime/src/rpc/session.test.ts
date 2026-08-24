@@ -101,6 +101,8 @@ const PREPARED: PreparedConnection = {
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
+      worktreeCatalogRefreshReason: false,
+      vcsStatusSummary: false,
       activityProtocolVersion: null,
     },
   },
@@ -123,6 +125,8 @@ const SERVER_CONFIG: ServerConfigType = {
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
+      worktreeCatalogRefreshReason: false,
+      vcsStatusSummary: false,
       activityProtocolVersion: null,
     },
   },

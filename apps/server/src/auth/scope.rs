@@ -45,6 +45,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
         | "subscribeVcsStatus"
+        | "subscribeVcsStatusSummary"
         | "subscribeWorktreeCatalog"
         | "vcs.listCommits"
         | "vcs.listRefs"
@@ -168,6 +169,7 @@ mod tests {
             );
         }
         for method in [
+            "subscribeVcsStatusSummary",
             "subscribeWorktreeCatalog",
             "vcs.refreshWorktreeCatalog",
             "worktree.getRemovalPlan",

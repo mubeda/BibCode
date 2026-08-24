@@ -4,6 +4,8 @@ import { createAtomCommandScheduler, type AtomCommandConcurrency } from "./runti
 
 export const vcsCommandScheduler = createAtomCommandScheduler();
 
+export const vcsStatusRefreshScheduler = createAtomCommandScheduler();
+
 /**
  * A separate scheduler instance for `generateCommitMessage`. It's a
  * read-only operation (no mutation of working tree/index), so it must not
@@ -19,6 +21,14 @@ export const vcsCommandConcurrency: AtomCommandConcurrency<{
   readonly input: { readonly cwd: string };
 }> = {
   mode: "serial",
+  key: ({ environmentId, input }) => JSON.stringify([environmentId, input.cwd]),
+};
+
+export const vcsStatusRefreshConcurrency: AtomCommandConcurrency<{
+  readonly environmentId: EnvironmentId;
+  readonly input: { readonly cwd: string };
+}> = {
+  mode: "latest",
   key: ({ environmentId, input }) => JSON.stringify([environmentId, input.cwd]),
 };
 

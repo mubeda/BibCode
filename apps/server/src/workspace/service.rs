@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -14,6 +16,15 @@ const READ_LIMIT_BYTES: usize = 1024 * 1024;
 const DUPLICATE_LIMIT: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 32;
 
+#[cfg(test)]
+pub(crate) type WorkspaceWriteHookFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), WorkspaceError>> + Send + 'a>>;
+
+#[cfg(test)]
+pub(crate) trait WorkspaceWriteHook: Send + Sync {
+    fn after_write<'a>(&'a self, target: &'a Path) -> WorkspaceWriteHookFuture<'a>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadFileResult {
@@ -23,9 +34,29 @@ pub struct ReadFileResult {
     pub truncated: bool,
 }
 
+pub struct WriteFileOutcome {
+    pub(crate) relative_path: String,
+    pub(crate) path_set_changed: bool,
+    pub(crate) index_classification_may_have_changed: bool,
+}
+
+fn write_may_change_index_classification(logical_path: &str, effective_target: &Path) -> bool {
+    Path::new(logical_path)
+        .components()
+        .chain(effective_target.components())
+        .any(|component| {
+            component.as_os_str().to_str().is_some_and(|component| {
+                component.eq_ignore_ascii_case(".git")
+                    || component.eq_ignore_ascii_case(".gitignore")
+            })
+        })
+}
+
 #[derive(Clone)]
 pub struct WorkspaceService {
     permits: Arc<Semaphore>,
+    #[cfg(test)]
+    write_hook: Option<Arc<dyn WorkspaceWriteHook>>,
 }
 
 impl Default for WorkspaceService {
@@ -38,7 +69,15 @@ impl WorkspaceService {
     pub fn new(max_concurrent_operations: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
+            #[cfg(test)]
+            write_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_write_hook_for_test(mut self, hook: Arc<dyn WorkspaceWriteHook>) -> Self {
+        self.write_hook = Some(hook);
+        self
     }
 
     async fn permit(&self) -> Result<OwnedSemaphorePermit, WorkspaceError> {
@@ -96,10 +135,19 @@ impl WorkspaceService {
         root: &Path,
         relative_path: &str,
         contents: &str,
-    ) -> Result<String, WorkspaceError> {
+    ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
         let (target, normalized) = resolve_relative(root, relative_path)?;
         let target = safe_mutation_target(root, &target).await?;
+        let target_existed = tokio::fs::try_exists(&target)
+            .await
+            .map_err(|error| WorkspaceError::operation("exists", &target, error))?;
+        let parent_existed = match target.parent() {
+            Some(parent) => tokio::fs::try_exists(parent)
+                .await
+                .map_err(|error| WorkspaceError::operation("exists", parent, error))?,
+            None => true,
+        };
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -108,7 +156,18 @@ impl WorkspaceService {
         tokio::fs::write(&target, contents)
             .await
             .map_err(|error| WorkspaceError::operation("write-file", &target, error))?;
-        Ok(normalized)
+        #[cfg(test)]
+        if let Some(hook) = &self.write_hook {
+            hook.after_write(&target).await?;
+        }
+        Ok(WriteFileOutcome {
+            index_classification_may_have_changed: write_may_change_index_classification(
+                &normalized,
+                &target,
+            ),
+            relative_path: normalized,
+            path_set_changed: !target_existed || !parent_existed,
+        })
     }
 
     pub async fn create_entry(
@@ -288,6 +347,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn write_classification_controls_include_logical_and_effective_paths_case_insensitively() {
+        assert!(write_may_change_index_classification(
+            "nested/.GITIGNORE",
+            Path::new("workspace/nested/.gitignore")
+        ));
+        assert!(write_may_change_index_classification(
+            "ignore-control-alias",
+            Path::new("workspace/nested/.GiTiGnOrE")
+        ));
+        assert!(write_may_change_index_classification(
+            "git-control-alias/info/exclude",
+            Path::new("workspace/.GiT/INFO/EXCLUDE")
+        ));
+        assert!(!write_may_change_index_classification(
+            "nested/ordinary.txt",
+            Path::new("workspace/nested/ordinary.txt")
+        ));
+    }
+
     #[tokio::test]
     async fn service_covers_file_and_directory_lifecycle_edges() {
         let root = TempDir::new().unwrap();
@@ -297,7 +376,8 @@ mod tests {
             service
                 .write_file(root.path(), "nested/file.txt", "hello")
                 .await
-                .unwrap(),
+                .unwrap()
+                .relative_path,
             "nested/file.txt"
         );
         let read = service
@@ -416,7 +496,8 @@ mod tests {
         for result in [
             service
                 .write_file(root.path(), "blocker/file.txt", "contents")
-                .await,
+                .await
+                .map(|outcome| outcome.relative_path),
             service
                 .create_entry(root.path(), "blocker/directory", EntryKind::Directory)
                 .await,

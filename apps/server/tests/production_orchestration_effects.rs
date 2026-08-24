@@ -10,7 +10,7 @@ use std::{
 use bibcode_server::{
     git::{BoxWorktreeBaseDirectoryFuture, GitRepository, WorktreeBaseDirectoryProvider},
     orchestration::engine::{EngineOptions, OrchestrationCommand, OrchestrationEngine},
-    persistence::{Database, run_migrations},
+    persistence::{Database, OrchestrationEvent, run_migrations},
     production::host_paths::process_compatible_path,
 };
 use orchestration_effects::{
@@ -19,8 +19,10 @@ use orchestration_effects::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::broadcast;
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
+const ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct StaticWorktreeBaseDirectory(Option<PathBuf>);
@@ -172,7 +174,17 @@ fn git_succeeds(cwd: &Path, args: &[&str]) -> bool {
         .success()
 }
 
-fn initialize_repository() -> TempDir {
+struct RealGitFixture {
+    directory: TempDir,
+}
+
+impl RealGitFixture {
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+async fn initialize_repository() -> RealGitFixture {
     let directory = tempfile::tempdir().unwrap();
     git(directory.path(), &["init"]);
     git(directory.path(), &["config", "user.name", "BiBCode Test"]);
@@ -183,7 +195,7 @@ fn initialize_repository() -> TempDir {
     std::fs::write(directory.path().join("tracked.txt"), "baseline\n").unwrap();
     git(directory.path(), &["add", "."]);
     git(directory.path(), &["commit", "-m", "baseline"]);
-    directory
+    RealGitFixture { directory }
 }
 
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -196,20 +208,52 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     panic!("condition was not met");
 }
 
-async fn wait_for_event(engine: &OrchestrationEngine, event_type: &str) {
-    for _ in 0..100 {
-        if engine
-            .read_events(0)
+async fn wait_for_git_ref(cwd: &Path, reference: &str) {
+    let cwd = cwd.to_path_buf();
+    let reference = reference.to_owned();
+    let diagnostic_reference = reference.clone();
+    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async move {
+        loop {
+            let probe_cwd = cwd.clone();
+            let probe_reference = reference.clone();
+            let exists = tokio::task::spawn_blocking(move || {
+                git_succeeds(
+                    &probe_cwd,
+                    &["rev-parse", "--verify", "--quiet", &probe_reference],
+                )
+            })
             .await
-            .unwrap()
-            .iter()
-            .any(|event| event.event.event_type == event_type)
-        {
-            return;
+            .expect("Git ref probe task completes");
+            if exists {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("event {event_type} was not emitted");
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("Git ref {diagnostic_reference} was not created before the fixture deadline")
+    });
+}
+
+async fn wait_for_event(
+    receiver: &mut broadcast::Receiver<OrchestrationEvent>,
+    event_type: &str,
+    predicate: impl Fn(&OrchestrationEvent) -> bool,
+) -> OrchestrationEvent {
+    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async {
+        loop {
+            let event = receiver
+                .recv()
+                .await
+                .unwrap_or_else(|error| panic!("orchestration event stream closed: {error}"));
+            if event.event.event_type == event_type && predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("event {event_type} was not emitted before the fixture deadline"))
 }
 
 #[tokio::test]
@@ -243,7 +287,7 @@ async fn normalizes_and_optionally_creates_project_workspace_roots() {
 
 #[tokio::test]
 async fn bootstrap_admission_does_not_use_the_injected_workspace_before_delivery() {
-    let source = initialize_repository();
+    let source = initialize_repository().await;
     let workspace = tempfile::tempdir().expect("worktree workspace");
     let canonical_workspace = process_compatible_path(
         workspace
@@ -309,7 +353,7 @@ async fn bootstrap_admission_does_not_use_the_injected_workspace_before_delivery
 
 #[tokio::test]
 async fn bootstrap_admission_persists_turn_without_running_prerequisites() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     dispatch(
         &engine,
@@ -390,7 +434,7 @@ async fn bootstrap_admission_persists_turn_without_running_prerequisites() {
 
 #[tokio::test]
 async fn bootstrap_admission_does_not_run_failing_setup_before_delivery() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     dispatch(
         &engine,
@@ -470,7 +514,7 @@ async fn bootstrap_admission_does_not_run_failing_setup_before_delivery() {
 
 #[tokio::test]
 async fn bootstrap_admission_does_not_refresh_workspace_before_delivery() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     let callbacks = Arc::new(CallbackState::default());
     *callbacks.refresh_error.lock().unwrap() = Some("index refresh failed".to_owned());
@@ -528,7 +572,7 @@ async fn bootstrap_admission_does_not_refresh_workspace_before_delivery() {
 
 #[tokio::test]
 async fn bootstrap_admission_does_not_fetch_origin_before_delivery() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     let effects = OrchestrationEffects::start(
         engine.clone(),
@@ -585,7 +629,7 @@ async fn bootstrap_admission_does_not_fetch_origin_before_delivery() {
 
 #[tokio::test]
 async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     let callbacks = Arc::new(CallbackState::default());
     *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
@@ -608,16 +652,12 @@ async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff()
     )
     .await;
     let baseline_ref = orchestration_effects::checkpoint_ref("t1", 0);
-    wait_until(|| {
-        git_succeeds(
-            repository.path(),
-            &["rev-parse", "--verify", "--quiet", &baseline_ref],
-        )
-    })
-    .await;
+    wait_for_git_ref(repository.path(), &baseline_ref).await;
 
     std::fs::write(repository.path().join("tracked.txt"), "changed\n").unwrap();
     std::fs::write(repository.path().join("new.txt"), "new\n").unwrap();
+    let checkpoint_ref = orchestration_effects::checkpoint_ref("t1", 1);
+    let mut events = engine.subscribe_events();
     dispatch(
         &engine,
         json!({
@@ -628,45 +668,43 @@ async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff()
         }),
     )
     .await;
+    wait_for_event(&mut events, "thread.turn-diff-completed", |event| {
+        event.event.payload["threadId"] == "t1"
+            && event.event.payload["status"] == "ready"
+            && event.event.payload["checkpointRef"] == checkpoint_ref
+    })
+    .await;
 
-    let checkpoint_ref = orchestration_effects::checkpoint_ref("t1", 1);
-    for _ in 0..100 {
-        let checkpoint = engine
-            .repositories()
-            .get_checkpoint("t1".to_owned(), 1)
-            .await
-            .unwrap();
-        if checkpoint
-            .as_ref()
-            .is_some_and(|entry| entry.status == "ready" && entry.checkpoint_ref == checkpoint_ref)
-        {
-            let files = checkpoint.unwrap().files;
-            assert!(
-                files
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|file| file["path"] == "tracked.txt")
-            );
-            assert!(
-                files
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|file| file["path"] == "new.txt")
-            );
-            effects.shutdown().await;
-            engine.shutdown().await;
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("real checkpoint was not projected");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t1".to_owned(), 1)
+        .await
+        .unwrap()
+        .expect("real checkpoint was projected");
+    assert_eq!(checkpoint.status, "ready");
+    assert_eq!(checkpoint.checkpoint_ref, checkpoint_ref);
+    let files = checkpoint.files;
+    assert!(
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "tracked.txt")
+    );
+    assert!(
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "new.txt")
+    );
+    effects.shutdown().await;
+    engine.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverts_workspace_provider_history_and_stale_checkpoint_refs() {
-    let repository = initialize_repository();
+    let repository = initialize_repository().await;
     let engine = engine(repository.path()).await;
     let callbacks = Arc::new(CallbackState::default());
     *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
@@ -705,6 +743,7 @@ async fn reverts_workspace_provider_history_and_stale_checkpoint_refs() {
         .await;
     }
 
+    let mut events = engine.subscribe_events();
     dispatch(
         &engine,
         json!({
@@ -713,7 +752,10 @@ async fn reverts_workspace_provider_history_and_stale_checkpoint_refs() {
         }),
     )
     .await;
-    wait_for_event(&engine, "thread.reverted").await;
+    wait_for_event(&mut events, "thread.reverted", |event| {
+        event.event.payload["threadId"] == "t1" && event.event.payload["turnCount"] == 1
+    })
+    .await;
     assert_eq!(
         std::fs::read_to_string(repository.path().join("tracked.txt"))
             .unwrap()

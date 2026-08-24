@@ -91,21 +91,21 @@ describe("RPC wire fixture exporter", () => {
         },
       },
     ]);
-    expect(manifest.methods).toHaveLength(96);
-    expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(17);
-    expect(manifest.streamMethodCount).toBe(17);
-    expect(manifest.expectedTopLevelStreamShapes).toBe(60);
+    expect(manifest.methods).toHaveLength(97);
+    expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(18);
+    expect(manifest.streamMethodCount).toBe(18);
+    expect(manifest.expectedTopLevelStreamShapes).toBe(65);
     expect(manifest.expectedOrchestrationEventShapes).toBe(23);
-    expect(manifest.streamShapeFixtures).toHaveLength(60);
+    expect(manifest.streamShapeFixtures).toHaveLength(65);
     expect(manifest.typedFailureFixtures).toHaveLength(224);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(305);
+    expect(manifest.fixtures).toHaveLength(310);
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(284);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(289);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));
@@ -123,6 +123,26 @@ describe("RPC wire fixture exporter", () => {
     await runExporter();
 
     expect(io.writes).toEqual(firstRun);
+  });
+
+  it("writes a named-provider summary with a matching populated pull request", async () => {
+    await runExporter();
+
+    const contents = io.writes.get(
+      NodePath.join(outputDirectory, "stream-shapes/subscribeVcsStatusSummary-02.json"),
+    );
+    expect(contents).toBeDefined();
+    const fixture = JSON.parse(contents!) as {
+      readonly values: ReadonlyArray<{
+        readonly sourceControlProvider: { readonly kind: string } | null;
+        readonly pr: { readonly provider: string } | null;
+      }>;
+    };
+    const summary = fixture.values[0];
+
+    expect(summary?.sourceControlProvider).not.toBeNull();
+    expect(summary?.pr).not.toBeNull();
+    expect(summary?.pr?.provider).toBe(summary?.sourceControlProvider?.kind);
   });
 
   it.each([

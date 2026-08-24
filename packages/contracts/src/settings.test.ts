@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import * as Duration from "effect/Duration";
 import * as Schema from "effect/Schema";
 
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
@@ -91,6 +92,14 @@ describe("ServerSettings agent activity", () => {
     expect(() => decodeServerSettings({ enableTerminalAgentActivity: 1 })).toThrow();
     expect(() => decodeServerSettingsPatch({ enableChatAgentActivity: 0 })).toThrow();
     expect(() => decodeServerSettingsPatch({ enableTerminalAgentActivity: "true" })).toThrow();
+  });
+});
+
+describe("ServerSettings automatic Git fetch", () => {
+  it("defaults fresh and legacy settings to three minutes", () => {
+    expect(Duration.toMillis(decodeServerSettings({}).automaticGitFetchInterval)).toBe(180_000);
+    expect(Duration.toMillis(DEFAULT_SERVER_SETTINGS.automaticGitFetchInterval)).toBe(180_000);
+    expect(Duration.toMillis(DEFAULT_UNIFIED_SETTINGS.automaticGitFetchInterval)).toBe(180_000);
   });
 });
 

@@ -39,6 +39,8 @@ describe("versionSkew", () => {
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,
+            worktreeCatalogRefreshReason: false,
+            vcsStatusSummary: false,
             activityProtocolVersion: null,
           },
         },

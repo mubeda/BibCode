@@ -12,6 +12,11 @@ use bibcode_server::{
     persistence::{Database, run_migrations},
 };
 use serde_json::json;
+use time::{Duration, UtcOffset};
+
+#[path = "support/activity_time.rs"]
+mod activity_time;
+use activity_time::{activity_timestamp, recent_activity_anchor};
 
 const MAX_ACTIVITY_MUTATIONS: usize = 256;
 
@@ -787,6 +792,10 @@ async fn monitoring_disabled_reactivation_records_each_disable_generation_once()
 
 #[tokio::test]
 async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
+    let timeline_start = recent_activity_anchor();
+    let started_at = activity_timestamp(timeline_start, Duration::ZERO);
+    let duplicate_at = activity_timestamp(timeline_start, Duration::seconds(1));
+    let completed_at = activity_timestamp(timeline_start, Duration::seconds(2));
     let database = Database::open_in_memory().await.expect("database");
     database
         .call(|connection| {
@@ -814,7 +823,7 @@ async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
                 ProviderActivityMutation::upsert_actor("actor:child-1", None, "Explore", "running")
                     .expect("valid actor"),
             ],
-            "2026-07-22T12:00:00Z",
+            &started_at,
         )
         .await
         .expect("batch")
@@ -832,7 +841,7 @@ async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
                     ProviderActivityMutation::remove_actor("actor:child-1")
                         .expect("valid actor id"),
                 ],
-                "2026-07-22T12:00:01Z",
+                &duplicate_at,
             )
             .await
             .expect("duplicate")
@@ -847,7 +856,7 @@ async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
                 ProviderActivityMutation::set_actor_status("actor:child-1", "completed")
                     .expect("valid status"),
             ],
-            "2026-07-22T12:00:02Z",
+            &completed_at,
         )
         .await
         .expect("complete");
@@ -860,7 +869,7 @@ async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
                     ProviderActivityMutation::set_actor_status("actor:child-1", "running",)
                         .expect("valid status")
                 ],
-                "2026-07-22T12:00:01Z",
+                &duplicate_at,
             )
             .await
             .expect("late")
@@ -879,6 +888,9 @@ async fn activity_batches_are_durable_idempotent_and_terminal_monotonic() {
 
 #[tokio::test]
 async fn count_changes_emit_one_authoritative_scope_update_without_scope_field_changes() {
+    let timeline_start = recent_activity_anchor();
+    let started_at = activity_timestamp(timeline_start, Duration::ZERO);
+    let completed_at = activity_timestamp(timeline_start, Duration::seconds(1));
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:count-deltas", "count-deltas");
@@ -892,7 +904,7 @@ async fn count_changes_emit_one_authoritative_scope_update_without_scope_field_c
                 ProviderActivityMutation::upsert_actor("actor:counted", None, "Counted", "running")
                     .expect("actor"),
             ],
-            "2026-07-22T12:00:00Z",
+            &started_at,
         )
         .await
         .expect("started batch")
@@ -913,7 +925,7 @@ async fn count_changes_emit_one_authoritative_scope_update_without_scope_field_c
                 ProviderActivityMutation::set_actor_status("actor:counted", "completed")
                     .expect("completed actor"),
             ],
-            "2026-07-22T12:00:01Z",
+            &completed_at,
         )
         .await
         .expect("completed batch")
@@ -1371,6 +1383,8 @@ async fn terminal_generation_replacement_interrupts_prior_active_records_atomica
 
 #[tokio::test]
 async fn roster_and_detail_use_bounded_keyset_cursors() {
+    let timeline_start = recent_activity_anchor();
+    let actors_at = activity_timestamp(timeline_start, Duration::ZERO);
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:paging", "paging");
@@ -1390,7 +1404,7 @@ async fn roster_and_detail_use_bounded_keyset_cursors() {
                     .expect("valid actor")
                 })
                 .collect(),
-            "2026-07-22T12:00:00Z",
+            &actors_at,
         )
         .await
         .expect("actors");
@@ -1409,13 +1423,13 @@ async fn roster_and_detail_use_bounded_keyset_cursors() {
                             format!("Entry {index}"),
                             None,
                             ActivityEntryTone::Info,
-                            format!("2026-07-22T12:00:0{index}Z"),
+                            activity_timestamp(timeline_start, Duration::seconds(index)),
                         )
                         .expect("valid entry"),
                     )
                 })
                 .collect(),
-            "2026-07-22T12:00:04Z",
+            &activity_timestamp(timeline_start, Duration::seconds(4)),
         )
         .await
         .expect("entries");
@@ -1536,6 +1550,11 @@ fn timestamps_are_canonical_and_record_lifecycle_chronology_is_validated() {
 
 #[tokio::test]
 async fn offset_late_events_do_not_regress_terminal_records() {
+    let timeline_start = recent_activity_anchor();
+    let completed_at = activity_timestamp(timeline_start, Duration::ZERO);
+    let late_offset =
+        timeline_start.to_offset(UtcOffset::from_hms(2, 0, 0).expect("valid UTC offset"));
+    let late_at = activity_timestamp(late_offset, -Duration::hours(1));
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:offset-late", "offset-late");
@@ -1548,7 +1567,7 @@ async fn offset_late_events_do_not_regress_terminal_records() {
                 ProviderActivityMutation::upsert_actor("actor:offset", None, "Offset", "completed")
                     .expect("actor"),
             ],
-            "2026-07-22T12:00:00Z",
+            &completed_at,
         )
         .await
         .expect("complete");
@@ -1562,7 +1581,7 @@ async fn offset_late_events_do_not_regress_terminal_records() {
                     ProviderActivityMutation::set_actor_status("actor:offset", "running")
                         .expect("status"),
                 ],
-                "2026-07-22T13:00:00+02:00",
+                &late_at,
             )
             .await
             .expect("late offset")
@@ -1580,6 +1599,10 @@ async fn offset_late_events_do_not_regress_terminal_records() {
 
 #[tokio::test]
 async fn canonical_fractional_timestamps_sort_by_instant() {
+    let timeline_start = recent_activity_anchor();
+    let whole_at = activity_timestamp(timeline_start, Duration::ZERO);
+    let fractional_at = activity_timestamp(timeline_start, Duration::milliseconds(100));
+    let batch_at = activity_timestamp(timeline_start, Duration::seconds(1));
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:fractional-order", "fractional-order");
@@ -1594,9 +1617,9 @@ async fn canonical_fractional_timestamps_sort_by_instant() {
                         "actor:whole",
                         None,
                         ActivityLifecycle::Completed,
-                        "2026-07-22T12:00:00Z",
-                        "2026-07-22T12:00:00Z",
-                        Some("2026-07-22T12:00:00Z"),
+                        &whole_at,
+                        &whole_at,
+                        Some(&whole_at),
                     )
                     .expect("whole second"),
                 ),
@@ -1605,14 +1628,14 @@ async fn canonical_fractional_timestamps_sort_by_instant() {
                         "actor:fractional",
                         None,
                         ActivityLifecycle::Completed,
-                        "2026-07-22T12:00:00Z",
-                        "2026-07-22T12:00:00.1Z",
-                        Some("2026-07-22T12:00:00.1Z"),
+                        &whole_at,
+                        &fractional_at,
+                        Some(&fractional_at),
                     )
                     .expect("fractional second"),
                 ),
             ],
-            "2026-07-22T12:00:01Z",
+            &batch_at,
         )
         .await
         .expect("actors");
@@ -2213,6 +2236,8 @@ async fn net_noop_scope_batches_do_not_consume_revision_or_event_key() {
 
 #[tokio::test]
 async fn cursor_payload_structure_is_strict_for_roster_and_detail() {
+    let timeline_start = recent_activity_anchor();
+    let fixture_at = activity_timestamp(timeline_start, Duration::seconds(1));
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:strict-cursor", "strict-cursor");
@@ -2229,12 +2254,12 @@ async fn cursor_payload_structure_is_strict_for_roster_and_detail() {
                         "entry:cursor",
                         ActivityRecordKind::Actor,
                         "actor:cursor",
-                        "2026-07-22T12:00:01Z",
+                        &fixture_at,
                     )
                     .expect("entry"),
                 ),
             ],
-            "2026-07-22T12:00:01Z",
+            &fixture_at,
         )
         .await
         .expect("fixture");
@@ -2294,6 +2319,8 @@ async fn cursor_payload_structure_is_strict_for_roster_and_detail() {
 
 #[tokio::test]
 async fn roster_pages_enforce_the_two_hundred_row_cap() {
+    let timeline_start = recent_activity_anchor();
+    let completed_at = activity_timestamp(timeline_start, Duration::ZERO);
     let database = migrated_database().await;
     let repository = ActivityRepository::new(database);
     let scope = thread_scope("thread:page-cap", "page-cap");
@@ -2313,7 +2340,7 @@ async fn roster_pages_enforce_the_two_hundred_row_cap() {
                     .expect("actor")
                 })
                 .collect(),
-            "2026-07-22T12:00:00Z",
+            &completed_at,
         )
         .await
         .expect("actors");

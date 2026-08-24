@@ -384,7 +384,7 @@ async fn process_runner_cancels_in_flight_requests_and_cleans_up_children() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn process_runner_times_out_and_cleans_up_children() {
     let temp = TempDir::new().expect("temporary directory");
     let script = write_process_tree_script(temp.path());
@@ -410,10 +410,25 @@ async fn process_runner_times_out_and_cleans_up_children() {
     );
     input.timeout = Duration::from_secs(5);
 
+    let keep_time_paused = CancellationToken::new();
+    let keepalive = tokio::spawn({
+        let keep_time_paused = keep_time_paused.clone();
+        async move {
+            while !keep_time_paused.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
     let task = tokio::spawn(async move { ProcessRunner.run(input).await });
-    wait_for_file(&parent_ready_path).await;
-    wait_for_file(&child_ready_path).await;
-    wait_for_file(&grandchild_ready_path).await;
+    tokio::task::spawn_blocking(move || {
+        wait_for_files_blocking(&[parent_ready_path, child_ready_path, grandchild_ready_path]);
+    })
+    .await
+    .expect("join process-tree readiness observer");
+    keep_time_paused.cancel();
+    keepalive.await.expect("join paused-time keepalive");
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
 
     let error = task
         .await
@@ -926,6 +941,20 @@ async fn wait_for_file(path: &Path) {
         sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_for_files_blocking(paths: &[PathBuf]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for path in paths {
+        while !path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 async fn assert_cleanup_sentinels_remain_absent(release: &Path, sentinels: &[&Path]) {

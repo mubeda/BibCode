@@ -36,7 +36,7 @@ export function useWorktreeCatalogFocusRefresh(
       for (const project of uniqueProjects.values()) {
         void refresh({
           environmentId: project.environmentId,
-          input: { projectId: project.projectId },
+          input: { projectId: project.projectId, reason: "focus" },
         });
       }
     };

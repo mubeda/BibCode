@@ -95,6 +95,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     stream("subscribeTerminalEvents"),
     stream("subscribeTerminalMetadata"),
     stream("subscribeVcsStatus"),
+    stream("subscribeVcsStatusSummary"),
     stream("subscribeWorktreeCatalog"),
     stream("terminal.attach"),
     unary("terminal.clear"),
@@ -146,5 +147,10 @@ mod tests {
                 mode: MethodMode::Stream,
             }
         );
+    }
+
+    #[test]
+    fn passive_vcs_summary_is_a_stream_method() {
+        assert!(ACTIVE_RPC_METHODS.contains(&stream("subscribeVcsStatusSummary")));
     }
 }

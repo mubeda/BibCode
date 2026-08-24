@@ -415,7 +415,7 @@ describe("git fetch interval settings", () => {
   }
 
   it("shows a reset affordance when the interval differs from the default", () => {
-    renderGitRow();
+    expect(renderGitRow()).toContain("The default is 180 seconds");
     expect(ui.filter("SettingResetButton")).toHaveLength(1);
     (ui.find("SettingResetButton").onClick as () => void)();
     expect(testState.updateSettings).toHaveBeenCalledWith({

@@ -1,20 +1,64 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::git::{OutputPolicy, ProcessError, ProcessRequest, ProcessRunner};
+use crate::git::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
 
 use super::WorkspaceError;
 use super::paths::to_posix;
 
 const ENTRY_OVERHEAD_BYTES: usize = 24;
-const GIT_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
+const GIT_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkspaceIndexPhase {
+    pub(super) operation: &'static str,
+    pub(super) phase: &'static str,
+    pub(super) elapsed_ms: u64,
+    pub(super) entry_count: usize,
+    pub(super) cache_outcome: &'static str,
+}
+
+#[cfg(test)]
+pub(super) type WorkspaceIndexPhaseSink = tokio::sync::mpsc::UnboundedSender<WorkspaceIndexPhase>;
+
+pub(super) fn emit_index_phase(
+    #[cfg(test)] sink: Option<&WorkspaceIndexPhaseSink>,
+    operation: &'static str,
+    phase: &'static str,
+    started: Instant,
+    entry_count: usize,
+    cache_outcome: &'static str,
+) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        operation,
+        phase,
+        elapsed_ms,
+        entry_count,
+        cache_outcome,
+        "workspace index phase completed"
+    );
+    #[cfg(test)]
+    if let Some(sink) = sink {
+        let _ = sink.send(WorkspaceIndexPhase {
+            operation,
+            phase,
+            elapsed_ms,
+            entry_count,
+            cache_outcome,
+        });
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,11 +109,107 @@ struct SearchSnapshot {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitListedPathKind {
+    Cached,
+    Deleted,
+    Untracked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitListedPath {
+    path: String,
+    kind: GitListedPathKind,
+}
+
+fn parse_main_listing(output: &str) -> Option<Vec<GitListedPath>> {
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let records = output.strip_suffix('\0')?;
+    if records.is_empty() {
+        return None;
+    }
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut paths: Vec<GitListedPath> = Vec::new();
+    for record in records.split('\0') {
+        let (tag, path) = record.split_once(' ')?;
+        if path.is_empty() {
+            return None;
+        }
+        let kind = match tag {
+            "H" | "S" => GitListedPathKind::Cached,
+            "R" => GitListedPathKind::Deleted,
+            "?" => GitListedPathKind::Untracked,
+            _ => return None,
+        };
+        if let Some(index) = seen.get(path).copied() {
+            let existing = paths[index].kind;
+            match (existing, kind) {
+                (left, right) if left == right => {}
+                (GitListedPathKind::Cached, GitListedPathKind::Deleted) => {
+                    paths[index].kind = GitListedPathKind::Deleted;
+                }
+                (GitListedPathKind::Deleted, GitListedPathKind::Cached) => {}
+                _ => return None,
+            }
+            continue;
+        }
+        seen.insert(path.to_owned(), paths.len());
+        paths.push(GitListedPath {
+            path: path.to_owned(),
+            kind,
+        });
+    }
+    Some(paths)
+}
+
+fn parse_ignored_listing(output: &str) -> Option<Vec<String>> {
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let records = output.strip_suffix('\0')?;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for path in records.split('\0') {
+        if path.is_empty() {
+            return None;
+        }
+        if seen.insert(path.to_owned()) {
+            paths.push(path.to_owned());
+        }
+    }
+    Some(paths)
+}
+
+type BoxWorkspaceGitCommandFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
+
+trait WorkspaceGitCommandRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxWorkspaceGitCommandFuture<'a>;
+}
+
+impl WorkspaceGitCommandRunner for ProcessRunner {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxWorkspaceGitCommandFuture<'a> {
+        Box::pin(ProcessRunner::run(self, request, cancellation))
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceSearchIndex {
     root: PathBuf,
     limits: SearchLimits,
     snapshot: Arc<RwLock<SearchSnapshot>>,
+    #[cfg(test)]
+    phase_sink: Option<WorkspaceIndexPhaseSink>,
 }
 
 impl WorkspaceSearchIndex {
@@ -78,7 +218,20 @@ impl WorkspaceSearchIndex {
             root,
             limits,
             snapshot: Arc::new(RwLock::new(SearchSnapshot::default())),
+            #[cfg(test)]
+            phase_sink: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_phase_sink(mut self, sink: Option<WorkspaceIndexPhaseSink>) -> Self {
+        self.phase_sink = sink;
+        self
+    }
+
+    #[cfg(test)]
+    fn phase_sink(&self) -> Option<&WorkspaceIndexPhaseSink> {
+        self.phase_sink.as_ref()
     }
 
     pub async fn refresh(&self, cancellation: CancellationToken) -> Result<(), WorkspaceError> {
@@ -88,14 +241,41 @@ impl WorkspaceSearchIndex {
         let root = self.root.clone();
         let limits = self.limits;
         let scan_cancel = cancellation.clone();
-        let scanned = if let Some(snapshot) = scan_git(&root, limits, &scan_cancel).await? {
+        let scanned = if let Some(snapshot) = scan_git(
+            &root,
+            limits,
+            &scan_cancel,
+            #[cfg(test)]
+            self.phase_sink(),
+        )
+        .await?
+        {
             snapshot
         } else {
-            tokio::task::spawn_blocking(move || scan(&root, limits, &scan_cancel))
+            let started = Instant::now();
+            let scanned = tokio::task::spawn_blocking(move || scan(&root, limits, &scan_cancel))
                 .await
                 .map_err(|error| {
                     WorkspaceError::operation("scan", &self.root, std::io::Error::other(error))
-                })??
+                })?;
+            let cache_outcome = match &scanned {
+                Ok(_) => "build",
+                Err(WorkspaceError::Cancelled) => "cancelled",
+                Err(_) => "error",
+            };
+            emit_index_phase(
+                #[cfg(test)]
+                self.phase_sink(),
+                "WorkspaceSearchIndex.filesystemSnapshot",
+                "filesystem_walk",
+                started,
+                scanned
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.entries.len())
+                    .min(limits.max_entries),
+                cache_outcome,
+            );
+            scanned?
         };
         if cancellation.is_cancelled() {
             return Err(WorkspaceError::Cancelled);
@@ -166,51 +346,106 @@ impl WorkspaceSearchIndex {
     pub async fn memory_bytes(&self) -> usize {
         self.snapshot.read().await.memory_bytes
     }
+
+    pub(super) async fn entry_count(&self) -> usize {
+        self.snapshot.read().await.entries.len()
+    }
 }
 
 async fn scan_git(
     root: &Path,
     limits: SearchLimits,
     cancellation: &CancellationToken,
+    #[cfg(test)] sink: Option<&WorkspaceIndexPhaseSink>,
 ) -> Result<Option<SearchSnapshot>, WorkspaceError> {
-    let Some(listed) = run_git_ls_files(
+    scan_git_with_runner(
         root,
-        ["--cached", "--others", "--exclude-standard"],
-        limits.max_memory_bytes,
+        limits,
         cancellation,
+        &ProcessRunner,
+        #[cfg(test)]
+        sink,
     )
-    .await?
-    else {
+    .await
+}
+
+async fn scan_git_with_runner<R: WorkspaceGitCommandRunner + ?Sized>(
+    root: &Path,
+    limits: SearchLimits,
+    cancellation: &CancellationToken,
+    runner: &R,
+    #[cfg(test)] sink: Option<&WorkspaceIndexPhaseSink>,
+) -> Result<Option<SearchSnapshot>, WorkspaceError> {
+    let git_started = Instant::now();
+    let command_cancellation = cancellation.child_token();
+    let main = async {
+        let result =
+            run_git_main_listing(root, limits.max_memory_bytes, &command_cancellation, runner)
+                .await;
+        if !matches!(result, Ok(Some(_))) {
+            command_cancellation.cancel();
+        }
+        result
+    };
+    let ignored = async {
+        let result =
+            run_git_ignored_listing(root, limits.max_memory_bytes, &command_cancellation, runner)
+                .await;
+        if !matches!(result, Ok(Some(_))) {
+            command_cancellation.cancel();
+        }
+        result
+    };
+    let (main, ignored_roots) = tokio::join!(main, ignored);
+    if cancellation.is_cancelled() {
+        emit_index_phase(
+            #[cfg(test)]
+            sink,
+            "WorkspaceSearchIndex.gitSnapshot",
+            "git_snapshot",
+            git_started,
+            0,
+            "cancelled",
+        );
+        return Err(WorkspaceError::Cancelled);
+    }
+    let (Ok(Some(listed)), Ok(Some(ignored_roots))) = (main, ignored_roots) else {
+        emit_index_phase(
+            #[cfg(test)]
+            sink,
+            "WorkspaceSearchIndex.gitSnapshot",
+            "git_snapshot",
+            git_started,
+            0,
+            "fallback",
+        );
         return Ok(None);
     };
-    let Some(deleted) =
-        run_git_ls_files(root, ["--deleted"], limits.max_memory_bytes, cancellation).await?
-    else {
-        return Ok(None);
-    };
-    let deleted = deleted
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .collect::<HashSet<_>>();
-    let ignored_roots = run_git_ls_files(
-        root,
-        ["--others", "--ignored", "--exclude-standard", "--directory"],
-        limits.max_memory_bytes,
-        cancellation,
-    )
-    .await?
-    .unwrap_or_default();
+    emit_index_phase(
+        #[cfg(test)]
+        sink,
+        "WorkspaceSearchIndex.gitSnapshot",
+        "git_snapshot",
+        git_started,
+        listed
+            .len()
+            .saturating_add(ignored_roots.len())
+            .min(limits.max_entries),
+        "build",
+    );
+
     let mut ignored_directories = ignored_roots
-        .split('\0')
+        .iter()
         .filter(|path| path.ends_with('/'))
         .map(|path| path.trim_end_matches('/').to_owned())
         .collect::<Vec<_>>();
     ignored_directories.sort();
     let mut candidates = BTreeMap::new();
-    for path in listed
-        .split('\0')
-        .filter(|path| !path.is_empty() && !deleted.contains(path))
+    for listed_path in listed
+        .iter()
+        .filter(|listed_path| listed_path.kind != GitListedPathKind::Deleted)
     {
+        let path = &listed_path.path;
         for (separator, _) in path.match_indices('/') {
             candidates
                 .entry(path[..separator].to_owned())
@@ -218,7 +453,7 @@ async fn scan_git(
         }
         candidates.insert(path.to_owned(), (EntryKind::File, false));
     }
-    for ignored_path in ignored_roots.split('\0').filter(|path| !path.is_empty()) {
+    for ignored_path in &ignored_roots {
         let path = ignored_path.trim_end_matches('/');
         for (separator, _) in path.match_indices('/') {
             candidates
@@ -241,6 +476,7 @@ async fn scan_git(
     let remaining = limits.max_entries.saturating_sub(candidates.len());
     let scan_root = root.to_path_buf();
     let scan_cancellation = cancellation.clone();
+    let ignored_started = Instant::now();
     let ignored_contents = tokio::task::spawn_blocking(move || {
         scan_ignored_directory_contents(
             &scan_root,
@@ -249,17 +485,47 @@ async fn scan_git(
             &scan_cancellation,
         )
     })
-    .await
-    .map_err(|error| {
-        WorkspaceError::operation(
-            "scan-ignored-directories",
-            root,
-            std::io::Error::other(error),
-        )
-    })?;
+    .await;
+    let ignored_contents = match ignored_contents {
+        Ok(ignored_contents) => ignored_contents,
+        Err(error) => {
+            emit_index_phase(
+                #[cfg(test)]
+                sink,
+                "WorkspaceSearchIndex.gitSnapshot",
+                "ignored_walk",
+                ignored_started,
+                0,
+                "error",
+            );
+            return Err(WorkspaceError::operation(
+                "scan-ignored-directories",
+                root,
+                std::io::Error::other(error),
+            ));
+        }
+    };
     if cancellation.is_cancelled() {
+        emit_index_phase(
+            #[cfg(test)]
+            sink,
+            "WorkspaceSearchIndex.gitSnapshot",
+            "ignored_walk",
+            ignored_started,
+            ignored_contents.len().min(limits.max_entries),
+            "cancelled",
+        );
         return Err(WorkspaceError::Cancelled);
     }
+    emit_index_phase(
+        #[cfg(test)]
+        sink,
+        "WorkspaceSearchIndex.gitSnapshot",
+        "ignored_walk",
+        ignored_started,
+        ignored_contents.len().min(limits.max_entries),
+        "build",
+    );
     for (path, kind) in ignored_contents {
         candidates
             .entry(path)
@@ -275,6 +541,7 @@ async fn scan_git(
     let scan_root = root.to_path_buf();
     let scan_cancellation = cancellation.clone();
     let ignored_prefixes = ignored_directory_prefixes.clone();
+    let directories_started = Instant::now();
     let walked_directories = tokio::task::spawn_blocking(move || {
         scan_directories(
             &scan_root,
@@ -283,13 +550,47 @@ async fn scan_git(
             &scan_cancellation,
         )
     })
-    .await
-    .map_err(|error| {
-        WorkspaceError::operation("scan-directories", root, std::io::Error::other(error))
-    })?;
+    .await;
+    let walked_directories = match walked_directories {
+        Ok(walked_directories) => walked_directories,
+        Err(error) => {
+            emit_index_phase(
+                #[cfg(test)]
+                sink,
+                "WorkspaceSearchIndex.gitSnapshot",
+                "directory_walk",
+                directories_started,
+                0,
+                "error",
+            );
+            return Err(WorkspaceError::operation(
+                "scan-directories",
+                root,
+                std::io::Error::other(error),
+            ));
+        }
+    };
     if cancellation.is_cancelled() {
+        emit_index_phase(
+            #[cfg(test)]
+            sink,
+            "WorkspaceSearchIndex.gitSnapshot",
+            "directory_walk",
+            directories_started,
+            walked_directories.len().min(limits.max_entries),
+            "cancelled",
+        );
         return Err(WorkspaceError::Cancelled);
     }
+    emit_index_phase(
+        #[cfg(test)]
+        sink,
+        "WorkspaceSearchIndex.gitSnapshot",
+        "directory_walk",
+        directories_started,
+        walked_directories.len().min(limits.max_entries),
+        "build",
+    );
     for path in walked_directories {
         candidates
             .entry(path)
@@ -414,17 +715,64 @@ fn scan_ignored_directory_contents(
     entries
 }
 
-async fn run_git_ls_files<const N: usize>(
+async fn run_git_main_listing<R: WorkspaceGitCommandRunner + ?Sized>(
+    root: &Path,
+    max_output_bytes: usize,
+    cancellation: &CancellationToken,
+    runner: &R,
+) -> Result<Option<Vec<GitListedPath>>, WorkspaceError> {
+    let Some(output) = run_git_ls_files(
+        root,
+        [
+            "-t",
+            "--cached",
+            "--others",
+            "--deleted",
+            "--exclude-standard",
+        ],
+        max_output_bytes,
+        cancellation,
+        runner,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(parse_main_listing(&output))
+}
+
+async fn run_git_ignored_listing<R: WorkspaceGitCommandRunner + ?Sized>(
+    root: &Path,
+    max_output_bytes: usize,
+    cancellation: &CancellationToken,
+    runner: &R,
+) -> Result<Option<Vec<String>>, WorkspaceError> {
+    let Some(output) = run_git_ls_files(
+        root,
+        ["--others", "--ignored", "--exclude-standard", "--directory"],
+        max_output_bytes,
+        cancellation,
+        runner,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(parse_ignored_listing(&output))
+}
+
+async fn run_git_ls_files<const N: usize, R: WorkspaceGitCommandRunner + ?Sized>(
     root: &Path,
     modes: [&str; N],
     max_output_bytes: usize,
     cancellation: &CancellationToken,
+    runner: &R,
 ) -> Result<Option<String>, WorkspaceError> {
     let mut args = vec![OsString::from("-c"), OsString::from("core.quotePath=false")];
     args.extend([OsString::from("ls-files"), OsString::from("-z")]);
     args.extend(modes.into_iter().map(OsString::from));
     args.push(OsString::from("--"));
-    match ProcessRunner
+    match runner
         .run(
             ProcessRequest {
                 operation: "WorkspaceSearchIndex.gitSnapshot".to_owned(),
@@ -443,7 +791,11 @@ async fn run_git_ls_files<const N: usize>(
         )
         .await
     {
-        Ok(output) if output.exit_code == 0 => Ok(Some(output.stdout)),
+        Ok(output)
+            if output.exit_code == 0 && !output.stdout_truncated && !output.stderr_truncated =>
+        {
+            Ok(Some(output.stdout))
+        }
         Ok(_) => Ok(None),
         Err(ProcessError::Cancelled { .. }) => Err(WorkspaceError::Cancelled),
         Err(_) => Ok(None),
@@ -627,7 +979,605 @@ fn subsequence_offset(candidate: &str, query: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
+
     use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[derive(Clone)]
+    struct PausingWorkspaceGitRunner {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        settled: Arc<Semaphore>,
+        requests: Arc<Mutex<Vec<ProcessRequest>>>,
+    }
+
+    impl PausingWorkspaceGitRunner {
+        fn new() -> Self {
+            Self {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                settled: Arc::new(Semaphore::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl WorkspaceGitCommandRunner for PausingWorkspaceGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxWorkspaceGitCommandFuture<'a> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.started.add_permits(1);
+            Box::pin(async move {
+                let result = tokio::select! {
+                    permit = self.release.acquire() => {
+                        permit.expect("release semaphore closed").forget();
+                        Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        })
+                    },
+                    () = cancellation.cancelled() => Err(ProcessError::Cancelled {
+                        operation: request.operation,
+                    }),
+                };
+                self.settled.add_permits(1);
+                result
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RejectedGitListing {
+        Spawn,
+        NonZero,
+        Timeout,
+        Truncated,
+        Malformed,
+    }
+
+    #[derive(Clone)]
+    struct RejectingWorkspaceGitRunner {
+        failure: RejectedGitListing,
+        fail_main: bool,
+        started: Arc<Semaphore>,
+        settled: Arc<Semaphore>,
+    }
+
+    impl RejectingWorkspaceGitRunner {
+        fn new(failure: RejectedGitListing, fail_main: bool) -> Self {
+            Self {
+                failure,
+                fail_main,
+                started: Arc::new(Semaphore::new(0)),
+                settled: Arc::new(Semaphore::new(0)),
+            }
+        }
+    }
+
+    impl WorkspaceGitCommandRunner for RejectingWorkspaceGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxWorkspaceGitCommandFuture<'a> {
+            let is_main = request.args.iter().any(|arg| arg == "-t");
+            self.started.add_permits(1);
+            Box::pin(async move {
+                let result = if is_main == self.fail_main {
+                    match self.failure {
+                        RejectedGitListing::Spawn => Err(ProcessError::Spawn {
+                            operation: request.operation,
+                            command: "git".to_owned(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "missing git",
+                            ),
+                        }),
+                        RejectedGitListing::Timeout => Err(ProcessError::Timeout {
+                            operation: request.operation,
+                            timeout_ms: 1,
+                        }),
+                        RejectedGitListing::NonZero => Ok(process_output(1, "")),
+                        RejectedGitListing::Truncated => Ok(ProcessOutput {
+                            stdout_truncated: true,
+                            ..process_output(0, "")
+                        }),
+                        RejectedGitListing::Malformed => Ok(process_output(0, "malformed")),
+                    }
+                } else {
+                    cancellation.cancelled().await;
+                    Err(ProcessError::Cancelled {
+                        operation: request.operation,
+                    })
+                };
+                self.settled.add_permits(1);
+                result
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedWorkspaceGitRunner {
+        delay: Duration,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl DelayedWorkspaceGitRunner {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                started: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl WorkspaceGitCommandRunner for DelayedWorkspaceGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> BoxWorkspaceGitCommandFuture<'a> {
+            let is_main = request.args.iter().any(|arg| arg == "-t");
+            self.started.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                tokio::select! {
+                    () = cancellation.cancelled() => Err(ProcessError::Cancelled {
+                        operation: request.operation,
+                    }),
+                    result = tokio::time::timeout(request.timeout, tokio::time::sleep(self.delay)) => {
+                        result.map_err(|_| ProcessError::Timeout {
+                            operation: request.operation,
+                            timeout_ms: request.timeout.as_millis(),
+                        })?;
+                        Ok(ProcessOutput {
+                            exit_code: 0,
+                            stdout: if is_main { "? delayed.txt\0".to_owned() } else { String::new() },
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        })
+                    },
+                }
+            })
+        }
+    }
+
+    fn process_output(exit_code: i32, stdout: &str) -> ProcessOutput {
+        ProcessOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    async fn consume_permits(semaphore: &Semaphore, count: u32, checkpoint: &str) {
+        timeout(TEST_TIMEOUT, semaphore.acquire_many(count))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {checkpoint}"))
+            .unwrap_or_else(|_| panic!("{checkpoint} semaphore closed"))
+            .forget();
+    }
+
+    #[test]
+    fn tagged_main_listing_distinguishes_cached_deleted_and_untracked() {
+        let parsed = parse_main_listing("H tracked.rs\0S sparse.rs\0R deleted.rs\0? new.rs\0")
+            .expect("valid tagged listing");
+
+        assert_eq!(parsed[0].kind, GitListedPathKind::Cached);
+        assert_eq!(parsed[1].kind, GitListedPathKind::Cached);
+        assert_eq!(parsed[2].kind, GitListedPathKind::Deleted);
+        assert_eq!(parsed[3].kind, GitListedPathKind::Untracked);
+    }
+
+    #[test]
+    fn tagged_main_listing_rejects_malformed_unknown_and_ambiguous_records() {
+        for invalid in [
+            "\0",
+            "\0H path.rs\0",
+            "H path.rs\0\0",
+            "X path.rs\0",
+            "H\0",
+            "H \0",
+            "H path.rs",
+        ] {
+            assert!(
+                parse_main_listing(invalid).is_none(),
+                "accepted {invalid:?}"
+            );
+        }
+        for invalid in [
+            "H same.rs\0? same.rs\0",
+            "? same.rs\0H same.rs\0",
+            "S same.rs\0? same.rs\0",
+            "? same.rs\0S same.rs\0",
+            "R same.rs\0? same.rs\0",
+            "? same.rs\0R same.rs\0",
+        ] {
+            assert!(
+                parse_main_listing(invalid).is_none(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_main_listing_resolves_only_deterministic_duplicates() {
+        assert!(parse_main_listing("").unwrap().is_empty());
+        for (output, kind) in [
+            ("H same.rs\0H same.rs\0", GitListedPathKind::Cached),
+            ("H same.rs\0S same.rs\0", GitListedPathKind::Cached),
+            ("S same.rs\0H same.rs\0", GitListedPathKind::Cached),
+            ("H same.rs\0R same.rs\0", GitListedPathKind::Deleted),
+            ("R same.rs\0H same.rs\0", GitListedPathKind::Deleted),
+            ("S same.rs\0R same.rs\0", GitListedPathKind::Deleted),
+            ("R same.rs\0S same.rs\0", GitListedPathKind::Deleted),
+            ("R same.rs\0R same.rs\0", GitListedPathKind::Deleted),
+            ("? same.rs\0? same.rs\0", GitListedPathKind::Untracked),
+        ] {
+            assert_eq!(
+                parse_main_listing(output).unwrap().as_slice(),
+                [GitListedPath {
+                    path: "same.rs".to_owned(),
+                    kind,
+                }],
+                "failed {output:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_snapshot_starts_two_processes_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let expected_root = root_path.clone();
+        let runner = PausingWorkspaceGitRunner::new();
+        let scan_runner = runner.clone();
+        let scan = tokio::spawn(async move {
+            scan_git_with_runner(
+                &root_path,
+                SearchLimits::default(),
+                &CancellationToken::new(),
+                &scan_runner,
+                None,
+            )
+            .await
+        });
+
+        consume_permits(&runner.started, 2, "both Git commands to start").await;
+        {
+            let requests = runner.requests.lock().unwrap();
+            let main = requests
+                .iter()
+                .find(|request| request.args.iter().any(|arg| arg == "-t"))
+                .unwrap();
+            assert_eq!(
+                main.args,
+                [
+                    "-c",
+                    "core.quotePath=false",
+                    "ls-files",
+                    "-z",
+                    "-t",
+                    "--cached",
+                    "--others",
+                    "--deleted",
+                    "--exclude-standard",
+                    "--",
+                ]
+                .map(OsString::from)
+            );
+            assert_git_request_contract(main, &expected_root);
+            let ignored = requests
+                .iter()
+                .find(|request| !request.args.iter().any(|arg| arg == "-t"))
+                .unwrap();
+            assert_eq!(
+                ignored.args,
+                [
+                    "-c",
+                    "core.quotePath=false",
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                    "--",
+                ]
+                .map(OsString::from)
+            );
+            assert_git_request_contract(ignored, &expected_root);
+        }
+        runner.release.add_permits(2);
+        assert!(
+            timeout(TEST_TIMEOUT, scan)
+                .await
+                .expect("scan timed out")
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        consume_permits(&runner.settled, 2, "both Git commands to settle").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn git_snapshot_accepts_slow_success_inside_bound_and_falls_back_beyond_it() {
+        let root = tempfile::tempdir().unwrap();
+        let slow = DelayedWorkspaceGitRunner::new(Duration::from_secs(4));
+        let snapshot = scan_git_with_runner(
+            root.path(),
+            SearchLimits::default(),
+            &CancellationToken::new(),
+            &slow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            snapshot.is_some(),
+            "four-second Git reads must remain authoritative"
+        );
+        assert_eq!(slow.started.load(Ordering::Relaxed), 2);
+
+        let beyond_bound =
+            DelayedWorkspaceGitRunner::new(GIT_SCAN_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            scan_git_with_runner(
+                root.path(),
+                SearchLimits::default(),
+                &CancellationToken::new(),
+                &beyond_bound,
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "Git reads beyond the bound must use the filesystem fallback"
+        );
+        assert_eq!(beyond_bound.started.load(Ordering::Relaxed), 2);
+    }
+
+    fn assert_git_request_contract(request: &ProcessRequest, root: &Path) {
+        assert_eq!(request.operation, "WorkspaceSearchIndex.gitSnapshot");
+        assert_eq!(request.command, PathBuf::from("git"));
+        assert_eq!(request.cwd, root);
+        assert_eq!(
+            request.env,
+            [(OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0"))]
+        );
+        assert_eq!(request.stdin, None);
+        assert_eq!(request.timeout, Duration::from_secs(10));
+        assert_eq!(
+            request.max_output_bytes,
+            SearchLimits::default().max_memory_bytes
+        );
+        assert_eq!(request.output_policy, OutputPolicy::Error);
+        assert!(!request.append_truncation_marker);
+        assert!(request.allow_non_zero_exit);
+    }
+
+    #[tokio::test]
+    async fn rejected_git_listing_cancels_and_awaits_sibling_before_fallback() {
+        for failure in [
+            RejectedGitListing::Spawn,
+            RejectedGitListing::NonZero,
+            RejectedGitListing::Timeout,
+            RejectedGitListing::Truncated,
+            RejectedGitListing::Malformed,
+        ] {
+            for fail_main in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let runner = RejectingWorkspaceGitRunner::new(failure, fail_main);
+
+                let snapshot = timeout(
+                    TEST_TIMEOUT,
+                    scan_git_with_runner(
+                        root.path(),
+                        SearchLimits::default(),
+                        &CancellationToken::new(),
+                        &runner,
+                        None,
+                    ),
+                )
+                .await
+                .expect("rejected Git scan timed out")
+                .unwrap();
+
+                assert!(snapshot.is_none());
+                consume_permits(&runner.started, 2, "both rejected commands to start").await;
+                consume_permits(&runner.settled, 2, "both rejected commands to settle").await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_both_starts_awaits_both_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let cancellation = CancellationToken::new();
+        let scan_cancellation = cancellation.clone();
+        let runner = PausingWorkspaceGitRunner::new();
+        let scan_runner = runner.clone();
+        let scan = tokio::spawn(async move {
+            scan_git_with_runner(
+                &root_path,
+                SearchLimits::default(),
+                &scan_cancellation,
+                &scan_runner,
+                None,
+            )
+            .await
+        });
+
+        consume_permits(&runner.started, 2, "both cancellable commands to start").await;
+        cancellation.cancel();
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, scan)
+                .await
+                .expect("cancelled scan timed out")
+                .unwrap(),
+            Err(WorkspaceError::Cancelled)
+        ));
+        consume_permits(&runner.settled, 2, "both cancelled commands to settle").await;
+    }
+
+    #[tokio::test]
+    async fn index_phases_match_git_fallback_error_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let (fallback_observer, mut fallback_phases) = tokio::sync::mpsc::unbounded_channel();
+        let runner = RejectingWorkspaceGitRunner::new(RejectedGitListing::NonZero, true);
+
+        assert!(
+            scan_git_with_runner(
+                root.path(),
+                SearchLimits::default(),
+                &CancellationToken::new(),
+                &runner,
+                Some(&fallback_observer),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            std::iter::from_fn(|| fallback_phases.try_recv().ok())
+                .map(|phase| (phase.phase, phase.cache_outcome))
+                .collect::<Vec<_>>(),
+            [("git_snapshot", "fallback")]
+        );
+
+        let index = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default())
+            .with_phase_sink(Some(fallback_observer.clone()));
+        index.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            std::iter::from_fn(|| fallback_phases.try_recv().ok())
+                .map(|phase| (phase.phase, phase.cache_outcome))
+                .collect::<Vec<_>>(),
+            [("git_snapshot", "fallback"), ("filesystem_walk", "build"),]
+        );
+
+        let missing = root.path().join("missing");
+        let index = WorkspaceSearchIndex::new(missing, SearchLimits::default())
+            .with_phase_sink(Some(fallback_observer));
+        assert!(matches!(
+            index.refresh(CancellationToken::new()).await,
+            Err(WorkspaceError::RootNotDirectory { .. })
+        ));
+        assert_eq!(
+            std::iter::from_fn(|| fallback_phases.try_recv().ok())
+                .map(|phase| (phase.phase, phase.cache_outcome))
+                .collect::<Vec<_>>(),
+            [("git_snapshot", "fallback"), ("filesystem_walk", "error"),]
+        );
+
+        let cancellation = CancellationToken::new();
+        let scan_cancellation = cancellation.clone();
+        let runner = PausingWorkspaceGitRunner::new();
+        let scan_runner = runner.clone();
+        let (cancellation_observer, mut cancelled_phases) = tokio::sync::mpsc::unbounded_channel();
+        let scan = tokio::spawn(async move {
+            scan_git_with_runner(
+                root.path(),
+                SearchLimits::default(),
+                &scan_cancellation,
+                &scan_runner,
+                Some(&cancellation_observer),
+            )
+            .await
+        });
+        consume_permits(&runner.started, 2, "both observed commands to start").await;
+        cancellation.cancel();
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, scan).await.unwrap().unwrap(),
+            Err(WorkspaceError::Cancelled)
+        ));
+        assert_eq!(
+            std::iter::from_fn(|| cancelled_phases.try_recv().ok())
+                .map(|phase| (phase.phase, phase.cache_outcome))
+                .collect::<Vec<_>>(),
+            [("git_snapshot", "cancelled")]
+        );
+    }
+
+    #[tokio::test]
+    async fn real_git_snapshot_classifies_tracked_deleted_untracked_and_ignored_paths() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "ignored-directory/\n*.ignored\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tracked.txt"), "tracked").unwrap();
+        std::fs::write(root.path().join("deleted.txt"), "deleted").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", ".gitignore", "tracked.txt", "deleted.txt"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_file(root.path().join("deleted.txt")).unwrap();
+        std::fs::write(root.path().join("untracked.txt"), "untracked").unwrap();
+        std::fs::write(root.path().join("cache.ignored"), "ignored").unwrap();
+        std::fs::create_dir(root.path().join("ignored-directory")).unwrap();
+        std::fs::write(
+            root.path().join("ignored-directory/generated.txt"),
+            "ignored",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("empty-directory")).unwrap();
+
+        let index = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+        index.refresh(CancellationToken::new()).await.unwrap();
+        let entries = index.list(None).await.entries;
+
+        for path in ["tracked.txt", "untracked.txt"] {
+            assert_eq!(
+                entries.iter().find(|entry| entry.path == path),
+                Some(&WorkspaceEntry {
+                    path: path.to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                })
+            );
+        }
+        assert!(!entries.iter().any(|entry| entry.path == "deleted.txt"));
+        for path in ["cache.ignored", "ignored-directory/generated.txt"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.path == path && entry.ignored),
+                "missing ignored {path}: {entries:?}"
+            );
+        }
+        assert!(entries.iter().any(|entry| {
+            entry.path == "empty-directory" && entry.kind == EntryKind::Directory && !entry.ignored
+        }));
+        assert!(!entries.iter().any(|entry| entry.path.starts_with(".git/")));
+    }
 
     #[tokio::test]
     async fn repository_snapshot_exposes_ignored_roots_and_their_contents() {

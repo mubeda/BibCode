@@ -234,6 +234,23 @@ describe("worktree catalog schemas", () => {
     expect(() => decodeCatalogInput({ projectId: "" })).toThrow();
   });
 
+  it("accepts only compatible catalog refresh reasons", () => {
+    expect(decodeCatalogRefreshInput({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(decodeCatalogRefreshInput({ projectId: "project-1", reason: "focus" })).toEqual({
+      projectId: "project-1",
+      reason: "focus",
+    });
+    expect(decodeCatalogRefreshInput({ projectId: "project-1", reason: "explicit" })).toEqual({
+      projectId: "project-1",
+      reason: "explicit",
+    });
+    expect(() =>
+      decodeCatalogRefreshInput({ projectId: "project-1", reason: "scheduled" }),
+    ).toThrow();
+  });
+
   it("accepts only server-compacted discovery policy update controls", () => {
     expect(
       decodeDiscoveryPolicyUpdateInput({

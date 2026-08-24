@@ -1,5 +1,6 @@
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
+use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
@@ -9,6 +10,40 @@ use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 use super::ProviderKind;
 
 const BITBUCKET_MAX_PAGES: usize = 100;
+const BITBUCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BITBUCKET_RESPONSE_LIMIT: usize = 1024 * 1024;
+const NO_OPEN_BITBUCKET_PULL_REQUEST: &str =
+    "No open Bitbucket pull request was found for the current branch.";
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderCommandSpec {
+    executable: PathBuf,
+    prefix_args: Vec<OsString>,
+}
+
+impl ProviderCommandSpec {
+    pub(crate) fn new(
+        executable: impl Into<PathBuf>,
+        prefix_args: impl IntoIterator<Item = OsString>,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            prefix_args: prefix_args.into_iter().collect(),
+        }
+    }
+
+    fn plain(executable: impl Into<PathBuf>) -> Self {
+        Self::new(executable, [])
+    }
+
+    fn label(&self) -> &str {
+        self.executable.to_str().unwrap_or("provider")
+    }
+
+    fn args(&self, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        self.prefix_args.iter().cloned().chain(args).collect()
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum BitbucketResolutionMode {
@@ -86,9 +121,9 @@ pub struct PullRequestService {
     bitbucket: BitbucketConfiguration,
     git_command: PathBuf,
     git_environment: Vec<(OsString, OsString)>,
-    github_command: String,
-    gitlab_command: String,
-    azure_command: String,
+    github_command: ProviderCommandSpec,
+    gitlab_command: ProviderCommandSpec,
+    azure_command: ProviderCommandSpec,
 }
 
 impl Default for PullRequestService {
@@ -99,9 +134,9 @@ impl Default for PullRequestService {
             bitbucket: BitbucketConfiguration::default(),
             git_command: PathBuf::from("git"),
             git_environment: Vec::new(),
-            github_command: "gh".to_owned(),
-            gitlab_command: "glab".to_owned(),
-            azure_command: "az".to_owned(),
+            github_command: ProviderCommandSpec::plain("gh"),
+            gitlab_command: ProviderCommandSpec::plain("glab"),
+            azure_command: ProviderCommandSpec::plain("az"),
         }
     }
 }
@@ -113,10 +148,27 @@ impl PullRequestService {
         gitlab_command: impl Into<String>,
         azure_command: impl Into<String>,
     ) -> Self {
+        let github_command = github_command.into();
+        let gitlab_command = gitlab_command.into();
+        let azure_command = azure_command.into();
         Self {
-            github_command: github_command.into(),
-            gitlab_command: gitlab_command.into(),
-            azure_command: azure_command.into(),
+            github_command: ProviderCommandSpec::plain(github_command),
+            gitlab_command: ProviderCommandSpec::plain(gitlab_command),
+            azure_command: ProviderCommandSpec::plain(azure_command),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_provider_command_specs_for_test(
+        github_command: ProviderCommandSpec,
+        gitlab_command: ProviderCommandSpec,
+        azure_command: ProviderCommandSpec,
+    ) -> Self {
+        Self {
+            github_command,
+            gitlab_command,
+            azure_command,
             ..Self::default()
         }
     }
@@ -132,55 +184,153 @@ impl PullRequestService {
         self
     }
 
+    #[cfg(test)]
+    fn with_bitbucket_limits_for_test(mut self, timeout: Duration, response_limit: usize) -> Self {
+        self.bitbucket.request_timeout = timeout;
+        self.bitbucket.response_limit = response_limit;
+        self
+    }
+
     pub async fn resolve_current(
         &self,
         input: ResolvePullRequestInput,
         cancellation: &CancellationToken,
     ) -> Result<ResolvedPullRequest, SourceControlProviderError> {
+        let provider = input.provider;
+        let cwd = input.cwd.clone();
+        let reference = input.reference.clone();
+        self.resolve_current_optional(input, cancellation)
+            .await?
+            .ok_or_else(|| {
+                operation_error(
+                    provider,
+                    &cwd,
+                    "resolveCurrentPullRequest",
+                    self.current_provider_command(provider)
+                        .map(ProviderCommandSpec::label),
+                    Some(&reference),
+                    "No open pull request was found for the current branch.",
+                )
+            })
+    }
+
+    pub async fn resolve_current_optional(
+        &self,
+        input: ResolvePullRequestInput,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ResolvedPullRequest>, SourceControlProviderError> {
         if input.provider == ProviderKind::Bitbucket {
             return self
-                .resolve_bitbucket(&input, BitbucketResolutionMode::CurrentBranch, cancellation)
+                .resolve_bitbucket_current_optional(&input, cancellation)
                 .await;
         }
-        if input.provider != ProviderKind::AzureDevops {
-            return self.resolve(input, cancellation).await;
-        }
-        let source_branch = format!("refs/heads/{}", input.reference);
+        let (command, args) = match input.provider {
+            ProviderKind::Github => (
+                &self.github_command,
+                [
+                    "pr",
+                    "list",
+                    "--head",
+                    input.reference.as_str(),
+                    "--state",
+                    "open",
+                    "--limit",
+                    "1",
+                    "--json",
+                    "number,title,url,baseRefName,headRefName,state",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            ),
+            ProviderKind::Gitlab => (
+                &self.gitlab_command,
+                [
+                    "mr",
+                    "list",
+                    "--source-branch",
+                    input.reference.as_str(),
+                    "--state",
+                    "opened",
+                    "--output",
+                    "json",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            ),
+            ProviderKind::AzureDevops => {
+                let source_branch = format!("refs/heads/{}", input.reference);
+                (
+                    &self.azure_command,
+                    [
+                        "repos",
+                        "pr",
+                        "list",
+                        "--only-show-errors",
+                        "--detect",
+                        "true",
+                        "--source-branch",
+                        source_branch.as_str(),
+                        "--status",
+                        "active",
+                        "--top",
+                        "1",
+                        "--output",
+                        "json",
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                )
+            }
+            ProviderKind::Unknown => return Ok(None),
+            ProviderKind::Bitbucket => unreachable!(),
+        };
         let output = self
-            .run_provider(
+            .run_provider_os(
                 input.provider,
                 &input.cwd,
                 "resolveCurrentPullRequest",
-                self.azure_command.as_str(),
-                [
-                    "repos",
-                    "pr",
-                    "list",
-                    "--only-show-errors",
-                    "--detect",
-                    "true",
-                    "--source-branch",
-                    source_branch.as_str(),
-                    "--status",
-                    "active",
-                    "--top",
-                    "1",
-                    "--output",
-                    "json",
-                ],
+                command,
+                args,
                 cancellation,
             )
             .await?;
-        parse_azure_pull_request_list(&output.stdout).ok_or_else(|| {
+        parse_current_provider_list(input.provider, &output.stdout).map_err(|detail| {
             operation_error(
                 input.provider,
                 &input.cwd,
                 "resolveCurrentPullRequest",
-                Some(self.azure_command.as_str()),
+                Some(command.label()),
                 Some(&input.reference),
-                "No open pull request was found for the current branch.",
+                &detail,
             )
         })
+    }
+
+    fn current_provider_command(&self, provider: ProviderKind) -> Option<&ProviderCommandSpec> {
+        match provider {
+            ProviderKind::Github => Some(&self.github_command),
+            ProviderKind::Gitlab => Some(&self.gitlab_command),
+            ProviderKind::AzureDevops => Some(&self.azure_command),
+            ProviderKind::Bitbucket | ProviderKind::Unknown => None,
+        }
+    }
+
+    async fn resolve_bitbucket_current_optional(
+        &self,
+        input: &ResolvePullRequestInput,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ResolvedPullRequest>, SourceControlProviderError> {
+        match self
+            .resolve_bitbucket(input, BitbucketResolutionMode::CurrentBranch, cancellation)
+            .await
+        {
+            Ok(pull_request) => Ok(Some(pull_request)),
+            Err(error) if error.detail.as_ref() == NO_OPEN_BITBUCKET_PULL_REQUEST => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn create(
@@ -191,9 +341,9 @@ impl PullRequestService {
         if input.provider == ProviderKind::Bitbucket {
             return self.create_bitbucket(&input, cancellation).await;
         }
-        let (command, args): (&str, Vec<OsString>) = match input.provider {
+        let (command, args): (&ProviderCommandSpec, Vec<OsString>) = match input.provider {
             ProviderKind::Github => (
-                self.github_command.as_str(),
+                &self.github_command,
                 [
                     "pr",
                     "create",
@@ -211,7 +361,7 @@ impl PullRequestService {
                 .collect(),
             ),
             ProviderKind::Gitlab => (
-                self.gitlab_command.as_str(),
+                &self.gitlab_command,
                 vec![
                     "api".into(),
                     "--method".into(),
@@ -228,7 +378,7 @@ impl PullRequestService {
                 ],
             ),
             ProviderKind::AzureDevops => (
-                self.azure_command.as_str(),
+                &self.azure_command,
                 [
                     "repos",
                     "pr",
@@ -283,7 +433,7 @@ impl PullRequestService {
                 input.provider,
                 &input.cwd,
                 "createPullRequest",
-                Some(command),
+                Some(command.label()),
                 Some(&input.head_branch),
                 "Provider CLI returned an unrecognized pull-request payload.",
             )
@@ -304,9 +454,9 @@ impl PullRequestService {
                 )
                 .await;
         }
-        let (command, args): (&str, Vec<OsString>) = match input.provider {
+        let (command, args): (&ProviderCommandSpec, Vec<OsString>) = match input.provider {
             ProviderKind::Github => (
-                self.github_command.as_str(),
+                &self.github_command,
                 [
                     "pr",
                     "view",
@@ -319,14 +469,14 @@ impl PullRequestService {
                 .collect(),
             ),
             ProviderKind::Gitlab => (
-                self.gitlab_command.as_str(),
+                &self.gitlab_command,
                 ["mr", "view", input.reference.as_str(), "--output", "json"]
                     .into_iter()
                     .map(OsString::from)
                     .collect(),
             ),
             ProviderKind::AzureDevops => (
-                self.azure_command.as_str(),
+                &self.azure_command,
                 [
                     "repos",
                     "pr",
@@ -355,8 +505,8 @@ impl PullRequestService {
             .run(
                 ProcessRequest {
                     operation: "source-control.resolve-change-request".into(),
-                    command: command.into(),
-                    args,
+                    command: command.executable.clone(),
+                    args: command.args(args),
                     cwd: input.cwd.clone(),
                     env: vec![],
                     stdin: None,
@@ -373,7 +523,7 @@ impl PullRequestService {
                 provider_error(
                     input.provider,
                     &input.cwd,
-                    Some(command),
+                    Some(command.label()),
                     &input.reference,
                     "Provider CLI execution failed.",
                 )
@@ -382,7 +532,7 @@ impl PullRequestService {
             return Err(provider_error(
                 input.provider,
                 &input.cwd,
-                Some(command),
+                Some(command.label()),
                 &input.reference,
                 "Change request was not found or provider authentication failed.",
             ));
@@ -397,7 +547,7 @@ impl PullRequestService {
             provider_error(
                 input.provider,
                 &input.cwd,
-                Some(command),
+                Some(command.label()),
                 &input.reference,
                 "Provider CLI returned an unrecognized change-request payload.",
             )
@@ -518,7 +668,7 @@ impl PullRequestService {
         let detail = if next_url.is_some() {
             "Bitbucket pull-request pagination exceeded the safety limit."
         } else {
-            "No open Bitbucket pull request was found for the current branch."
+            NO_OPEN_BITBUCKET_PULL_REQUEST
         };
         Err(operation_error(
             ProviderKind::Bitbucket,
@@ -625,6 +775,7 @@ impl PullRequestService {
         reference: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<T, SourceControlProviderError> {
+        let deadline = tokio::time::Instant::now() + self.bitbucket.request_timeout;
         let request = self
             .bitbucket
             .credentials
@@ -641,42 +792,6 @@ impl PullRequestService {
                 )
             })?;
         let response = tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(operation_error(
-                    ProviderKind::Bitbucket,
-                    cwd,
-                    operation,
-                    None,
-                    reference,
-                    "Bitbucket request was cancelled.",
-                ));
-            }
-            response = request.send() => response,
-        }
-        .map_err(|error| {
-            operation_error(
-                ProviderKind::Bitbucket,
-                cwd,
-                operation,
-                None,
-                reference,
-                &error.to_string(),
-            )
-        })?;
-        self.decode_bitbucket_response(response, cwd, operation, reference, cancellation)
-            .await
-    }
-
-    async fn decode_bitbucket_response<T: DeserializeOwned>(
-        &self,
-        response: Response,
-        cwd: &std::path::Path,
-        operation: &str,
-        reference: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<T, SourceControlProviderError> {
-        let status = response.status();
-        let body = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 return Err(operation_error(
@@ -688,18 +803,138 @@ impl PullRequestService {
                     "Bitbucket request was cancelled.",
                 ));
             }
-            body = response.text() => body,
-        }
-        .map_err(|error| {
-            operation_error(
-                ProviderKind::Bitbucket,
+            response = tokio::time::timeout_at(deadline, request.send()) => {
+                match response {
+                    Ok(response) => response.map_err(|error| {
+                        operation_error(
+                            ProviderKind::Bitbucket,
+                            cwd,
+                            operation,
+                            None,
+                            reference,
+                            &error.to_string(),
+                        )
+                    })?,
+                    Err(_) => return Err(bitbucket_deadline_error(
+                        cwd,
+                        operation,
+                        reference,
+                        self.bitbucket.request_timeout,
+                    )),
+                }
+            },
+        };
+        self.decode_bitbucket_response_at(
+            response,
+            cwd,
+            operation,
+            reference,
+            cancellation,
+            deadline,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn decode_bitbucket_response<T: DeserializeOwned>(
+        &self,
+        response: Response,
+        cwd: &std::path::Path,
+        operation: &str,
+        reference: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<T, SourceControlProviderError> {
+        let deadline = tokio::time::Instant::now() + self.bitbucket.request_timeout;
+        self.decode_bitbucket_response_at(
+            response,
+            cwd,
+            operation,
+            reference,
+            cancellation,
+            deadline,
+        )
+        .await
+    }
+
+    async fn decode_bitbucket_response_at<T: DeserializeOwned>(
+        &self,
+        response: Response,
+        cwd: &std::path::Path,
+        operation: &str,
+        reference: Option<&str>,
+        cancellation: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<T, SourceControlProviderError> {
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.bitbucket.response_limit as u64)
+        {
+            return Err(bitbucket_response_limit_error(
                 cwd,
                 operation,
-                None,
                 reference,
-                &error.to_string(),
-            )
-        })?;
+                self.bitbucket.response_limit,
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(operation_error(
+                        ProviderKind::Bitbucket,
+                        cwd,
+                        operation,
+                        None,
+                        reference,
+                        "Bitbucket request was cancelled.",
+                    ));
+                }
+                chunk = tokio::time::timeout_at(deadline, stream.next()) => {
+                    match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => return Err(bitbucket_deadline_error(
+                            cwd,
+                            operation,
+                            reference,
+                            self.bitbucket.request_timeout,
+                        )),
+                    }
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let chunk = chunk.map_err(|error| {
+                operation_error(
+                    ProviderKind::Bitbucket,
+                    cwd,
+                    operation,
+                    None,
+                    reference,
+                    &error.to_string(),
+                )
+            })?;
+            let Some(length) = body.len().checked_add(chunk.len()) else {
+                return Err(bitbucket_response_limit_error(
+                    cwd,
+                    operation,
+                    reference,
+                    self.bitbucket.response_limit,
+                ));
+            };
+            if length > self.bitbucket.response_limit {
+                return Err(bitbucket_response_limit_error(
+                    cwd,
+                    operation,
+                    reference,
+                    self.bitbucket.response_limit,
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
         if !status.is_success() {
             return Err(operation_error(
                 ProviderKind::Bitbucket,
@@ -709,11 +944,11 @@ impl PullRequestService {
                 reference,
                 &format!(
                     "Bitbucket returned HTTP {status}: {}",
-                    truncate_detail(&body)
+                    truncate_detail(&String::from_utf8_lossy(&body))
                 ),
             ));
         }
-        serde_json::from_str(&body).map_err(|error| {
+        serde_json::from_slice(&body).map_err(|error| {
             operation_error(
                 ProviderKind::Bitbucket,
                 cwd,
@@ -725,32 +960,12 @@ impl PullRequestService {
         })
     }
 
-    async fn run_provider<const N: usize>(
-        &self,
-        provider: ProviderKind,
-        cwd: &std::path::Path,
-        operation: &str,
-        command: &str,
-        args: [&str; N],
-        cancellation: &CancellationToken,
-    ) -> Result<crate::git::ProcessOutput, SourceControlProviderError> {
-        self.run_provider_os(
-            provider,
-            cwd,
-            operation,
-            command,
-            args.into_iter().map(OsString::from).collect(),
-            cancellation,
-        )
-        .await
-    }
-
     async fn run_provider_os(
         &self,
         provider: ProviderKind,
         cwd: &std::path::Path,
         operation: &str,
-        command: &str,
+        command: &ProviderCommandSpec,
         args: Vec<OsString>,
         cancellation: &CancellationToken,
     ) -> Result<crate::git::ProcessOutput, SourceControlProviderError> {
@@ -758,8 +973,8 @@ impl PullRequestService {
             .run(
                 ProcessRequest {
                     operation: format!("source-control.{operation}"),
-                    command: command.into(),
-                    args,
+                    command: command.executable.clone(),
+                    args: command.args(args),
                     cwd: cwd.to_path_buf(),
                     env: vec![],
                     stdin: None,
@@ -777,7 +992,7 @@ impl PullRequestService {
                     provider,
                     cwd,
                     operation,
-                    Some(command),
+                    Some(command.label()),
                     None,
                     &error.to_string(),
                 )
@@ -799,6 +1014,10 @@ struct GitHubPullRequest {
 #[must_use]
 pub fn parse_github_pull_request(text: &str) -> Option<ResolvedPullRequest> {
     let value = serde_json::from_str::<GitHubPullRequest>(text).ok()?;
+    normalize_github_pull_request(value)
+}
+
+fn normalize_github_pull_request(value: GitHubPullRequest) -> Option<ResolvedPullRequest> {
     Some(ResolvedPullRequest {
         number: value.number,
         title: non_empty(value.title)?,
@@ -822,6 +1041,10 @@ struct GitLabMergeRequest {
 #[must_use]
 pub fn parse_gitlab_merge_request(text: &str) -> Option<ResolvedPullRequest> {
     let value = serde_json::from_str::<GitLabMergeRequest>(text).ok()?;
+    normalize_gitlab_merge_request(value)
+}
+
+fn normalize_gitlab_merge_request(value: GitLabMergeRequest) -> Option<ResolvedPullRequest> {
     Some(ResolvedPullRequest {
         number: value.iid,
         title: non_empty(value.title)?,
@@ -830,6 +1053,24 @@ pub fn parse_gitlab_merge_request(text: &str) -> Option<ResolvedPullRequest> {
         head_branch: non_empty(value.source_branch)?,
         state: parse_state(&value.state, false),
     })
+}
+
+fn parse_current_provider_list(
+    provider: ProviderKind,
+    text: &str,
+) -> Result<Option<ResolvedPullRequest>, String> {
+    match provider {
+        ProviderKind::Github => serde_json::from_str::<Vec<GitHubPullRequest>>(text)
+            .map_err(|error| format!("GitHub returned an invalid pull-request list: {error}"))
+            .map(|values| values.into_iter().find_map(normalize_github_pull_request)),
+        ProviderKind::Gitlab => serde_json::from_str::<Vec<GitLabMergeRequest>>(text)
+            .map_err(|error| format!("GitLab returned an invalid merge-request list: {error}"))
+            .map(|values| values.into_iter().find_map(normalize_gitlab_merge_request)),
+        ProviderKind::AzureDevops => serde_json::from_str::<Vec<AzurePullRequest>>(text)
+            .map_err(|error| format!("Azure DevOps returned an invalid pull-request list: {error}"))
+            .map(|values| values.into_iter().find_map(normalize_azure_pull_request)),
+        ProviderKind::Bitbucket | ProviderKind::Unknown => Ok(None),
+    }
 }
 
 #[derive(Deserialize)]
@@ -907,6 +1148,8 @@ enum BitbucketCredentials {
 struct BitbucketConfiguration {
     api_base_url: String,
     credentials: Option<BitbucketCredentials>,
+    request_timeout: Duration,
+    response_limit: usize,
 }
 
 impl Default for BitbucketConfiguration {
@@ -914,6 +1157,8 @@ impl Default for BitbucketConfiguration {
         Self {
             api_base_url: bitbucket_api_base_url(),
             credentials: bitbucket_credentials(),
+            request_timeout: BITBUCKET_REQUEST_TIMEOUT,
+            response_limit: BITBUCKET_RESPONSE_LIMIT,
         }
     }
 }
@@ -952,6 +1197,7 @@ fn normalize_azure_pull_request(value: AzurePullRequest) -> Option<ResolvedPullR
     })
 }
 
+#[cfg(test)]
 fn parse_azure_pull_request_list(text: &str) -> Option<ResolvedPullRequest> {
     let values = serde_json::from_str::<Vec<AzurePullRequest>>(text).ok()?;
     values
@@ -1123,6 +1369,41 @@ fn operation_error(
     }
 }
 
+fn bitbucket_deadline_error(
+    cwd: &std::path::Path,
+    operation: &str,
+    reference: Option<&str>,
+    timeout: Duration,
+) -> SourceControlProviderError {
+    operation_error(
+        ProviderKind::Bitbucket,
+        cwd,
+        operation,
+        None,
+        reference,
+        &format!(
+            "Bitbucket request exceeded its {}ms deadline.",
+            timeout.as_millis()
+        ),
+    )
+}
+
+fn bitbucket_response_limit_error(
+    cwd: &std::path::Path,
+    operation: &str,
+    reference: Option<&str>,
+    limit: usize,
+) -> SourceControlProviderError {
+    operation_error(
+        ProviderKind::Bitbucket,
+        cwd,
+        operation,
+        None,
+        reference,
+        &format!("Bitbucket response exceeded the {limit} bytes limit."),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::Path, time::Duration};
@@ -1131,7 +1412,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::oneshot,
+        sync::{Semaphore, SemaphorePermit, oneshot},
         task::JoinHandle,
     };
 
@@ -1150,6 +1431,15 @@ mod tests {
         headers_sent: oneshot::Receiver<()>,
         connection_closed: oneshot::Receiver<()>,
         task: JoinHandle<()>,
+    }
+
+    static PULL_REQUEST_FIXTURE_PERMITS: Semaphore = Semaphore::const_new(4);
+
+    async fn acquire_pull_request_fixture() -> SemaphorePermit<'static> {
+        PULL_REQUEST_FIXTURE_PERMITS
+            .acquire()
+            .await
+            .expect("pull-request fixture permit remains open")
     }
 
     fn http_request_is_complete(request: &[u8]) -> bool {
@@ -1310,6 +1600,50 @@ mod tests {
         }
     }
 
+    async fn spawn_chunked_response_server(chunks: Vec<Vec<u8>>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked Bitbucket server");
+        let address = listener.local_addr().expect("chunked server address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept chunked request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read chunked request");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if http_request_is_complete(&request) {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write chunked headers");
+            for chunk in chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .expect("write chunk length");
+                stream.write_all(&chunk).await.expect("write chunk body");
+                stream.write_all(b"\r\n").await.expect("write chunk end");
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("finish chunked body");
+        });
+        (format!("http://{address}/2.0"), task)
+    }
+
     fn bitbucket_service(
         api_base_url: &str,
         credentials: Option<BitbucketCredentials>,
@@ -1318,6 +1652,7 @@ mod tests {
             bitbucket: BitbucketConfiguration {
                 api_base_url: api_base_url.into(),
                 credentials,
+                ..BitbucketConfiguration::default()
             },
             ..PullRequestService::default()
         }
@@ -1345,6 +1680,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn provider_cli_fixtures_are_instance_owned_in_parallel() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         async fn resolve(label: &str) -> ResolvedPullRequest {
             let sandbox = TestSandbox::new(label);
             let command = sandbox.executable_script(
@@ -1377,11 +1714,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn provider_cli_flows_cover_github_gitlab_and_azure_resolution_and_creation() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let sandbox = TestSandbox::new("provider-cli");
         let script = r#"#!/bin/sh
 case "$(basename "$0"):$*" in
   gh.sh:*create*) printf '%s\n' 'https://github.com/example/repo/pull/42' ;;
+  gh.sh:*list*) printf '%s\n' '[{"number":42,"title":"GitHub PR","url":"https://github.test/42","baseRefName":"main","headRefName":"feature","state":"OPEN"}]' ;;
   gh.sh:*) printf '%s\n' '{"number":42,"title":"GitHub PR","url":"https://github.test/42","baseRefName":"main","headRefName":"feature","state":"OPEN"}' ;;
+  glab.sh:*list*) printf '%s\n' '[{"iid":43,"title":"GitLab MR","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}]' ;;
   glab.sh:*) printf '%s\n' '{"iid":43,"title":"GitLab MR","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}' ;;
   az.sh:*list*) printf '%s\n' '[{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}]' ;;
   az.sh:*) printf '%s\n' '{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}' ;;
@@ -1466,6 +1807,8 @@ esac
 
     #[tokio::test]
     async fn provider_cli_flows_report_spawn_exit_and_payload_failures() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let sandbox = TestSandbox::new("provider-cli-errors");
         let cancellation = CancellationToken::new();
         let missing = sandbox
@@ -1536,7 +1879,7 @@ esac
                 .await
                 .unwrap_err()
                 .detail
-                .contains("No open pull request")
+                .contains("invalid pull-request list")
         );
         assert!(
             invalid_service
@@ -1561,6 +1904,8 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn bitbucket_locator_uses_its_owned_git_command_and_environment() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let sandbox = TestSandbox::new("bitbucket-owned-git");
         let git_command = sandbox.executable_script(
             "git",
@@ -1606,6 +1951,138 @@ esac
             let path = directory.join(format!("{name}.cmd"));
             std::fs::write(&path, _windows_contents).expect("provider fixture should write");
             path
+        }
+    }
+
+    fn provider_command_fixture(
+        sandbox: &TestSandbox,
+        name: &str,
+        unix_contents: &str,
+        windows_contents: &str,
+    ) -> ProviderCommandSpec {
+        let script = sandbox.executable_script(name, unix_contents, windows_contents);
+        #[cfg(unix)]
+        {
+            ProviderCommandSpec::new("/bin/sh", [script.into_os_string()])
+        }
+        #[cfg(windows)]
+        {
+            ProviderCommandSpec::new(
+                std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()),
+                [
+                    OsString::from("/D"),
+                    OsString::from("/C"),
+                    script.into_os_string(),
+                ],
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn current_provider_resolution_distinguishes_absence_success_and_operational_failure() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let sandbox = TestSandbox::new("provider-current-optional");
+        let empty = provider_command_fixture(
+            &sandbox,
+            "empty",
+            "printf '%s\\n' '[]'",
+            "@echo off\r\necho []\r\n",
+        );
+        let service = PullRequestService::with_provider_command_specs_for_test(
+            empty.clone(),
+            empty.clone(),
+            empty,
+        );
+        for provider in [
+            ProviderKind::Github,
+            ProviderKind::Gitlab,
+            ProviderKind::AzureDevops,
+        ] {
+            assert_eq!(
+                service
+                    .resolve_current_optional(
+                        ResolvePullRequestInput {
+                            cwd: sandbox.root().to_path_buf(),
+                            provider,
+                            reference: "feature/test".to_owned(),
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .expect("empty provider list is successful absence"),
+                None
+            );
+        }
+
+        let failed =
+            provider_command_fixture(&sandbox, "failed", "exit 7", "@echo off\r\nexit /b 7\r\n");
+        let service = PullRequestService::with_provider_command_specs_for_test(
+            failed.clone(),
+            failed.clone(),
+            failed,
+        );
+        for provider in [ProviderKind::Github, ProviderKind::Gitlab] {
+            let error = service
+                .resolve_current_optional(
+                    ResolvePullRequestInput {
+                        cwd: sandbox.root().to_path_buf(),
+                        provider,
+                        reference: "feature/test".to_owned(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("provider failure must not become no PR");
+            assert_eq!(error.provider, provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_provider_resolution_parses_github_gitlab_and_azure_lists() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let sandbox = TestSandbox::new("provider-current-values");
+        let github = provider_command_fixture(
+            &sandbox,
+            "github",
+            "printf '%s\\n' '[{\"number\":42,\"title\":\"GitHub PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"feature/test\",\"state\":\"OPEN\"}]'",
+            "@echo off\r\necho [{\"number\":42,\"title\":\"GitHub PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"feature/test\",\"state\":\"OPEN\"}]\r\n",
+        );
+        let gitlab = provider_command_fixture(
+            &sandbox,
+            "gitlab",
+            "printf '%s\\n' '[{\"iid\":43,\"title\":\"GitLab MR\",\"web_url\":\"https://gitlab.test/43\",\"target_branch\":\"main\",\"source_branch\":\"feature/test\",\"state\":\"opened\"}]'",
+            "@echo off\r\necho [{\"iid\":43,\"title\":\"GitLab MR\",\"web_url\":\"https://gitlab.test/43\",\"target_branch\":\"main\",\"source_branch\":\"feature/test\",\"state\":\"opened\"}]\r\n",
+        );
+        let azure = provider_command_fixture(
+            &sandbox,
+            "azure",
+            "printf '%s\\n' '[{\"pullRequestId\":44,\"title\":\"Azure PR\",\"url\":\"https://azure.test/44\",\"targetRefName\":\"refs/heads/main\",\"sourceRefName\":\"refs/heads/feature/test\",\"status\":\"active\"}]'",
+            "@echo off\r\necho [{\"pullRequestId\":44,\"title\":\"Azure PR\",\"url\":\"https://azure.test/44\",\"targetRefName\":\"refs/heads/main\",\"sourceRefName\":\"refs/heads/feature/test\",\"status\":\"active\"}]\r\n",
+        );
+        let service =
+            PullRequestService::with_provider_command_specs_for_test(github, gitlab, azure);
+
+        for (provider, expected) in [
+            (ProviderKind::Github, 42),
+            (ProviderKind::Gitlab, 43),
+            (ProviderKind::AzureDevops, 44),
+        ] {
+            let resolved = service
+                .resolve_current_optional(
+                    ResolvePullRequestInput {
+                        cwd: sandbox.root().to_path_buf(),
+                        provider,
+                        reference: "feature/test".to_owned(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("provider list succeeds")
+                .expect("matching PR");
+            assert_eq!(resolved.number, expected);
+            assert_eq!(resolved.head_branch, "feature/test");
         }
     }
 
@@ -1709,6 +2186,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_branch_resolution_follows_pagination() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let mut server = spawn_http_server(vec![
             (
@@ -1755,6 +2234,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_pagination_rejects_a_different_origin_before_sending_credentials() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let mut second_server = spawn_http_server(vec![(
             200,
@@ -1801,6 +2282,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_pagination_maps_a_malformed_next_url_to_a_structured_error() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let server = spawn_http_server(vec![(
             200,
@@ -1855,6 +2338,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_explicit_references_use_the_direct_endpoint_and_bearer_auth() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let response = r#"{"id":42,"title":"Merged work","state":"MERGED","links":{"html":{"href":"https://bitbucket.org/example/native-source-control/pull-requests/42"}},"source":{"branch":{"name":"feature/merged"}},"destination":{"branch":{"name":"main"}}}"#.to_owned();
         let mut server = spawn_http_server(vec![
@@ -1899,6 +2384,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_current_branch_preserves_numeric_path_segments_in_the_list_query() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let mut server = spawn_http_server(vec![
             (
@@ -1954,7 +2441,90 @@ esac
     }
 
     #[tokio::test]
+    async fn bitbucket_current_optional_distinguishes_no_pr_from_provider_error() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let repository = bitbucket_repository().await;
+        let mut server = spawn_http_server(vec![
+            (200, r#"{"values":[]}"#.to_owned()),
+            (401, r#"{"error":{"message":"unauthorized"}}"#.to_owned()),
+        ])
+        .await;
+        let service = bitbucket_service_for_repository(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
+        );
+        let input = || ResolvePullRequestInput {
+            cwd: repository.root().to_path_buf(),
+            provider: ProviderKind::Bitbucket,
+            reference: "feature/test".into(),
+        };
+
+        assert_eq!(
+            service
+                .resolve_current_optional(input(), &CancellationToken::new())
+                .await
+                .expect("empty Bitbucket list is absence"),
+            None
+        );
+        let error = service
+            .resolve_current_optional(input(), &CancellationToken::new())
+            .await
+            .expect_err("Bitbucket authentication failure is operational");
+        assert!(error.detail.contains("HTTP 401"));
+
+        server.requests.recv().await.expect("empty-list request");
+        server.requests.recv().await.expect("error request");
+        server.task.await.expect("optional Bitbucket server task");
+    }
+
+    #[tokio::test]
+    async fn bitbucket_current_optional_recovers_after_an_operational_error() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let repository = bitbucket_repository().await;
+        let mut server = spawn_http_server(vec![
+            (503, r#"{"error":{"message":"retry"}}"#.to_owned()),
+            (
+                200,
+                r#"{"values":[{"id":79,"title":"Recovered","state":"OPEN","links":{"html":{"href":"https://bitbucket.test/79"}},"source":{"branch":{"name":"feature/test"}},"destination":{"branch":{"name":"main"}}}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let service = bitbucket_service_for_repository(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
+        );
+        let input = || ResolvePullRequestInput {
+            cwd: repository.root().to_path_buf(),
+            provider: ProviderKind::Bitbucket,
+            reference: "feature/test".into(),
+        };
+
+        assert!(
+            service
+                .resolve_current_optional(input(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let recovered = service
+            .resolve_current_optional(input(), &CancellationToken::new())
+            .await
+            .expect("Bitbucket recovery request succeeds")
+            .expect("Bitbucket recovery PR");
+        assert_eq!(recovered.number, 79);
+
+        server.requests.recv().await.expect("failed request");
+        server.requests.recv().await.expect("recovery request");
+        server.task.await.expect("recovery server task");
+    }
+
+    #[tokio::test]
     async fn bitbucket_creation_sends_branch_payload_with_basic_auth() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let mut server = spawn_http_server(vec![(
             200,
@@ -2011,6 +2581,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_cancellation_stops_an_in_flight_request() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let mut server = spawn_stalled_http_server().await;
         let service = bitbucket_service_for_repository(
@@ -2050,6 +2622,8 @@ esac
 
     #[tokio::test]
     async fn bitbucket_cancellation_stops_a_stalled_response_body_read() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let server = spawn_stalled_body_server().await;
         let service = bitbucket_service(
             &server.base_url,
@@ -2098,7 +2672,187 @@ esac
     }
 
     #[tokio::test]
+    async fn bitbucket_response_deadline_covers_a_stalled_body_and_closes_the_request() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let server = spawn_stalled_body_server().await;
+        let service = bitbucket_service(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+        )
+        .with_bitbucket_limits_for_test(Duration::from_millis(50), 256);
+        let response = service
+            .client
+            .get(format!("{}/deadline", server.base_url))
+            .send()
+            .await
+            .expect("receive deadline response headers");
+        server.headers_sent.await.expect("deadline headers sent");
+
+        let result = service
+            .decode_bitbucket_response::<BitbucketPullRequest>(
+                response,
+                Path::new("deadline-repository"),
+                "resolvePullRequest",
+                Some("75"),
+                &CancellationToken::new(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("stalled response did not hit the absolute deadline"),
+        };
+
+        assert!(error.detail.contains("deadline"));
+        tokio::time::timeout(Duration::from_secs(5), server.connection_closed)
+            .await
+            .expect("deadline closes the request")
+            .expect("deadline disconnect signal");
+        server.task.await.expect("deadline server task");
+    }
+
+    #[tokio::test]
+    async fn bitbucket_request_deadline_covers_stalled_response_headers() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let mut server = spawn_stalled_http_server().await;
+        let service = bitbucket_service(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+        )
+        .with_bitbucket_limits_for_test(Duration::from_millis(50), 1024);
+
+        let result = service
+            .send_bitbucket::<BitbucketPullRequest>(
+                service
+                    .client
+                    .get(format!("{}/stalled-headers", server.base_url)),
+                Path::new("stalled-headers-repository"),
+                "resolvePullRequest",
+                Some("80"),
+                &CancellationToken::new(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("stalled response headers did not hit the absolute deadline"),
+        };
+
+        assert!(error.detail.contains("deadline"));
+        server
+            .requests
+            .recv()
+            .await
+            .expect("stalled request reached server");
+        server.task.abort();
+        let _ = server.task.await;
+    }
+
+    #[tokio::test]
+    async fn bitbucket_rejects_oversized_content_length_before_reading_the_body() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let server = spawn_stalled_body_server().await;
+        let service = bitbucket_service(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+        )
+        .with_bitbucket_limits_for_test(Duration::from_secs(5), 64);
+        let response = service
+            .client
+            .get(format!("{}/oversized-content-length", server.base_url))
+            .send()
+            .await
+            .expect("receive oversized response headers");
+        server.headers_sent.await.expect("oversized headers sent");
+
+        let result = service
+            .decode_bitbucket_response::<BitbucketPullRequest>(
+                response,
+                Path::new("oversized-repository"),
+                "resolvePullRequest",
+                Some("76"),
+                &CancellationToken::new(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("oversized Content-Length did not fail before body read"),
+        };
+
+        assert!(error.detail.contains("64 bytes"));
+        tokio::time::timeout(Duration::from_secs(5), server.connection_closed)
+            .await
+            .expect("oversize rejection closes the request")
+            .expect("oversize disconnect signal");
+        server.task.await.expect("oversize server task");
+    }
+
+    #[tokio::test]
+    async fn bitbucket_rejects_an_oversized_chunked_body_and_accepts_a_bounded_body() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
+        let (base_url, oversized_task) =
+            spawn_chunked_response_server(vec![vec![b' '; 24], vec![b' '; 24]]).await;
+        let service = bitbucket_service(
+            &base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+        )
+        .with_bitbucket_limits_for_test(Duration::from_secs(5), 32);
+        let response = service
+            .client
+            .get(format!("{base_url}/oversized-chunked"))
+            .send()
+            .await
+            .expect("receive chunked response");
+        let result = service
+            .decode_bitbucket_response::<BitbucketPullRequest>(
+                response,
+                Path::new("chunked-repository"),
+                "resolvePullRequest",
+                Some("77"),
+                &CancellationToken::new(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("oversized chunked body was accepted"),
+        };
+        assert!(error.detail.contains("32 bytes"));
+        oversized_task.await.expect("oversized chunked server task");
+
+        let body = r#"{"id":78,"title":"Bounded","state":"OPEN","links":{"html":{"href":"https://bitbucket.test/78"}},"source":{"branch":{"name":"feature/test"}},"destination":{"branch":{"name":"main"}}}"#;
+        let mut server = spawn_http_server(vec![(200, body.to_owned())]).await;
+        let service = bitbucket_service(
+            &server.base_url,
+            Some(BitbucketCredentials::Bearer("test-token".into())),
+        )
+        .with_bitbucket_limits_for_test(Duration::from_secs(5), 1024);
+        let response = service
+            .client
+            .get(format!("{}/bounded", server.base_url))
+            .send()
+            .await
+            .expect("receive bounded response");
+        let decoded = service
+            .decode_bitbucket_response::<BitbucketPullRequest>(
+                response,
+                Path::new("bounded-repository"),
+                "resolvePullRequest",
+                Some("78"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("bounded valid response");
+        assert_eq!(decoded.id, 78);
+        server.requests.recv().await.expect("bounded request");
+        server.task.await.expect("bounded server task");
+    }
+
+    #[tokio::test]
     async fn bitbucket_errors_map_credentials_http_status_and_invalid_json() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+
         let repository = bitbucket_repository().await;
         let cancellation = CancellationToken::new();
         let error = bitbucket_service_for_repository("http://127.0.0.1:1/2.0", None, &repository)

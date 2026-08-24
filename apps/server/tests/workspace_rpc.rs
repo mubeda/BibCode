@@ -19,12 +19,24 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use workspace::{
-    AssetContextResolver, EntryKind, SearchLimits, WorkspaceError, WorkspaceRpc,
-    WorkspaceRpcDependencies, WorkspaceSearchIndex, WorkspaceService, WorkspaceWatcher,
+    AssetContextResolver, EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceError,
+    WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceSearchIndex, WorkspaceService,
+    WorkspaceWatcher,
 };
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn entry_is_ignored(result: &serde_json::Value, path: &str) -> bool {
+    result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"] == path)
+        .unwrap_or_else(|| panic!("missing entry {path}"))["ignored"]
+        .as_bool()
+        .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -299,6 +311,21 @@ fn git_in(cwd: &Path, args: &[&str]) {
     assert!(output.status.success(), "git {args:?} failed");
 }
 
+fn init_isolated_git_fixture(root: &Path) {
+    git_in(root, &["init", "-b", "main"]);
+    let excludes = root.join(".git/bibcode-test-global-excludes");
+    std::fs::write(&excludes, "").expect("empty fixture excludes file");
+    git_in(
+        root,
+        &[
+            "config",
+            "--local",
+            "core.excludesFile",
+            &path_string(&excludes),
+        ],
+    );
+}
+
 /// A directory holding no files is still a directory the user created and can see on disk.
 ///
 /// `git ls-files` only reports files, so a git-backed scan that infers directories from file paths
@@ -338,101 +365,148 @@ async fn empty_directories_are_listed_in_a_git_workspace() {
     );
 }
 
-/// Every path on disk, excluding `.git`, as workspace-relative posix strings.
-fn disk_paths(root: &Path) -> std::collections::BTreeSet<String> {
-    fn walk(root: &Path, current: &Path, out: &mut std::collections::BTreeSet<String>) {
-        let Ok(children) = std::fs::read_dir(current) else {
-            return;
-        };
-        for child in children.filter_map(Result::ok) {
-            let path = child.path();
-            let Ok(relative) = path.strip_prefix(root) else {
-                continue;
-            };
-            let relative = relative
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            if relative == ".git" || relative.starts_with(".git/") {
-                continue;
-            }
-            let Ok(file_type) = child.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            out.insert(relative);
-            if file_type.is_dir() {
-                walk(root, &path, out);
-            }
-        }
-    }
-    let mut out = std::collections::BTreeSet::new();
-    walk(root, root, &mut out);
-    out
-}
-
-/// The tree must show exactly what is on disk.
-///
-/// Guards the whole listing against divergence rather than one shape of it: empty directories,
-/// nested empty chains, ignored directories and their contents, and ordinary files all have to
-/// round-trip. `.git` is the only deliberate omission.
 #[tokio::test]
-async fn listed_entries_match_the_filesystem_exactly() {
+async fn workspace_index_contract_matches_git_and_bounded_fallback_exactly() {
     let root = TempDir::new().expect("root");
-    git_in(root.path(), &["init", "-b", "main"]);
+    init_isolated_git_fixture(root.path());
     write(
         root.path(),
         ".gitignore",
-        b"ignored-tree/
-",
+        b"ignored-file.txt\nignored-root/\n",
     )
     .await;
-    write(root.path(), "src/app.ts", b"export {}").await;
-    write(root.path(), "docs/guide.md", b"# guide").await;
-    write(root.path(), "ignored-tree/cache/blob.bin", b"blob").await;
-    git_in(root.path(), &["add", "-A"]);
-    git_in(root.path(), &["commit", "-m", "init"]);
-
-    // Shapes git cannot see on its own: an empty directory, and a nested chain of them.
-    tokio::fs::create_dir_all(root.path().join("docs/screenshots"))
+    write(root.path(), "tracked.txt", b"tracked").await;
+    write(root.path(), "deleted.txt", b"deleted").await;
+    git_in(
+        root.path(),
+        &["add", ".gitignore", "tracked.txt", "deleted.txt"],
+    );
+    tokio::fs::remove_file(root.path().join("deleted.txt"))
+        .await
+        .expect("delete tracked fixture file");
+    write(root.path(), "untracked.txt", b"untracked").await;
+    write(root.path(), "ignored-file.txt", b"ignored").await;
+    write(root.path(), "ignored-root/eager-child.txt", b"ignored").await;
+    tokio::fs::create_dir(root.path().join("empty-directory"))
         .await
         .expect("empty directory");
-    tokio::fs::create_dir_all(root.path().join("deep/empty/chain"))
-        .await
-        .expect("empty chain");
-    // An untracked file, and an empty directory inside an ignored tree.
-    write(root.path(), "src/untracked.ts", b"export {}").await;
-    tokio::fs::create_dir_all(root.path().join("ignored-tree/empty-inside"))
-        .await
-        .expect("empty directory inside an ignored tree");
 
     let rpc = WorkspaceRpc::new(WorkspaceService::default());
-    let result = rpc
+    let git_result = rpc
         .handle(
             "projects.listEntries",
             json!({ "cwd": path_string(root.path()) }),
         )
         .await
         .expect("list entries");
-    assert_eq!(result["truncated"], false, "fixture must fit the budget");
-    let listed = result["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
-        .collect::<std::collections::BTreeSet<_>>();
-
-    let on_disk = disk_paths(root.path());
-    let missing = on_disk.difference(&listed).collect::<Vec<_>>();
-    let phantom = listed.difference(&on_disk).collect::<Vec<_>>();
-    assert!(
-        missing.is_empty(),
-        "these exist on disk but are missing from the tree: {missing:?}"
+    assert_eq!(
+        serde_json::from_value::<SearchResult>(git_result).expect("typed Git result"),
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: ".gitignore".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "empty-directory".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "ignored-file.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "ignored-root".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "ignored-root/eager-child.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: false,
+        }
     );
-    assert!(
-        phantom.is_empty(),
-        "these are in the tree but not on disk: {phantom:?}"
+
+    std::fs::remove_dir_all(root.path().join(".git")).expect("remove test-owned Git metadata");
+    let fallback = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+    fallback
+        .refresh(CancellationToken::new())
+        .await
+        .expect("non-Git fallback");
+    assert_eq!(
+        fallback.list(None).await,
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: ".gitignore".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "empty-directory".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: false,
+        }
+    );
+
+    let bounded = WorkspaceSearchIndex::new(
+        root.path().to_path_buf(),
+        SearchLimits {
+            max_entries: 2,
+            max_memory_bytes: usize::MAX,
+            max_path_bytes: usize::MAX,
+        },
+    );
+    bounded
+        .refresh(CancellationToken::new())
+        .await
+        .expect("bounded non-Git fallback");
+    assert_eq!(
+        bounded.list(None).await,
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: true,
+        }
     );
 }
 
@@ -1242,6 +1316,458 @@ async fn list_entries_refreshes_only_when_the_request_opts_in() {
 }
 
 #[tokio::test]
+async fn write_file_existing_path_preserves_cached_index_and_wire_shape() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "existing.txt", b"before").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert_eq!(rpc.index_scans(), 1);
+
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "existing.txt", "contents": "after" }),
+        )
+        .await
+        .expect("write existing file");
+    assert_eq!(response, json!({ "relativePath": "existing.txt" }));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("existing.txt")).expect("written contents"),
+        "after"
+    );
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("reuse index");
+    assert_eq!(rpc.index_scans(), 1);
+}
+
+#[tokio::test]
+async fn write_file_new_path_invalidates_cached_index_once_and_preserves_wire_shape() {
+    let root = TempDir::new().expect("root");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "created.txt", "contents": "created" }),
+        )
+        .await
+        .expect("create file");
+    assert_eq!(response, json!({ "relativePath": "created.txt" }));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("created.txt")).expect("created contents"),
+        "created"
+    );
+
+    for _ in 0..2 {
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .expect("list created file");
+    }
+    assert_eq!(rpc.index_scans(), 2);
+}
+
+#[tokio::test]
+async fn write_file_new_parent_paths_invalidates_cached_index_once_and_preserves_wire_shape() {
+    let root = TempDir::new().expect("root");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({
+                "cwd": cwd,
+                "relativePath": "new/parents/created.txt",
+                "contents": "created"
+            }),
+        )
+        .await
+        .expect("create nested file");
+    assert_eq!(
+        response,
+        json!({ "relativePath": "new/parents/created.txt" })
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("new/parents/created.txt"))
+            .expect("created nested contents"),
+        "created"
+    );
+
+    for _ in 0..2 {
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .expect("list nested file");
+    }
+    assert_eq!(rpc.index_scans(), 2);
+}
+
+#[tokio::test]
+async fn write_file_nested_gitignore_rebuilds_cached_classification() {
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(root.path(), "nested/.gitignore", b"").await;
+    write(
+        root.path(),
+        "nested/bibcode-task2-classification-9f3a7c1b",
+        b"target",
+    )
+    .await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    let initial = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert!(!entry_is_ignored(
+        &initial,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "nested/.gitignore",
+            "contents": "bibcode-task2-classification-9f3a7c1b\n"
+        }),
+    )
+    .await
+    .expect("ignore target");
+    let ignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild ignored classification");
+    assert!(entry_is_ignored(
+        &ignored,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": "nested/.gitignore", "contents": "" }),
+    )
+    .await
+    .expect("unignore target");
+    let unignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild unignored classification");
+    assert!(!entry_is_ignored(
+        &unignored,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+}
+
+#[tokio::test]
+async fn write_file_git_internal_controls_rebuild_cached_classification() {
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(
+        root.path(),
+        "bibcode-task2-info-exclude-41ac90d7",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        "bibcode-task2-config-exclude-6e2d38f4",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        ".task2-global-ignore",
+        b"bibcode-task2-config-exclude-6e2d38f4\n",
+    )
+    .await;
+    let original_exclude =
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).expect("Git exclude");
+    let original_config =
+        std::fs::read_to_string(root.path().join(".git/config")).expect("Git config");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    let initial = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert!(!entry_is_ignored(
+        &initial,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(!entry_is_ignored(
+        &initial,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/info/exclude",
+            "contents": format!("{original_exclude}\nbibcode-task2-info-exclude-41ac90d7\n")
+        }),
+    )
+    .await
+    .expect("write Git exclude");
+    let excluded = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild exclude classification");
+    assert!(entry_is_ignored(
+        &excluded,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    let excludes_path = root
+        .path()
+        .join(".task2-global-ignore")
+        .to_string_lossy()
+        .replace('\\', "/");
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/config",
+            "contents": format!(
+                "{original_config}\n[core]\n\texcludesFile = {excludes_path}\n"
+            )
+        }),
+    )
+    .await
+    .expect("write Git config");
+    let configured = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild configured classification");
+    assert!(entry_is_ignored(
+        &configured,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(entry_is_ignored(
+        &configured,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": ".git/config", "contents": original_config }),
+    )
+    .await
+    .expect("restore Git config");
+    let config_restored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild restored config classification");
+    assert!(entry_is_ignored(
+        &config_restored,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(!entry_is_ignored(
+        &config_restored,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+    assert_eq!(rpc.index_scans(), 4);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/info/exclude",
+            "contents": original_exclude
+        }),
+    )
+    .await
+    .expect("restore Git exclude");
+    let exclude_restored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild restored exclude classification");
+    assert!(!entry_is_ignored(
+        &exclude_restored,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert_eq!(rpc.index_scans(), 5);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_symlink_aliases_to_classification_controls_invalidate() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .into_owned();
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(root.path(), "nested/.gitignore", b"").await;
+    write(
+        root.path(),
+        "nested/bibcode-task2-alias-ignore-582e713c",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        "bibcode-task2-alias-exclude-a9306d4e",
+        b"target",
+    )
+    .await;
+    symlink(
+        root.path().join("nested/.gitignore"),
+        root.path().join("ignore-control-alias"),
+    )
+    .expect("ignore control symlink");
+    symlink(
+        root.path().join(".git"),
+        root.path().join("git-control-alias"),
+    )
+    .expect("Git control symlink");
+    let original_exclude =
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).expect("Git exclude");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "ignore-control-alias",
+            "contents": "bibcode-task2-alias-ignore-582e713c\n"
+        }),
+    )
+    .await
+    .expect("write ignore alias");
+    let ignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild ignore alias");
+    assert!(entry_is_ignored(
+        &ignored,
+        "nested/bibcode-task2-alias-ignore-582e713c"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "git-control-alias/info/exclude",
+            "contents": format!(
+                "{original_exclude}\nbibcode-task2-alias-exclude-a9306d4e\n"
+            )
+        }),
+    )
+    .await
+    .expect("write Git control alias");
+    let excluded = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild Git control alias");
+    assert!(entry_is_ignored(
+        &excluded,
+        "bibcode-task2-alias-exclude-a9306d4e"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+}
+
+#[tokio::test]
+async fn write_file_mixed_case_classification_controls_invalidate_on_all_hosts() {
+    let root = TempDir::new().expect("root");
+    for path in [
+        "nested/.GITIGNORE",
+        ".GIT/config",
+        ".GiT/INFO/EXCLUDE",
+        "ordinary.txt",
+    ] {
+        write(root.path(), path, b"before").await;
+    }
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert_eq!(rpc.index_scans(), 1);
+
+    for (expected_scans, path) in [
+        (2, "nested/.GITIGNORE"),
+        (3, ".GIT/config"),
+        (4, ".GiT/INFO/EXCLUDE"),
+    ] {
+        rpc.handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": path, "contents": "after" }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("write {path}: {error}"));
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .unwrap_or_else(|error| panic!("list after {path}: {error}"));
+        assert_eq!(rpc.index_scans(), expected_scans, "path {path}");
+    }
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": "ordinary.txt", "contents": "after" }),
+    )
+    .await
+    .expect("write ordinary file");
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("reuse index after ordinary write");
+    assert_eq!(rpc.index_scans(), 4);
+}
+
+#[tokio::test]
 async fn workspace_rpc_invalidates_cached_indexes_after_mutations() {
     let root = TempDir::new().expect("root");
     write(root.path(), "src/existing.ts", b"export {};\n").await;
@@ -1769,16 +2295,20 @@ async fn public_workspace_service_maps_filesystem_failures() {
     for result in [
         service
             .write_file(root.path(), "blocker/file.txt", "contents")
-            .await,
+            .await
+            .map(|_| ()),
         service
             .create_entry(root.path(), "blocker/directory", EntryKind::Directory)
-            .await,
+            .await
+            .map(|_| ()),
         service
             .create_entry(root.path(), "blocker/file.txt", EntryKind::File)
-            .await,
+            .await
+            .map(|_| ()),
         service
             .rename_entry(root.path(), "blocker", "blocker/renamed")
-            .await,
+            .await
+            .map(|_| ()),
     ] {
         assert!(matches!(result, Err(WorkspaceError::Operation { .. })));
     }

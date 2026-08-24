@@ -76,8 +76,18 @@ describe("worktree environment state", () => {
     windowTarget.fire("focus");
 
     expect(harness.refresh.mock.calls).toEqual([
-      [{ environmentId: first.environmentId, input: { projectId: first.projectId } }],
-      [{ environmentId: second.environmentId, input: { projectId: second.projectId } }],
+      [
+        {
+          environmentId: first.environmentId,
+          input: { projectId: first.projectId, reason: "focus" },
+        },
+      ],
+      [
+        {
+          environmentId: second.environmentId,
+          input: { projectId: second.projectId, reason: "focus" },
+        },
+      ],
     ]);
 
     documentTarget.visibilityState = "hidden";

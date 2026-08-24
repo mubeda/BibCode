@@ -12,6 +12,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   environmentRpcKey,
+  type AtomCommandResult,
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
@@ -587,6 +588,76 @@ describe("runtime command runner", () => {
     expect(await second).toMatchObject({ _tag: "Success", value: 3, waiting: false });
     expect(await third).toMatchObject({ _tag: "Success", value: 3, waiting: false });
     expect(executed).toEqual([1, 3]);
+    registry.dispose();
+  });
+
+  it("runs latest lanes independently by key and deletes settled lane state", async () => {
+    let resolveFirst!: (result: AtomCommandResult<string, never>) => void;
+    const firstResult = new Promise<AtomCommandResult<string, never>>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const scheduler = createAtomCommandScheduler();
+    const registry = AtomRegistry.make();
+    const concurrency = { mode: "latest" as const, key: (key: string) => key };
+    const executed: string[] = [];
+
+    const first = scheduler.schedule(registry, concurrency, "first", () => {
+      executed.push("first:blocked");
+      return firstResult;
+    });
+    const other = scheduler.schedule(registry, concurrency, "other", async () => {
+      executed.push("other");
+      return AsyncResult.success("other");
+    });
+
+    expect(await other).toMatchObject({ _tag: "Success", value: "other" });
+    expect(executed).toEqual(["first:blocked", "other"]);
+    resolveFirst(AsyncResult.success("first"));
+    await first;
+    const replacement = await scheduler.schedule(registry, concurrency, "first", async () => {
+      executed.push("first:replacement");
+      return AsyncResult.success("replacement");
+    });
+    expect(replacement).toMatchObject({ _tag: "Success", value: "replacement" });
+    expect(executed).toEqual(["first:blocked", "other", "first:replacement"]);
+    registry.dispose();
+  });
+
+  it("cleans latest lanes after rejection and registry cancellation", async () => {
+    const scheduler = createAtomCommandScheduler();
+    const runtime = Atom.runtime(Layer.empty);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const concurrency = { mode: "latest" as const, key: () => "shared" };
+    const command = createRuntimeCommand(runtime, {
+      label: "test.latest-cleanup",
+      scheduler,
+      concurrency,
+      execute: (input: "cancel" | "complete") =>
+        input === "cancel"
+          ? Effect.sync(markStarted).pipe(Effect.andThen(Effect.never))
+          : Effect.succeed(input),
+    });
+    const registry = AtomRegistry.make();
+
+    const rejected = await scheduler.schedule(registry, concurrency, undefined, () =>
+      Promise.reject(new Error("refresh rejected")),
+    );
+    expect(rejected._tag).toBe("Failure");
+    if (rejected._tag === "Failure") {
+      expect(Cause.hasDies(rejected.cause)).toBe(true);
+    }
+
+    const cancelled = command.run(registry, "cancel");
+    await started;
+    registry.reset();
+    expect(isAtomCommandInterrupted(await cancelled)).toBe(true);
+    expect(await command.run(registry, "complete")).toMatchObject({
+      _tag: "Success",
+      value: "complete",
+    });
     registry.dispose();
   });
 });

@@ -99,6 +99,169 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### VCS coordination gates
+
+When VCS status observation, mutation ownership, automatic fetch, or client
+refresh scheduling changes, run the current focused owners before broad gates:
+
+```sh
+vp run check:contracts
+vp test run apps/web/src/components/SourceControlPanel.test.tsx apps/web/src/components/files/FileBrowserPanel.test.tsx apps/web/src/components/GitActionsControl.test.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/ThreadStatusIndicators.test.tsx
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server git:: -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib git::broadcaster::tests::ref_poll_is_replaced_by_watcher_and_safety_status_reads -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib terminal::manager::tests::retained_process_exit_callback_does_not_hold_terminal_publication -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib production::runtime::tests::provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads -- --exact --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_git_vcs_rpc -- --nocapture
+vp test run packages/client-runtime/src/state/vcs.test.ts apps/web/src/components/GitActionsControl.test.tsx
+```
+
+On non-Windows hosts, replace the MSVC launcher with the equivalent direct
+Cargo invocation. Run the production RPC file once with its default harness and
+record the complete pass/fail matrix. If it exposes a causal product failure,
+isolate only that case. Do not repeatedly run the file, serialize it, or change
+production deadlines to conceal load/order timeouts.
+
+For the event-driven VCS boundary, retain separate evidence for:
+
+- the paused-time idle regression: after the initial snapshot, 59 seconds starts
+  no status or `symbolic-ref` Git process, and 60 seconds starts exactly one
+  local safety read without `symbolic-ref`;
+- native worktree content, index, `HEAD`, packed-ref, and nested-ref events;
+- watcher setup failure, root loss, overflow, sticky fallback, final release,
+  reattachment, and shutdown;
+- one 125 ms trailing watcher read and one immediate structured-terminal read;
+- reconnect plus hidden, reveal, focus, and Git-menu explicit catch-up; and
+- execution-host routing for native, WSL-direct, and SSH/server workspaces.
+
+Host-independent event-shape and routing tests are compatibility evidence, not
+native evidence for another operating system or remote host. Record unavailable
+Linux, macOS, WSL, or SSH execution separately instead of simulating it as run.
+
+For an automatic-fetch default decision, measure a current-source server or
+desktop runtime, never an installed application. Use a disposable scenario
+with a recorded number of physical repositories, worktrees, and active
+`subscribeVcsStatus` streams. After bootstrap work settles, verify the recorder
+with a short probe, clear it, then leave the scenario idle for a real interval
+of at least ten minutes. Count top-level Git launches attributed by exact root
+PID and process-start identity, retain command lines when the platform exposes
+them, and normalize launches per elapsed minute per physical repository. State
+whether discovery, status/diff, and fetch could be distinguished; do not infer
+an internal operation label that the evidence does not contain.
+
+On Windows the maintained controller performs that complete scenario and the
+production-Atom queue benchmark. The default command records a 600-second
+window; the short command exercises the same build, fixture, identity, probe,
+cleanup, parser, and queue paths without serving as threshold evidence:
+
+```powershell
+node scripts/measure-vcs-runtime.ts
+node scripts/measure-vcs-runtime.ts --duration-ms 3000 --queue-warmups 2 --queue-samples 10
+```
+
+The controller prints its unique evidence directory and retains ready, raw Git
+launch, parsed Git summary, queue summary, server log, and aggregate summary
+files there. Its example build overrides inherited Cargo target configuration
+with an isolated target inside that directory and consumes Cargo
+`compiler-artifact` JSON to launch those exact executable paths, including a
+configured target-triple directory. Pass `--output-dir` only with a new path;
+the controller refuses to
+overwrite an existing evidence directory. Every success or failure requests a
+graceful stop after one atomic Windows snapshot binds PID, parent PID, decimal
+FILETIME, and executable. Both graceful and timeout cleanup capture/revalidate
+the exact child tree, terminate verified descendants leaf-first and the owned
+server handle last when required, await the server, and reject survivors.
+
+Measure foreground queue delay separately through the actual production Atom
+commands. Hold a real `vcs.refreshStatus` command active, schedule a same-key
+mutation command, and record from scheduling immediately before the command run
+to the mutation RPC execution start. Warm the harness, collect at least 100
+measured samples, report the sample count and percentile method, and compute
+p95 from the sorted measured values. A synthetic scheduler without production
+command wiring is not acceptance evidence.
+
+The automatic-fetch default is 180 seconds. A future default change requires an
+approved measurement gate; the current decision thresholds are more than 20
+top-level Git processes per minute per physical repository or more than 250 ms
+foreground mutation queue delay at p95. Update the contract/default codec, Rust
+settings defaults and fallbacks, RPC fixtures, settings tests, and user-facing
+reset/presentation together. Preserve live updates, bounded failure backoff,
+and `0 = disabled`. Record machine-specific process counts, timings, paths, and
+the decision only in the execution report.
+
+### Worktree catalog native fleet evidence
+
+When catalog fingerprint inputs, reuse timing, or inventory invalidation change,
+run the ignored native fleet test explicitly:
+
+```powershell
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib worktree_catalog::tests::fingerprint_focus_fleet_reconciles_every_five_minutes_for_thirty_minutes -- --ignored --exact --nocapture
+```
+
+The test uses ten disposable real Git repositories, the production filesystem
+fingerprint reader, and production Git inventory. It executes 18,000 Focus
+refreshes over 30 minutes of paused policy time, checks every five-minute real
+inventory boundary, and then proves real changed and Unknown fingerprint inputs
+scan immediately. Record the native runtime and inventory counts in the
+execution report; the test is ignored so this several-minute evidence workload
+does not inflate ordinary server suites.
+
+### File Manager index benchmark gate
+
+When File Manager index phases or eager ignored-directory traversal change,
+run the current-source, test-owned native Windows benchmark from the repository
+root. Clear any smoke-sample override so the acceptance run collects exactly 30
+cold builds and 30 immediate warm hits:
+
+```powershell
+Remove-Item Env:BIBCODE_FILE_INDEX_BENCHMARK_SAMPLES -ErrorAction SilentlyContinue
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib workspace::rpc::tests::benchmark_file_manager_index_phases -- --ignored --exact --nocapture
+```
+
+The ignored test creates one unique disposable real-Git repository and completes
+fixture creation and Git setup before sampling. Before every cold request it
+invalidates the cached root outside the measured build; each warm request follows
+the completed cold request without setup or invalidation. Every cold sample must
+assert exactly
+`cache_wait(miss) -> git_snapshot(build) -> ignored_walk(build) ->
+directory_walk(build) -> cache_build(built)`. Every warm sample must assert only
+`cache_hit(hit)`, with the physical scan count unchanged; this is the acceptance
+assertion that a warm hit started zero Git work.
+
+The output must retain the raw millisecond arrays for `cache_build`,
+`git_snapshot`, `ignored_walk`, `directory_walk`, and `cache_hit`, plus
+`filesystem_walk` when a fallback fixture makes it applicable. Compute p50 and
+p95 with sorted nearest rank at zero-based index
+`ceil(sample_count * percentile / 100) - 1`; for 30 samples the p50 index is 14
+and the p95 index is 28.
+
+Record enough fixture metadata to reproduce and reconcile the returned entry
+count: tracked workload files, tracked control files, ordinary untracked files,
+ordinary directory rows, ignored files, ignored directory rows, empty directory
+rows, total entries, and ignored entries. Record the host model, OS/build and
+architecture, CPU core/logical-processor counts, physical memory, Rust/Cargo
+versions, and Git version.
+
+Apply the lazy-loading gate literally: a separately reviewed follow-up is
+required when `ignored_walk` p95 is greater than 50% of `cache_build` p95 **OR**
+greater than 500 ms. Otherwise record that lazy loading remains deferred; do not
+change eager tree behavior as part of the measurement task. Machine-specific
+fixture paths, raw arrays, phase timings, host details, ratios, and the gate
+decision belong only in the execution report, never in this living runbook.
+
+The two `git ls-files` reads use a workspace-index-specific ten-second
+post-spawn execution bound. A bound change must preserve external cancellation,
+output limits, sibling settlement, and bounded filesystem fallback. Verify a
+slow successful pair inside the bound and timeout fallback beyond it with:
+
+```powershell
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib workspace::search::tests::git_snapshot_accepts_slow_success_inside_bound_and_falls_back_beyond_it -- --exact --nocapture
+```
+
+Then run `workspace_rpc` twice at its default harness width. Isolate the known
+watcher burst-coalescing assertion if it fails, but do not serialize the file,
+weaken exact Git classification, or widen the shared Git runner.
+
 ## Workspace and static gates
 
 Run broad owners sequentially so one Cargo process owns the shared build
@@ -106,7 +269,7 @@ directory at a time:
 
 ```sh
 vp run test
-cargo test --workspace -j 2
+cargo test --workspace -j 2 -- --test-threads=2
 vp check
 vp run typecheck
 cargo fmt --all --check
@@ -115,9 +278,11 @@ git diff --check
 ```
 
 Use the repository's Windows/MSVC launcher when required by the native Windows
-page. The `-j 2` option bounds Cargo compilation jobs; it does not serialize
-Rust test binaries. Do not add `--test-threads=1`, broad locks, sleeps, yields,
-or larger production deadlines to make a loaded suite pass.
+page. The `-j 2` option bounds Cargo compilation jobs. The
+`--test-threads=2` harness option bounds concurrent tests within each Rust test
+binary; it does not serialize distinct test binaries. Do not add
+`--test-threads=1`, broad locks, sleeps, yields, or larger production deadlines
+to make a loaded suite pass.
 
 For each command record the exact invocation, exit code, duration, test totals,
 warnings, cleanup diagnostics, and commands skipped after a failure. A broad

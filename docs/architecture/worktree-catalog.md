@@ -84,6 +84,51 @@ The production bounds are intentionally finite:
 | Discovery baseline            | 512 normalized paths |
 | Runtime-owned mutations       | 64 in flight         |
 
+### Repository fingerprint reuse
+
+After a repository has one trusted successful inventory, the server can prove
+whether its retained inventory is still plausible without starting Git. The
+versioned fingerprint includes the repository lifecycle and mutation epochs;
+physical identities for the common directory, primary checkout, and known
+worktree paths; common `config`, `HEAD`, selected symbolic refs,
+`config.worktree`, `packed-refs`, and validated reftable state; and sorted
+linked-worktree entry names plus each entry's identity, `HEAD`, `gitdir`,
+`locked`, `config.worktree`, and reftable state.
+
+Git-admin descendants are opened relative to retained trusted directory
+handles with no-follow semantics. The proof permits at most 512 known paths,
+linked-worktree entries, or reftable tables, 255 bytes per name, 64 symbolic-ref
+components, 64 KiB per file, and 1 MiB total input. Reads are sequential, and
+two complete matching passes are required. An unreadable, malformed, escaping,
+replaced, symlinked, junction/reparse, canceled, changed-during-read,
+unsupported, or over-limit input produces `Unknown`. `Unknown` fails open to
+the normal bounded Git inventory; it never proves the retained inventory
+current.
+
+For every real scan after bootstrap, the server captures the fingerprint
+before starting Git. It publishes that proof for reuse only with the matching
+successful authoritative observation after repository lifecycle, mutation,
+observation-identity, and project-publication fences still match. A mutation
+during inventory therefore cannot be hidden by a later fingerprint capture.
+
+Only a healthy authoritative **Focus** refresh may reuse a matching known
+fingerprint. **Explicit** refresh—including manual Retry—and FirstSubscriber,
+metadata, availability, mutation, degraded-recovery, changed, or unknown cases
+run real inventory. Reuse never resets time: at exactly five minutes from the
+completion of the last successful real scan, Focus performs another
+authoritative inventory. Before that boundary, reuse skips only the repository
+Git observation; the project projection is reloaded, generation is advanced,
+suppressions and current availability are applied, and anchor and lifecycle
+fences still run.
+
+Managed create records its exact path suppression and invalidates the shared
+repository fingerprint only after Git rollback identity and the terminal
+durable owner receipt have settled. Retarget and removal likewise invalidate
+after their terminal durable settlement; repository-wide Git removal fans the
+invalidation out to every live project view. This preserves the existing
+managed-creation suppression while forcing the next Focus through real
+inventory.
+
 The subscription is latest-value state, not an event queue: a slow consumer may
 skip intermediate generations but receives the newest snapshot. Subscriptions
 and unary refresh, adoption, removal, anchor, and latest-snapshot consumers all
@@ -276,6 +321,13 @@ that same session. A false or missing capability makes no catalog-method call.
 The sole compatibility fallback is explicit legacy detach-only via ordinary
 thread deletion; it leaves Git and files untouched and never invokes a raw
 destructive worktree method.
+
+The optional refresh `reason` is additive and separately gated by the
+default-false `worktreeCatalogRefreshReason` capability. Current catalog-capable
+servers advertise it and accept `focus` or `explicit`; omission remains
+Explicit. A new client connected to an older catalog server keeps Focus as the
+local scheduler class but omits `reason` on the wire. Manual Retry continues to
+omit the field, and clients do not use decode-error retries for negotiation.
 
 Client presentation uses one shared availability selector. Cold/no catalog
 status, `present`, and retained `verification-unavailable` state remain usable;

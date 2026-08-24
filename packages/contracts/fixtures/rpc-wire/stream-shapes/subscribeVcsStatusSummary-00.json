@@ -1,0 +1,16 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "isRepo": false,
+      "refName": null,
+      "detachedHead": null,
+      "hasWorkingTreeChanges": false,
+      "sourceControlProvider": null,
+      "pr": null,
+      "observedAt": "#0",
+      "stale": false
+    }
+  ]
+}

@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 80,
     "javascriptLedger": 79,
-    "rustRegistry": 77,
+    "rustRegistry": 78,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -1565,6 +1565,17 @@
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
       "notes": "Pinned verifier for stable updater release signatures."
+    },
+    {
+      "key": "rust:workspace:notify",
+      "name": "notify",
+      "current": "8",
+      "target": "8.2.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/notify",
+      "cohort": "event-driven-vcs-observation",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
     },
     {
       "key": "rust:workspace:open",

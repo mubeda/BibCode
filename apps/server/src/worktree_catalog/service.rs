@@ -30,6 +30,10 @@ use crate::{
 };
 
 use super::availability::{WorkspaceAvailabilityRegistry, WorkspaceLossTransition};
+use super::fingerprint::{
+    CatalogRepositoryFingerprint, FingerprintOutcome, FingerprintRequest,
+    read_catalog_repository_fingerprint,
+};
 use super::model::{
     AdoptedWorktreeAvailability, AdoptedWorktreeStatus, AdoptionValidationError,
     AdoptionValidationErrorReason, CatalogDegradedReason, CatalogError, CatalogErrorReason,
@@ -37,6 +41,8 @@ use super::model::{
     WorktreeCatalogSnapshot, WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
     bounded_message,
 };
+
+const FINGERPRINT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) type CatalogFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -58,6 +64,18 @@ pub(crate) trait InventorySource: Send + Sync {
         anchor: PathBuf,
         cancellation: CancellationToken,
     ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>>;
+}
+
+pub(crate) trait CatalogFingerprintSource: Send + Sync {
+    fn read(&self, request: FingerprintRequest) -> CatalogFuture<FingerprintOutcome>;
+}
+
+struct NativeCatalogFingerprintSource;
+
+impl CatalogFingerprintSource for NativeCatalogFingerprintSource {
+    fn read(&self, request: FingerprintRequest) -> CatalogFuture<FingerprintOutcome> {
+        Box::pin(read_catalog_repository_fingerprint(request))
+    }
 }
 
 pub(crate) trait CatalogFileSystem: Send + Sync {
@@ -175,6 +193,7 @@ struct Inner {
     projections: Arc<dyn CatalogProjectionSource>,
     inventory: Arc<dyn InventorySource>,
     filesystem: Arc<dyn CatalogFileSystem>,
+    fingerprint: Arc<dyn CatalogFingerprintSource>,
     options: CatalogServiceOptions,
     scan_semaphore: Arc<Semaphore>,
     probe_semaphore: Arc<Semaphore>,
@@ -202,6 +221,8 @@ struct Inner {
     mutation_refresh_start_pause: Mutex<Option<MutationRefreshStartPause>>,
     #[cfg(test)]
     repository_observation_requests: AtomicUsize,
+    #[cfg(test)]
+    repository_observation_publication_pause: Mutex<Option<RepositoryObservationPublicationPause>>,
 }
 
 #[derive(Default)]
@@ -222,6 +243,14 @@ struct FinalReleasePause {
 struct MutationRefreshStartPause {
     starts_before_pause: usize,
     release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+struct RepositoryObservationPublicationPause {
+    repository_key: String,
+    entered: Arc<Semaphore>,
+    resume: Arc<Semaphore>,
+    finished: Arc<Semaphore>,
 }
 
 #[cfg(test)]
@@ -282,6 +311,13 @@ struct RepositoryState {
     last_result: Option<Result<Arc<CompletedObservation>, ScanError>>,
     last_result_anchor: Option<PathBuf>,
     last_result_lifecycle_epoch: Option<u64>,
+    retained_observation: Option<Arc<CompletedObservation>>,
+    pending_fingerprint: Option<PendingFingerprintPublication>,
+    last_fingerprint: Option<CatalogRepositoryFingerprint>,
+    last_real_scan_at: Option<Instant>,
+    fingerprint_epoch: u64,
+    #[cfg(test)]
+    invalidations: usize,
     lifecycle_epoch: u64,
     subscribers: usize,
     active_users: usize,
@@ -295,12 +331,26 @@ impl Default for RepositoryState {
             last_result: None,
             last_result_anchor: None,
             last_result_lifecycle_epoch: None,
+            retained_observation: None,
+            pending_fingerprint: None,
+            last_fingerprint: None,
+            last_real_scan_at: None,
+            fingerprint_epoch: 0,
+            #[cfg(test)]
+            invalidations: 0,
             lifecycle_epoch: 0,
             subscribers: 0,
             active_users: 0,
             scan_cancellation: CancellationToken::new(),
         }
     }
+}
+
+struct PendingFingerprintPublication {
+    observation: Weak<CompletedObservation>,
+    repository_lifecycle_epoch: u64,
+    fingerprint_epoch: u64,
+    fingerprint: Option<CatalogRepositoryFingerprint>,
 }
 
 struct EntryState {
@@ -460,6 +510,7 @@ impl WorktreeCatalogService {
                 repository: repository.clone(),
             }),
             Arc::new(TokioCatalogFileSystem),
+            Arc::new(NativeCatalogFingerprintSource),
             CatalogServiceOptions::default(),
             availability_registry,
             Some(repository),
@@ -478,6 +529,7 @@ impl WorktreeCatalogService {
             projections,
             inventory,
             filesystem,
+            Arc::new(NativeCatalogFingerprintSource),
             options,
             availability_registry,
             None,
@@ -495,6 +547,26 @@ impl WorktreeCatalogService {
             projections,
             inventory,
             filesystem,
+            Arc::new(NativeCatalogFingerprintSource),
+            options,
+            WorkspaceAvailabilityRegistry::new(),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_dependencies_and_fingerprint(
+        projections: Arc<dyn CatalogProjectionSource>,
+        inventory: Arc<dyn InventorySource>,
+        filesystem: Arc<dyn CatalogFileSystem>,
+        fingerprint: Arc<dyn CatalogFingerprintSource>,
+        options: CatalogServiceOptions,
+    ) -> Self {
+        Self::build(
+            projections,
+            inventory,
+            filesystem,
+            fingerprint,
             options,
             WorkspaceAvailabilityRegistry::new(),
             None,
@@ -505,6 +577,7 @@ impl WorktreeCatalogService {
         projections: Arc<dyn CatalogProjectionSource>,
         inventory: Arc<dyn InventorySource>,
         filesystem: Arc<dyn CatalogFileSystem>,
+        fingerprint: Arc<dyn CatalogFingerprintSource>,
         options: CatalogServiceOptions,
         availability_registry: WorkspaceAvailabilityRegistry,
         git_repository: Option<Arc<GitRepository>>,
@@ -516,6 +589,7 @@ impl WorktreeCatalogService {
                 projections,
                 inventory,
                 filesystem,
+                fingerprint,
                 options,
                 scan_semaphore: Arc::new(Semaphore::new(max_repository_scans)),
                 probe_semaphore: Arc::new(Semaphore::new(max_directory_probes)),
@@ -543,6 +617,8 @@ impl WorktreeCatalogService {
                 mutation_refresh_start_pause: Mutex::new(None),
                 #[cfg(test)]
                 repository_observation_requests: AtomicUsize::new(0),
+                #[cfg(test)]
+                repository_observation_publication_pause: Mutex::new(None),
             }),
         }
     }
@@ -890,7 +966,7 @@ impl WorktreeCatalogService {
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
-        let (fence, next_generation, suppressions, previous) = {
+        let (fence, next_generation, suppressions, previous, fingerprint_reuse_eligible) = {
             let mut state = lock(&entry.state);
             if lifecycle_epoch.is_some_and(|epoch| {
                 epoch != state.lifecycle_epoch || lifecycle_inactive(&state, requires_subscriber)
@@ -902,6 +978,9 @@ impl WorktreeCatalogService {
             state.suppressions.retain(|_, created_at| {
                 now.duration_since(*created_at) < self.inner.options.managed_creation_suppression
             });
+            let fingerprint_reuse_eligible = trigger == CatalogRefreshTrigger::Focus
+                && state.snapshot.authoritative
+                && matches!(state.snapshot.scan_status, CatalogScanStatus::Ready);
             let refreshing = Arc::new(retained_snapshot(
                 &state.last_authoritative,
                 CatalogScanStatus::Refreshing,
@@ -917,6 +996,7 @@ impl WorktreeCatalogService {
                 state.last_authoritative.generation + 1,
                 state.suppressions.keys().cloned().collect::<HashSet<_>>(),
                 Arc::clone(&state.last_authoritative),
+                fingerprint_reuse_eligible,
             )
         };
         let anchor = match self
@@ -941,6 +1021,8 @@ impl WorktreeCatalogService {
                 &entry.repository,
                 anchor.path.clone(),
                 project.repository_key.as_deref(),
+                trigger,
+                fingerprint_reuse_eligible,
                 &cancellation,
             )
             .await;
@@ -1049,6 +1131,7 @@ impl WorktreeCatalogService {
             state.sender.send_replace(Arc::clone(&snapshot));
             transitions
         };
+        self.publish_repository_fingerprint(&entry.repository, &observation);
         self.observe_workspace_losses(transitions).await;
         self.observe_healthy_snapshot(project_id, Arc::clone(&snapshot))
             .await;
@@ -1147,6 +1230,8 @@ impl WorktreeCatalogService {
                 &entry.repository,
                 candidate_path.clone(),
                 Some(&snapshot.repository_key),
+                CatalogRefreshTrigger::Explicit,
+                false,
                 &cancellation,
             )
             .await
@@ -1277,6 +1362,7 @@ impl WorktreeCatalogService {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
+        Self::invalidate_repository_fingerprint_state(&entry.repository);
         self.invalidate_entry_after_mutation(&entry);
     }
 
@@ -1284,21 +1370,36 @@ impl WorktreeCatalogService {
         if self.inner.shutdown.is_cancelled() {
             return;
         }
-        let entries = {
+        let (repository, entries) = {
             let registry = lock(&self.inner.registry);
             let Some(source) = registry.entries.get(project_id) else {
                 return;
             };
-            registry
-                .entries
-                .values()
-                .filter(|entry| Arc::ptr_eq(&entry.repository, &source.repository))
-                .cloned()
-                .collect::<Vec<_>>()
+            (
+                Arc::clone(&source.repository),
+                registry
+                    .entries
+                    .values()
+                    .filter(|entry| Arc::ptr_eq(&entry.repository, &source.repository))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         };
+        Self::invalidate_repository_fingerprint_state(&repository);
         for entry in entries {
             self.invalidate_entry_after_mutation(&entry);
         }
+    }
+
+    fn invalidate_repository_fingerprint_state(repository: &RepositoryEntry) {
+        let mut state = lock(&repository.state);
+        state.fingerprint_epoch = state.fingerprint_epoch.wrapping_add(1);
+        #[cfg(test)]
+        {
+            state.invalidations = state.invalidations.wrapping_add(1);
+        }
+        state.pending_fingerprint = None;
+        state.last_fingerprint = None;
     }
 
     fn invalidate_entry_after_mutation(&self, entry: &Arc<CatalogEntry>) {
@@ -1655,10 +1756,15 @@ impl WorktreeCatalogService {
                 .get(&scan.repository_key)
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
+                    let repository_state = RepositoryState {
+                        retained_observation: Some(Arc::clone(&scan.observation)),
+                        last_real_scan_at: Some(scan.observation.real_scan_at),
+                        ..RepositoryState::default()
+                    };
                     let repository = Arc::new(RepositoryEntry {
                         common_dir: scan.common_dir.clone(),
                         observation_lock: Arc::new(AsyncMutex::new(())),
-                        state: Mutex::new(RepositoryState::default()),
+                        state: Mutex::new(repository_state),
                     });
                     registry
                         .repositories
@@ -1920,9 +2026,10 @@ impl WorktreeCatalogService {
             suppressions,
             cancellation,
         } = request;
-        let observation = self
-            .observe(anchor, expected_repository_key, cancellation.clone())
-            .await?;
+        let observation = Arc::new(
+            self.observe(anchor, expected_repository_key, cancellation.clone())
+                .await?,
+        );
         let snapshot = self
             .snapshot_from_observation(
                 project,
@@ -1936,6 +2043,7 @@ impl WorktreeCatalogService {
         Ok(CompletedScan {
             repository_key: observation.repository_key.clone(),
             common_dir: observation.common_dir.clone(),
+            observation,
             snapshot,
         })
     }
@@ -1994,6 +2102,7 @@ impl WorktreeCatalogService {
             repository_key,
             common_dir,
             inventory,
+            real_scan_at: Instant::now(),
         })
     }
 
@@ -2028,6 +2137,8 @@ impl WorktreeCatalogService {
         repository: &Arc<RepositoryEntry>,
         anchor: PathBuf,
         expected_repository_key: Option<&str>,
+        trigger: CatalogRefreshTrigger,
+        fingerprint_reuse_eligible: bool,
         caller_cancellation: &CancellationToken,
     ) -> Result<Arc<CompletedObservation>, ScanError> {
         let (completed_observations, lifecycle_epoch) = {
@@ -2046,7 +2157,12 @@ impl WorktreeCatalogService {
         if caller_cancellation.is_cancelled() {
             return Err(ScanError::Cancelled);
         }
-        let repository_cancellation = {
+        let (
+            repository_cancellation,
+            retained_observation,
+            fingerprint_epoch,
+            last_observation_succeeded,
+        ) = {
             let state = lock(&repository.state);
             if state.lifecycle_epoch != lifecycle_epoch {
                 return Err(ScanError::Cancelled);
@@ -2062,10 +2178,83 @@ impl WorktreeCatalogService {
                     )))
                 });
             }
-            (state.active_users != 0).then(|| state.scan_cancellation.clone())
+            (
+                (state.active_users != 0).then(|| state.scan_cancellation.clone()),
+                state.retained_observation.clone(),
+                state.fingerprint_epoch,
+                matches!(state.last_result, Some(Ok(_))),
+            )
         };
         let repository_owned = repository_cancellation.is_some();
         let cancellation = repository_cancellation.unwrap_or_else(|| caller_cancellation.clone());
+        let fingerprint = if let Some(retained) = retained_observation.as_ref() {
+            let primary_path = retained
+                .inventory
+                .records
+                .iter()
+                .find(|record| record.is_primary)
+                .map(|record| {
+                    if record.is_bare {
+                        retained.common_dir.clone()
+                    } else {
+                        record.path.clone()
+                    }
+                });
+            if let Some(primary_path) = primary_path {
+                let mut known_worktree_paths = retained
+                    .inventory
+                    .records
+                    .iter()
+                    .map(|record| record.path.clone())
+                    .collect::<Vec<_>>();
+                if !known_worktree_paths.contains(&anchor) {
+                    known_worktree_paths.push(anchor.clone());
+                }
+                self.inner
+                    .fingerprint
+                    .read(FingerprintRequest {
+                        common_dir: repository.common_dir.clone(),
+                        primary_path,
+                        known_worktree_paths,
+                        repository_lifecycle_epoch: lifecycle_epoch,
+                        mutation_epoch: fingerprint_epoch,
+                        cancellation: cancellation.clone(),
+                    })
+                    .await
+            } else {
+                FingerprintOutcome::Unknown(super::fingerprint::FingerprintFailure::Unreadable)
+            }
+        } else {
+            FingerprintOutcome::Unknown(super::fingerprint::FingerprintFailure::Unreadable)
+        };
+        if fingerprint_reuse_eligible
+            && trigger == CatalogRefreshTrigger::Focus
+            && last_observation_succeeded
+        {
+            let state = lock(&repository.state);
+            if state.lifecycle_epoch == lifecycle_epoch
+                && state.fingerprint_epoch == fingerprint_epoch
+                && state
+                    .last_fingerprint
+                    .as_ref()
+                    .zip(match &fingerprint {
+                        FingerprintOutcome::Known(current) => Some(current),
+                        FingerprintOutcome::Unknown(_) => None,
+                    })
+                    .is_some_and(|(previous, current)| previous == current)
+                && state.last_real_scan_at.is_some_and(|completed_at| {
+                    Instant::now().duration_since(completed_at)
+                        < FINGERPRINT_RECONCILIATION_INTERVAL
+                })
+                && state.retained_observation.as_ref().is_some_and(|current| {
+                    retained_observation
+                        .as_ref()
+                        .is_some_and(|retained| Arc::ptr_eq(current, retained))
+                })
+            {
+                return Ok(retained_observation.expect("retained observation"));
+            }
+        }
         let service = self.clone();
         let repository = Arc::clone(repository);
         let expected_repository_key = expected_repository_key.map(str::to_owned);
@@ -2079,16 +2268,51 @@ impl WorktreeCatalogService {
                 )
                 .await
                 .map(Arc::new);
+            #[cfg(test)]
+            let publication_finished = match &result {
+                Ok(observation) => {
+                    service
+                        .pause_repository_observation_publication_for_test(observation)
+                        .await
+                }
+                Err(_) => None,
+            };
+            let pending_fingerprint = match (&result, fingerprint) {
+                (Ok(observation), FingerprintOutcome::Known(fingerprint)) => {
+                    Some(PendingFingerprintPublication {
+                        observation: Arc::downgrade(observation),
+                        repository_lifecycle_epoch: lifecycle_epoch,
+                        fingerprint_epoch,
+                        fingerprint: Some(fingerprint),
+                    })
+                }
+                (Ok(observation), FingerprintOutcome::Unknown(_)) => {
+                    Some(PendingFingerprintPublication {
+                        observation: Arc::downgrade(observation),
+                        repository_lifecycle_epoch: lifecycle_epoch,
+                        fingerprint_epoch,
+                        fingerprint: None,
+                    })
+                }
+                (Err(_), _) => None,
+            };
             let lifecycle = lock(&service.inner.lifecycle_tasks);
             if lifecycle.terminal {
                 return Err(ScanError::Cancelled);
             }
             let mut state = lock(&repository.state);
             if state.lifecycle_epoch == lifecycle_epoch {
+                if state.active_users != 0 && state.fingerprint_epoch == fingerprint_epoch {
+                    state.pending_fingerprint = pending_fingerprint;
+                }
                 state.completed_observations = state.completed_observations.wrapping_add(1);
                 state.last_result = Some(result.clone());
                 state.last_result_anchor = Some(anchor);
                 state.last_result_lifecycle_epoch = Some(lifecycle_epoch);
+            }
+            #[cfg(test)]
+            if let Some(finished) = publication_finished {
+                finished.add_permits(1);
             }
             result
         };
@@ -2118,6 +2342,37 @@ impl WorktreeCatalogService {
                 ))),
             },
         }
+    }
+
+    fn publish_repository_fingerprint(
+        &self,
+        repository: &RepositoryEntry,
+        observation: &Arc<CompletedObservation>,
+    ) {
+        let mut state = lock(&repository.state);
+        let pending_matches = state.pending_fingerprint.as_ref().is_some_and(|pending| {
+            pending.repository_lifecycle_epoch == state.lifecycle_epoch
+                && pending.fingerprint_epoch == state.fingerprint_epoch
+                && pending
+                    .observation
+                    .upgrade()
+                    .is_some_and(|candidate| Arc::ptr_eq(&candidate, observation))
+        });
+        if !pending_matches
+            || !matches!(
+                state.last_result.as_ref(),
+                Some(Ok(current)) if Arc::ptr_eq(current, observation)
+            )
+        {
+            return;
+        }
+        let pending = state
+            .pending_fingerprint
+            .take()
+            .expect("matching pending fingerprint publication");
+        state.retained_observation = Some(Arc::clone(observation));
+        state.last_fingerprint = pending.fingerprint;
+        state.last_real_scan_at = Some(observation.real_scan_at);
     }
 
     async fn physical_path_key(
@@ -2707,6 +2962,8 @@ impl WorktreeCatalogService {
             repository_state.subscribers = repository_state.subscribers.saturating_sub(1);
             repository_state.active_users = repository_state.active_users.saturating_sub(1);
             if repository_state.active_users == 0 {
+                repository_state.pending_fingerprint = None;
+                repository_state.last_fingerprint = None;
                 repository_state.scan_cancellation.cancel();
             }
             final_active_user
@@ -2732,6 +2989,8 @@ impl WorktreeCatalogService {
             let mut repository_state = lock(&entry.repository.state);
             repository_state.active_users = repository_state.active_users.saturating_sub(1);
             if repository_state.active_users == 0 {
+                repository_state.pending_fingerprint = None;
+                repository_state.last_fingerprint = None;
                 repository_state.scan_cancellation.cancel();
             }
             final_active_user
@@ -2886,6 +3145,70 @@ impl WorktreeCatalogService {
         self.inner
             .repository_observation_requests
             .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repository_fingerprint_ownership_for_test(
+        &self,
+        project_id: &str,
+    ) -> Option<(usize, bool, bool)> {
+        let entry = self.entry_for_project(project_id)?;
+        let state = lock(&entry.repository.state);
+        Some((
+            state.active_users,
+            state.pending_fingerprint.is_some(),
+            state.last_fingerprint.is_some(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidation_count_for_test(&self, project_id: &str) -> Option<usize> {
+        let entry = self.entry_for_project(project_id)?;
+        Some(lock(&entry.repository.state).invalidations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_repository_observation_publication_for_test(
+        &self,
+        repository_key: &str,
+    ) -> (Arc<Semaphore>, Arc<Semaphore>, Arc<Semaphore>) {
+        let entered = Arc::new(Semaphore::new(0));
+        let resume = Arc::new(Semaphore::new(0));
+        let finished = Arc::new(Semaphore::new(0));
+        *lock(&self.inner.repository_observation_publication_pause) =
+            Some(RepositoryObservationPublicationPause {
+                repository_key: repository_key.to_owned(),
+                entered: Arc::clone(&entered),
+                resume: Arc::clone(&resume),
+                finished: Arc::clone(&finished),
+            });
+        (entered, resume, finished)
+    }
+
+    #[cfg(test)]
+    async fn pause_repository_observation_publication_for_test(
+        &self,
+        observation: &CompletedObservation,
+    ) -> Option<Arc<Semaphore>> {
+        let pause = {
+            let mut configured = lock(&self.inner.repository_observation_publication_pause);
+            if configured
+                .as_ref()
+                .is_some_and(|pause| pause.repository_key == observation.repository_key)
+            {
+                configured.take()
+            } else {
+                None
+            }
+        }?;
+        pause.entered.add_permits(1);
+        pause
+            .resume
+            .acquire()
+            .await
+            .expect("repository observation publication release")
+            .forget();
+        Some(pause.finished)
     }
 
     #[cfg(test)]
@@ -3064,6 +3387,7 @@ impl Drop for CatalogSubscription {
 struct CompletedScan {
     repository_key: String,
     common_dir: PathBuf,
+    observation: Arc<CompletedObservation>,
     snapshot: Arc<WorktreeCatalogSnapshot>,
 }
 
@@ -3071,6 +3395,7 @@ struct CompletedObservation {
     repository_key: String,
     common_dir: PathBuf,
     inventory: GitWorktreeInventory,
+    real_scan_at: Instant,
 }
 
 struct ScanRequest<'a> {
@@ -3263,6 +3588,13 @@ fn persistence_error(error: crate::persistence::PersistenceError) -> CatalogErro
 
 struct GitInventorySource {
     repository: Arc<GitRepository>,
+}
+
+#[cfg(test)]
+pub(super) fn native_inventory_source_for_test(
+    repository: Arc<GitRepository>,
+) -> Arc<dyn InventorySource> {
+    Arc::new(GitInventorySource { repository })
 }
 
 impl InventorySource for GitInventorySource {

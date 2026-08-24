@@ -379,6 +379,8 @@ pub trait ProviderDriverFactory: Send + Sync {
 pub struct SupervisorOptions {
     pub queue_capacity: usize,
     pub session_idle_timeout: Duration,
+    #[cfg(test)]
+    idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 }
 
 impl Default for SupervisorOptions {
@@ -386,6 +388,8 @@ impl Default for SupervisorOptions {
         Self {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            #[cfg(test)]
+            idle_deadline_test_observer: None,
         }
     }
 }
@@ -540,6 +544,26 @@ struct ActivityDispatchCompletionTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleDeadlineEvaluation {
+    Stale,
+    Suspended,
+    Failed,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleDeadlineTestEvent {
+    Armed {
+        generation: u64,
+    },
+    Evaluated {
+        generation: u64,
+        outcome: IdleDeadlineEvaluation,
+    },
+}
+
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
@@ -564,6 +588,8 @@ struct SessionEntry {
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     activity_dispatch_capacity: usize,
     idle_timeout: Duration,
+    #[cfg(test)]
+    idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 }
 
 struct DetachedSession {
@@ -744,6 +770,8 @@ impl ProviderRuntimeSupervisor {
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
         let session_idle_timeout = options.session_idle_timeout;
+        #[cfg(test)]
+        let idle_deadline_test_observer = options.idle_deadline_test_observer.clone();
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
         let (activity_dispatch_sender, activity_dispatch_receiver) = mpsc::channel(queue_capacity);
@@ -770,6 +798,8 @@ impl ProviderRuntimeSupervisor {
                 worker_activity_cancellation,
                 #[cfg(test)]
                 activity_dispatch_completion_hook,
+                #[cfg(test)]
+                idle_deadline_test_observer,
             )
             .await;
         });
@@ -2109,6 +2139,7 @@ async fn run_supervisor(
     operational_log: Option<ProviderOperationalLog>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
@@ -2165,6 +2196,8 @@ async fn run_supervisor(
                     deferred_capacity,
                     session_idle_timeout,
                     activity_cancellation.clone(),
+                    #[cfg(test)]
+                    idle_deadline_test_observer.clone(),
                 )
                 .await;
                 let _ = response.send(result);
@@ -2595,16 +2628,33 @@ async fn run_supervisor(
                     Arc::ptr_eq(&entry.idle_generation, &idle_generation)
                         && entry.idle_generation.load(Ordering::Relaxed) == generation
                 });
-                if is_current
-                    && let Err(error) = suspend_idle_session(
-                        &engine.repositories(),
-                        &activity,
-                        &mut sessions,
-                        &thread_id,
+                let suspension = if is_current {
+                    Some(
+                        suspend_idle_session(
+                            &engine.repositories(),
+                            &activity,
+                            &mut sessions,
+                            &thread_id,
+                        )
+                        .await,
                     )
-                    .await
-                {
+                } else {
+                    None
+                };
+                if let Some(Err(error)) = &suspension {
                     tracing::warn!(%error, %thread_id, "failed to suspend idle provider session");
+                }
+                #[cfg(test)]
+                if let Some(observer) = &idle_deadline_test_observer {
+                    let outcome = match suspension {
+                        None => IdleDeadlineEvaluation::Stale,
+                        Some(Ok(())) => IdleDeadlineEvaluation::Suspended,
+                        Some(Err(_)) => IdleDeadlineEvaluation::Failed,
+                    };
+                    let _ = observer.send(IdleDeadlineTestEvent::Evaluated {
+                        generation,
+                        outcome,
+                    });
                 }
             }
             SupervisorMessage::Shutdown { response } => {
@@ -3170,6 +3220,7 @@ async fn launch_session(
     activity_dispatch_capacity: usize,
     idle_timeout: Duration,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) -> Result<(), ProviderRuntimeError> {
     let option_application_method = if inherited_activity_lifecycle.is_some() {
         "restart"
@@ -3326,6 +3377,8 @@ async fn launch_session(
         idle_generation.clone(),
         terminal_sender.clone(),
         idle_timeout,
+        #[cfg(test)]
+        idle_deadline_test_observer.clone(),
     );
     sessions.insert(
         request.thread_id.clone(),
@@ -3353,6 +3406,8 @@ async fn launch_session(
             activity_dispatch_sender,
             activity_dispatch_capacity,
             idle_timeout,
+            #[cfg(test)]
+            idle_deadline_test_observer,
         },
     );
     Ok(())
@@ -3761,6 +3816,10 @@ async fn restart_session(
     mut launch: ProviderLaunchRequest,
     operational_log: Option<&ProviderOperationalLog>,
 ) -> Result<(), ProviderRuntimeError> {
+    #[cfg(test)]
+    let idle_deadline_test_observer = sessions
+        .get(thread_id)
+        .and_then(|entry| entry.idle_deadline_test_observer.clone());
     let mut inherited_activity_lifecycle = None;
     let mut terminal_sender = None;
     let mut idle_timeout = None;
@@ -3826,6 +3885,8 @@ async fn restart_session(
         activity_cancellation.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
+        #[cfg(test)]
+        idle_deadline_test_observer,
     )
     .await
 }
@@ -3964,6 +4025,7 @@ fn spawn_event_pump(
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     idle_timeout: Duration,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) -> JoinHandle<()> {
     let activity_controller = activity.agent_activity_controller();
     tokio::spawn(async move {
@@ -4263,6 +4325,8 @@ fn spawn_event_pump(
                             launch.thread_id.clone(),
                             idle_generation.clone(),
                             idle_timeout,
+                            #[cfg(test)]
+                            idle_deadline_test_observer.clone(),
                         );
                     }
                 }
@@ -4276,9 +4340,14 @@ fn schedule_idle_suspend(
     thread_id: String,
     idle_generation: Arc<AtomicU64>,
     idle_timeout: Duration,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) {
     let generation = idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
     tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(observer) = &idle_deadline_test_observer {
+            let _ = observer.send(IdleDeadlineTestEvent::Armed { generation });
+        }
         tokio::time::sleep(idle_timeout).await;
         let _ = sender.send(SupervisorMessage::SuspendIdle {
             thread_id,
@@ -11980,6 +12049,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -12233,6 +12303,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -12424,6 +12495,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -15032,9 +15104,12 @@ done
 
     #[tokio::test]
     async fn completed_idle_session_is_suspended_without_losing_resume_state() {
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
         let engine = supervisor_engine().await;
         let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
         let (events_tx, events_rx) = mpsc::channel(2);
+        let (idle_deadline_tx, mut idle_deadline_rx) = mpsc::unbounded_channel();
         let supervisor = super::ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(SupervisorFactory {
@@ -15046,7 +15121,8 @@ done
             )),
             super::SupervisorOptions {
                 queue_capacity: 2,
-                session_idle_timeout: std::time::Duration::from_millis(100),
+                session_idle_timeout: IDLE_TIMEOUT,
+                idle_deadline_test_observer: Some(idle_deadline_tx),
             },
         );
         let temp = TempDir::new().unwrap();
@@ -15080,21 +15156,26 @@ done
                 .unwrap();
         }
 
-        for _ in 0..100 {
-            let projected = load_snapshot(&engine.repositories())
-                .await
-                .unwrap()
-                .messages
-                .iter()
-                .any(|message| message.message_id == "assistant-idle" && !message.is_streaming);
-            if projected {
-                break;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let projected = load_snapshot(&engine.repositories())
+                    .await
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| message.message_id == "assistant-idle" && !message.is_streaming);
+                if projected {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("first completed assistant message is projected");
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Armed { generation: 1 })
+        );
         let follow_up: OrchestrationCommand = serde_json::from_value(json!({
             "type":"thread.turn.start", "commandId":"follow-up", "threadId":"t1",
             "message":{"messageId":"user-follow-up","role":"user","text":"next","attachments":[]},
@@ -15104,11 +15185,25 @@ done
         }))
         .unwrap();
         supervisor.handle_orchestration(follow_up).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::pause();
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Evaluated {
+                generation: 1,
+                outcome: super::IdleDeadlineEvaluation::Stale,
+            })
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the stale pre-follow-up idle deadline must not suspend the session"
+        );
         assert_eq!(state.lock().unwrap().shutdowns, 0);
+        tokio::time::resume();
 
         for (event_type, payload) in [
             (
@@ -15135,35 +15230,47 @@ done
                 .await
                 .unwrap();
         }
-        for _ in 0..100 {
-            let projected = load_snapshot(&engine.repositories())
-                .await
-                .unwrap()
-                .messages
-                .iter()
-                .any(|message| {
-                    message.message_id == "assistant-follow-up" && !message.is_streaming
-                });
-            if projected {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        timeout(std::time::Duration::from_secs(1), async {
+        timeout(Duration::from_secs(5), async {
             loop {
-                if state.lock().unwrap().shutdowns == 1 {
+                let projected = load_snapshot(&engine.repositories())
+                    .await
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.message_id == "assistant-follow-up" && !message.is_streaming
+                    });
+                if projected {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("idle provider is suspended");
+        .expect("follow-up completed assistant message is projected");
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Armed { generation: 3 })
+        );
+        tokio::time::pause();
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Evaluated {
+                generation: 3,
+                outcome: super::IdleDeadlineEvaluation::Suspended,
+            })
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the current idle deadline suspends the session"
+        );
+        assert_eq!(state.lock().unwrap().shutdowns, 1);
+        tokio::time::resume();
 
         let runtime = engine
             .repositories()
@@ -16030,7 +16137,7 @@ done
             result
         });
 
-        let diagnostic_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let diagnostic_deadline = ProviderFixtureDeadline::integration().instant();
         let observation = tokio::time::timeout_at(diagnostic_deadline, async {
             initialize_request_queued
                 .wait_after(initialize_request_checkpoint)

@@ -198,7 +198,7 @@ import {
   SourceControlRepositoryInfo,
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
-import { VcsError } from "./vcs.ts";
+import { VcsError, VcsStatusSummary } from "./vcs.ts";
 import {
   ProjectWorktreeDiscoveryPolicy,
   VcsWorktreeCatalogSnapshot,
@@ -414,6 +414,7 @@ export const WS_METHODS = {
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
+  subscribeVcsStatusSummary: "subscribeVcsStatusSummary",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -711,6 +712,18 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
   success: VcsStatusStreamEvent,
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+  stream: true,
+});
+
+export const WsSubscribeVcsStatusSummaryRpc = Rpc.make(WS_METHODS.subscribeVcsStatusSummary, {
+  payload: VcsStatusInput,
+  success: VcsStatusSummary,
   error: Schema.Union([
     GitManagerServiceError,
     WorkspaceUnavailableError,
@@ -1299,6 +1312,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
   WsSubscribeVcsStatusRpc,
+  WsSubscribeVcsStatusSummaryRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,
