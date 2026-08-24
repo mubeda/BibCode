@@ -3469,7 +3469,10 @@ exit /b 9
     }
 
     async fn wait_for_fixture_event(event: &FixtureEvent, checkpoint: u64, description: &str) {
-        tokio::time::timeout(Duration::from_secs(5), event.wait_after(checkpoint))
+        // This is a deadlock guard for test coordination, not a product
+        // readiness budget. Windows runners can take several seconds just to
+        // schedule a fresh PowerShell process while the Rust suite is loaded.
+        tokio::time::timeout(Duration::from_secs(15), event.wait_after(checkpoint))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
     }

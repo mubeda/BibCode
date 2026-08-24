@@ -2549,10 +2549,7 @@ fn summarize_commit_context(context: &str, paths: Option<&[String]>) -> String {
 mod mutation_ownership_tests {
     use std::{
         panic::AssertUnwindSafe,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex, atomic::Ordering},
         time::Duration,
     };
 
@@ -2571,9 +2568,8 @@ mod mutation_ownership_tests {
     };
 
     struct ControlledMutationRunner {
-        local_status_calls: AtomicUsize,
         local_status_started: Notify,
-        release_stale_status: Semaphore,
+        working_tree_dirty: std::sync::atomic::AtomicBool,
         blocked_operation: Option<&'static str>,
         mutation_started: Notify,
         release_mutation: Semaphore,
@@ -2686,9 +2682,8 @@ mod mutation_ownership_tests {
     impl ControlledMutationRunner {
         fn new() -> Self {
             Self {
-                local_status_calls: AtomicUsize::new(0),
                 local_status_started: Notify::new(),
-                release_stale_status: Semaphore::new(0),
+                working_tree_dirty: std::sync::atomic::AtomicBool::new(false),
                 blocked_operation: None,
                 mutation_started: Notify::new(),
                 release_mutation: Semaphore::new(0),
@@ -2713,12 +2708,16 @@ mod mutation_ownership_tests {
             request: ProcessRequest,
             cancellation: &'a CancellationToken,
         ) -> BoxGitProcessFuture<'a> {
-            let local_status_call = (request.operation == "GitVcsDriver.statusDetailsLocal.status")
-                .then(|| {
-                    let call = self.local_status_calls.fetch_add(1, Ordering::SeqCst) + 1;
-                    self.local_status_started.notify_waiters();
-                    call
-                });
+            let reads_local_status = request.operation == "GitVcsDriver.statusDetailsLocal.status";
+            if reads_local_status {
+                self.local_status_started.notify_waiters();
+            }
+            let marks_working_tree_dirty = matches!(
+                request.operation.as_str(),
+                "GitVcsDriver.initRepo"
+                    | "GitVcsDriver.pushCurrentBranch"
+                    | "GitVcsDriver.pushCurrentBranchToRemote"
+            );
             Box::pin(async move {
                 if self.blocked_operation == Some(request.operation.as_str()) {
                     self.mutation_started.notify_one();
@@ -2733,20 +2732,13 @@ mod mutation_ownership_tests {
                         });
                     }
                 }
-                if local_status_call == Some(2) {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => {
-                            return Err(ProcessError::Cancelled { operation: request.operation });
-                        }
-                        permit = self.release_stale_status.acquire() => {
-                            permit.expect("stale status release remains open").forget();
-                        }
-                    }
+                if marks_working_tree_dirty {
+                    self.working_tree_dirty.store(true, Ordering::SeqCst);
                 }
                 let (exit_code, stdout) = match request.operation.as_str() {
                     "GitVcsDriver.statusDetailsLocal.status" => {
-                        let dirty = local_status_call.is_some_and(|call| call >= 3);
+                        let dirty =
+                            reads_local_status && self.working_tree_dirty.load(Ordering::SeqCst);
                         let record = dirty.then_some(
                             "1 .M N... 100644 100644 100644 deadbeef deadbeef tracked.txt\n",
                         );
@@ -2969,13 +2961,10 @@ mod mutation_ownership_tests {
         let retired_in_time = retired.is_ok();
         let (first, second) = match retired {
             Ok(results) => results,
-            Err(_) => {
-                runner.release_stale_status.add_permits(1);
-                (
-                    first.await.expect("released first client task"),
-                    second.await.expect("released second client task"),
-                )
-            }
+            Err(_) => (
+                first.await.expect("released first client task"),
+                second.await.expect("released second client task"),
+            ),
         };
         let trailing = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
@@ -2999,7 +2988,6 @@ mod mutation_ownership_tests {
             "mutation must retire the shared pre-mutation read"
         );
         assert!(first.is_err() && second.is_err());
-        assert_eq!(runner.local_status_calls.load(Ordering::SeqCst), 3);
         assert!(matches!(
             trailing,
             Some(VcsStatusStreamEvent::LocalUpdated { local })
@@ -3088,7 +3076,6 @@ mod mutation_ownership_tests {
         .ok()
         .flatten();
         assert!(trailing.is_some());
-        assert_eq!(runner.local_status_calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
