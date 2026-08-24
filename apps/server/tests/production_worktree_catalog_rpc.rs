@@ -137,7 +137,7 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
         .subscribe("project-1")
         .await
         .expect("catalog subscription");
-    let _initial_catalog = catalog_subscription.initial_latest();
+    let initial_catalog = catalog_subscription.initial_latest();
     request(
         fixture.socket(),
         "9901",
@@ -203,6 +203,11 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
     assert_eq!(panel.worktree_path.as_deref(), Some(managed_path.as_str()));
     assert_eq!(panel.branch.as_deref(), Some("feature/managed-create"));
 
+    // The explicit refresh below is intentionally allowed to coalesce with an
+    // in-flight catalog scan. Settle the managed-create invalidation first so
+    // the external worktree is not created behind an already-running scan.
+    let _managed_catalog =
+        wait_for_catalog_generation(&mut catalog_subscription, initial_catalog.generation).await;
     let target =
         fixture.create_named_external_worktree("retarget-target", "feature/retarget-target");
     request(

@@ -477,6 +477,19 @@ describe("header rendering", () => {
     expect(markup).toContain("Expand all folders");
   });
 
+  it("shows and disables a user-initiated rescan while it is pending", () => {
+    setEntries([entry("a.ts", "file")]);
+    harness.seedState((initial) => initial === false, true);
+
+    const markup = renderPanel();
+
+    expect(markup).toContain("Refreshing…");
+    expect(markup).toContain('aria-busy="true"');
+    expect(markup).toContain('aria-label="Refresh workspace files"');
+    expect(markup).toContain('disabled=""');
+    expect(markup).toContain("animate-spin");
+  });
+
   it("renders the error surface instead of the tree when the query fails", () => {
     testState.entriesQuery = {
       data: null,
@@ -808,6 +821,27 @@ describe("drag and drop", () => {
     renderPanel(baseProps({ workspaceUnavailable: "Workspace unavailable." }));
     expect(dragAndDrop().canDrag(["src/app.ts"])).toBe(false);
   });
+
+  it("resyncs Pierre's optimistic move when availability changes before completion", () => {
+    harness.persistRefs = true;
+    setEntries([entry("src/app.ts", "file")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    renderPanel();
+    harness.runEffects();
+    const staleDropComplete = dragAndDrop().onDropComplete;
+
+    renderPanel(baseProps({ workspaceUnavailable: "Workspace unavailable." }));
+    harness.runEffects();
+    staleDropComplete({
+      draggedPaths: ["src/app.ts"],
+      operation: "move",
+      target: directoryTarget("docs/"),
+    });
+
+    expect(testState.commandCalls.some((call) => call.label === "renameEntry")).toBe(false);
+    expect(refresh).toHaveBeenCalledOnce();
+  });
 });
 
 describe("refresh", () => {
@@ -828,6 +862,56 @@ describe("refresh", () => {
       input: { cwd: "/workspace/demo", refresh: true },
     });
     expect(refresh).toHaveBeenCalled();
+  });
+
+  it("reports a failed server rescan and still re-lists the last-known index", async () => {
+    setEntries([entry("src/app.ts", "file")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    testState.commandResults["refreshEntries"] = {
+      _tag: "Failure",
+      error: new Error("index rebuild failed"),
+    };
+    harness.seedState((initial) => initial === null, null);
+    harness.seedState((initial) => initial === null, { x: 5, y: 6 });
+    renderPanel();
+
+    const menus = ui.filter("FileTreeContextMenu");
+    (menus[menus.length - 1]!["actions"] as { onRefresh: () => void }).onRefresh();
+    await flushPromises();
+
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Failed to refresh workspace files",
+        description: "index rebuild failed",
+      }),
+    );
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces repeated rescan requests while one rebuild is in flight", async () => {
+    setEntries([entry("src/app.ts", "file")]);
+    const refresh = vi.fn();
+    testState.entriesQuery.refresh = refresh;
+    const pending = deferred<{ _tag: "Success"; value: Record<string, never> }>();
+    testState.commandResults["refreshEntries"] = pending.promise;
+    harness.seedState((initial) => initial === null, null);
+    harness.seedState((initial) => initial === null, { x: 5, y: 6 });
+    renderPanel();
+
+    const menus = ui.filter("FileTreeContextMenu");
+    const onRefresh = (menus[menus.length - 1]!["actions"] as { onRefresh: () => void }).onRefresh;
+    onRefresh();
+    onRefresh();
+
+    expect(testState.commandCalls.filter((call) => call.label === "refreshEntries")).toHaveLength(
+      1,
+    );
+    expect(refresh).not.toHaveBeenCalled();
+
+    pending.resolve({ _tag: "Success", value: {} });
+    await flushPromises();
+    expect(refresh).toHaveBeenCalledOnce();
   });
 
   it("re-lists when the subscription starts with a server resync signal", () => {

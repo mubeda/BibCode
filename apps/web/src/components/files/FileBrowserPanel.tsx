@@ -236,6 +236,8 @@ export default function FileBrowserPanel({
   const remapFileSurfaces = useRightPanelStore((state) => state.remapFileSurfaces);
   const closeFileSurfacesUnder = useRightPanelStore((state) => state.closeFileSurfacesUnder);
 
+  const [isRescanning, setIsRescanning] = useState(false);
+  const rescanInFlightRef = useRef(false);
   const [dialogRequest, setDialogRequest] = useState<FileEntryDialogRequest | null>(null);
   const workspaceUnavailableRef = useRef(workspaceUnavailable);
   // Right-click on empty tree space: Pierre only surfaces row menus, so a background menu is
@@ -291,14 +293,27 @@ export default function FileBrowserPanel({
   // server has. The projects.* mutations already drop the server's cached index themselves, so they
   // must NOT come through here; a second rebuild request would ship the whole entry list twice.
   const rescanFiles = useCallback(() => {
+    if (rescanInFlightRef.current) return;
+    rescanInFlightRef.current = true;
+    setIsRescanning(true);
     void (async () => {
       try {
-        await refreshServerEntries({ environmentId, input: { cwd, refresh: true } });
+        const result = await refreshServerEntries({
+          environmentId,
+          input: { cwd, refresh: true },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          showMutationError(squashAtomCommandFailure(result), "Failed to refresh workspace files");
+        }
+      } catch (error) {
+        showMutationError(error, "Failed to refresh workspace files");
       } finally {
+        rescanInFlightRef.current = false;
+        setIsRescanning(false);
         entriesQuery.refresh();
       }
     })();
-  }, [cwd, entriesQuery, environmentId, refreshServerEntries]);
+  }, [cwd, entriesQuery, environmentId, refreshServerEntries, showMutationError]);
 
   const addAsProject = useCallback(
     (workspaceRoot: string) => {
@@ -561,7 +576,10 @@ export default function FileBrowserPanel({
   // to resync the tree with the server.
   const moveDroppedEntries = useCallback(
     (event: FileTreeDropResult) => {
-      if (workspaceUnavailableRef.current) return;
+      if (workspaceUnavailableRef.current) {
+        entriesQuery.refresh();
+        return;
+      }
       const targetDir =
         event.target.kind === "root" ? "" : stripTrailingSlash(event.target.directoryPath ?? "");
       void (async () => {
@@ -755,9 +773,11 @@ export default function FileBrowserPanel({
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-foreground">{projectName}</div>
           <div className="truncate text-[10px] leading-none text-muted-foreground">
-            {entriesQuery.isPending && entriesQuery.data === null
-              ? "Indexing…"
-              : `${fileCount.toLocaleString()} files`}
+            {isRescanning
+              ? "Refreshing…"
+              : entriesQuery.isPending && entriesQuery.data === null
+                ? "Indexing…"
+                : `${fileCount.toLocaleString()} files`}
             {entriesQuery.data?.truncated ? " · partial" : ""}
           </div>
         </div>
@@ -789,9 +809,13 @@ export default function FileBrowserPanel({
           type="button"
           className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
           aria-label="Refresh workspace files"
+          aria-busy={isRescanning}
+          disabled={isRescanning}
           onClick={rescanFiles}
         >
-          <RefreshCw className={cn("size-3.5", entriesQuery.isPending && "animate-spin")} />
+          <RefreshCw
+            className={cn("size-3.5", (entriesQuery.isPending || isRescanning) && "animate-spin")}
+          />
         </button>
       </div>
       {entriesQuery.error && entriesQuery.data === null ? (

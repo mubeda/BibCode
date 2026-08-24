@@ -432,6 +432,7 @@ async fn mcp_request(state: HttpRoutesState, method: Method, request: Request) -
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn bounded_json(body: Body, limit: usize) -> Result<Value, Response> {
     let body = to_bytes(body, limit)
         .await

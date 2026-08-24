@@ -29,7 +29,11 @@ permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
 an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
 Selecting a free local branch suggests its name and enables **Reuse branch** by
 default; edited names are preserved, and branches already checked out elsewhere
-continue through the server's safe suffixed-branch flow.
+continue through the server's safe suffixed-branch flow. Typing an exact local
+or remote branch selects that ref without repeating the same value as a result
+row below the input. If the chosen remote branch becomes local before submit,
+the server reuses it when free and still suffixes it when another worktree owns
+it.
 
 Use Add Project to open one existing project folder, clone a Git URL, or create
 a new Git repository. On macOS and Linux desktop, Add Project uses this device
@@ -310,8 +314,10 @@ The Files surface is a full file manager for the active workspace:
   area, to move them there. Entries already in the target folder stay put. A
   move the server rejects is reported and the tree resyncs to the server's state
   rather than keeping the dragged row in its new place. Dragging is disabled
-  while the workspace is unavailable. Dragging entries to or from the operating
-  system's file manager is not supported.
+  while the workspace is unavailable. If availability changes during a drag,
+  the optimistic move is likewise resynced instead of remaining on screen.
+  Dragging entries to or from the operating system's file manager is not
+  supported.
 - Open file tabs follow renames and moves, and close when their file is deleted.
 - The tree follows changes made outside BiBCode. While the Files surface is open,
   the server watches the workspace and the tree picks up files and folders
@@ -321,7 +327,10 @@ The Files surface is a full file manager for the active workspace:
 - The panel header offers collapse all folders, expand all folders, search, and
   Refresh. **Refresh** rescans the workspace on the server immediately, rather
   than waiting for the next check. The tree background context menu offers the
-  same Refresh.
+  same Refresh. While that rescan is pending the action is disabled and labelled
+  **Refreshing…**; repeated requests share that same rescan. A server or
+  transport failure is reported and the existing tree remains available after
+  its query is reconciled.
 - Saves to built-in Git classification controls such as `.gitignore` and files
   under `.git` automatically rescan the tree. If the repository configures an
   arbitrary custom `core.excludesFile`, editing that custom file is not detected

@@ -1133,7 +1133,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           }}
         />
       ) : null}
-      {!agentSubRowStatus && unresolvedDelivery ? (
+      {unresolvedDelivery ? (
         <div
           data-thread-selection-safe
           data-testid={`thread-delivery-row-${thread.id}`}
@@ -1259,9 +1259,12 @@ function SidebarPrimaryRow(props: {
       input: { cwd: project.workspaceRoot },
     }),
   );
+  const gitStatusData = gitStatus.data;
   const liveBranch =
-    gitStatus.data?.refName ??
-    (gitStatus.data && "detachedHead" in gitStatus.data ? gitStatus.data.detachedHead : null);
+    gitStatusData && !("stale" in gitStatusData && gitStatusData.stale)
+      ? (gitStatusData.refName ??
+        ("detachedHead" in gitStatusData ? gitStatusData.detachedHead : null))
+      : null;
   const title = liveBranch ?? primaryThread?.branch ?? project.displayName;
   const statusPill = primaryThread ? resolveThreadStatusPill({ thread: primaryThread }) : null;
   const primaryThreadKey = primaryThread

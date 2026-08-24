@@ -207,6 +207,40 @@ pub struct GitVcsRpcServices {
     terminal: Option<TerminalManager>,
     repositories: Option<Repositories>,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    #[cfg(test)]
+    status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
+}
+
+#[cfg(test)]
+struct StatusStreamEnrichmentTestHook {
+    started: Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for StatusStreamEnrichmentTestHook {
+    fn default() -> Self {
+        Self {
+            started: Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl StatusStreamEnrichmentTestHook {
+    async fn block(&self, cancellation: &CancellationToken) {
+        self.started.notify_one();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {}
+            permit = self.release.acquire() => {
+                if let Ok(permit) = permit {
+                    permit.forget();
+                }
+            }
+        }
+    }
 }
 
 impl Default for GitVcsRpcServices {
@@ -300,6 +334,8 @@ impl GitVcsRpcServices {
             terminal,
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
+            #[cfg(test)]
+            status_stream_enrichment_test_hook: None,
         }
     }
 
@@ -321,6 +357,15 @@ impl GitVcsRpcServices {
         let mut services = Self::with_repository(repository);
         services.github_runner = github_runner;
         services
+    }
+
+    #[cfg(test)]
+    fn with_status_stream_enrichment_test_hook(
+        mut self,
+        hook: Arc<StatusStreamEnrichmentTestHook>,
+    ) -> Self {
+        self.status_stream_enrichment_test_hook = Some(hook);
+        self
     }
 
     #[must_use]
@@ -1078,6 +1123,8 @@ impl GitVcsRpcServices {
         let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
         let availability = self.availability_registry.clone();
+        #[cfg(test)]
+        let enrichment_test_hook = self.status_stream_enrichment_test_hook.clone();
         tokio::spawn(async move {
             let input = match decode::<CwdInput>(request.payload, "subscribeVcsStatus") {
                 Ok(input) => input,
@@ -1120,6 +1167,7 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
+            let mut enrichment: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
             loop {
                 tokio::select! {
                     biased;
@@ -1133,45 +1181,70 @@ impl GitVcsRpcServices {
                     _ = cancellation.cancelled() => break,
                     publication = subscription.recv_publication() => {
                         let Some(publication) = publication else { break };
-                        let mut event = publication.value;
-                        match &mut event {
-                            VcsStatusStreamEvent::Snapshot { local, remote } => {
-                                if let Some(remote) = remote {
-                                    enrich_remote_pull_request(
-                                        &pull_requests,
-                                        &input.cwd,
-                                        local,
-                                        remote,
-                                        &operation_cancellation,
-                                    ).await;
-                                }
-                            }
-                            VcsStatusStreamEvent::LocalUpdated { .. } => {}
-                            VcsStatusStreamEvent::RemoteUpdated { remote } => {
-                                if let Some(remote) = remote {
-                                    enrich_remote_pull_request(
-                                        &pull_requests,
-                                        &input.cwd,
-                                        &publication.local,
-                                        remote,
-                                        &operation_cancellation,
-                                    ).await;
-                                }
-                            }
-                        }
-                        let chunk = serde_json::to_value(event).map(|event| vec![event]).map_err(|error| {
-                            request_error("subscribeVcsStatus", &error.to_string())
-                        });
-                        let permit = match sender.reserve().await {
-                            Ok(permit) => permit,
-                            Err(_) => break,
+                        stop_status_stream_enrichment(&mut enrichment).await;
+                        let enrichment_remote = match &publication.value {
+                            VcsStatusStreamEvent::Snapshot { remote, .. }
+                            | VcsStatusStreamEvent::RemoteUpdated { remote } => remote.clone(),
+                            VcsStatusStreamEvent::LocalUpdated { .. } => None,
                         };
-                        let _ = broadcaster.publish_if_fence_current(&publication.fence, || {
-                            permit.send(chunk);
-                        });
+                        if !send_status_stream_event(
+                            &sender,
+                            &broadcaster,
+                            &publication.fence,
+                            publication.value,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if let Some(remote) = enrichment_remote {
+                            let task_cancellation = operation_cancellation.child_token();
+                            let task_token = task_cancellation.clone();
+                            let task_sender = sender.clone();
+                            let task_broadcaster = broadcaster.clone();
+                            let task_pull_requests = pull_requests.clone();
+                            let task_cwd = input.cwd.clone();
+                            let task_local = publication.local;
+                            let task_fence = publication.fence;
+                            #[cfg(test)]
+                            let task_test_hook = enrichment_test_hook.clone();
+                            let task = tokio::spawn(async move {
+                                #[cfg(test)]
+                                if let Some(hook) = &task_test_hook {
+                                    hook.block(&task_token).await;
+                                }
+                                if task_token.is_cancelled() {
+                                    return;
+                                }
+                                let mut enriched = remote.clone();
+                                enrich_remote_pull_request(
+                                    &task_pull_requests,
+                                    &task_cwd,
+                                    &task_local,
+                                    &mut enriched,
+                                    &task_token,
+                                )
+                                .await;
+                                if task_token.is_cancelled() || enriched == remote {
+                                    return;
+                                }
+                                let _ = send_status_stream_event(
+                                    &task_sender,
+                                    &task_broadcaster,
+                                    &task_fence,
+                                    VcsStatusStreamEvent::RemoteUpdated {
+                                        remote: Some(enriched),
+                                    },
+                                )
+                                .await;
+                            });
+                            enrichment = Some((task_cancellation, task));
+                        }
                     }
                 }
             }
+            operation_cancellation.cancel();
+            stop_status_stream_enrichment(&mut enrichment).await;
         });
         receiver
     }
@@ -2158,6 +2231,33 @@ async fn finish_fenced_enrichment<T>(
     broadcaster.publish_if_fence_current(&fence, || value)
 }
 
+async fn send_status_stream_event(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    broadcaster: &StatusBroadcaster,
+    fence: &StatusReadFence,
+    event: VcsStatusStreamEvent,
+) -> bool {
+    let chunk = serde_json::to_value(event)
+        .map(|event| vec![event])
+        .map_err(|error| request_error("subscribeVcsStatus", &error.to_string()));
+    let permit = match sender.reserve().await {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    let _ = broadcaster.publish_if_fence_current(fence, || permit.send(chunk));
+    true
+}
+
+async fn stop_status_stream_enrichment(
+    enrichment: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+) {
+    if let Some((cancellation, task)) = enrichment.take() {
+        cancellation.cancel();
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 async fn enrich_remote_pull_request(
     pull_requests: &PullRequestService,
     cwd: &std::path::Path,
@@ -2717,6 +2817,88 @@ mod mutation_ownership_tests {
         request.payload["repository"] = json!(repository);
         request.payload["remoteName"] = json!(remote);
         request
+    }
+
+    #[tokio::test]
+    async fn blocked_pull_request_enrichment_cannot_delay_base_or_local_publications() {
+        let root = tempfile::tempdir().expect("repository root");
+        let runner = Arc::new(ControlledMutationRunner::new());
+        let repository = Arc::new(GitRepository::with_runner_for_test(runner));
+        let hook = Arc::new(StatusStreamEnrichmentTestHook::default());
+        let services = GitVcsRpcServices::with_repository(repository)
+            .with_status_stream_enrichment_test_hook(Arc::clone(&hook));
+        let cancellation = CancellationToken::new();
+        let mut stream = services.status_stream(
+            request("subscribeVcsStatus", root.path()),
+            cancellation.clone(),
+        );
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("initial snapshot deadline")
+            .expect("status stream remains open")
+            .expect("initial snapshot succeeds");
+        assert_eq!(snapshot[0]["_tag"], "snapshot");
+        services
+            .broadcaster
+            .publish_status_event_for_test(
+                root.path(),
+                VcsStatusStreamEvent::RemoteUpdated {
+                    remote: Some(VcsStatusRemoteResult {
+                        has_upstream: true,
+                        ahead_count: 1,
+                        behind_count: 0,
+                        ahead_of_default_count: Some(1),
+                        pr: None,
+                    }),
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), hook.started.notified())
+            .await
+            .expect("enrichment start deadline");
+        let remote = tokio::time::timeout(Duration::from_millis(200), stream.recv())
+            .await
+            .expect("base publication must not wait for PR enrichment")
+            .expect("status stream remains open")
+            .expect("base publication succeeds");
+        assert_eq!(remote[0]["_tag"], "remoteUpdated");
+
+        services
+            .broadcaster
+            .publish_status_event_for_test(
+                root.path(),
+                VcsStatusStreamEvent::LocalUpdated {
+                    local: VcsStatusLocalResult {
+                        is_repo: true,
+                        source_control_provider: None,
+                        has_primary_remote: false,
+                        is_default_ref: false,
+                        ref_name: Some("main".to_owned()),
+                        default_ref_name: Some("main".to_owned()),
+                        has_working_tree_changes: true,
+                        working_tree: Default::default(),
+                    },
+                },
+            )
+            .await;
+        let local = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let chunk = stream
+                    .recv()
+                    .await
+                    .expect("status stream remains open")
+                    .expect("local publication succeeds");
+                if chunk[0]["_tag"] == "localUpdated" {
+                    return chunk;
+                }
+            }
+        })
+        .await
+        .expect("local publication must overtake blocked PR enrichment");
+        assert_eq!(local[0]["_tag"], "localUpdated");
+
+        cancellation.cancel();
+        hook.release.add_permits(1);
     }
 
     #[tokio::test]

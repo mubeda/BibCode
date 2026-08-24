@@ -76,7 +76,12 @@ export function resolveThreadPr(
   threadBranch: string | null,
   gitStatus: ThreadVcsStatus | null,
 ): ThreadPr | null {
-  if (threadBranch === null || gitStatus === null || gitStatus.refName !== threadBranch) {
+  if (
+    threadBranch === null ||
+    gitStatus === null ||
+    ("stale" in gitStatus && gitStatus.stale) ||
+    gitStatus.refName !== threadBranch
+  ) {
     return null;
   }
 

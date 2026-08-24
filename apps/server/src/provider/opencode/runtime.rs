@@ -147,6 +147,7 @@ struct RuntimeInner {
     assistant_text: Mutex<HashMap<String, String>>,
     events_tx: mpsc::UnboundedSender<OpenCodeRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<OpenCodeRuntimeEvent>>,
+    event_stream_ended: CancellationToken,
     event_counter: Mutex<u64>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
     pending_permissions: Mutex<HashMap<String, Option<String>>>,
@@ -482,6 +483,7 @@ impl OpenCodeSessionRuntime {
                 assistant_text: Mutex::new(HashMap::new()),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
+                event_stream_ended: CancellationToken::new(),
                 event_counter: Mutex::new(0),
                 pending_questions: Mutex::new(HashMap::new()),
                 pending_permissions: Mutex::new(HashMap::new()),
@@ -590,9 +592,9 @@ impl OpenCodeSessionRuntime {
             .to_owned();
         *self.inner.session_id.lock().await = Some(session_id.clone());
         self.reset_activity_root(&session_id).await;
-        self.start_event_pump().await?;
         self.emit("session.started", None, None, json!({})).await;
         self.emit("thread.started", None, None, json!({})).await;
+        self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
         Ok(session_id)
     }
@@ -617,10 +619,10 @@ impl OpenCodeSessionRuntime {
         }
         *self.inner.session_id.lock().await = Some(session_id.to_owned());
         self.reset_activity_root(session_id).await;
-        self.start_event_pump().await?;
         self.emit("session.started", None, None, json!({ "resumed": true }))
             .await;
         self.emit("thread.started", None, None, json!({})).await;
+        self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
         Ok(session_id.to_owned())
     }
@@ -1158,11 +1160,22 @@ impl OpenCodeSessionRuntime {
             json!({ "reason": "Session stopped." }),
         )
         .await;
+        self.end_event_stream();
         Ok(())
     }
 
     pub async fn next_event(&self) -> Option<OpenCodeRuntimeEvent> {
-        self.inner.events_rx.lock().await.recv().await
+        let mut events = self.inner.events_rx.lock().await;
+        loop {
+            if self.inner.event_stream_ended.is_cancelled() {
+                return events.try_recv().ok();
+            }
+            tokio::select! {
+                biased;
+                event = events.recv() => return event,
+                () = self.inner.event_stream_ended.cancelled() => {}
+            }
+        }
     }
 
     pub async fn collect_events(&self, expected: usize) -> Vec<OpenCodeRuntimeEventStableView> {
@@ -1193,7 +1206,8 @@ impl OpenCodeSessionRuntime {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(inner) = runtime.upgrade() {
-                        OpenCodeSessionRuntime::internal(inner)
+                        let runtime = OpenCodeSessionRuntime::internal(inner);
+                        runtime
                             .emit(
                                 "runtime.error",
                                 None,
@@ -1204,6 +1218,7 @@ impl OpenCodeSessionRuntime {
                                 }),
                             )
                             .await;
+                        runtime.end_event_stream();
                     }
                     return;
                 }
@@ -1226,7 +1241,8 @@ impl OpenCodeSessionRuntime {
                     "provider_error"
                 };
                 if let Some(inner) = runtime.upgrade() {
-                    OpenCodeSessionRuntime::internal(inner)
+                    let runtime = OpenCodeSessionRuntime::internal(inner);
+                    runtime
                         .emit(
                             "runtime.error",
                             None,
@@ -1234,6 +1250,7 @@ impl OpenCodeSessionRuntime {
                             json!({ "message": message, "class": class }),
                         )
                         .await;
+                    runtime.end_event_stream();
                 }
                 return;
             }
@@ -1295,7 +1312,8 @@ impl OpenCodeSessionRuntime {
                         // server presents. Saying nothing made that look like a
                         // hung BiBCode.
                         if let Some(inner) = runtime.upgrade() {
-                            OpenCodeSessionRuntime::internal(inner)
+                            let runtime = OpenCodeSessionRuntime::internal(inner);
+                            runtime
                                 .emit(
                                     "session.exited",
                                     None,
@@ -1303,12 +1321,14 @@ impl OpenCodeSessionRuntime {
                                     json!({ "reason": "OpenCode closed its event stream." }),
                                 )
                                 .await;
+                            runtime.end_event_stream();
                         }
                         break;
                     }
                     Err(error) => {
                         if let Some(inner) = runtime.upgrade() {
-                            OpenCodeSessionRuntime::internal(inner)
+                            let runtime = OpenCodeSessionRuntime::internal(inner);
+                            runtime
                                 .emit(
                                     "runtime.error",
                                     None,
@@ -1316,6 +1336,7 @@ impl OpenCodeSessionRuntime {
                                     json!({ "message": error.to_string() }),
                                 )
                                 .await;
+                            runtime.end_event_stream();
                         }
                         break;
                     }
@@ -1726,6 +1747,10 @@ impl OpenCodeSessionRuntime {
             native_event_id: None,
             activity: Vec::new(),
         });
+    }
+
+    fn end_event_stream(&self) {
+        self.inner.event_stream_ended.cancel();
     }
 
     async fn reset_activity_root(&self, root_session_id: &str) {

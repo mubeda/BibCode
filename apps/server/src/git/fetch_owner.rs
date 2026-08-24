@@ -9,7 +9,7 @@ use std::{
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::{sync::watch, time::Instant};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{GitCommandError, GitRepository};
 
@@ -25,6 +25,7 @@ struct Inner {
     repository: Arc<GitRepository>,
     interval: watch::Sender<Duration>,
     state: Mutex<State>,
+    tasks: TaskTracker,
     #[cfg(test)]
     attachments_changed: Notify,
     #[cfg(test)]
@@ -35,6 +36,7 @@ struct Inner {
 
 #[derive(Default)]
 struct State {
+    closed: bool,
     next_generation: u64,
     repositories: HashMap<PathBuf, RepositoryState>,
     worktree_keys: HashMap<PathBuf, PathBuf>,
@@ -68,6 +70,7 @@ impl RepositoryFetchOwner {
                 repository,
                 interval,
                 state: Mutex::new(State::default()),
+                tasks: TaskTracker::new(),
                 #[cfg(test)]
                 attachments_changed: Notify::new(),
                 #[cfg(test)]
@@ -90,6 +93,9 @@ impl RepositoryFetchOwner {
         let mut spawn = None;
         {
             let mut state = self.lock_state();
+            if state.closed {
+                return;
+            }
             if let Some(previous_key) = state.worktree_keys.get(&cwd).cloned()
                 && previous_key != repository_key
             {
@@ -127,12 +133,12 @@ impl RepositoryFetchOwner {
             worktree.subscribers.insert(subscriber_id);
             worktree.ref_name = ref_name;
             worktree.reconcile = reconcile;
+            if let Some((generation, cancellation)) = spawn.take() {
+                self.spawn(repository_key.clone(), generation, cancellation);
+            }
         }
         if let Some(cancellation) = cancelled {
             cancellation.cancel();
-        }
-        if let Some((generation, cancellation)) = spawn {
-            self.spawn(repository_key, generation, cancellation);
         }
         #[cfg(test)]
         self.inner.attachments_changed.notify_waiters();
@@ -186,6 +192,9 @@ impl RepositoryFetchOwner {
         let mut cancelled = Vec::new();
         {
             let mut state = self.lock_state();
+            if state.closed {
+                return;
+            }
             for repository_key in keys {
                 let Some(previous) = state.repositories.remove(repository_key) else {
                     continue;
@@ -204,13 +213,32 @@ impl RepositoryFetchOwner {
                 );
                 replacements.push((repository_key.clone(), generation, cancellation));
             }
+            for (repository_key, generation, cancellation) in replacements.drain(..) {
+                self.spawn(repository_key, generation, cancellation);
+            }
         }
         for cancellation in cancelled {
             cancellation.cancel();
         }
-        for (repository_key, generation, cancellation) in replacements {
-            self.spawn(repository_key, generation, cancellation);
+    }
+
+    pub(super) async fn shutdown(&self) {
+        let cancellations = {
+            let mut state = self.lock_state();
+            state.closed = true;
+            state.worktree_keys.clear();
+            let cancellations = state
+                .repositories
+                .drain()
+                .map(|(_, repository)| repository.cancellation)
+                .collect::<Vec<_>>();
+            self.inner.tasks.close();
+            cancellations
+        };
+        for cancellation in cancellations {
+            cancellation.cancel();
         }
+        self.inner.tasks.wait().await;
     }
 
     fn spawn(&self, repository_key: PathBuf, generation: u64, cancellation: CancellationToken) {
@@ -221,7 +249,7 @@ impl RepositoryFetchOwner {
         let interval_observed = self.inner.interval_observed.clone();
         #[cfg(test)]
         let workers_started = self.inner.workers_started.clone();
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let configured_interval = *interval.borrow_and_update();
             #[cfg(test)]
             workers_started.send_modify(|count| *count = count.wrapping_add(1));
@@ -407,6 +435,7 @@ impl Drop for Inner {
         for repository in state.repositories.values() {
             repository.cancellation.cancel();
         }
+        self.tasks.close();
     }
 }
 
@@ -789,6 +818,33 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         harness.runner.wait_for_fetches(2).await;
         assert_eq!(harness.runner.fetch_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_cancellation_ignoring_fetch_to_finish() {
+        let mut harness = FetchOwnerHarness::new(
+            RecordingFetchRunner::new([("main", "origin")]).with_blocked_fetches(1),
+            Duration::from_millis(1),
+        );
+        harness.attach(1, "/repo/main", Some("main"));
+        harness.owner.wait_for_worker_count_for_test(1).await;
+        harness.runner.wait_for_fetches(1).await;
+
+        let owner = harness.owner.clone();
+        let shutdown = tokio::spawn(async move { owner.shutdown().await });
+        tokio::task::yield_now().await;
+
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must retain and await a fetch that ignores cancellation"
+        );
+        harness.runner.release_fetch.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("fetch-owner shutdown completes after the fetch exits")
+            .expect("fetch-owner shutdown task joins");
+        assert_eq!(harness.owner.repository_count_for_test(), 0);
+        assert_eq!(harness.owner.worktree_count_for_test(), 0);
     }
 
     #[tokio::test]

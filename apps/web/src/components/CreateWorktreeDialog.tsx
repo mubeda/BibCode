@@ -42,6 +42,7 @@ import {
   canReuseBranch,
   detectSmartMode,
   filterRefsByQuery,
+  findExactRefMatch,
   getCreateWorktreeDisabled,
   githubWorkItemBranchName,
   parseGitHubWorkItem,
@@ -270,7 +271,10 @@ export function CreateWorktreeDialog({
           environmentId,
           // ponytail: one maximum-size page keeps this UI query bounded; move
           // collision suffixing server-side if repositories exceed that ceiling.
-          input: { cwd, query: sourceText.trim() || undefined, limit: 200 },
+          // Keep the atom stable while the user types. Re-keying it for every
+          // character clears the cached refs before the exact-match effect can
+          // select the branch and does not automatically refresh the new atom.
+          input: { cwd, query: undefined, limit: 200 },
         })
       : null,
   );
@@ -282,12 +286,22 @@ export function CreateWorktreeDialog({
   }, [refsEnabled, refsQuery.refresh]);
   // TODO(orca-port): confirm VcsListRefsResult field name is `refs`.
   const refs: ReadonlyArray<RefLike> = refsQuery.data?.refs ?? [];
+  const exactBranchRef = useMemo(() => findExactRefMatch(refs, sourceText), [refs, sourceText]);
   const selectedBranchRef = useMemo(
     () => refs.find((ref) => ref.name === branchRefName) ?? null,
     [branchRefName, refs],
   );
   const selectedBranchRefName = selectedBranchRef?.name ?? null;
   const canReuseSelectedBranch = canReuseBranch(selectedBranchRef);
+  useEffect(() => {
+    if (
+      (mode === "branch" || mode === "smart") &&
+      exactBranchRef !== null &&
+      branchRefName !== exactBranchRef.name
+    ) {
+      handleBranchSelect(exactBranchRef);
+    }
+  }, [branchRefName, exactBranchRef, handleBranchSelect, mode]);
   const handleReuseSelectedBranchChange = useCallback(
     (nextReuse: boolean) => {
       if (!selectedBranchRef || !canReuseSelectedBranch) return;
@@ -307,12 +321,17 @@ export function CreateWorktreeDialog({
     mode === "github" || mode === "smart" ? parseGitHubWorkItem(sourceText) : null;
 
   const smartRows: SmartRow[] = useMemo(
-    () => (mode === "smart" ? buildSmartRows({ query: sourceText, refs }) : []),
-    [mode, sourceText, refs],
+    () =>
+      mode === "smart"
+        ? buildSmartRows({ query: sourceText, refs }).filter(
+            (row) => row.kind !== "branch" || row.refName !== exactBranchRef?.name,
+          )
+        : [],
+    [exactBranchRef, mode, sourceText, refs],
   );
   const branchRows = useMemo(
-    () => (mode === "branch" ? filterRefsByQuery(refs, sourceText) : []),
-    [mode, sourceText, refs],
+    () => (mode === "branch" && exactBranchRef === null ? filterRefsByQuery(refs, sourceText) : []),
+    [exactBranchRef, mode, sourceText, refs],
   );
   const smartDetectedMode = useMemo(
     () => (mode === "smart" ? detectSmartMode(sourceText, refs) : mode),

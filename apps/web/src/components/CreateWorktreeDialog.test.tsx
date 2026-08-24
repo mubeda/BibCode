@@ -145,6 +145,7 @@ const testState = vi.hoisted(() => ({
   refs: [] as Array<{
     name: string;
     isRemote?: boolean;
+    remoteName?: string;
     current?: boolean;
     worktreePath?: string | null;
   }>,
@@ -820,7 +821,7 @@ staticDescribe("CreateWorktreeDialog", () => {
     expect(testState.queryAtoms.at(-1)).toEqual(
       expect.objectContaining({
         args: expect.objectContaining({
-          input: { cwd: "/repo", query: "feature", limit: 200 },
+          input: { cwd: "/repo", query: undefined, limit: 200 },
         }),
       }),
     );
@@ -1425,6 +1426,45 @@ if (browserRuntime) {
       expect(reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']")?.checked).toBe(
         true,
       );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("turns an exact remote ref into the selection without duplicating it below the input", async () => {
+      testState.refs = [
+        {
+          name: "origin/feature/remote-only",
+          isRemote: true,
+          remoteName: "origin",
+        },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      const sourceInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Search branches']",
+      );
+      await setInputValue(sourceInput, "origin/feature/remote-only");
+
+      expect(sourceInput.value).toBe("origin/feature/remote-only");
+      expect(testState.queryAtoms.at(-1)).toEqual({
+        kind: "vcs.listRefs",
+        args: {
+          environmentId: ENVIRONMENT_ID,
+          input: { cwd: "/repo", query: undefined, limit: 200 },
+        },
+      });
+      expect(
+        Array.from(container.querySelectorAll("button")).filter(
+          (button) => button.textContent?.trim() === "origin/feature/remote-only",
+        ),
+      ).toHaveLength(0);
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']").value,
+      ).toBe("feature/remote-only");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
 
       await React.act(async () => root.unmount());
       container.remove();

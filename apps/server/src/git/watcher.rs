@@ -117,12 +117,14 @@ struct WatchEntry {
     health: Arc<AtomicU8>,
     backend: Option<Box<dyn GitWatcherBackend>>,
     roots: GitWatchIdentity,
+    root_aliases: Vec<GitWatchIdentity>,
     registered_roots: Vec<(String, RecursiveMode)>,
     setup: Arc<SetupCompletion>,
 }
 
 struct AdmittedRoots {
     identity: GitWatchIdentity,
+    alias: GitWatchIdentity,
     worktree_root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
@@ -330,6 +332,9 @@ impl GitWatchService {
             let subscriber_id = state.next_subscriber_id;
             state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
             if let Some(entry) = state.entries.get_mut(&roots.identity) {
+                if !entry.root_aliases.contains(&roots.alias) {
+                    entry.root_aliases.push(roots.alias.clone());
+                }
                 entry.subscribers.insert(subscriber_id);
                 (
                     GitWatchSubscription::new(
@@ -348,6 +353,10 @@ impl GitWatchService {
                 let setup = Arc::new(SetupCompletion::default());
                 let watch_roots = watch_roots(&roots);
                 let registered_roots = normalize_registered_roots(&watch_roots);
+                let mut root_aliases = vec![roots.identity.clone()];
+                if roots.alias != roots.identity {
+                    root_aliases.push(roots.alias.clone());
+                }
                 state.entries.insert(
                     roots.identity.clone(),
                     WatchEntry {
@@ -357,6 +366,7 @@ impl GitWatchService {
                         health: Arc::clone(&health),
                         backend: None,
                         roots: roots.identity.clone(),
+                        root_aliases,
                         registered_roots,
                         setup: Arc::clone(&setup),
                     },
@@ -602,6 +612,7 @@ impl Inner {
                 classify_event(
                     &event,
                     &entry.roots,
+                    &entry.root_aliases,
                     &entry.registered_roots,
                     host_path_platform(),
                 )
@@ -930,14 +941,21 @@ fn publish(entry: &mut WatchEntry, event: GitWatchEvent) {
 }
 
 async fn admit_roots(request: GitWatchRequest) -> Result<AdmittedRoots, GitWatchError> {
+    let platform = host_path_platform();
+    let alias = identity_for_paths(
+        &request.worktree_root,
+        &request.git_dir,
+        &request.common_dir,
+        platform,
+    );
     let (worktree_root, git_dir, common_dir) = tokio::try_join!(
         canonical_root(request.worktree_root),
         canonical_root(request.git_dir),
         canonical_root(request.common_dir),
     )?;
-    let platform = host_path_platform();
     Ok(AdmittedRoots {
         identity: identity_for_paths(&worktree_root, &git_dir, &common_dir, platform),
+        alias,
         worktree_root,
         git_dir,
         common_dir,
@@ -960,6 +978,7 @@ fn identity_for_paths(
 fn classify_event(
     event: &Event,
     roots: &GitWatchIdentity,
+    root_aliases: &[GitWatchIdentity],
     registered_roots: &[(String, RecursiveMode)],
     platform: super::HostPathPlatform,
 ) -> Option<GitWatchEvent> {
@@ -974,7 +993,7 @@ fn classify_event(
     }
     let mut working_tree = false;
     for path in &event.paths {
-        let path = normalize_worktree_path_key(path, platform);
+        let path = normalize_event_path_key(path, roots, root_aliases, platform);
         let registered_mode = registered_roots
             .iter()
             .find_map(|(registered, mode)| (registered == &path).then_some(*mode));
@@ -1002,6 +1021,31 @@ fn classify_event(
         working_tree = true;
     }
     working_tree.then_some(GitWatchEvent::WorkingTree)
+}
+
+fn normalize_event_path_key(
+    path: &Path,
+    roots: &GitWatchIdentity,
+    root_aliases: &[GitWatchIdentity],
+    platform: super::HostPathPlatform,
+) -> String {
+    let path = normalize_worktree_path_key(path, platform);
+    for aliases in root_aliases {
+        for (alias, canonical) in [
+            (&aliases.git_dir, &roots.git_dir),
+            (&aliases.common_dir, &roots.common_dir),
+            (&aliases.worktree_root, &roots.worktree_root),
+        ] {
+            if let Some(relative) = relative_to_root(&path, alias) {
+                return if relative.is_empty() {
+                    canonical.clone()
+                } else {
+                    format!("{canonical}/{relative}")
+                };
+            }
+        }
+    }
+    path
 }
 
 #[cfg(windows)]
@@ -1395,6 +1439,18 @@ mod tests {
             git_dir: git_dir.to_path_buf(),
             common_dir: common_dir.to_path_buf(),
         }
+    }
+
+    async fn expect_fake_event(
+        subscription: &mut GitWatchSubscription,
+        expected: GitWatchEvent,
+        context: &str,
+    ) {
+        let actual = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .unwrap_or_else(|_| panic!("fake watcher event deadline: {context}"))
+            .unwrap_or_else(|| panic!("fake watcher closed: {context}"));
+        assert_eq!(actual, expected, "{context}");
     }
 
     async fn expect_native_event(subscription: &mut GitWatchSubscription, expected: GitWatchEvent) {
@@ -1880,11 +1936,12 @@ mod tests {
                     .add_path(registered_root.with_extension("retired"))
             };
             backend.emit(0, Ok(event));
-            assert_eq!(
-                subscription.recv().await,
-                Some(GitWatchEvent::Unavailable),
-                "registered root {index} loss must require fallback"
-            );
+            expect_fake_event(
+                &mut subscription,
+                GitWatchEvent::Unavailable,
+                &format!("registered root {index} loss must require fallback"),
+            )
+            .await;
         }
 
         backend.emit(
@@ -1894,7 +1951,12 @@ mod tests {
                     .add_path(worktree.join("ordinary-child.txt")),
             ),
         );
-        assert_eq!(subscription.recv().await, Some(GitWatchEvent::WorkingTree));
+        expect_fake_event(
+            &mut subscription,
+            GitWatchEvent::WorkingTree,
+            "ordinary child removal remains a working-tree signal",
+        )
+        .await;
         assert_eq!(subscription.health(), GitWatcherHealth::FallbackRequired);
     }
 
@@ -1943,7 +2005,14 @@ mod tests {
             "the identical event after backend commit remains observable"
         );
 
-        let roots = identity_for_paths(&worktree, &git_dir, &common_dir, host_path_platform());
+        let aliases = identity_for_paths(&worktree, &git_dir, &common_dir, host_path_platform());
+        let roots = identity_for_paths(
+            std::fs::canonicalize(&worktree).expect("canonical worktree"),
+            std::fs::canonicalize(&git_dir).expect("canonical Git directory"),
+            std::fs::canonicalize(&common_dir).expect("canonical common directory"),
+            host_path_platform(),
+        );
+        let root_aliases = [roots.clone(), aliases];
         let registered = registered
             .into_iter()
             .map(|(_, path, mode)| {
@@ -1955,7 +2024,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            classify_event(&event, &roots, &registered, host_path_platform()),
+            classify_event(
+                &event,
+                &roots,
+                &root_aliases,
+                &registered,
+                host_path_platform(),
+            ),
             Some(GitWatchEvent::Metadata),
             "the classifier never permanently suppresses this metadata shape"
         );
@@ -1972,7 +2047,13 @@ mod tests {
                 .add_path(refs_root.join("heads/main")),
         ] {
             assert_eq!(
-                classify_event(&event, &roots, &registered, host_path_platform()),
+                classify_event(
+                    &event,
+                    &roots,
+                    &root_aliases,
+                    &registered,
+                    host_path_platform(),
+                ),
                 Some(GitWatchEvent::Metadata),
                 "child create, delete, content, and rename changes remain invalidating"
             );
@@ -2195,6 +2276,12 @@ mod tests {
             .expect("first subscriber");
 
         backend.emit(0, Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        expect_fake_event(
+            &mut first,
+            GitWatchEvent::Overflow,
+            "overflow signal is observable before later ordinary events",
+        )
+        .await;
         backend.emit(
             0,
             Ok(
@@ -2202,7 +2289,12 @@ mod tests {
                     .add_path(worktree.join("tracked.txt")),
             ),
         );
-        assert_eq!(first.recv().await, Some(GitWatchEvent::WorkingTree));
+        expect_fake_event(
+            &mut first,
+            GitWatchEvent::WorkingTree,
+            "ordinary events continue after sticky fallback health",
+        )
+        .await;
         assert_eq!(first.health(), GitWatcherHealth::FallbackRequired);
 
         let late = service
@@ -2400,7 +2492,12 @@ mod tests {
                     .add_path(upstream_dir.join("main")),
             ),
         );
-        assert_eq!(subscription.recv().await, Some(GitWatchEvent::Metadata));
+        expect_fake_event(
+            &mut subscription,
+            GitWatchEvent::Metadata,
+            "nested common ref changes publish metadata",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2493,6 +2590,7 @@ mod tests {
             .expect("open tracked file");
         file.write_all(b" second").expect("content write");
         file.sync_all().expect("flush content write");
+        drop(file);
         fixture.expect(GitWatchEvent::WorkingTree).await;
     }
 
@@ -2538,6 +2636,7 @@ mod tests {
             .expect("open tracked file");
         file.write_all(b" second").expect("content write");
         file.sync_all().expect("flush content write");
+        drop(file);
         expect_native_event(&mut subscription, GitWatchEvent::WorkingTree).await;
     }
 
@@ -2672,6 +2771,7 @@ mod tests {
                     .add_path(r"C:\repo\tracked.txt.tmp".into())
                     .add_path(r"C:\repo\tracked.txt".into()),
                 &windows,
+                std::slice::from_ref(&windows),
                 &windows_registered,
                 HostPathPlatform::Windows,
             ),
@@ -2682,6 +2782,7 @@ mod tests {
                 &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                     .add_path("/repo/.git/worktrees/topic/HEAD".into()),
                 &linux,
+                std::slice::from_ref(&linux),
                 &linux_registered,
                 HostPathPlatform::Posix,
             ),
@@ -2693,6 +2794,7 @@ mod tests {
                     .add_path("/repo/tracked.txt".into())
                     .add_path("/repo/.git/worktrees/topic/index".into()),
                 &linux,
+                std::slice::from_ref(&linux),
                 &linux_registered,
                 HostPathPlatform::Posix,
             ),
@@ -2704,6 +2806,7 @@ mod tests {
                 &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                     .add_path(r"C:\repo\..\outside\tracked.txt".into()),
                 &windows,
+                std::slice::from_ref(&windows),
                 &windows_registered,
                 HostPathPlatform::Windows,
             ),
@@ -2714,6 +2817,7 @@ mod tests {
                 &Event::new(EventKind::Any)
                     .add_path("/Users/dev/repo/.git/refs/remotes/origin/main".into()),
                 &macos,
+                std::slice::from_ref(&macos),
                 &macos_registered,
                 HostPathPlatform::Posix,
             ),
@@ -2724,6 +2828,7 @@ mod tests {
                 &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                     .add_path("/repo-other/tracked.txt".into()),
                 &linux,
+                std::slice::from_ref(&linux),
                 &linux_registered,
                 HostPathPlatform::Posix,
             ),
@@ -2735,6 +2840,7 @@ mod tests {
                 &Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
                     .add_path(r"C:\repo\tracked.txt.tmp".into()),
                 &windows,
+                std::slice::from_ref(&windows),
                 &windows_registered,
                 HostPathPlatform::Windows,
             ),
@@ -2746,6 +2852,7 @@ mod tests {
                 &Event::new(EventKind::Access(AccessKind::Read))
                     .add_path(r"C:\repo\tracked.txt.tmp".into()),
                 &windows,
+                std::slice::from_ref(&windows),
                 &windows_registered,
                 HostPathPlatform::Windows,
             ),

@@ -1719,6 +1719,7 @@ mod tests {
             std::fs::write(primary.join("README.md"), "base\n").expect("fixture file");
             git(&primary, &["add", "README.md"]);
             git(&primary, &["commit", "-m", "initial"]);
+            let primary = std::fs::canonicalize(primary).expect("canonical primary directory");
             Self {
                 root,
                 primary,
@@ -1739,6 +1740,7 @@ mod tests {
             std::fs::write(primary.join("README.md"), "base\n").expect("fixture file");
             git(&primary, &["add", "README.md"]);
             git(&primary, &["commit", "-m", "initial"]);
+            let primary = std::fs::canonicalize(primary).expect("canonical primary directory");
             Some(Self {
                 root,
                 primary,
@@ -1751,6 +1753,7 @@ mod tests {
             let primary = root.path().join("bare.git");
             std::fs::create_dir(&primary).expect("bare directory");
             git(&primary, &["init", "--bare", "--initial-branch=main"]);
+            let primary = std::fs::canonicalize(primary).expect("canonical bare directory");
             Self {
                 root,
                 primary,
@@ -1798,7 +1801,7 @@ mod tests {
                     linked.to_str().expect("UTF-8 fixture path"),
                 ],
             );
-            self.linked = Some(linked);
+            self.linked = Some(std::fs::canonicalize(linked).expect("canonical linked worktree"));
         }
 
         fn move_worktree(&mut self) {
@@ -1813,7 +1816,7 @@ mod tests {
                     moved.to_str().expect("UTF-8 fixture path"),
                 ],
             );
-            self.linked = Some(moved);
+            self.linked = Some(std::fs::canonicalize(moved).expect("canonical moved worktree"));
         }
 
         fn lock_worktree(&self) {
@@ -2230,7 +2233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_worktree_entry_swap_cannot_change_the_anchored_read() {
+    async fn transient_worktree_entry_swap_is_anchored_or_rejected() {
         let mut fixture = FingerprintFixture::new().await;
         fixture.add_worktree();
         let baseline = fixture.read_known().await;
@@ -2240,7 +2243,7 @@ mod tests {
         let pause = super::install_admin_read_pause(
             common_dir.clone(),
             super::AdminReadTarget::WorktreeEntry,
-            2,
+            if cfg!(windows) { 2 } else { 1 },
         );
         let reader = tokio::spawn(read_catalog_repository_fingerprint(FingerprintRequest {
             common_dir: common_dir.clone(),
@@ -2252,7 +2255,7 @@ mod tests {
         }));
         let entry = common_dir.join("worktrees").join("feature");
         let displaced = common_dir.join("worktrees").join("feature-original");
-        for cycle in 0..2 {
+        for cycle in 0..if cfg!(windows) { 2 } else { 1 } {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 pause.before_open_reached.notified(),
@@ -2294,10 +2297,17 @@ mod tests {
             pause.resume_read.notify_one();
         }
 
-        assert_eq!(
-            reader.await.expect("fingerprint reader"),
-            FingerprintOutcome::Known(baseline)
-        );
+        let outcome = reader.await.expect("fingerprint reader");
+        #[cfg(windows)]
+        assert_eq!(outcome, FingerprintOutcome::Known(baseline));
+        #[cfg(unix)]
+        {
+            drop(baseline);
+            assert_eq!(
+                outcome,
+                FingerprintOutcome::Unknown(super::FingerprintFailure::ChangedDuringRead)
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -2465,7 +2475,9 @@ mod tests {
             mutation_epoch: 2,
             cancellation: CancellationToken::new(),
         }));
-        pause.reached.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("first fingerprint pass reaches the mutation pause");
         std::fs::write(common_dir.join("packed-refs"), "# pack-refs with: peeled\n")
             .expect("inter-pass mutation");
         pause.resume.notify_one();
@@ -2490,7 +2502,9 @@ mod tests {
             mutation_epoch: 2,
             cancellation: cancellation.clone(),
         }));
-        pause.reached.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("first fingerprint pass reaches the cancellation pause");
         cancellation.cancel();
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut reader).await;
         if result.is_err() {

@@ -1833,6 +1833,23 @@ impl GitRepository {
         } else {
             false
         };
+        if new_ref_existed
+            && let Some(new_ref) = input.new_ref_name.as_deref()
+            && self
+                .worktree_map(&input.cwd, cancellation)
+                .await?
+                .contains_key(new_ref)
+        {
+            return self
+                .create_suffixed_worktree_from_occupied_branch(
+                    &input.cwd,
+                    new_ref,
+                    requested_path.as_ref(),
+                    path_policy.as_ref(),
+                    cancellation,
+                )
+                .await;
+        }
         let owned_path = if requested_path.is_none()
             && path_policy
                 .as_ref()
@@ -1848,10 +1865,20 @@ impl GitRepository {
             None
         };
         let mut args = strings(&["worktree", "add"]);
-        if let Some(new_ref) = input.new_ref_name.as_deref() {
+        if let Some(new_ref) = input.new_ref_name.as_deref()
+            && !new_ref_existed
+        {
             args.extend(["-b".into(), new_ref.into()]);
         }
-        args.extend([path_string, input.ref_name.clone()]);
+        let checkout_ref = if new_ref_existed {
+            input
+                .new_ref_name
+                .as_deref()
+                .expect("an existing requested branch has a name")
+        } else {
+            input.ref_name.as_str()
+        };
+        args.extend([path_string, checkout_ref.into()]);
         if let Err(mut error) = self
             .run(
                 "GitVcsDriver.createWorktree",
@@ -4935,7 +4962,7 @@ mod tests {
                     ),
                     (
                         "GitVcsDriver.statusDetailsLocal.unstagedNumstat".into(),
-                        process_output("4\t3\tfile.rs\n"),
+                        process_output("4\t5\tfile.rs\n"),
                     ),
                     (
                         "GitVcsDriver.statusDetailsLocal.remotes".into(),

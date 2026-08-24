@@ -201,7 +201,11 @@ The same authority boundary covers every worktree-bearing owner mutation:
   identity or POSIX device/inode before rollback. A replacement at the same
   path is never removed. This is not a public raw-path primitive. Pull-request
   worktree creation resolves the PR first, then uses this same atomic
-  owner-creation RPC; the legacy PR preparation RPC is local-checkout-only.
+  owner-creation RPC; the legacy PR preparation RPC is local-checkout-only. If
+  remote-ref selection becomes stale because the corresponding local branch
+  appears before Git creation starts, the operation reuses that now-existing
+  unoccupied local branch. A branch already occupied by another worktree keeps
+  the existing safe suffixed-branch policy.
 - `worktree.createPanel` accepts a host thread and derives project, kind,
   branch, and path from that persisted host.
 - `worktree.retarget` accepts an opaque worktree key and expected generation;

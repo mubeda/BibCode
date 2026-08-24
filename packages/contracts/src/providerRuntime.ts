@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import {
   EventId,
   IsoDateTime,
@@ -92,13 +93,29 @@ export type RuntimeContentStreamKind = typeof RuntimeContentStreamKind.Type;
 const RuntimeSessionExitKind = Schema.Literals(["graceful", "error"]);
 export type RuntimeSessionExitKind = typeof RuntimeSessionExitKind.Type;
 
-export const RuntimeErrorClass = Schema.Literals([
+const CanonicalRuntimeErrorClass = Schema.Literals([
   "provider_error",
   "transport_error",
   "permission_error",
   "validation_error",
   "unknown",
 ]);
+const isCanonicalRuntimeErrorClass = Schema.is(CanonicalRuntimeErrorClass);
+
+/**
+ * Decode newer server-side classifications as `unknown` so persisted sessions
+ * and live events remain readable across version skew. Encoding stays strict.
+ */
+export const RuntimeErrorClass = Schema.String.pipe(
+  Schema.decodeTo(
+    CanonicalRuntimeErrorClass,
+    SchemaTransformation.transformOrFail({
+      decode: (value) =>
+        Effect.succeed(isCanonicalRuntimeErrorClass(value) ? value : ("unknown" as const)),
+      encode: (value) => Effect.succeed(value),
+    }),
+  ),
+);
 export type RuntimeErrorClass = typeof RuntimeErrorClass.Type;
 
 export const TOOL_LIFECYCLE_ITEM_TYPES = [
