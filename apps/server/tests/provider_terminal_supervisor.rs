@@ -262,7 +262,10 @@ impl PtyBackend for BlockingBackend {
         self.spawn_release
             .lock()
             .expect("spawn release lock")
-            .recv_timeout(std::time::Duration::from_secs(2))
+            // This is only a deadlock guard. The 250 ms observer wait in the
+            // lifecycle test below owns the behavioral timing assertion, so a
+            // loaded CI runner must not make this blocking helper fail first.
+            .recv_timeout(std::time::Duration::from_secs(10))
             .expect("spawn release");
         Ok(self.process.clone())
     }
