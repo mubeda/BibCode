@@ -217,6 +217,73 @@ async fn concrete_workspace_and_preview_handlers_run_through_effect_transport() 
 }
 
 #[tokio::test]
+async fn project_entries_stream_starts_with_a_resync_signal() {
+    let temp = TempDir::new().expect("temporary base directory");
+    tokio::fs::write(temp.path().join("existing.txt"), "hello")
+        .await
+        .expect("fixture");
+    let mut registry = RpcRegistry::empty();
+    register_workspace_preview_rpc(
+        &mut registry,
+        WorkspacePreviewRpcServices::new(
+            WorkspaceRpc::new(WorkspaceService::default()),
+            PreviewManager::new(),
+            mcp::preview_automation::PreviewAutomationBroker::new(),
+        ),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+    let cwd = path_string(temp.path());
+
+    send_json(
+        &mut socket,
+        json!({
+            "_tag": "Request",
+            "id": "11",
+            "tag": "subscribeProjectEntries",
+            "payload": { "cwd": cwd },
+            "headers": []
+        }),
+    )
+    .await;
+    match next_server_message(&mut socket).await {
+        ServerMessage::Chunk { values, .. } => {
+            assert_eq!(values, vec![json!({ "cwd": cwd })]);
+        }
+        message => panic!("expected initial project-entry resync chunk, got {message:?}"),
+    }
+
+    send_json(
+        &mut socket,
+        serde_json::to_value(ClientMessage::Ack {
+            request_id: RequestId::try_from("11").expect("request id"),
+        })
+        .expect("ack"),
+    )
+    .await;
+    send_json(
+        &mut socket,
+        serde_json::to_value(ClientMessage::Interrupt {
+            request_id: RequestId::try_from("11").expect("request id"),
+        })
+        .expect("interrupt"),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(&mut socket).await,
+        ServerMessage::Exit { .. }
+    ));
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
 async fn preview_automation_connect_stream_is_bounded_and_cancellable() {
     let temp = TempDir::new().expect("temporary base directory");
     let mut registry = RpcRegistry::empty();

@@ -830,23 +830,17 @@ describe("refresh", () => {
     expect(refresh).toHaveBeenCalled();
   });
 
-  it("re-lists when the server signals an out-of-band workspace change", () => {
+  it("re-lists when the subscription starts with a server resync signal", () => {
     harness.persistRefs = true;
     setEntries([entry("src", "directory")]);
     const refresh = vi.fn();
     testState.entriesQuery.refresh = refresh;
-
-    renderPanel();
-    harness.runEffects();
-    // The signal already present on the first read is the current state, not a change; refreshing
-    // for it would cost an extra list every time the panel mounts.
-    expect(refresh).not.toHaveBeenCalled();
-
     testState.entryChangeSignal = { cwd: "/workspace/demo" };
+
     renderPanel();
     harness.runEffects();
 
-    expect(refresh).toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalledOnce();
     // The signal carries no entries, so the panel re-reads rather than asking for another rescan:
     // the server already dropped its cached index before signalling.
     expect(testState.commandCalls.some((call) => call.label === "refreshEntries")).toBe(false);
