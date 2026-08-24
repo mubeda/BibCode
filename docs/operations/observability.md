@@ -227,6 +227,36 @@ the measurement script does not duplicate cross-platform CPU accounting.
 
 ## Instrumentation Guidance
 
+### File Manager index phases
+
+File Manager path-index timings use these exact `operation` and `phase` values:
+
+| `operation`                               | `phase`           | When emitted                                                                                                     |
+| ----------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `WorkspaceSearchIndex.refresh`            | `cache_hit`       | A ready snapshot is returned without starting Git; elapsed time starts before cache-lock acquisition.            |
+| `WorkspaceSearchIndex.refresh`            | `cache_wait`      | A cold caller acquires the per-root build slot; `cache_outcome=shared` means another caller supplied the result. |
+| `WorkspaceSearchIndex.refresh`            | `cache_build`     | The physical scan returns success or error, or its result is fenced by a newer generation.                       |
+| `WorkspaceSearchIndex.gitSnapshot`        | `git_snapshot`    | The concurrent main and ignored `git ls-files` reads settle.                                                     |
+| `WorkspaceSearchIndex.gitSnapshot`        | `ignored_walk`    | Contents beneath Git-reported ignored directory roots are walked.                                                |
+| `WorkspaceSearchIndex.gitSnapshot`        | `directory_walk`  | Directories omitted from file listings, including empty directories, are walked.                                 |
+| `WorkspaceSearchIndex.filesystemSnapshot` | `filesystem_walk` | The bounded filesystem fallback runs after Git is unsupported or non-authoritative.                              |
+
+Every event has `elapsed_ms`, bounded `entry_count`, and `cache_outcome`.
+Outcomes are bounded literals: `hit`, `miss`, `shared`, `build`, `built`,
+`stale`, `fallback`, `cancelled`, or `error`. Events never include workspace
+paths or entry names. A warm lookup emits only `cache_hit`; shared cold callers
+do not repeat the physical scan phases. `cancelled` applies to an observable
+search phase such as `git_snapshot`; cache builds have no external cancellation
+owner and therefore report only `built`, `stale`, or `error` after returning.
+Dropped cache-operation futures do not invent a terminal phase.
+
+Source Control work is separate. Its operations use the `GitVcsDriver.*`
+namespace, including `GitVcsDriver.statusReadOwner`,
+`GitVcsDriver.statusDetailsLocal.status`, and
+`GitVcsDriver.automaticFetch.fetch`; do not attribute those VCS costs to the
+File Manager operations above. Record execution-specific timings in validation
+reports rather than this living guide.
+
 Add spans and structured fields at meaningful Rust boundaries:
 
 - Axum HTTP and WebSocket RPC requests;

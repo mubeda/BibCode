@@ -166,9 +166,16 @@ it.effect("lists the legacy diagnostic archive with the platform archive tool", 
       "../apps/server/tests/fixtures/diagnostic-bundle-v4.zip",
     );
     const platform = yield* HostProcessPlatform;
+    // Address Windows' bundled bsdtar by absolute path rather than by name.
+    // Resolving `tar` through PATH finds Git for Windows' GNU tar first, which
+    // cannot read a zip at all and additionally reads a leading `X:` in an
+    // absolute path as a remote `host:path`. bsdtar is the archive tool the
+    // platform actually ships, and it is what a user opening a diagnostic
+    // bundle would get from a stock shell.
+    const systemRoot = process.env["SystemRoot"] ?? "C:\\Windows";
     const [command, args] =
       platform === "win32"
-        ? (["tar", ["-tf", archivePath]] as const)
+        ? ([NodePath.win32.join(systemRoot, "System32", "tar.exe"), ["-tf", archivePath]] as const)
         : (["unzip", ["-t", archivePath]] as const);
     const result = NodeChildProcess.spawnSync(command, args, {
       encoding: "utf8",

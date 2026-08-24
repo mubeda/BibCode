@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   mergeTerminalSpawnEnv,
+  resolveTerminalThemeMode,
+  terminalExtendedAnsiPalette,
   retainTerminalLaunchTheme,
   terminalOscColorEnv,
 } from "./terminalTheme";
@@ -148,5 +150,38 @@ describe("terminal theme launch values", () => {
         resolvedTheme: "light",
       }),
     ).toEqual({ generation: 4, theme: "light" });
+  });
+  it("keeps the terminal on its own theme unless it is told to follow the app", () => {
+    // Codex paints hardcoded dark panels and never queries the terminal, so a
+    // dark terminal inside a light app is the correct default, not a mismatch.
+    expect(resolveTerminalThemeMode("dark", "light")).toBe("dark");
+    expect(resolveTerminalThemeMode("dark", "dark")).toBe("dark");
+    expect(resolveTerminalThemeMode("light", "dark")).toBe("light");
+    expect(resolveTerminalThemeMode("light", "light")).toBe("light");
+  });
+
+  it("tracks the app theme only for the explicit follow preference", () => {
+    expect(resolveTerminalThemeMode("app", "light")).toBe("light");
+    expect(resolveTerminalThemeMode("app", "dark")).toBe("dark");
+  });
+  it("flips only the grayscale ramp so hardcoded TUI surfaces follow a light terminal", () => {
+    const dark = terminalExtendedAnsiPalette("dark");
+    const light = terminalExtendedAnsiPalette("light");
+
+    // Indices 16..255 inclusive.
+    expect(dark).toHaveLength(240);
+    expect(light).toHaveLength(240);
+
+    // Codex fills its panels with index 235, deep in the grayscale ramp.
+    const at = (palette: ReadonlyArray<string>, index: number) => palette[index - 16];
+    expect(at(dark, 235)).toBe("#262626");
+    expect(at(light, 235)).toBe("#d0d0d0");
+
+    // The ramp ends swap, and the 6x6x6 colour cube is untouched in both.
+    expect(at(dark, 232)).toBe(at(light, 255));
+    expect(at(dark, 255)).toBe(at(light, 232));
+    expect(at(dark, 196)).toBe("#ff0000");
+    expect(at(light, 196)).toBe("#ff0000");
+    expect(dark.slice(0, 216)).toEqual(light.slice(0, 216));
   });
 });

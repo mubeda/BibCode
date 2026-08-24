@@ -12,6 +12,7 @@ import {
   WsVcsInitRpc,
   WsShellOpenInEditorRpc,
   WsSubscribeVcsStatusRpc,
+  WsSubscribeVcsStatusSummaryRpc,
   WsCloudInstallRelayClientRpc,
   WsTerminalOpenRpc,
   WsTerminalWriteRpc,
@@ -83,6 +84,7 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.vcsPull).toBe("vcs.pull");
     expect(WS_METHODS.terminalOpen).toBe("terminal.open");
     expect(WS_METHODS.subscribeVcsStatus).toBe("subscribeVcsStatus");
+    expect(WS_METHODS.subscribeVcsStatusSummary).toBe("subscribeVcsStatusSummary");
     expect(WS_METHODS.cloudInstallRelayClient).toBe("cloud.installRelayClient");
     expect(WS_METHODS.sourceControlLookupRepository).toBe("sourceControl.lookupRepository");
     expect(WS_METHODS.activityGetSnapshot).toBe("activity.getSnapshot");
@@ -195,6 +197,7 @@ describe("individual RPC definitions", () => {
     expect(WsRpcGroup.requests.has("activity.cancelSubtree")).toBe(true);
     expect(WsRpcGroup.requests.has("activity.retrySubtreeCancellation")).toBe(true);
     expect(WsSubscribeActivityRpc._tag).toBe(WS_METHODS.subscribeActivity);
+    expect(WsSubscribeVcsStatusSummaryRpc._tag).toBe(WS_METHODS.subscribeVcsStatusSummary);
     expect(WsSubscribeWorktreeCatalogRpc._tag).toBe(WS_METHODS.subscribeWorktreeCatalog);
     expect(WsVcsRefreshWorktreeCatalogRpc._tag).toBe(WS_METHODS.vcsRefreshWorktreeCatalog);
     expect(WsWorktreeUpdateDiscoveryPolicyRpc._tag).toBe(WS_METHODS.worktreeUpdateDiscoveryPolicy);
@@ -224,6 +227,7 @@ describe("individual RPC definitions", () => {
     // Rpc.make sets errorSchema to Schema.Never and wraps success for streams.
     for (const streamRpc of [
       WsSubscribeVcsStatusRpc,
+      WsSubscribeVcsStatusSummaryRpc,
       WsCloudInstallRelayClientRpc,
       WsSubscribeAuthAccessRpc,
       WsOrchestrationSubscribeShellRpc,
@@ -255,6 +259,7 @@ describe("WsRpcGroup", () => {
       WsVcsInitRpc,
       WsShellOpenInEditorRpc,
       WsSubscribeVcsStatusRpc,
+      WsSubscribeVcsStatusSummaryRpc,
       WsCloudInstallRelayClientRpc,
       WsTerminalOpenRpc,
       WsPreviewListRpc,

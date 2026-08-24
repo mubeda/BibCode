@@ -1,8 +1,9 @@
 import * as Schema from "effect/Schema";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { ChangeRequest, SourceControlProviderInfo } from "./sourceControl.ts";
+import { VcsDriverKind } from "./vcsDriver.ts";
 
-export const VcsDriverKind = Schema.Literals(["git", "jj", "unknown"]);
-export type VcsDriverKind = typeof VcsDriverKind.Type;
+export { VcsDriverKind };
 
 export const VcsFreshnessSource = Schema.Literals([
   "live-local",
@@ -57,6 +58,63 @@ export const VcsListRemotesResult = Schema.Struct({
   freshness: VcsFreshness,
 });
 export type VcsListRemotesResult = typeof VcsListRemotesResult.Type;
+
+const VcsStatusSummarySharedFields = {
+  observedAt: IsoDateTime,
+  stale: Schema.Boolean,
+} as const;
+const VcsRepositorySummarySharedFields = {
+  isRepo: Schema.Literal(true),
+  hasWorkingTreeChanges: Schema.Boolean,
+  ...VcsStatusSummarySharedFields,
+} as const;
+
+export const VcsStatusSummary = Schema.Union([
+  Schema.Struct({
+    isRepo: Schema.Literal(false),
+    refName: Schema.Null,
+    detachedHead: Schema.Null,
+    hasWorkingTreeChanges: Schema.Literal(false),
+    sourceControlProvider: Schema.Null,
+    pr: Schema.Null,
+    ...VcsStatusSummarySharedFields,
+  }),
+  Schema.Struct({
+    ...VcsRepositorySummarySharedFields,
+    refName: TrimmedNonEmptyString,
+    detachedHead: Schema.Null,
+    sourceControlProvider: Schema.Null,
+    pr: Schema.Null,
+  }),
+  Schema.Struct({
+    ...VcsRepositorySummarySharedFields,
+    refName: TrimmedNonEmptyString,
+    detachedHead: Schema.Null,
+    sourceControlProvider: SourceControlProviderInfo,
+    pr: Schema.NullOr(ChangeRequest),
+  }).check(
+    Schema.makeFilter(
+      ({ sourceControlProvider, pr }) => pr === null || pr.provider === sourceControlProvider.kind,
+      { title: "summary provider and pull request kind match" },
+    ),
+  ),
+  Schema.Struct({
+    ...VcsRepositorySummarySharedFields,
+    refName: Schema.Null,
+    detachedHead: TrimmedNonEmptyString,
+    sourceControlProvider: Schema.NullOr(SourceControlProviderInfo),
+    pr: Schema.Null,
+  }),
+  // An initialized repository has no ref identity until its first commit.
+  Schema.Struct({
+    ...VcsRepositorySummarySharedFields,
+    refName: Schema.Null,
+    detachedHead: Schema.Null,
+    sourceControlProvider: Schema.NullOr(SourceControlProviderInfo),
+    pr: Schema.Null,
+  }),
+]);
+export type VcsStatusSummary = typeof VcsStatusSummary.Type;
 
 export interface VcsProcessErrorContext {
   readonly operation: string;

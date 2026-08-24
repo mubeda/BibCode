@@ -21,6 +21,7 @@ use bibcode_server::{
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CANONICAL_SCENARIOS: &str =
     include_str!("fixtures/activity-conformance/canonical-scenarios.json");
@@ -833,6 +834,7 @@ fn malformed_native_inputs_are_rejected_and_oversized_inputs_are_handled_safely(
 
 #[tokio::test]
 async fn repository_graph_invariants_hold_for_bounded_deterministic_permutations() {
+    let timeline_start = OffsetDateTime::now_utc() - TimeDuration::minutes(10);
     for seed in [0xA11CE_u64, 0xC0DE_u64, 0x5EED_u64] {
         let database = Database::open_in_memory()
             .await
@@ -880,7 +882,7 @@ async fn repository_graph_invariants_hold_for_bounded_deterministic_permutations
                     .unwrap_or_else(|| panic!("seed={seed:#x} dependency scheduler deadlocked"));
                 let operation = pending.remove(position);
                 let (event_key, updated_at, mutations, outcome) =
-                    permutation_operation(operation, seed);
+                    permutation_operation(operation, seed, timeline_start);
                 let before_revision = repository
                     .snapshot(&scope.scope)
                     .await
@@ -889,7 +891,7 @@ async fn repository_graph_invariants_hold_for_bounded_deterministic_permutations
                     })
                     .revision;
                 let result = repository
-                    .apply_batch(&scope_id, event_key, mutations, updated_at)
+                    .apply_batch(&scope_id, event_key, mutations, &updated_at)
                     .await;
                 match outcome {
                     PermutationOutcome::Effective => {
@@ -3412,16 +3414,30 @@ fn permutation_dependencies(operation: usize, seed: u64) -> &'static [usize] {
 fn permutation_operation(
     operation: usize,
     seed: u64,
+    timeline_start: OffsetDateTime,
 ) -> (
     &'static str,
-    &'static str,
+    String,
     Vec<ProviderActivityMutation>,
     PermutationOutcome,
 ) {
+    let minute_offset = match operation {
+        0 | 6 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 10,
+        5 => 5,
+        7 => 4,
+        other => panic!("seed={seed:#x} unknown permutation operation {other}"),
+    };
+    let updated_at = (timeline_start + TimeDuration::minutes(minute_offset))
+        .format(&Rfc3339)
+        .unwrap_or_else(|error| panic!("seed={seed:#x} format operation {operation}: {error}"));
     match operation {
         0 => (
             "event:shared:root",
-            "2026-07-22T12:00:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::upsert_actor(
                     "actor:shared:root",
@@ -3435,7 +3451,7 @@ fn permutation_operation(
         ),
         1 => (
             "event:shared:parent",
-            "2026-07-22T12:01:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::upsert_actor(
                     "actor:shared:parent",
@@ -3451,7 +3467,7 @@ fn permutation_operation(
         ),
         2 => (
             "event:shared:child",
-            "2026-07-22T12:02:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::upsert_actor(
                     "actor:shared:child",
@@ -3467,14 +3483,14 @@ fn permutation_operation(
         ),
         3 => (
             "event:shared:work",
-            "2026-07-22T12:03:00Z",
+            updated_at.clone(),
             vec![ProviderActivityMutation::UpsertWorkItem(
                 work_item_summary(
                     "work:shared:child",
                     Some("actor:shared:child"),
                     ActivityLifecycle::Running,
-                    "2026-07-22T12:03:00Z",
-                    "2026-07-22T12:03:00Z",
+                    &updated_at,
+                    &updated_at,
                     None,
                 )
                 .unwrap_or_else(|error| {
@@ -3485,7 +3501,7 @@ fn permutation_operation(
         ),
         4 => (
             "event:shared:complete",
-            "2026-07-22T12:10:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::set_actor_status("actor:shared:child", "completed")
                     .unwrap_or_else(|error| {
@@ -3496,7 +3512,7 @@ fn permutation_operation(
         ),
         5 => (
             "event:shared:late-running",
-            "2026-07-22T12:05:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::set_actor_status("actor:shared:child", "running")
                     .unwrap_or_else(|error| {
@@ -3507,7 +3523,7 @@ fn permutation_operation(
         ),
         6 => (
             "event:shared:root",
-            "2026-07-22T12:00:00Z",
+            updated_at,
             vec![
                 ProviderActivityMutation::upsert_actor(
                     "actor:shared:root",
@@ -3523,14 +3539,14 @@ fn permutation_operation(
         ),
         7 => (
             "event:shared:missing-owner",
-            "2026-07-22T12:04:00Z",
+            updated_at.clone(),
             vec![ProviderActivityMutation::UpsertWorkItem(
                 work_item_summary(
                     "work:shared:missing",
                     Some("actor:shared:missing"),
                     ActivityLifecycle::Running,
-                    "2026-07-22T12:04:00Z",
-                    "2026-07-22T12:04:00Z",
+                    &updated_at,
+                    &updated_at,
                     None,
                 )
                 .unwrap_or_else(|error| {

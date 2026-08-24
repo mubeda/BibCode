@@ -86,6 +86,26 @@ export const TerminalFontPreference = TerminalFontPreferenceValue.pipe(
   Schema.withDecodingDefault(Effect.succeed(BUNDLED_TERMINAL_FONT_PREFERENCE)),
 );
 
+/**
+ * Which theme the embedded terminal surface renders with.
+ *
+ * Full-screen provider TUIs (Codex most visibly) paint their own dark surfaces
+ * with hardcoded 256-colour indices and never query the terminal for its
+ * colours, so a light terminal shows their panels as dark blocks. Keeping the
+ * terminal on its own theme — dark by default, following the app only when the
+ * user asks — lets those TUIs render as designed. `app` tracks the resolved app
+ * theme for users who prefer a light terminal and do not run such TUIs.
+ */
+export const TerminalThemePreferenceValue = Schema.Literals(["app", "dark", "light"]);
+export type TerminalThemePreference = typeof TerminalThemePreferenceValue.Type;
+
+export const DEFAULT_TERMINAL_THEME_PREFERENCE: TerminalThemePreference = "dark";
+
+export const TerminalThemePreference = TerminalThemePreferenceValue.pipe(
+  Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_TERMINAL_THEME_PREFERENCE)),
+  Schema.withDecodingDefault(Effect.succeed(DEFAULT_TERMINAL_THEME_PREFERENCE)),
+);
+
 export const ClientSettingsSchema = Schema.Struct({
   autoOpenPlanSidebar: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   confirmThreadArchive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -147,6 +167,7 @@ export const ClientSettingsSchema = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_TIMESTAMP_FORMAT)),
   ),
   terminalFontPreference: TerminalFontPreference,
+  terminalThemePreference: TerminalThemePreference,
   usagePercentageDisplay: UsagePercentageDisplay.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
@@ -446,7 +467,7 @@ export type ProviderSessionDefault = typeof ProviderSessionDefault.Type;
 export const ProviderSessionDefaultsMap = Schema.Record(ProviderDriverKind, ProviderSessionDefault);
 export type ProviderSessionDefaultsMap = typeof ProviderSessionDefaultsMap.Type;
 
-export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
+export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.minutes(3);
 
 export const ServerSettings = Schema.Struct({
   enableAssistantStreaming: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -687,6 +708,7 @@ export const ClientSettingsPatch = Schema.Struct({
   statusBarUsageMode: Schema.optionalKey(StatusBarUsageMode),
   timestampFormat: Schema.optionalKey(TimestampFormat),
   terminalFontPreference: Schema.optionalKey(TerminalFontPreference),
+  terminalThemePreference: Schema.optionalKey(TerminalThemePreference),
   usagePercentageDisplay: Schema.optionalKey(UsagePercentageDisplay),
   wordWrap: Schema.optionalKey(Schema.Boolean),
 });

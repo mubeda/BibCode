@@ -618,6 +618,11 @@ mod tests {
             .await
             .expect("environment descriptor should decode");
         assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
+        assert!(
+            descriptor["capabilities"]
+                .get("worktreeCatalogRefreshReason")
+                .is_none()
+        );
         let token = client
             .post(format!("http://{}/oauth/token", production.local_addr()))
             .form(&[

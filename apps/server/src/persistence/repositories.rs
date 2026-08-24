@@ -859,15 +859,15 @@ impl Repositories {
 
     pub async fn upsert_thread_session(&self, row: ProjectionThreadSession) -> Result<()> {
         self.database.call(move |connection| { connection.execute(
-            "INSERT INTO projection_thread_sessions (thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (thread_id) DO UPDATE SET status=excluded.status, provider_name=excluded.provider_name, provider_instance_id=excluded.provider_instance_id, runtime_mode=excluded.runtime_mode, active_turn_id=excluded.active_turn_id, last_error=excluded.last_error, updated_at=excluded.updated_at",
-            params![row.thread_id,row.status,row.provider_name,row.provider_instance_id,row.runtime_mode,row.active_turn_id,row.last_error,row.updated_at])?; Ok(()) }).await
+            "INSERT INTO projection_thread_sessions (thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (thread_id) DO UPDATE SET status=excluded.status, provider_name=excluded.provider_name, provider_instance_id=excluded.provider_instance_id, runtime_mode=excluded.runtime_mode, active_turn_id=excluded.active_turn_id, last_error=excluded.last_error, last_error_class=excluded.last_error_class, updated_at=excluded.updated_at",
+            params![row.thread_id,row.status,row.provider_name,row.provider_instance_id,row.runtime_mode,row.active_turn_id,row.last_error,row.last_error_class,row.updated_at])?; Ok(()) }).await
     }
     pub async fn get_thread_session(
         &self,
         thread_id: String,
     ) -> Result<Option<ProjectionThreadSession>> {
-        self.database.call(move |connection| connection.query_row("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, updated_at FROM projection_thread_sessions WHERE thread_id = ?", [thread_id], decode_thread_session).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at FROM projection_thread_sessions WHERE thread_id = ?", [thread_id], decode_thread_session).optional().map_err(Into::into)).await
     }
     pub async fn delete_thread_session(&self, thread_id: String) -> Result<()> {
         self.delete(
@@ -1305,6 +1305,11 @@ pub struct ProjectionThread {
     pub pending_approval_count: i64,
     pub pending_user_input_count: i64,
     pub has_actionable_proposed_plan: i64,
+    /// The state of the newest delivery on this thread that the user still has
+    /// to resolve (`failed` or `uncertain`), or `None` when there is none.
+    /// Derived from the outbox on every delivery transition, so it clears itself.
+    pub unresolved_delivery_state: Option<String>,
+    pub unresolved_delivery_detail: Option<String>,
     pub deleted_at: Option<Timestamp>,
 }
 
@@ -1350,6 +1355,7 @@ pub struct ProjectionThreadSession {
     pub runtime_mode: String,
     pub active_turn_id: Option<String>,
     pub last_error: Option<String>,
+    pub last_error_class: Option<String>,
     pub updated_at: Timestamp,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1478,7 +1484,7 @@ pub struct AuthSession {
     pub revoked_at: Option<Timestamp>,
 }
 
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at FROM projection_threads";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at FROM projection_thread_messages";
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
@@ -1628,7 +1634,9 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         pending_approval_count: row.get(14)?,
         pending_user_input_count: row.get(15)?,
         has_actionable_proposed_plan: row.get(16)?,
-        deleted_at: row.get(17)?,
+        unresolved_delivery_state: row.get(17)?,
+        unresolved_delivery_detail: row.get(18)?,
+        deleted_at: row.get(19)?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
@@ -1715,7 +1723,8 @@ fn decode_thread_session(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadSess
         runtime_mode: row.get(4)?,
         active_turn_id: row.get(5)?,
         last_error: row.get(6)?,
-        updated_at: row.get(7)?,
+        last_error_class: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 fn decode_pending_approval(row: &Row<'_>) -> rusqlite::Result<ProjectionPendingApproval> {

@@ -11,7 +11,7 @@
           "enableProviderUpdateChecks": true,
           "enableChatAgentActivity": true,
           "enableTerminalAgentActivity": false,
-          "automaticGitFetchInterval": 30000,
+          "automaticGitFetchInterval": 180000,
           "defaultThreadEnvMode": "local",
           "newWorktreesStartFromOrigin": false,
           "worktreeBaseDirectory": "",
@@ -40,7 +40,7 @@
               "launchArgs": ""
             },
             "cursor": {
-              "enabled": false,
+              "enabled": true,
               "binaryPath": "cursor-agent",
               "apiEndpoint": "",
               "customModels": []

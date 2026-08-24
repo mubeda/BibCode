@@ -84,6 +84,7 @@ const hooks = vi.hoisted(() => {
 });
 
 interface CapturedButtonProps {
+  readonly "aria-pressed"?: boolean;
   readonly disabled?: boolean;
   readonly onClick?: () => void;
   readonly children?: ReactNode;
@@ -144,6 +145,7 @@ const testState = vi.hoisted(() => ({
   refs: [] as Array<{
     name: string;
     isRemote?: boolean;
+    remoteName?: string;
     current?: boolean;
     worktreePath?: string | null;
   }>,
@@ -217,7 +219,12 @@ vi.mock("./ui/button", () => ({
   Button: (props: CapturedButtonProps) => {
     captured.buttons.push(props);
     return (
-      <button type="button" disabled={props.disabled} onClick={props.onClick}>
+      <button
+        type="button"
+        aria-pressed={props["aria-pressed"]}
+        disabled={props.disabled}
+        onClick={props.onClick}
+      >
         {props.children}
       </button>
     );
@@ -430,9 +437,8 @@ staticDescribe("CreateWorktreeDialog", () => {
   });
 
   async function submitWorktree(): Promise<void> {
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "agent-selection" } });
+    input("Worktree name").onChange?.({ target: { value: "agent-selection" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -471,7 +477,7 @@ staticDescribe("CreateWorktreeDialog", () => {
       kind: "vcs.listRefs",
       args: {
         environmentId: targetEnvironmentId,
-        input: { cwd: "/remote/repo", query: undefined },
+        input: { cwd: "/remote/repo", query: undefined, limit: 200 },
       },
     });
   });
@@ -540,10 +546,13 @@ staticDescribe("CreateWorktreeDialog", () => {
     ]);
     expect(testState.queryAtoms.at(-1)).toEqual({
       kind: "vcs.listRefs",
-      args: { environmentId: ENVIRONMENT_ID, input: { cwd: "/repo", query: undefined } },
+      args: {
+        environmentId: ENVIRONMENT_ID,
+        input: { cwd: "/repo", query: undefined, limit: 200 },
+      },
     });
     expect(markup).toContain("Interpreting as:");
-    expect(input("Type a name, #1234, or a branch").value).toBe("");
+    expect(input("Type #1234 or search branches").value).toBe("");
   });
 
   it("adopts the first scoped project when projects load after the dialog opens", () => {
@@ -559,7 +568,7 @@ staticDescribe("CreateWorktreeDialog", () => {
       kind: "vcs.listRefs",
       args: {
         environmentId: ENVIRONMENT_ID,
-        input: { cwd: "/repo", query: undefined },
+        input: { cwd: "/repo", query: undefined, limit: 200 },
       },
     });
   });
@@ -794,34 +803,36 @@ staticDescribe("CreateWorktreeDialog", () => {
     expect(testState.replaceMainWithTerminal).not.toHaveBeenCalled();
   });
 
-  it("switches among smart, GitHub, branch, and name inputs and selects branch rows", () => {
+  it("keeps Name visible while switching among Smart, GitHub, and Branch sources", () => {
     testState.refs = [{ name: "main" }, { name: "feature/login" }];
     render();
+    expect(input("Worktree name").value).toBe("");
+    expect(button("Smart")["aria-pressed"]).toBe(true);
 
-    input("Type a name, #1234, or a branch").onChange?.({ target: { value: "feature" } });
+    input("Type #1234 or search branches").onChange?.({ target: { value: "feature" } });
     let markup = render();
-    expect(markup).toContain("Use &quot;feature&quot;");
     expect(markup).toContain("feature/login");
 
     button("Branch").onClick?.();
     markup = render();
+    expect(button("Branch")["aria-pressed"]).toBe(true);
     expect(input("Search branches").value).toBe("feature");
     expect(markup).toContain("feature/login");
     expect(testState.queryAtoms.at(-1)).toEqual(
       expect.objectContaining({
-        args: expect.objectContaining({ input: { cwd: "/repo", query: "feature" } }),
+        args: expect.objectContaining({
+          input: { cwd: "/repo", query: undefined, limit: 200 },
+        }),
       }),
     );
 
     button("GitHub").onClick?.();
     render();
     input("#1234 or a GitHub issue/PR URL").onChange?.({ target: { value: "#42" } });
-    render();
+    markup = render();
     expect(button("Create worktree").disabled).toBe(false);
-
-    button("Name").onClick?.();
-    render();
-    expect(input("Worktree / branch name").value).toBe("#42");
+    expect(input("Worktree name").value).toBe("pr-42");
+    expect(markup).not.toContain(">Name</button>");
     expect(testState.queryAtoms.at(-1)).toBeNull();
   });
 
@@ -961,9 +972,8 @@ staticDescribe("CreateWorktreeDialog", () => {
     });
     render();
     expect(captured.selects[1]?.value).toBe("chat:codex");
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "project-default" } });
+    input("Worktree name").onChange?.({ target: { value: "project-default" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -1056,9 +1066,8 @@ staticDescribe("CreateWorktreeDialog", () => {
     });
 
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "defaults" } });
+    input("Worktree name").onChange?.({ target: { value: "defaults" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -1083,9 +1092,8 @@ staticDescribe("CreateWorktreeDialog", () => {
 
   it("falls back to the default Codex selection when project and providers have no model", async () => {
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "fallback" } });
+    input("Worktree name").onChange?.({ target: { value: "fallback" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -1107,9 +1115,8 @@ staticDescribe("CreateWorktreeDialog", () => {
   ])("reports worktree creation failures", async (error, description) => {
     testState.createWorktree.mockResolvedValue(failure(error));
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "failure" } });
+    input("Worktree name").onChange?.({ target: { value: "failure" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -1124,9 +1131,8 @@ staticDescribe("CreateWorktreeDialog", () => {
   it("suppresses interrupted worktree failures", async () => {
     testState.createWorktree.mockResolvedValue(failure(new Error("cancelled"), true));
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "cancelled" } });
+    input("Worktree name").onChange?.({ target: { value: "cancelled" } });
     render();
     button("Create worktree").onClick?.();
     await flushPromises();
@@ -1136,9 +1142,8 @@ staticDescribe("CreateWorktreeDialog", () => {
 
   it("resets the form instead of closing when Create more is enabled", async () => {
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "one" } });
+    input("Worktree name").onChange?.({ target: { value: "one" } });
     captured.switches[0]?.onCheckedChange?.(true);
     render();
     button("Create worktree").onClick?.();
@@ -1146,16 +1151,15 @@ staticDescribe("CreateWorktreeDialog", () => {
     const markup = render();
 
     expect(markup).toContain("Create worktree");
-    expect(input("Worktree / branch name").value).toBe("");
+    expect(input("Worktree name").value).toBe("");
     expect(testState.onOpenChange).not.toHaveBeenCalled();
     expect(testState.navigate).not.toHaveBeenCalled();
   });
 
   it("submits with Ctrl+Enter and Meta+Enter but ignores other key combinations", async () => {
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "keyboard" } });
+    input("Worktree name").onChange?.({ target: { value: "keyboard" } });
     render();
     const preventDefault = vi.fn();
 
@@ -1209,7 +1213,7 @@ staticDescribe("CreateWorktreeDialog", () => {
 
     button("Create worktree").onClick?.();
     await flushPromises();
-    expect(render()).toContain("Choose a project and a name/branch to create the worktree from.");
+    expect(render()).toContain("Choose a project and enter a worktree name.");
   });
 
   it("ignores close requests while a command is pending", async () => {
@@ -1220,9 +1224,8 @@ staticDescribe("CreateWorktreeDialog", () => {
       }),
     );
     render();
-    button("Name").onClick?.();
     render();
-    input("Worktree / branch name").onChange?.({ target: { value: "pending" } });
+    input("Worktree name").onChange?.({ target: { value: "pending" } });
     render();
     button("Create worktree").onClick?.();
     render();
@@ -1335,7 +1338,7 @@ if (browserRuntime) {
         kind: "vcs.listRefs",
         args: {
           environmentId: targetEnvironmentId,
-          input: { cwd: "/remote/repo", query: undefined },
+          input: { cwd: "/remote/repo", query: undefined, limit: 200 },
         },
       });
 
@@ -1401,6 +1404,128 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("suggests a permanent name and defaults reuse on for a free local branch", async () => {
+      testState.refs = [
+        { name: "main", current: true, worktreePath: "/repo" },
+        { name: "feature/login", isRemote: false, current: false, worktreePath: null },
+      ];
+      const { container, root } = await mountDialog();
+
+      const nameInput = container.querySelector<HTMLInputElement>(
+        "input[placeholder='Worktree name']",
+      );
+      expect(nameInput?.value).toBe("");
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/login").click());
+
+      expect(nameInput?.value).toBe("feature/login");
+      const reuseLabel = Array.from(container.querySelectorAll("label")).find((label) =>
+        label.textContent?.includes("Reuse branch"),
+      );
+      expect(reuseLabel?.querySelector<HTMLInputElement>("input[type='checkbox']")?.checked).toBe(
+        true,
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("turns an exact remote ref into the selection without duplicating it below the input", async () => {
+      testState.refs = [
+        {
+          name: "origin/feature/remote-only",
+          isRemote: true,
+          remoteName: "origin",
+        },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      const sourceInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Search branches']",
+      );
+      await setInputValue(sourceInput, "origin/feature/remote-only");
+
+      expect(sourceInput.value).toBe("origin/feature/remote-only");
+      expect(testState.queryAtoms.at(-1)).toEqual({
+        kind: "vcs.listRefs",
+        args: {
+          environmentId: ENVIRONMENT_ID,
+          input: { cwd: "/repo", query: undefined, limit: 200 },
+        },
+      });
+      expect(
+        Array.from(container.querySelectorAll("button")).filter(
+          (button) => button.textContent?.trim() === "origin/feature/remote-only",
+        ),
+      ).toHaveLength(0);
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']").value,
+      ).toBe("feature/remote-only");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("preserves a manually edited name and leaves branch reuse off", async () => {
+      testState.refs = [{ name: "feature/login", isRemote: false }];
+      const { container, root } = await mountDialog();
+      const nameInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Worktree name']",
+      );
+
+      await setInputValue(nameInput, "Custom workspace");
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/login").click());
+
+      expect(nameInput.value).toBe("Custom workspace");
+      const reuseCheckbox = Array.from(container.querySelectorAll("label"))
+        .find((label) => label.textContent?.includes("Reuse branch"))
+        ?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      expect(reuseCheckbox?.checked).toBe(false);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("advances an untouched name when opting out of branch reuse", async () => {
+      testState.refs = [
+        { name: "feature/login", isRemote: false },
+        { name: "feature/login-2", isRemote: false },
+      ];
+      const { container, root } = await mountDialog();
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/login").click());
+      const reuseCheckbox = Array.from(container.querySelectorAll("label"))
+        .find((label) => label.textContent?.includes("Reuse branch"))
+        ?.querySelector<HTMLInputElement>("input[type='checkbox']");
+      await React.act(async () => reuseCheckbox?.click());
+
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']").value,
+      ).toBe("feature/login-3");
+      await React.act(async () => requiredButton(container, "Create worktree").click());
+      await React.act(async () => flushPromises());
+      expect(testState.createWorktree).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            title: "feature/login-3",
+            refName: "feature/login",
+            newRefName: "feature/login-3",
+            baseRefName: "feature/login",
+          }),
+        }),
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("explains when the selected local branch is already checked out", async () => {
       testState.refs = [
         {
@@ -1418,6 +1543,7 @@ if (browserRuntime) {
       expect(container.textContent).toContain(
         '"main" is already checked out. A new branch ("main-2" or the next available name) will be created from it.',
       );
+      expect(container.textContent).not.toContain("Reuse branch");
 
       await React.act(async () => root.unmount());
       container.remove();
@@ -1451,7 +1577,7 @@ if (browserRuntime) {
         kind: "vcs.listRefs",
         args: {
           environmentId: remoteEnvironmentId,
-          input: { cwd: "/remote/repo", query: undefined },
+          input: { cwd: "/remote/repo", query: undefined, limit: 200 },
         },
       });
 
@@ -1514,7 +1640,7 @@ if (browserRuntime) {
         kind: "vcs.listRefs",
         args: {
           environmentId: secondEnvironmentId,
-          input: { cwd: "/repo-b", query: undefined },
+          input: { cwd: "/repo-b", query: undefined, limit: 200 },
         },
       });
 
@@ -1553,7 +1679,7 @@ if (browserRuntime) {
         kind: "vcs.listRefs",
         args: {
           environmentId: secondEnvironmentId,
-          input: { cwd: "/repo-b", query: undefined },
+          input: { cwd: "/repo-b", query: undefined, limit: 200 },
         },
       });
 
@@ -1615,6 +1741,60 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("keeps a stale Smart source invalid after reopening", async () => {
+      testState.refs = [{ name: "feature/login", isRemote: false }];
+      const { container, root } = await mountDialog(true, PROJECT_REF);
+      const sourceInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Type #1234 or search branches']",
+      );
+
+      await setInputValue(sourceInput, "feature");
+      await React.act(async () => requiredButton(container, "feature/login").click());
+      await setInputValue(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+        "Custom workspace",
+      );
+      await renderDialog(root, false, PROJECT_REF);
+      await renderDialog(root, true, PROJECT_REF);
+
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']").value,
+      ).toBe("Custom workspace");
+      expect(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
+      ).toBe("feature");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("does not use a branch search after switching Create From modes", async () => {
+      testState.refs = [{ name: "feature/login", isRemote: false }];
+      const { container, root } = await mountDialog(true, PROJECT_REF);
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await setInputValue(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']"),
+        "feature",
+      );
+      await React.act(async () => requiredButton(container, "feature/login").click());
+      await setInputValue(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+        "Custom workspace",
+      );
+      await React.act(async () => requiredButton(container, "Smart").click());
+
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("enables and submits the worktree form through real input and Ctrl+Enter events", async () => {
       testState.serverConfigs.set(ENVIRONMENT_ID, {
         providers: [
@@ -1636,10 +1816,9 @@ if (browserRuntime) {
       const { container, root } = await mountDialog();
 
       expect(requiredButton(container, "Create worktree").disabled).toBe(true);
-      await React.act(async () => requiredButton(container, "Name").click());
       const nameInput = requiredElement<HTMLInputElement>(
         container,
-        "input[placeholder='Worktree / branch name']",
+        "input[placeholder='Worktree name']",
       );
       await setInputValue(nameInput, "My Feature");
       expect(nameInput.value).toBe("My Feature");
@@ -1663,12 +1842,12 @@ if (browserRuntime) {
           commandId: "command-create-worktree",
           projectId: PROJECT_ID,
           threadId: "thread-created",
-          title: "My-Feature",
+          title: "My Feature",
           refName: "HEAD",
           newRefName: "My-Feature",
           baseRefName: "HEAD",
           threadDefaults: {
-            modelSelection: expect.objectContaining({ instanceId: "claude", model: "sonnet" }),
+            modelSelection: expect.any(Object),
             runtimeMode: "full-access",
             interactionMode: "default",
           },

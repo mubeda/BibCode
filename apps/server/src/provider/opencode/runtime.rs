@@ -147,6 +147,7 @@ struct RuntimeInner {
     assistant_text: Mutex<HashMap<String, String>>,
     events_tx: mpsc::UnboundedSender<OpenCodeRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<OpenCodeRuntimeEvent>>,
+    event_stream_ended: CancellationToken,
     event_counter: Mutex<u64>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
     pending_permissions: Mutex<HashMap<String, Option<String>>>,
@@ -482,6 +483,7 @@ impl OpenCodeSessionRuntime {
                 assistant_text: Mutex::new(HashMap::new()),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
+                event_stream_ended: CancellationToken::new(),
                 event_counter: Mutex::new(0),
                 pending_questions: Mutex::new(HashMap::new()),
                 pending_permissions: Mutex::new(HashMap::new()),
@@ -590,9 +592,9 @@ impl OpenCodeSessionRuntime {
             .to_owned();
         *self.inner.session_id.lock().await = Some(session_id.clone());
         self.reset_activity_root(&session_id).await;
-        self.start_event_pump().await?;
         self.emit("session.started", None, None, json!({})).await;
         self.emit("thread.started", None, None, json!({})).await;
+        self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
         Ok(session_id)
     }
@@ -617,10 +619,10 @@ impl OpenCodeSessionRuntime {
         }
         *self.inner.session_id.lock().await = Some(session_id.to_owned());
         self.reset_activity_root(session_id).await;
-        self.start_event_pump().await?;
         self.emit("session.started", None, None, json!({ "resumed": true }))
             .await;
         self.emit("thread.started", None, None, json!({})).await;
+        self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
         Ok(session_id.to_owned())
     }
@@ -1158,11 +1160,22 @@ impl OpenCodeSessionRuntime {
             json!({ "reason": "Session stopped." }),
         )
         .await;
+        self.end_event_stream();
         Ok(())
     }
 
     pub async fn next_event(&self) -> Option<OpenCodeRuntimeEvent> {
-        self.inner.events_rx.lock().await.recv().await
+        let mut events = self.inner.events_rx.lock().await;
+        loop {
+            if self.inner.event_stream_ended.is_cancelled() {
+                return events.try_recv().ok();
+            }
+            tokio::select! {
+                biased;
+                event = events.recv() => return event,
+                () = self.inner.event_stream_ended.cancelled() => {}
+            }
+        }
     }
 
     pub async fn collect_events(&self, expected: usize) -> Vec<OpenCodeRuntimeEventStableView> {
@@ -1193,18 +1206,54 @@ impl OpenCodeSessionRuntime {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(inner) = runtime.upgrade() {
-                        OpenCodeSessionRuntime::internal(inner)
+                        let runtime = OpenCodeSessionRuntime::internal(inner);
+                        runtime
                             .emit(
                                 "runtime.error",
                                 None,
                                 None,
-                                json!({ "message": error.to_string() }),
+                                json!({
+                                    "message": error.to_string(),
+                                    "class": "transport_error",
+                                }),
                             )
                             .await;
+                        runtime.end_event_stream();
                     }
                     return;
                 }
             };
+            // The status used to go unchecked, so an auth failure or a 5xx was
+            // parsed as SSE and surfaced as "invalid JSON" — or as nothing at
+            // all — with the status lost.
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let detail = body.trim().chars().take(300).collect::<String>();
+                let message = if detail.is_empty() {
+                    format!("OpenCode rejected the event stream with HTTP {status}.")
+                } else {
+                    format!("OpenCode rejected the event stream with HTTP {status}: {detail}")
+                };
+                let class = if matches!(status.as_u16(), 401 | 403) {
+                    "permission_error"
+                } else {
+                    "provider_error"
+                };
+                if let Some(inner) = runtime.upgrade() {
+                    let runtime = OpenCodeSessionRuntime::internal(inner);
+                    runtime
+                        .emit(
+                            "runtime.error",
+                            None,
+                            None,
+                            json!({ "message": message, "class": class }),
+                        )
+                        .await;
+                    runtime.end_event_stream();
+                }
+                return;
+            }
             let mut decoder = OpenCodeSseDecoder::default();
             let mut response = response;
             loop {
@@ -1258,10 +1307,28 @@ impl OpenCodeSessionRuntime {
                                 .await;
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // The stream ending is how a crashed or killed opencode
+                        // server presents. Saying nothing made that look like a
+                        // hung BiBCode.
+                        if let Some(inner) = runtime.upgrade() {
+                            let runtime = OpenCodeSessionRuntime::internal(inner);
+                            runtime
+                                .emit(
+                                    "session.exited",
+                                    None,
+                                    None,
+                                    json!({ "reason": "OpenCode closed its event stream." }),
+                                )
+                                .await;
+                            runtime.end_event_stream();
+                        }
+                        break;
+                    }
                     Err(error) => {
                         if let Some(inner) = runtime.upgrade() {
-                            OpenCodeSessionRuntime::internal(inner)
+                            let runtime = OpenCodeSessionRuntime::internal(inner);
+                            runtime
                                 .emit(
                                     "runtime.error",
                                     None,
@@ -1269,6 +1336,7 @@ impl OpenCodeSessionRuntime {
                                     json!({ "message": error.to_string() }),
                                 )
                                 .await;
+                            runtime.end_event_stream();
                         }
                         break;
                     }
@@ -1310,6 +1378,16 @@ impl OpenCodeSessionRuntime {
         let (route, candidate_is_known, parent_is_known) = {
             let activity = self.inner.activity.lock().await;
             let route = match payload_identity {
+                // opencode marks `session.error`'s `sessionID` optional. Routing
+                // an identity-less error to `Foreign` dropped it and left the
+                // turn open, so the following `session.status{idle}` reported
+                // the upstream failure as a completed turn. This stream drives
+                // exactly one root session, so attribute it there rather than
+                // lose it. `Conflicting` stays foreign — that one is genuinely
+                // ambiguous.
+                PayloadSessionIdentity::Missing if event_type == "session.error" => {
+                    OpenCodeEventRoute::Root
+                }
                 PayloadSessionIdentity::Missing | PayloadSessionIdentity::Conflicting => {
                     OpenCodeEventRoute::Foreign
                 }
@@ -1499,16 +1577,23 @@ impl OpenCodeSessionRuntime {
                 }
             }
             "session.error" => {
+                let failure =
+                    classify_opencode_error(properties.get("error").unwrap_or(&Value::Null));
                 let Some(failed_turn_id) = self.inner.active_turn_id.lock().await.take() else {
+                    // An error outside a tracked turn used to return silently,
+                    // so anything failing post-idle, during compaction, or on a
+                    // background path was invisible. Report it as a runtime
+                    // error instead of losing it.
+                    self.emit(
+                        "runtime.error",
+                        None,
+                        None,
+                        json!({ "message": failure.message, "class": failure.class }),
+                    )
+                    .await;
                     return;
                 };
-                let message = properties
-                    .pointer("/error/data/message")
-                    .and_then(Value::as_str)
-                    .or_else(|| properties.pointer("/error/message").and_then(Value::as_str))
-                    .or_else(|| properties.get("error").and_then(Value::as_str))
-                    .unwrap_or("OpenCode session failed.")
-                    .to_owned();
+                let message = failure.message.clone();
                 let has_assistant_message =
                     !self.inner.assistant_message_ids.lock().await.is_empty();
                 let failed_user_message = self.inner.active_user_message_id.lock().await.take();
@@ -1519,14 +1604,18 @@ impl OpenCodeSessionRuntime {
                 {
                     let _ = self.inner.client.delete(url).send().await;
                 }
+                // `state`/`stopReason` were hardcoded to a failure, so an
+                // abort — the user's own interrupt — was reported as a provider
+                // error. `errorMessage` is the contract-canonical field.
                 self.emit(
                     "turn.completed",
                     Some(failed_turn_id),
                     None,
                     json!({
-                        "state": "failed",
-                        "stopReason": "error",
-                        "error": { "message": message },
+                        "state": failure.state,
+                        "stopReason": failure.stop_reason,
+                        "errorMessage": message,
+                        "errorClass": failure.class,
                     }),
                 )
                 .await;
@@ -1612,7 +1701,15 @@ impl OpenCodeSessionRuntime {
                 )
                 .await;
             }
-            _ => {}
+            unhandled => {
+                // Unknown SSE event types were discarded unlogged, with no
+                // metric either. Event type only — properties carry content.
+                tracing::debug!(
+                    provider = "opencode",
+                    event_type = unhandled,
+                    "dropped an unhandled opencode event"
+                );
+            }
         }
     }
 
@@ -1650,6 +1747,10 @@ impl OpenCodeSessionRuntime {
             native_event_id: None,
             activity: Vec::new(),
         });
+    }
+
+    fn end_event_stream(&self) {
+        self.inner.event_stream_ended.cancel();
     }
 
     async fn reset_activity_root(&self, root_session_id: &str) {
@@ -2795,6 +2896,102 @@ fn build_permission_rules(runtime_mode: &str) -> Vec<Value> {
     .collect()
 }
 
+/// A classified opencode failure: the canonical turn state, the stop reason,
+/// the `RuntimeErrorClass`, and a message that is useful even when opencode
+/// supplied no text.
+pub(crate) struct OpenCodeFailure {
+    pub(crate) state: &'static str,
+    pub(crate) stop_reason: &'static str,
+    pub(crate) class: &'static str,
+    pub(crate) message: String,
+}
+
+/// Classify an opencode error object, which is discriminated on `name`.
+///
+/// opencode already computes the distinction this needs. Reading only
+/// `data.message` reported an aborted turn as a provider failure, and left
+/// `MessageOutputLengthError` — whose data is empty — indistinguishable from an
+/// unexplained BiBCode fault.
+/// Verified against the opencode SDK's generated types: the discriminant is
+/// literally `"APIError"` (all caps) even though the TypeScript alias is
+/// `ApiError`, and `ProviderAuthError`, `UnknownError`,
+/// `MessageOutputLengthError` and `MessageAbortedError` are the rest of the
+/// documented union. `ContextOverflowError`, `ContentFilterError` and
+/// `StructuredOutputError` were read out of the installed 1.18.18 binary but do
+/// not appear in the current SDK types; their arms are harmless if the name
+/// never arrives, and the `_` arm covers anything unrecognised.
+pub(crate) fn classify_opencode_error(error: &Value) -> OpenCodeFailure {
+    let name = error.get("name").and_then(Value::as_str);
+    let (state, stop_reason, class, fallback) = match name {
+        // An abort is the user's own doing, not a provider failure.
+        Some("MessageAbortedError") => {
+            ("cancelled", "cancelled", "unknown", "The turn was stopped.")
+        }
+        Some("MessageOutputLengthError") => (
+            "failed",
+            "max_tokens",
+            "provider_error",
+            "The model reached its maximum output length.",
+        ),
+        Some("ContentFilterError") => (
+            "failed",
+            "refusal",
+            "provider_error",
+            "The provider's content filter stopped this turn.",
+        ),
+        Some("ProviderAuthError") => (
+            "failed",
+            "error",
+            "permission_error",
+            "The upstream provider rejected the credentials.",
+        ),
+        Some("ContextOverflowError") => (
+            "failed",
+            "error",
+            "provider_error",
+            "The conversation exceeded the model's context window.",
+        ),
+        Some("APIError") => (
+            "failed",
+            "error",
+            "provider_error",
+            "The upstream provider's API returned an error.",
+        ),
+        _ => (
+            "failed",
+            "error",
+            "provider_error",
+            "OpenCode session failed.",
+        ),
+    };
+    let mut message = error
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .or_else(|| error.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback)
+        .to_owned();
+    // Detail opencode already carries and BiBCode used to drop. It is what tells
+    // the user this was the upstream API rather than BiBCode.
+    if let Some(provider) = error.pointer("/data/providerID").and_then(Value::as_str) {
+        message.push_str(&format!(" (provider: {provider})"));
+    }
+    if let Some(status) = error.pointer("/data/statusCode").and_then(Value::as_i64) {
+        message.push_str(&format!(" (HTTP {status})"));
+    }
+    if error.pointer("/data/isRetryable").and_then(Value::as_bool) == Some(true) {
+        message.push_str(" (the provider reported this as retryable)");
+    }
+    OpenCodeFailure {
+        state,
+        stop_reason,
+        class,
+        message,
+    }
+}
+
 fn payload_session_identity<'a>(
     event_type: &str,
     properties: &'a Value,
@@ -2850,6 +3047,80 @@ fn activity_flush_is_current(
     inner.owner_state.is_active()
         && !cancellation.is_cancelled()
         && inner.activity_flush_generation.load(Ordering::SeqCst) == generation
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    use super::classify_opencode_error;
+    use serde_json::json;
+
+    #[test]
+    fn an_abort_is_not_reported_as_a_provider_failure() {
+        // opencode names a user abort `MessageAbortedError`. BiBCode read only
+        // `data.message` and hardcoded `stopReason: "error"`, so the user's own
+        // interrupt was presented as a provider failure.
+        let failure = classify_opencode_error(&json!({
+            "name": "MessageAbortedError",
+            "data": { "message": "aborted" }
+        }));
+        assert_eq!(failure.state, "cancelled");
+        assert_eq!(failure.stop_reason, "cancelled");
+    }
+
+    #[test]
+    fn an_empty_output_length_error_still_explains_itself() {
+        // `MessageOutputLengthError` carries no data, so the old code fell
+        // through to the literal "OpenCode session failed." — a benign
+        // max-output stop was indistinguishable from an unexplained fault.
+        let failure = classify_opencode_error(&json!({ "name": "MessageOutputLengthError" }));
+        assert_eq!(failure.state, "failed");
+        assert_eq!(failure.stop_reason, "max_tokens");
+        assert!(
+            failure.message.contains("maximum output length"),
+            "got {:?}",
+            failure.message
+        );
+        assert_ne!(failure.message, "OpenCode session failed.");
+    }
+
+    #[test]
+    fn an_auth_failure_is_a_permission_error_and_names_the_provider() {
+        let failure = classify_opencode_error(&json!({
+            "name": "ProviderAuthError",
+            "data": { "message": "no key", "providerID": "anthropic" }
+        }));
+        assert_eq!(failure.class, "permission_error");
+        assert!(
+            failure.message.contains("anthropic"),
+            "got {:?}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn an_api_error_carries_the_upstream_status_and_retryability() {
+        // The discriminant is literally "APIError" (all caps) in opencode's
+        // generated SDK types, even though the TypeScript alias is `ApiError`.
+        let failure = classify_opencode_error(&json!({
+            "name": "APIError",
+            "data": { "message": "overloaded", "statusCode": 529, "isRetryable": true }
+        }));
+        assert_eq!(failure.class, "provider_error");
+        assert!(failure.message.contains("529"), "got {:?}", failure.message);
+        assert!(
+            failure.message.contains("retryable"),
+            "got {:?}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_error_name_still_fails_closed_with_a_message() {
+        let failure = classify_opencode_error(&json!({ "name": "SomethingNewerOpenCodeSends" }));
+        assert_eq!(failure.state, "failed");
+        assert_eq!(failure.class, "provider_error");
+        assert!(!failure.message.is_empty());
+    }
 }
 
 #[cfg(test)]

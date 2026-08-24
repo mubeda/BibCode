@@ -286,7 +286,7 @@ describe("applyGitStatusStreamEvent", () => {
     });
   });
 
-  it("applies local updates while preserving current remote-only fields", () => {
+  it("clears branch-specific remote fields when a local update changes refs", () => {
     const current: VcsStatusResult = {
       ...localStatus,
       ...remoteStatus,
@@ -295,6 +295,21 @@ describe("applyGitStatusStreamEvent", () => {
     const nextLocal = { ...localStatus, refName: "feature/next" };
     expect(applyGitStatusStreamEvent(current, { _tag: "localUpdated", local: nextLocal })).toEqual({
       ...nextLocal,
+      hasUpstream: false,
+      aheadCount: 0,
+      behindCount: 0,
+      aheadOfDefaultCount: 0,
+      pr: null,
+    });
+
+    expect(
+      applyGitStatusStreamEvent(current, {
+        _tag: "localUpdated",
+        local: { ...localStatus, hasWorkingTreeChanges: !localStatus.hasWorkingTreeChanges },
+      }),
+    ).toEqual({
+      ...localStatus,
+      hasWorkingTreeChanges: !localStatus.hasWorkingTreeChanges,
       ...remoteStatus,
       aheadOfDefaultCount: 7,
     });
@@ -305,7 +320,7 @@ describe("applyGitStatusStreamEvent", () => {
       Object.hasOwn(
         applyGitStatusStreamEvent(withoutAheadOfDefault, {
           _tag: "localUpdated",
-          local: nextLocal,
+          local: { ...localStatus, hasWorkingTreeChanges: false },
         }),
         "aheadOfDefaultCount",
       ),

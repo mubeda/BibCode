@@ -60,6 +60,13 @@ From the Git actions or Source Control UI, BiBCode can:
 Provider terminology follows the host: GitLab uses merge requests, while the
 other supported hosts use pull requests.
 
+Passive workspace summaries publish their fresh Git/provider base before the
+optional PR lookup. While that lookup is pending or fails, a same-branch and
+same-provider PR completed in the previous producer cycle may appear for one
+cycle with its original observation time and `stale` state. It expires in the
+following cycle unless the provider refreshes it; fresh local base fields are
+not replaced by the prior whole summary.
+
 ## Source Control panel
 
 The right-panel Source Control surface manages the active project or worktree:
@@ -136,6 +143,9 @@ export BIBCODE_BITBUCKET_API_TOKEN="your-api-token"
 
 Restart the server after changing its environment. The `origin` remote must be a
 recognizable Bitbucket URL so BiBCode can identify the workspace and repository.
+Each Bitbucket REST operation has one 30-second deadline spanning request and
+response-body work. Response bodies are capped at 1 MiB before JSON decoding;
+both declared and chunked oversized responses fail with a typed provider error.
 
 The current Source Control discovery screen does not probe these environment
 variables; it always reports Bitbucket as missing/unknown. That status is not a

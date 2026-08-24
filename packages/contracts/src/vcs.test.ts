@@ -1,5 +1,6 @@
 import { DateTime, Exit, Option, SchemaIssue } from "effect";
 import * as Schema from "effect/Schema";
+import * as FastCheck from "fast-check";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -21,6 +22,7 @@ import {
   VcsRemote,
   VcsRepositoryDetectionError,
   VcsRepositoryIdentity,
+  VcsStatusSummary,
   VcsUnsupportedOperationError,
 } from "./vcs.ts";
 
@@ -37,6 +39,8 @@ const decodeVcsError = Schema.decodeUnknownSync(VcsError);
 const encodeVcsError = Schema.encodeSync(VcsError);
 const decodeOutputError = Schema.decodeUnknownSync(VcsOutputDecodeError);
 const encodeOutputError = Schema.encodeSync(VcsOutputDecodeError);
+const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
+const encodeStatusSummary = Schema.encodeSync(VcsStatusSummary);
 
 interface DecodeFailureExpectation {
   readonly rootTag: SchemaIssue.Issue["_tag"];
@@ -129,6 +133,241 @@ describe("VCS driver schemas", () => {
 });
 
 describe("VCS repository schemas", () => {
+  const provider = {
+    kind: "github" as const,
+    name: "GitHub",
+    baseUrl: "https://github.com",
+  };
+  const pullRequest = {
+    provider: "github" as const,
+    number: 42,
+    title: "Summary contract",
+    url: "https://github.com/acme/repo/pull/42",
+    baseRefName: "main",
+    headRefName: "feature/test",
+    state: "open" as const,
+    updatedAt: Option.none(),
+  };
+  const observedAt = "2026-08-20T12:00:00.000Z";
+
+  it("accepts every valid passive summary identity", () => {
+    const valid = [
+      {
+        isRepo: false,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: null,
+        pr: null,
+        observedAt,
+        stale: false,
+      },
+      {
+        isRepo: true,
+        refName: "feature/test",
+        detachedHead: null,
+        hasWorkingTreeChanges: true,
+        sourceControlProvider: null,
+        pr: null,
+        observedAt,
+        stale: false,
+      },
+      {
+        isRepo: true,
+        refName: "feature/test",
+        detachedHead: null,
+        hasWorkingTreeChanges: true,
+        sourceControlProvider: provider,
+        pr: pullRequest,
+        observedAt,
+        stale: false,
+      },
+      {
+        isRepo: true,
+        refName: null,
+        detachedHead: "0123456789abcdef0123456789abcdef01234567",
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: null,
+        observedAt,
+        stale: false,
+      },
+      {
+        isRepo: true,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: true,
+        sourceControlProvider: provider,
+        pr: null,
+        observedAt,
+        stale: false,
+      },
+    ];
+
+    expect(valid.map((summary) => encodeStatusSummary(decodeStatusSummary(summary)))).toEqual(
+      valid,
+    );
+  });
+
+  it.each([
+    [
+      "simultaneous named and detached identities",
+      {
+        isRepo: true,
+        refName: "main",
+        detachedHead: "0123456789abcdef0123456789abcdef01234567",
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: null,
+        pr: null,
+      },
+    ],
+    [
+      "non-repository branch",
+      {
+        isRepo: false,
+        refName: "main",
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: null,
+        pr: null,
+      },
+    ],
+    [
+      "non-repository dirtiness",
+      {
+        isRepo: false,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: true,
+        sourceControlProvider: null,
+        pr: null,
+      },
+    ],
+    [
+      "non-repository provider",
+      {
+        isRepo: false,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: null,
+      },
+    ],
+    [
+      "non-repository pull request",
+      {
+        isRepo: false,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: pullRequest,
+      },
+    ],
+    [
+      "pull request without provider",
+      {
+        isRepo: true,
+        refName: "feature/test",
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: null,
+        pr: pullRequest,
+      },
+    ],
+    [
+      "detached pull request",
+      {
+        isRepo: true,
+        refName: null,
+        detachedHead: "0123456789abcdef0123456789abcdef01234567",
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: pullRequest,
+      },
+    ],
+    [
+      "unborn pull request",
+      {
+        isRepo: true,
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: pullRequest,
+      },
+    ],
+    [
+      "provider and pull-request kind mismatch",
+      {
+        isRepo: true,
+        refName: "feature/test",
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: provider,
+        pr: { ...pullRequest, provider: "gitlab" as const },
+      },
+    ],
+  ] as const)("rejects %s", (_label, summary) => {
+    expect(() => decodeStatusSummary({ ...summary, observedAt, stale: false })).toThrow();
+  });
+
+  it("generates only decodable passive summary fixtures", () => {
+    const samples = FastCheck.sample(Schema.toArbitrary(VcsStatusSummary), {
+      numRuns: 100,
+      seed: 20260820,
+    });
+    let encodedCount = 0;
+    for (const sample of samples) {
+      let encoded: ReturnType<typeof encodeStatusSummary>;
+      try {
+        encoded = encodeStatusSummary(sample);
+      } catch {
+        // Existing nested checked strings can reject arbitrary candidates; the exporter retries.
+        continue;
+      }
+      encodedCount += 1;
+      expect(() => decodeStatusSummary(encoded)).not.toThrow();
+      expect(
+        encoded.isRepo
+          ? [encoded.refName, encoded.detachedHead].filter((identity) => identity !== null)
+              .length <= 1 &&
+              (encoded.pr === null || encoded.sourceControlProvider?.kind === encoded.pr.provider)
+          : encoded.refName === null &&
+              encoded.detachedHead === null &&
+              encoded.hasWorkingTreeChanges === false &&
+              encoded.sourceControlProvider === null &&
+              encoded.pr === null,
+      ).toBe(true);
+    }
+    expect(encodedCount).toBeGreaterThan(0);
+  });
+
+  it("constructs the passive status summary wire shape", () => {
+    expect(
+      decodeStatusSummary({
+        isRepo: true,
+        refName: "feature/test",
+        detachedHead: null,
+        hasWorkingTreeChanges: true,
+        sourceControlProvider: null,
+        pr: null,
+        observedAt,
+        stale: false,
+      }),
+    ).toEqual({
+      isRepo: true,
+      refName: "feature/test",
+      detachedHead: null,
+      hasWorkingTreeChanges: true,
+      sourceControlProvider: null,
+      pr: null,
+      observedAt,
+      stale: false,
+    });
+  });
+
   it("decodes capabilities, repository identity, and workspace files", () => {
     expect(
       decodeCapabilities({

@@ -33,6 +33,32 @@ fn repository_with_workspace(path: Option<PathBuf>) -> GitRepository {
     GitRepository::with_worktree_settings(Arc::new(StaticWorktreeBaseDirectory(path)))
 }
 
+#[test]
+fn production_vcs_observation_has_no_periodic_ref_worker() {
+    let broadcaster = include_str!("../src/git/broadcaster.rs");
+    let tests_start = broadcaster
+        .find("\nmod tests {")
+        .expect("broadcaster test module remains discoverable");
+    let production_broadcaster = &broadcaster[..tests_start];
+
+    for removed_worker_symbol in [
+        "currentRef",
+        "symbolic-ref",
+        "ref_refresh_interval",
+        "refresh_ref_for_lifecycle",
+        "spawn_remote_and_ref_poller",
+    ] {
+        assert!(
+            !production_broadcaster.contains(removed_worker_symbol),
+            "production broadcaster must not restore the periodic ref worker symbol {removed_worker_symbol}"
+        );
+    }
+
+    let production_git_vcs = include_str!("../src/production/git_vcs.rs");
+    assert!(!production_git_vcs.contains("REF_REFRESH_INTERVAL"));
+    assert!(!production_git_vcs.contains("Duration::from_secs(3)"));
+}
+
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -1528,12 +1554,11 @@ async fn status_subscription_starts_with_snapshot_deduplicates_and_stops_last_po
 }
 
 #[tokio::test]
-async fn status_subscription_poller_observes_external_working_tree_changes() {
+async fn status_subscription_observes_external_working_tree_changes() {
     let repo = init_repo();
     commit_file(repo.path(), "tracked.txt", "base\n", "initial");
-    let broadcaster = StatusBroadcaster::with_refresh_intervals(
+    let broadcaster = StatusBroadcaster::new(
         Arc::new(GitRepository::default()),
-        Duration::from_secs(3600),
         Duration::from_millis(50),
         4,
     );
@@ -1557,7 +1582,7 @@ async fn status_subscription_poller_observes_external_working_tree_changes() {
         }
     })
     .await
-    .expect("poller should observe an external working tree edit");
+    .expect("status subscription should observe an external working tree edit");
     assert!(local.has_working_tree_changes);
     assert!(
         local
@@ -1569,12 +1594,11 @@ async fn status_subscription_poller_observes_external_working_tree_changes() {
 }
 
 #[tokio::test]
-async fn status_subscription_poller_observes_external_branch_changes_without_full_refresh() {
+async fn status_subscription_watcher_observes_external_branch_changes_without_full_refresh() {
     let repo = init_repo();
     commit_file(repo.path(), "tracked.txt", "base\n", "initial");
-    let broadcaster = StatusBroadcaster::with_refresh_intervals(
+    let broadcaster = StatusBroadcaster::new(
         Arc::new(GitRepository::default()),
-        Duration::from_millis(50),
         Duration::from_secs(3600),
         4,
     );
@@ -1602,12 +1626,12 @@ async fn status_subscription_poller_observes_external_branch_changes_without_ful
         }
     })
     .await
-    .expect("ref poller should observe an external branch change");
+    .expect("watcher should observe an external branch change");
     assert_eq!(local.ref_name.as_deref(), Some("feature/external"));
 }
 
 #[tokio::test]
-async fn lagging_status_subscriber_is_bounded_and_releases_its_poller() {
+async fn lagging_status_subscriber_is_bounded_and_releases_its_lifecycle() {
     let repo = init_repo();
     commit_file(repo.path(), "tracked.txt", "base\n", "initial");
     let broadcaster = StatusBroadcaster::new(
@@ -1620,10 +1644,15 @@ async fn lagging_status_subscriber_is_bounded_and_releases_its_poller() {
         .await
         .expect("bounded subscription");
     fs::write(repo.path().join("tracked.txt"), "changed\n").expect("working tree edit");
-    broadcaster
-        .refresh_local(repo.path(), &cancellation())
-        .await
-        .expect("refresh lagging subscriber");
+    broadcaster.notify_local_change(repo.path()).await;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while broadcaster.active_poller_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("lagging subscriber is evicted after the changed status publication");
 
     assert_eq!(broadcaster.active_poller_count(), 0);
     drop(subscription);
@@ -1660,9 +1689,8 @@ async fn subscribed_remote_poller_fetches_real_upstream_changes() {
             &consumer.to_string_lossy(),
         ],
     );
-    let broadcaster = StatusBroadcaster::with_refresh_intervals(
+    let broadcaster = StatusBroadcaster::new(
         Arc::new(GitRepository::default()),
-        Duration::from_secs(3600),
         Duration::from_millis(100),
         4,
     );

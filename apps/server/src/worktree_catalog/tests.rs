@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8,18 +9,24 @@ use std::{
     time::Duration,
 };
 
+use tempfile::TempDir;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::git::{
-    GitWorktreeInventory, GitWorktreeRecord, host_path_platform, worktree_repository_key,
+    GitRepository, GitWorktreeInventory, GitWorktreeRecord, host_path_platform,
+    worktree_repository_key,
 };
 
+use super::fingerprint::{
+    CatalogRepositoryFingerprint, FingerprintOutcome, FingerprintRequest,
+    read_catalog_repository_fingerprint,
+};
 use super::service::TokioCatalogFileSystem;
 use super::service::{
-    CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
-    CatalogServiceOptions, CatalogShallowSignature, CatalogThread, DirectoryProbeState,
-    InventorySource, ScanFailure,
+    CatalogFileSystem, CatalogFingerprintSource, CatalogFuture, CatalogProject,
+    CatalogProjectionSource, CatalogServiceOptions, CatalogShallowSignature, CatalogThread,
+    DirectoryProbeState, InventorySource, ScanFailure,
 };
 use super::{
     CatalogRefreshTrigger, CatalogWorkspaceLossObserver, WorkspaceAvailabilityRegistry,
@@ -1607,6 +1614,933 @@ async fn focus_refresh_uses_the_one_second_result_ttl() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn fingerprint_matching_focus_skips_inventory_until_reconciliation() {
+    let inventory = Arc::new(FakeInventorySource::new((0..2).map(|_| {
+        inventory(
+            "/repo/common",
+            [
+                record("/repo/main", true),
+                record("/repo/managed", false),
+                record("/repo/adopted", false),
+            ],
+        )
+    })));
+    let projections = Arc::new(FakeProjectionSource::new([project(
+        "project-1",
+        "/repo/main",
+        [],
+    )]));
+    let filesystem = Arc::new(FakeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/managed", DirectoryProbeState::Present),
+        ("/repo/adopted", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let fingerprint = Arc::new(FakeFingerprintSource::new([
+        FingerprintOutcome::Known(known.clone()),
+        FingerprintOutcome::Known(known),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        projections.clone(),
+        inventory.clone(),
+        filesystem.clone(),
+        fingerprint,
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let seeded = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("fingerprint-seeding scan");
+    service
+        .note_managed_creation("project-1", Path::new("/repo/managed"))
+        .await;
+    projections.set_project(project(
+        "project-1",
+        "/repo/main",
+        [thread("thread-adopted", "/repo/adopted")],
+    ));
+    filesystem.set("/repo/adopted", DirectoryProbeState::Missing);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let rejoined = service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("matching fingerprint refresh");
+
+    assert_eq!(inventory.calls().len(), 2);
+    assert_eq!(rejoined.generation, seeded.generation + 1);
+    assert!(!descriptor(&rejoined, "/repo/managed").eligible_for_adoption);
+    assert_eq!(
+        rejoined.adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::MissingRegistered
+    );
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_matching_focus_reuses_a_bare_repository_observation() {
+    let bare = GitWorktreeRecord {
+        path: PathBuf::from("/repo/bare.git"),
+        head: None,
+        branch: None,
+        is_primary: true,
+        is_bare: true,
+        locked: false,
+        lock_reason: None,
+        is_prunable: false,
+        prunable_reason: None,
+    };
+    let inventory = Arc::new(FakeInventorySource::new(
+        (0..3).map(|_| inventory("/repo/bare.git", [bare.clone()])),
+    ));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let fingerprint = Arc::new(FakeFingerprintSource::new([
+        FingerprintOutcome::Known(known.clone()),
+        FingerprintOutcome::Known(known),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/bare.git",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([(
+            "/repo/bare.git",
+            DirectoryProbeState::Present,
+        )])),
+        fingerprint.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("bare fingerprint-seeding scan");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("matching bare fingerprint refresh");
+
+    assert_eq!(inventory.calls().len(), 2);
+    let requests = fingerprint.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].primary_path, Path::new("/repo/bare.git"));
+    assert_eq!(
+        requests[0].known_worktree_paths,
+        [PathBuf::from("/repo/bare.git")]
+    );
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_changed_or_unknown_focus_runs_inventory() {
+    let (first_fixture, first) = known_test_fingerprint().await;
+    let (second_fixture, second) = known_test_fingerprint().await;
+    for outcomes in [
+        vec![
+            FingerprintOutcome::Known(first.clone()),
+            FingerprintOutcome::Known(second.clone()),
+        ],
+        vec![
+            FingerprintOutcome::Known(first.clone()),
+            FingerprintOutcome::Unknown(super::fingerprint::FingerprintFailure::Unreadable),
+        ],
+    ] {
+        let inventory =
+            Arc::new(FakeInventorySource::new((0..3).map(|_| {
+                inventory("/repo/common", [record("/repo/main", true)])
+            })));
+        let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+            Arc::new(FakeProjectionSource::new([project(
+                "project-1",
+                "/repo/main",
+                [],
+            )])),
+            inventory.clone(),
+            Arc::new(FakeFileSystem::new([
+                ("/repo/main", DirectoryProbeState::Present),
+                ("/repo/common", DirectoryProbeState::Present),
+            ])),
+            Arc::new(FakeFingerprintSource::new(outcomes)),
+            CatalogServiceOptions::default(),
+        );
+        let subscription = service.subscribe("project-1").await.expect("subscription");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("fingerprint-seeding scan");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        service
+            .refresh("project-1", CatalogRefreshTrigger::Focus)
+            .await
+            .expect("non-matching fingerprint refresh");
+        assert_eq!(inventory.calls().len(), 3);
+        drop(subscription);
+        shutdown_fingerprint_service(&service).await;
+    }
+    drop(first);
+    drop(second);
+    drop(first_fixture);
+    drop(second_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_matching_focus_forces_inventory_at_five_minutes() {
+    let inventory =
+        Arc::new(FakeInventorySource::new((0..3).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        })));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        Arc::new(FakeFingerprintSource::new([
+            FingerprintOutcome::Known(known.clone()),
+            FingerprintOutcome::Known(known),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("fingerprint-seeding scan");
+
+    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("five-minute reconciliation");
+
+    assert_eq!(inventory.calls().len(), 3);
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "native fleet performance evidence; run explicitly"]
+async fn fingerprint_focus_fleet_reconciles_every_five_minutes_for_thirty_minutes() {
+    const REPOSITORY_COUNT: usize = 10;
+    const WORKLOAD_SECONDS: u64 = 30 * 60;
+    const RECONCILIATION_SECONDS: u64 = 5 * 60;
+
+    let mut fixtures = Vec::with_capacity(REPOSITORY_COUNT);
+    let mut primary_paths = Vec::with_capacity(REPOSITORY_COUNT);
+    let mut common_dirs = Vec::with_capacity(REPOSITORY_COUNT);
+    for _ in 0..REPOSITORY_COUNT {
+        let (fixture, primary_path, common_dir) = test_repository_fixture();
+        fixtures.push(fixture);
+        primary_paths.push(primary_path);
+        common_dirs.push(common_dir);
+    }
+    let managed_path = fixtures[0].path().join("managed");
+    run_git(
+        &primary_paths[0],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/managed",
+            managed_path.to_str().expect("managed path is UTF-8"),
+        ],
+    );
+    let adopted_path = fixtures[0].path().join("adopted");
+    run_git(
+        &primary_paths[0],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/adopted",
+            adopted_path.to_str().expect("adopted path is UTF-8"),
+        ],
+    );
+    std::fs::rename(&adopted_path, fixtures[0].path().join("adopted-displaced"))
+        .expect("make registered worktree path unavailable");
+
+    let projects = (0..REPOSITORY_COUNT).map(|index| {
+        project(
+            &format!("project-{index}"),
+            primary_paths[index]
+                .to_str()
+                .expect("fleet primary path is UTF-8"),
+            [],
+        )
+    });
+    let projections = Arc::new(FakeProjectionSource::new(projects));
+    let reconciliation_count = WORKLOAD_SECONDS / RECONCILIATION_SECONDS;
+    let inventory = Arc::new(CountingInventorySource::new(
+        super::service::native_inventory_source_for_test(Arc::new(GitRepository::default())),
+    ));
+    let fingerprint = Arc::new(CountingNativeFingerprintSource::default());
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        projections.clone(),
+        inventory.clone(),
+        Arc::new(TokioCatalogFileSystem),
+        fingerprint.clone(),
+        CatalogServiceOptions {
+            poll_interval: Duration::from_secs(60 * 60),
+            ..CatalogServiceOptions::default()
+        },
+    );
+
+    let mut subscriptions = Vec::with_capacity(REPOSITORY_COUNT);
+    for index in 0..REPOSITORY_COUNT {
+        subscriptions.push(
+            service
+                .subscribe(&format!("project-{index}"))
+                .await
+                .expect("fleet subscription"),
+        );
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for index in 0..REPOSITORY_COUNT {
+        service
+            .refresh(&format!("project-{index}"), CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("fleet fingerprint-seeding scan");
+    }
+    assert_eq!(inventory.count(), REPOSITORY_COUNT * 2);
+
+    service
+        .note_managed_creation("project-0", &managed_path)
+        .await;
+    projections.set_project(project(
+        "project-0",
+        primary_paths[0]
+            .to_str()
+            .expect("fleet primary path is UTF-8"),
+        [thread(
+            "thread-adopted",
+            adopted_path.to_str().expect("adopted path is UTF-8"),
+        )],
+    ));
+    for elapsed_seconds in 1..=WORKLOAD_SECONDS {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for index in 0..REPOSITORY_COUNT {
+            let snapshot = service
+                .refresh(&format!("project-{index}"), CatalogRefreshTrigger::Focus)
+                .await
+                .expect("fleet focus refresh");
+            if elapsed_seconds == 1 && index == 0 {
+                assert!(
+                    !snapshot
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.branch.as_deref() == Some("feature/managed"))
+                        .expect("managed worktree descriptor")
+                        .eligible_for_adoption
+                );
+                assert_eq!(
+                    adopted(&snapshot, "thread-adopted").availability,
+                    super::AdoptedWorktreeAvailability::MissingRegistered
+                );
+            }
+        }
+        let reconciliations = elapsed_seconds / RECONCILIATION_SECONDS;
+        assert_eq!(
+            inventory.count(),
+            REPOSITORY_COUNT * (2 + reconciliations as usize),
+            "only each exact five-minute boundary runs fleet inventory"
+        );
+    }
+    assert_eq!(
+        fingerprint.count(),
+        REPOSITORY_COUNT * (WORKLOAD_SECONDS as usize + 1)
+    );
+
+    run_git(
+        &primary_paths[0],
+        &["config", "bibcode.fingerprint", "changed"],
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-0", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("real repository mutation runs inventory immediately");
+    assert_eq!(
+        inventory.count(),
+        REPOSITORY_COUNT * (2 + reconciliation_count as usize) + 1
+    );
+
+    std::fs::write(
+        common_dirs[1].join("config.worktree"),
+        vec![b'#'; 64 * 1024 + 1],
+    )
+    .expect("oversized optional fingerprint input");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("native Unknown fingerprint runs inventory immediately");
+    assert_eq!(
+        inventory.count(),
+        REPOSITORY_COUNT * (2 + reconciliation_count as usize) + 2
+    );
+    assert_eq!(
+        fingerprint.count(),
+        REPOSITORY_COUNT * (WORKLOAD_SECONDS as usize + 1) + 2
+    );
+
+    drop(subscriptions);
+    shutdown_fingerprint_service(&service).await;
+    drop(service);
+    drop(fingerprint);
+    drop(fixtures);
+}
+
+#[tokio::test]
+async fn fingerprint_captured_before_inventory_cannot_hide_mid_scan_mutation() {
+    let inventory = Arc::new(PausingSecondOnlyInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let fingerprint = Arc::new(MutableFingerprintSource::new(FingerprintOutcome::Known(
+        known,
+    )));
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        fingerprint.clone(),
+        CatalogServiceOptions {
+            result_ttl: Duration::from_millis(10),
+            ..CatalogServiceOptions::default()
+        },
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let scan_service = service.clone();
+    let scan = tokio::spawn(async move {
+        scan_service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), wait_for_count(&inventory.calls, 2))
+        .await
+        .expect("second inventory reached its bounded pause");
+
+    let worker_release = service.pause_mutation_refresh_starts_after_for_test(0);
+    service.invalidate_after_mutation("project-1").await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_mutation_refresh_worker_starts(&service, 1),
+    )
+    .await
+    .expect("mutation refresh worker reached its bounded pause");
+    inventory.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(5), scan)
+        .await
+        .expect("stale scan completed after release")
+        .expect("scan task")
+        .expect_err("mid-scan invalidation rejects the stale generation");
+    assert_eq!(error.reason, super::CatalogErrorReason::StaleGeneration);
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("post-mutation focus refresh");
+
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+    worker_release.add_permits(1);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_active_mutation_refresh_workers(&service, 0),
+    )
+    .await
+    .expect("mutation refresh worker drained");
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint);
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test]
+async fn fingerprint_invalidation_drops_a_pending_native_lease_and_blocks_late_publication() {
+    let (repository_fixture, primary, common_dir) = test_repository_fixture();
+    let repository_inventory = GitWorktreeInventory {
+        common_dir: common_dir.clone(),
+        records: vec![GitWorktreeRecord {
+            path: primary.clone(),
+            head: Some("abc123".to_owned()),
+            branch: Some("main".to_owned()),
+            is_primary: true,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: false,
+            prunable_reason: None,
+        }],
+        nul_delimited: true,
+    };
+    let inventory = Arc::new(FakeInventorySource::new(
+        (0..3).map(|_| repository_inventory.clone()),
+    ));
+    let filesystem = Arc::new(PausingNextShallowFileSystem::new([
+        (primary.clone(), DirectoryProbeState::Present),
+        (common_dir.clone(), DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            primary.to_str().expect("UTF-8 fixture path"),
+            [],
+        )])),
+        inventory.clone(),
+        filesystem.clone(),
+        CatalogServiceOptions {
+            poll_interval: Duration::from_secs(60 * 60),
+            result_ttl: Duration::from_millis(10),
+            ..CatalogServiceOptions::default()
+        },
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    filesystem.pause_next();
+    let scan_service = service.clone();
+    let scan = tokio::spawn(async move {
+        scan_service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), filesystem.wait_until_paused())
+        .await
+        .expect("native fingerprint reached pending-publication pause");
+
+    let moved_common_dir = repository_fixture.path().join("common-dir-moved");
+    #[cfg(windows)]
+    assert!(
+        std::fs::rename(&common_dir, &moved_common_dir).is_err(),
+        "the pending native fingerprint must retain its common-directory lease"
+    );
+    let worker_release = service.pause_mutation_refresh_starts_after_for_test(0);
+    service.invalidate_after_mutation("project-1").await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_mutation_refresh_worker_starts(&service, 1),
+    )
+    .await
+    .expect("mutation worker reached its bounded pause");
+    std::fs::rename(&common_dir, &moved_common_dir)
+        .expect("invalidation releases the pending common-directory lease");
+    std::fs::rename(&moved_common_dir, &common_dir).expect("restore common directory");
+
+    filesystem.release();
+    let error = tokio::time::timeout(Duration::from_secs(10), scan)
+        .await
+        .expect("invalidated native scan completed after release")
+        .expect("native scan task")
+        .expect_err("pending native scan is stale after invalidation");
+    assert_eq!(error.reason, super::CatalogErrorReason::StaleGeneration);
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("post-invalidation Focus performs a real scan");
+    assert_eq!(inventory.calls().len(), 3);
+
+    worker_release.add_permits(1);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_active_mutation_refresh_workers(&service, 0),
+    )
+    .await
+    .expect("mutation refresh worker drained");
+    let moved_after_shutdown = repository_fixture.path().join("published-common-dir-moved");
+    #[cfg(windows)]
+    assert!(
+        std::fs::rename(&common_dir, &moved_after_shutdown).is_err(),
+        "the published fingerprint remains repository-owned before shutdown"
+    );
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(service);
+    drop(filesystem);
+    std::fs::rename(&common_dir, &moved_after_shutdown)
+        .expect("repository shutdown drops the published common-directory lease");
+    std::fs::rename(&moved_after_shutdown, &common_dir).expect("restore after shutdown");
+    drop(repository_fixture);
+}
+
+#[tokio::test]
+async fn fingerprint_final_owner_release_drops_lease_before_eviction_and_forces_a_real_scan() {
+    let (repository_fixture, primary, common_dir) = test_repository_fixture();
+    let repository_inventory = GitWorktreeInventory {
+        common_dir: common_dir.clone(),
+        records: vec![GitWorktreeRecord {
+            path: primary.clone(),
+            head: Some("abc123".to_owned()),
+            branch: Some("main".to_owned()),
+            is_primary: true,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: false,
+            prunable_reason: None,
+        }],
+        nul_delimited: true,
+    };
+    let inventory = Arc::new(FakeInventorySource::new(
+        (0..3).map(|_| repository_inventory.clone()),
+    ));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            primary.to_str().expect("UTF-8 fixture path"),
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::from_owned([
+            (
+                primary.to_string_lossy().into_owned(),
+                DirectoryProbeState::Present,
+            ),
+            (
+                common_dir.to_string_lossy().into_owned(),
+                DirectoryProbeState::Present,
+            ),
+        ])),
+        CatalogServiceOptions {
+            idle_eviction: Duration::from_secs(60),
+            poll_interval: Duration::from_secs(60 * 60),
+            result_ttl: Duration::from_millis(10),
+            ..CatalogServiceOptions::default()
+        },
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("seed native fingerprint while subscriber owns repository");
+    assert_eq!(inventory.calls().len(), 2);
+
+    let moved_common_dir = repository_fixture
+        .path()
+        .join("final-owner-common-dir-moved");
+    #[cfg(windows)]
+    assert!(
+        std::fs::rename(&common_dir, &moved_common_dir).is_err(),
+        "the active repository owner retains the published fingerprint lease"
+    );
+    drop(subscription);
+    std::fs::rename(&common_dir, &moved_common_dir)
+        .expect("final subscriber release drops the lease before idle eviction");
+    std::fs::rename(&moved_common_dir, &common_dir).expect("restore common directory");
+
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("immediate unary reattachment performs a real scan");
+    assert_eq!(inventory.calls().len(), 3);
+    std::fs::rename(&common_dir, &moved_common_dir)
+        .expect("final unary release also drops the newly published lease");
+    std::fs::rename(&moved_common_dir, &common_dir).expect("restore after unary release");
+
+    shutdown_fingerprint_service(&service).await;
+    drop(service);
+    drop(repository_fixture);
+}
+
+#[tokio::test]
+async fn fingerprint_observation_cannot_repopulate_proof_after_final_owner_release() {
+    let (repository_fixture, primary, common_dir) = test_repository_fixture();
+    let repository_inventory = GitWorktreeInventory {
+        common_dir: common_dir.clone(),
+        records: vec![GitWorktreeRecord {
+            path: primary.clone(),
+            head: Some("abc123".to_owned()),
+            branch: Some("main".to_owned()),
+            is_primary: true,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: false,
+            prunable_reason: None,
+        }],
+        nul_delimited: true,
+    };
+    let inventory = Arc::new(FakeInventorySource::new(
+        (0..4).map(|_| repository_inventory.clone()),
+    ));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            primary.to_str().expect("UTF-8 fixture path"),
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::from_owned([
+            (
+                primary.to_string_lossy().into_owned(),
+                DirectoryProbeState::Present,
+            ),
+            (
+                common_dir.to_string_lossy().into_owned(),
+                DirectoryProbeState::Present,
+            ),
+        ])),
+        CatalogServiceOptions {
+            idle_eviction: Duration::from_secs(60),
+            poll_interval: Duration::from_secs(60 * 60),
+            result_ttl: Duration::from_millis(10),
+            ..CatalogServiceOptions::default()
+        },
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let repository_key = subscription.latest().repository_key.clone();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("seed native fingerprint");
+    let (publication_entered, publication_resume, publication_finished) =
+        service.pause_next_repository_observation_publication_for_test(&repository_key);
+    let scan_service = service.clone();
+    let scan = tokio::spawn(async move {
+        scan_service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), publication_entered.acquire())
+        .await
+        .expect("physical observation reached publication pause")
+        .expect("publication pause remains open")
+        .forget();
+
+    drop(subscription);
+    scan.abort();
+    let aborted = scan.await.expect_err("refresh caller is aborted");
+    assert!(aborted.is_cancelled());
+    assert_eq!(
+        service.repository_fingerprint_ownership_for_test("project-1"),
+        Some((0, false, false))
+    );
+
+    publication_resume.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), publication_finished.acquire())
+        .await
+        .expect("physical observation completed publication attempt")
+        .expect("publication completion remains open")
+        .forget();
+    assert_eq!(
+        service.repository_fingerprint_ownership_for_test("project-1"),
+        Some((0, false, false))
+    );
+    let moved_common_dir = repository_fixture
+        .path()
+        .join("post-owner-race-common-dir-moved");
+    std::fs::rename(&common_dir, &moved_common_dir)
+        .expect("resumed ownerless observation cannot retain a fingerprint lease");
+    std::fs::rename(&moved_common_dir, &common_dir).expect("restore common directory");
+
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("immediate new lifecycle performs a real scan");
+    assert_eq!(inventory.calls().len(), 4);
+    std::fs::rename(&common_dir, &moved_common_dir)
+        .expect("final unary release drops the new lifecycle proof");
+    std::fs::rename(&moved_common_dir, &common_dir).expect("restore after unary release");
+
+    shutdown_fingerprint_service(&service).await;
+    drop(service);
+    drop(repository_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_matching_non_focus_triggers_always_run_inventory() {
+    let inventory =
+        Arc::new(FakeInventorySource::new((0..7).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        })));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        Arc::new(MutableFingerprintSource::new(FingerprintOutcome::Known(
+            known,
+        ))),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("fingerprint-seeding scan");
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::FirstSubscriber)
+        .await
+        .expect("post-TTL first-subscriber refresh");
+
+    for trigger in [
+        CatalogRefreshTrigger::Explicit,
+        CatalogRefreshTrigger::MetadataChanged,
+        CatalogRefreshTrigger::AvailabilityChanged,
+        CatalogRefreshTrigger::Mutation,
+    ] {
+        service
+            .refresh("project-1", trigger)
+            .await
+            .expect("non-focus authoritative refresh");
+    }
+
+    assert_eq!(inventory.calls().len(), 7);
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_never_extends_a_degraded_observation() {
+    let healthy = inventory("/repo/common", [record("/repo/main", true)]);
+    let inventory = Arc::new(FakeInventorySource::new_results([
+        Ok(healthy.clone()),
+        Ok(healthy.clone()),
+        Err(ScanFailure {
+            reason: super::CatalogDegradedReason::GitFailed,
+            message: "injected inventory failure".to_owned(),
+        }),
+        Ok(healthy),
+    ]));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        Arc::new(MutableFingerprintSource::new(FingerprintOutcome::Known(
+            known,
+        ))),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("fingerprint-seeding scan");
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("degraded observation");
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Focus)
+        .await
+        .expect("failure recovery scan");
+
+    assert_eq!(inventory.calls().len(), 4);
+    drop(subscription);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fingerprint_uses_repository_epoch_and_retained_inventory_paths() {
+    let inventory = Arc::new(FakeInventorySource::new((0..3).map(|_| {
+        inventory(
+            "/repo/common",
+            [record("/repo/main", true), record("/repo/linked", false)],
+        )
+    })));
+    let (fingerprint_fixture, known) = known_test_fingerprint().await;
+    let fingerprint = Arc::new(FakeFingerprintSource::new(
+        (0..3).map(|_| FingerprintOutcome::Known(known.clone())),
+    ));
+    let service = WorktreeCatalogService::with_dependencies_and_fingerprint(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory,
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/linked", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        fingerprint.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("fingerprint-seeding scan");
+    drop(subscription);
+
+    service.invalidate_after_mutation("project-1").await;
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("post-invalidation scan");
+
+    let requests = fingerprint.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].common_dir, Path::new("/repo/common"));
+    assert_eq!(requests[0].primary_path, Path::new("/repo/main"));
+    assert_eq!(
+        requests[0].known_worktree_paths,
+        [PathBuf::from("/repo/main"), PathBuf::from("/repo/linked")]
+    );
+    assert_eq!(requests[0].repository_lifecycle_epoch, 1);
+    assert_eq!(requests[0].mutation_epoch, 0);
+    assert_eq!(requests[1].repository_lifecycle_epoch, 2);
+    assert_eq!(requests[1].mutation_epoch, 1);
+    shutdown_fingerprint_service(&service).await;
+    drop(fingerprint);
+    drop(known);
+    drop(fingerprint_fixture);
+}
+
+#[tokio::test(start_paused = true)]
 async fn managed_creation_suppression_expires_after_thirty_seconds() {
     let inventory = Arc::new(FakeInventorySource::new((0..3).map(|_| {
         inventory(
@@ -3000,6 +3934,187 @@ struct FakeInventorySource {
     calls: Mutex<Vec<PathBuf>>,
 }
 
+struct CountingInventorySource {
+    inner: Arc<dyn InventorySource>,
+    calls: AtomicUsize,
+}
+
+impl CountingInventorySource {
+    fn new(inner: Arc<dyn InventorySource>) -> Self {
+        Self {
+            inner,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl InventorySource for CountingInventorySource {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("native inventory runtime")
+                    .block_on(inner.inventory(anchor, cancellation))
+            })
+            .await
+            .expect("native inventory worker")
+        })
+    }
+}
+
+#[derive(Default)]
+struct CountingNativeFingerprintSource {
+    calls: AtomicUsize,
+}
+
+impl CountingNativeFingerprintSource {
+    fn count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl CatalogFingerprintSource for CountingNativeFingerprintSource {
+    fn read(&self, request: FingerprintRequest) -> CatalogFuture<FingerprintOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(read_catalog_repository_fingerprint(request))
+    }
+}
+
+struct FakeFingerprintSource {
+    outcomes: Mutex<VecDeque<FingerprintOutcome>>,
+    requests: Mutex<Vec<FingerprintRequest>>,
+}
+
+impl FakeFingerprintSource {
+    fn new(outcomes: impl IntoIterator<Item = FingerprintOutcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<FingerprintRequest> {
+        self.requests.lock().expect("fingerprint requests").clone()
+    }
+}
+
+impl CatalogFingerprintSource for FakeFingerprintSource {
+    fn read(&self, request: FingerprintRequest) -> CatalogFuture<FingerprintOutcome> {
+        self.requests
+            .lock()
+            .expect("fingerprint requests")
+            .push(request);
+        let outcome = self
+            .outcomes
+            .lock()
+            .expect("fingerprint outcomes")
+            .pop_front()
+            .expect("configured fingerprint outcome");
+        Box::pin(async move { outcome })
+    }
+}
+
+struct MutableFingerprintSource {
+    outcome: Mutex<FingerprintOutcome>,
+}
+
+impl MutableFingerprintSource {
+    fn new(outcome: FingerprintOutcome) -> Self {
+        Self {
+            outcome: Mutex::new(outcome),
+        }
+    }
+}
+
+impl CatalogFingerprintSource for MutableFingerprintSource {
+    fn read(&self, _request: FingerprintRequest) -> CatalogFuture<FingerprintOutcome> {
+        let outcome = self.outcome.lock().expect("mutable fingerprint").clone();
+        Box::pin(async move { outcome })
+    }
+}
+
+fn test_repository_fixture() -> (TempDir, PathBuf, PathBuf) {
+    let fixture = TempDir::new().expect("fingerprint fixture");
+    let primary = fixture.path().join("primary");
+    std::fs::create_dir(&primary).expect("fingerprint primary directory");
+    for arguments in [
+        vec!["init", "--initial-branch=main"],
+        vec!["config", "user.name", "BiBCode Test"],
+        vec!["config", "user.email", "bibcode-test@example.invalid"],
+    ] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(&primary)
+            .output()
+            .expect("fingerprint fixture Git");
+        assert!(output.status.success(), "fingerprint fixture Git failed");
+    }
+    std::fs::write(primary.join("README.md"), "fixture\n").expect("fingerprint fixture file");
+    for arguments in [vec!["add", "README.md"], vec!["commit", "-m", "fixture"]] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(&primary)
+            .output()
+            .expect("fingerprint fixture Git");
+        assert!(output.status.success(), "fingerprint fixture Git failed");
+    }
+    let primary = std::fs::canonicalize(primary).expect("canonical primary directory");
+    let common_dir = std::fs::canonicalize(primary.join(".git")).expect("common directory");
+    (fixture, primary, common_dir)
+}
+
+fn run_git(cwd: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .expect("fleet Git command");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn known_test_fingerprint() -> (TempDir, CatalogRepositoryFingerprint) {
+    let (fixture, primary, common_dir) = test_repository_fixture();
+    let fingerprint = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_catalog_repository_fingerprint(FingerprintRequest {
+            common_dir,
+            primary_path: primary.clone(),
+            known_worktree_paths: vec![primary],
+            repository_lifecycle_epoch: 1,
+            mutation_epoch: 0,
+            cancellation: CancellationToken::new(),
+        }),
+    )
+    .await
+    .expect("native test fingerprint completed within ten seconds");
+    let FingerprintOutcome::Known(fingerprint) = fingerprint else {
+        panic!("fingerprint fixture must produce a known proof");
+    };
+    (fixture, fingerprint)
+}
+
+async fn shutdown_fingerprint_service(service: &WorktreeCatalogService) {
+    tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+        .await
+        .expect("fingerprint test service shutdown completed within five seconds");
+}
+
 impl FakeInventorySource {
     fn new(inventories: impl IntoIterator<Item = GitWorktreeInventory>) -> Self {
         Self {
@@ -3282,6 +4397,43 @@ struct BlockingFirstShallowFileSystem {
     release: Arc<Semaphore>,
 }
 
+struct PausingNextShallowFileSystem {
+    states: HashMap<PathBuf, DirectoryProbeState>,
+    pause_next: AtomicBool,
+    paused: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl PausingNextShallowFileSystem {
+    fn new(states: impl IntoIterator<Item = (PathBuf, DirectoryProbeState)>) -> Self {
+        Self {
+            states: states.into_iter().collect(),
+            pause_next: AtomicBool::new(false),
+            paused: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    fn pause_next(&self) {
+        assert!(
+            !self.pause_next.swap(true, Ordering::SeqCst),
+            "only one shallow operation may be paused at a time"
+        );
+    }
+
+    async fn wait_until_paused(&self) {
+        self.paused
+            .acquire()
+            .await
+            .expect("pause notification")
+            .forget();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 impl BlockingFirstShallowFileSystem {
     fn new(states: impl IntoIterator<Item = (&'static str, DirectoryProbeState)>) -> Self {
         Self {
@@ -3432,6 +4584,42 @@ impl CatalogFileSystem for BlockingFirstShallowFileSystem {
     }
 }
 
+impl CatalogFileSystem for PausingNextShallowFileSystem {
+    fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
+        let state = self
+            .states
+            .get(&path)
+            .copied()
+            .unwrap_or(DirectoryProbeState::Missing);
+        Box::pin(async move { state })
+    }
+
+    fn canonicalize(&self, path: PathBuf) -> CatalogFuture<Result<PathBuf, std::io::Error>> {
+        Box::pin(async move { Ok(path) })
+    }
+
+    fn shallow_signature(
+        &self,
+        _common_dir: PathBuf,
+        _known_paths: Vec<PathBuf>,
+    ) -> CatalogFuture<CatalogShallowSignature> {
+        let should_pause = self.pause_next.swap(false, Ordering::SeqCst);
+        let paused = Arc::clone(&self.paused);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if should_pause {
+                paused.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("shallow operation release")
+                    .forget();
+            }
+            CatalogShallowSignature::default()
+        })
+    }
+}
+
 struct SwitchableBlockingProbeFileSystem {
     states: HashMap<PathBuf, DirectoryProbeState>,
     block: AtomicBool,
@@ -3514,6 +4702,12 @@ impl CatalogFileSystem for BlockingProbeFileSystem {
 }
 
 struct PausingSecondInventorySource {
+    response: GitWorktreeInventory,
+    calls: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+struct PausingSecondOnlyInventorySource {
     response: GitWorktreeInventory,
     calls: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
@@ -3744,6 +4938,38 @@ impl PausingSecondInventorySource {
             calls: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Semaphore::new(0)),
         }
+    }
+}
+
+impl PausingSecondOnlyInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+impl InventorySource for PausingSecondOnlyInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = self.response.clone();
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if call == 2 {
+                release
+                    .acquire()
+                    .await
+                    .expect("second scan release")
+                    .forget();
+            }
+            Ok(response)
+        })
     }
 }
 

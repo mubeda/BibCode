@@ -17,6 +17,9 @@
           "storageInstanceId": "00000000-0000-4000-8000-000000000002",
           "capabilities": {
             "repositoryIdentity": true,
+            "worktreeCatalog": true,
+            "worktreeCatalogRefreshReason": true,
+            "vcsStatusSummary": true,
             "activityProtocolVersion": 2
           }
         },
@@ -43,7 +46,7 @@
           "enableProviderUpdateChecks": true,
           "enableChatAgentActivity": true,
           "enableTerminalAgentActivity": false,
-          "automaticGitFetchInterval": 30000,
+          "automaticGitFetchInterval": 180000,
           "defaultThreadEnvMode": "local",
           "newWorktreesStartFromOrigin": false,
           "worktreeBaseDirectory": "",
@@ -72,7 +75,7 @@
               "launchArgs": ""
             },
             "cursor": {
-              "enabled": false,
+              "enabled": true,
               "binaryPath": "cursor-agent",
               "apiEndpoint": "",
               "customModels": []

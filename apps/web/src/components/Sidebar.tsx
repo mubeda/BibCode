@@ -108,7 +108,6 @@ import {
   selectIsUnread,
   useSidebarWorkspaceMetaStore,
 } from "../sidebarWorkspaceMetaStore";
-import { useProjectBranchPolling } from "../hooks/useProjectBranchPolling";
 import {
   useProject,
   useProjects,
@@ -596,10 +595,15 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   });
   const gitStatus = useEnvironmentQuery(
     workspaceActionsAvailable && thread.branch != null && gitCwd !== null
-      ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd },
-        })
+      ? isActive
+        ? vcsEnvironment.status({
+            environmentId: thread.environmentId,
+            input: { cwd: gitCwd },
+          })
+        : vcsEnvironment.summary({
+            environmentId: thread.environmentId,
+            input: { cwd: gitCwd },
+          })
       : null,
   );
   const isHighlighted = isActive || isSelected;
@@ -634,16 +638,27 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   // for any workspace row with an active/connecting session, broader than
   // `isThreadRunning` above (which additionally requires an active turn and
   // only gates the archive-button swap).
+  // `error` is included deliberately: `derivePhase` collapses it into
+  // `disconnected`, so without this an errored thread looks identical to one
+  // that was simply stopped and the failure is invisible outside the open chat.
   const agentSubRowStatus =
-    thread.session?.status === "running" || thread.session?.status === "starting"
+    thread.session?.status === "running" ||
+    thread.session?.status === "starting" ||
+    thread.session?.status === "error"
       ? thread.session.status
       : null;
-  const agentSubRowDuration = agentSubRowStatus
-    ? formatSessionDuration({
-        sessionUpdatedAt: thread.session?.updatedAt,
-        latestTurnStartedAt: thread.latestTurn?.startedAt,
-      })
-    : null;
+  const agentSubRowFailed = agentSubRowStatus === "error";
+  // A delivery the provider refused, or one whose fate is unknown, never reached
+  // the session at all — it lives on the thread shell. Surface it here so a send
+  // that did not land is visible without opening the thread.
+  const unresolvedDelivery = thread.unresolvedDelivery ?? null;
+  const agentSubRowDuration =
+    agentSubRowStatus && !agentSubRowFailed
+      ? formatSessionDuration({
+          sessionUpdatedAt: thread.session?.updatedAt,
+          latestTurnStartedAt: thread.latestTurn?.startedAt,
+        })
+      : null;
   const threadStatus = resolveThreadStatusPill({
     thread: {
       ...thread,
@@ -1118,17 +1133,55 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           }}
         />
       ) : null}
+      {unresolvedDelivery ? (
+        <div
+          data-thread-selection-safe
+          data-testid={`thread-delivery-row-${thread.id}`}
+          className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-[10px] text-muted-foreground/70"
+        >
+          <span
+            className={
+              unresolvedDelivery.state === "failed"
+                ? "size-1.5 shrink-0 rounded-full bg-destructive"
+                : "size-1.5 shrink-0 rounded-full bg-warning"
+            }
+          />
+          <span
+            className={
+              unresolvedDelivery.state === "failed"
+                ? "min-w-0 truncate text-destructive"
+                : "min-w-0 truncate text-warning-foreground"
+            }
+          >
+            {thread.session?.providerName ?? "Agent"}
+            {" – "}
+            {unresolvedDelivery.state === "failed" ? "Delivery failed" : "Delivery uncertain"}
+          </span>
+        </div>
+      ) : null}
       {agentSubRowStatus && (
         <div
           data-thread-selection-safe
           data-testid={`thread-agent-row-${thread.id}`}
           className="flex items-center gap-1.5 truncate pr-2 pb-0.5 pl-6 text-[10px] text-muted-foreground/70"
         >
-          <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-sky-500 dark:bg-sky-300/80" />
-          <span className="min-w-0 truncate">
+          <span
+            className={
+              agentSubRowFailed
+                ? "size-1.5 shrink-0 rounded-full bg-destructive"
+                : "size-1.5 shrink-0 animate-pulse rounded-full bg-sky-500 dark:bg-sky-300/80"
+            }
+          />
+          <span
+            className={agentSubRowFailed ? "min-w-0 truncate text-destructive" : "min-w-0 truncate"}
+          >
             {thread.session?.providerName ?? "Agent"}
             {" – "}
-            {agentSubRowStatus === "running" ? "Running" : "Connecting"}
+            {agentSubRowFailed
+              ? "Failed"
+              : agentSubRowStatus === "running"
+                ? "Running"
+                : "Connecting"}
             {agentSubRowDuration ? ` · ${agentSubRowDuration}` : ""}
           </span>
         </div>
@@ -1189,12 +1242,8 @@ interface SidebarProjectThreadListProps {
 /**
  * Orca-parity primary workspace row: the project checkout itself (not a
  * worktree). Title/subtitle track the checkout's LIVE current branch (not
- * `thread.branch`, which the default thread always carries as `null`) —
- * TODO(orca-port): wire `useProjectBranchPolling`'s `branchByProjectKey`
- * through props once the prop-drilling path through
- * SidebarProjectsContent/SidebarProjectListRow is threaded (see
- * w3-progress.md); for now this row queries `vcs.status` directly, the same
- * pattern `SidebarThreadRow` already uses per-thread (see `gitStatus` above).
+ * `thread.branch`, which the default thread always carries as `null`). The
+ * passive summary keeps this label fresh without mounting full status.
  */
 function SidebarPrimaryRow(props: {
   project: SidebarProjectSnapshot;
@@ -1205,12 +1254,17 @@ function SidebarPrimaryRow(props: {
 }) {
   const { project, primaryThread, isActive, onClick, onContextMenu } = props;
   const gitStatus = useEnvironmentQuery(
-    vcsEnvironment.status({
+    vcsEnvironment.summary({
       environmentId: project.environmentId,
       input: { cwd: project.workspaceRoot },
     }),
   );
-  const liveBranch = gitStatus.data?.refName ?? null;
+  const gitStatusData = gitStatus.data;
+  const liveBranch =
+    gitStatusData && !("stale" in gitStatusData && gitStatusData.stale)
+      ? (gitStatusData.refName ??
+        ("detachedHead" in gitStatusData ? gitStatusData.detachedHead : null))
+      : null;
   const title = liveBranch ?? primaryThread?.branch ?? project.displayName;
   const statusPill = primaryThread ? resolveThreadStatusPill({ thread: primaryThread }) : null;
   const primaryThreadKey = primaryThread
@@ -4323,26 +4377,6 @@ export default function Sidebar() {
     sidebarProjects,
     visibleThreads,
   ]);
-  // Pinned interface 5: keeps each project checkout's `vcs.status` fresh on
-  // a cadence (3s active / 30s others). We don't need the hook's returned
-  // `branchByProjectKey` here — `SidebarPrimaryRow` already subscribes to
-  // the identical {environmentId, cwd} status query per-row (same pattern
-  // as `SidebarThreadRow`'s `gitStatus` above), and that subscription atom
-  // is shared/keyed by input, so the `refreshStatus` calls this hook makes
-  // land on every row subscribed to the same project without prop-drilling.
-  const branchPollingProjects = useMemo(
-    () =>
-      sortedProjects.map((project) => ({
-        key: project.projectKey,
-        environmentId: project.environmentId,
-        workspaceRoot: project.workspaceRoot,
-      })),
-    [sortedProjects],
-  );
-  useProjectBranchPolling({
-    projects: branchPollingProjects,
-    activeProjectKey: activeRouteProjectKey,
-  });
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
   const visibleSidebarThreadKeys = useMemo(
     () =>

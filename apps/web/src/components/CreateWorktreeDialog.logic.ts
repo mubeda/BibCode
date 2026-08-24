@@ -1,10 +1,10 @@
 /**
  * Pure helpers for `CreateWorktreeDialog`. Kept side-effect free so the
- * Smart/GitHub/Branch/Name parsing + resolution rules can be unit tested
+ * Name and Smart/GitHub/Branch resolution rules can be unit tested
  * without rendering React or touching the network.
  */
 
-export type WorktreeNameMode = "smart" | "github" | "branch" | "name";
+export type WorktreeSourceMode = "smart" | "github" | "branch";
 
 export interface GitHubWorkItemRef {
   readonly number: number;
@@ -61,8 +61,18 @@ export function sanitizeBranchName(input: string): string {
 export interface RefLike {
   readonly name: string;
   readonly isRemote?: boolean | undefined;
+  readonly remoteName?: string | undefined;
   readonly current?: boolean | undefined;
   readonly worktreePath?: string | null | undefined;
+}
+
+/** Orca parity: only a free local branch can be checked out as-is. */
+export function canReuseBranch(ref: RefLike | null): boolean {
+  return ref !== null && ref.isRemote !== true && ref.current !== true && ref.worktreePath == null;
+}
+
+function isOccupiedLocalBranch(ref: RefLike): boolean {
+  return ref.isRemote !== true && (ref.current === true || ref.worktreePath != null);
 }
 
 /** Client-side substring filter for the Branch tab result list. */
@@ -70,6 +80,23 @@ export function filterRefsByQuery<T extends RefLike>(refs: ReadonlyArray<T>, que
   const trimmed = query.trim().toLowerCase();
   if (trimmed.length === 0) return [...refs];
   return refs.filter((ref) => ref.name.toLowerCase().includes(trimmed));
+}
+
+/** Mirrors Git's occupied-branch naming without treating remote refs as local collisions. */
+export function suggestNextAvailableBranchName(name: string, refs: ReadonlyArray<RefLike>): string {
+  const localNames = new Set(refs.filter((ref) => ref.isRemote !== true).map((ref) => ref.name));
+  let suffix = 2;
+  while (localNames.has(`${name}-${suffix}`)) suffix += 1;
+  return `${name}-${suffix}`;
+}
+
+export function suggestWorktreeNameFromRef(ref: RefLike): string {
+  if (ref.isRemote !== true) return ref.name;
+  if (ref.remoteName && ref.name.startsWith(`${ref.remoteName}/`)) {
+    return ref.name.slice(ref.remoteName.length + 1);
+  }
+  const separator = ref.name.indexOf("/");
+  return separator === -1 ? ref.name : ref.name.slice(separator + 1);
 }
 
 /** True when `query` exactly matches a known ref name (case-sensitive, git refs are). */
@@ -83,16 +110,14 @@ export function findExactRefMatch<T extends RefLike>(
 }
 
 export type SmartRow =
-  | { readonly kind: "use-name"; readonly name: string }
   | { readonly kind: "branch"; readonly refName: string }
   | { readonly kind: "github"; readonly item: GitHubWorkItemRef };
 
 const SMART_MAX_BRANCH_ROWS = 5;
 
 /**
- * Builds the Smart-tab row list, Orca-style: a pinned "use as name" row
- * (or a "github work item" row when the input parses as one), followed by
- * matching branch rows.
+ * Builds the Smart-tab row list: a GitHub work item when detected, followed
+ * by matching branch rows. Worktree naming is handled by the separate field.
  */
 export function buildSmartRows(input: {
   readonly query: string;
@@ -106,8 +131,6 @@ export function buildSmartRows(input: {
   const githubItem = parseGitHubWorkItem(trimmed);
   if (githubItem) {
     rows.push({ kind: "github", item: githubItem });
-  } else {
-    rows.push({ kind: "use-name", name: trimmed });
   }
 
   const maxBranchRows = input.maxBranchRows ?? SMART_MAX_BRANCH_ROWS;
@@ -127,20 +150,21 @@ export function buildSmartRows(input: {
 export function detectSmartMode(
   query: string,
   refs: ReadonlyArray<RefLike>,
-): "github" | "branch" | "name" {
+): "github" | "branch" | "search" {
   const trimmed = query.trim();
-  if (trimmed.length === 0) return "name";
+  if (trimmed.length === 0) return "search";
   if (parseGitHubWorkItem(trimmed)) return "github";
   const exact = findExactRefMatch(refs, trimmed);
   if (exact) return "branch";
   const lower = trimmed.toLowerCase();
   const hasPrefixMatch = refs.some((ref) => ref.name.toLowerCase().startsWith(lower));
-  return hasPrefixMatch ? "branch" : "name";
+  return hasPrefixMatch ? "branch" : "search";
 }
 
 export type WorktreeCreateResolution =
   | {
       readonly kind: "existing-ref";
+      readonly title: string;
       readonly branchName: string;
       readonly refName: string;
       readonly newRefName: null;
@@ -148,6 +172,7 @@ export type WorktreeCreateResolution =
     }
   | {
       readonly kind: "new-branch";
+      readonly title: string;
       readonly branchName: string;
       readonly refName: string;
       readonly newRefName: string;
@@ -160,48 +185,80 @@ export type WorktreeCreateResolution =
  * disabled).
  */
 export function resolveWorktreeCreateInput(input: {
-  readonly mode: WorktreeNameMode;
+  readonly mode: WorktreeSourceMode;
   readonly nameText: string;
+  readonly sourceText?: string;
   readonly selectedBranchRefName: string | null;
+  readonly selectedBranchRef?: RefLike | null;
+  readonly reuseSelectedBranch?: boolean;
   readonly githubItem: GitHubWorkItemRef | null;
   readonly advancedBaseBranchOverride: string | null;
   readonly defaultBaseBranch: string | null;
 }): WorktreeCreateResolution | null {
+  const title = input.nameText.trim();
+  if (title.length === 0) return null;
+  const namedBranch = sanitizeBranchName(title);
   const existingRef = (refName: string): WorktreeCreateResolution => ({
     kind: "existing-ref",
+    title,
     branchName: refName,
     refName,
     newRefName: null,
     baseRefName: null,
   });
-  const newBranch = (branchName: string): WorktreeCreateResolution => {
+  const newBranch = (
+    branchName: string,
+    selectedBaseRefName?: string,
+  ): WorktreeCreateResolution => {
     const baseRefName =
-      (input.advancedBaseBranchOverride?.trim() || null) ?? input.defaultBaseBranch ?? "HEAD";
+      selectedBaseRefName ??
+      (input.advancedBaseBranchOverride?.trim() || null) ??
+      input.defaultBaseBranch ??
+      "HEAD";
     return {
       kind: "new-branch",
+      title,
       branchName,
       refName: baseRefName,
       newRefName: branchName,
       baseRefName,
     };
   };
+  const selectedBranch = (): WorktreeCreateResolution | null => {
+    if (!input.selectedBranchRefName) return null;
+    if (input.selectedBranchRef === null) return null;
+    if (
+      input.selectedBranchRef &&
+      !isOccupiedLocalBranch(input.selectedBranchRef) &&
+      !(canReuseBranch(input.selectedBranchRef) && input.reuseSelectedBranch === true)
+    ) {
+      return namedBranch.length > 0 ? newBranch(namedBranch, input.selectedBranchRefName) : null;
+    }
+    return existingRef(input.selectedBranchRefName);
+  };
 
   if (input.mode === "branch") {
-    return input.selectedBranchRefName ? existingRef(input.selectedBranchRefName) : null;
+    if (input.selectedBranchRefName) return selectedBranch();
+    if (input.sourceText?.trim()) return null;
   }
 
   if (input.mode === "github") {
-    return input.githubItem ? newBranch(githubWorkItemBranchName(input.githubItem)) : null;
+    if (input.githubItem) {
+      return namedBranch.length > 0 ? newBranch(namedBranch) : null;
+    }
+    if (input.sourceText?.trim()) return null;
   }
 
   if (input.mode === "smart") {
-    if (input.githubItem) return newBranch(githubWorkItemBranchName(input.githubItem));
-    if (input.selectedBranchRefName) return existingRef(input.selectedBranchRefName);
+    if (input.githubItem) {
+      return namedBranch.length > 0 ? newBranch(namedBranch) : null;
+    }
+    if (input.selectedBranchRefName) return selectedBranch();
+    if (input.sourceText?.trim()) return null;
   }
 
-  // "name" mode, or Smart falling back to plain text.
-  const branchName = sanitizeBranchName(input.nameText);
-  return branchName.length > 0 ? newBranch(branchName) : null;
+  // No selected source: create from the configured default.
+  return namedBranch.length > 0 ? newBranch(namedBranch) : null;
 }
 
 /** Gate for the primary "Create worktree" button. */

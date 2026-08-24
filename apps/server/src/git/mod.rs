@@ -1,8 +1,12 @@
 mod broadcaster;
+mod fetch_owner;
 mod model;
 mod parser;
 mod process;
 mod repository;
+mod status_owner;
+mod summary;
+mod watcher;
 mod worktree;
 
 #[allow(unused_imports)]
@@ -14,9 +18,22 @@ pub use parser::{
 };
 pub use process::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
 #[cfg(test)]
-pub(crate) use repository::{BoxGitProcessFuture, GitProcessRunner};
+pub(crate) use repository::BoxGitProcessFuture;
+pub(crate) use repository::GitProcessRunner;
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitRepository, WorktreeBaseDirectoryProvider,
+};
+#[allow(unused_imports)]
+pub(crate) use repository::{StatusObservation, validate_pathspecs};
+pub use status_owner::StatusMutationGuard;
+pub(crate) use status_owner::{STATUS_SAFETY_INTERVAL, StatusReadFence};
+pub use summary::GitStatusSummaryService;
+#[cfg(test)]
+pub(crate) use watcher::acquire_native_watcher_test_permit;
+#[allow(unused_imports)]
+pub(crate) use watcher::{
+    GitWatchError, GitWatchEvent, GitWatchRequest, GitWatchService, GitWatchSubscription,
+    GitWatcherHealth,
 };
 pub(crate) use worktree::uses_foreign_posix_identity;
 pub use worktree::{

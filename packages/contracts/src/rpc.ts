@@ -104,6 +104,7 @@ import {
   ProjectDuplicateEntryError,
   ProjectDuplicateEntryInput,
   ProjectDuplicateEntryResult,
+  ProjectEntriesChangedEvent,
   ProjectListEntriesError,
   ProjectListEntriesInput,
   ProjectListEntriesResult,
@@ -116,6 +117,7 @@ import {
   ProjectSearchEntriesError,
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
+  ProjectSubscribeEntriesInput,
   ProjectWriteFileError,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
@@ -196,7 +198,7 @@ import {
   SourceControlRepositoryInfo,
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
-import { VcsError } from "./vcs.ts";
+import { VcsError, VcsStatusSummary } from "./vcs.ts";
 import {
   ProjectWorktreeDiscoveryPolicy,
   VcsWorktreeCatalogSnapshot,
@@ -309,6 +311,7 @@ export const WS_METHODS = {
   projectsAdd: "projects.add",
   projectsRemove: "projects.remove",
   projectsListEntries: "projects.listEntries",
+  projectsSubscribeEntries: "subscribeProjectEntries",
   projectsReadFile: "projects.readFile",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
@@ -411,6 +414,7 @@ export const WS_METHODS = {
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
+  subscribeVcsStatusSummary: "subscribeVcsStatusSummary",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -595,6 +599,18 @@ export const WsProjectsListEntriesRpc = Rpc.make(WS_METHODS.projectsListEntries,
   ]),
 });
 
+export const WsProjectsSubscribeEntriesRpc = Rpc.make(WS_METHODS.projectsSubscribeEntries, {
+  payload: ProjectSubscribeEntriesInput,
+  success: ProjectEntriesChangedEvent,
+  error: Schema.Union([
+    ProjectListEntriesError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+  stream: true,
+});
+
 export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   payload: ProjectReadFileInput,
   success: ProjectReadFileResult,
@@ -696,6 +712,18 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
   success: VcsStatusStreamEvent,
+  error: Schema.Union([
+    GitManagerServiceError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentAuthorizationError,
+  ]),
+  stream: true,
+});
+
+export const WsSubscribeVcsStatusSummaryRpc = Rpc.make(WS_METHODS.subscribeVcsStatusSummary, {
+  payload: VcsStatusInput,
+  success: VcsStatusSummary,
   error: Schema.Union([
     GitManagerServiceError,
     WorkspaceUnavailableError,
@@ -1272,6 +1300,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,
   WsProjectsListEntriesRpc,
+  WsProjectsSubscribeEntriesRpc,
   WsProjectsReadFileRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
@@ -1283,6 +1312,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
   WsSubscribeVcsStatusRpc,
+  WsSubscribeVcsStatusSummaryRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,

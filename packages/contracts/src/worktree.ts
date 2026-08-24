@@ -52,6 +52,7 @@ export type WorktreeCatalogInput = typeof WorktreeCatalogInput.Type;
 
 export const WorktreeCatalogRefreshInput = Schema.Struct({
   projectId: ProjectId,
+  reason: Schema.optionalKey(Schema.Literals(["focus", "explicit"])),
 });
 export type WorktreeCatalogRefreshInput = typeof WorktreeCatalogRefreshInput.Type;
 

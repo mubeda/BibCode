@@ -39,15 +39,20 @@ import { worktreeEnvironment } from "~/state/worktrees";
 
 import {
   buildSmartRows,
+  canReuseBranch,
   detectSmartMode,
   filterRefsByQuery,
+  findExactRefMatch,
   getCreateWorktreeDisabled,
+  githubWorkItemBranchName,
   parseGitHubWorkItem,
   resolveWorktreeCreateInput,
+  suggestNextAvailableBranchName,
+  suggestWorktreeNameFromRef,
   type GitHubWorkItemRef,
   type RefLike,
   type SmartRow,
-  type WorktreeNameMode,
+  type WorktreeSourceMode,
 } from "./CreateWorktreeDialog.logic";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleTrigger, CollapsiblePanel } from "./ui/collapsible";
@@ -101,11 +106,10 @@ function sameProjectRef(left: ScopedProjectRef | null, right: ScopedProjectRef |
   );
 }
 
-const TAB_OPTIONS: ReadonlyArray<{ value: WorktreeNameMode; label: string }> = [
+const TAB_OPTIONS: ReadonlyArray<{ value: WorktreeSourceMode; label: string }> = [
   { value: "smart", label: "Smart" },
   { value: "github", label: "GitHub" },
   { value: "branch", label: "Branch" },
-  { value: "name", label: "Name" },
 ];
 
 export function CreateWorktreeDialog({
@@ -124,14 +128,17 @@ export function CreateWorktreeDialog({
     branchRefName: null,
   }));
   const { projectRef, branchRefName } = projectSelection;
-  const [mode, setMode] = useState<WorktreeNameMode>("smart");
+  const [mode, setMode] = useState<WorktreeSourceMode>("smart");
   const [nameText, setNameText] = useState("");
+  const [sourceText, setSourceText] = useState("");
+  const [reuseSelectedBranch, setReuseSelectedBranch] = useState(false);
   const [baseBranchOverride, setBaseBranchOverride] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [createMore, setCreateMore] = useState(false);
   const [agentActionValue, setAgentActionValue] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const agentSelectionTouchedRef = useRef(false);
+  const automaticNameRef = useRef<string | null>(null);
   const previousOpenRef = useRef(false);
   const refsEnabledRef = useRef(false);
 
@@ -146,10 +153,70 @@ export function CreateWorktreeDialog({
     setProjectSelection((current) => ({ ...current, branchRefName: branchRef?.name ?? null }));
   }, []);
 
-  // A fresh query/tab invalidates whatever branch row was previously picked.
-  useEffect(() => {
+  const clearBranchSelection = useCallback(() => {
     selectBranchRef(null);
-  }, [nameText, mode, selectBranchRef]);
+    setReuseSelectedBranch(false);
+  }, [selectBranchRef]);
+
+  const applySuggestedName = useCallback(
+    (suggestion: string): boolean => {
+      const shouldApply = nameText.trim().length === 0 || nameText === automaticNameRef.current;
+      if (shouldApply) {
+        automaticNameRef.current = suggestion;
+        setNameText(suggestion);
+      }
+      return shouldApply;
+    },
+    [nameText],
+  );
+
+  const handleModeChange = useCallback(
+    (nextMode: WorktreeSourceMode) => {
+      setMode(nextMode);
+      clearBranchSelection();
+      if (nextMode === "github" || nextMode === "smart") {
+        const item = parseGitHubWorkItem(sourceText);
+        if (item) applySuggestedName(githubWorkItemBranchName(item));
+      }
+    },
+    [applySuggestedName, clearBranchSelection, sourceText],
+  );
+
+  const handleSourceTextChange = useCallback(
+    (value: string) => {
+      setSourceText(value);
+      clearBranchSelection();
+      if (mode === "github" || mode === "smart") {
+        const item = parseGitHubWorkItem(value);
+        if (item) applySuggestedName(githubWorkItemBranchName(item));
+      }
+    },
+    [applySuggestedName, clearBranchSelection, mode],
+  );
+
+  const handleBranchSelect = useCallback(
+    (ref: RefLike) => {
+      selectBranchRef(ref);
+      const automaticNameApplied = applySuggestedName(suggestWorktreeNameFromRef(ref));
+      setReuseSelectedBranch(canReuseBranch(ref) && automaticNameApplied);
+    },
+    [applySuggestedName, selectBranchRef],
+  );
+
+  const handleProjectChange = useCallback(
+    (nextProjectRef: ScopedProjectRef) => {
+      if (sameProjectRef(projectRef, nextProjectRef)) return;
+      selectProjectTarget(nextProjectRef);
+      setSourceText("");
+      setReuseSelectedBranch(false);
+      const automaticName = automaticNameRef.current;
+      if (automaticName !== null) {
+        automaticNameRef.current = null;
+        setNameText((current) => (current === automaticName ? "" : current));
+      }
+    },
+    [projectRef, selectProjectTarget],
+  );
 
   useEffect(() => {
     const wasOpen = previousOpenRef.current;
@@ -157,6 +224,12 @@ export function CreateWorktreeDialog({
     if (!open) return;
     if (!wasOpen) {
       agentSelectionTouchedRef.current = false;
+      setReuseSelectedBranch(false);
+      const automaticName = automaticNameRef.current;
+      if (automaticName !== null) {
+        setNameText((current) => (current === automaticName ? "" : current));
+        automaticNameRef.current = null;
+      }
     }
     const firstProject = projects[0];
     const firstProjectRef = firstProject
@@ -196,7 +269,12 @@ export function CreateWorktreeDialog({
     branchesEnabled && environmentId !== null && cwd !== null
       ? vcsEnvironment.listRefs({
           environmentId,
-          input: { cwd, query: nameText.trim() || undefined },
+          // ponytail: one maximum-size page keeps this UI query bounded; move
+          // collision suffixing server-side if repositories exceed that ceiling.
+          // Keep the atom stable while the user types. Re-keying it for every
+          // character clears the cached refs before the exact-match effect can
+          // select the branch and does not automatically refresh the new atom.
+          input: { cwd, query: undefined, limit: 200 },
         })
       : null,
   );
@@ -208,26 +286,56 @@ export function CreateWorktreeDialog({
   }, [refsEnabled, refsQuery.refresh]);
   // TODO(orca-port): confirm VcsListRefsResult field name is `refs`.
   const refs: ReadonlyArray<RefLike> = refsQuery.data?.refs ?? [];
+  const exactBranchRef = useMemo(() => findExactRefMatch(refs, sourceText), [refs, sourceText]);
   const selectedBranchRef = useMemo(
     () => refs.find((ref) => ref.name === branchRefName) ?? null,
     [branchRefName, refs],
   );
   const selectedBranchRefName = selectedBranchRef?.name ?? null;
+  const canReuseSelectedBranch = canReuseBranch(selectedBranchRef);
+  useEffect(() => {
+    if (
+      (mode === "branch" || mode === "smart") &&
+      exactBranchRef !== null &&
+      branchRefName !== exactBranchRef.name
+    ) {
+      handleBranchSelect(exactBranchRef);
+    }
+  }, [branchRefName, exactBranchRef, handleBranchSelect, mode]);
+  const handleReuseSelectedBranchChange = useCallback(
+    (nextReuse: boolean) => {
+      if (!selectedBranchRef || !canReuseSelectedBranch) return;
+      if (nameText === automaticNameRef.current) {
+        const suggestion = nextReuse
+          ? selectedBranchRef.name
+          : suggestNextAvailableBranchName(selectedBranchRef.name, refs);
+        automaticNameRef.current = suggestion;
+        setNameText(suggestion);
+      }
+      setReuseSelectedBranch(nextReuse);
+    },
+    [canReuseSelectedBranch, nameText, refs, selectedBranchRef],
+  );
 
   const githubItem: GitHubWorkItemRef | null =
-    mode === "github" || mode === "smart" ? parseGitHubWorkItem(nameText) : null;
+    mode === "github" || mode === "smart" ? parseGitHubWorkItem(sourceText) : null;
 
   const smartRows: SmartRow[] = useMemo(
-    () => (mode === "smart" ? buildSmartRows({ query: nameText, refs }) : []),
-    [mode, nameText, refs],
+    () =>
+      mode === "smart"
+        ? buildSmartRows({ query: sourceText, refs }).filter(
+            (row) => row.kind !== "branch" || row.refName !== exactBranchRef?.name,
+          )
+        : [],
+    [exactBranchRef, mode, sourceText, refs],
   );
   const branchRows = useMemo(
-    () => (mode === "branch" ? filterRefsByQuery(refs, nameText) : []),
-    [mode, nameText, refs],
+    () => (mode === "branch" && exactBranchRef === null ? filterRefsByQuery(refs, sourceText) : []),
+    [exactBranchRef, mode, sourceText, refs],
   );
   const smartDetectedMode = useMemo(
-    () => (mode === "smart" ? detectSmartMode(nameText, refs) : mode),
-    [mode, nameText, refs],
+    () => (mode === "smart" ? detectSmartMode(sourceText, refs) : mode),
+    [mode, sourceText, refs],
   );
 
   const serverConfig = environmentId ? serverConfigs.get(environmentId) : undefined;
@@ -261,12 +369,24 @@ export function CreateWorktreeDialog({
       resolveWorktreeCreateInput({
         mode,
         nameText,
-        selectedBranchRefName,
+        sourceText,
+        selectedBranchRefName: branchRefName,
+        selectedBranchRef,
+        reuseSelectedBranch,
         githubItem,
         advancedBaseBranchOverride: baseBranchOverride || null,
         defaultBaseBranch: null,
       }),
-    [mode, nameText, selectedBranchRefName, githubItem, baseBranchOverride],
+    [
+      mode,
+      nameText,
+      sourceText,
+      branchRefName,
+      selectedBranchRef,
+      reuseSelectedBranch,
+      githubItem,
+      baseBranchOverride,
+    ],
   );
 
   const createManagedWorktree = useAtomCommand(worktreeEnvironment.createManaged, {
@@ -282,14 +402,16 @@ export function CreateWorktreeDialog({
 
   const resetForNextCreate = useCallback(() => {
     setNameText("");
-    selectBranchRef(null);
+    setSourceText("");
+    automaticNameRef.current = null;
+    clearBranchSelection();
     setFormError(null);
     window.requestAnimationFrame(() => nameInputRef.current?.focus());
-  }, [selectBranchRef]);
+  }, [clearBranchSelection]);
 
   const handleSubmit = useCallback(async () => {
     if (!project || !environmentId || !cwd || !resolution) {
-      setFormError("Choose a project and a name/branch to create the worktree from.");
+      setFormError("Choose a project and enter a worktree name.");
       return;
     }
     setFormError(null);
@@ -322,7 +444,7 @@ export function CreateWorktreeDialog({
           commandId: newCommandId(),
           threadId,
           projectId: project.id,
-          title: resolution.branchName,
+          title: resolution.title,
           refName: resolution.refName,
           newRefName: resolution.newRefName,
           baseRefName: resolution.baseRefName,
@@ -405,7 +527,7 @@ export function CreateWorktreeDialog({
         <DialogHeader>
           <DialogTitle>Create worktree</DialogTitle>
           <DialogDescription>
-            Create a new worktree and thread from a project, branch, or GitHub issue/PR.
+            Create a named worktree and thread, optionally from a branch or GitHub issue/PR.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
@@ -417,7 +539,7 @@ export function CreateWorktreeDialog({
               onValueChange={(value) => {
                 if (value === null) return;
                 const nextProjectRef = parseScopedProjectKey(value);
-                if (nextProjectRef) selectProjectTarget(nextProjectRef);
+                if (nextProjectRef) handleProjectChange(nextProjectRef);
               }}
               items={projects.map((p) => ({
                 value: scopedProjectKey(scopeProjectRef(p.environmentId, p.id)),
@@ -442,7 +564,23 @@ export function CreateWorktreeDialog({
             </Select>
           </label>
 
+          <label className="grid gap-1.5">
+            <span className="text-foreground text-xs font-medium">Name</span>
+            <Input
+              ref={nameInputRef}
+              placeholder="Worktree name"
+              value={nameText}
+              onChange={(event) => {
+                automaticNameRef.current = null;
+                setNameText(event.target.value);
+              }}
+            />
+          </label>
+
           <div className="grid gap-1.5">
+            <span className="text-foreground text-xs font-medium">
+              Create From <span className="text-muted-foreground font-normal">[Optional]</span>
+            </span>
             {/* TODO(orca-port): swap for ui/toggle-group's segmented control
                 once its single-select value API (string vs string[]) is
                 confirmed; plain buttons are a safe first pass. */}
@@ -453,7 +591,8 @@ export function CreateWorktreeDialog({
                   type="button"
                   size="sm"
                   variant={mode === tab.value ? "default" : "outline"}
-                  onClick={() => setMode(tab.value)}
+                  aria-pressed={mode === tab.value}
+                  onClick={() => handleModeChange(tab.value)}
                 >
                   {tab.label}
                 </Button>
@@ -461,18 +600,16 @@ export function CreateWorktreeDialog({
             </div>
 
             <Input
-              ref={nameInputRef}
+              aria-label="Create From"
               placeholder={
                 mode === "github"
                   ? "#1234 or a GitHub issue/PR URL"
                   : mode === "branch"
                     ? "Search branches"
-                    : mode === "name"
-                      ? "Worktree / branch name"
-                      : "Type a name, #1234, or a branch"
+                    : "Type #1234 or search branches"
               }
-              value={nameText}
-              onChange={(event) => setNameText(event.target.value)}
+              value={sourceText}
+              onChange={(event) => handleSourceTextChange(event.target.value)}
             />
 
             {mode === "smart" && smartRows.length > 0 ? (
@@ -480,11 +617,7 @@ export function CreateWorktreeDialog({
                 {smartRows.map((row) => (
                   <button
                     key={
-                      row.kind === "github"
-                        ? `github-${row.item.number}`
-                        : row.kind === "branch"
-                          ? `branch-${row.refName}`
-                          : "use-name"
+                      row.kind === "github" ? `github-${row.item.number}` : `branch-${row.refName}`
                     }
                     type="button"
                     className={cn(
@@ -493,16 +626,13 @@ export function CreateWorktreeDialog({
                     )}
                     onClick={() => {
                       if (row.kind === "branch") {
-                        selectBranchRef(refs.find((ref) => ref.name === row.refName) ?? null);
+                        const ref = refs.find((candidate) => candidate.name === row.refName);
+                        if (ref) handleBranchSelect(ref);
                       }
                     }}
                   >
                     <span>
-                      {row.kind === "github"
-                        ? `GitHub #${row.item.number}`
-                        : row.kind === "branch"
-                          ? row.refName
-                          : `Use "${row.name}"`}
+                      {row.kind === "github" ? `GitHub #${row.item.number}` : row.refName}
                     </span>
                     <span className="text-muted-foreground text-xs capitalize">{row.kind}</span>
                   </button>
@@ -520,11 +650,28 @@ export function CreateWorktreeDialog({
                       "hover:bg-accent flex w-full items-center px-3 py-1.5 text-left text-sm",
                       ref.name === selectedBranchRefName && "bg-accent",
                     )}
-                    onClick={() => selectBranchRef(ref)}
+                    onClick={() => handleBranchSelect(ref)}
                   >
                     {ref.name}
                   </button>
                 ))}
+              </div>
+            ) : null}
+
+            {canReuseSelectedBranch ? (
+              <div className="space-y-1 pt-1">
+                <label className="flex w-fit items-center gap-2 text-xs text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={reuseSelectedBranch}
+                    onChange={(event) => handleReuseSelectedBranchChange(event.target.checked)}
+                    className="accent-primary size-4"
+                  />
+                  Reuse branch
+                </label>
+                <p className="text-muted-foreground pl-6 text-xs">
+                  Check out the existing branch instead of creating a new one from it.
+                </p>
               </div>
             ) : null}
 

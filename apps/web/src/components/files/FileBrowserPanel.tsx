@@ -11,7 +11,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
-import type { GitStatus, GitStatusEntry } from "@pierre/trees";
+import type { FileTreeDropResult, GitStatus, GitStatusEntry } from "@pierre/trees";
 import { FileTree, useFileTree } from "@pierre/trees/react";
 import { FolderClosed, FolderOpen, RefreshCw, Search } from "lucide-react";
 import type { MouseEvent } from "react";
@@ -83,6 +83,9 @@ const TREE_UNSAFE_CSS = `
   button[data-type='item'] { border-radius: 5px; }
 `;
 
+/** Stable identity while the query is pending, so the path-reset effect does not run every render. */
+const NO_ENTRIES: ReadonlyArray<ProjectEntry> = Object.freeze([]);
+
 function treePath(entry: ProjectEntry): string {
   return entry.kind === "directory" ? `${entry.path}/` : entry.path;
 }
@@ -137,6 +140,7 @@ export function buildFileTreeGitStatus(
 interface CollapsibleTreeItem {
   collapse?: () => void;
   isDirectory: () => boolean;
+  isExpanded?: () => boolean;
 }
 
 interface CollapsibleTreeModel {
@@ -145,6 +149,21 @@ interface CollapsibleTreeModel {
 
 export function expandedDirectoryTreePaths(entries: ReadonlyArray<ProjectEntry>): string[] {
   return entries.filter((entry) => entry.kind === "directory").map(treePath);
+}
+
+/**
+ * The directories the live tree currently shows expanded. `resetPaths` rebuilds the path store and
+ * re-applies `initialExpansion` unless it is handed the expansion to keep, so every refresh has to
+ * carry the current expansion forward.
+ */
+export function currentlyExpandedTreePaths(
+  model: CollapsibleTreeModel,
+  directoryTreePaths: ReadonlyArray<string>,
+): string[] {
+  return directoryTreePaths.filter((path) => {
+    const item = model.getItem(path);
+    return item?.isDirectory() === true && item.isExpanded?.() === true;
+  });
 }
 
 export function collapseDirectoryTreePaths(
@@ -169,9 +188,15 @@ export default function FileBrowserPanel({
 }: FileBrowserPanelProps) {
   const { resolvedTheme } = useTheme();
   const entriesQuery = useProjectEntriesQuery(environmentId, cwd);
-  const entries = entriesQuery.data?.entries ?? [];
+  const entries = entriesQuery.data?.entries ?? NO_ENTRIES;
   const vcsStatusQuery = useEnvironmentQuery(
     cwd.length > 0 ? vcsEnvironment.status({ environmentId, input: { cwd } }) : null,
+  );
+  // The server sweeps a subscribed workspace for changes made outside the app and drops its cached
+  // index before signalling, so re-reading the query here is enough — the signal carries no entries
+  // of its own.
+  const entryChanges = useEnvironmentQuery(
+    cwd.length > 0 ? projectEnvironment.subscribeEntries({ environmentId, input: { cwd } }) : null,
   );
   const gitStatus = useMemo(
     () => buildFileTreeGitStatus(entries, vcsStatusQuery.data),
@@ -193,6 +218,9 @@ export default function FileBrowserPanel({
 
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const createEntry = useAtomCommand(projectEnvironment.createEntry, { reportFailure: false });
+  const refreshServerEntries = useAtomCommand(projectEnvironment.refreshEntries, {
+    reportFailure: false,
+  });
   const renameEntry = useAtomCommand(projectEnvironment.renameEntry, { reportFailure: false });
   const deleteEntry = useAtomCommand(projectEnvironment.deleteEntry, { reportFailure: false });
   const duplicateEntry = useAtomCommand(projectEnvironment.duplicateEntry, {
@@ -208,6 +236,8 @@ export default function FileBrowserPanel({
   const remapFileSurfaces = useRightPanelStore((state) => state.remapFileSurfaces);
   const closeFileSurfacesUnder = useRightPanelStore((state) => state.closeFileSurfacesUnder);
 
+  const [isRescanning, setIsRescanning] = useState(false);
+  const rescanInFlightRef = useRef(false);
   const [dialogRequest, setDialogRequest] = useState<FileEntryDialogRequest | null>(null);
   const workspaceUnavailableRef = useRef(workspaceUnavailable);
   // Right-click on empty tree space: Pierre only surfaces row menus, so a background menu is
@@ -256,6 +286,34 @@ export default function FileBrowserPanel({
       }),
     );
   }, []);
+
+  // The server keeps a cached workspace index, so refreshing the query atom alone replays the stale
+  // list. This is the user-initiated rescan: it asks the server to rebuild first, then refreshes the
+  // query — including when the rebuild itself fails, so the tree still resyncs with whatever the
+  // server has. The projects.* mutations already drop the server's cached index themselves, so they
+  // must NOT come through here; a second rebuild request would ship the whole entry list twice.
+  const rescanFiles = useCallback(() => {
+    if (rescanInFlightRef.current) return;
+    rescanInFlightRef.current = true;
+    setIsRescanning(true);
+    void (async () => {
+      try {
+        const result = await refreshServerEntries({
+          environmentId,
+          input: { cwd, refresh: true },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          showMutationError(squashAtomCommandFailure(result), "Failed to refresh workspace files");
+        }
+      } catch (error) {
+        showMutationError(error, "Failed to refresh workspace files");
+      } finally {
+        rescanInFlightRef.current = false;
+        setIsRescanning(false);
+        entriesQuery.refresh();
+      }
+    })();
+  }, [cwd, entriesQuery, environmentId, refreshServerEntries, showMutationError]);
 
   const addAsProject = useCallback(
     (workspaceRoot: string) => {
@@ -512,11 +570,95 @@ export default function FileBrowserPanel({
     [createAssetUrl, cwd, environmentHttpBaseUrl, openPreview, showMutationError, threadRef],
   );
 
+  // An in-tree drop is a move, which the server exposes as a rename from → to, so it runs through
+  // the same editing-session lease and surface remapping as the Rename command. Pierre has already
+  // applied the move to its own model by the time it calls back, so every outcome ends in a refresh
+  // to resync the tree with the server.
+  const moveDroppedEntries = useCallback(
+    (event: FileTreeDropResult) => {
+      if (workspaceUnavailableRef.current) {
+        entriesQuery.refresh();
+        return;
+      }
+      const targetDir =
+        event.target.kind === "root" ? "" : stripTrailingSlash(event.target.directoryPath ?? "");
+      void (async () => {
+        for (const draggedPath of event.draggedPaths) {
+          const fromRelativePath = stripTrailingSlash(draggedPath);
+          if (parentRelativePath(fromRelativePath) === targetDir) continue;
+          const name = entryName(fromRelativePath);
+          const toRelativePath = joinRelativePath(targetDir, name);
+          let lease: FilePathMutationLease | null | undefined;
+          try {
+            lease = await onBeginPathMutation?.({
+              kind: "rename",
+              fromRelativePath,
+              toRelativePath,
+            });
+            if (onBeginPathMutation && !lease) continue;
+            const result = await renameEntry({
+              environmentId,
+              input: { cwd, fromRelativePath, toRelativePath },
+            });
+            if (result._tag === "Failure") {
+              if (!isAtomCommandInterrupted(result)) {
+                showMutationError(squashAtomCommandFailure(result), `Failed to move "${name}"`);
+              }
+              continue;
+            }
+            lease?.commitRename(result.value.relativePath);
+            remapFileSurfaces(threadRef, fromRelativePath, result.value.relativePath);
+          } catch (error) {
+            showMutationError(error, `Failed to move "${name}"`);
+          } finally {
+            lease?.release();
+          }
+        }
+        entriesQuery.refresh();
+      })();
+    },
+    [
+      cwd,
+      entriesQuery,
+      environmentId,
+      onBeginPathMutation,
+      remapFileSurfaces,
+      renameEntry,
+      showMutationError,
+      threadRef,
+    ],
+  );
+
+  // Pierre rejects some drops inside its own model (a name collision, or a directory dropped into
+  // its own descendant), in which case onDropComplete never runs. Nothing reached the server, so
+  // re-reading its unchanged list is what puts the tree back.
+  const reportDropError = useCallback(
+    (error: string) => {
+      showMutationError(new Error(error), "Failed to move files");
+      entriesQuery.refresh();
+    },
+    [entriesQuery, showMutationError],
+  );
+
+  // useFileTree captures its options once, so the drop callbacks are reached through refs that
+  // always hold the current render's handlers.
+  const moveDroppedEntriesRef = useRef(moveDroppedEntries);
+  const reportDropErrorRef = useRef(reportDropError);
+  useEffect(() => {
+    moveDroppedEntriesRef.current = moveDroppedEntries;
+    reportDropErrorRef.current = reportDropError;
+  }, [moveDroppedEntries, reportDropError]);
+
   const { model } = useFileTree({
     composition: { contextMenu: { enabled: true, triggerMode: "both" } },
     density: "compact",
+    dragAndDrop: {
+      canDrag: () => !workspaceUnavailableRef.current,
+      onDropComplete: (event) => moveDroppedEntriesRef.current(event),
+      onDropError: (error) => reportDropErrorRef.current(error),
+    },
     fileTreeSearchMode: "hide-non-matches",
-    flattenEmptyDirectories: true,
+    flattenEmptyDirectories: false,
     gitStatus,
     initialExpansion: 0,
     icons: BIBCODE_PIERRE_ICONS,
@@ -535,10 +677,30 @@ export default function FileBrowserPanel({
     if (previousTreePathsRef.current === treePaths) return;
     entryKindsRef.current = entryKinds;
     previousTreePathsRef.current = treePaths;
-    model.resetPaths(treePaths);
-  }, [entryKinds, model, treePaths]);
+    model.resetPaths(treePaths, {
+      initialExpandedPaths: currentlyExpandedTreePaths(model, expandedTreePaths),
+    });
+  }, [entryKinds, expandedTreePaths, model, treePaths]);
 
   useEffect(() => model.setGitStatus(gitStatus), [gitStatus, model]);
+
+  const entryChangeSignal = entryChanges.data;
+  // Tracks the signal already acted on. The server starts each subscription with a resync signal
+  // after establishing the watcher, so the first value must refresh a list that may have raced it.
+  //
+  // Recording it is what makes the effect idempotent. `entriesQuery` is a fresh object on every
+  // render, so an effect depending on it re-runs constantly; without this the refresh it triggers
+  // re-renders, re-runs the effect, and refreshes again in a hot loop. Depend on the stable
+  // `refresh` callback rather than the wrapper object for the same reason.
+  const handledEntryChangeRef = useRef<typeof entryChangeSignal>(null);
+  const refreshEntries = entriesQuery.refresh;
+  useEffect(() => {
+    if (entryChangeSignal === null || entryChangeSignal === handledEntryChangeRef.current) {
+      return;
+    }
+    handledEntryChangeRef.current = entryChangeSignal;
+    refreshEntries();
+  }, [entryChangeSignal, refreshEntries]);
 
   const fileCount = useMemo(
     () => entries.reduce((count, entry) => count + (entry.kind === "file" ? 1 : 0), 0),
@@ -611,9 +773,11 @@ export default function FileBrowserPanel({
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-foreground">{projectName}</div>
           <div className="truncate text-[10px] leading-none text-muted-foreground">
-            {entriesQuery.isPending && entriesQuery.data === null
-              ? "Indexing…"
-              : `${fileCount.toLocaleString()} files`}
+            {isRescanning
+              ? "Refreshing…"
+              : entriesQuery.isPending && entriesQuery.data === null
+                ? "Indexing…"
+                : `${fileCount.toLocaleString()} files`}
             {entriesQuery.data?.truncated ? " · partial" : ""}
           </div>
         </div>
@@ -645,9 +809,13 @@ export default function FileBrowserPanel({
           type="button"
           className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
           aria-label="Refresh workspace files"
-          onClick={entriesQuery.refresh}
+          aria-busy={isRescanning}
+          disabled={isRescanning}
+          onClick={rescanFiles}
         >
-          <RefreshCw className={cn("size-3.5", entriesQuery.isPending && "animate-spin")} />
+          <RefreshCw
+            className={cn("size-3.5", (entriesQuery.isPending || isRescanning) && "animate-spin")}
+          />
         </button>
       </div>
       {entriesQuery.error && entriesQuery.data === null ? (
@@ -711,7 +879,7 @@ export default function FileBrowserPanel({
                 }
               : {}),
             onCopyPath: () => copyText(cwd),
-            onRefresh: () => entriesQuery.refresh(),
+            onRefresh: () => rescanFiles(),
           }}
           anchor={backgroundAnchor}
           onClose={() => setBackgroundMenu(null)}

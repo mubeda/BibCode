@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::source_control::WireOption;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VcsWorkingTreeFileStatus {
@@ -110,6 +112,32 @@ pub struct ChangeRequest {
     pub base_ref: String,
     pub head_ref: String,
     pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsSummaryChangeRequest {
+    pub provider: ProviderKind,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub base_ref_name: String,
+    pub head_ref_name: String,
+    pub state: String,
+    pub updated_at: WireOption<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsStatusSummary {
+    pub is_repo: bool,
+    pub ref_name: Option<String>,
+    pub detached_head: Option<String>,
+    pub has_working_tree_changes: bool,
+    pub source_control_provider: Option<SourceControlProviderInfo>,
+    pub pr: Option<VcsSummaryChangeRequest>,
+    pub observed_at: String,
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

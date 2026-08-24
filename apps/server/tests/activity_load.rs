@@ -46,6 +46,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::TempDir;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Barrier, oneshot},
     task::JoinSet,
@@ -1548,6 +1549,9 @@ async fn high_volume_rpc_stream_replaces_lagged_subscribers_and_retains_exact_ca
 }
 
 async fn seed_capped_rosters(projection: &ActivityProjection, scope: &ActivityScopeSeed) {
+    let retained_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("current UTC timestamp");
     let actor_mutations = (0..(ROSTER_RECORDS_PER_BUCKET * 2))
         .map(|index| {
             ProviderActivityMutation::upsert_actor(
@@ -1579,12 +1583,12 @@ async fn seed_capped_rosters(projection: &ActivityProjection, scope: &ActivitySc
                         ActivityLifecycle::Completed
                     },
                     None,
-                    "2026-07-22T12:00:00Z",
-                    "2026-07-22T12:00:01Z",
+                    retained_at.clone(),
+                    retained_at.clone(),
                     if index < ROSTER_RECORDS_PER_BUCKET {
                         None
                     } else {
-                        Some("2026-07-22T12:00:01Z")
+                        Some(retained_at.as_str())
                     },
                 )
                 .expect("work item"),
@@ -1601,7 +1605,7 @@ async fn seed_capped_rosters(projection: &ActivityProjection, scope: &ActivitySc
                 &scope.scope_id,
                 format!("seed:{batch_index}"),
                 mutations.to_vec(),
-                timestamp(batch_index),
+                retained_at.clone(),
             )
             .await
             .expect("seed batch");

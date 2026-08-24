@@ -53,6 +53,16 @@ async fn agent_activity_defaults_chat_on_and_terminal_off() {
 }
 
 #[tokio::test]
+async fn automatic_git_fetch_defaults_to_three_minutes() {
+    let state = tempfile::tempdir().expect("state");
+    let settings = ProviderSettingsStore::new(state.path())
+        .get()
+        .await
+        .expect("settings");
+    assert_eq!(settings.automatic_git_fetch_interval, 180_000);
+}
+
+#[tokio::test]
 async fn legacy_agent_activity_migrates_only_to_chat() {
     let state = tempfile::tempdir().expect("state");
     tokio::fs::write(

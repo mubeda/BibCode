@@ -101,6 +101,8 @@ pub struct ProductionRuntime {
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    status_broadcaster: crate::git::StatusBroadcaster,
+    workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
     update_quiesced: tokio::sync::Mutex<bool>,
 }
@@ -283,6 +285,14 @@ impl ProductionRuntime {
         )
         .with_availability_registry(workspace_availability.clone());
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
+        let status_broadcaster = git_vcs.status_broadcaster();
+        let terminal_status_broadcaster = status_broadcaster.clone();
+        terminal_manager.set_process_exit_callback(Arc::new(move |cwd| {
+            let status_broadcaster = terminal_status_broadcaster.clone();
+            Box::pin(async move {
+                status_broadcaster.notify_local_change(&cwd).await;
+            })
+        }));
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
@@ -298,8 +308,11 @@ impl ProductionRuntime {
         let workspace_for_effects = workspace.clone();
         let preview = PreviewManager::new();
         let preview_automation = PreviewAutomationBroker::new();
-        let workspace_preview =
-            WorkspacePreviewRpcServices::new(workspace, preview, preview_automation.clone());
+        let workspace_preview = WorkspacePreviewRpcServices::new(
+            workspace.clone(),
+            preview,
+            preview_automation.clone(),
+        );
 
         let process_monitor = Arc::new(DiagnosticsMonitor::new(
             resource_sampler.clone(),
@@ -374,6 +387,7 @@ impl ProductionRuntime {
         register_git_vcs_rpc(&mut registry, git_vcs);
         let worktree_catalog_rpc =
             WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
+                .with_status_broadcaster(status_broadcaster.clone())
                 .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
         let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
@@ -398,6 +412,8 @@ impl ProductionRuntime {
             worktree_catalog_operations,
             worktree_runtime,
             worktree_removal_tasks,
+            status_broadcaster,
+            workspace,
             _resource_sampler: resource_sampler,
             update_quiesced: tokio::sync::Mutex::new(false),
         })
@@ -524,6 +540,8 @@ impl ProductionRuntime {
         }
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.managed_endpoint.shutdown().await;
+        self.workspace.shutdown().await;
+        self.status_broadcaster.shutdown().await;
         self.worktree_catalog_operations.shutdown().await;
         self._worktree_catalog.shutdown().await;
         self.worktree_runtime.shutdown().await;
@@ -978,7 +996,9 @@ mod tests {
             ActivityScopeSeed, ProviderActivityMutation,
         },
         assets::{AssetIssueRequest, AssetResource},
+        orchestration::{TurnDeliveryState, TurnDeliveryTransition},
         persistence::run_migrations,
+        terminal::{TerminalEvent, TerminalLaunchCommand, TerminalOpenInput},
     };
     use axum::http::{HeaderMap, Uri};
     use futures_util::{SinkExt, StreamExt};
@@ -1010,6 +1030,433 @@ mod tests {
             factories.opencode.is_some(),
             "production must install the OpenCode terminal observer factory"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads() {
+        let _native_watcher_permit = crate::git::acquire_native_watcher_test_permit().await;
+        const NOW: &str = "2026-08-22T00:00:00Z";
+        let state = TempDir::new().expect("temporary state directory");
+        let repository = TempDir::new().expect("temporary Git repository");
+        let git = if cfg!(windows) { "git.exe" } else { "git" };
+        let initialized = std::process::Command::new(git)
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(repository.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("Git fixture command starts");
+        assert!(
+            initialized.status.success(),
+            "Git fixture initialization failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime start");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create",
+                    "commandId":"provider-no-git-project",
+                    "projectId":"provider-no-git-project",
+                    "title":"Provider no-Git trigger",
+                    "workspaceRoot":repository.path(),
+                    "defaultModelSelection":null,
+                    "createdAt":NOW,
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        let thread_id = runtime
+            .orchestration
+            .repositories()
+            .list_threads_by_project("provider-no-git-project".to_owned())
+            .await
+            .expect("project threads")
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let delivery_thread_id = thread_id.clone();
+        database
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES (?, 'thread', ?, ?, 0, 'accepted', NULL, NULL)",
+                    rusqlite::params!["provider-no-git-delivery", delivery_thread_id, NOW],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('provider-no-git-delivery', ?, 'provider-no-git-message', 'codex', 'codex', NULL, 'provider-no-git-key', '{}', 'sending', 1, NULL, ?, ?)",
+                    rusqlite::params![delivery_thread_id, NOW, NOW],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("delivery fixture");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.message.assistant.delta",
+                    "commandId":"provider-no-git-assistant-seed",
+                    "threadId":thread_id,
+                    "messageId":"provider-no-git-assistant-message",
+                    "delta":"working",
+                    "turnId":null,
+                    "createdAt":NOW,
+                }))
+                .expect("assistant seed command"),
+            )
+            .await
+            .expect("assistant seed");
+
+        let cancellation = CancellationToken::new();
+        let mut status = runtime
+            .status_broadcaster
+            .subscribe(repository.path().to_path_buf(), cancellation.clone())
+            .await
+            .expect("status subscription");
+        assert!(matches!(
+            status.recv().await,
+            Some(crate::git::VcsStatusStreamEvent::Snapshot { .. })
+        ));
+        let baseline = runtime
+            .status_broadcaster
+            .physical_local_read_count_for_test(repository.path())
+            .await;
+        assert_eq!(baseline, 1);
+        let event_baseline = runtime
+            .orchestration
+            .read_events(0)
+            .await
+            .expect("baseline events")
+            .last()
+            .map_or(0, |event| event.sequence);
+
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.message.assistant.complete",
+                    "commandId":"provider-no-git-assistant",
+                    "threadId":thread_id,
+                    "messageId":"provider-no-git-assistant-message",
+                    "turnId":null,
+                    "createdAt":NOW,
+                }))
+                .expect("assistant completion command"),
+            )
+            .await
+            .expect("assistant completion");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.session.set",
+                    "commandId":"provider-no-git-session",
+                    "threadId":thread_id,
+                    "session":{
+                        "threadId":thread_id,
+                        "status":"idle",
+                        "providerName":"codex",
+                        "providerInstanceId":"codex",
+                        "runtimeMode":"full-access",
+                        "activeTurnId":null,
+                        "lastError":null,
+                        "lastErrorClass":null,
+                        "updatedAt":NOW
+                    },
+                    "createdAt":NOW,
+                }))
+                .expect("provider completion command"),
+            )
+            .await
+            .expect("provider completion");
+        assert!(
+            runtime
+                .orchestration
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: "provider-no-git-delivery".to_owned(),
+                    expected_states: vec![TurnDeliveryState::Sending],
+                    expected_attempt: 1,
+                    next_state: TurnDeliveryState::Failed,
+                    detail: Some("provider rejected delivery".to_owned()),
+                    updated_at: NOW.to_owned(),
+                })
+                .await
+                .expect("delivery failure transition")
+        );
+        let events = runtime
+            .orchestration
+            .read_events(event_baseline)
+            .await
+            .expect("provider lifecycle events");
+        for (event_type, command_id) in [
+            ("thread.message-sent", "provider-no-git-assistant"),
+            ("thread.session-set", "provider-no-git-session"),
+            (
+                "thread.turn-delivery-updated",
+                "server:turn-delivery:provider-no-git-delivery",
+            ),
+        ] {
+            assert!(events.iter().any(|event| {
+                event.event.event_type == event_type
+                    && event.event.command_id.as_deref() == Some(command_id)
+            }));
+        }
+
+        assert!(
+            timeout(
+                Duration::from_millis(750),
+                runtime
+                    .status_broadcaster
+                    .wait_for_physical_local_read_after_for_test(repository.path(), baseline),
+            )
+            .await
+            .is_err(),
+            "provider/session/delivery events must not schedule a physical local status read"
+        );
+        assert_eq!(
+            runtime
+                .status_broadcaster
+                .physical_local_read_count_for_test(repository.path())
+                .await,
+            baseline
+        );
+        drop(status);
+        cancellation.cancel();
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn structured_terminal_process_exit_immediately_invalidates_status_under_watcher_fallback()
+     {
+        let _native_watcher_permit = crate::git::acquire_native_watcher_test_permit().await;
+        let state = TempDir::new().expect("temporary state directory");
+        let repository = TempDir::new().expect("temporary Git repository");
+        let git = if cfg!(windows) { "git.exe" } else { "git" };
+        for args in [
+            &["init", "--quiet", "-b", "main"][..],
+            &["config", "user.name", "BiBCode Test"][..],
+            &["config", "user.email", "bibcode@example.invalid"][..],
+        ] {
+            let output = std::process::Command::new(git)
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("Git fixture command starts");
+            assert!(
+                output.status.success(),
+                "Git fixture command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(repository.path().join("tracked.txt"), "base\n")
+            .expect("tracked fixture file");
+        let command_cwd = repository.path().join("nested");
+        std::fs::create_dir(&command_cwd).expect("nested command cwd");
+        for args in [
+            &["add", "--", "tracked.txt"][..],
+            &["commit", "--quiet", "-m", "initial"][..],
+        ] {
+            let output = std::process::Command::new(git)
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("Git fixture command starts");
+            assert!(
+                output.status.success(),
+                "Git fixture command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime start");
+        let cancellation = CancellationToken::new();
+        let mut status = runtime
+            .status_broadcaster
+            .subscribe(repository.path().to_path_buf(), cancellation.clone())
+            .await
+            .expect("status subscription");
+        assert!(matches!(
+            status.recv().await,
+            Some(crate::git::VcsStatusStreamEvent::Snapshot { .. })
+        ));
+        runtime
+            .status_broadcaster
+            .shut_down_watcher_for_test()
+            .await;
+        let read_baseline = runtime
+            .status_broadcaster
+            .physical_local_read_count_for_test(repository.path())
+            .await;
+        let refresh_baseline = runtime
+            .status_broadcaster
+            .local_refresh_generation_for_test(repository.path())
+            .await;
+
+        let terminal = runtime.terminal_services.terminal_manager_for_test();
+        let mut terminal_events = terminal.subscribe_events();
+        let mut input = TerminalOpenInput::new(
+            "terminal-status-thread",
+            "terminal-status-command",
+            command_cwd,
+            80,
+            24,
+        );
+        input.command = Some(if cfg!(windows) {
+            TerminalLaunchCommand {
+                executable: "cmd.exe".to_owned(),
+                args: vec![
+                    "/d".to_owned(),
+                    "/s".to_owned(),
+                    "/c".to_owned(),
+                    "echo terminal-change>>..\\tracked.txt".to_owned(),
+                ],
+                label: Some("Status mutation".to_owned()),
+                activity: None,
+            }
+        } else {
+            TerminalLaunchCommand {
+                executable: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'terminal-change\\n' >> ../tracked.txt".to_owned(),
+                ],
+                label: Some("Status mutation".to_owned()),
+                activity: None,
+            }
+        });
+        terminal
+            .open(input)
+            .await
+            .expect("structured command starts");
+        let exit_code = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(TerminalEvent::Exited {
+                    thread_id,
+                    terminal_id,
+                    exit_code,
+                    ..
+                }) = terminal_events.recv().await
+                    && thread_id == "terminal-status-thread"
+                    && terminal_id == "terminal-status-command"
+                {
+                    return exit_code;
+                }
+            }
+        })
+        .await
+        .expect("structured terminal process exits");
+        assert_eq!(exit_code, Some(0), "structured command succeeds");
+        assert_ne!(
+            std::fs::read_to_string(repository.path().join("tracked.txt"))
+                .expect("tracked file remains readable"),
+            "base\n",
+            "structured command mutates the tracked file before Exited"
+        );
+        timeout(
+            Duration::from_millis(750),
+            runtime
+                .status_broadcaster
+                .wait_for_local_refresh_generation_after_for_test(
+                    repository.path(),
+                    refresh_baseline,
+                ),
+        )
+        .await
+        .expect("terminal exit reaches the admitted worktree invalidation seam");
+
+        timeout(
+            Duration::from_millis(750),
+            runtime
+                .status_broadcaster
+                .wait_for_physical_local_read_after_for_test(repository.path(), read_baseline),
+        )
+        .await
+        .expect("terminal exit immediately schedules a physical local status read");
+        let dirty = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(crate::git::VcsStatusStreamEvent::LocalUpdated { local }) =
+                    status.recv().await
+                    && local.has_working_tree_changes
+                {
+                    return local;
+                }
+            }
+        })
+        .await;
+        let dirty = match dirty {
+            Ok(dirty) => dirty,
+            Err(_) => {
+                let observed_reads = runtime
+                    .status_broadcaster
+                    .physical_local_read_count_for_test(repository.path())
+                    .await;
+                panic!(
+                    "terminal-triggered status refresh publishes the command mutation; physical reads {read_baseline}->{observed_reads}"
+                );
+            }
+        };
+        assert!(
+            dirty
+                .working_tree
+                .files
+                .iter()
+                .any(|file| file.path == "tracked.txt")
+        );
+        assert_eq!(
+            runtime
+                .status_broadcaster
+                .physical_local_read_count_for_test(repository.path())
+                .await,
+            read_baseline + 1,
+            "structured terminal exit requests exactly one immediate local read"
+        );
+        drop(status);
+        cancellation.cancel();
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

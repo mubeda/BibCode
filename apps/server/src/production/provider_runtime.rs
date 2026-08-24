@@ -379,6 +379,8 @@ pub trait ProviderDriverFactory: Send + Sync {
 pub struct SupervisorOptions {
     pub queue_capacity: usize,
     pub session_idle_timeout: Duration,
+    #[cfg(test)]
+    idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 }
 
 impl Default for SupervisorOptions {
@@ -386,6 +388,8 @@ impl Default for SupervisorOptions {
         Self {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            #[cfg(test)]
+            idle_deadline_test_observer: None,
         }
     }
 }
@@ -540,6 +544,26 @@ struct ActivityDispatchCompletionTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleDeadlineEvaluation {
+    Stale,
+    Suspended,
+    Failed,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleDeadlineTestEvent {
+    Armed {
+        generation: u64,
+    },
+    Evaluated {
+        generation: u64,
+        outcome: IdleDeadlineEvaluation,
+    },
+}
+
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
@@ -564,6 +588,8 @@ struct SessionEntry {
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     activity_dispatch_capacity: usize,
     idle_timeout: Duration,
+    #[cfg(test)]
+    idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 }
 
 struct DetachedSession {
@@ -744,6 +770,8 @@ impl ProviderRuntimeSupervisor {
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
         let session_idle_timeout = options.session_idle_timeout;
+        #[cfg(test)]
+        let idle_deadline_test_observer = options.idle_deadline_test_observer.clone();
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
         let (activity_dispatch_sender, activity_dispatch_receiver) = mpsc::channel(queue_capacity);
@@ -770,6 +798,8 @@ impl ProviderRuntimeSupervisor {
                 worker_activity_cancellation,
                 #[cfg(test)]
                 activity_dispatch_completion_hook,
+                #[cfg(test)]
+                idle_deadline_test_observer,
             )
             .await;
         });
@@ -1620,6 +1650,8 @@ async fn reconcile_abandoned_provider_session(
                     runtime_mode: runtime.runtime_mode.clone(),
                     active_turn_id: None,
                     last_error: Some(restart_error.to_owned()),
+                    // BiBCode restarted; the provider did not fail.
+                    last_error_class: Some("transport_error".to_owned()),
                     updated_at: projected_at.clone(),
                 },
                 created_at: projected_at,
@@ -2107,6 +2139,7 @@ async fn run_supervisor(
     operational_log: Option<ProviderOperationalLog>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
@@ -2163,6 +2196,8 @@ async fn run_supervisor(
                     deferred_capacity,
                     session_idle_timeout,
                     activity_cancellation.clone(),
+                    #[cfg(test)]
+                    idle_deadline_test_observer.clone(),
                 )
                 .await;
                 let _ = response.send(result);
@@ -2593,16 +2628,33 @@ async fn run_supervisor(
                     Arc::ptr_eq(&entry.idle_generation, &idle_generation)
                         && entry.idle_generation.load(Ordering::Relaxed) == generation
                 });
-                if is_current
-                    && let Err(error) = suspend_idle_session(
-                        &engine.repositories(),
-                        &activity,
-                        &mut sessions,
-                        &thread_id,
+                let suspension = if is_current {
+                    Some(
+                        suspend_idle_session(
+                            &engine.repositories(),
+                            &activity,
+                            &mut sessions,
+                            &thread_id,
+                        )
+                        .await,
                     )
-                    .await
-                {
+                } else {
+                    None
+                };
+                if let Some(Err(error)) = &suspension {
                     tracing::warn!(%error, %thread_id, "failed to suspend idle provider session");
+                }
+                #[cfg(test)]
+                if let Some(observer) = &idle_deadline_test_observer {
+                    let outcome = match suspension {
+                        None => IdleDeadlineEvaluation::Stale,
+                        Some(Ok(())) => IdleDeadlineEvaluation::Suspended,
+                        Some(Err(_)) => IdleDeadlineEvaluation::Failed,
+                    };
+                    let _ = observer.send(IdleDeadlineTestEvent::Evaluated {
+                        generation,
+                        outcome,
+                    });
                 }
             }
             SupervisorMessage::Shutdown { response } => {
@@ -2868,7 +2920,8 @@ async fn spawn_delivery(
                 tracing::warn!(%error, "accepted provider delivery runtime state was not persisted");
             }
             if let Err(error) =
-                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None).await
+                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None, None)
+                    .await
             {
                 tracing::warn!(%error, "accepted provider delivery session state was not projected");
             }
@@ -3167,6 +3220,7 @@ async fn launch_session(
     activity_dispatch_capacity: usize,
     idle_timeout: Duration,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) -> Result<(), ProviderRuntimeError> {
     let option_application_method = if inherited_activity_lifecycle.is_some() {
         "restart"
@@ -3296,7 +3350,7 @@ async fn launch_session(
         started.runtime_payload.clone(),
     )
     .await?;
-    dispatch_session_state(engine, &request, "ready", None, None).await?;
+    dispatch_session_state(engine, &request, "ready", None, None, None).await?;
 
     if !activity_controller.snapshot().enabled {
         activity_control.write().await.take();
@@ -3323,6 +3377,8 @@ async fn launch_session(
         idle_generation.clone(),
         terminal_sender.clone(),
         idle_timeout,
+        #[cfg(test)]
+        idle_deadline_test_observer.clone(),
     );
     sessions.insert(
         request.thread_id.clone(),
@@ -3350,6 +3406,8 @@ async fn launch_session(
             activity_dispatch_sender,
             activity_dispatch_capacity,
             idle_timeout,
+            #[cfg(test)]
+            idle_deadline_test_observer,
         },
     );
     Ok(())
@@ -3416,7 +3474,7 @@ async fn handle_command(
                 .send(message.text, message.attachments, interaction_mode)
                 .await?;
             persist_entry(&engine.repositories(), entry, "running").await?;
-            dispatch_session_state(engine, &entry.launch, "running", turn_id, None).await
+            dispatch_session_state(engine, &entry.launch, "running", turn_id, None, None).await
         }
         OrchestrationCommand::ThreadTurnInterrupt { turn_id, .. } => {
             entry.driver.interrupt(turn_id).await?;
@@ -3758,6 +3816,10 @@ async fn restart_session(
     mut launch: ProviderLaunchRequest,
     operational_log: Option<&ProviderOperationalLog>,
 ) -> Result<(), ProviderRuntimeError> {
+    #[cfg(test)]
+    let idle_deadline_test_observer = sessions
+        .get(thread_id)
+        .and_then(|entry| entry.idle_deadline_test_observer.clone());
     let mut inherited_activity_lifecycle = None;
     let mut terminal_sender = None;
     let mut idle_timeout = None;
@@ -3823,6 +3885,8 @@ async fn restart_session(
         activity_cancellation.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
+        #[cfg(test)]
+        idle_deadline_test_observer,
     )
     .await
 }
@@ -3961,9 +4025,14 @@ fn spawn_event_pump(
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     idle_timeout: Duration,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) -> JoinHandle<()> {
     let activity_controller = activity.agent_activity_controller();
     tokio::spawn(async move {
+        // Providers announce why they are going away in `session.exited` just
+        // before their stream ends. Remember it so the synthesized stream-end
+        // failure can say what actually happened instead of a fixed string.
+        let mut last_exit_reason: Option<String> = None;
         loop {
             tokio::select! {
                 biased;
@@ -4007,6 +4076,14 @@ fn spawn_event_pump(
                         if !cancellation.is_cancelled() {
                             const STREAM_END_ERROR: &str =
                                 "Provider event stream ended unexpectedly.";
+                            let stream_end_message = last_exit_reason.as_deref().map_or_else(
+                                || STREAM_END_ERROR.to_owned(),
+                                |reason| {
+                                    format!(
+                                        "Provider event stream ended unexpectedly: {reason}"
+                                    )
+                                },
+                            );
                             let active_turn_id = match engine
                                 .repositories()
                                 .get_thread_session(launch.thread_id.clone())
@@ -4032,7 +4109,11 @@ fn spawn_event_pump(
                                 request_id: None,
                                 payload: json!({
                                     "state": "failed",
-                                    "error": { "message": STREAM_END_ERROR },
+                                    "errorMessage": stream_end_message,
+                                    // The provider's stream died under BiBCode;
+                                    // that is our transport, not a fault the
+                                    // provider reported about the work itself.
+                                    "errorClass": "transport_error",
                                 }),
                                 activity: Vec::new(),
                                 activity_controls: Default::default(),
@@ -4067,6 +4148,15 @@ fn spawn_event_pump(
                     let mut event = event;
                     if let Some(log) = &operational_log {
                         let _ = log.record(&event);
+                    }
+                    if event.event_type == "session.exited" {
+                        last_exit_reason = event
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .map(str::to_owned);
                     }
                     let activity_state = activity_controller.snapshot();
                     if activity_capable
@@ -4235,6 +4325,8 @@ fn spawn_event_pump(
                             launch.thread_id.clone(),
                             idle_generation.clone(),
                             idle_timeout,
+                            #[cfg(test)]
+                            idle_deadline_test_observer.clone(),
                         );
                     }
                 }
@@ -4248,9 +4340,14 @@ fn schedule_idle_suspend(
     thread_id: String,
     idle_generation: Arc<AtomicU64>,
     idle_timeout: Duration,
+    #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) {
     let generation = idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
     tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(observer) = &idle_deadline_test_observer {
+            let _ = observer.send(IdleDeadlineTestEvent::Armed { generation });
+        }
         tokio::time::sleep(idle_timeout).await;
         let _ = sender.send(SupervisorMessage::SuspendIdle {
             thread_id,
@@ -4287,6 +4384,7 @@ async fn project_provider_event(
             .unwrap_or("completed");
         let failed = state == "failed";
         let last_error = failed.then(|| provider_completion_error(&event.payload));
+        let last_error_class = failed.then(|| provider_completion_error_class(&event.payload));
         let status = if failed { "error" } else { "ready" };
         persist_runtime(
             &engine.repositories(),
@@ -4296,7 +4394,7 @@ async fn project_provider_event(
             runtime_payload,
         )
         .await?;
-        dispatch_session_state(engine, launch, status, None, last_error).await?;
+        dispatch_session_state(engine, launch, status, None, last_error, last_error_class).await?;
         if let Err(error) = settle_streaming_assistant_messages(
             engine,
             &event.thread_id,
@@ -4605,17 +4703,55 @@ fn assistant_message_id(event: &ProviderEvent) -> String {
 }
 
 fn provider_completion_error(payload: &Value) -> String {
+    // `errorMessage` is the canonical `turn.completed` field in
+    // `packages/contracts/src/providerRuntime.ts`, but the runtimes do not agree
+    // yet, so every shape they actually emit is read here:
+    //   - claude: `errorMessage` (both the result-frame and transport paths)
+    //   - codex: `errorMessage` when the transport dies, but a verbatim
+    //     `error` object copied from `turn.error` for a normal failing turn
+    //   - cursor, opencode: `error: { message }`
+    // Normalising the runtimes onto `errorMessage` is tracked in
+    // `docs/plans/2026-08-18-provider-error-attribution-design.md`; until then
+    // dropping any of these branches silently loses the provider's message.
     payload
-        .get("error")
-        .and_then(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload.get("error").and_then(|error| {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.as_str())
+            })
         })
         .or_else(|| payload.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
         .unwrap_or("Provider turn failed.")
         .to_owned()
+}
+
+/// Which side reported the failure, as a `RuntimeErrorClass`
+/// (`packages/contracts/src/providerRuntime.ts`).
+///
+/// Runtimes that classify their own failure say so in `errorClass`. Everything
+/// else reaching this projection came off a provider's wire, so it is reported
+/// by the provider — BiBCode's own failures take the separate paths that set
+/// the class explicitly. This says who *reported* the error, never who is to
+/// blame: a provider rejecting a malformed BiBCode request is still
+/// provider-reported.
+fn provider_completion_error_class(payload: &Value) -> String {
+    match payload
+        .get("errorClass")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|class| !class.is_empty())
+        .unwrap_or("provider_error")
+    {
+        class @ ("provider_error" | "transport_error" | "permission_error" | "validation_error"
+        | "unknown") => class.to_owned(),
+        _ => "unknown".to_owned(),
+    }
 }
 
 fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
@@ -4625,6 +4761,11 @@ fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
         "user-input.requested" => ("approval", "user-input.requested"),
         "user-input.resolved" => ("approval", "user-input.resolved"),
         event if event.contains("error") || event.contains("failed") => ("error", "provider.error"),
+        // Provider stderr and upstream retries arrive as `runtime.warning`.
+        // Without this arm they fell through to the catch-all and were filed as
+        // tool-toned events, so an upstream 401 or 429 was presented to the user
+        // as an ordinary tool call.
+        "runtime.warning" => ("warning", "provider.warning"),
         event if event.starts_with("turn.") => ("info", "provider.turn"),
         event if event.starts_with("session.") => ("info", "provider.session"),
         _ => ("tool", "provider.event"),
@@ -4637,6 +4778,7 @@ async fn dispatch_session_state(
     status: &str,
     active_turn_id: Option<String>,
     last_error: Option<String>,
+    last_error_class: Option<String>,
 ) -> Result<(), ProviderRuntimeError> {
     let created_at = now();
     engine
@@ -4651,6 +4793,7 @@ async fn dispatch_session_state(
                 runtime_mode: request.runtime_mode.clone(),
                 active_turn_id,
                 last_error,
+                last_error_class,
                 updated_at: created_at.clone(),
             },
             created_at,
@@ -6211,9 +6354,21 @@ impl OpenCodeDriver {
             "--hostname=127.0.0.1".to_owned(),
             format!("--port={port}"),
         ];
-        let child = Arc::new(Mutex::new(
-            spawn_child(&request, &args, false, attribution).await?,
-        ));
+        // Pipe opencode's output instead of discarding it: this was the only
+        // driver of five spawning with `pipe_output = false`, which sent both
+        // streams to the null device and made any panic, auth diagnostic or
+        // crash message unrecoverable. Both streams must then be drained or a
+        // full pipe buffer would block the child.
+        let mut spawned = spawn_child(&request, &args, true, attribution).await?;
+        let server_stdout = spawned.stdout().take();
+        let server_stderr = spawned.stderr().take();
+        let child = Arc::new(Mutex::new(spawned));
+        if let Some(stdout) = server_stdout {
+            drain_opencode_output(stdout, "stdout");
+        }
+        if let Some(stderr) = server_stderr {
+            drain_opencode_output(stderr, "stderr");
+        }
         wait_for_endpoint(&endpoint, &child).await?;
         let runtime =
             OpenCodeSessionRuntime::new_with_options_reconciliation_revision_and_agent_activity(
@@ -7163,8 +7318,8 @@ mod claude_stop_task_control_tests {
 mod claude_context_query_tests {
     use super::{
         ClaudeControlResponseRoute, ClaudeControlResponseRouter, ProviderEvent,
-        claude_completion_query_turn_id, claude_provider_event, query_claude_context_usage,
-        query_claude_mcp_status,
+        claude_completion_query_turn_id, claude_provider_event, provider_completion_error,
+        provider_completion_error_class, query_claude_context_usage, query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -7498,7 +7653,163 @@ mod claude_context_query_tests {
             completion.payload["errorMessage"],
             "Reached the maximum number of turns."
         );
+        assert_eq!(
+            provider_completion_error(&completion.payload),
+            "Reached the maximum number of turns.",
+            "the session's last error must carry the provider's message, not the generic fallback"
+        );
         assert_eq!(claude_completion_query_turn_id(&completion), None);
+    }
+
+    #[test]
+    fn newer_provider_error_classes_are_persisted_as_unknown() {
+        assert_eq!(
+            provider_completion_error_class(&json!({ "errorClass": "rate_limit_error" })),
+            "unknown"
+        );
+        assert_eq!(
+            provider_completion_error_class(&json!({ "errorClass": "transport_error" })),
+            "transport_error"
+        );
+    }
+
+    #[test]
+    fn claude_failure_names_the_upstream_api_error_it_was_retrying() {
+        // The originating incident: the API dropped the stream and the result
+        // frame carried no `errors`, so the only evidence of an upstream fault
+        // was the retry frames Claude had already sent.
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "trigger an upstream outage".to_owned(),
+        });
+
+        let retry = runtime.handle_raw_value(
+            &json!({
+                "type": "system",
+                "subtype": "api_retry",
+                "attempt": 3,
+                "max_retries": 10,
+                "retry_delay_ms": 573,
+                "error_status": 529,
+                "error": "overloaded",
+                "session_id": "session-1",
+                "uuid": "retry-1"
+            }),
+            500,
+        );
+        let warning = claude_provider_event(
+            retry.events.into_iter().next().expect("retry event"),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(warning.event_type, "runtime.warning");
+        assert_eq!(warning.payload["class"], "provider_error");
+        assert_eq!(warning.payload["status"], 529);
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result",
+                "subtype": "error_during_api_call",
+                "is_error": true,
+                "stop_reason": null,
+                "session_id": "session-1",
+                "uuid": "result-error-3"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(completion.payload["state"], "failed");
+        assert_eq!(completion.payload["errorClass"], "provider_error");
+        let message = completion.payload["errorMessage"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("529") && message.contains("overloaded"),
+            "the failure must name the upstream API error, got {message:?}"
+        );
+        assert_eq!(provider_completion_error(&completion.payload), message);
+    }
+
+    #[test]
+    fn claude_upstream_api_error_does_not_leak_into_a_later_turn() {
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "first".to_owned(),
+        });
+        runtime.handle_raw_value(
+            &json!({
+                "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+                "error_status": 429, "error": "rate_limited",
+                "session_id": "session-1", "uuid": "retry-1"
+            }),
+            500,
+        );
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-2".to_owned(),
+            input: "second".to_owned(),
+        });
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result", "subtype": "error_max_turns", "is_error": true,
+                "stop_reason": null, "session_id": "session-1", "uuid": "result-error-4"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+        let message = completion.payload["errorMessage"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            !message.contains("429"),
+            "a retry from an earlier turn must not be blamed for this one, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn claude_error_result_without_errors_still_reports_its_subtype() {
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "lose the upstream connection".to_owned(),
+        });
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result",
+                "subtype": "error_api",
+                "is_error": true,
+                "stop_reason": null,
+                "session_id": "session-1",
+                "uuid": "result-error-2"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(completion.payload["state"], "failed");
+        assert_eq!(
+            completion.payload["errorMessage"],
+            "Claude turn failed (error_api)."
+        );
+        assert_eq!(
+            provider_completion_error(&completion.payload),
+            "Claude turn failed (error_api)."
+        );
     }
 }
 
@@ -9554,6 +9865,27 @@ fn reject_unsupported_options(
                 .unwrap_or("unknown"),
         ))
     })
+}
+
+/// Drain one of the opencode server's output streams, logging each line.
+///
+/// The streams must be consumed once piped, otherwise a full pipe buffer blocks
+/// the child. Logging is the point as well as the mechanism: opencode has no
+/// `session.stderr` event, so before this its diagnostics were simply lost.
+fn drain_opencode_output(
+    stream: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+    stream_name: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            tracing::debug!(provider = "opencode", stream = stream_name, %line, "opencode output");
+        }
+    });
 }
 
 async fn wait_for_endpoint(
@@ -11733,6 +12065,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -11986,6 +12319,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -12177,6 +12511,7 @@ done
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
             Duration::from_secs(3_600),
+            None,
         );
         let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -14785,9 +15120,12 @@ done
 
     #[tokio::test]
     async fn completed_idle_session_is_suspended_without_losing_resume_state() {
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
         let engine = supervisor_engine().await;
         let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
         let (events_tx, events_rx) = mpsc::channel(2);
+        let (idle_deadline_tx, mut idle_deadline_rx) = mpsc::unbounded_channel();
         let supervisor = super::ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(SupervisorFactory {
@@ -14799,7 +15137,8 @@ done
             )),
             super::SupervisorOptions {
                 queue_capacity: 2,
-                session_idle_timeout: std::time::Duration::from_millis(100),
+                session_idle_timeout: IDLE_TIMEOUT,
+                idle_deadline_test_observer: Some(idle_deadline_tx),
             },
         );
         let temp = TempDir::new().unwrap();
@@ -14833,21 +15172,26 @@ done
                 .unwrap();
         }
 
-        for _ in 0..100 {
-            let projected = load_snapshot(&engine.repositories())
-                .await
-                .unwrap()
-                .messages
-                .iter()
-                .any(|message| message.message_id == "assistant-idle" && !message.is_streaming);
-            if projected {
-                break;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let projected = load_snapshot(&engine.repositories())
+                    .await
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| message.message_id == "assistant-idle" && !message.is_streaming);
+                if projected {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("first completed assistant message is projected");
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Armed { generation: 1 })
+        );
         let follow_up: OrchestrationCommand = serde_json::from_value(json!({
             "type":"thread.turn.start", "commandId":"follow-up", "threadId":"t1",
             "message":{"messageId":"user-follow-up","role":"user","text":"next","attachments":[]},
@@ -14857,11 +15201,25 @@ done
         }))
         .unwrap();
         supervisor.handle_orchestration(follow_up).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::pause();
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Evaluated {
+                generation: 1,
+                outcome: super::IdleDeadlineEvaluation::Stale,
+            })
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the stale pre-follow-up idle deadline must not suspend the session"
+        );
         assert_eq!(state.lock().unwrap().shutdowns, 0);
+        tokio::time::resume();
 
         for (event_type, payload) in [
             (
@@ -14888,35 +15246,47 @@ done
                 .await
                 .unwrap();
         }
-        for _ in 0..100 {
-            let projected = load_snapshot(&engine.repositories())
-                .await
-                .unwrap()
-                .messages
-                .iter()
-                .any(|message| {
-                    message.message_id == "assistant-follow-up" && !message.is_streaming
-                });
-            if projected {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        timeout(std::time::Duration::from_secs(1), async {
+        timeout(Duration::from_secs(5), async {
             loop {
-                if state.lock().unwrap().shutdowns == 1 {
+                let projected = load_snapshot(&engine.repositories())
+                    .await
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.message_id == "assistant-follow-up" && !message.is_streaming
+                    });
+                if projected {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("idle provider is suspended");
+        .expect("follow-up completed assistant message is projected");
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Armed { generation: 3 })
+        );
+        tokio::time::pause();
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert_eq!(
+            idle_deadline_rx.recv().await,
+            Some(super::IdleDeadlineTestEvent::Evaluated {
+                generation: 3,
+                outcome: super::IdleDeadlineEvaluation::Suspended,
+            })
+        );
+        assert!(
+            supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the current idle deadline suspends the session"
+        );
+        assert_eq!(state.lock().unwrap().shutdowns, 1);
+        tokio::time::resume();
 
         let runtime = engine
             .repositories()
@@ -15783,7 +16153,7 @@ done
             result
         });
 
-        let diagnostic_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let diagnostic_deadline = ProviderFixtureDeadline::integration().instant();
         let observation = tokio::time::timeout_at(diagnostic_deadline, async {
             initialize_request_queued
                 .wait_after(initialize_request_checkpoint)
@@ -16642,6 +17012,24 @@ done
             "assistant:thread-1"
         );
 
+        // `errorMessage` is what every provider runtime actually writes into a
+        // failed `turn.completed` payload, so it must win over the raw shapes.
+        assert_eq!(
+            super::provider_completion_error(
+                &json!({"state":"failed","errorMessage":"Reached the maximum number of turns."})
+            ),
+            "Reached the maximum number of turns."
+        );
+        assert_eq!(
+            super::provider_completion_error(
+                &json!({"errorMessage":"canonical","error":{"message":"nested"},"message":"top-level"})
+            ),
+            "canonical"
+        );
+        assert_eq!(
+            super::provider_completion_error(&json!({"errorMessage":"   "})),
+            "Provider turn failed."
+        );
         assert_eq!(
             super::provider_completion_error(&json!({"error":{"message":"nested"}})),
             "nested"
@@ -16665,6 +17053,8 @@ done
             ("user-input.requested", ("approval", "user-input.requested")),
             ("user-input.resolved", ("approval", "user-input.resolved")),
             ("provider.failed", ("error", "provider.error")),
+            // Provider warnings must not be filed as tool events.
+            ("runtime.warning", ("warning", "provider.warning")),
             ("provider.error", ("error", "provider.error")),
             ("turn.started", ("info", "provider.turn")),
             ("session.ready", ("info", "provider.session")),

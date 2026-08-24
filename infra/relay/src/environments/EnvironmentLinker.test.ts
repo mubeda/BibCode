@@ -82,6 +82,8 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
         capabilities: {
           repositoryIdentity: true,
           worktreeCatalog: false,
+          worktreeCatalogRefreshReason: false,
+          vcsStatusSummary: false,
           activityProtocolVersion: null,
         },
       },

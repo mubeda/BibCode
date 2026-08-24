@@ -214,6 +214,15 @@ function dispatchKey(target: Element, key: string): void {
 }
 
 describe("CenterPanelSplitLayout", () => {
+  it("shows orange separator lines at rest in both split directions", async () => {
+    await renderLayout(input());
+
+    for (const path of ["root", "second"]) {
+      const line = separatorAt(path).querySelector<HTMLElement>(":scope > [aria-hidden='true']");
+      expect(line?.classList.contains("bg-ring")).toBe(true);
+    }
+  });
+
   it("uses the same framing for focused and unfocused panes", async () => {
     await renderLayout(input());
 

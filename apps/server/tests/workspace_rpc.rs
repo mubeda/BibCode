@@ -19,12 +19,24 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use workspace::{
-    AssetContextResolver, EntryKind, SearchLimits, WorkspaceError, WorkspaceRpc,
-    WorkspaceRpcDependencies, WorkspaceSearchIndex, WorkspaceService, WorkspaceWatcher,
+    AssetContextResolver, EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceError,
+    WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceSearchIndex, WorkspaceService,
+    WorkspaceWatcher,
 };
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn entry_is_ignored(result: &serde_json::Value, path: &str) -> bool {
+    result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"] == path)
+        .unwrap_or_else(|| panic!("missing entry {path}"))["ignored"]
+        .as_bool()
+        .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -285,38 +297,505 @@ async fn workspace_rpc_bounds_list_entries_and_preserves_unbounded_calls() {
     assert_eq!(unbounded["truncated"], false);
 }
 
+fn git_in(cwd: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "BiBCode Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "BiBCode Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .output()
+        .expect("git must be installed for integration tests");
+    assert!(output.status.success(), "git {args:?} failed");
+}
+
+fn init_isolated_git_fixture(root: &Path) {
+    git_in(root, &["init", "-b", "main"]);
+    let excludes = root.join(".git/bibcode-test-global-excludes");
+    std::fs::write(&excludes, "").expect("empty fixture excludes file");
+    git_in(
+        root,
+        &[
+            "config",
+            "--local",
+            "core.excludesFile",
+            &path_string(&excludes),
+        ],
+    );
+}
+
+/// A directory holding no files is still a directory the user created and can see on disk.
+///
+/// `git ls-files` only reports files, so a git-backed scan that infers directories from file paths
+/// alone cannot see one — while the non-git walk does. The tree must not disagree with the disk just
+/// because the workspace happens to be a repository.
 #[tokio::test]
-async fn watcher_coalesces_bursts_and_stops_when_subscription_is_cancelled() {
+async fn empty_directories_are_listed_in_a_git_workspace() {
     let root = TempDir::new().expect("root");
-    write(root.path(), "baseline.txt", b"baseline").await;
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), "tracked.txt", b"tracked").await;
+    git_in(root.path(), &["add", "-A"]);
+    git_in(root.path(), &["commit", "-m", "init"]);
+
+    // Exactly what "New Folder…" produces, and what an mkdir in a file manager produces.
+    tokio::fs::create_dir_all(root.path().join("docs/screenshots/empty-child"))
+        .await
+        .expect("create empty directory");
+
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let result = rpc
+        .handle(
+            "projects.listEntries",
+            json!({ "cwd": path_string(root.path()) }),
+        )
+        .await
+        .expect("list entries");
+    let paths = result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        paths.contains(&"docs/screenshots/empty-child"),
+        "an empty directory on disk must appear in the tree; got {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn workspace_index_contract_matches_git_and_bounded_fallback_exactly() {
+    let root = TempDir::new().expect("root");
+    init_isolated_git_fixture(root.path());
+    write(
+        root.path(),
+        ".gitignore",
+        b"ignored-file.txt\nignored-root/\n",
+    )
+    .await;
+    write(root.path(), "tracked.txt", b"tracked").await;
+    write(root.path(), "deleted.txt", b"deleted").await;
+    git_in(
+        root.path(),
+        &["add", ".gitignore", "tracked.txt", "deleted.txt"],
+    );
+    tokio::fs::remove_file(root.path().join("deleted.txt"))
+        .await
+        .expect("delete tracked fixture file");
+    write(root.path(), "untracked.txt", b"untracked").await;
+    write(root.path(), "ignored-file.txt", b"ignored").await;
+    write(root.path(), "ignored-root/eager-child.txt", b"ignored").await;
+    tokio::fs::create_dir(root.path().join("empty-directory"))
+        .await
+        .expect("empty directory");
+
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let git_result = rpc
+        .handle(
+            "projects.listEntries",
+            json!({ "cwd": path_string(root.path()) }),
+        )
+        .await
+        .expect("list entries");
+    assert_eq!(
+        serde_json::from_value::<SearchResult>(git_result).expect("typed Git result"),
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: ".gitignore".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "empty-directory".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "ignored-file.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "ignored-root".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "ignored-root/eager-child.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: true,
+                },
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: false,
+        }
+    );
+
+    std::fs::remove_dir_all(root.path().join(".git")).expect("remove test-owned Git metadata");
+    let fallback = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+    fallback
+        .refresh(CancellationToken::new())
+        .await
+        .expect("non-Git fallback");
+    assert_eq!(
+        fallback.list(None).await,
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: ".gitignore".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "empty-directory".to_owned(),
+                    kind: EntryKind::Directory,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: false,
+        }
+    );
+
+    let bounded = WorkspaceSearchIndex::new(
+        root.path().to_path_buf(),
+        SearchLimits {
+            max_entries: 2,
+            max_memory_bytes: usize::MAX,
+            max_path_bytes: usize::MAX,
+        },
+    );
+    bounded
+        .refresh(CancellationToken::new())
+        .await
+        .expect("bounded non-Git fallback");
+    assert_eq!(
+        bounded.list(None).await,
+        SearchResult {
+            entries: vec![
+                WorkspaceEntry {
+                    path: "tracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+                WorkspaceEntry {
+                    path: "untracked.txt".to_owned(),
+                    kind: EntryKind::File,
+                    ignored: false,
+                },
+            ],
+            truncated: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn subscribed_roots_pick_up_outside_changes_without_an_explicit_refresh() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(50));
+    let cwd = path_string(root.path());
+
+    let lists = |payload| {
+        let rpc = rpc.clone();
+        async move {
+            let result = rpc
+                .handle("projects.listEntries", payload)
+                .await
+                .expect("list entries");
+            result["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["path"] == "nested/pasted.txt")
+        }
+    };
+
+    assert!(!lists(json!({ "cwd": cwd })).await, "cache is warmed");
+    let mut changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+
+    // The paste an Explorer window would make: no workspace RPC is involved.
+    write(root.path(), "nested/pasted.txt", b"pasted").await;
+
+    tokio::time::timeout(Duration::from_secs(10), changes.recv())
+        .await
+        .expect("change signal timeout")
+        .expect("change signal");
+
+    // No refresh flag: the sweep must already have dropped the stale snapshot.
+    assert!(
+        lists(json!({ "cwd": cwd })).await,
+        "a subscribed root reflects outside changes without an explicit refresh"
+    );
+}
+
+/// An unavailable workspace must not acquire a sweep.
+///
+/// Every other request against a workspace path goes through admission; a subscription that skipped
+/// it could start sweeping a root the availability guard has already fenced for removal.
+#[tokio::test]
+async fn subscribing_is_refused_while_the_workspace_is_unavailable() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let registry = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-1".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 3,
+                path: root.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("physical identity resolves")
+    );
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_availability_registry(registry)
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+
+    let Err(error) = rpc.subscribe_entry_changes(root.path()).await else {
+        panic!("an unavailable workspace must refuse a subscription");
+    };
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert_eq!(
+        rpc.active_entry_watches().await,
+        0,
+        "a refused subscription must not leave a sweep behind"
+    );
+}
+
+/// Concurrent listers of a cold root must share one scan.
+///
+/// A scan runs outside the cache lock, so without single-flight every caller that misses the cache
+/// starts its own full scan of the same tree -- seconds of duplicated work each, on exactly the
+/// paths a large workspace makes expensive.
+#[tokio::test]
+async fn concurrent_listers_share_a_single_workspace_scan() {
+    let root = TempDir::new().expect("root");
+    for index in 0..40 {
+        write(root.path(), &format!("src/module-{index}.ts"), b"export {}").await;
+    }
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+    assert_eq!(rpc.index_scans(), 0);
+
+    let listers = (0..6)
+        .map(|_| {
+            let rpc = rpc.clone();
+            let cwd = cwd.clone();
+            tokio::spawn(async move {
+                rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    for lister in listers {
+        lister
+            .await
+            .expect("lister task")
+            .expect("concurrent list succeeds");
+    }
+
+    assert_eq!(
+        rpc.index_scans(),
+        1,
+        "six concurrent listers of one cold root must produce one scan"
+    );
+}
+
+/// Subscribing must resync, not trust a snapshot older than the sweep.
+///
+/// A change made while no sweep existed is already on disk when the baseline is stamped, so it can
+/// never appear as a difference. If the cached snapshot predates that change, the tree stays stale
+/// until something else changes or the user refreshes by hand.
+#[tokio::test]
+async fn subscribing_resyncs_a_snapshot_that_predates_the_sweep() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+    let cwd = path_string(root.path());
+
+    // Warm the cache, then change the workspace while nothing is watching it.
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm the cache");
+    write(root.path(), "nested/added-while-unwatched.txt", b"added").await;
+
+    let _changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+
+    // No refresh flag: subscribing is itself a resync point.
+    let result = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("list entries");
+    let present = result["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .any(|entry| entry["path"] == "nested/added-while-unwatched.txt");
+    assert!(
+        present,
+        "starting a sweep must resync the snapshot it is about to track"
+    );
+}
+
+/// A sweep must not outlive its subscribers on a quiet workspace.
+///
+/// Losing the last receiver is invisible to a loop parked on the watcher, so without an independent
+/// idle check the sweep survives panel closure until some unrelated path changes — which on a quiet
+/// workspace never happens, leaving one two-second sweep per root running for the process lifetime.
+#[tokio::test]
+async fn idle_sweeps_are_retired_without_waiting_for_a_filesystem_change() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
+
+    let changes = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("subscription");
+    assert_eq!(rpc.active_entry_watches().await, 1);
+
+    // The panel closes. Nothing on disk changes afterwards.
+    drop(changes);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rpc.active_entry_watches().await > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        rpc.active_entry_watches().await,
+        0,
+        "the sweep must retire once nothing is listening"
+    );
+
+    // A later subscriber gets a working sweep rather than the retired one.
+    let mut resubscribed = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("second subscription");
+    assert_eq!(rpc.active_entry_watches().await, 1);
+    write(root.path(), "nested/after-resubscribe.txt", b"after").await;
+    tokio::time::timeout(Duration::from_secs(10), resubscribed.recv())
+        .await
+        .expect("resubscribed signal timeout")
+        .expect("resubscribed signal");
+}
+
+#[tokio::test]
+async fn entry_change_subscribers_share_one_sweep_per_root() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/tracked.txt", b"tracked").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default())
+        .with_watch_timing(Duration::from_millis(25), Duration::from_millis(50));
+    let noncanonical = root.path().join(".");
+
+    let mut first = rpc
+        .subscribe_entry_changes(root.path())
+        .await
+        .expect("first subscription");
+    let mut second = rpc
+        .subscribe_entry_changes(&noncanonical)
+        .await
+        .expect("second subscription");
+
+    write(root.path(), "nested/pasted.txt", b"pasted").await;
+
+    // Both receivers see the same signal, which is what proves they share a sweep rather than each
+    // starting one; the noncanonical path must resolve onto the same root.
+    tokio::time::timeout(Duration::from_secs(10), first.recv())
+        .await
+        .expect("first signal timeout")
+        .expect("first signal");
+    tokio::time::timeout(Duration::from_secs(10), second.recv())
+        .await
+        .expect("second signal timeout")
+        .expect("second signal");
+}
+
+/// Supplies a fixed directory set, standing in for the workspace index.
+struct FixedScope(Vec<String>);
+
+impl workspace::WatchScope for FixedScope {
+    fn directories(&self, _root: PathBuf) -> workspace::WatchScopeFuture {
+        let directories = self.0.clone();
+        Box::pin(async move { directories })
+    }
+}
+
+#[tokio::test]
+async fn watcher_reports_directories_whose_contents_changed_and_coalesces_bursts() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/baseline.txt", b"baseline").await;
     let coalesce_window = Duration::from_millis(500);
     let watcher = WorkspaceWatcher::new(Duration::from_millis(20), coalesce_window, 2);
-    let mut subscription = watcher.watch(root.path().to_path_buf());
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
 
-    let baseline = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
-        .await
-        .expect("baseline timeout")
-        .expect("baseline event");
+    // Everything that already existed is the baseline, so a quiet workspace must stay silent
+    // rather than reporting a change that would rebuild a freshly built index.
+    tokio::time::sleep(coalesce_window + Duration::from_millis(200)).await;
     assert!(
-        baseline
-            .changed_paths
-            .iter()
-            .any(|path| path.ends_with("baseline.txt"))
+        subscription.try_recv().is_err(),
+        "an unchanged workspace must not report a change"
     );
 
     for sequence in 0..8 {
-        write(root.path(), "burst.txt", sequence.to_string().as_bytes()).await;
+        write(
+            root.path(),
+            &format!("nested/burst-{sequence}.txt"),
+            sequence.to_string().as_bytes(),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
         .await
         .expect("watch timeout")
         .expect("watch event");
+    // The sweep stats directories, so a new file surfaces as its parent directory moving.
     assert!(
         event
             .changed_paths
             .iter()
-            .any(|path| path.ends_with("burst.txt"))
+            .any(|path| path.ends_with("nested")),
+        "expected the containing directory, got {:?}",
+        event.changed_paths
     );
     tokio::time::sleep(coalesce_window + Duration::from_millis(150)).await;
     assert!(
@@ -329,6 +808,100 @@ async fn watcher_coalesces_bursts_and_stops_when_subscription_is_cancelled() {
         .await
         .expect("watcher cancellation");
     assert_eq!(watcher.active_watchers(), 0);
+}
+
+/// Sustained change must not starve notifications.
+///
+/// Production runs a coalesce window shorter than the poll interval, so a deadline reset on every
+/// observed change is always pushed past the current tick. A long build or an agent writing files
+/// touches a directory on every poll, which would suppress every signal for as long as it runs —
+/// exactly when the tree most needs to update.
+#[tokio::test]
+async fn watcher_flushes_during_sustained_change_instead_of_starving() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/seed.txt", b"seed").await;
+    // Same relationship as production: the coalesce window is shorter than the poll interval.
+    let poll_interval = Duration::from_millis(60);
+    let coalesce_window = Duration::from_millis(20);
+    let watcher = WorkspaceWatcher::new(poll_interval, coalesce_window, 4);
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
+
+    // Churn until aborted, so the changes outlast the window we assert over: the point is that a
+    // signal arrives *while* changes are still arriving, not once they stop.
+    let churn_root = root.path().to_path_buf();
+    let churn = tokio::spawn(async move {
+        let mut sequence = 0u32;
+        loop {
+            let path = churn_root.join(format!("nested/churn-{sequence}.txt"));
+            let _ = tokio::fs::write(path, b"churn").await;
+            sequence += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv()).await;
+    churn.abort();
+    assert!(
+        event.is_ok_and(|received| received.is_some()),
+        "a signal must arrive while changes are still arriving"
+    );
+    subscription.cancel();
+}
+
+#[tokio::test]
+async fn watcher_ignores_in_place_edits_that_cannot_change_the_index() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "nested/stable.txt", b"before").await;
+    let coalesce_window = Duration::from_millis(300);
+    let watcher = WorkspaceWatcher::new(Duration::from_millis(20), coalesce_window, 2);
+    let mut subscription = watcher
+        .watch(
+            root.path().to_path_buf(),
+            Arc::new(FixedScope(vec!["nested".to_owned()])),
+        )
+        .await;
+    tokio::time::sleep(coalesce_window + Duration::from_millis(200)).await;
+    let _ = subscription.try_recv();
+
+    // The index stores paths and kinds, never contents, so rewriting a file in place cannot
+    // invalidate it and must not cost a rebuild.
+    write(root.path(), "nested/stable.txt", b"after-the-edit").await;
+    tokio::time::sleep(coalesce_window + Duration::from_millis(400)).await;
+
+    assert!(
+        subscription.try_recv().is_err(),
+        "an in-place edit must not report a path-set change"
+    );
+    subscription.cancel();
+}
+
+#[tokio::test]
+async fn directory_stamps_cover_the_root_and_skip_missing_directories() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "present/file.txt", b"x").await;
+    let stamps =
+        workspace::directory_stamps(root.path(), &["present".to_owned(), "absent".to_owned()])
+            .await;
+
+    assert!(
+        stamps.get(root.path()).is_some_and(Option::is_some),
+        "the root is always swept so top-level creations are seen"
+    );
+    assert!(
+        stamps
+            .get(&root.path().join("present"))
+            .is_some_and(Option::is_some)
+    );
+    assert_eq!(
+        stamps.get(&root.path().join("absent")),
+        Some(&None),
+        "a missing directory is a distinct state, not an omission"
+    );
 }
 
 #[tokio::test]
@@ -696,6 +1269,504 @@ async fn explicit_index_refresh_replaces_a_cached_snapshot() {
             .any(|entry| entry["path"] == "after.txt")
     );
 }
+
+#[tokio::test]
+async fn list_entries_refreshes_only_when_the_request_opts_in() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "tracked.txt", b"").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let noncanonical_root = root.path().join(".");
+    let cwd = path_string(&noncanonical_root);
+    let lists = |payload| {
+        let rpc = rpc.clone();
+        async move {
+            let result = rpc
+                .handle("projects.listEntries", payload)
+                .await
+                .expect("list entries");
+            result["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["path"] == "pasted.txt")
+        }
+    };
+
+    assert!(!lists(json!({ "cwd": cwd })).await, "cache is warmed");
+
+    // Simulate an out-of-band paste: the file appears without any workspace RPC.
+    write(root.path(), "pasted.txt", b"").await;
+
+    assert!(
+        !lists(json!({ "cwd": cwd })).await,
+        "cached snapshots stay stale without an explicit refresh"
+    );
+    assert!(
+        !lists(json!({ "cwd": cwd, "refresh": false })).await,
+        "an explicit refresh: false keeps the cached snapshot"
+    );
+    assert!(
+        lists(json!({ "cwd": cwd, "refresh": true })).await,
+        "refresh: true rebuilds the index from the filesystem"
+    );
+    assert!(
+        lists(json!({ "cwd": cwd })).await,
+        "the refreshed snapshot repopulates the cache for later requests"
+    );
+}
+
+#[tokio::test]
+async fn write_file_existing_path_preserves_cached_index_and_wire_shape() {
+    let root = TempDir::new().expect("root");
+    write(root.path(), "existing.txt", b"before").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert_eq!(rpc.index_scans(), 1);
+
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "existing.txt", "contents": "after" }),
+        )
+        .await
+        .expect("write existing file");
+    assert_eq!(response, json!({ "relativePath": "existing.txt" }));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("existing.txt")).expect("written contents"),
+        "after"
+    );
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("reuse index");
+    assert_eq!(rpc.index_scans(), 1);
+}
+
+#[tokio::test]
+async fn write_file_new_path_invalidates_cached_index_once_and_preserves_wire_shape() {
+    let root = TempDir::new().expect("root");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "created.txt", "contents": "created" }),
+        )
+        .await
+        .expect("create file");
+    assert_eq!(response, json!({ "relativePath": "created.txt" }));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("created.txt")).expect("created contents"),
+        "created"
+    );
+
+    for _ in 0..2 {
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .expect("list created file");
+    }
+    assert_eq!(rpc.index_scans(), 2);
+}
+
+#[tokio::test]
+async fn write_file_new_parent_paths_invalidates_cached_index_once_and_preserves_wire_shape() {
+    let root = TempDir::new().expect("root");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    let response = rpc
+        .handle(
+            "projects.writeFile",
+            json!({
+                "cwd": cwd,
+                "relativePath": "new/parents/created.txt",
+                "contents": "created"
+            }),
+        )
+        .await
+        .expect("create nested file");
+    assert_eq!(
+        response,
+        json!({ "relativePath": "new/parents/created.txt" })
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("new/parents/created.txt"))
+            .expect("created nested contents"),
+        "created"
+    );
+
+    for _ in 0..2 {
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .expect("list nested file");
+    }
+    assert_eq!(rpc.index_scans(), 2);
+}
+
+#[tokio::test]
+async fn write_file_nested_gitignore_rebuilds_cached_classification() {
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(root.path(), "nested/.gitignore", b"").await;
+    write(
+        root.path(),
+        "nested/bibcode-task2-classification-9f3a7c1b",
+        b"target",
+    )
+    .await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    let initial = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert!(!entry_is_ignored(
+        &initial,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "nested/.gitignore",
+            "contents": "bibcode-task2-classification-9f3a7c1b\n"
+        }),
+    )
+    .await
+    .expect("ignore target");
+    let ignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild ignored classification");
+    assert!(entry_is_ignored(
+        &ignored,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": "nested/.gitignore", "contents": "" }),
+    )
+    .await
+    .expect("unignore target");
+    let unignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild unignored classification");
+    assert!(!entry_is_ignored(
+        &unignored,
+        "nested/bibcode-task2-classification-9f3a7c1b"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+}
+
+#[tokio::test]
+async fn write_file_git_internal_controls_rebuild_cached_classification() {
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(
+        root.path(),
+        "bibcode-task2-info-exclude-41ac90d7",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        "bibcode-task2-config-exclude-6e2d38f4",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        ".task2-global-ignore",
+        b"bibcode-task2-config-exclude-6e2d38f4\n",
+    )
+    .await;
+    let original_exclude =
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).expect("Git exclude");
+    let original_config =
+        std::fs::read_to_string(root.path().join(".git/config")).expect("Git config");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    let initial = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert!(!entry_is_ignored(
+        &initial,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(!entry_is_ignored(
+        &initial,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/info/exclude",
+            "contents": format!("{original_exclude}\nbibcode-task2-info-exclude-41ac90d7\n")
+        }),
+    )
+    .await
+    .expect("write Git exclude");
+    let excluded = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild exclude classification");
+    assert!(entry_is_ignored(
+        &excluded,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    let excludes_path = root
+        .path()
+        .join(".task2-global-ignore")
+        .to_string_lossy()
+        .replace('\\', "/");
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/config",
+            "contents": format!(
+                "{original_config}\n[core]\n\texcludesFile = {excludes_path}\n"
+            )
+        }),
+    )
+    .await
+    .expect("write Git config");
+    let configured = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild configured classification");
+    assert!(entry_is_ignored(
+        &configured,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(entry_is_ignored(
+        &configured,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": ".git/config", "contents": original_config }),
+    )
+    .await
+    .expect("restore Git config");
+    let config_restored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild restored config classification");
+    assert!(entry_is_ignored(
+        &config_restored,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert!(!entry_is_ignored(
+        &config_restored,
+        "bibcode-task2-config-exclude-6e2d38f4"
+    ));
+    assert_eq!(rpc.index_scans(), 4);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": ".git/info/exclude",
+            "contents": original_exclude
+        }),
+    )
+    .await
+    .expect("restore Git exclude");
+    let exclude_restored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild restored exclude classification");
+    assert!(!entry_is_ignored(
+        &exclude_restored,
+        "bibcode-task2-info-exclude-41ac90d7"
+    ));
+    assert_eq!(rpc.index_scans(), 5);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_symlink_aliases_to_classification_controls_invalidate() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("root");
+    git_in(root.path(), &["init", "-b", "main"]);
+    write(root.path(), ".bibcode-task2-empty-excludes", b"").await;
+    let empty_excludes = root
+        .path()
+        .join(".bibcode-task2-empty-excludes")
+        .to_string_lossy()
+        .into_owned();
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    write(root.path(), "nested/.gitignore", b"").await;
+    write(
+        root.path(),
+        "nested/bibcode-task2-alias-ignore-582e713c",
+        b"target",
+    )
+    .await;
+    write(
+        root.path(),
+        "bibcode-task2-alias-exclude-a9306d4e",
+        b"target",
+    )
+    .await;
+    symlink(
+        root.path().join("nested/.gitignore"),
+        root.path().join("ignore-control-alias"),
+    )
+    .expect("ignore control symlink");
+    symlink(
+        root.path().join(".git"),
+        root.path().join("git-control-alias"),
+    )
+    .expect("Git control symlink");
+    let original_exclude =
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).expect("Git exclude");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "ignore-control-alias",
+            "contents": "bibcode-task2-alias-ignore-582e713c\n"
+        }),
+    )
+    .await
+    .expect("write ignore alias");
+    let ignored = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild ignore alias");
+    assert!(entry_is_ignored(
+        &ignored,
+        "nested/bibcode-task2-alias-ignore-582e713c"
+    ));
+    assert_eq!(rpc.index_scans(), 2);
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "git-control-alias/info/exclude",
+            "contents": format!(
+                "{original_exclude}\nbibcode-task2-alias-exclude-a9306d4e\n"
+            )
+        }),
+    )
+    .await
+    .expect("write Git control alias");
+    let excluded = rpc
+        .handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("rebuild Git control alias");
+    assert!(entry_is_ignored(
+        &excluded,
+        "bibcode-task2-alias-exclude-a9306d4e"
+    ));
+    assert_eq!(rpc.index_scans(), 3);
+}
+
+#[tokio::test]
+async fn write_file_mixed_case_classification_controls_invalidate_on_all_hosts() {
+    let root = TempDir::new().expect("root");
+    for path in [
+        "nested/.GITIGNORE",
+        ".GIT/config",
+        ".GiT/INFO/EXCLUDE",
+        "ordinary.txt",
+    ] {
+        write(root.path(), path, b"before").await;
+    }
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let cwd = path_string(root.path());
+
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("warm index");
+    assert_eq!(rpc.index_scans(), 1);
+
+    for (expected_scans, path) in [
+        (2, "nested/.GITIGNORE"),
+        (3, ".GIT/config"),
+        (4, ".GiT/INFO/EXCLUDE"),
+    ] {
+        rpc.handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": path, "contents": "after" }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("write {path}: {error}"));
+        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .unwrap_or_else(|error| panic!("list after {path}: {error}"));
+        assert_eq!(rpc.index_scans(), expected_scans, "path {path}");
+    }
+
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": "ordinary.txt", "contents": "after" }),
+    )
+    .await
+    .expect("write ordinary file");
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("reuse index after ordinary write");
+    assert_eq!(rpc.index_scans(), 4);
+}
+
 #[tokio::test]
 async fn workspace_rpc_invalidates_cached_indexes_after_mutations() {
     let root = TempDir::new().expect("root");
@@ -1224,16 +2295,20 @@ async fn public_workspace_service_maps_filesystem_failures() {
     for result in [
         service
             .write_file(root.path(), "blocker/file.txt", "contents")
-            .await,
+            .await
+            .map(|_| ()),
         service
             .create_entry(root.path(), "blocker/directory", EntryKind::Directory)
-            .await,
+            .await
+            .map(|_| ()),
         service
             .create_entry(root.path(), "blocker/file.txt", EntryKind::File)
-            .await,
+            .await
+            .map(|_| ()),
         service
             .rename_entry(root.path(), "blocker", "blocker/renamed")
-            .await,
+            .await
+            .map(|_| ()),
     ] {
         assert!(matches!(result, Err(WorkspaceError::Operation { .. })));
     }

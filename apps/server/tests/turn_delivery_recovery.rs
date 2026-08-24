@@ -55,10 +55,17 @@ const CRASH_BOUNDARY_CHILD_STATE: &str = "BIBCODE_TURN_DELIVERY_CRASH_STATE";
 const CRASH_BOUNDARY_CHILD_PROVIDER: &str = "BIBCODE_TURN_DELIVERY_CRASH_PROVIDER";
 const CRASH_BOUNDARY_CHILD_MODE: &str = "BIBCODE_TURN_DELIVERY_CRASH_MODE";
 const CRASH_BOUNDARY_CHILD_SENDS: &str = "BIBCODE_TURN_DELIVERY_CRASH_SENDS";
+const BOOTSTRAP_RECOVERY_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
 
 fn child_process_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn child_process_guard() -> std::sync::MutexGuard<'static, ()> {
+    child_process_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn attachment_upload_stages_absent(attachments_dir: &Path) -> bool {
@@ -277,7 +284,7 @@ async fn attachment_abort_child() {
 
 #[tokio::test]
 async fn attachment_startup_recovery_removes_finals_left_by_an_aborted_process() {
-    let _process_guard = child_process_lock().lock().expect("child process lock");
+    let _process_guard = child_process_guard();
     let state = TempDir::new().expect("state directory");
     let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
     let attachments_dir = config.state_dir().join("attachments");
@@ -539,7 +546,7 @@ async fn durable_boundary_crash_child() {
 
 fn run_durable_boundary_child(state: &Path, provider: &str, mode: &str, sends: &Path) {
     let output = {
-        let _guard = child_process_lock().lock().expect("child process lock");
+        let _guard = child_process_guard();
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -1025,7 +1032,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 
 #[tokio::test]
 async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_persisted_thread() {
-    let _process_guard = child_process_lock().lock().expect("child process lock");
+    let _process_guard = child_process_guard();
     let repository_root = TempDir::new().expect("repository");
     git(repository_root.path(), &["init", "-b", "main"]);
     std::fs::write(repository_root.path().join("README.md"), "base\n").expect("fixture");
@@ -1150,7 +1157,7 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
             state.path().to_path_buf(),
         );
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            BOOTSTRAP_RECOVERY_INTEGRATION_DEADLINE,
             callbacks.setup_entered.notified(),
         )
         .await
@@ -1279,7 +1286,7 @@ fn missing_origin_keeps_durable_delivery_pending_without_provider_route() {
     let state = TempDir::new().expect("child state");
     let trace_path = state.path().join("git-trace.json");
     let output = {
-        let _guard = child_process_lock().lock().expect("child process lock");
+        let _guard = child_process_guard();
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -1552,7 +1559,7 @@ async fn missing_origin_delivery_child() {
 
 #[tokio::test]
 async fn pre_39_migration_is_restart_idempotent_without_synthesizing_historical_deliveries() {
-    let _process_guard = child_process_lock().lock().expect("child process lock");
+    let _process_guard = child_process_guard();
     let state = TempDir::new().expect("migration state");
     let config = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)

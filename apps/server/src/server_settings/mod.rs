@@ -160,7 +160,7 @@ impl Default for ProviderSettingsState {
 }
 
 const fn default_git_fetch_interval() -> u64 {
-    30_000
+    180_000
 }
 
 #[derive(Clone, Debug, Default)]

@@ -100,6 +100,8 @@ struct WorkerThreadExitTestHook {
 struct WorkerCleanupGraceTestHook {
     reached: Arc<tokio::sync::Semaphore>,
     release: CancellationToken,
+    abort_started: Option<Arc<tokio::sync::Semaphore>>,
+    cleanup_finished: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[cfg(test)]
@@ -107,6 +109,18 @@ impl WorkerCleanupGraceTestHook {
     async fn block(&self) {
         self.reached.add_permits(1);
         self.release.cancelled().await;
+    }
+
+    fn observe_abort_started(&self) {
+        if let Some(abort_started) = &self.abort_started {
+            abort_started.add_permits(1);
+        }
+    }
+
+    fn observe_cleanup_finished(&self) {
+        if let Some(cleanup_finished) = &self.cleanup_finished {
+            cleanup_finished.add_permits(1);
+        }
     }
 }
 
@@ -164,11 +178,15 @@ impl TerminalObserverWorker {
         *self.completion.borrow()
     }
 
-    async fn wait_until(&mut self, deadline: Instant) -> bool {
+    async fn wait_until(
+        &mut self,
+        deadline: Instant,
+        #[cfg(test)] deadline_armed: Option<&WorkerCleanupGraceTestHook>,
+    ) -> bool {
         if self.is_complete() {
             return true;
         }
-        tokio::time::timeout_at(deadline, async {
+        let timeout = tokio::time::timeout_at(deadline, async {
             loop {
                 if self.is_complete() {
                     break;
@@ -178,9 +196,26 @@ impl TerminalObserverWorker {
                     () = tokio::time::sleep(Duration::from_millis(1)) => {}
                 }
             }
-        })
-        .await
-        .is_ok()
+        });
+        #[cfg(test)]
+        let result = {
+            let mut timeout = std::pin::pin!(timeout);
+            let mut armed = false;
+            std::future::poll_fn(|context| {
+                let result = timeout.as_mut().poll(context);
+                if !armed && result.is_pending() {
+                    if let Some(deadline_armed) = deadline_armed {
+                        deadline_armed.observe_abort_started();
+                    }
+                    armed = true;
+                }
+                result
+            })
+            .await
+        };
+        #[cfg(not(test))]
+        let result = timeout.await;
+        result.is_ok()
     }
 }
 
@@ -527,14 +562,21 @@ async fn reap_observer_workers(
     #[cfg(test)] cleanup_grace_hook: Option<Arc<WorkerCleanupGraceTestHook>>,
 ) {
     #[cfg(test)]
-    if let Some(cleanup_grace_hook) = cleanup_grace_hook {
+    if let Some(cleanup_grace_hook) = &cleanup_grace_hook {
         cleanup_grace_hook.block().await;
     }
     let graceful_deadline = Instant::now() + graceful_timeout;
     let mut pending = Vec::new();
     let mut workers = workers.into_iter();
     while let Some(mut worker) = workers.next() {
-        if !worker.wait_until(graceful_deadline).await {
+        if !worker
+            .wait_until(
+                graceful_deadline,
+                #[cfg(test)]
+                None,
+            )
+            .await
+        {
             pending.push(worker);
             pending.extend(workers);
             break;
@@ -548,12 +590,23 @@ async fn reap_observer_workers(
     }
     let abort_deadline = Instant::now() + abort_timeout;
     for mut worker in pending {
-        if !worker.wait_until(abort_deadline).await {
+        if !worker
+            .wait_until(
+                abort_deadline,
+                #[cfg(test)]
+                cleanup_grace_hook.as_deref(),
+            )
+            .await
+        {
             tracing::warn!(
                 timeout_ms = abort_timeout.as_millis(),
                 "provider terminal observer worker did not stop after abort"
             );
         }
+    }
+    #[cfg(test)]
+    if let Some(cleanup_grace_hook) = &cleanup_grace_hook {
+        cleanup_grace_hook.observe_cleanup_finished();
     }
 }
 
@@ -1660,6 +1713,8 @@ mod tests {
         WorkerThreadExitTestHook,
     };
 
+    const WORKER_LIFECYCLE_INTEGRATION_DEADLINE: Duration = Duration::from_secs(5);
+
     #[derive(Debug)]
     struct DropCount(Arc<AtomicUsize>);
 
@@ -2052,6 +2107,8 @@ mod tests {
         let cleanup_grace_hook = Arc::new(WorkerCleanupGraceTestHook {
             reached: cleanup_grace_reached.clone(),
             release: tokio_util::sync::CancellationToken::new(),
+            abort_started: None,
+            cleanup_finished: None,
         });
         *generation
             .workers
@@ -2218,7 +2275,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn hardening_worker_slot_is_retained_until_the_os_thread_exits() {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_OBSERVER_WORKERS));
         let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
@@ -2241,6 +2298,21 @@ mod tests {
             .thread_exit_hook
             .lock()
             .expect("thread exit hook lock") = Some(hook.clone());
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let abort_cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_finished = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = tokio_util::sync::CancellationToken::new();
+        *generation
+            .workers
+            .inner
+            .cleanup_grace_hook
+            .lock()
+            .expect("cleanup hook lock") = Some(Arc::new(WorkerCleanupGraceTestHook {
+            reached: cleanup_started.clone(),
+            release: cleanup_release.clone(),
+            abort_started: Some(abort_cleanup_started.clone()),
+            cleanup_finished: Some(cleanup_finished.clone()),
+        }));
         let workers = generation.worker_context();
         for _ in 0..MAX_GLOBAL_OBSERVER_WORKERS {
             workers.spawn(async {}).expect("worker admission");
@@ -2274,6 +2346,7 @@ mod tests {
             slots.clone(),
         );
         let challenger_admission = challenger.worker_context().spawn(async {});
+        tokio::time::pause();
         let mut shutdown = tokio::spawn({
             let generation = generation.clone();
             async move {
@@ -2282,18 +2355,51 @@ mod tests {
                     .await;
             }
         });
-        let shutdown_returned_within_bound =
-            tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
-                .await
-                .is_ok();
+        tokio::time::timeout(
+            WORKER_LIFECYCLE_INTEGRATION_DEADLINE,
+            cleanup_started.acquire(),
+        )
+        .await
+        .expect("worker cleanup started within the outer deadlock bound")
+        .expect("worker cleanup start signal remains open")
+        .forget();
+        cleanup_release.cancel();
+        tokio::time::timeout(
+            WORKER_LIFECYCLE_INTEGRATION_DEADLINE,
+            abort_cleanup_started.acquire(),
+        )
+        .await
+        .expect("worker abort cleanup started within the outer deadlock bound")
+        .expect("worker abort cleanup start signal remains open")
+        .forget();
+        let abort_started_at = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(19)).await;
+        assert!(matches!(
+            cleanup_finished.try_acquire(),
+            Err(tokio::sync::TryAcquireError::NoPermits)
+        ));
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            WORKER_LIFECYCLE_INTEGRATION_DEADLINE,
+            cleanup_finished.acquire(),
+        )
+        .await
+        .expect("worker abort cleanup finishes within the outer deadlock bound")
+        .expect("worker abort cleanup finish signal remains open")
+        .forget();
+        let cleanup_elapsed = tokio::time::Instant::now().duration_since(abort_started_at);
+        assert!(
+            (Duration::from_millis(20)..=Duration::from_millis(21)).contains(&cleanup_elapsed),
+            "the outer deadlock wait must not mask the 20 ms abort bound beyond Tokio's one-millisecond timer-wheel tolerance: {cleanup_elapsed:?}"
+        );
+        tokio::time::resume();
+        tokio::time::timeout(WORKER_LIFECYCLE_INTEGRATION_DEADLINE, &mut shutdown)
+            .await
+            .expect("public shutdown completes within the outer deadlock bound")
+            .expect("shutdown task");
 
         hook.release_join();
-        if !shutdown.is_finished() {
-            tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
-                .await
-                .expect("shutdown completed after thread exit")
-                .expect("shutdown task");
-        }
         challenger
             .shutdown_workers(Duration::from_millis(100), Duration::from_millis(20))
             .await;
@@ -2332,10 +2438,6 @@ mod tests {
             challenger_admission,
             Err(TerminalObserverWorkerSpawnError::CapacityExceeded),
             "a global worker slot became reusable while the old OS thread was still alive"
-        );
-        assert!(
-            shutdown_returned_within_bound,
-            "the reaper treated future completion as thread completion and blocked in join"
         );
     }
 
