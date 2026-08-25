@@ -1,4 +1,14 @@
 import {
+  CacheManifestEntry,
+  EncryptedCacheEnvelope,
+  selectCacheEvictions,
+  shouldReplaceCacheEntry,
+  type CacheAssociatedDataScope,
+  type CacheEntityKind,
+  type CacheQuarantineReason,
+  type EncryptedCacheEnvelope as EncryptedCacheEnvelopeType,
+} from "@bibcode/client-runtime/cache";
+import {
   AcceptedStorageIdentityStore,
   type ConnectionCatalogHealth,
   ConnectionCatalogHealthStore,
@@ -48,6 +58,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import {
@@ -55,6 +66,16 @@ import {
   planCatalogV1ToV3Migration,
   type CatalogMigrationMetadata,
 } from "./catalogMigration.ts";
+import {
+  cacheEnvelopeByteLength,
+  decodeCacheKeyMaterial,
+  decryptCachePayload,
+  encodeCacheKeyMaterial,
+  encryptCachePayload,
+  generateCacheKey,
+  generateCacheKeyMaterial,
+  importCacheKeyMaterial,
+} from "./cacheCrypto.ts";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
 const DATABASE_VERSION = 3;
@@ -85,6 +106,9 @@ const MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS = 8;
 const CORRUPT_CATALOG_MESSAGE =
   "The connection catalog is corrupt and must be reset before it can be changed.";
 const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
+const DEFAULT_CACHE_MAX_BYTES = 50 * 1024 * 1024;
+const DEFAULT_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const CACHE_SHELL_ENTITY_ID = "shell";
 
 const StoredShellSnapshot = Schema.Struct({
   schemaVersion: Schema.Literal(SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION),
@@ -115,6 +139,8 @@ const decodeEnvironmentBindings = Schema.decodeUnknownEffect(Schema.Array(Enviro
 const decodeEnvironmentBinding = Schema.decodeUnknownEffect(EnvironmentBinding);
 const decodeEnvironmentUiStateDocument = Schema.decodeUnknownEffect(EnvironmentUiStateDocument);
 const decodeEnvironmentCacheManifest = Schema.decodeUnknownEffect(EnvironmentCacheManifest);
+const decodeEnvironmentCacheManifestSync = Schema.decodeUnknownSync(EnvironmentCacheManifest);
+const decodeEncryptedCacheEnvelope = Schema.decodeUnknownEffect(EncryptedCacheEnvelope);
 const decodeEnvironmentMigrationReceipt = Schema.decodeUnknownEffect(EnvironmentMigrationReceipt);
 
 function catalogError(operation: string, cause: unknown) {
@@ -565,6 +591,27 @@ function readAllDatabaseValues(database: IDBDatabase, storeName: string) {
   }).pipe(Effect.withSpan("web.connectionStorage.readAllDatabaseValues"));
 }
 
+function readAllDatabaseKeys(database: IDBDatabase, storeName: string) {
+  return Effect.callback<ReadonlyArray<IDBValidKey>, ConnectionTransientError>((resume) => {
+    const store = database.transaction(storeName, "readonly").objectStore(storeName);
+    if (typeof store.getAllKeys !== "function") {
+      resume(Effect.fail(catalogError("read cache keys", "Bulk key reads are unavailable.")));
+      return;
+    }
+    const keys = store.getAllKeys();
+    keys.addEventListener("error", () =>
+      resume(
+        Effect.fail(
+          catalogError("read cache keys", keys.error ?? "Unknown IndexedDB key read error"),
+        ),
+      ),
+    );
+    keys.addEventListener("success", () => {
+      resume(Effect.succeed(keys.result));
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.readAllDatabaseKeys"));
+}
+
 function readNormalizedEnvironmentRows(database: IDBDatabase) {
   return Effect.callback<
     {
@@ -918,6 +965,367 @@ function threadCacheKey(environmentId: EnvironmentId, threadId: ThreadId) {
   return `${environmentId}:${threadId}`;
 }
 
+type StoredCacheManifest = EnvironmentCacheManifest & { readonly browserKey?: CryptoKey };
+
+function cacheRecordKey(
+  entityKind: CacheEntityKind,
+  environmentId: EnvironmentId,
+  entityId: string,
+): IDBValidKey {
+  return entityKind === "shell" ? environmentId : [environmentId, entityId];
+}
+
+function cacheStoreName(entityKind: CacheEntityKind): string {
+  return entityKind === "shell"
+    ? ENCRYPTED_SHELL_CACHE_STORE_NAME
+    : ENCRYPTED_THREAD_CACHE_STORE_NAME;
+}
+
+function sessionCacheRecordKey(
+  environmentId: EnvironmentId,
+  entityKind: CacheEntityKind,
+  entityId: string,
+): string {
+  return JSON.stringify([environmentId, entityKind, entityId]);
+}
+
+function encryptedCacheRecord(envelope: EncryptedCacheEnvelopeType): unknown {
+  return envelope.entityKind === "thread" ? { ...envelope, threadId: envelope.entityId } : envelope;
+}
+
+function commitEncryptedCacheWrite(input: {
+  readonly database: IDBDatabase;
+  readonly baseManifest: EnvironmentCacheManifest;
+  readonly browserKey?: CryptoKey;
+  readonly envelope: EncryptedCacheEnvelopeType;
+  readonly protectedEntity: {
+    readonly entityKind: CacheEntityKind;
+    readonly entityId: string;
+  } | null;
+  readonly accessedAt: string;
+}) {
+  return Effect.callback<
+    { readonly applied: boolean; readonly manifest: EnvironmentCacheManifest },
+    ConnectionTransientError
+  >((resume) => {
+    const transaction = input.database.transaction(
+      [
+        ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+        ENCRYPTED_SHELL_CACHE_STORE_NAME,
+        ENCRYPTED_THREAD_CACHE_STORE_NAME,
+      ],
+      "readwrite",
+    );
+    let settled = false;
+    let result: { readonly applied: boolean; readonly manifest: EnvironmentCacheManifest } = {
+      applied: false,
+      manifest: input.baseManifest,
+    };
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("write encrypted cache", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown encrypted-cache transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Encrypted-cache transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.succeed(result));
+    });
+
+    const manifestStore = transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME);
+    const request = manifestStore.get(input.envelope.environmentId);
+    request.addEventListener("success", () => {
+      try {
+        const raw = request.result as StoredCacheManifest | undefined;
+        const current =
+          raw === undefined ? input.baseManifest : decodeEnvironmentCacheManifestSync(raw);
+        if (current.storageInstanceId !== input.envelope.storageInstanceId) {
+          throw new Error("Cache manifest storage identity mismatch.");
+        }
+        const existing = current.entries.find(
+          (entry) =>
+            entry.entityKind === input.envelope.entityKind &&
+            entry.entityId === input.envelope.entityId,
+        );
+        if (!shouldReplaceCacheEntry(existing, input.envelope)) {
+          result = { applied: false, manifest: current };
+          return;
+        }
+
+        const nextEntry: CacheManifestEntry = {
+          entityKind: input.envelope.entityKind,
+          entityId: input.envelope.entityId,
+          byteLength: cacheEnvelopeByteLength(input.envelope),
+          serverRevision: input.envelope.serverRevision,
+          synchronizedAt: input.envelope.synchronizedAt,
+          lastAccessedAt: input.accessedAt,
+        };
+        const candidateEntries = [
+          ...current.entries.filter(
+            (entry) =>
+              entry.entityKind !== nextEntry.entityKind || entry.entityId !== nextEntry.entityId,
+          ),
+          nextEntry,
+        ];
+        const evictions = selectCacheEvictions(candidateEntries, {
+          maxBytes: current.maxBytes,
+          maxAgeMs: current.maxAgeMs,
+          nowEpochMs: Date.parse(input.accessedAt),
+          protectedEntity: input.protectedEntity,
+        });
+        const evictionKeys = new Set(
+          evictions.map((entry) => `${entry.entityKind}\u0000${entry.entityId}`),
+        );
+        const retainedEntries = candidateEntries.filter(
+          (entry) => !evictionKeys.has(`${entry.entityKind}\u0000${entry.entityId}`),
+        );
+        const nextManifest: EnvironmentCacheManifest = {
+          ...current,
+          keyRef: input.baseManifest.keyRef,
+          persistence: input.baseManifest.persistence,
+          lastSynchronizedAt: input.envelope.synchronizedAt,
+          totalBytes: retainedEntries.reduce((total, entry) => total + entry.byteLength, 0),
+          entries: retainedEntries,
+        };
+        transaction
+          .objectStore(cacheStoreName(input.envelope.entityKind))
+          .put(encryptedCacheRecord(input.envelope));
+        for (const eviction of evictions) {
+          transaction
+            .objectStore(cacheStoreName(eviction.entityKind))
+            .delete(
+              cacheRecordKey(eviction.entityKind, input.envelope.environmentId, eviction.entityId),
+            );
+        }
+        const browserKey = raw?.browserKey ?? input.browserKey;
+        manifestStore.put({
+          ...nextManifest,
+          ...(browserKey === undefined ? {} : { browserKey }),
+        });
+        result = { applied: true, manifest: nextManifest };
+      } catch (cause) {
+        fail(cause);
+        transaction.abort();
+      }
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.commitEncryptedCacheWrite"));
+}
+
+function removeEncryptedCacheRecord(input: {
+  readonly database: IDBDatabase;
+  readonly environmentId: EnvironmentId;
+  readonly entityKind: CacheEntityKind;
+  readonly entityId: string;
+  readonly reason: CacheQuarantineReason | null;
+  readonly quarantinedAt: string;
+}) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const storeName = cacheStoreName(input.entityKind);
+    const transaction = input.database.transaction(
+      [ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, storeName],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("quarantine encrypted cache", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown cache-quarantine transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Cache-quarantine transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+
+    transaction
+      .objectStore(storeName)
+      .delete(cacheRecordKey(input.entityKind, input.environmentId, input.entityId));
+    const manifestStore = transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME);
+    const request = manifestStore.get(input.environmentId);
+    request.addEventListener("success", () => {
+      try {
+        const raw = request.result as StoredCacheManifest | undefined;
+        if (raw === undefined) return;
+        const current = decodeEnvironmentCacheManifestSync(raw);
+        const entries = current.entries.filter(
+          (entry) => entry.entityKind !== input.entityKind || entry.entityId !== input.entityId,
+        );
+        const next: EnvironmentCacheManifest = {
+          ...current,
+          entries,
+          totalBytes: entries.reduce((total, entry) => total + entry.byteLength, 0),
+          quarantine:
+            input.reason === null
+              ? current.quarantine
+              : [
+                  ...current.quarantine,
+                  {
+                    entityKind: input.entityKind,
+                    entityId: input.entityId,
+                    reason: input.reason,
+                    quarantinedAt: input.quarantinedAt,
+                  },
+                ].slice(-64),
+        };
+        manifestStore.put({
+          ...next,
+          ...(raw.browserKey === undefined ? {} : { browserKey: raw.browserKey }),
+        });
+      } catch (cause) {
+        fail(cause);
+        transaction.abort();
+      }
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.quarantineEncryptedCacheRecord"));
+}
+
+function touchEncryptedCacheEntry(input: {
+  readonly database: IDBDatabase;
+  readonly environmentId: EnvironmentId;
+  readonly entityKind: CacheEntityKind;
+  readonly entityId: string;
+  readonly accessedAt: string;
+}) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = input.database.transaction(
+      ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("touch encrypted cache", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown cache-touch transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Cache-touch transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+    const store = transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME);
+    const request = store.get(input.environmentId);
+    request.addEventListener("success", () => {
+      try {
+        const raw = request.result as StoredCacheManifest | undefined;
+        if (raw === undefined) return;
+        const current = decodeEnvironmentCacheManifestSync(raw);
+        store.put({
+          ...current,
+          entries: current.entries.map((entry) =>
+            entry.entityKind === input.entityKind && entry.entityId === input.entityId
+              ? { ...entry, lastAccessedAt: input.accessedAt }
+              : entry,
+          ),
+          ...(raw.browserKey === undefined ? {} : { browserKey: raw.browserKey }),
+        });
+      } catch (cause) {
+        fail(cause);
+        transaction.abort();
+      }
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.touchEncryptedCacheEntry"));
+}
+
+function replaceCacheManifest(
+  database: IDBDatabase,
+  manifest: EnvironmentCacheManifest,
+  browserKey?: CryptoKey,
+) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, "readwrite");
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("replace cache manifest", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown cache-manifest transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Cache-manifest transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+    const store = transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME);
+    const request = store.get(manifest.environmentId);
+    request.addEventListener("success", () => {
+      try {
+        const current = request.result as StoredCacheManifest | undefined;
+        const retainedBrowserKey = current?.browserKey ?? browserKey;
+        store.put({
+          ...manifest,
+          ...(retainedBrowserKey === undefined ? {} : { browserKey: retainedBrowserKey }),
+        });
+      } catch (cause) {
+        fail(cause);
+        transaction.abort();
+      }
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.replaceCacheManifest"));
+}
+
+function clearEncryptedCacheDatabase(database: IDBDatabase, environmentId: EnvironmentId) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [
+        ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+        ENCRYPTED_SHELL_CACHE_STORE_NAME,
+        ENCRYPTED_THREAD_CACHE_STORE_NAME,
+      ],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("clear encrypted cache", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown encrypted-cache clear error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Encrypted-cache clear transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+    transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME).delete(environmentId);
+    transaction.objectStore(ENCRYPTED_SHELL_CACHE_STORE_NAME).delete(environmentId);
+    const threadStore = transaction.objectStore(ENCRYPTED_THREAD_CACHE_STORE_NAME);
+    const keys = threadStore.index("environmentId").getAllKeys(IDBKeyRange.only(environmentId));
+    keys.addEventListener("error", () =>
+      fail(keys.error ?? "Unknown encrypted thread-cache cursor error"),
+    );
+    keys.addEventListener("success", () => {
+      for (const key of keys.result) threadStore.delete(key);
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.clearEncryptedCacheDatabase"));
+}
+
 const decodeCatalog = Effect.fn("web.connectionStorage.decodeCatalog")(function* (raw: string) {
   return yield* decodeConnectionCatalogDocument(raw).pipe(
     Effect.mapError((cause) => catalogError("decode", cause)),
@@ -1214,9 +1622,8 @@ export const connectionStorageLayer = Layer.effectContext(
     );
     const backend = makeCatalogBackend(database);
     yield* migrateLegacyRendererCatalog(backend);
-    const environmentSecretStore = makeEnvironmentSecretStore(
-      typeof window === "undefined" ? undefined : window.desktopBridge,
-    );
+    const desktopBridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+    const environmentSecretStore = makeEnvironmentSecretStore(desktopBridge);
     yield* activateCatalogV1ToV3Migration(database, backend, environmentSecretStore).pipe(
       Effect.catch(() =>
         Effect.logWarning(
@@ -1345,27 +1752,293 @@ export const connectionStorageLayer = Layer.effectContext(
         ),
     });
 
+    const sessionCacheManifests = new Map<EnvironmentId, EnvironmentCacheManifest>();
+    const sessionCacheKeys = new Map<EnvironmentId, CryptoKey>();
+    const sessionCacheEnvelopes = new Map<string, EncryptedCacheEnvelopeType>();
+    const resolvedCacheKeys = new Map<
+      EnvironmentId,
+      {
+        readonly key: CryptoKey;
+        readonly manifest: EnvironmentCacheManifest;
+        readonly browserKey: CryptoKey | undefined;
+      }
+    >();
+    const cacheMutationSemaphore = yield* Semaphore.make(1);
+
     const environmentCacheManifestStore = EnvironmentCacheManifestStore.of({
       load: (environmentId) =>
-        readDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId).pipe(
-          Effect.flatMap((raw) =>
-            raw === undefined
-              ? Effect.succeed(Option.none())
-              : decodeEnvironmentCacheManifest(raw).pipe(Effect.map(Option.some)),
-          ),
-          Effect.mapError((cause) => normalizedPersistenceError("load-cache-manifest", cause)),
-        ),
+        Effect.suspend(() => {
+          const sessionManifest = sessionCacheManifests.get(environmentId);
+          if (sessionManifest !== undefined) return Effect.succeed(Option.some(sessionManifest));
+          return readDatabaseValue(
+            database,
+            ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+            environmentId,
+          ).pipe(
+            Effect.flatMap((raw) =>
+              raw === undefined
+                ? Effect.succeed(Option.none())
+                : decodeEnvironmentCacheManifest(raw).pipe(Effect.map(Option.some)),
+            ),
+            Effect.mapError((cause) => normalizedPersistenceError("load-cache-manifest", cause)),
+          );
+        }),
       save: (manifest) =>
         decodeEnvironmentCacheManifest(manifest).pipe(
-          Effect.flatMap((decoded) =>
-            writeInlineDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, decoded),
-          ),
+          Effect.flatMap((decoded) => {
+            if (decoded.persistence === "session-only") {
+              return Effect.sync(() => {
+                sessionCacheManifests.set(decoded.environmentId, decoded);
+              });
+            }
+            return replaceCacheManifest(database, decoded);
+          }),
           Effect.mapError((cause) => normalizedPersistenceError("save-cache-manifest", cause)),
         ),
       remove: (environmentId) =>
-        removeDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId).pipe(
+        Effect.sync(() => {
+          sessionCacheManifests.delete(environmentId);
+          sessionCacheKeys.delete(environmentId);
+          resolvedCacheKeys.delete(environmentId);
+        }).pipe(
+          Effect.andThen(
+            removeDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId),
+          ),
           Effect.mapError((cause) => normalizedPersistenceError("delete-cache-manifest", cause)),
         ),
+    });
+
+    const loadDurableCacheManifest = (environmentId: EnvironmentId) =>
+      readDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId).pipe(
+        Effect.flatMap((raw) =>
+          raw === undefined
+            ? Effect.succeed(Option.none<EnvironmentCacheManifest>())
+            : decodeEnvironmentCacheManifest(raw).pipe(Effect.map(Option.some)),
+        ),
+      );
+
+    const cacheEnvironmentStorageId = Effect.fn("web.connectionStorage.cacheEnvironmentStorageId")(
+      function* (environmentId: EnvironmentId) {
+        const raw = yield* readDatabaseValue(database, ENVIRONMENTS_STORE_NAME, environmentId);
+        if (
+          typeof raw !== "object" ||
+          raw === null ||
+          !("acceptedStorageInstanceId" in raw) ||
+          typeof raw.acceptedStorageInstanceId !== "string"
+        ) {
+          return yield* catalogError(
+            "resolve cache identity",
+            "The environment is not in the normalized catalog.",
+          );
+        }
+        return raw.acceptedStorageInstanceId;
+      },
+    );
+
+    const defaultCacheManifest = (
+      environmentId: EnvironmentId,
+      storageInstanceId: string,
+    ): EnvironmentCacheManifest => ({
+      schemaVersion: 1,
+      environmentId,
+      storageInstanceId,
+      keyRef: null,
+      persistence: "session-only",
+      lastSynchronizedAt: null,
+      maxBytes: DEFAULT_CACHE_MAX_BYTES,
+      maxAgeMs: DEFAULT_CACHE_MAX_AGE_MS,
+      totalBytes: 0,
+      entries: [],
+      quarantine: [],
+    });
+
+    const cryptoKeyFromUnknown = (value: unknown): CryptoKey | null => {
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        !("type" in value) ||
+        value.type !== "secret" ||
+        !("algorithm" in value) ||
+        typeof value.algorithm !== "object" ||
+        value.algorithm === null ||
+        !("name" in value.algorithm) ||
+        value.algorithm.name !== "AES-GCM"
+      ) {
+        return null;
+      }
+      return value as CryptoKey;
+    };
+
+    const makeSessionCacheKey = Effect.fn("web.connectionStorage.makeSessionCacheKey")(function* (
+      manifest: EnvironmentCacheManifest,
+    ) {
+      const key = yield* Effect.tryPromise({
+        try: generateCacheKey,
+        catch: (cause) => catalogError("generate session cache key", cause),
+      });
+      const sessionManifest: EnvironmentCacheManifest = {
+        ...manifest,
+        keyRef: null,
+        persistence: "session-only",
+        totalBytes: 0,
+        entries: [],
+      };
+      sessionCacheKeys.set(manifest.environmentId, key);
+      sessionCacheManifests.set(manifest.environmentId, sessionManifest);
+      const resolved = { key, manifest: sessionManifest, browserKey: undefined } as const;
+      resolvedCacheKeys.set(manifest.environmentId, resolved);
+      return resolved;
+    });
+
+    const resetUnreadableDurableCache = Effect.fn(
+      "web.connectionStorage.resetUnreadableDurableCache",
+    )(function* (manifest: EnvironmentCacheManifest) {
+      if (manifest.keyRef !== null) {
+        yield* environmentSecretStore.delete(manifest.keyRef).pipe(Effect.ignore);
+      }
+      yield* clearEncryptedCacheDatabase(database, manifest.environmentId);
+      return {
+        ...manifest,
+        keyRef: null,
+        persistence: "session-only" as const,
+        lastSynchronizedAt: null,
+        totalBytes: 0,
+        entries: [],
+      } satisfies EnvironmentCacheManifest;
+    });
+
+    const resolveCacheKeyUnlocked = Effect.fn("web.connectionStorage.resolveCacheKey")(function* (
+      environmentId: EnvironmentId,
+    ) {
+      const alreadyResolved = resolvedCacheKeys.get(environmentId);
+      if (alreadyResolved !== undefined) return alreadyResolved;
+
+      const storageInstanceId = yield* cacheEnvironmentStorageId(environmentId);
+      const raw = yield* readDatabaseValue(
+        database,
+        ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+        environmentId,
+      );
+      let manifest =
+        raw === undefined
+          ? defaultCacheManifest(environmentId, storageInstanceId)
+          : yield* decodeEnvironmentCacheManifest(raw);
+      let durableStatePresent = raw !== undefined;
+      if (manifest.storageInstanceId !== storageInstanceId) {
+        yield* resetUnreadableDurableCache(manifest);
+        manifest = defaultCacheManifest(environmentId, storageInstanceId);
+        durableStatePresent = false;
+      }
+
+      if (desktopBridge?.putSecret !== undefined && desktopBridge.getSecret !== undefined) {
+        if (manifest.keyRef !== null) {
+          const loaded = yield* environmentSecretStore.get(manifest.keyRef).pipe(Effect.option);
+          if (Option.isSome(loaded) && Option.isSome(loaded.value)) {
+            const encodedKey = loaded.value.value;
+            const imported = yield* Effect.tryPromise({
+              try: () => importCacheKeyMaterial(decodeCacheKeyMaterial(encodedKey)),
+              catch: (cause) => catalogError("import protected cache key", cause),
+            }).pipe(Effect.option);
+            if (Option.isSome(imported)) {
+              const durableManifest = { ...manifest, persistence: "durable" as const };
+              const resolved = {
+                key: imported.value,
+                manifest: durableManifest,
+                browserKey: undefined,
+              } as const;
+              resolvedCacheKeys.set(environmentId, resolved);
+              return resolved;
+            }
+          }
+        }
+
+        if (durableStatePresent) {
+          manifest = yield* resetUnreadableDurableCache(manifest);
+          durableStatePresent = false;
+        }
+
+        const material = generateCacheKeyMaterial();
+        const key = yield* Effect.tryPromise({
+          try: () => importCacheKeyMaterial(material),
+          catch: (cause) => catalogError("generate protected cache key", cause),
+        });
+        const stored = yield* environmentSecretStore
+          .put(environmentId, "cache-key", encodeCacheKeyMaterial(material))
+          .pipe(Effect.option);
+        if (Option.isSome(stored)) {
+          const durableManifest: EnvironmentCacheManifest = {
+            ...manifest,
+            keyRef: stored.value,
+            persistence: "durable",
+            entries: manifest.keyRef === stored.value ? manifest.entries : [],
+            totalBytes: manifest.keyRef === stored.value ? manifest.totalBytes : 0,
+          };
+          const resolved = { key, manifest: durableManifest, browserKey: undefined } as const;
+          resolvedCacheKeys.set(environmentId, resolved);
+          return resolved;
+        }
+        return yield* makeSessionCacheKey(manifest);
+      }
+
+      const secureContextAvailable =
+        (typeof isSecureContext === "undefined" || isSecureContext) &&
+        globalThis.crypto?.subtle !== undefined;
+      if (secureContextAvailable) {
+        const storedBrowserKey =
+          durableStatePresent && typeof raw === "object" && raw !== null && "browserKey" in raw
+            ? cryptoKeyFromUnknown(raw.browserKey)
+            : null;
+        if (storedBrowserKey !== null) {
+          const durableManifest: EnvironmentCacheManifest = {
+            ...manifest,
+            keyRef: null,
+            persistence: "durable",
+          };
+          const resolved = {
+            key: storedBrowserKey,
+            manifest: durableManifest,
+            browserKey: storedBrowserKey,
+          } as const;
+          resolvedCacheKeys.set(environmentId, resolved);
+          return resolved;
+        }
+
+        if (durableStatePresent) {
+          manifest = yield* resetUnreadableDurableCache(manifest);
+          durableStatePresent = false;
+        }
+
+        const browserKey = yield* Effect.tryPromise({
+          try: generateCacheKey,
+          catch: (cause) => catalogError("generate browser cache key", cause),
+        });
+        const durableManifest: EnvironmentCacheManifest = {
+          ...manifest,
+          keyRef: null,
+          persistence: "durable",
+          entries: [],
+          totalBytes: 0,
+        };
+        const persisted = yield* replaceCacheManifest(database, durableManifest, browserKey).pipe(
+          Effect.as(true),
+          Effect.orElseSucceed(() => false),
+        );
+        if (persisted) {
+          const resolved = {
+            key: browserKey,
+            manifest: durableManifest,
+            browserKey,
+          } as const;
+          resolvedCacheKeys.set(environmentId, resolved);
+          return resolved;
+        }
+      }
+
+      if (durableStatePresent) {
+        manifest = yield* resetUnreadableDurableCache(manifest);
+      }
+
+      return yield* makeSessionCacheKey(manifest);
     });
 
     const environmentMigrationStore = EnvironmentMigrationStore.of({
@@ -1541,68 +2214,466 @@ export const connectionStorageLayer = Layer.effectContext(
           })
           .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
     });
+
+    const selectedCacheEntity = Effect.fn("web.connectionStorage.selectedCacheEntity")(function* (
+      environmentId: EnvironmentId,
+    ) {
+      const uiState = yield* loadEnvironmentUiState;
+      if (Option.isNone(uiState) || uiState.value.selected?.environmentId !== environmentId) {
+        return null;
+      }
+      return uiState.value.selected.threadId === null
+        ? ({ entityKind: "shell", entityId: CACHE_SHELL_ENTITY_ID } as const)
+        : ({ entityKind: "thread", entityId: uiState.value.selected.threadId } as const);
+    });
+
+    const effectiveCacheManifest = Effect.fn("web.connectionStorage.effectiveCacheManifest")(
+      function* (
+        environmentId: EnvironmentId,
+        resolved: {
+          readonly manifest: EnvironmentCacheManifest;
+        },
+      ) {
+        if (resolved.manifest.persistence === "session-only") {
+          return sessionCacheManifests.get(environmentId) ?? resolved.manifest;
+        }
+        return Option.getOrElse(
+          yield* loadDurableCacheManifest(environmentId),
+          () => resolved.manifest,
+        );
+      },
+    );
+
+    const cacheScope = (
+      manifest: EnvironmentCacheManifest,
+      entityKind: CacheEntityKind,
+      entityId: string,
+    ): CacheAssociatedDataScope => ({
+      schemaVersion: 1,
+      environmentId: manifest.environmentId,
+      storageInstanceId: manifest.storageInstanceId,
+      entityKind,
+      entityId,
+    });
+
+    const applySessionCacheWrite = (input: {
+      readonly manifest: EnvironmentCacheManifest;
+      readonly envelope: EncryptedCacheEnvelopeType;
+      readonly protectedEntity: {
+        readonly entityKind: CacheEntityKind;
+        readonly entityId: string;
+      } | null;
+      readonly accessedAt: string;
+    }): boolean => {
+      const current = sessionCacheManifests.get(input.manifest.environmentId) ?? input.manifest;
+      const existing = current.entries.find(
+        (entry) =>
+          entry.entityKind === input.envelope.entityKind &&
+          entry.entityId === input.envelope.entityId,
+      );
+      if (!shouldReplaceCacheEntry(existing, input.envelope)) return false;
+      const nextEntry: CacheManifestEntry = {
+        entityKind: input.envelope.entityKind,
+        entityId: input.envelope.entityId,
+        byteLength: cacheEnvelopeByteLength(input.envelope),
+        serverRevision: input.envelope.serverRevision,
+        synchronizedAt: input.envelope.synchronizedAt,
+        lastAccessedAt: input.accessedAt,
+      };
+      const candidateEntries = [
+        ...current.entries.filter(
+          (entry) =>
+            entry.entityKind !== nextEntry.entityKind || entry.entityId !== nextEntry.entityId,
+        ),
+        nextEntry,
+      ];
+      const evictions = selectCacheEvictions(candidateEntries, {
+        maxBytes: current.maxBytes,
+        maxAgeMs: current.maxAgeMs,
+        nowEpochMs: Date.parse(input.accessedAt),
+        protectedEntity: input.protectedEntity,
+      });
+      const evictedKeys = new Set(
+        evictions.map((entry) => `${entry.entityKind}\u0000${entry.entityId}`),
+      );
+      const retainedEntries = candidateEntries.filter(
+        (entry) => !evictedKeys.has(`${entry.entityKind}\u0000${entry.entityId}`),
+      );
+      sessionCacheEnvelopes.set(
+        sessionCacheRecordKey(
+          input.manifest.environmentId,
+          input.envelope.entityKind,
+          input.envelope.entityId,
+        ),
+        input.envelope,
+      );
+      for (const eviction of evictions) {
+        sessionCacheEnvelopes.delete(
+          sessionCacheRecordKey(
+            input.manifest.environmentId,
+            eviction.entityKind,
+            eviction.entityId,
+          ),
+        );
+      }
+      sessionCacheManifests.set(input.manifest.environmentId, {
+        ...current,
+        keyRef: null,
+        persistence: "session-only",
+        lastSynchronizedAt: input.envelope.synchronizedAt,
+        totalBytes: retainedEntries.reduce((total, entry) => total + entry.byteLength, 0),
+        entries: retainedEntries,
+      });
+      return true;
+    };
+
+    const saveEncryptedCachePayload = Effect.fn("web.connectionStorage.saveEncryptedCachePayload")(
+      function* (input: {
+        readonly environmentId: EnvironmentId;
+        readonly entityKind: CacheEntityKind;
+        readonly entityId: string;
+        readonly serverRevision: number;
+        readonly synchronizedAt: string;
+        readonly plaintext: string;
+      }) {
+        return yield* cacheMutationSemaphore.withPermits(1)(
+          Effect.gen(function* () {
+            const resolved = yield* resolveCacheKeyUnlocked(input.environmentId);
+            const manifest = yield* effectiveCacheManifest(input.environmentId, resolved);
+            const envelope = yield* Effect.tryPromise({
+              try: () =>
+                encryptCachePayload(resolved.key, {
+                  scope: cacheScope(manifest, input.entityKind, input.entityId),
+                  serverRevision: input.serverRevision,
+                  synchronizedAt: input.synchronizedAt,
+                  plaintext: input.plaintext,
+                }),
+              catch: (cause) => catalogError("encrypt cache payload", cause),
+            });
+            const accessedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+            const protectedEntity = yield* selectedCacheEntity(input.environmentId);
+            if (manifest.persistence === "session-only") {
+              return applySessionCacheWrite({
+                manifest,
+                envelope,
+                protectedEntity,
+                accessedAt,
+              });
+            }
+            return (yield* commitEncryptedCacheWrite({
+              database,
+              baseManifest: manifest,
+              ...(resolved.browserKey === undefined ? {} : { browserKey: resolved.browserKey }),
+              envelope,
+              protectedEntity,
+              accessedAt,
+            })).applied;
+          }),
+        );
+      },
+    );
+
+    const quarantineSessionCacheRecord = (input: {
+      readonly manifest: EnvironmentCacheManifest;
+      readonly entityKind: CacheEntityKind;
+      readonly entityId: string;
+      readonly reason: CacheQuarantineReason | null;
+      readonly quarantinedAt: string;
+    }) => {
+      sessionCacheEnvelopes.delete(
+        sessionCacheRecordKey(input.manifest.environmentId, input.entityKind, input.entityId),
+      );
+      const entries = input.manifest.entries.filter(
+        (entry) => entry.entityKind !== input.entityKind || entry.entityId !== input.entityId,
+      );
+      sessionCacheManifests.set(input.manifest.environmentId, {
+        ...input.manifest,
+        entries,
+        totalBytes: entries.reduce((total, entry) => total + entry.byteLength, 0),
+        quarantine:
+          input.reason === null
+            ? input.manifest.quarantine
+            : [
+                ...input.manifest.quarantine,
+                {
+                  entityKind: input.entityKind,
+                  entityId: input.entityId,
+                  reason: input.reason,
+                  quarantinedAt: input.quarantinedAt,
+                },
+              ].slice(-64),
+      });
+    };
+
+    const loadEncryptedCachePayload = Effect.fn("web.connectionStorage.loadEncryptedCachePayload")(
+      function* (input: {
+        readonly environmentId: EnvironmentId;
+        readonly entityKind: CacheEntityKind;
+        readonly entityId: string;
+      }) {
+        return yield* cacheMutationSemaphore.withPermits(1)(
+          Effect.gen(function* () {
+            const resolved = yield* resolveCacheKeyUnlocked(input.environmentId);
+            const manifest = yield* effectiveCacheManifest(input.environmentId, resolved);
+            const raw =
+              manifest.persistence === "session-only"
+                ? sessionCacheEnvelopes.get(
+                    sessionCacheRecordKey(input.environmentId, input.entityKind, input.entityId),
+                  )
+                : yield* readDatabaseValue(
+                    database,
+                    cacheStoreName(input.entityKind),
+                    cacheRecordKey(input.entityKind, input.environmentId, input.entityId),
+                  );
+            if (raw === undefined) return Option.none<string>();
+
+            const accessedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+            const decoded = yield* decodeEncryptedCacheEnvelope(raw).pipe(Effect.option);
+            let quarantineReason: CacheQuarantineReason | null = null;
+            if (Option.isNone(decoded)) {
+              quarantineReason = "payload-invalid";
+            } else if (decoded.value.storageInstanceId !== manifest.storageInstanceId) {
+              quarantineReason = "storage-identity-mismatch";
+            } else if (
+              decoded.value.environmentId !== manifest.environmentId ||
+              decoded.value.entityKind !== input.entityKind ||
+              decoded.value.entityId !== input.entityId
+            ) {
+              quarantineReason = "scope-mismatch";
+            } else if (
+              Date.parse(accessedAt) - Date.parse(decoded.value.synchronizedAt) >
+              manifest.maxAgeMs
+            ) {
+              quarantineReason = null;
+            } else {
+              const plaintext = yield* Effect.tryPromise({
+                try: () =>
+                  decryptCachePayload(
+                    resolved.key,
+                    decoded.value,
+                    cacheScope(manifest, input.entityKind, input.entityId),
+                  ),
+                catch: () => catalogError("authenticate cache payload", "Authentication failed."),
+              }).pipe(Effect.option);
+              if (Option.isSome(plaintext)) {
+                if (manifest.persistence === "session-only") {
+                  sessionCacheManifests.set(input.environmentId, {
+                    ...manifest,
+                    entries: manifest.entries.map((entry) =>
+                      entry.entityKind === input.entityKind && entry.entityId === input.entityId
+                        ? { ...entry, lastAccessedAt: accessedAt }
+                        : entry,
+                    ),
+                  });
+                } else {
+                  yield* touchEncryptedCacheEntry({
+                    database,
+                    environmentId: input.environmentId,
+                    entityKind: input.entityKind,
+                    entityId: input.entityId,
+                    accessedAt,
+                  });
+                }
+                return plaintext;
+              }
+              quarantineReason = "authentication-failed";
+            }
+
+            if (manifest.persistence === "session-only") {
+              quarantineSessionCacheRecord({
+                manifest,
+                entityKind: input.entityKind,
+                entityId: input.entityId,
+                reason: quarantineReason,
+                quarantinedAt: accessedAt,
+              });
+            } else {
+              yield* removeEncryptedCacheRecord({
+                database,
+                environmentId: input.environmentId,
+                entityKind: input.entityKind,
+                entityId: input.entityId,
+                reason: quarantineReason,
+                quarantinedAt: accessedAt,
+              });
+            }
+            return Option.none<string>();
+          }),
+        );
+      },
+    );
+
+    const discardEncryptedCacheRecord = Effect.fn(
+      "web.connectionStorage.discardEncryptedCacheRecord",
+    )(function* (
+      environmentId: EnvironmentId,
+      entityKind: CacheEntityKind,
+      entityId: string,
+      reason: CacheQuarantineReason | null,
+    ) {
+      yield* cacheMutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const resolved = yield* resolveCacheKeyUnlocked(environmentId);
+          const manifest = yield* effectiveCacheManifest(environmentId, resolved);
+          const removedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          if (manifest.persistence === "session-only") {
+            quarantineSessionCacheRecord({
+              manifest,
+              entityKind,
+              entityId,
+              reason,
+              quarantinedAt: removedAt,
+            });
+            return;
+          }
+          yield* removeEncryptedCacheRecord({
+            database,
+            environmentId,
+            entityKind,
+            entityId,
+            reason,
+            quarantinedAt: removedAt,
+          });
+        }),
+      );
+    });
+
+    const cachePersistenceMode = (environmentId: EnvironmentId) =>
+      cacheMutationSemaphore.withPermits(1)(
+        resolveCacheKeyUnlocked(environmentId).pipe(
+          Effect.map((resolved) => resolved.manifest.persistence),
+        ),
+      );
     const cacheStore = EnvironmentCacheStore.of({
       loadShell: (environmentId) =>
-        readDatabaseValue(database, SHELL_STORE_NAME, environmentId).pipe(
-          Effect.flatMap((raw) => {
-            if (typeof raw !== "string") {
-              return Effect.succeed(Option.none());
+        Effect.gen(function* () {
+          const encrypted = yield* loadEncryptedCachePayload({
+            environmentId,
+            entityKind: "shell",
+            entityId: CACHE_SHELL_ENTITY_ID,
+          });
+          if (Option.isSome(encrypted)) {
+            const decoded = yield* decodeStoredShellSnapshot(encrypted.value).pipe(Effect.option);
+            if (Option.isSome(decoded) && decoded.value.environmentId === environmentId) {
+              return Option.some(decoded.value.snapshot);
             }
-            return decodeStoredShellSnapshot(raw).pipe(
-              Effect.mapError((cause) => persistenceError("load-shell", cause)),
-              Effect.map((stored) =>
-                stored.environmentId === environmentId
-                  ? Option.some(stored.snapshot)
-                  : Option.none(),
-              ),
+            yield* discardEncryptedCacheRecord(
+              environmentId,
+              "shell",
+              CACHE_SHELL_ENTITY_ID,
+              "payload-invalid",
             );
-          }),
-          Effect.mapError((cause) =>
-            cause._tag === "ConnectionPersistenceError"
-              ? cause
-              : persistenceError("load-shell", cause),
-          ),
-        ),
+            return Option.none();
+          }
+
+          const legacy = yield* readDatabaseValue(database, SHELL_STORE_NAME, environmentId);
+          if (typeof legacy !== "string") return Option.none();
+          const decoded = yield* decodeStoredShellSnapshot(legacy).pipe(Effect.option);
+          if (Option.isNone(decoded) || decoded.value.environmentId !== environmentId) {
+            yield* removeDatabaseValue(database, SHELL_STORE_NAME, environmentId);
+            return Option.none();
+          }
+          if ((yield* cachePersistenceMode(environmentId)) !== "durable") {
+            yield* removeDatabaseValue(database, SHELL_STORE_NAME, environmentId);
+            return Option.none();
+          }
+          const encoded = yield* encodeStoredShellSnapshot(decoded.value);
+          yield* saveEncryptedCachePayload({
+            environmentId,
+            entityKind: "shell",
+            entityId: CACHE_SHELL_ENTITY_ID,
+            serverRevision: decoded.value.snapshot.snapshotSequence,
+            synchronizedAt: decoded.value.snapshot.updatedAt,
+            plaintext: encoded,
+          });
+          yield* removeDatabaseValue(database, SHELL_STORE_NAME, environmentId);
+          return Option.some(decoded.value.snapshot);
+        }).pipe(Effect.mapError((cause) => persistenceError("load-shell", cause))),
       saveShell: (environmentId, snapshot) =>
         Effect.gen(function* () {
           const encoded = yield* encodeStoredShellSnapshot({
             schemaVersion: SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION,
             environmentId,
             snapshot,
-          }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause)));
-          yield* writeDatabaseValue(database, SHELL_STORE_NAME, environmentId, encoded);
-        }).pipe(
-          Effect.mapError((cause) =>
-            cause._tag === "ConnectionPersistenceError"
-              ? cause
-              : persistenceError("save-shell", cause),
-          ),
-        ),
+          });
+          yield* saveEncryptedCachePayload({
+            environmentId,
+            entityKind: "shell",
+            entityId: CACHE_SHELL_ENTITY_ID,
+            serverRevision: snapshot.snapshotSequence,
+            synchronizedAt: snapshot.updatedAt,
+            plaintext: encoded,
+          });
+          yield* removeDatabaseValue(database, SHELL_STORE_NAME, environmentId);
+        }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause))),
       loadThread: (environmentId, threadId) =>
-        readDatabaseValue(
-          database,
-          THREAD_STORE_NAME,
-          threadCacheKey(environmentId, threadId),
-        ).pipe(
-          Effect.flatMap((raw) => {
-            if (typeof raw !== "string") {
-              return Effect.succeed(Option.none());
+        Effect.gen(function* () {
+          const encrypted = yield* loadEncryptedCachePayload({
+            environmentId,
+            entityKind: "thread",
+            entityId: threadId,
+          });
+          if (Option.isSome(encrypted)) {
+            const decoded = yield* decodeStoredThreadSnapshot(encrypted.value).pipe(Effect.option);
+            if (
+              Option.isSome(decoded) &&
+              decoded.value.environmentId === environmentId &&
+              decoded.value.threadId === threadId
+            ) {
+              return Option.some(decoded.value.thread);
             }
-            return decodeStoredThreadSnapshot(raw).pipe(
-              Effect.mapError((cause) => persistenceError("load-thread", cause)),
-              Effect.map((stored) =>
-                stored.environmentId === environmentId && stored.threadId === threadId
-                  ? Option.some(stored.thread)
-                  : Option.none(),
-              ),
+            yield* discardEncryptedCacheRecord(
+              environmentId,
+              "thread",
+              threadId,
+              "payload-invalid",
             );
-          }),
-          Effect.mapError((cause) =>
-            cause._tag === "ConnectionPersistenceError"
-              ? cause
-              : persistenceError("load-thread", cause),
-          ),
-        ),
+            return Option.none();
+          }
+
+          const legacy = yield* readDatabaseValue(
+            database,
+            THREAD_STORE_NAME,
+            threadCacheKey(environmentId, threadId),
+          );
+          if (typeof legacy !== "string") return Option.none();
+          const decoded = yield* decodeStoredThreadSnapshot(legacy).pipe(Effect.option);
+          if (
+            Option.isNone(decoded) ||
+            decoded.value.environmentId !== environmentId ||
+            decoded.value.threadId !== threadId
+          ) {
+            yield* removeDatabaseValue(
+              database,
+              THREAD_STORE_NAME,
+              threadCacheKey(environmentId, threadId),
+            );
+            return Option.none();
+          }
+          if ((yield* cachePersistenceMode(environmentId)) !== "durable") {
+            yield* removeDatabaseValue(
+              database,
+              THREAD_STORE_NAME,
+              threadCacheKey(environmentId, threadId),
+            );
+            return Option.none();
+          }
+          const encoded = yield* encodeStoredThreadSnapshot(decoded.value);
+          yield* saveEncryptedCachePayload({
+            environmentId,
+            entityKind: "thread",
+            entityId: threadId,
+            serverRevision: Math.max(0, Date.parse(decoded.value.thread.updatedAt)),
+            synchronizedAt: decoded.value.thread.updatedAt,
+            plaintext: encoded,
+          });
+          yield* removeDatabaseValue(
+            database,
+            THREAD_STORE_NAME,
+            threadCacheKey(environmentId, threadId),
+          );
+          return Option.some(decoded.value.thread);
+        }).pipe(Effect.mapError((cause) => persistenceError("load-thread", cause))),
       saveThread: (environmentId, thread) =>
         Effect.gen(function* () {
           const encoded = yield* encodeStoredThreadSnapshot({
@@ -1610,39 +2681,124 @@ export const connectionStorageLayer = Layer.effectContext(
             environmentId,
             threadId: thread.id,
             thread,
-          }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause)));
-          yield* writeDatabaseValue(
+          });
+          yield* saveEncryptedCachePayload({
+            environmentId,
+            entityKind: "thread",
+            entityId: thread.id,
+            serverRevision: Math.max(0, Date.parse(thread.updatedAt)),
+            synchronizedAt: thread.updatedAt,
+            plaintext: encoded,
+          });
+          yield* removeDatabaseValue(
             database,
             THREAD_STORE_NAME,
             threadCacheKey(environmentId, thread.id),
-            encoded,
           );
-        }).pipe(
-          Effect.mapError((cause) =>
-            cause._tag === "ConnectionPersistenceError"
-              ? cause
-              : persistenceError("save-thread", cause),
-          ),
-        ),
+        }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause))),
       removeThread: (environmentId, threadId) =>
-        removeDatabaseValue(
-          database,
-          THREAD_STORE_NAME,
-          threadCacheKey(environmentId, threadId),
-        ).pipe(Effect.mapError((cause) => persistenceError("remove-thread", cause))),
-      clear: (environmentId) =>
-        Effect.all(
-          [
-            removeDatabaseValue(database, SHELL_STORE_NAME, environmentId),
-            removeDatabaseValuesInRange(
+        discardEncryptedCacheRecord(environmentId, "thread", threadId, null).pipe(
+          Effect.andThen(
+            removeDatabaseValue(
               database,
               THREAD_STORE_NAME,
-              IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
+              threadCacheKey(environmentId, threadId),
             ),
-          ],
-          { concurrency: "unbounded", discard: true },
-        ).pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
+          ),
+          Effect.mapError((cause) => persistenceError("remove-thread", cause)),
+        ),
+      clear: (environmentId) =>
+        cacheMutationSemaphore
+          .withPermits(1)(
+            Effect.gen(function* () {
+              const sessionManifest = sessionCacheManifests.get(environmentId);
+              const durableManifest = yield* loadDurableCacheManifest(environmentId);
+              const keyRef =
+                sessionManifest?.keyRef ?? Option.getOrNull(durableManifest)?.keyRef ?? null;
+              if (keyRef !== null) {
+                yield* environmentSecretStore.delete(keyRef);
+              }
+              const entries = [
+                ...(sessionManifest?.entries ?? []),
+                ...(Option.getOrNull(durableManifest)?.entries ?? []),
+              ];
+              for (const entry of entries) {
+                sessionCacheEnvelopes.delete(
+                  sessionCacheRecordKey(environmentId, entry.entityKind, entry.entityId),
+                );
+              }
+              sessionCacheManifests.delete(environmentId);
+              sessionCacheKeys.delete(environmentId);
+              resolvedCacheKeys.delete(environmentId);
+              yield* clearEncryptedCacheDatabase(database, environmentId);
+              yield* Effect.all(
+                [
+                  removeDatabaseValue(database, SHELL_STORE_NAME, environmentId),
+                  removeDatabaseValuesInRange(
+                    database,
+                    THREAD_STORE_NAME,
+                    IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
+                  ),
+                ],
+                { concurrency: "unbounded", discard: true },
+              );
+            }),
+          )
+          .pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });
+
+    const migrateLegacyPlaintextCache = Effect.gen(function* () {
+      const shellKeys = yield* readAllDatabaseKeys(database, SHELL_STORE_NAME).pipe(
+        Effect.mapError((cause) => persistenceError("load-shell", cause)),
+      );
+      const threadKeys = yield* readAllDatabaseKeys(database, THREAD_STORE_NAME).pipe(
+        Effect.mapError((cause) => persistenceError("load-thread", cause)),
+      );
+      const known = yield* environmentCatalogStore.list;
+      const knownIds = new Set(known.map((environment) => environment.environmentId));
+      yield* Effect.forEach(
+        shellKeys,
+        (key) => {
+          if (typeof key !== "string" || !knownIds.has(EnvironmentId.make(key))) {
+            return removeDatabaseValue(database, SHELL_STORE_NAME, key).pipe(
+              Effect.mapError((cause) => persistenceError("load-shell", cause)),
+            );
+          }
+          return cacheStore.loadShell(EnvironmentId.make(key)).pipe(Effect.asVoid);
+        },
+        { concurrency: 1, discard: true },
+      );
+
+      yield* Effect.forEach(
+        threadKeys,
+        (key) => {
+          if (typeof key !== "string") {
+            return removeDatabaseValue(database, THREAD_STORE_NAME, key).pipe(
+              Effect.mapError((cause) => persistenceError("load-thread", cause)),
+            );
+          }
+          const cacheKey = key;
+          const environment = known.find((candidate) =>
+            cacheKey.startsWith(`${candidate.environmentId}:`),
+          );
+          if (environment === undefined) {
+            return removeDatabaseValue(database, THREAD_STORE_NAME, cacheKey).pipe(
+              Effect.mapError((cause) => persistenceError("load-thread", cause)),
+            );
+          }
+          const threadId = ThreadId.make(cacheKey.slice(environment.environmentId.length + 1));
+          return cacheStore.loadThread(environment.environmentId, threadId).pipe(Effect.asVoid);
+        },
+        { concurrency: 1, discard: true },
+      );
+    });
+    yield* migrateLegacyPlaintextCache.pipe(
+      Effect.catch(() =>
+        Effect.logWarning(
+          "Legacy plaintext cache cleanup was deferred without exposing its cause.",
+        ),
+      ),
+    );
 
     return Context.make(ConnectionTargetStore, targetStore).pipe(
       Context.add(EnvironmentCatalogStore, environmentCatalogStore),

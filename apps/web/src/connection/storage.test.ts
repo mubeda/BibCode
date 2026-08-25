@@ -196,6 +196,22 @@ class FakeTransaction {
         });
         return request;
       },
+      index: (_indexName: string) => ({
+        getAllKeys: (range: { includes: (key: IDBValidKey) => boolean }) => {
+          const request = new FakeRequest();
+          queueMicrotask(() => {
+            if (this.fault === "cursor") {
+              request.error = new Error("boom-cursor");
+              request.fire("error");
+              return;
+            }
+            request.result = [...this.store.keys()].filter((key) => range.includes(key));
+            request.fire("success");
+            this.complete();
+          });
+          return request;
+        },
+      }),
     };
   }
 }
@@ -255,6 +271,9 @@ function installFakeIndexedDb(
     });
   }
   vi.stubGlobal("IDBKeyRange", {
+    only: (value: IDBValidKey) => ({
+      includes: (key: IDBValidKey) => (Array.isArray(key) ? key[0] === value : key === value),
+    }),
     bound: (lower: string, upper: string) => ({
       includes: (key: IDBValidKey) => typeof key === "string" && key >= lower && key <= upper,
     }),
@@ -295,6 +314,58 @@ function deleteDatabaseValue(
     transaction.addEventListener("complete", () => resolve());
     transaction.addEventListener("error", () => reject(transaction.error));
     transaction.addEventListener("abort", () => reject(transaction.error));
+  });
+}
+
+function readIndexedDbValue(
+  factory: IDBFactory,
+  storeName: string,
+  key: IDBValidKey,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open("bibcode:connection-runtime", 3);
+    request.addEventListener("error", () => reject(request.error));
+    request.addEventListener("success", () => {
+      const database = request.result;
+      const read = database.transaction(storeName, "readonly").objectStore(storeName).get(key);
+      read.addEventListener("success", () => {
+        database.close();
+        resolve(read.result);
+      });
+      read.addEventListener("error", () => {
+        database.close();
+        reject(read.error);
+      });
+    });
+  });
+}
+
+function writeIndexedDbRecord(
+  factory: IDBFactory,
+  storeName: string,
+  value: unknown,
+  key?: IDBValidKey,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open("bibcode:connection-runtime", 3);
+    request.addEventListener("error", () => reject(request.error));
+    request.addEventListener("success", () => {
+      const database = request.result;
+      const transaction = database.transaction(storeName, "readwrite");
+      if (key === undefined) {
+        transaction.objectStore(storeName).put(value);
+      } else {
+        transaction.objectStore(storeName).put(value, key);
+      }
+      transaction.addEventListener("complete", () => {
+        database.close();
+        resolve();
+      });
+      transaction.addEventListener("error", () => {
+        database.close();
+        reject(transaction.error);
+      });
+    });
   });
 }
 
@@ -1796,6 +1867,8 @@ describe("connectionStorageLayer", () => {
         maxBytes: 1024,
         maxAgeMs: 60_000,
         totalBytes: 0,
+        entries: [],
+        quarantine: [],
       } as const;
       const receipt = { id: "catalog-v1-to-v3", completedAt: now };
 
@@ -2391,33 +2464,354 @@ describe("connectionStorageLayer", () => {
   });
 
   it.effect("persists and restores shell and thread snapshots", () => {
-    installFakeIndexedDb();
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+    const otherDurableId = EnvironmentId.make(otherDurableEnvironmentId);
     return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const firstEnvironment = normalizedKnownEnvironment();
+      yield* catalog.put(firstEnvironment);
+      yield* catalog.put(
+        decodeKnownEnvironment({
+          ...firstEnvironment,
+          environmentId: otherDurableEnvironmentId,
+          acceptedStorageInstanceId: otherDurableStorageId,
+          routes: firstEnvironment.routes.map((route) => ({
+            ...route,
+            routeId: "route:other",
+            environmentId: otherDurableEnvironmentId,
+          })),
+        }),
+      );
       const cacheStore = yield* EnvironmentCacheStore;
 
-      expect(Option.isNone(yield* cacheStore.loadShell(environmentId))).toBe(true);
-      yield* cacheStore.saveShell(environmentId, shellSnapshot());
-      const shell = yield* cacheStore.loadShell(environmentId);
+      expect(Option.isNone(yield* cacheStore.loadShell(durableId))).toBe(true);
+      yield* cacheStore.saveShell(durableId, shellSnapshot());
+      const shell = yield* cacheStore.loadShell(durableId);
       expect(Option.isSome(shell)).toBe(true);
 
-      expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
-      yield* cacheStore.saveThread(environmentId, orchestrationThread());
-      const thread = yield* cacheStore.loadThread(environmentId, threadId);
+      expect(Option.isNone(yield* cacheStore.loadThread(durableId, threadId))).toBe(true);
+      yield* cacheStore.saveThread(durableId, orchestrationThread());
+      const thread = yield* cacheStore.loadThread(durableId, threadId);
       expect(Option.isSome(thread)).toBe(true);
 
       // A thread cached under a different environment is not returned.
-      expect(Option.isNone(yield* cacheStore.loadThread(otherEnvironmentId, threadId))).toBe(true);
+      expect(Option.isNone(yield* cacheStore.loadThread(otherDurableId, threadId))).toBe(true);
 
-      yield* cacheStore.removeThread(environmentId, threadId);
-      expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
+      yield* cacheStore.removeThread(durableId, threadId);
+      expect(Option.isNone(yield* cacheStore.loadThread(durableId, threadId))).toBe(true);
 
       // Repopulate, then clear the whole environment (shell + thread range).
-      yield* cacheStore.saveShell(environmentId, shellSnapshot());
-      yield* cacheStore.saveThread(environmentId, orchestrationThread());
-      yield* cacheStore.clear(environmentId);
-      expect(Option.isNone(yield* cacheStore.loadShell(environmentId))).toBe(true);
-      expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
-    }).pipe(Effect.provide(connectionStorageLayer));
+      yield* cacheStore.saveShell(durableId, shellSnapshot());
+      yield* cacheStore.saveThread(durableId, orchestrationThread());
+      yield* cacheStore.clear(durableId);
+      expect(Option.isNone(yield* cacheStore.loadShell(durableId))).toBe(true);
+      expect(Option.isNone(yield* cacheStore.loadThread(durableId, threadId))).toBe(true);
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("encrypts durable snapshots and rejects stale revision overwrites", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    let protectedKey: string | null = null;
+    const bridge = {
+      putSecret: vi.fn(async (input: { readonly value: string }) => {
+        protectedKey = input.value;
+        return secretRef;
+      }),
+      getSecret: vi.fn(async () => protectedKey),
+      deleteSecret: vi.fn(async () => undefined),
+    } as unknown as DesktopBridge;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", { desktopBridge: bridge });
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+      const cache = yield* EnvironmentCacheStore;
+      const newest = { ...shellSnapshot(), snapshotSequence: 2, updatedAt: now };
+      const stale = {
+        ...shellSnapshot(),
+        snapshotSequence: 1,
+        updatedAt: "2026-03-28T00:00:00.000Z",
+      };
+
+      yield* cache.saveShell(durableId, newest);
+      yield* cache.saveShell(durableId, stale);
+
+      expect(yield* cache.loadShell(durableId)).toEqual(Option.some(newest));
+      const raw = yield* Effect.promise(() =>
+        readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+      );
+      expect(raw).toMatchObject({
+        schemaVersion: 1,
+        environmentId: durableEnvironmentId,
+        storageInstanceId: durableStorageId,
+        entityKind: "shell",
+        entityId: "shell",
+        serverRevision: 2,
+      });
+      expect(encodeUnknownJson(raw)).not.toContain('"snapshotSequence"');
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "shell", durableEnvironmentId)),
+      ).toBeUndefined();
+
+      const manifest = yield* (yield* EnvironmentCacheManifestStore).load(durableId);
+      expect(manifest).toMatchObject({
+        _tag: "Some",
+        value: {
+          keyRef: secretRef,
+          persistence: "durable",
+          entries: [{ entityKind: "shell", entityId: "shell", serverRevision: 2 }],
+        },
+      });
+      expect(bridge.putSecret).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("purges encrypted rows before replacing an unavailable durable cache key", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    let protectedKey: string | null = null;
+    const bridge = {
+      putSecret: vi.fn(async (input: { readonly value: string }) => {
+        protectedKey = input.value;
+        return secretRef;
+      }),
+      getSecret: vi.fn(async () => protectedKey),
+      deleteSecret: vi.fn(async () => undefined),
+    } as unknown as DesktopBridge;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", { desktopBridge: bridge });
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+        const cache = yield* EnvironmentCacheStore;
+        yield* cache.saveShell(durableId, shellSnapshot());
+        yield* cache.saveThread(durableId, orchestrationThread());
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+      protectedKey = null;
+
+      yield* Effect.gen(function* () {
+        yield* (yield* EnvironmentCacheStore).loadShell(durableId);
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "threadCache", [durableEnvironmentId, threadId]),
+        ),
+      ).toBeUndefined();
+      expect(bridge.putSecret).toHaveBeenCalledTimes(2);
+      expect(bridge.deleteSecret).toHaveBeenCalledWith(secretRef);
+    });
+  });
+
+  it.effect("evicts unselected LRU entries while retaining the selected thread", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    let protectedKey: string | null = null;
+    const bridge = {
+      putSecret: vi.fn(async (input: { readonly value: string }) => {
+        protectedKey = input.value;
+        return secretRef;
+      }),
+      getSecret: vi.fn(async () => protectedKey),
+      deleteSecret: vi.fn(async () => undefined),
+    } as unknown as DesktopBridge;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", { desktopBridge: bridge });
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+    const selectedThreadId = ThreadId.make("selected-thread");
+    const otherThreadId = ThreadId.make("other-thread");
+
+    return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+      yield* (yield* EnvironmentCacheManifestStore).save({
+        schemaVersion: 1,
+        environmentId: durableId,
+        storageInstanceId: durableStorageId,
+        keyRef: null,
+        persistence: "durable",
+        lastSynchronizedAt: null,
+        maxBytes: 1,
+        maxAgeMs: 60_000,
+        totalBytes: 0,
+        entries: [],
+        quarantine: [],
+      });
+      yield* (yield* EnvironmentUiStateStore).save({
+        schemaVersion: 2,
+        selected: {
+          environmentId: durableId,
+          projectId: null,
+          threadId: selectedThreadId,
+        },
+        expandedEnvironmentIds: [],
+        expandedProjectKeys: [],
+        manuallyToggledKeys: [],
+        environmentOrder: [],
+        pinnedEnvironmentIds: [],
+        projectOrderByEnvironment: {},
+      });
+      const cache = yield* EnvironmentCacheStore;
+      yield* cache.saveThread(durableId, {
+        ...orchestrationThread(),
+        id: selectedThreadId,
+        title: "selected".repeat(200),
+      });
+      yield* cache.saveThread(durableId, {
+        ...orchestrationThread(),
+        id: otherThreadId,
+        title: "other".repeat(200),
+      });
+
+      expect(Option.isSome(yield* cache.loadThread(durableId, selectedThreadId))).toBe(true);
+      expect(Option.isNone(yield* cache.loadThread(durableId, otherThreadId))).toBe(true);
+      const manifest = yield* (yield* EnvironmentCacheManifestStore).load(durableId);
+      expect(Option.getOrThrow(manifest).entries.map((entry) => entry.entityId)).toEqual([
+        selectedThreadId,
+      ]);
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("quarantines tampered and storage-mismatched encrypted records", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    let protectedKey: string | null = null;
+    const bridge = {
+      putSecret: vi.fn(async (input: { readonly value: string }) => {
+        protectedKey = input.value;
+        return secretRef;
+      }),
+      getSecret: vi.fn(async () => protectedKey),
+      deleteSecret: vi.fn(async () => undefined),
+    } as unknown as DesktopBridge;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", { desktopBridge: bridge });
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+      const cache = yield* EnvironmentCacheStore;
+      yield* cache.saveShell(durableId, shellSnapshot());
+      const firstRaw = (yield* Effect.promise(() =>
+        readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+      )) as { readonly ciphertext: string };
+      const tamperedByte = firstRaw.ciphertext.endsWith("A") ? "B" : "A";
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(factory, "shellCache", {
+          ...firstRaw,
+          ciphertext: `${firstRaw.ciphertext.slice(0, -1)}${tamperedByte}`,
+        }),
+      );
+      expect(Option.isNone(yield* cache.loadShell(durableId))).toBe(true);
+
+      yield* cache.saveShell(durableId, { ...shellSnapshot(), snapshotSequence: 2 });
+      const secondRaw = (yield* Effect.promise(() =>
+        readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+      )) as Record<string, unknown>;
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(factory, "shellCache", {
+          ...secondRaw,
+          storageInstanceId: otherDurableStorageId,
+        }),
+      );
+      expect(Option.isNone(yield* cache.loadShell(durableId))).toBe(true);
+
+      const manifest = Option.getOrThrow(
+        yield* (yield* EnvironmentCacheManifestStore).load(durableId),
+      );
+      expect(manifest.quarantine.map((entry) => entry.reason)).toEqual([
+        "authentication-failed",
+        "storage-identity-mismatch",
+      ]);
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+        ),
+      ).toBeUndefined();
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("keeps cache session-only when secure durable key storage is unavailable", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("isSecureContext", false);
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+      const cache = yield* EnvironmentCacheStore;
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "shell",
+          encodeUnknownJson({
+            schemaVersion: 1,
+            environmentId: durableEnvironmentId,
+            snapshot: shellSnapshot(),
+          }),
+          durableEnvironmentId,
+        ),
+      );
+      expect(Option.isNone(yield* cache.loadShell(durableId))).toBe(true);
+      yield* cache.saveShell(durableId, shellSnapshot());
+
+      expect(Option.isSome(yield* cache.loadShell(durableId))).toBe(true);
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+        ),
+      ).toBeUndefined();
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "shell", durableEnvironmentId)),
+      ).toBeUndefined();
+      expect(yield* (yield* EnvironmentCacheManifestStore).load(durableId)).toMatchObject({
+        _tag: "Some",
+        value: { persistence: "session-only", keyRef: null },
+      });
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("restores a non-exportable browser cache key after a storage-layer restart", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("isSecureContext", true);
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+        yield* (yield* EnvironmentCacheStore).saveShell(durableId, shellSnapshot());
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+
+      yield* Effect.gen(function* () {
+        expect(yield* (yield* EnvironmentCacheStore).loadShell(durableId)).toEqual(
+          Option.some(shellSnapshot()),
+        );
+        expect(yield* (yield* EnvironmentCacheManifestStore).load(durableId)).toMatchObject({
+          _tag: "Some",
+          value: { persistence: "durable", keyRef: null },
+        });
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+    });
   });
 
   it.effect("fails to build when IndexedDB is unavailable", () => {
@@ -2477,44 +2871,126 @@ describe("connectionStorageLayer", () => {
     },
   );
 
-  it.effect("rejects malformed cached snapshots and ignores snapshots scoped elsewhere", () => {
-    const handle = installFakeIndexedDb();
-    const shellStore = new Map<IDBValidKey, unknown>();
-    const threadStore = new Map<IDBValidKey, unknown>();
-    handle.stores.set("shell", shellStore);
-    handle.stores.set("thread", threadStore);
-    shellStore.set(environmentId, "{malformed");
-    threadStore.set(`${environmentId}:${threadId}`, "{malformed");
+  it.effect("deletes malformed and incorrectly scoped legacy plaintext cache", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    const durableId = EnvironmentId.make(durableEnvironmentId);
 
     return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
       const cacheStore = yield* EnvironmentCacheStore;
-      expect((yield* Effect.flip(cacheStore.loadShell(environmentId))).operation).toBe(
-        "load-shell",
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(factory, "shell", "{malformed", durableEnvironmentId),
       );
-      expect((yield* Effect.flip(cacheStore.loadThread(environmentId, threadId))).operation).toBe(
-        "load-thread",
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "thread",
+          "{malformed",
+          `${durableEnvironmentId}:${threadId}`,
+        ),
+      );
+      expect(Option.isNone(yield* cacheStore.loadShell(durableId))).toBe(true);
+      expect(Option.isNone(yield* cacheStore.loadThread(durableId, threadId))).toBe(true);
+
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "shell",
+          encodeUnknownJson({
+            schemaVersion: 1,
+            environmentId: otherDurableEnvironmentId,
+            snapshot: shellSnapshot(),
+          }),
+          durableEnvironmentId,
+        ),
+      );
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "thread",
+          encodeUnknownJson({
+            schemaVersion: 1,
+            environmentId: otherDurableEnvironmentId,
+            threadId,
+            thread: orchestrationThread(),
+          }),
+          `${durableEnvironmentId}:${threadId}`,
+        ),
+      );
+      expect(Option.isNone(yield* cacheStore.loadShell(durableId))).toBe(true);
+      expect(Option.isNone(yield* cacheStore.loadThread(durableId, threadId))).toBe(true);
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "shell", durableEnvironmentId)),
+      ).toBeUndefined();
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "thread", `${durableEnvironmentId}:${threadId}`),
+        ),
+      ).toBeUndefined();
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+  });
+
+  it.effect("migrates valid legacy plaintext cache before deleting it", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    const durableId = EnvironmentId.make(durableEnvironmentId);
+    const thread = orchestrationThread();
+
+    return Effect.gen(function* () {
+      yield* (yield* EnvironmentCatalogStore).put(normalizedKnownEnvironment());
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "shell",
+          encodeUnknownJson({
+            schemaVersion: 1,
+            environmentId: durableEnvironmentId,
+            snapshot: shellSnapshot(),
+          }),
+          durableEnvironmentId,
+        ),
+      );
+      yield* Effect.promise(() =>
+        writeIndexedDbRecord(
+          factory,
+          "thread",
+          encodeUnknownJson({
+            schemaVersion: 1,
+            environmentId: durableEnvironmentId,
+            threadId,
+            thread,
+          }),
+          `${durableEnvironmentId}:${threadId}`,
+        ),
       );
 
-      shellStore.set(
-        environmentId,
-        encodeUnknownJson({
-          schemaVersion: 1,
-          environmentId: otherEnvironmentId,
-          snapshot: shellSnapshot(),
-        }),
-      );
-      threadStore.set(
-        `${environmentId}:${threadId}`,
-        encodeUnknownJson({
-          schemaVersion: 1,
-          environmentId: otherEnvironmentId,
-          threadId,
-          thread: orchestrationThread(),
-        }),
-      );
-      expect(Option.isNone(yield* cacheStore.loadShell(environmentId))).toBe(true);
-      expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
-    }).pipe(Effect.provide(connectionStorageLayer));
+      const cache = yield* EnvironmentCacheStore;
+      expect(yield* cache.loadShell(durableId)).toEqual(Option.some(shellSnapshot()));
+      expect(yield* cache.loadThread(durableId, threadId)).toEqual(Option.some(thread));
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "shell", durableEnvironmentId)),
+      ).toBeUndefined();
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "thread", `${durableEnvironmentId}:${threadId}`),
+        ),
+      ).toBeUndefined();
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "shellCache", durableEnvironmentId),
+        ),
+      ).toMatchObject({ entityKind: "shell" });
+      expect(
+        yield* Effect.promise(() =>
+          readIndexedDbValue(factory, "threadCache", [durableEnvironmentId, threadId]),
+        ),
+      ).toMatchObject({ entityKind: "thread" });
+    }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
   });
 
   it.effect("maps malformed save payloads and removal failures to persistence errors", () => {

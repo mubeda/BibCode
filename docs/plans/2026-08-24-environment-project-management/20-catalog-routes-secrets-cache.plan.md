@@ -527,7 +527,7 @@ git commit -m "feat(connections): verify route identity before credentials"
 
 - Produces: versioned AES-GCM envelope, associated-data scope, byte/age/LRU manifest, and session-only fallback.
 
-- [ ] **Step 1: Write failing round-trip/tamper/scope/eviction tests**
+- [x] **Step 1: Write failing round-trip/tamper/scope/eviction tests**
 
 ```ts
 await expect(decrypt(envelope, { ...scope, environmentId: OTHER_ENV })).rejects.toThrow();
@@ -535,13 +535,13 @@ await expect(decrypt({ ...envelope, ciphertext: tampered }, scope)).rejects.toTh
 expect(evict(manifest, { maxBytes: 1024, protect: selectedKey })).not.toContain(selectedKey);
 ```
 
-- [ ] **Step 2: Run cache tests and confirm RED**
+- [x] **Step 2: Run cache tests and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/cache/envelope.test.ts apps/web/src/connection/cacheCrypto.test.ts apps/web/src/connection/storage.test.ts
 ```
 
-- [ ] **Step 3: Define the envelope and associated data**
+- [x] **Step 3: Define the envelope and associated data**
 
 ```ts
 export interface EncryptedCacheEnvelope {
@@ -559,19 +559,19 @@ export interface EncryptedCacheEnvelope {
 
 Serialize `{schemaVersion, environmentId, storageInstanceId, entityKind, entityId}` as AES-GCM additional authenticated data.
 
-- [ ] **Step 4: Resolve cache keys through the secret capability**
+- [x] **Step 4: Resolve cache keys through the secret capability**
 
 Desktop uses an opaque `cache-key` reference. Secure browser contexts use a non-exportable Web Crypto key when durable structured-clone persistence succeeds; otherwise keep the key and cache in memory for the session and expose `persistence: "session-only"`.
 
-- [ ] **Step 5: Enforce age/byte/LRU bounds**
+- [x] **Step 5: Enforce age/byte/LRU bounds**
 
 Update the manifest in the same transaction as cache writes. Protect current selection, evict oldest unprotected entries, reject stale-revision overwrites, and quarantine a storage-identity mismatch without rendering it.
 
-- [ ] **Step 6: Migrate or delete legacy plaintext cache**
+- [x] **Step 6: Migrate or delete legacy plaintext cache**
 
 When a secure key is available, decode once and write an envelope before deleting plaintext. Otherwise delete persistent plaintext and report that offline history must resynchronize.
 
-- [ ] **Step 7: Run tests and commit**
+- [x] **Step 7: Run tests and commit**
 
 ```sh
 vp test run packages/client-runtime/src/cache/envelope.test.ts apps/web/src/connection/cacheCrypto.test.ts apps/web/src/connection/storage.test.ts

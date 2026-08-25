@@ -15,6 +15,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
+import { CacheManifestEntry, CacheQuarantineEntry } from "../cache/envelope.ts";
+
 import type {
   ConnectionRegistration,
   EnvironmentBinding,
@@ -177,6 +179,10 @@ export const EnvironmentCacheManifest = Schema.Struct({
   maxBytes: NonNegativeInt,
   maxAgeMs: NonNegativeInt,
   totalBytes: NonNegativeInt,
+  entries: Schema.Array(CacheManifestEntry).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  quarantine: Schema.Array(CacheQuarantineEntry).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 export type EnvironmentCacheManifest = typeof EnvironmentCacheManifest.Type;
 
