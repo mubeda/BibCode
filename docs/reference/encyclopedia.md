@@ -7,24 +7,28 @@ codebase and UI.
 
 ### Project
 
-The top-level workspace record in an environment. A project points at a
-workspace root and owns the visible primary/worktree rows in the left panel.
+An environment-local workspace record. A project points at one repository or
+workspace root and owns Main plus its ordinary and worktree-backed threads. The
+same project ID in another environment is unrelated.
 
 ### Workspace Root
 
 The filesystem path for a project checkout. Git, file, terminal, and provider
 operations run relative to this root unless a thread has a worktree path.
 
-### Primary Workspace Row
+### Main
 
-The left-panel row for a project's live checkout. It is backed by the project's
-default thread, shows the live checkout branch, and cannot be deleted as a
-normal thread.
+The permanent left-panel thread for a project's primary checkout. Main is
+stored with wire kind `default`, is always presented as **Main**, and cannot be
+renamed, archived, or deleted as an ordinary thread. Selecting the project opens
+Main.
 
-### Default Thread
+### Repository Claim
 
-The undeletable thread that backs a project primary row. Removing it is modeled
-as removing the project, not deleting a thread.
+The environment-local ownership record for one verified Git common-directory
+identity. A second add of the same repository family returns the existing
+project/Main; an independent clone and the same repository on another
+environment receive independent claims and projects.
 
 ### Worktree
 
@@ -48,8 +52,10 @@ transcript. They appear as center-panel tabs, not left-panel rows.
 
 ### Left Panel
 
-The project/worktree navigator. It shows project groups, primary rows, worktree
-rows, pin/unread state, context menus, and running agent sub-rows.
+The navigation-only `Environment -> Project -> Main/threads` tree. It shows
+status, pin/unread state, context menus, and running-agent adornments. Settings,
+diagnostics, conversations, terminals, files, diffs, and panel threads belong
+in center workspaces rather than extra left-panel tabs or information panels.
 
 ### Center Panel
 

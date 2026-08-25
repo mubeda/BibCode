@@ -485,11 +485,12 @@ git commit -m "feat(projects): enforce one permanent Main thread"
 - Modify: `docs/architecture/rpc-and-orchestration.md`
 - Modify: `docs/architecture/worktree-catalog.md`
 - Modify: `docs/reference/encyclopedia.md`
+- Modify: `docs/reference/workspace-layout.md`
 - Modify: `docs/user/workspace-ui.md`
 - Modify: `docs/testing/cross-platform-validation.md`
 - Modify: `docs/testing/execution-report-template.md`
 
-- [ ] **Step 1: Replace global-project terminology with the approved ownership contract**
+- [x] **Step 1: Replace global-project terminology with the approved ownership contract**
 
 Document the exact hierarchy and include this invariant block:
 
@@ -499,11 +500,11 @@ Repository claims are environment-local and use Git common-directory identity.
 Main is permanent; worktree-backed workspace threads still use the worktree catalog.
 ```
 
-- [ ] **Step 2: Add migration/restart/duplicate evidence fields to the runbook**
+- [x] **Step 2: Add migration/restart/duplicate evidence fields to the runbook**
 
 Record both UUIDs, duplicate-add disposition, independent-clone result, Main count, and unchanged worktree suite outcome without embedding machine-specific values in the living procedure.
 
-- [ ] **Step 3: Check links and commit**
+- [x] **Step 3: Check links and commit**
 
 ```sh
 git diff --check

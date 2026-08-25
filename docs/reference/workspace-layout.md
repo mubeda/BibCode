@@ -53,10 +53,14 @@ through Tauri commands/events. Browser mode connects directly to a native
 
 ## UI Workspace Model
 
-- A project is a repository/workspace root in an environment.
-- Every project has a primary row backed by an undeletable default thread for
-  the main checkout.
-- Worktree rows are workspace threads with `worktreePath` set.
+- The left panel is a navigation-only `Environment -> Project -> Main/threads`
+  tree; details and settings open in center workspaces.
+- A project is an environment-local repository/workspace root. The same local
+  Git common directory cannot back two active projects in one environment.
+- Every project has one permanent Main thread (`kind: "default"`) for the
+  primary checkout. Main cannot be renamed, archived, or independently deleted.
+- Worktree rows are workspace threads with `worktreePath` set; current worktree
+  discovery, adoption, identity, and removal behavior remains authoritative.
 - Center chat panels are sibling threads with `kind: "panel"` that share the
   host worktree while owning their own provider session and transcript.
 - Center surfaces are arranged into tab groups. Up to four groups can be shown

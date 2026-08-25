@@ -40,6 +40,21 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | ------- | ---------------- | -------- | --------------------- |
 |         |                  |          |                       |
 
+## Environment, project, and Main invariants
+
+- Environment UUID before/restart/restore:
+- Storage-instance UUID before/restart/restore:
+- UUIDs distinct and explicit start-empty rotation:
+- First project add disposition and project/Main IDs:
+- Same-path duplicate disposition and IDs:
+- Linked-worktree duplicate disposition and IDs:
+- Independent-clone disposition and IDs:
+- Same repository on another environment result:
+- Active Main count after migration/restart/replay:
+- Main rename/archive/delete rejection:
+- Ambiguous legacy migration diagnostic IDs:
+- Existing worktree suite result and unchanged-behavior evidence:
+
 ## VCS observation evidence
 
 - Execution host and route: Native | WSL direct | SSH/server | Unavailable

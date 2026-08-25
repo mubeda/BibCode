@@ -1,17 +1,21 @@
 # Workspace UI
 
-BiBCode is split into left, center, and right work areas. The left panel chooses
-the project/worktree thread, the center panel runs chats and terminals, and the
-right panel hosts project tools.
+BiBCode is split into left, center, and right work areas. The left panel is the
+navigation-only `Environment -> Project -> Main/threads` tree. The center panel
+owns conversations, terminals, environment overview/settings, and other tabbed
+workspaces; the right panel hosts tools for the selected thread.
 
 ## Left Panel
 
-Projects are shown as groups of workspace rows:
+Each project appears only beneath its owning environment:
 
-- The primary row represents the project's live checkout. Its branch label is
-  refreshed from the checkout, not from a stale thread title.
-- The primary row is backed by an undeletable default thread. Attempts to delete
-  it should guide the user to remove the project instead.
+- Main is the permanent first thread and represents the project's primary
+  checkout. Its wire kind remains `default`; the UI always labels it **Main**.
+  Main cannot be renamed, archived, or removed independently. Selecting the
+  project opens Main, while removing Main means removing the project.
+- Ordinary conversation threads follow Main. Worktree-backed threads retain
+  their existing branch, discovery, missing-path, dirty, lock, detach, and Git
+  removal behavior without an extra Worktrees navigation level.
 - Worktree rows represent eager worktree threads. Creating a worktree creates
   both the Git worktree and its thread before the first message.
 - Rows can show pinned/unread state and nested agent activity such as provider,
@@ -42,12 +46,16 @@ a mapped WSL backend is available, offering **This device** and the usable WSL
 locations. Browser clients retain connected-host selection. Local and mapped
 WSL locations use the native folder picker; browser-only remote hosts accept an
 explicit host path. Selecting a folder adds that folder as one project and does
-not scan for nested repositories.
+not scan for nested repositories. If that local Git common-directory/worktree
+family is already a project in the selected environment, BiBCode opens the
+existing project/Main and reports **Already added in this environment.** It does
+not create another project. An independent clone is allowed, and the same
+repository in another environment is a separate project.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
-delete worktree for worktree rows and remove project for primary rows. On the
+delete worktree for worktree rows and remove project for Main. On the
 local desktop environment, **Open in → File Explorer** opens the repository
-folder for a primary row or the worktree folder for a worktree row. The action
+folder for Main or the worktree folder for a worktree row. The action
 is omitted for remote environments and browser mode.
 
 ### Discovering existing worktrees

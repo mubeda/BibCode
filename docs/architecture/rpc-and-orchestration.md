@@ -66,6 +66,38 @@ authorization mapping is
 [`required_scope`](../../apps/server/src/auth/scope.rs); adding a live method
 without exactly one declared scope fails a server test.
 
+## Environment-local projects and permanent Main
+
+One WebSocket session is bound to one verified environment descriptor. Project
+and thread IDs are therefore environment-local on the server, while every
+client route, cache key, draft, and command reference carries the verified
+`environmentId`. The server database does not duplicate that identity on every
+project, thread, message, or activity table.
+
+`project.create` resolves the server-visible Git common directory before
+admission. The orchestration transaction acquires its environment-local
+repository claim and commits the project plus one `kind = "default"` thread.
+It returns exactly one of these typed outcomes:
+
+- `created { projectId, mainThreadId }`; or
+- `existing { projectId, mainThreadId, reason: "same-local-repository" }`.
+
+Command replay returns the original `created` outcome. A distinct request for
+the same verified local repository family returns the committed `existing`
+project/Main without creating another event group. Linked worktrees converge on
+that same claim; an independent clone with another common directory remains a
+different project even when its remote URL matches. The same repository may be
+added independently to another environment because claims never cross server
+data roots.
+
+The wire kind remains `default`, but product text calls it **Main**. A partial
+unique SQLite index permits at most one active default row per project. Legacy
+projection state is repaired only when canonical project/thread creation events
+prove one Main and every active thread kind; ambiguous or missing evidence
+stops migration with project/thread IDs. Ordinary `thread.meta.update`,
+`thread.archive`, and `thread.delete` reject Main title, archive, and deletion
+mutations. Only project deletion may retire Main together with the project.
+
 ## VCS status and mutation coordination
 
 `subscribeVcsStatus` and `vcs.refreshStatus` keep their existing wire shapes,
@@ -1009,6 +1041,10 @@ replacement that now occupies the old path.
 ## Invariants
 
 - Contracts define the wire; server and client fixtures guard compatibility.
+- Every client-side project/thread reference is scoped by the accepted
+  environment identity; server-local aggregate IDs are never treated as global.
+- Project creation and its Main are atomic, and one environment-local Git
+  repository identity has at most one active project claim.
 - One connection supervisor owns reconnects. The Effect RPC protocol does not
   retry sockets independently.
 - Authorization is checked at each HTTP route or RPC method, not inferred from

@@ -10,14 +10,14 @@ authority.
 
 ## Ownership and sources of truth
 
-| Concern                | Owner and durable source                                                                                                                                                                                                         |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Repository identity    | The server resolves `git-common-dir`; a successful authoritative scan establishes the project's durable compare-and-set repository pin. Generic project metadata writes cannot create or replace the pin.                        |
-| Current Git membership | A bounded server inventory of `git worktree list --porcelain -z` plus known-path probes. The repository observation is shared by projects that have the same verified common directory.                                          |
-| Discovery preference   | The complete `ProjectWorktreeDiscoveryPolicy` persisted in project metadata: `hidden` or `shown`, prompt acknowledgement, and a capped baseline of known paths.                                                                  |
-| Workspace ownership    | Orchestration projections and immutable thread events. A catalog snapshot joins them to the current inventory on the server.                                                                                                     |
-| Availability           | The shared `WorkspaceAvailabilityRegistry`, indexed by workspace identity and the server's physical path identity. Filesystem RPCs retain an admission lease for the whole operation; mutations also cross a finalization fence. |
-| Mutation arbitration   | Durable orchestration command receipts plus a process-local command claim, then the stable project lock and optional repository lock, retained by a server-owned operation after durable handoff.                                |
+| Concern                | Owner and durable source                                                                                                                                                                                                                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repository identity    | Project admission resolves `git-common-dir` and acquires the environment-local repository claim. A successful authoritative catalog scan separately establishes the project's durable compare-and-set repository pin. Generic project metadata writes cannot create or replace either fact. |
+| Current Git membership | A bounded server inventory of `git worktree list --porcelain -z` plus known-path probes. Observation remains repository-keyed, while the claim prevents multiple active projects in one environment from owning the same verified common directory.                                         |
+| Discovery preference   | The complete `ProjectWorktreeDiscoveryPolicy` persisted in project metadata: `hidden` or `shown`, prompt acknowledgement, and a capped baseline of known paths.                                                                                                                             |
+| Workspace ownership    | Orchestration projections and immutable thread events. A catalog snapshot joins them to the current inventory on the server.                                                                                                                                                                |
+| Availability           | The shared `WorkspaceAvailabilityRegistry`, indexed by workspace identity and the server's physical path identity. Filesystem RPCs retain an admission lease for the whole operation; mutations also cross a finalization fence.                                                            |
+| Mutation arbitration   | Durable orchestration command receipts plus a process-local command claim, then the stable project lock and optional repository lock, retained by a server-owned operation after durable handoff.                                                                                           |
 
 `packages/contracts` defines only the schemas and wire contracts. Runtime policy
 lives in the server catalog, orchestration, and availability services; React
@@ -51,9 +51,10 @@ the persisted display path. Adoption and ordinary thread mutations preserve the
 exact server-resolved checkout path and its separator/casing spelling for the
 workspace record and UI.
 
-The first authoritative scan through the configured primary checkout is the
-only operation that may establish the durable repository pin. Once pinned, a
-fallback anchor is accepted only when it resolves to that same identity. Anchor
+Project creation acquires the repository claim before publication. The first
+authoritative catalog scan through the configured primary checkout is the only
+operation that may establish the separate durable repository pin. Once pinned,
+a fallback anchor is accepted only when it resolves to that same identity. Anchor
 selection prefers the configured primary checkout, then a present adopted
 worktree, then a previously verified common directory retained for the service
 lifetime. A different repository at a reused path cannot replace the pin.
@@ -65,9 +66,11 @@ repository.
 
 ## Observation and catalog snapshots
 
-One repository observation is shared by every subscribed project with the same
-verified repository identity. Each project still receives its own joined view:
-eligible external worktrees, adopted workspaces, discovery policy, generation,
+One repository observation is keyed by verified repository identity. Under the
+project-claim invariant there is at most one active project view for that key in
+an environment; aliases and lifecycle handoffs may still reuse the observation
+without changing ownership. The project receives its own joined view: eligible
+external worktrees, adopted workspaces, discovery policy, generation,
 observation time, authority flag, and scan health.
 
 The production bounds are intentionally finite:

@@ -99,6 +99,30 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Environment, project, and Main invariant evidence
+
+When environment identity, project admission, project navigation, or thread
+kind behavior changes, use disposable roots and repositories and record:
+
+- `environmentId` and `storageInstanceId` before and after restart and in-place
+  restore; both remain stable and distinct. Record new UUIDs after explicit
+  start-empty without copying machine-specific values into this runbook;
+- one add of a Git repository returning `created`, then the same path and one
+  linked worktree returning `existing` with the same project/Main IDs;
+- an independent clone of the same remote in that environment returning
+  `created`, and the same repository on another environment remaining an
+  independent project;
+- exactly one active `kind = "default"` row per project after migration,
+  restart, and projection replay, plus rejected Main rename/archive/delete;
+- an ambiguous legacy Main fixture failing migration with its project/thread
+  IDs rather than deleting or selecting data; and
+- the unchanged worktree discovery, adoption, detach, retarget, removal, replay,
+  and cleanup suite result.
+
+Project/thread/cache/navigation assertions must always include the accepted
+environment identity. Do not use host label, distro, SSH target, path, remote
+URL, or project count as identity or availability evidence.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client
@@ -324,14 +348,16 @@ Git's worktree paths and the host's physical/canonical identities. In the
 packaged application:
 
 1. add the repository as a project;
-2. observe manually created worktrees in **Discovered worktrees**;
-3. verify the parent is grouped once and full paths remain accessible;
-4. adopt one candidate and exercise **Add all** only on disposable candidates;
-5. verify **Keep hidden** does not delete the Git worktree;
-6. present the same physical worktree through its platform alias and confirm no
+2. add its primary path and one linked-worktree path again, confirm both return
+   the existing project/Main, and confirm no duplicate project appears;
+3. observe manually created worktrees in **Discovered worktrees**;
+4. verify the parent is grouped once and full paths remain accessible;
+5. adopt one candidate and exercise **Add all** only on disposable candidates;
+6. verify **Keep hidden** does not delete the Git worktree;
+7. present the same physical worktree through its platform alias and confirm no
    duplicate owner/catalog entry appears;
-7. restart the exact package and confirm identity/adoption persists; and
-8. prove every external worktree still exists on disk.
+8. restart the exact package and confirm identity/adoption persists; and
+9. prove every external worktree still exists on disk.
 
 Do not run destructive worktree scenarios against a user repository.
 
@@ -345,7 +371,8 @@ user profile.
 Capture original-resolution screenshots at normal and minimum supported window
 sizes. Cover relevant:
 
-- Add Project and environment presentation;
+- Environment -> Project -> Main/thread hierarchy and Add Project duplicate
+  disposition, with no left-panel settings/information tabs;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears

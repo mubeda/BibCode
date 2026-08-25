@@ -45,16 +45,20 @@ flowchart TB
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
   and process supervision. Its worktree catalog joins bounded live Git and
   filesystem observations with durable project and canonical-thread
-  projections. A nullable project repository-key pin is stored outside the
-  rebuildable projection, established only by a trusted primary-checkout scan,
-  and joined into project reads; generic projection writes cannot change it,
-  and projection rewind/replay preserves it. It fences later fallback anchors
-  and is not a persisted live catalog. Projects sharing a repository may share
-  Git observation, but retain isolated latest-value snapshots, streams, thread
-  joins, subscribers, suppressions, and mutation epochs. Catalog views retain
-  the last authoritative arrays through degraded observations and cancel
-  pending poll, Git, and probe work after their final subscriber before bounded
-  idle eviction. Project and repository lifecycle epochs make poller
+  projections. An authoritative `project_repository_claims` row admits at most
+  one active project for a verified Git common-directory identity in this
+  environment. Claim acquisition, the project event, and its permanent Main
+  event commit together; project deletion releases the claim in its
+  authoritative transaction. A separate nullable project repository-key pin
+  is stored outside the rebuildable projection, established only by a trusted
+  primary-checkout scan, and joined into project reads; generic projection
+  writes cannot change it, and projection rewind/replay preserves it. It fences
+  later fallback anchors and is not a persisted live catalog. Repository-level
+  observation remains keyed by verified identity, while the claim prevents two
+  active project views in one environment from owning that identity. Catalog
+  views retain the last authoritative arrays through degraded observations and
+  cancel pending poll, Git, and probe work after their final subscriber before
+  bounded idle eviction. Project and repository lifecycle epochs make poller
   initialization transferable across subscriber aborts and prevent canceled
   prior-lifecycle work from publishing into an immediate reattachment.
   For an already trusted repository, Focus may reuse that observation when two
@@ -206,17 +210,22 @@ store; it is not evidence that the previous store was deleted. Recovery and
 diagnostics always report both the requested root and the canonical effective
 root so that alias changes are visible.
 
-`environmentId` is a logical routing identity. `storageInstanceId` is the
-persistent UUID of one prepared store. The client records the first observed
-non-null storage identity for a stable target and blocks a different identity
-before synchronization or cache consumption. That boundary cannot reconstruct
-history that predates marker deployment: the first protected release cannot
-detect that an earlier build already switched to another valid unmarked
-BiBCode database until the database receives a UUID and a client accepts it.
+`environmentId` is a random, server-owned UUID persisted in `environment-id`.
+It is the durable logical identity that scopes every project, thread, terminal,
+route, cache key, and navigation reference. `storageInstanceId` is the distinct
+persistent UUID of the prepared store in `storage-instance-id`. The client
+records the first accepted storage identity for an environment and blocks a
+different identity before synchronization or cache consumption. Host names,
+WSL distro names, SSH targets, labels, CLI flags, and client input are locators
+or presentation only; none may choose either UUID.
 
 The server classifies its persistent SQLite store before opening it for normal
-read/write traffic. The absence of both `state.sqlite` and its
-`environment-id` storage-instance marker is the only automatic first-run case.
+read/write traffic. The absence of `state.sqlite`, `environment-id`, and
+`storage-instance-id` is the only automatic first-run case. Under the existing
+data-root operation lock, a legacy store that has only `environment-id` moves
+that exact UUID to `storage-instance-id` and publishes a new random
+`environment-id`; interrupted states are retried without replacing either
+published marker.
 An existing unmarked database is adopted only after a read-only integrity,
 migration-ledger, and required-table check recognizes it as a BiBCode store;
 missing, malformed, corrupt, or unrelated state is preserved and startup fails
@@ -252,16 +261,14 @@ cleanup, mock backend lifecycle, window-state fixtures, and IPC fixtures cannot
 read, replace, or recursively remove a developer's or installed application's
 store on Windows, macOS, or Linux.
 
-After store preparation succeeds, the runtime copies the marker's persistent
-UUID into runtime-only server configuration. Every current-server descriptor
-surface publishes that UUID as `storageInstanceId`: the public
-`/.well-known/bibcode/environment` response, `server.getConfig`, the initial
-`subscribeServerConfig` snapshot, lifecycle welcome and ready events, and
-BiBCode Connect descriptors. A clean restart of the same store therefore
-reports the same identity. New local servers always publish a UUID string;
-contract decoding maps the omitted field from an older or third-party remote
-server to `null`. Normal environment descriptors never include the requested
-or effective data root, alias diagnostics, or any other local filesystem path.
+After store preparation succeeds, the runtime copies both prepared identities
+into runtime-only server configuration. Current environment descriptors publish
+strict UUID `environmentId` and `storageInstanceId` fields plus the supported
+protocol range, platform, server version, and bounded capabilities. A clean
+restart of the same root reports both UUIDs unchanged. In-place restore
+preserves both identities; explicit start-empty creates new identities. Normal
+environment descriptors never include the requested or effective data root,
+alias diagnostics, or any other local filesystem path.
 
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
@@ -289,9 +296,10 @@ before the migration transaction begins. SQLite's online backup API copies the
 live connection, including committed WAL data, in bounded cancellable page
 batches into a same-filesystem staging directory. The server then closes and
 checks the staged database, records its pre-migration ledger version, hashes it
-with SHA-256, writes a path-free manifest, flushes both files and supported
-directories, atomically renames the generation, and reloads it for checksum and
-`quick_check` verification. Unix backup directories and files use `0700` and
+with SHA-256, writes a path-free manifest that binds the environment and storage
+identities, flushes both files and supported directories, atomically renames the
+generation, and reloads it for checksum and `quick_check` verification. Unix
+backup directories and files use `0700` and
 `0600`; Windows generations inherit the private data-root ACL. Only after that
 publication is verified may migration start or retention remove older verified
 generations. Every backup ancestor is identity-bound beneath the effective root,
@@ -534,6 +542,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 [Connection runtime](./connection-runtime.md) for the detailed boundaries.
 
 ## Boundaries and invariants
+
+```text
+Environment identity scopes every project/thread reference.
+Repository claims are environment-local and use Git common-directory identity.
+Main is permanent; worktree-backed workspace threads still use the worktree catalog.
+```
 
 - React does not import Rust or native-host implementation details.
 - Privileged desktop behavior crosses `DesktopBridge` commands and events.
