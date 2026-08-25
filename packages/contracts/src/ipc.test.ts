@@ -10,6 +10,12 @@ import {
   DesktopServerExposureStateSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
+  DesktopWslDiscoverySchema,
+  RemoteHostProbeSchema,
+  RemoteSetupCancellationSchema,
+  RemoteSetupConsentDecisionSchema,
+  RemoteSetupConsentSchema,
+  RemoteSetupProgressSchema,
   type DesktopUpdateState,
   DesktopEnvironmentBootstrapSchema,
   DesktopUpdateStateSchema,
@@ -30,6 +36,190 @@ const decodeDesktopSecretInput = Schema.decodeUnknownSync(DesktopSecretInputSche
 const decodeDesktopSecretReference = Schema.decodeUnknownSync(DesktopSecretReferenceSchema);
 const decodeDesktopSecretStoreError = Schema.decodeUnknownSync(DesktopSecretStoreErrorSchema);
 const decodeDesktopServerExposureState = Schema.decodeUnknownSync(DesktopServerExposureStateSchema);
+const decodeDesktopWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
+const decodeRemoteHostProbe = Schema.decodeUnknownSync(RemoteHostProbeSchema);
+const decodeRemoteSetupConsent = Schema.decodeUnknownSync(RemoteSetupConsentSchema);
+const decodeRemoteSetupConsentDecision = Schema.decodeUnknownSync(RemoteSetupConsentDecisionSchema);
+const decodeRemoteSetupProgress = Schema.decodeUnknownSync(RemoteSetupProgressSchema);
+const decodeRemoteSetupCancellation = Schema.decodeUnknownSync(RemoteSetupCancellationSchema);
+
+describe("Desktop WSL discovery contract", () => {
+  it("preserves Running/Stopped state, default marker, and WSL version", () => {
+    expect(
+      decodeDesktopWslDiscovery({
+        generation: 7,
+        observedAt: "2036-08-25T12:00:00.000Z",
+        health: "available",
+        detail: null,
+        distros: [
+          { name: "Ubuntu", isDefault: true, state: "running", version: 2 },
+          { name: "Legacy Dev", isDefault: false, state: "stopped", version: 1 },
+        ],
+      }),
+    ).toMatchObject({
+      generation: 7,
+      health: "available",
+      distros: [
+        { name: "Ubuntu", isDefault: true, state: "running", version: 2 },
+        { name: "Legacy Dev", isDefault: false, state: "stopped", version: 1 },
+      ],
+    });
+  });
+
+  it.each(["disabled", "missing", "timedOut", "failed"] as const)(
+    "represents %s discovery health without fabricating a distro",
+    (health) => {
+      expect(
+        decodeDesktopWslDiscovery({
+          generation: 8,
+          observedAt: "2036-08-25T12:01:00.000Z",
+          health,
+          detail: health === "failed" ? "permission denied" : null,
+          distros: [],
+        }),
+      ).toMatchObject({ health, distros: [] });
+    },
+  );
+
+  it("carries a generation so consumers can reject a late snapshot", () => {
+    const current = decodeDesktopWslDiscovery({
+      generation: 11,
+      observedAt: "2036-08-25T12:03:00.000Z",
+      health: "available",
+      detail: null,
+      distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+    });
+    const late = decodeDesktopWslDiscovery({
+      generation: 10,
+      observedAt: "2036-08-25T12:02:00.000Z",
+      health: "available",
+      detail: null,
+      distros: [{ name: "Debian", isDefault: false, state: "running", version: 2 }],
+    });
+
+    expect(late.generation).toBeLessThan(current.generation);
+  });
+
+  it("rejects malformed rows instead of weakening the event contract", () => {
+    expect(() =>
+      decodeDesktopWslDiscovery({
+        generation: 12,
+        observedAt: "2036-08-25T12:04:00.000Z",
+        health: "available",
+        detail: "one malformed native row was isolated before publication",
+        distros: [{ name: "Ubuntu", isDefault: true, state: "paused", version: 2 }],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects an unbounded native diagnostic", () => {
+    expect(() =>
+      decodeDesktopWslDiscovery({
+        generation: 13,
+        observedAt: "2036-08-25T12:05:00.000Z",
+        health: "failed",
+        detail: "x".repeat(4097),
+        distros: [],
+      }),
+    ).toThrow();
+  });
+});
+
+describe("Remote setup contracts", () => {
+  it.each([
+    ["linux", "x86_64"],
+    ["macos", "aarch64"],
+    ["windows", "x86_64"],
+  ] as const)("decodes a staged %s/%s host probe", (os, architecture) => {
+    expect(
+      decodeRemoteHostProbe({
+        os,
+        architecture,
+        installedVersion: "0.4.1",
+        serviceMode: "workstation",
+        serviceState: "running",
+        dataRoot: "/managed/bibcode",
+        controlAvailable: true,
+      }),
+    ).toMatchObject({ os, architecture, serviceState: "running" });
+  });
+
+  it("binds install consent to one request and probe generation", () => {
+    const consent = decodeRemoteSetupConsent({
+      requestId: "setup-1",
+      probeGeneration: 4,
+      transport: "ssh",
+      targetLabel: "build-host",
+      targetVersion: "0.4.2",
+      artifact: {
+        product: "bibcode-server",
+        version: "0.4.2",
+        os: "linux",
+        architecture: "x86_64",
+        format: "tar.gz",
+        downloadName: "bibcode-server-linux-x86_64.tar.gz",
+        size: 4096,
+        sha256: "a".repeat(64),
+        signatureName: "bibcode-server-linux-x86_64.tar.gz.sig",
+      },
+      installDestination: "/home/dev/.local/share/bibcode/server/0.4.2",
+      dataRoot: "/home/dev/.bibcode",
+      serviceMode: "workstation",
+      requiredCommands: ["transfer verified artifact", "install atomically"],
+      expiresAt: "2036-08-25T12:10:00.000Z",
+    });
+    const decision = decodeRemoteSetupConsentDecision({
+      requestId: consent.requestId,
+      probeGeneration: consent.probeGeneration,
+      accepted: true,
+    });
+
+    expect(decision).toEqual({ requestId: "setup-1", probeGeneration: 4, accepted: true });
+  });
+
+  it("reports bounded stage progress without a credential field", () => {
+    const progress = decodeRemoteSetupProgress({
+      requestId: "setup-1",
+      generation: 5,
+      stage: "transfer",
+      status: "running",
+      completedBytes: 1024,
+      totalBytes: 4096,
+      message: "Transferring verified server artifact.",
+      credential: "must-not-survive-decoding",
+    });
+
+    expect(progress).toMatchObject({ stage: "transfer", completedBytes: 1024 });
+    expect(progress).not.toHaveProperty("credential");
+    expect(() =>
+      decodeRemoteSetupProgress({
+        ...progress,
+        completedBytes: 4097,
+        totalBytes: 4096,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRemoteSetupProgress({
+        ...progress,
+        message: "x".repeat(4097),
+      }),
+    ).toThrow();
+  });
+
+  it("represents cancellation as a terminal request-scoped event", () => {
+    expect(
+      decodeRemoteSetupCancellation({
+        requestId: "setup-1",
+        generation: 6,
+        stage: "install",
+        status: "cancelled",
+        mutationStatus: "partial",
+        cleanupStatus: "completed",
+        message: "Installation was cancelled; the previous version remains active.",
+      }),
+    ).toMatchObject({ status: "cancelled", mutationStatus: "partial" });
+  });
+});
 
 describe("Desktop server exposure contract", () => {
   it("represents only the packaged loopback listener", () => {

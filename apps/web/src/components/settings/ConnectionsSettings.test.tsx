@@ -662,8 +662,8 @@ function createDesktopBridgeStub(): DesktopBridgeStub {
     available: true,
     wslOnly: false,
     distros: [
-      { name: "Ubuntu", isDefault: true, version: 2 },
-      { name: "Debian", isDefault: false, version: 2 },
+      { name: "Ubuntu", isDefault: true, state: "running", version: 2 },
+      { name: "Debian", isDefault: false, state: "stopped", version: 2 },
     ],
     preflightError: null,
   };
@@ -1162,7 +1162,7 @@ describe("ConnectionsSettings", () => {
       distro: "Ubuntu",
       available: true,
       wslOnly: false,
-      distros: [{ name: "Ubuntu", isDefault: true, version: 2 }],
+      distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
       preflightError: null,
     } satisfies DesktopWslState;
     h.connectionsPresentation = "local-wsl";
@@ -1633,7 +1633,7 @@ describe("ConnectionsSettings", () => {
       distro: "Ubuntu",
       available: true,
       wslOnly: true,
-      distros: [{ name: "Ubuntu", isDefault: true, version: 2 }],
+      distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
       preflightError: null,
     } satisfies DesktopWslState;
     h.accessChangesQuery.data = accessSnapshot({

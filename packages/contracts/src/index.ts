@@ -7,6 +7,7 @@ export * from "./relayClient.ts";
 export * from "./desktopBootstrap.ts";
 export * from "./remoteAccess.ts";
 export * from "./ipc.ts";
+export * from "./serverArtifact.ts";
 export * from "./terminal.ts";
 export * from "./provider.ts";
 export * from "./providerUsage.ts";

@@ -13,6 +13,7 @@ const wslState: DesktopWslState = {
     {
       isDefault: true,
       name: "Ubuntu",
+      state: "running",
       version: 2,
     },
   ],

@@ -51,11 +51,11 @@
 - Create: `packages/contracts/src/serverArtifact.ts`, `serverArtifact.test.ts`
 - Modify: `packages/contracts/src/index.ts`
 
-- [ ] **Step 1: Write failing schema fixtures**
+- [x] **Step 1: Write failing schema fixtures**
 
 Cover Running/Stopped, default marker, WSL1/WSL2, partial valid rows, discovery unavailable/timeout/permission error, stale generations, SSH Linux/macOS/Windows probes, install consent, progress, cancellation, and manifest mismatch.
 
-- [ ] **Step 2: Replace the incomplete WSL row**
+- [x] **Step 2: Replace the incomplete WSL row**
 
 ```ts
 export const DesktopWslDistroSchema = Schema.Struct({
@@ -76,7 +76,7 @@ export const DesktopWslDiscoverySchema = Schema.Struct({
 
 Keep the last good snapshot separate from current discovery health so a transient command failure cannot erase accepted rows.
 
-- [ ] **Step 3: Define a staged SSH/WSL setup model**
+- [x] **Step 3: Define a staged SSH/WSL setup model**
 
 ```ts
 export const RemoteHostProbeSchema = Schema.Struct({
@@ -92,7 +92,7 @@ export const RemoteHostProbeSchema = Schema.Struct({
 
 Add request IDs and stages `trust`, `probe`, `download`, `verify`, `transfer`, `install`, `start`, `tunnel`, `verifyIdentity`, `pair`; progress contains bounded counts, never credentials.
 
-- [ ] **Step 4: Define artifact selection without filename guessing**
+- [x] **Step 4: Define artifact selection without filename guessing**
 
 ```ts
 export const ServerArtifactRecordSchema = Schema.Struct({
@@ -110,13 +110,34 @@ export const ServerArtifactRecordSchema = Schema.Struct({
 
 Plan 40 consumes fixture/remote manifests. Plan 70 builds and publishes the authoritative manifest and runs end-to-end artifact resolution.
 
-- [ ] **Step 5: Run schema tests and commit**
+- [x] **Step 5: Run schema tests and commit**
 
 ```sh
 vp test packages/contracts/src/ipc.test.ts packages/contracts/src/serverArtifact.test.ts
 git add packages/contracts/src/ipc.ts packages/contracts/src/ipc.test.ts packages/contracts/src/serverArtifact.ts packages/contracts/src/serverArtifact.test.ts packages/contracts/src/index.ts
 git commit -m "feat(contracts): model WSL discovery and remote provisioning"
 ```
+
+Implementation note: the WSL row now carries explicit Running/Stopped state,
+and discovery snapshots carry a monotonic generation, observation time, health,
+bounded detail, and only validated distro rows. Remote setup contracts model
+Linux/macOS/Windows probe results, the fixed trust-through-pair stage sequence,
+request/generation-bound consent, secret-free byte progress, cancellation, and
+partial cleanup state.
+
+The new schema-only server artifact contract selects by signed-manifest
+product/version/OS/architecture/format metadata rather than filenames. It
+rejects unsafe file names, invalid SHA-256 values, zero-size records,
+non-macOS universal artifacts, manifest/record drift, duplicate target records,
+and target/record mismatches. Plan 70 remains the producer and authoritative
+signature/download owner.
+
+The initial tests failed on the absent schemas and overlong diagnostics. Green
+validation passed 40 focused contract tests, 79 affected contract/web fixture tests, contracts
+typecheck, `vp check` with only the recorded Plan 20 warning, and the complete
+workspace typecheck graph with concurrency limited to one. Existing typed WSL
+test fixtures now state Running or Stopped explicitly; no compatibility default
+hides an incomplete native row.
 
 ### Task 2: Extract bounded asynchronous WSL discovery from the bridge
 

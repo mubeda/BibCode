@@ -151,8 +151,8 @@ function wslState(overrides: Partial<DesktopWslState> = {}): DesktopWslState {
     available: true,
     wslOnly: false,
     distros: [
-      { name: "Ubuntu", isDefault: true, version: 2 },
-      { name: "Debian", isDefault: false, version: 2 },
+      { name: "Ubuntu", isDefault: true, state: "running", version: 2 },
+      { name: "Debian", isDefault: false, state: "stopped", version: 2 },
     ],
     preflightError: null,
     ...overrides,

@@ -96,7 +96,8 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId } from "./baseSchemas.ts";
+import { EnvironmentId, IsoDateTime, NonNegativeInt } from "./baseSchemas.ts";
+import { ServerArtifactRecordSchema } from "./serverArtifact.ts";
 import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
@@ -669,14 +670,146 @@ export const PickFolderOptionsSchema = Schema.Struct({
 export interface DesktopWslDistro {
   name: string;
   isDefault: boolean;
+  state: "running" | "stopped";
   version: 1 | 2;
 }
 
 export const DesktopWslDistroSchema = Schema.Struct({
   name: Schema.String,
   isDefault: Schema.Boolean,
+  state: Schema.Literals(["running", "stopped"]),
   version: Schema.Literals([1, 2]),
 });
+
+export const DesktopWslDiscoveryHealthSchema = Schema.Literals([
+  "available",
+  "disabled",
+  "missing",
+  "timedOut",
+  "failed",
+]);
+export type DesktopWslDiscoveryHealth = typeof DesktopWslDiscoveryHealthSchema.Type;
+
+const BoundedDesktopDiagnosticSchema = Schema.String.check(
+  Schema.makeFilter(
+    (value) => value.length <= 4096 || "Desktop diagnostics must not exceed 4096 characters.",
+  ),
+);
+
+export const DesktopWslDiscoverySchema = Schema.Struct({
+  generation: NonNegativeInt,
+  observedAt: IsoDateTime,
+  health: DesktopWslDiscoveryHealthSchema,
+  detail: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+  distros: Schema.Array(DesktopWslDistroSchema),
+});
+export type DesktopWslDiscovery = typeof DesktopWslDiscoverySchema.Type;
+
+export const RemoteHostOsSchema = Schema.Literals(["linux", "macos", "windows"]);
+export type RemoteHostOs = typeof RemoteHostOsSchema.Type;
+
+export const RemoteHostArchitectureSchema = Schema.Literals(["x86_64", "aarch64"]);
+export type RemoteHostArchitecture = typeof RemoteHostArchitectureSchema.Type;
+
+export const RemoteHostServiceModeSchema = Schema.Literals(["workstation", "headless"]);
+export type RemoteHostServiceMode = typeof RemoteHostServiceModeSchema.Type;
+
+export const RemoteHostServiceStateSchema = Schema.Literals([
+  "notInstalled",
+  "stopped",
+  "running",
+  "failed",
+]);
+export type RemoteHostServiceState = typeof RemoteHostServiceStateSchema.Type;
+
+export const RemoteHostProbeSchema = Schema.Struct({
+  os: RemoteHostOsSchema,
+  architecture: RemoteHostArchitectureSchema,
+  installedVersion: Schema.NullOr(Schema.String),
+  serviceMode: Schema.NullOr(RemoteHostServiceModeSchema),
+  serviceState: RemoteHostServiceStateSchema,
+  dataRoot: Schema.NullOr(Schema.String),
+  controlAvailable: Schema.Boolean,
+});
+export type RemoteHostProbe = typeof RemoteHostProbeSchema.Type;
+
+export const RemoteSetupTransportSchema = Schema.Literals(["wsl", "ssh"]);
+export type RemoteSetupTransport = typeof RemoteSetupTransportSchema.Type;
+
+export const RemoteSetupStageSchema = Schema.Literals([
+  "trust",
+  "probe",
+  "download",
+  "verify",
+  "transfer",
+  "install",
+  "start",
+  "tunnel",
+  "verifyIdentity",
+  "pair",
+]);
+export type RemoteSetupStage = typeof RemoteSetupStageSchema.Type;
+
+export const RemoteSetupConsentSchema = Schema.Struct({
+  requestId: Schema.String,
+  probeGeneration: NonNegativeInt,
+  transport: RemoteSetupTransportSchema,
+  targetLabel: Schema.String,
+  targetVersion: Schema.String,
+  artifact: ServerArtifactRecordSchema,
+  installDestination: Schema.String,
+  dataRoot: Schema.String,
+  serviceMode: RemoteHostServiceModeSchema,
+  requiredCommands: Schema.Array(BoundedDesktopDiagnosticSchema).check(
+    Schema.makeFilter(
+      (commands) => commands.length <= 32 || "Remote setup consent command summaries are bounded.",
+    ),
+  ),
+  expiresAt: IsoDateTime,
+});
+export type RemoteSetupConsent = typeof RemoteSetupConsentSchema.Type;
+
+export const RemoteSetupConsentDecisionSchema = Schema.Struct({
+  requestId: Schema.String,
+  probeGeneration: NonNegativeInt,
+  accepted: Schema.Boolean,
+});
+export type RemoteSetupConsentDecision = typeof RemoteSetupConsentDecisionSchema.Type;
+
+export const RemoteSetupProgressSchema = Schema.Struct({
+  requestId: Schema.String,
+  generation: NonNegativeInt,
+  stage: RemoteSetupStageSchema,
+  status: Schema.Literals(["pending", "running", "completed", "failed", "cancelled"]),
+  completedBytes: NonNegativeInt,
+  totalBytes: Schema.NullOr(NonNegativeInt),
+  message: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(
+    ({ completedBytes, totalBytes }) =>
+      totalBytes === null ||
+      completedBytes <= totalBytes ||
+      "Remote setup completed bytes must not exceed the declared total.",
+  ),
+);
+export type RemoteSetupProgress = typeof RemoteSetupProgressSchema.Type;
+
+export const RemoteSetupCancelInputSchema = Schema.Struct({
+  requestId: Schema.String,
+  generation: NonNegativeInt,
+});
+export type RemoteSetupCancelInput = typeof RemoteSetupCancelInputSchema.Type;
+
+export const RemoteSetupCancellationSchema = Schema.Struct({
+  requestId: Schema.String,
+  generation: NonNegativeInt,
+  stage: RemoteSetupStageSchema,
+  status: Schema.Literal("cancelled"),
+  mutationStatus: Schema.Literals(["none", "partial", "completed"]),
+  cleanupStatus: Schema.Literals(["notRequired", "completed", "failed"]),
+  message: BoundedDesktopDiagnosticSchema,
+});
+export type RemoteSetupCancellation = typeof RemoteSetupCancellationSchema.Type;
 
 export interface DesktopWslState {
   // True when the user has opted the WSL backend in; the actual backend
