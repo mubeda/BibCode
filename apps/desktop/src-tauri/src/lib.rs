@@ -110,7 +110,6 @@ pub fn run() {
         let update_app = app.handle().clone();
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
-        wsl::request_refresh(app.handle().clone(), "startup");
         wsl::start_reconciliation(app.handle().clone());
 
         let app_handle = app.handle().clone();
@@ -119,6 +118,11 @@ pub fn run() {
         backend::install_termination_signal_handler(app_handle.clone(), backend.clone());
         tauri::async_runtime::spawn(async move {
             let discovery_app = app_handle.clone();
+            let discovery = app_handle
+                .state::<wsl::WslDiscoveryService>()
+                .inner()
+                .clone();
+            let _ = discovery.refresh_and_emit(&app_handle, "startup").await;
             match backend.start_default(app_handle).await {
                 Ok(_config) => {}
                 Err(error) => {

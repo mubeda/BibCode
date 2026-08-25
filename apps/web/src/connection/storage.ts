@@ -429,7 +429,12 @@ function upsertEnvironmentBinding(database: IDBDatabase, binding: EnvironmentBin
     const store = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME);
     const request = store.get([binding._tag, binding.bindingId]);
     let currentLoaded = false;
-    let current: { readonly acceptedEnvironmentId?: unknown } | undefined;
+    let current:
+      | {
+          readonly acceptedEnvironmentId?: unknown;
+          readonly lastDiscoveryGeneration?: unknown;
+        }
+      | undefined;
     let environmentLoaded = binding.acceptedEnvironmentId === null;
     let environmentExists = binding.acceptedEnvironmentId === null;
     const publish = () => {
@@ -448,10 +453,22 @@ function upsertEnvironmentBinding(database: IDBDatabase, binding: EnvironmentBin
         transaction.abort();
         return;
       }
+      if (
+        binding._tag === "DesktopWslBinding" &&
+        typeof current?.lastDiscoveryGeneration === "number" &&
+        current.lastDiscoveryGeneration > binding.lastDiscoveryGeneration
+      ) {
+        return;
+      }
       store.put(binding);
     };
     request.addEventListener("success", () => {
-      current = request.result as { readonly acceptedEnvironmentId?: unknown } | undefined;
+      current = request.result as
+        | {
+            readonly acceptedEnvironmentId?: unknown;
+            readonly lastDiscoveryGeneration?: unknown;
+          }
+        | undefined;
       currentLoaded = true;
       publish();
     });
@@ -874,13 +891,56 @@ function replaceEnvironmentRows(database: IDBDatabase, environment: KnownEnviron
       .getAllKeys(IDBKeyRange.only(environment.environmentId));
     let routeKeys: ReadonlyArray<IDBValidKey> | null = null;
     let bindingKeys: ReadonlyArray<IDBValidKey> | null = null;
+    let incomingBindingsRemaining = environment.bindings.length;
+    let published = false;
+    const currentIncomingBindings = new Map<
+      string,
+      | {
+          readonly acceptedEnvironmentId?: unknown;
+          readonly lastDiscoveryGeneration?: unknown;
+        }
+      | undefined
+    >();
+    const failAndAbort = (cause: unknown) => {
+      fail(cause);
+      transaction.abort();
+    };
     const publish = () => {
-      if (routeKeys === null || bindingKeys === null) return;
+      if (
+        published ||
+        routeKeys === null ||
+        bindingKeys === null ||
+        incomingBindingsRemaining !== 0
+      ) {
+        return;
+      }
+      for (const binding of environment.bindings) {
+        const current = currentIncomingBindings.get(binding.bindingId);
+        const currentEnvironmentId = current?.acceptedEnvironmentId;
+        if (
+          currentEnvironmentId !== undefined &&
+          currentEnvironmentId !== null &&
+          (typeof currentEnvironmentId !== "string" ||
+            currentEnvironmentId !== binding.acceptedEnvironmentId)
+        ) {
+          failAndAbort("A proved binding cannot be reassigned to another environment.");
+          return;
+        }
+        if (
+          binding._tag === "DesktopWslBinding" &&
+          typeof current?.lastDiscoveryGeneration === "number" &&
+          current.lastDiscoveryGeneration > binding.lastDiscoveryGeneration
+        ) {
+          failAndAbort("A stale WSL binding generation cannot replace the catalog aggregate.");
+          return;
+        }
+      }
+      published = true;
       transaction.objectStore(ENVIRONMENTS_STORE_NAME).put(environmentRecord(environment));
       for (const key of routeKeys) routeStore.delete(key);
       for (const key of bindingKeys) bindingStore.delete(key);
       for (const route of environment.routes) routeStore.add(route);
-      for (const binding of environment.bindings) bindingStore.add(binding);
+      for (const binding of environment.bindings) bindingStore.put(binding);
     };
     routeKeysRequest.addEventListener("success", () => {
       routeKeys = routeKeysRequest.result;
@@ -890,6 +950,25 @@ function replaceEnvironmentRows(database: IDBDatabase, environment: KnownEnviron
       bindingKeys = bindingKeysRequest.result;
       publish();
     });
+    for (const binding of environment.bindings) {
+      const request = bindingStore.get([binding._tag, binding.bindingId]);
+      request.addEventListener("error", () =>
+        failAndAbort(request.error ?? "Unknown IndexedDB binding read error"),
+      );
+      request.addEventListener("success", () => {
+        currentIncomingBindings.set(
+          binding.bindingId,
+          request.result as
+            | {
+                readonly acceptedEnvironmentId?: unknown;
+                readonly lastDiscoveryGeneration?: unknown;
+              }
+            | undefined,
+        );
+        incomingBindingsRemaining -= 1;
+        publish();
+      });
+    }
   }).pipe(Effect.withSpan("web.connectionStorage.replaceEnvironmentRows"));
 }
 

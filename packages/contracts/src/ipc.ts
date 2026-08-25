@@ -488,17 +488,15 @@ export const DesktopWslPreflightErrorSchema = Schema.Union([
 ]);
 
 export interface DesktopEnvironmentBootstrap {
-  // Stable backend instance id (e.g. "primary" or "wsl:ubuntu"). The
-  // web env runtime keys local environments off this so projects
-  // routed to a specific backend reopen against the same one.
+  // Host-managed runtime slot. Only "primary" is stable. WSL values are opaque
+  // process-instance keys and must never be persisted as environment or binding
+  // identity; descriptor UUIDs and the client catalog own those identities.
   id: string;
   label: string;
-  // Concrete WSL distro used by the current backend run. This stays separate
-  // from id because a default-tracking instance keeps the stable
-  // "wsl:default" IPC target while each run launches a specific distro.
+  // Concrete mutable locator used by this backend run. It remains separate
+  // from the opaque runtime slot and from durable descriptor identity.
   runningDistro?: string | null;
-  // The explicit distro whose desired registration this entry represents.
-  // null/absent means the stable default-tracking WSL registration.
+  // Discovery locator represented by an unavailable runtime candidate.
   configuredDistro?: string | null;
   httpBaseUrl: string | null;
   wsBaseUrl: string | null;
@@ -654,17 +652,15 @@ export const DesktopServerExposureStateSchema = Schema.Struct({
 
 export interface PickFolderOptions {
   initialPath?: string | null;
-  // When set, the desktop dialog opens against the named backend's
-  // filesystem instead of the primary's. Used by callers that already
-  // know which local environment they're targeting (e.g. opening a
-  // project that lives inside WSL). Omitting it keeps the historical
-  // behavior so non-WSL users never see a different picker.
-  targetEnvironmentId?: string;
+  // Mutable locator resolved from environment -> platform binding by the web
+  // catalog. Native code validates it against discovery and never treats it as
+  // the durable environment identity.
+  targetWslDistro?: string;
 }
 
 export const PickFolderOptionsSchema = Schema.Struct({
   initialPath: Schema.optionalKey(Schema.NullOr(Schema.String)),
-  targetEnvironmentId: Schema.optionalKey(Schema.String),
+  targetWslDistro: Schema.optionalKey(Schema.String),
 });
 
 export interface DesktopWslDistro {
@@ -812,19 +808,22 @@ export const RemoteSetupCancellationSchema = Schema.Struct({
 export type RemoteSetupCancellation = typeof RemoteSetupCancellationSchema.Type;
 
 export interface DesktopWslState {
-  // True when the user has opted the WSL backend in; the actual backend
-  // process is registered with the desktop pool independently of this
-  // flag and may take a moment to come up after the user enables it.
+  // True when authoritative discovery contains at least one Running distro.
+  // Running distros are host-managed candidates by default; this is no longer
+  // a persisted opt-in flag.
   enabled: boolean;
-  // null means "track the current WSL default distro".
+  /** Retired selected-distro setting, exposed only as migration input. */
   distro: string | null;
+  /** Normalized accepted-locator hint derived from retired desktop settings. */
+  legacyAcceptedDistro: string | null;
   available: boolean;
-  // When true the desktop runs only the WSL backend as the primary and treats
-  // this intent as authoritative even if a persisted `enabled` flag is stale.
-  // The Windows-side backend is not started. Toggling this requires an app restart because the
-  // primary backend's spec is captured once at layer init.
+  // When true the desktop runs the current Running default distro as primary
+  // and does not start the Windows-side server. Changing it restarts the owned
+  // backend topology and fails closed if no distro is Running.
   wslOnly: boolean;
   distros: readonly DesktopWslDistro[];
+  /** Authoritative generation-fenced discovery snapshot used for reconciliation. */
+  discovery: DesktopWslDiscovery;
   // A structured primary or secondary WSL failure. Primary failures never
   // substitute Windows; secondary failures leave the Windows primary live.
   // null means planning/startup has not failed.
@@ -834,9 +833,11 @@ export interface DesktopWslState {
 export const DesktopWslStateSchema = Schema.Struct({
   enabled: Schema.Boolean,
   distro: Schema.NullOr(Schema.String),
+  legacyAcceptedDistro: Schema.NullOr(Schema.String),
   available: Schema.Boolean,
   wslOnly: Schema.Boolean,
   distros: Schema.Array(DesktopWslDistroSchema),
+  discovery: DesktopWslDiscoverySchema,
   preflightError: Schema.NullOr(DesktopWslPreflightErrorSchema),
 });
 
@@ -1379,7 +1380,9 @@ export interface DesktopBridge {
   }) => Promise<DesktopServerExposureState>;
   getAdvertisedEndpoints: () => Promise<readonly AdvertisedEndpoint[]>;
   getWslState: () => Promise<DesktopWslState>;
+  /** @deprecated Compatibility refresh; Running distro discovery owns availability. */
   setWslBackendEnabled: (enabled: boolean) => Promise<DesktopWslState>;
+  /** @deprecated Compatibility refresh; platform bindings own distro locators. */
   setWslDistro: (distro: string | null) => Promise<DesktopWslState>;
   setWslOnly: (enabled: boolean) => Promise<DesktopWslState>;
   pickFolder: (options?: PickFolderOptions) => Promise<string | null>;

@@ -4,7 +4,7 @@ import { PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
 import {
   applyWslEnvironmentConfiguration,
   parseWslUncPath,
-  resolveProjectPickerTarget,
+  resolveProjectPickerDistro,
   resolveWslProjectSelection,
   type WslEnvironmentCandidate,
 } from "~/wslPaths";
@@ -68,15 +68,22 @@ export async function pickHostFolder(input: PickHostFolderInput): Promise<PickHo
     input.host.isPrimary && input.host.platform === "Linux"
       ? await input.getWslState().catch(() => null)
       : null;
-  const targetEnvironmentId = resolveProjectPickerTarget({
+  const configuredCandidates = applyWslEnvironmentConfiguration(
+    input.wslCandidates,
+    input.primaryEnvironmentId,
+    wslState,
+    input.primaryRunningDistro,
+  );
+  const targetWslDistro = resolveProjectPickerDistro({
     browseEnvironmentId: input.host.environmentId,
     primaryEnvironmentId: input.primaryEnvironmentId,
-    desktopInstanceId: input.host.desktopInstanceId,
+    candidates: configuredCandidates,
     wslConfiguration: wslState,
+    primaryRunningDistro: input.primaryRunningDistro,
   });
   const pickedPath = await input.dialogs.pickFolder({
     initialPath: input.initialPath,
-    ...(targetEnvironmentId ? { targetEnvironmentId } : {}),
+    ...(targetWslDistro ? { targetWslDistro } : {}),
   });
   if (!pickedPath) return { _tag: "Cancelled" };
   if (!parseWslUncPath(pickedPath)) {
@@ -87,15 +94,7 @@ export async function pickHostFolder(input: PickHostFolderInput): Promise<PickHo
     };
   }
 
-  const selection = resolveWslProjectSelection(
-    pickedPath,
-    applyWslEnvironmentConfiguration(
-      input.wslCandidates,
-      input.primaryEnvironmentId,
-      wslState,
-      input.primaryRunningDistro,
-    ),
-  );
+  const selection = resolveWslProjectSelection(pickedPath, configuredCandidates);
   return selection
     ? { _tag: "Selected", environmentId: selection.environmentId, path: selection.linuxPath }
     : {

@@ -1609,12 +1609,28 @@ describe("connectionStorageLayer", () => {
 
     return Effect.gen(function* () {
       const catalog = yield* EnvironmentCatalogStore;
-      const environment = normalizedKnownEnvironment();
+      const baseEnvironment = normalizedKnownEnvironment();
+      const provedBinding = decodeEnvironmentBinding({
+        _tag: "DesktopWslBinding",
+        bindingId: "binding-ubuntu",
+        distroName: "Ubuntu",
+        acceptedEnvironmentId: baseEnvironment.environmentId,
+        acceptedStorageInstanceIds: [baseEnvironment.acceptedStorageInstanceId],
+        acceptedAt: now,
+        lastDiscoveryGeneration: 1,
+        condition: "available",
+        detail: null,
+      });
+      const environment = decodeKnownEnvironment({
+        ...baseEnvironment,
+        bindings: [provedBinding],
+      });
 
       expect(yield* catalog.list).toEqual([]);
       yield* catalog.put(environment);
       expect(yield* catalog.list).toEqual([environment]);
       expect(yield* catalog.load(environment.environmentId)).toEqual(Option.some(environment));
+      expect(yield* catalog.listBindings).toEqual([provedBinding]);
 
       yield* (yield* EnvironmentCleanupStore).commitForget(environment.environmentId);
       expect(yield* catalog.list).toEqual([]);
@@ -1801,7 +1817,7 @@ describe("connectionStorageLayer", () => {
       yield* catalog.put(second);
       const binding = decodeEnvironmentBinding({
         _tag: "DesktopWslBinding",
-        bindingId: "wsl:Ubuntu",
+        bindingId: "binding-ubuntu",
         distroName: "Ubuntu",
         acceptedEnvironmentId: first.environmentId,
         acceptedStorageInstanceIds: [durableStorageId],
@@ -1825,7 +1841,7 @@ describe("connectionStorageLayer", () => {
 
       const orphan = decodeEnvironmentBinding({
         ...binding,
-        bindingId: "wsl:Missing",
+        bindingId: "binding-missing",
         distroName: "Missing",
         acceptedEnvironmentId: missingDurableEnvironmentId,
         acceptedStorageInstanceIds: [missingDurableStorageId],
@@ -1834,6 +1850,82 @@ describe("connectionStorageLayer", () => {
         "put-environment-binding",
       );
       expect(yield* catalog.listBindings).toEqual([binding]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("ignores a stale WSL binding generation without rolling back its locator", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const current = decodeEnvironmentBinding({
+        _tag: "DesktopWslBinding",
+        bindingId: "binding-ubuntu",
+        distroName: "Ubuntu-Renamed",
+        acceptedEnvironmentId: null,
+        acceptedStorageInstanceIds: [],
+        acceptedAt: null,
+        lastDiscoveryGeneration: 8,
+        condition: "setup-required",
+        detail: "Install required.",
+      });
+      yield* catalog.putBinding(current);
+
+      yield* catalog.putBinding(
+        decodeEnvironmentBinding({
+          ...current,
+          distroName: "Ubuntu-Old",
+          lastDiscoveryGeneration: 7,
+          condition: "unavailable",
+          detail: "Stale snapshot.",
+        }),
+      );
+
+      expect(yield* catalog.listBindings).toEqual([current]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("atomically proves a pre-setup WSL binding into its descriptor environment", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const unproved = decodeEnvironmentBinding({
+        _tag: "DesktopWslBinding",
+        bindingId: "binding-ubuntu",
+        distroName: "Ubuntu",
+        acceptedEnvironmentId: null,
+        acceptedStorageInstanceIds: [],
+        acceptedAt: null,
+        lastDiscoveryGeneration: 4,
+        condition: "setup-required",
+        detail: "Install required.",
+      });
+      yield* catalog.putBinding(unproved);
+
+      const baseEnvironment = normalizedKnownEnvironment();
+      const proved = decodeEnvironmentBinding({
+        ...unproved,
+        acceptedEnvironmentId: baseEnvironment.environmentId,
+        acceptedStorageInstanceIds: [baseEnvironment.acceptedStorageInstanceId],
+        acceptedAt: now,
+        condition: "available",
+        detail: null,
+      });
+      const environment = decodeKnownEnvironment({
+        ...baseEnvironment,
+        bindings: [proved],
+      });
+      yield* catalog.put(environment);
+
+      expect(yield* catalog.load(environment.environmentId)).toEqual(Option.some(environment));
+      expect(yield* catalog.listBindings).toEqual([proved]);
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 

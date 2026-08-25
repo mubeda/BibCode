@@ -223,12 +223,15 @@ runbook/CI evidence rather than being claimed from the macOS host.
 - Modify: `packages/contracts/src/ipc.ts`
 - Modify: `apps/web/src/state/desktopWslState.ts`, tests
 - Modify: `apps/web/src/connection/storage.ts`, tests
+- Modify: `apps/web/src/wslPaths.ts`, `connection/desktopLocal.ts`, `connection/platform.ts`
+- Modify: `apps/web/src/components/hostFolderPicker.ts`, Add Project and worktree-settings callers
+- Modify: `apps/web/src/tauriDesktopBridge.ts`, provider-update locator helpers, and affected tests
 
-- [ ] **Step 1: Write failing reconciliation tables**
+- [x] **Step 1: Write failing reconciliation tables**
 
 Cover new Running -> visible/setup required; new Stopped -> discovery only; accepted Stopped -> visible/stopped; Running with same descriptor after rename -> same environment; reused name with different UUID -> blocked identity conflict; missing snapshot -> retained unavailable; stale generation -> ignored; user Hide -> hidden but binding retained.
 
-- [ ] **Step 2: Persist a locator binding distinct from identity**
+- [x] **Step 2: Persist a locator binding distinct from identity**
 
 ```ts
 type WslPlatformBinding = {
@@ -243,15 +246,15 @@ type WslPlatformBinding = {
 
 The binding can exist before setup with `acceptedEnvironmentId = null`. A proved descriptor atomically attaches it to the catalog environment from Plan 20.
 
-- [ ] **Step 3: Replace one-selected-distro backend planning**
+- [x] **Step 3: Replace one-selected-distro backend planning**
 
 Plan one backend candidate per Running distro, not `wsl_backend_enabled + wsl_distro`. Keep legacy desktop settings only as a migration input that marks the prior distro accepted, then stop writing them.
 
-- [ ] **Step 4: Preserve worktree routing**
+- [x] **Step 4: Preserve worktree routing**
 
 Replace `wsl:<name>` as public identity with a binding lookup. Folder picker, open-in-editor, terminal, Git, worktree discovery/adoption/removal, and process ownership resolve `environmentId -> binding -> distroName`. No Git/worktree record stores the mutable distro name as identity.
 
-- [ ] **Step 5: Run state/storage/backend tests and commit**
+- [x] **Step 5: Run state/storage/backend tests and commit**
 
 ```sh
 vp test apps/web/src/state/desktopWslState.test.ts apps/web/src/connection/storage.test.ts
@@ -259,6 +262,37 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop backend:: -- --nocap
 git add apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts apps/web/src/state/desktopWslState.ts apps/web/src/state/desktopWslState.test.ts apps/web/src/connection/storage.ts apps/web/src/connection/storage.test.ts
 git commit -m "feat(environments): reconcile WSL bindings by server identity"
 ```
+
+Implementation note: the web now has one pure, generation-fenced WSL
+reconciler covering every table above. Mutable distro locators live only in
+`DesktopWslBinding`; a verified descriptor UUID plus an accepted storage UUID
+can atomically prove a pre-setup binding into the Plan 20 catalog. IndexedDB
+rejects proved-binding reassignment and stale WSL generations both for direct
+binding writes and aggregate environment replacement.
+
+Desktop startup awaits its first owned discovery snapshot before planning. It
+plans one candidate for every Running distro, selects the Running default only
+when WSL-only mode needs a primary, and uses random opaque runtime-slot IDs for
+secondaries. Retired `wslBackendEnabled` and `wslDistro` fields remain read-only
+migration inputs, are omitted from new settings writes, and are ignored by
+backend planning. Their compatibility IPC setters now refresh state without
+mutating selection. Folder and worktree pickers resolve a durable environment
+to its current running-distro locator and pass that locator explicitly; the
+native bridge validates it against authoritative Running discovery and never
+starts a stopped distro. The old `wsl:<name>` parser is removed, and Git,
+worktree, terminal, editor, and process records continue to be scoped by
+durable environment identity rather than distro name. Task 9 remains the
+planned owner of event-driven bridge subscription and feeding these bindings
+into the live Plan 20 catalog; it does not change this identity boundary.
+
+The exact focused commands passed on macOS: 80 state/storage tests, 93 backend
+tests, 43 bridge tests, and a 322-test affected web/contracts batch. The full
+desktop package passed 304 unit tests plus 7 bridge/SSH public-contract tests;
+desktop Clippy passed for all targets with warnings denied, Rust formatting,
+`vp check`, workspace typecheck, and diff checks passed. `vp check` retained one
+pre-existing unused-test-fixture warning in `connection/storage.test.ts` and no
+errors. Native Windows runtime behavior remains for the Windows runbook/CI
+evidence rather than being claimed from this macOS host.
 
 ### Task 4: Replace WSL wildcard HTTP with a desktop-owned loopback forwarder
 

@@ -6,7 +6,7 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 
-import { desktopLocalBackendId, isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
+import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "~/connection/useDesktopLocalBootstraps";
 import { readLocalApi } from "~/localApi";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
@@ -160,15 +160,13 @@ function EnvironmentWorktreeWorkspaceSetting({
     nativePickerAvailable: typeof window !== "undefined" && window.desktopBridge !== undefined,
   };
   const wslCandidates = environments.flatMap((candidate) => {
-    const backendId = desktopLocalBackendId(candidate.entry.target);
-    if (backendId === null) return [];
+    if (!isDesktopLocalConnectionTarget(candidate.entry.target)) return [];
     const bootstrap = desktopLocalBootstraps.find(
       (entry) => entry.httpBaseUrl === candidate.displayUrl,
     );
     return [
       {
         environmentId: candidate.environmentId,
-        backendId,
         runningDistro: bootstrap?.runningDistro ?? null,
       },
     ];

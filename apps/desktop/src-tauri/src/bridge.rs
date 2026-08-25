@@ -52,8 +52,6 @@ const CLIENT_SETTINGS_FILE_NAME: &str = "client-settings.json";
 const CONNECTION_CATALOG_FILE_NAME: &str = "connection-catalog.tauri.json";
 const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
-const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
-const WSL_INSTANCE_ID_PREFIX: &str = "wsl:";
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
@@ -307,8 +305,6 @@ fn desktop_settings_to_value(settings: &DesktopSettings) -> Value {
         "serverExposureMode": &settings.server_exposure_mode,
         "tailscaleServeEnabled": settings.tailscale_serve_enabled,
         "tailscaleServePort": settings.tailscale_serve_port,
-        "wslBackendEnabled": settings.wsl_backend_enabled,
-        "wslDistro": &settings.wsl_distro,
         "wslOnly": settings.wsl_only,
     })
 }
@@ -640,23 +636,34 @@ async fn tailscale_advertised_endpoints_for_config(
     tailscale_endpoints_for_status(config, &status, magic_dns_reachable)
 }
 
-fn extract_wsl_distro_from_environment_id(environment_id: &str) -> Option<String> {
-    let suffix = environment_id.strip_prefix(WSL_INSTANCE_ID_PREFIX)?;
-    if suffix.is_empty() || suffix == "default" {
-        return None;
-    }
-    normalize_wsl_distro(Some(suffix.to_string()))
-}
-
-fn is_wsl_pick_folder_target(raw_options: Option<&Value>) -> bool {
-    let Some(target_id) = raw_options
-        .and_then(|options| options.get("targetEnvironmentId"))
+fn resolve_running_wsl_picker_distro(
+    raw_options: Option<&Value>,
+    discovery: &WslDiscoverySnapshot,
+) -> Result<Option<String>, String> {
+    let Some(requested) = raw_options
+        .and_then(|options| options.get("targetWslDistro"))
         .and_then(Value::as_str)
     else {
-        return false;
+        return Ok(None);
     };
-
-    target_id != PRIMARY_LOCAL_ENVIRONMENT_ID && target_id.starts_with(WSL_INSTANCE_ID_PREFIX)
+    if !is_valid_distro_name(requested) {
+        return Err("The WSL folder-picker locator is invalid.".to_string());
+    }
+    if discovery.health != WslDiscoveryHealth::Available {
+        return Err("WSL discovery is not currently authoritative.".to_string());
+    }
+    discovery
+        .distros
+        .iter()
+        .find(|distro| {
+            distro.name.eq_ignore_ascii_case(requested)
+                && distro.state == crate::wsl::WslDistroState::Running
+        })
+        .map(|distro| Some(distro.name.clone()))
+        .ok_or_else(|| {
+            "The selected WSL distribution is not currently Running; BiBCode will not start it automatically."
+                .to_string()
+        })
 }
 
 fn resolve_wsl_home_unc_path(config_distro: Option<&str>, distros: &[WslDistro]) -> Option<String> {
@@ -747,20 +754,15 @@ fn wsl_unc_path_to_linux_path(windows_path: &str) -> Option<String> {
 
 fn resolve_pick_folder_dialog_default_path<R: Runtime>(
     app: &AppHandle<R>,
-    settings: &DesktopSettings,
     raw_options: Option<&Value>,
+    target_wsl_distro: Option<&str>,
 ) -> Option<PathBuf> {
-    if !is_wsl_pick_folder_target(raw_options) {
+    if target_wsl_distro.is_none() {
         return resolve_pick_folder_default_path(app, raw_options);
     }
 
-    let target_distro = raw_options
-        .and_then(|options| options.get("targetEnvironmentId"))
-        .and_then(Value::as_str)
-        .and_then(extract_wsl_distro_from_environment_id)
-        .or_else(|| settings.wsl_distro.clone());
     let distros = app.state::<WslDiscoveryService>().last_good_distros();
-    resolve_wsl_pick_folder_default_path(raw_options, target_distro.as_deref(), &distros, None)
+    resolve_wsl_pick_folder_default_path(raw_options, target_wsl_distro, &distros, None)
 }
 
 fn wsl_state(
@@ -768,6 +770,18 @@ fn wsl_state(
     backend: &BackendSupervisor,
     discovery: &WslDiscoverySnapshot,
 ) -> Value {
+    let legacy_accepted_distro = settings
+        .wsl_backend_enabled
+        .then(|| {
+            settings.wsl_distro.clone().or_else(|| {
+                discovery
+                    .distros
+                    .iter()
+                    .find(|distro| distro.is_default)
+                    .map(|distro| distro.name.clone())
+            })
+        })
+        .flatten();
     let preflight_error = match backend.primary_plan_error() {
         Some(BackendPlanError::WslPrimaryUnavailable { detail }) => Some(json!({
             "kind": "wsl-primary-unavailable",
@@ -784,11 +798,16 @@ fn wsl_state(
             }),
     };
     json!({
-        "enabled": settings.wsl_backend_enabled,
+        "enabled": discovery
+            .distros
+            .iter()
+            .any(|distro| distro.state == crate::wsl::WslDistroState::Running),
         "distro": &settings.wsl_distro,
+        "legacyAcceptedDistro": legacy_accepted_distro,
         "available": discovery.health == WslDiscoveryHealth::Available,
         "wslOnly": settings.wsl_only,
         "distros": &discovery.distros,
+        "discovery": discovery,
         "preflightError": preflight_error,
     })
 }
@@ -1171,13 +1190,8 @@ pub async fn desktop_bridge_set_wsl_backend_enabled(
     backend: State<'_, BackendSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_backend_enabled = enabled;
-        if !enabled {
-            settings.wsl_only = false;
-        }
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
+    let _ = enabled;
+    let settings = read_desktop_settings(&app)?;
     let discovery = app.state::<WslDiscoveryService>().inner().clone();
     let snapshot = discovery
         .refresh_and_emit(&app, "backend lifecycle")
@@ -1192,10 +1206,8 @@ pub async fn desktop_bridge_set_wsl_distro(
     backend: State<'_, BackendSupervisor>,
     distro: Option<String>,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_distro = normalize_wsl_distro(distro);
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
+    let _ = distro;
+    let settings = read_desktop_settings(&app)?;
     let discovery = app.state::<WslDiscoveryService>().inner().clone();
     let snapshot = discovery
         .refresh_and_emit(&app, "accepted binding change")
@@ -1248,12 +1260,15 @@ pub async fn desktop_bridge_pick_folder(
         .and_then(Value::as_str)
         .unwrap_or("Select Folder");
 
-    let settings = read_desktop_settings(&app)?;
-    let use_wsl = is_wsl_pick_folder_target(options.as_ref());
+    let discovery = app.state::<WslDiscoveryService>().snapshot();
+    let target_wsl_distro = resolve_running_wsl_picker_distro(options.as_ref(), &discovery)?;
+    let use_wsl = target_wsl_distro.is_some();
     let mut dialog = app.dialog().file().set_title(title);
-    if let Some(default_path) =
-        resolve_pick_folder_dialog_default_path(&app, &settings, options.as_ref())
-    {
+    if let Some(default_path) = resolve_pick_folder_dialog_default_path(
+        &app,
+        options.as_ref(),
+        target_wsl_distro.as_deref(),
+    ) {
         dialog = dialog.set_directory(default_path);
     }
 
@@ -2026,7 +2041,7 @@ mod tests {
         };
         let backend = BackendSupervisor::new();
         backend.record_unavailable_environment(BackendUnavailableEnvironment {
-            environment_id: "wsl:Ubuntu".to_string(),
+            environment_id: "desktop-wsl-runtime:test".to_string(),
             label: "WSL (Ubuntu)".to_string(),
             configured_distro: Some("Ubuntu".to_string()),
             detail: "the selected distribution could not start".to_string(),
@@ -2044,7 +2059,7 @@ mod tests {
         assert_eq!(
             backend.local_environment_bootstraps(),
             vec![json!({
-                "id": "wsl:Ubuntu",
+                "id": "desktop-wsl-runtime:test",
                 "label": "WSL (Ubuntu)",
                 "configuredDistro": "Ubuntu",
                 "runningDistro": null,
@@ -2170,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_settings_defaults_and_serialization_are_stable() {
+    fn desktop_settings_write_omits_retired_wsl_selection_fields() {
         let settings = default_desktop_settings();
 
         assert_eq!(
@@ -2179,8 +2194,6 @@ mod tests {
                 "serverExposureMode": "local-only",
                 "tailscaleServeEnabled": false,
                 "tailscaleServePort": 443,
-                "wslBackendEnabled": false,
-                "wslDistro": null,
                 "wslOnly": false,
             })
         );
@@ -2280,13 +2293,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_wsl_distro_names_and_environment_locators() {
+    fn validates_wsl_distro_locators() {
         assert!(is_valid_distro_name("Ubuntu 24.04-LTS"));
         assert!(!is_valid_distro_name(""));
         assert!(!is_valid_distro_name("-Ubuntu"));
         assert!(!is_valid_distro_name("Ubuntu!"));
-        assert_eq!(extract_wsl_distro_from_environment_id("primary"), None);
-        assert_eq!(extract_wsl_distro_from_environment_id("wsl:bad!name"), None);
     }
 
     #[test]
@@ -2398,22 +2409,44 @@ mod tests {
     }
 
     #[test]
-    fn detects_wsl_picker_targets() {
-        assert!(is_wsl_pick_folder_target(Some(&json!({
-            "targetEnvironmentId": "wsl:Ubuntu"
-        }))));
-        assert!(is_wsl_pick_folder_target(Some(&json!({
-            "targetEnvironmentId": "wsl:default"
-        }))));
-        assert!(!is_wsl_pick_folder_target(Some(&json!({
-            "targetEnvironmentId": "primary"
-        }))));
-        assert!(!is_wsl_pick_folder_target(None));
+    fn validates_wsl_picker_targets_against_running_discovery() {
+        let running = WslDiscoverySnapshot {
+            generation: 2,
+            observed_at: "2026-08-25T00:00:00Z".to_string(),
+            health: WslDiscoveryHealth::Available,
+            detail: None,
+            distros: vec![WslDistro {
+                name: "Ubuntu".to_string(),
+                is_default: true,
+                state: WslDistroState::Running,
+                version: 2,
+            }],
+        };
         assert_eq!(
-            extract_wsl_distro_from_environment_id("wsl:Ubuntu-22.04"),
-            Some("Ubuntu-22.04".to_string())
+            resolve_running_wsl_picker_distro(
+                Some(&json!({"targetWslDistro": "ubuntu"})),
+                &running,
+            ),
+            Ok(Some("Ubuntu".to_string())),
         );
-        assert_eq!(extract_wsl_distro_from_environment_id("wsl:default"), None);
+        let mut stopped = running.clone();
+        stopped.distros[0].state = WslDistroState::Stopped;
+        assert!(
+            resolve_running_wsl_picker_distro(
+                Some(&json!({"targetWslDistro": "Ubuntu"})),
+                &stopped,
+            )
+            .expect_err("a stopped distro must not be opened")
+            .contains("will not start it automatically")
+        );
+        assert!(
+            resolve_running_wsl_picker_distro(
+                Some(&json!({"targetWslDistro": "bad!name"})),
+                &running,
+            )
+            .is_err()
+        );
+        assert_eq!(resolve_running_wsl_picker_distro(None, &running), Ok(None));
     }
 
     #[test]
@@ -2998,20 +3031,19 @@ mod tests {
                 .unwrap()
                 .ends_with(DESKTOP_SETTINGS_FILE_NAME)
         );
-        let settings = read_desktop_settings(handle).expect("desktop settings should read");
         assert!(
             resolve_pick_folder_dialog_default_path(
                 handle,
-                &settings,
                 Some(&json!({"initialPath":test_state_dir})),
+                None,
             )
             .is_some()
         );
         assert!(
             resolve_pick_folder_dialog_default_path(
                 handle,
-                &settings,
-                Some(&json!({"targetEnvironmentId":"wsl:Ubuntu-24.04"})),
+                Some(&json!({"targetWslDistro":"Ubuntu-24.04"})),
+                Some("Ubuntu-24.04"),
             )
             .is_some()
         );

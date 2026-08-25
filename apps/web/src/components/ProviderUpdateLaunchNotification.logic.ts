@@ -664,17 +664,6 @@ export function firstUnsuccessfulSecondaryProviderOutcome(
   return null;
 }
 
-const WSL_INSTANCE_ID_PREFIX = "wsl:";
-
-/** The distro name from a WSL backend instance id ("wsl:ubuntu" -> "ubuntu"), or null for the default. */
-export function parseWslDistroFromInstanceId(instanceId: string | undefined): string | null {
-  if (!instanceId || !instanceId.startsWith(WSL_INSTANCE_ID_PREFIX)) {
-    return null;
-  }
-  const distro = instanceId.slice(WSL_INSTANCE_ID_PREFIX.length).trim();
-  return distro.length === 0 || distro === "default" ? null : distro;
-}
-
 /**
  * A human label that distinguishes local environments by platform (so the
  * popover shows "Windows" / "WSL" rather than the account name twice). WSL is

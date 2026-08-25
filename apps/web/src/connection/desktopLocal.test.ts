@@ -8,21 +8,21 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   createDesktopSecondaryBootstrapsReader,
-  desktopLocalBackendId,
+  desktopLocalRuntimeId,
   desktopLocalConnectionId,
   isDesktopLocalConnectionTarget,
 } from "./desktopLocal";
 
 describe("desktop local connection identity", () => {
-  it("preserves the desktop backend instance id", () => {
+  it("preserves the opaque desktop runtime slot", () => {
     const target = new BearerConnectionTarget({
-      connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+      connectionId: desktopLocalConnectionId("desktop-wsl-runtime:test"),
       environmentId: EnvironmentId.make("environment-wsl"),
       label: "WSL (Ubuntu)",
     });
 
     expect(isDesktopLocalConnectionTarget(target)).toBe(true);
-    expect(desktopLocalBackendId(target)).toBe("wsl:Ubuntu");
+    expect(desktopLocalRuntimeId(target)).toBe("desktop-wsl-runtime:test");
   });
 
   it("does not classify the primary environment as desktop-local", () => {
@@ -34,20 +34,20 @@ describe("desktop local connection identity", () => {
     });
 
     expect(isDesktopLocalConnectionTarget(target)).toBe(false);
-    expect(desktopLocalBackendId(target)).toBeNull();
+    expect(desktopLocalRuntimeId(target)).toBeNull();
   });
 
   it("keeps an unavailable desired WSL environment desktop-local", () => {
     const target = new UnavailableConnectionTarget({
-      connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
-      environmentId: EnvironmentId.make("wsl:Ubuntu"),
+      connectionId: desktopLocalConnectionId("desktop-wsl-runtime:test"),
+      environmentId: EnvironmentId.make("environment-wsl"),
       label: "WSL (Ubuntu)",
       configuredDistro: "Ubuntu",
       detail: "the configured WSL distribution could not start",
     });
 
     expect(isDesktopLocalConnectionTarget(target)).toBe(true);
-    expect(desktopLocalBackendId(target)).toBe("wsl:Ubuntu");
+    expect(desktopLocalRuntimeId(target)).toBe("desktop-wsl-runtime:test");
   });
 });
 
@@ -69,7 +69,7 @@ describe("desktop local topology reads", () => {
 
   it("filters the primary bootstrap from successful topology reads", () => {
     const secondary = {
-      id: "wsl:Ubuntu",
+      id: "desktop-wsl-runtime:test",
       label: "WSL: Ubuntu",
       httpBaseUrl: "http://127.0.0.1:4000",
       wsBaseUrl: "ws://127.0.0.1:4000",
@@ -91,7 +91,7 @@ describe("desktop local topology reads", () => {
 
   it("retains the last successful snapshot only until another read succeeds", () => {
     const secondary = {
-      id: "wsl:Ubuntu",
+      id: "desktop-wsl-runtime:test",
       label: "WSL: Ubuntu",
       httpBaseUrl: "http://127.0.0.1:4000",
       wsBaseUrl: "ws://127.0.0.1:4000",

@@ -656,15 +656,24 @@ interface DesktopBridgeStub {
 }
 
 function createDesktopBridgeStub(): DesktopBridgeStub {
+  const distros = [
+    { name: "Ubuntu", isDefault: true, state: "running" as const, version: 2 as const },
+    { name: "Debian", isDefault: false, state: "stopped" as const, version: 2 as const },
+  ];
   const wslState: DesktopWslState = {
     enabled: true,
     distro: "Ubuntu",
+    legacyAcceptedDistro: "Ubuntu",
     available: true,
     wslOnly: false,
-    distros: [
-      { name: "Ubuntu", isDefault: true, state: "running", version: 2 },
-      { name: "Debian", isDefault: false, state: "stopped", version: 2 },
-    ],
+    distros,
+    discovery: {
+      generation: 1,
+      observedAt: "2026-08-25T00:00:00.000Z",
+      health: "available",
+      detail: null,
+      distros,
+    },
     preflightError: null,
   };
   return {
@@ -1160,9 +1169,17 @@ describe("ConnectionsSettings", () => {
     h.wslQuery.data = {
       enabled: true,
       distro: "Ubuntu",
+      legacyAcceptedDistro: "Ubuntu",
       available: true,
       wslOnly: false,
       distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+      discovery: {
+        generation: 1,
+        observedAt: "2026-08-25T00:00:00.000Z",
+        health: "available",
+        detail: null,
+        distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+      },
       preflightError: null,
     } satisfies DesktopWslState;
     h.connectionsPresentation = "local-wsl";
@@ -1631,9 +1648,17 @@ describe("ConnectionsSettings", () => {
     h.wslQuery.data = {
       enabled: true,
       distro: "Ubuntu",
+      legacyAcceptedDistro: "Ubuntu",
       available: true,
       wslOnly: true,
       distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+      discovery: {
+        generation: 1,
+        observedAt: "2026-08-25T00:00:00.000Z",
+        health: "available",
+        detail: null,
+        distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+      },
       preflightError: null,
     } satisfies DesktopWslState;
     h.accessChangesQuery.data = accessSnapshot({

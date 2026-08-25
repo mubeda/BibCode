@@ -19,7 +19,7 @@ import {
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { isDesktopLocalConnectionTarget, desktopLocalBackendId } from "~/connection/desktopLocal";
+import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
 import { useDesktopLocalBootstraps } from "~/connection/useDesktopLocalBootstraps";
 import { useCenterPanelStore } from "~/centerPanelStore";
@@ -755,8 +755,7 @@ export function useAddProjectWorkflow(input: {
   const wslCandidates = useMemo(
     () =>
       environments.flatMap((environment) => {
-        const backendId = desktopLocalBackendId(environment.entry.target);
-        if (backendId === null) {
+        if (!isDesktopLocalConnectionTarget(environment.entry.target)) {
           return [];
         }
         const bootstrap = desktopLocalBootstraps.find(
@@ -765,7 +764,6 @@ export function useAddProjectWorkflow(input: {
         return [
           {
             environmentId: environment.environmentId,
-            backendId,
             runningDistro: bootstrap?.runningDistro ?? null,
           },
         ];

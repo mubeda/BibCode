@@ -414,9 +414,17 @@ function defaultWslState(): DesktopWslState {
   return {
     enabled: false,
     distro: null,
+    legacyAcceptedDistro: null,
     available: false,
     wslOnly: false,
     distros: [],
+    discovery: {
+      generation: 0,
+      observedAt: "1970-01-01T00:00:00.000Z",
+      health: "missing",
+      detail: "WSL discovery is unavailable.",
+      distros: [],
+    },
     preflightError: null,
   };
 }

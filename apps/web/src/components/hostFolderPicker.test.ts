@@ -25,7 +25,7 @@ const wslHost: HostFolderPickerTarget = {
   environmentId: ENV_WSL,
   platform: "Linux",
   isPrimary: false,
-  desktopInstanceId: "wsl:Ubuntu",
+  desktopInstanceId: "desktop-wsl-runtime:test",
   nativePickerAvailable: true,
 };
 
@@ -48,8 +48,16 @@ function makeInput(
       enabled: true,
       wslOnly: false,
       distro: null,
+      legacyAcceptedDistro: null,
       available: true,
       distros: [],
+      discovery: {
+        generation: 1,
+        observedAt: "2026-08-25T00:00:00.000Z",
+        health: "available",
+        detail: null,
+        distros: [],
+      },
       preflightError: null,
     }),
     primaryRunningDistro: null,
@@ -118,7 +126,6 @@ describe("pickHostFolder", () => {
       wslCandidates: [
         {
           environmentId: EnvironmentId.make("wsl"),
-          backendId: "wsl:Ubuntu",
           runningDistro: "Ubuntu",
         },
       ],
@@ -126,7 +133,7 @@ describe("pickHostFolder", () => {
     const result = await pickHostFolder(input);
     expect(input.dialogs.pickFolder).toHaveBeenCalledWith({
       initialPath: "~/",
-      targetEnvironmentId: "wsl:Ubuntu",
+      targetWslDistro: "Ubuntu",
     });
     expect(result).toEqual({
       _tag: "Selected",

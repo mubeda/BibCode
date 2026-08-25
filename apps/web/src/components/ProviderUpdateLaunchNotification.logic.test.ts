@@ -30,7 +30,6 @@ import {
   isProviderUpdateCandidate,
   isTerminalProviderUpdatePhase,
   localEnvironmentUpdateNotificationKey,
-  parseWslDistroFromInstanceId,
   providerUpdateNotificationKey,
   resolveEnvironmentUpdateRowStatus,
   type LocalEnvironmentProvidersInput,
@@ -984,14 +983,6 @@ describe("provider update launch notification logic", () => {
         }),
       ).toBe("My Device");
     });
-
-    it("parses the WSL distro from the backend instance id", () => {
-      expect(parseWslDistroFromInstanceId("wsl:ubuntu")).toBe("ubuntu");
-      expect(parseWslDistroFromInstanceId("wsl:default")).toBeNull();
-      expect(parseWslDistroFromInstanceId("wsl:")).toBeNull();
-      expect(parseWslDistroFromInstanceId("ssh:host")).toBeNull();
-      expect(parseWslDistroFromInstanceId(undefined)).toBeNull();
-    });
   });
 
   describe("isTerminalProviderUpdatePhase", () => {
@@ -1417,7 +1408,7 @@ describe("provider update launch notification logic", () => {
       ).toMatchObject({ title: "2 providers updated" });
     });
 
-    it("handles timestamps, non-error rejections, WSL ids, and platform labels", () => {
+    it("handles timestamps, non-error rejections, and platform labels", () => {
       const noTimestamp = provider({
         driver: driver("codex"),
         updateState: terminalState("failed", "", null),
@@ -1429,12 +1420,6 @@ describe("provider update launch notification logic", () => {
       expect(firstRejectedProviderUpdateMessage([{ status: "rejected", reason: "bad" }])).toBe(
         "Provider update failed.",
       );
-      expect(parseWslDistroFromInstanceId(undefined)).toBeNull();
-      expect(parseWslDistroFromInstanceId("local")).toBeNull();
-      expect(parseWslDistroFromInstanceId("wsl:")).toBeNull();
-      expect(parseWslDistroFromInstanceId("wsl:default")).toBeNull();
-      expect(parseWslDistroFromInstanceId("wsl: fedora ")).toBe("fedora");
-
       const label = (platformOs: "windows" | "darwin" | "linux" | undefined) =>
         deriveEnvironmentDisplayLabel({
           isWsl: false,

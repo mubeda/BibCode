@@ -5,9 +5,17 @@ import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
 const baseWslState: DesktopWslState = {
   enabled: false,
   distro: null,
+  legacyAcceptedDistro: null,
   available: true,
   wslOnly: true,
   distros: [],
+  discovery: {
+    generation: 1,
+    observedAt: "2026-08-25T00:00:00.000Z",
+    health: "available",
+    detail: null,
+    distros: [],
+  },
   preflightError: null,
 };
 
