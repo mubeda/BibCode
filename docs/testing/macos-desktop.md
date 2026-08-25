@@ -56,6 +56,24 @@ Select focused tests from affected source and verify at least:
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
 threads without serializing broad suites.
 
+## Native macOS service and listener evidence
+
+Use disposable roots to exercise the current-user
+`com.bibcode.server` LaunchAgent and, only with explicit root authority, the
+`_bibcode` LaunchDaemon. Capture the exact bootstrap domain, plist path and
+mode/ownership, rendered loopback arguments, account, enablement, state, and
+single-instance result. Verify definition mismatch requires `install --update`,
+partial fresh-install rollback preserves pre-existing accounts, and uninstall
+removes registration while preserving the exact data root.
+
+Inspect the real Unix control parent/socket ownership and `0700`/`0600` modes,
+prove wrong-UID rejection, and confirm no stale run-owned socket or child
+process survives stop. For direct HTTPS, record the exact listening
+PID/address, certificate hostname/chain/date trust or configured pin, an
+untrusted-certificate rejection, and absence of a plaintext non-loopback
+listener. Record unchanged environment/storage IDs and expected-version or
+`recoveryRequired` update reconciliation after restart.
+
 ## External worktree and symlink fixture
 
 Use a unique test-owned root outside a user project:

@@ -66,6 +66,41 @@ references, and atomically removes local routes, bindings, UI state, cache, and
 environment metadata. It does not imply that a remote server was stopped or
 that remote projects/worktrees/data were deleted.
 
+### Pairing Credential
+
+A reveal-once, five-minute bootstrap created through authenticated startup or
+protected local control. The server stores only its SHA-256 hash and short
+fingerprint. A successful exchange binds the resulting administrator session
+to the client's DPoP key.
+
+### Local Control
+
+The host-only, versioned protocol used for pairing creation and bounded
+service/update drain coordination. It uses a protected Unix socket on macOS and
+Linux or a remote-rejecting named pipe on Windows and never falls back to HTTP.
+
+### Host Authority Channel
+
+One trusted path allowed to mutate native host lifecycle: the desktop bridge,
+protected local control, or an explicit SSH administration session. A paired
+network client has environment-administrator access but not host-service
+authority.
+
+### Service Mode
+
+`workstation` runs under the current interactive user through Task Scheduler,
+a LaunchAgent, or a systemd user unit. `headless` runs through SCM, a
+LaunchDaemon, or a systemd system unit with a dedicated service identity.
+Both managed modes bind the BiBCode server to loopback only.
+
+### Update Phase
+
+The redacted durable state of a server update handoff: idle, preparing,
+prepared, restarting, succeeded, failed, cancelled, expired, or recovery
+required. Restart success requires the expected version and the same
+environment/storage identities; package-byte rollback belongs to the signed
+distribution transaction.
+
 ## Project And Workspace
 
 ### Project

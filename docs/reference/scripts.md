@@ -31,6 +31,32 @@ temporary roots and fail closed if a Tauri mock attempts to resolve the real
 default user root, so `cargo test -p bibcode-desktop` must not mutate either
 state kind.
 
+## Server Administration
+
+- `bibcode auth pairing create --client-label <label> --format human`: create
+  one five-minute full-administrator pairing through protected local control.
+- `bibcode service status --mode workstation --format json`: inspect the native
+  registration, state, definition match, paths, bind, account, and Linux linger
+  status from the server host.
+- `bibcode service install --mode workstation`: install and start the
+  current-user Task Scheduler, LaunchAgent, or systemd user definition.
+- `bibcode service install --mode headless`: install and start the elevated
+  SCM, LaunchDaemon, or systemd system definition with its dedicated identity.
+- `bibcode service start|stop|restart --mode <workstation|headless>`: manage an
+  installed service. Stop/restart first attempt bounded drain through local
+  control.
+- `bibcode service uninstall --mode <workstation|headless>`: remove native
+  registration while preserving the selected data root. No purge flag exists.
+
+Add the same explicit `--base-dir` to every command when the service does not
+use its mode's default root. Managed services reject non-loopback `--host`
+values. A changed definition requires the explicit `service install --update`
+form after the administrator inspects the difference. That flag updates the
+native definition, not standalone binary package bytes.
+
+See [Server administration](../user/server-administration.md) for per-platform
+authority, accounts, defaults, and recovery.
+
 ## Build And Quality
 
 - `vp run build`: build application, package, lint-plugin, and script outputs.
@@ -48,6 +74,9 @@ state kind.
 - `vp run fmt` / `vp run fmt:check`: write or verify Vite+ formatting.
 - `vp run lint`: run Vite+ linting with unused-disable reporting.
 - `vp run typecheck` (or `vp run tc`): run package TypeScript and Rust checks.
+  Use `vp run --concurrency-limit 1 typecheck` when a constrained host cannot
+  safely run all typecheck owners concurrently; this changes scheduling, not
+  the selected graph.
 - `vp test`: run the built-in Vite+ unit test command.
 - `vp run test`: run every package `test` script, including Rust packages.
 - `vp run test:desktop`: run the Tauri Rust test suite.

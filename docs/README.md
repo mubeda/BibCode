@@ -11,6 +11,7 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Provider setup](./providers/README.md)
 - [Remote access](./user/remote-access.md)
+- [Server administration](./user/server-administration.md)
 - [Architecture overview](./architecture/overview.md)
 
 ## User guides
@@ -18,6 +19,7 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
+- [Server administration](./user/server-administration.md)
 - [Project data safety and recovery](./guides/project-data-recovery.md)
 - [Source control providers](./integrations/source-control-providers.md)
 
@@ -39,6 +41,8 @@ current behavior.
 - [Connection runtime](./architecture/connection-runtime.md)
 - [Runtime modes](./architecture/runtime-modes.md)
 - [Remote environments](./architecture/remote.md)
+- [Authentication](./architecture/authentication.md)
+- [Runtime and process model](./architecture/runtime-process-model.md)
 
 ## Cloud and environment authentication
 

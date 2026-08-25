@@ -559,19 +559,19 @@ warning.
 - Modify: `docs/testing/windows-desktop.md`, `macos-desktop.md`, `linux-desktop.md`
 - Modify: `docs/testing/execution-report-template.md`
 
-- [ ] **Step 1: Document the trust and listener matrix**
+- [x] **Step 1: Document the trust and listener matrix**
 
 Include loopback HTTP, SSH forward, direct HTTPS, system trust/pinning, the lack of an insecure override, control-channel authorization, five-minute pairing, DPoP, revocation, and safe troubleshooting.
 
-- [ ] **Step 2: Document workstation/headless lifecycle**
+- [x] **Step 2: Document workstation/headless lifecycle**
 
 Show exact status/install/start/stop/restart/uninstall commands per OS, authority requirements, service accounts, data preservation, linger/background-session behavior, and recovery from partial update/install.
 
-- [ ] **Step 3: Add native evidence procedures**
+- [x] **Step 3: Add native evidence procedures**
 
 Require socket/pipe ACL evidence, wrong-peer rejection, bind inspection, certificate verification, pairing expiry/race/redaction, service single-instance behavior, restart identity, uninstall preservation, and zero leftover processes.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```sh
 git diff --check
@@ -581,3 +581,26 @@ node scripts/run-msvc-x64.mjs cargo clippy -p bibcode-server --all-targets -- -D
 git add apps/server/README.md docs/architecture/authentication.md docs/architecture/remote.md docs/architecture/runtime-process-model.md docs/user/remote-access.md docs/user/server-administration.md docs/reference/scripts.md docs/reference/encyclopedia.md docs/testing
 git commit -m "docs: define secure server administration and services"
 ```
+
+Implementation note: the three planned living documents that did not yet exist
+were created at their intended paths: the server package README,
+authentication architecture, and runtime/process architecture. A new server
+administration guide owns the exact workstation/headless commands, per-platform
+manager and account behavior, data-root defaults, listener/certificate choices,
+five-minute full-administrator pairing, local-control boundary, uninstall data
+preservation, and bounded partial-install/update recovery. The remote, scripts,
+glossary, and documentation indexes link back to those owners instead of
+duplicating lifecycle policy.
+
+The shared and native Windows/macOS/Linux runbooks plus execution-report
+template now require OS evidence for listener binds and certificate trust,
+socket/pipe ACLs and wrong-peer rejection, pairing expiry/race/redaction,
+network host-authority rejection, service idempotence/single-instance behavior,
+partial rollback, restart identity/version reconciliation, uninstall
+preservation, and zero server-owned survivors. Compatibility evidence remains
+explicitly separate from native manager/ACL/certificate claims.
+
+Validation passed the requested insecure-listener/pairing/control/service/DPoP
+documentation scan, `git diff --check`, `cargo fmt --all --check`, server
+all-target Clippy with warnings denied, and `vp check`. The latter retains only
+the previously recorded Plan 20 unused-fixture warning.

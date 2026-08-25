@@ -241,6 +241,58 @@ admission; and immediate socket close after client revocation. The settings UI
 must warn that access is full administrator with no permission levels, reveal a
 new credential once, and show only metadata/fingerprint afterward.
 
+### Listener, service, and update lifecycle evidence
+
+When listener admission, service definitions, host authority, managed process
+state, or update handoff changes, run the focused owners before broad gates:
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test network_admission -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test service_lifecycle -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_control -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_maintenance -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test local_control -- --nocapture
+```
+
+On non-Windows hosts, replace the launcher with direct Cargo. The native run
+must record:
+
+- numeric loopback HTTP admission and rejection of every plain non-loopback
+  HTTP configuration, with no insecure override in CLI/help or UI;
+- a real direct HTTPS bind, certificate chain/hostname/date validation, system
+  trust or the exact configured SPKI pin, DPoP verification against the HTTPS
+  request URL, and rejection of a wrong/untrusted certificate;
+- the exact listening address/port and process identity from an OS-native
+  socket inspection tool;
+- Unix `0700` parent/`0600` socket ownership and wrong-UID rejection, or the
+  Windows explicit DACL, remote-client rejection, allowed SID/token, and
+  impersonation/revert evidence;
+- network `server.requestHostAction` rejection with the bounded allowed-channel
+  list and no control endpoint, credential, environment variable, binary path,
+  data path, or backup path in the public service view;
+- workstation and headless status/install/start/stop/restart/uninstall for the
+  native manager, including insufficient authority and exact definition
+  mismatch/`--update` behavior;
+- idempotent install, one live service instance, bounded stop/drain, no newly
+  admitted mutation, and zero server-owned provider/terminal descendants after
+  stop;
+- partial fresh-install rollback, proof that a pre-existing service account is
+  retained, and explicit reporting of any rollback failure;
+- the same environment/storage IDs after service restart and prepared update
+  restart, plus expected-version success and mismatched/interrupted
+  `recoveryRequired` results;
+- an expired/cancelled update lease, durable phase record, verified store
+  backup, and redacted update view; and
+- uninstall removal of native registration while the exact data root,
+  environment marker, projects, repositories, and worktrees remain intact.
+
+Run workstation and headless cases in separate disposable roots. Do not enable
+Linux linger, create a system account, elevate, replace a real service, or
+change system certificate trust without explicit authority. A simulated
+adapter or cross-target check is compatibility evidence only; Task Scheduler,
+SCM, launchd, systemd, socket ACL, and certificate behavior require the named
+native host.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

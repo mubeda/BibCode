@@ -57,6 +57,27 @@ Select focused tests from affected source and verify at least:
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
 threads without serializing broad suites.
 
+## Native Linux service and listener evidence
+
+Use disposable roots to exercise `bibcode.service` in both the current user's
+systemd manager and, only with explicit root authority, the system manager with
+the dedicated `bibcode` account. Capture the exact unit path/content,
+enablement, account, loopback bind, state, and single-instance result. Record
+workstation linger state and prove BiBCode does not change it silently.
+
+Verify insufficient headless authority fails before mutation, a changed unit
+requires `install --update`, partial fresh-install rollback does not delete a
+pre-existing account, bounded stop leaves no owned process group descendants,
+and uninstall removes the unit while preserving `/var/lib/bibcode` or the
+explicit root. Inspect Unix control parent/socket ownership and `0700`/`0600`
+modes plus wrong-UID rejection.
+
+For direct HTTPS, record the exact listening PID/address, certificate
+hostname/chain/date trust or configured pin, an untrusted-certificate failure,
+and absence of a plaintext non-loopback listener. Record unchanged
+environment/storage IDs and expected-version or `recoveryRequired` update
+reconciliation after restart.
+
 ## External worktree and symlink fixture
 
 Use a unique test-owned root:

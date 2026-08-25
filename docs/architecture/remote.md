@@ -27,6 +27,18 @@ Exactly one verified route owns the live session at a time.
   access is HTTPS/WSS; local, WSL, and SSH transports terminate at a
   desktop-owned loopback address.
 
+## Listener, trust, and authority matrix
+
+| Route            | Server-facing listener                                                 | Transport trust                                                       | Host-control channel                                                          |
+| ---------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Desktop loopback | Numeric loopback HTTP/WebSocket                                        | Desktop-owned bootstrap and verified environment/storage descriptor   | Desktop bridge or protected local control                                     |
+| WSL/SSH          | Remote loopback HTTP/WebSocket behind a desktop-owned loopback forward | SSH host/key policy plus verified environment/storage descriptor      | Desktop bridge for the forward; local control or SSH shell on the server host |
+| Direct HTTPS     | Non-loopback HTTPS/WSS                                                 | System certificate trust or an explicitly configured SPKI SHA-256 pin | Local control or SSH shell; network RPC has no host authority                 |
+
+No route can opt into plain non-loopback HTTP. Descriptor fingerprints do not
+replace certificate trust. Pairing and DPoP authenticate the client after the
+transport is trusted; they do not repair an untrusted TLS connection.
+
 ## Environment catalog, bindings, and routes
 
 The normalized connection catalog stores one `KnownEnvironment` with its
@@ -185,6 +197,13 @@ endpoint can install software, start a process, or use SSH.
   service-account/Administrators DACL and validates the impersonated client
   token. Network administrator sessions do not gain host-control authority.
 
+The network-visible server configuration contains only a redacted service view:
+mode, startup mechanism, runtime state, version, bind posture, account kind,
+update state, and allowed host-authority channels. It never exposes the control
+endpoint, service credentials, raw environment variables, binary/data/backup
+paths, or permission-changing actions. A network host-action request fails with
+the typed `hostAuthorityRequired` result.
+
 Storage-identity mismatch protection applies equally to direct HTTPS,
 compatibility BiBCode Connect, WSL, and desktop-managed SSH routes: a different non-null
 `storageInstanceId` is blocked before synchronization. The desktop project-data
@@ -221,6 +240,12 @@ channel. It resolves the same data root as the server, verifies the durable
 environment marker and response identity/expiry, and emits either a single JSON
 document or a human pairing URL. It has no HTTP fallback and grants one fixed
 environment-administrator scope set rather than exposing permission levels.
+
+The same protected channel coordinates service stop and update preparation.
+Managed workstation/headless services remain loopback-only. Their native
+Task Scheduler/SCM, launchd, or systemd registration is owned by the host CLI,
+not by network RPC. See [Server administration](../user/server-administration.md)
+and [Runtime and process model](./runtime-process-model.md).
 
 ## Current limitations
 

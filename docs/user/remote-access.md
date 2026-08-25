@@ -8,6 +8,9 @@ Plain HTTP/WebSocket is restricted to loopback. This rule also applies on a
 trusted LAN or tailnet: BiBCode has no packaged switch or override that binds an
 unencrypted server to another interface.
 
+For service installation, host authority, local-control pairing, and recovery,
+use [Server administration](./server-administration.md).
+
 ## Supported routes
 
 - **Same machine:** loopback HTTP/WebSocket.
@@ -52,6 +55,11 @@ server initialization if either file is missing, unusable, mismatched, expired,
 or not yet valid. A non-loopback bind without this pair is rejected; there is no
 insecure override.
 
+The client must validate that listener through its operating-system trust store
+or an explicitly accepted SPKI SHA-256 pin. The environment descriptor's
+fingerprint is diagnostic metadata and is not a trust bypass. Do not switch to
+HTTP to diagnose a certificate problem.
+
 The server prints one JSON object to stdout. In authenticated web mode it has
 this shape:
 
@@ -76,6 +84,23 @@ implemented options.
 `--static-dir` is needed only when this server should deliver the web client.
 A separately hosted HTTPS web app can connect directly to an HTTPS/WSS backend
 without the backend serving static files.
+
+### Managed workstation or headless service
+
+For a server that should survive the invoking terminal, register the native
+loopback-only service instead of backgrounding `serve` manually:
+
+```bash
+bibcode service install --mode workstation
+bibcode service status --mode workstation --format json
+```
+
+Use `--mode headless` with elevated host authority for a machine service.
+Windows uses Task Scheduler or SCM, macOS uses a LaunchAgent or LaunchDaemon,
+and Linux uses a systemd user or system unit. Stop/restart first drain through
+protected local control. Uninstall preserves the data root and has no purge
+option. Exact commands and platform accounts are in
+[Server administration](./server-administration.md).
 
 ## Pairing
 
@@ -190,6 +215,8 @@ identity checks then apply.
   listener, including private networks.
 - Verify the certificate through system trust or an explicitly accepted pin;
   descriptor fingerprint metadata is not itself a trust decision.
+- A `hostAuthorityRequired` response from a network session is expected for
+  service/update mutations; run those operations on the host or through SSH.
 - Treat pairing URLs and credentials as secrets.
 - Copy a newly created pairing credential before closing its reveal-once
   result; BiBCode cannot display it again.

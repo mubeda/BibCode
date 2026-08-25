@@ -75,6 +75,44 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Restart with pending repair and successful retry result:
 - Remote server/projects/worktrees/data retained after local Forget:
 
+## Listener, authentication, and local-control evidence
+
+- Loopback HTTP listener address/PID and admission result:
+- Plain non-loopback HTTP rejection and no-override evidence:
+- Direct HTTPS listener address/PID:
+- Certificate hostname/chain/date result:
+- Trust source: System trust | Explicit SPKI pin | Unavailable
+- Wrong/untrusted certificate result:
+- Exact HTTPS DPoP URL/method/replay result:
+- Pairing five-minute expiry, race, retry, and redaction result:
+- WebSocket one-use/revocation-close result:
+- Unix socket parent/mode/owner/wrong-UID result:
+- Windows named-pipe DACL/remote rejection/SID/impersonation result:
+- Public service-view redaction result:
+- Network host-action rejection and allowed channels:
+
+## Service and update lifecycle evidence
+
+- Mode: Workstation | Headless
+- Native manager/definition identity:
+- Authority/account and insufficient-authority result:
+- Data root and loopback bind:
+- Status before install:
+- Install/idempotence/single-instance result:
+- Definition mismatch and explicit update result:
+- Partial-install rollback and pre-existing-account result:
+- Stop drain/admission/owned-child reap result:
+- Restart environment/storage identities:
+- Update operation/backup/phase/target version:
+- Expected-version reconciliation result:
+- Interrupted/mismatched recovery result:
+- Uninstall registration/account result:
+- Preserved data/environment/projects/worktrees evidence:
+- Final native service/socket/pipe/process survivor result:
+
+Repeat this section for every tested mode. Keep adapter simulations and
+cross-target checks under non-native compatibility evidence.
+
 ## VCS observation evidence
 
 - Execution host and route: Native | WSL direct | SSH/server | Unavailable

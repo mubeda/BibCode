@@ -71,6 +71,30 @@ Select focused tests from affected source and verify at least:
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
 threads. Do not replace the default harness with a serial run.
 
+## Native Windows service and listener evidence
+
+In disposable roots, exercise both service modes through the native CLI. For
+workstation mode, verify the `BiBCode` logon task uses the current account,
+interactive token, no stored password, exact loopback arguments, and a single
+running instance. For headless mode, use an Administrator shell and verify the
+`BiBCode` SCM service uses `NT SERVICE\BiBCode`, automatic startup, exact
+definition, and one running instance.
+
+Record `service status --format json` before install, after install/start,
+after bounded stop/restart, and after uninstall. Prove mismatched definitions
+require `install --update`, insufficient headless authority fails before
+mutation, partial fresh install rolls back only run-owned artifacts, and
+uninstall preserves `%ProgramData%\BiBCode` or the explicit root. Inspect the
+named-pipe DACL and remote rejection natively; a cross-target test is not ACL
+evidence.
+
+For direct HTTPS, inspect the exact listening PID/address with native Windows
+tools, validate the certificate through system trust or the configured pin,
+exercise an untrusted certificate failure, and prove no plaintext non-loopback
+socket exists. After restart/update preparation, record unchanged environment
+and storage IDs, expected-version outcome, and zero service-owned descendant
+processes after stop.
+
 ## VCS idle and foreground measurement
 
 Before measuring an idle window, verify the current event-driven observation
