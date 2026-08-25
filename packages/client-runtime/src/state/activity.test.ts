@@ -260,7 +260,15 @@ const makeHarnessCore = Effect.fn("TestEnvironmentActivity.makeHarnessCore")(fun
   );
   const prepared = yield* SubscriptionRef.make<Option.Option<PreparedConnection>>(Option.none());
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+    environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+      target: TARGET,
+      profile: Option.none(),
+    }),
     target: TARGET,
+    activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+    routeResults: yield* SubscriptionRef.make<
+      ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+    >([]),
     state: supervisorState,
     session: supervisorSession,
     prepared,

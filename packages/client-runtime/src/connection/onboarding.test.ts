@@ -7,12 +7,18 @@ import * as Option from "effect/Option";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { ClientPresentation, SshEnvironmentGateway } from "../platform/capabilities.ts";
 import { BearerConnectionCredential, BearerConnectionProfile } from "./catalog.ts";
+import { EnvironmentRegistry, type EnvironmentRegistrationInput } from "./registry.ts";
 import { BearerConnectionTarget } from "./model.ts";
 import {
   prepareBearerConnectionUpdate,
   preparePairingRegistration,
   prepareSshRegistration,
+  registerPairingConnection,
 } from "./onboarding.ts";
+
+const PAIRED_ENVIRONMENT_ID = "00000000-0000-4000-8000-000000000021";
+const PAIRED_STORAGE_ID = "00000000-0000-4000-8000-000000000022";
+const SSH_ENVIRONMENT_ID = "00000000-0000-4000-8000-000000000031";
 
 const CLIENT_PRESENTATION_LAYER = Layer.succeed(
   ClientPresentation,
@@ -42,13 +48,15 @@ function pairingHttpLayer(
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "environment-paired",
+          environmentId: PAIRED_ENVIRONMENT_ID,
           label: "Paired environment",
           platform: {
             os: "linux",
             arch: "x64",
           },
           serverVersion: "0.0.0-test",
+          storageInstanceId: PAIRED_STORAGE_ID,
+          protocol: { minimum: 1, maximum: 1 },
           capabilities: {
             repositoryIdentity: true,
           },
@@ -86,14 +94,14 @@ describe("connection onboarding", () => {
       expect(registration).toMatchObject({
         _tag: "BearerConnectionRegistration",
         target: {
-          environmentId: "environment-paired",
+          environmentId: PAIRED_ENVIRONMENT_ID,
           label: "Paired environment",
-          connectionId: "bearer:environment-paired",
+          connectionId: `bearer:${PAIRED_ENVIRONMENT_ID}`,
         },
         profile: {
-          environmentId: "environment-paired",
+          environmentId: PAIRED_ENVIRONMENT_ID,
           label: "Paired environment",
-          connectionId: "bearer:environment-paired",
+          connectionId: `bearer:${PAIRED_ENVIRONMENT_ID}`,
           httpBaseUrl: "https://remote.example.test/",
           wsBaseUrl: "wss://remote.example.test/",
         },
@@ -138,6 +146,62 @@ describe("connection onboarding", () => {
       expect(calls.map((call) => call.url)).toEqual([
         "https://remote.example.test/.well-known/bibcode/environment",
       ]);
+    }),
+  );
+
+  it.effect("publishes pairing enrollment only through the normalized environment API", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      let registered: EnvironmentRegistrationInput | undefined;
+      const registry = EnvironmentRegistry.of({
+        registerEnvironment: (input: EnvironmentRegistrationInput) =>
+          Effect.sync(() => {
+            registered = input;
+          }),
+      } as unknown as EnvironmentRegistry["Service"]);
+
+      const environmentId = yield* registerPairingConnection({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+      }).pipe(
+        Effect.provideService(EnvironmentRegistry, registry),
+        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
+      );
+
+      expect(environmentId).toBe(PAIRED_ENVIRONMENT_ID);
+      expect(registered).toMatchObject({
+        environment: {
+          environmentId: PAIRED_ENVIRONMENT_ID,
+          acceptedStorageInstanceId: PAIRED_STORAGE_ID,
+          routes: [
+            {
+              _tag: "DirectHttpsRoute",
+              httpsBaseUrl: "https://remote.example.test/",
+              secretRef: null,
+            },
+          ],
+        },
+        sessionSecret: {
+          routeId: `bearer:${PAIRED_ENVIRONMENT_ID}`,
+          value: "bearer-token",
+        },
+      });
+    }),
+  );
+
+  it.effect("rejects non-loopback HTTP before descriptor or pairing access", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const error = yield* preparePairingRegistration({
+        host: "http://remote.example.test",
+        pairingCode: "pairing-token",
+      }).pipe(
+        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({ reason: "configuration" });
+      expect(calls).toEqual([]);
     }),
   );
 
@@ -222,8 +286,23 @@ describe("connection onboarding", () => {
           SshEnvironmentGateway.of({
             provision: () =>
               Effect.succeed({
-                environmentId: EnvironmentId.make("environment-ssh"),
+                environmentId: EnvironmentId.make(SSH_ENVIRONMENT_ID),
                 label: "Remote development box",
+                descriptor: {
+                  environmentId: EnvironmentId.make(SSH_ENVIRONMENT_ID),
+                  label: "Remote development box",
+                  platform: { os: "linux", arch: "x64" },
+                  serverVersion: "0.0.0-test",
+                  storageInstanceId: "00000000-0000-4000-8000-000000000032",
+                  protocol: { minimum: 1, maximum: 1 },
+                  capabilities: {
+                    repositoryIdentity: true,
+                    worktreeCatalog: false,
+                    worktreeCatalogRefreshReason: false,
+                    vcsStatusSummary: false,
+                    activityProtocolVersion: null,
+                  },
+                },
                 bootstrap: {
                   target,
                   httpBaseUrl: "http://127.0.0.1:3201",
@@ -233,6 +312,8 @@ describe("connection onboarding", () => {
                 bearerToken: "bearer-token",
               }),
             prepare: () => Effect.die("unused"),
+            inspect: () => Effect.die("unused"),
+            exchange: () => Effect.die("unused"),
             disconnect: () => Effect.die("unused"),
           }),
         ),
@@ -241,14 +322,14 @@ describe("connection onboarding", () => {
       expect(registration).toMatchObject({
         _tag: "SshConnectionRegistration",
         target: {
-          environmentId: "environment-ssh",
+          environmentId: SSH_ENVIRONMENT_ID,
           label: "Remote development box",
-          connectionId: "ssh:environment-ssh",
+          connectionId: `ssh:${SSH_ENVIRONMENT_ID}`,
         },
         profile: {
-          environmentId: "environment-ssh",
+          environmentId: SSH_ENVIRONMENT_ID,
           label: "Remote development box",
-          connectionId: "ssh:environment-ssh",
+          connectionId: `ssh:${SSH_ENVIRONMENT_ID}`,
           target,
         },
       });

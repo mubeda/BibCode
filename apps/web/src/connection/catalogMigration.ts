@@ -20,7 +20,7 @@ import { LegacyConnectionCatalogV1 } from "@bibcode/client-runtime/platform/migr
 import { DurableEnvironmentId, TrimmedNonEmptyString } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
-const MIGRATION_ID = "catalog-v1-to-v3";
+export const CATALOG_V1_TO_V3_MIGRATION_ID = "catalog-v1-to-v3";
 const MAX_FINGERPRINT_INPUT_BYTES = 65_536;
 
 const StoredLegacyCredential = Schema.Struct({
@@ -177,7 +177,7 @@ function emptyPlan(
 ): CatalogMigrationPlan {
   const metadata: CatalogMigrationMetadata = {
     environments: [],
-    receipt: { id: MIGRATION_ID, completedAt },
+    receipt: { id: CATALOG_V1_TO_V3_MIGRATION_ID, completedAt },
     quarantine,
     discarded: { relayTargets: 0, remoteDpopTokens: 0 },
   };
@@ -332,7 +332,7 @@ export async function planCatalogV1ToV3Migration(
 
   const metadata: CatalogMigrationMetadata = {
     environments,
-    receipt: { id: MIGRATION_ID, completedAt: options.completedAt },
+    receipt: { id: CATALOG_V1_TO_V3_MIGRATION_ID, completedAt: options.completedAt },
     quarantine,
     discarded: {
       relayTargets,

@@ -1,4 +1,8 @@
-import type { DesktopSshEnvironmentTarget, EnvironmentId } from "@bibcode/contracts";
+import type {
+  DesktopSshEnvironmentTarget,
+  EnvironmentId,
+  ExecutionEnvironmentDescriptor,
+} from "@bibcode/contracts";
 import { resolveRemotePairingTarget } from "@bibcode/shared/remote";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -20,12 +24,16 @@ import {
   type ConnectionCredential,
   SshConnectionProfile,
   SshConnectionRegistration,
+  type KnownEnvironment,
 } from "./catalog.ts";
-import * as ConnectionCredentialStore from "./credentialStore.ts";
 import { mapRemoteEnvironmentError } from "./errors.ts";
 import {
   BearerConnectionTarget,
   ConnectionBlockedError,
+  DesktopLoopbackRoute,
+  DirectHttpsRoute,
+  isLoopbackHostname,
+  SshTunnelRoute,
   SshConnectionTarget,
   type ConnectionAttemptError,
 } from "./model.ts";
@@ -83,10 +91,22 @@ const resolvePairingTarget = Effect.fn("clientRuntime.connection.onboarding.reso
   },
 );
 
-export const preparePairingRegistration = Effect.fn(
-  "clientRuntime.connection.onboarding.preparePairingRegistration",
+interface PreparedPairingEnrollment {
+  readonly registration: BearerConnectionRegistration;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
+}
+
+const preparePairingEnrollment = Effect.fn(
+  "clientRuntime.connection.onboarding.preparePairingEnrollment",
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
+  const endpoint = new URL(target.httpBaseUrl);
+  if (endpoint.protocol !== "https:" && !isLoopbackHostname(endpoint.hostname)) {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "Remote environments require HTTPS; plaintext HTTP is allowed only on loopback.",
+    });
+  }
   const presentation = yield* ClientCapabilities.ClientPresentation;
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
@@ -99,7 +119,7 @@ export const preparePairingRegistration = Effect.fn(
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
   const connectionId = `bearer:${descriptor.environmentId}`;
 
-  return new BearerConnectionRegistration({
+  const registration = new BearerConnectionRegistration({
     target: new BearerConnectionTarget({
       environmentId: descriptor.environmentId,
       label: descriptor.label,
@@ -116,15 +136,62 @@ export const preparePairingRegistration = Effect.fn(
       token: access.access_token,
     }),
   });
+  return { registration, descriptor } satisfies PreparedPairingEnrollment;
 });
+
+export const preparePairingRegistration = Effect.fn(
+  "clientRuntime.connection.onboarding.preparePairingRegistration",
+)(function* (input: PairingConnectionInput) {
+  return (yield* preparePairingEnrollment(input)).registration;
+});
+
+function pairingEnvironment(enrollment: PreparedPairingEnrollment): KnownEnvironment {
+  const { descriptor, registration } = enrollment;
+  const endpoint = new URL(registration.profile.httpBaseUrl);
+  const routeBase = {
+    routeId: registration.target.connectionId,
+    environmentId: descriptor.environmentId,
+    label: descriptor.label,
+    priority: 0,
+    pinned: false,
+    autoconnect: true,
+    secretRef: null,
+  } as const;
+  const route = isLoopbackHostname(endpoint.hostname)
+    ? new DesktopLoopbackRoute({
+        ...routeBase,
+        httpBaseUrl: registration.profile.httpBaseUrl,
+        wsBaseUrl: registration.profile.wsBaseUrl,
+      })
+    : new DirectHttpsRoute({
+        ...routeBase,
+        httpsBaseUrl: registration.profile.httpBaseUrl,
+        trust: { _tag: "System" },
+      });
+  return {
+    environmentId: descriptor.environmentId,
+    acceptedStorageInstanceId: descriptor.storageInstanceId,
+    descriptor,
+    alias: descriptor.label,
+    hidden: false,
+    bindings: [],
+    routes: [route],
+  };
+}
 
 export const registerPairingConnection = Effect.fn(
   "clientRuntime.connection.onboarding.registerPairingConnection",
 )(function* (input: PairingConnectionInput) {
-  const registration = yield* preparePairingRegistration(input);
+  const enrollment = yield* preparePairingEnrollment(input);
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
-  yield* registry.register(registration);
-  return registration.target.environmentId;
+  yield* registry.registerEnvironment({
+    environment: pairingEnvironment(enrollment),
+    sessionSecret: {
+      routeId: enrollment.registration.target.connectionId,
+      value: enrollment.registration.credential.token,
+    },
+  });
+  return enrollment.registration.target.environmentId;
 });
 
 const isBearerCredential = Schema.is(BearerConnectionCredential);
@@ -134,18 +201,56 @@ export const updateBearerConnection = Effect.fn(
   "clientRuntime.connection.onboarding.updateBearerConnection",
 )(function* (input: BearerConnectionUpdateInput) {
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
-  const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
-  const entry = (yield* SubscriptionRef.get(registry.entries)).get(input.environmentId);
-  const credential =
-    entry?.target._tag === "BearerConnectionTarget"
-      ? yield* credentials.get(entry.target.connectionId)
-      : Option.none();
-  const registration = yield* prepareBearerConnectionUpdate({
-    input,
-    entry: Option.fromUndefinedOr(entry),
-    credential,
+  const environment = (yield* SubscriptionRef.get(registry.environments)).get(input.environmentId);
+  if (environment === undefined) {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "The environment is not registered.",
+    });
+  }
+  const route = environment.routes.find((candidate) => candidate._tag === "DirectHttpsRoute");
+  if (route === undefined || route._tag !== "DirectHttpsRoute") {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "Only direct HTTPS routes can be edited from this connection form.",
+    });
+  }
+  const label = input.label.trim();
+  if (label === "") {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "Environment label cannot be empty.",
+    });
+  }
+  const httpsBaseUrl = yield* Effect.try({
+    try: () => normalizeHttpBaseUrl(input.httpBaseUrl),
+    catch: (cause) =>
+      new ConnectionBlockedError({
+        reason: "configuration",
+        detail: cause instanceof Error ? cause.message : "The environment URL is invalid.",
+      }),
   });
-  yield* registry.register(registration);
+  if (new URL(httpsBaseUrl).protocol !== "https:") {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "Direct environments require HTTPS; no insecure HTTP override is available.",
+    });
+  }
+  yield* registry.registerEnvironment({
+    environment: {
+      ...environment,
+      alias: label,
+      routes: environment.routes.map((candidate) =>
+        candidate.routeId === route.routeId
+          ? new DirectHttpsRoute({
+              ...route,
+              label,
+              httpsBaseUrl,
+            })
+          : candidate,
+      ),
+    },
+  });
 });
 
 export const prepareBearerConnectionUpdate = Effect.fn(
@@ -210,36 +315,79 @@ export const prepareBearerConnectionUpdate = Effect.fn(
   });
 });
 
+interface PreparedSshEnrollment {
+  readonly registration: SshConnectionRegistration;
+  readonly environment: KnownEnvironment;
+  readonly sessionSecret: string;
+}
+
+const prepareSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.prepareSshEnrollment")(
+  function* (input: SshConnectionInput) {
+    const gateway = yield* ClientCapabilities.SshEnvironmentGateway;
+    const provisioned = yield* gateway.provision(input.target);
+    const connectionId = `ssh:${provisioned.environmentId}`;
+    const label = input.label?.trim() || provisioned.label || provisioned.bootstrap.target.alias;
+
+    const registration = new SshConnectionRegistration({
+      target: new SshConnectionTarget({
+        environmentId: provisioned.environmentId,
+        label,
+        connectionId,
+      }),
+      profile: new SshConnectionProfile({
+        connectionId,
+        environmentId: provisioned.environmentId,
+        label,
+        target: provisioned.bootstrap.target,
+      }),
+    });
+    return {
+      registration,
+      environment: {
+        environmentId: provisioned.descriptor.environmentId,
+        acceptedStorageInstanceId: provisioned.descriptor.storageInstanceId,
+        descriptor: provisioned.descriptor,
+        alias: label,
+        hidden: false,
+        bindings: [],
+        routes: [
+          new SshTunnelRoute({
+            routeId: connectionId,
+            environmentId: provisioned.descriptor.environmentId,
+            label,
+            priority: 0,
+            pinned: false,
+            autoconnect: true,
+            secretRef: null,
+            target: provisioned.bootstrap.target,
+            hostKeyFingerprint: null,
+          }),
+        ],
+      },
+      sessionSecret: provisioned.bearerToken,
+    } satisfies PreparedSshEnrollment;
+  },
+);
+
 export const prepareSshRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.prepareSshRegistration",
 )(function* (input: SshConnectionInput) {
-  const gateway = yield* ClientCapabilities.SshEnvironmentGateway;
-  const provisioned = yield* gateway.provision(input.target);
-  const connectionId = `ssh:${provisioned.environmentId}`;
-  const label = input.label?.trim() || provisioned.label || provisioned.bootstrap.target.alias;
-
-  return new SshConnectionRegistration({
-    target: new SshConnectionTarget({
-      environmentId: provisioned.environmentId,
-      label,
-      connectionId,
-    }),
-    profile: new SshConnectionProfile({
-      connectionId,
-      environmentId: provisioned.environmentId,
-      label,
-      target: provisioned.bootstrap.target,
-    }),
-  });
+  return (yield* prepareSshEnrollment(input)).registration;
 });
 
 export const registerSshConnection = Effect.fn(
   "clientRuntime.connection.onboarding.registerSshConnection",
 )(function* (input: SshConnectionInput) {
-  const registration = yield* prepareSshRegistration(input);
+  const enrollment = yield* prepareSshEnrollment(input);
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
-  yield* registry.register(registration);
-  return registration.target.environmentId;
+  yield* registry.registerEnvironment({
+    environment: enrollment.environment,
+    sessionSecret: {
+      routeId: enrollment.registration.target.connectionId,
+      value: enrollment.sessionSecret,
+    },
+  });
+  return enrollment.registration.target.environmentId;
 });
 
 export const make = Effect.gen(function* () {
@@ -247,7 +395,6 @@ export const make = Effect.gen(function* () {
   const presentation = yield* ClientCapabilities.ClientPresentation;
   const httpClient = yield* HttpClient.HttpClient;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
-  const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
 
   return ConnectionOnboarding.of({
     registerPairing: (input) =>
@@ -264,7 +411,6 @@ export const make = Effect.gen(function* () {
     updateBearer: (input) =>
       updateBearerConnection(input).pipe(
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),
-        Effect.provideService(ConnectionCredentialStore.ConnectionCredentialStore, credentials),
       ),
   });
 });

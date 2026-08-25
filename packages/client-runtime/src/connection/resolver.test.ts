@@ -19,6 +19,7 @@ import {
   BearerConnectionCredential,
   BearerConnectionProfile,
   type ConnectionCatalogEntry,
+  type KnownEnvironment,
   SshConnectionProfile,
   type ConnectionCredential,
   type ConnectionProfile,
@@ -26,6 +27,8 @@ import {
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
   BearerConnectionTarget,
+  ConnectionBlockedError,
+  DirectHttpsRoute,
   ConnectionTransientError,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
@@ -34,6 +37,7 @@ import {
   UnavailableConnectionTarget,
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
+import * as Persistence from "../platform/persistence.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("00000000-0000-4000-8000-000000000001");
 const ENDPOINT = {
@@ -98,9 +102,13 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly connectEnvironment?: ManagedRelay.ManagedRelayClient["Service"]["connectEnvironment"];
   readonly authorizeBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBearer"];
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
+  readonly authorizeVerifiedBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeVerifiedBearer"];
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
   readonly descriptor?: ExecutionEnvironmentDescriptor;
+  readonly routeSecret?: string;
+  readonly verifyDirectHttps?: ConnectionResolver.RouteTransportSecurityService["verifyDirectHttps"];
+  readonly events?: string[];
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -149,6 +157,35 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
             },
           }),
         )),
+    authorizeVerifiedBearer:
+      options?.authorizeVerifiedBearer ??
+      ((input) =>
+        Effect.sync(() => options?.events?.push("open-session")).pipe(
+          Effect.as({
+            descriptor: input.identity.descriptor,
+            environmentId: input.identity.environmentId,
+            label: input.identity.descriptor.label,
+            httpBaseUrl: input.httpBaseUrl,
+            socketUrl: "wss://authorized.example.test/ws?wsTicket=verified",
+            httpAuthorization: {
+              _tag: "Bearer" as const,
+              token: input.bearerToken,
+            },
+          }),
+        )),
+  });
+  const routeSecrets = Persistence.EnvironmentSecretStore.of({
+    put: () => Effect.die(new Error("Secret writes are not used by resolver tests.")),
+    get: () =>
+      Effect.sync(() => options?.events?.push("load-secret")).pipe(
+        Effect.as(Option.fromNullishOr(options?.routeSecret)),
+      ),
+    delete: () => Effect.void,
+  });
+  const routeTransportSecurity = ConnectionResolver.RouteTransportSecurity.of({
+    verifyDirectHttps:
+      options?.verifyDirectHttps ??
+      (() => Effect.sync(() => options?.events?.push("transport-trust"))),
   });
   const ssh = ClientCapabilities.SshEnvironmentGateway.of({
     provision: () => Effect.die("unused"),
@@ -164,11 +201,25 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
           },
           bearerToken: "ssh-bearer",
         })),
+    inspect: (input) =>
+      Effect.succeed({
+        bootstrap: {
+          target: input.target,
+          httpBaseUrl: "http://127.0.0.1:4010",
+          wsBaseUrl: "ws://127.0.0.1:4010",
+          pairingToken: input.issuePairingToken ? "ssh-pairing" : null,
+        },
+        descriptor: options?.descriptor ?? DESCRIPTOR,
+      }),
+    exchange: () => Effect.succeed("ssh-bearer"),
     disconnect: () => Effect.void,
   });
 
   const dependencies = Layer.mergeAll(
-    remoteHttpClientLayer(() => Promise.resolve(Response.json(options?.descriptor ?? DESCRIPTOR))),
+    remoteHttpClientLayer(() => {
+      options?.events?.push("fetch-descriptor");
+      return Promise.resolve(Response.json(options?.descriptor ?? DESCRIPTOR));
+    }),
     Layer.succeed(ConnectionProfileStore.ConnectionProfileStore, profileStore),
     Layer.succeed(ConnectionCredentialStore.ConnectionCredentialStore, credentialStore),
     Layer.succeed(
@@ -182,6 +233,8 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       }),
     ),
     Layer.succeed(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization, remote),
+    Layer.succeed(Persistence.EnvironmentSecretStore, routeSecrets),
+    Layer.succeed(ConnectionResolver.RouteTransportSecurity, routeTransportSecurity),
     Layer.succeed(ClientCapabilities.SshEnvironmentGateway, ssh),
     Layer.succeed(
       ManagedRelay.ManagedRelayClient,
@@ -445,6 +498,141 @@ describe("ConnectionResolver", () => {
 
       expect(error).toBeInstanceOf(ConnectionTransientError);
       expect(error).toMatchObject({ reason: "timeout" });
+    }),
+  );
+});
+
+describe("ConnectionResolver normalized routes", () => {
+  const route = new DirectHttpsRoute({
+    routeId: "direct-https",
+    environmentId: ENVIRONMENT_ID,
+    label: "Direct HTTPS",
+    priority: 0,
+    pinned: false,
+    autoconnect: true,
+    secretRef: "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8",
+    httpsBaseUrl: ENDPOINT.httpBaseUrl,
+    trust: { _tag: "System" },
+  });
+  const environment = {
+    environmentId: ENVIRONMENT_ID,
+    acceptedStorageInstanceId: DESCRIPTOR.storageInstanceId,
+    descriptor: DESCRIPTOR,
+    alias: "Current environment",
+    hidden: false,
+    bindings: [],
+    routes: [route],
+  } as KnownEnvironment;
+
+  it.effect("verifies transport and descriptor identity before loading a route secret", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      const brokerLayer = yield* makeDependencies({
+        events,
+        routeSecret: "protected-session-secret",
+        authorizeVerifiedBearer: (input) =>
+          Effect.sync(() => events.push("open-session")).pipe(
+            Effect.as({
+              descriptor: input.identity.descriptor,
+              environmentId: input.identity.environmentId,
+              label: input.identity.descriptor.label,
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://authorized.example.test/ws?wsTicket=verified",
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            }),
+          ),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      const prepared = yield* broker.prepareRoute({
+        environment,
+        route,
+        cancellation: new AbortController().signal,
+      });
+
+      expect(events).toEqual([
+        "transport-trust",
+        "fetch-descriptor",
+        "load-secret",
+        "open-session",
+      ]);
+      expect(prepared.verifiedRouteIdentity).toMatchObject({
+        routeId: route.routeId,
+        environmentId: ENVIRONMENT_ID,
+        storageInstanceId: DESCRIPTOR.storageInstanceId,
+        transportTrust: "system-tls",
+      });
+    }),
+  );
+
+  it.effect("does not read the secret after a descriptor storage mismatch", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      const brokerLayer = yield* makeDependencies({
+        events,
+        routeSecret: "must-not-be-read",
+        descriptor: { ...DESCRIPTOR, storageInstanceId: "00000000-0000-4000-8000-000000000099" },
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      const error = yield* broker
+        .prepareRoute({ environment, route, cancellation: new AbortController().signal })
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "ConnectionStorageChangedError",
+        reason: "storage-changed",
+      });
+      expect(events).toEqual(["transport-trust", "fetch-descriptor"]);
+    }),
+  );
+
+  it.effect("blocks certificate, environment, and protocol mismatches before secret access", () =>
+    Effect.gen(function* () {
+      for (const testCase of [
+        {
+          descriptor: {
+            ...DESCRIPTOR,
+            environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000099"),
+          },
+          reason: "environment-changed",
+        },
+        {
+          descriptor: { ...DESCRIPTOR, protocol: { minimum: 2, maximum: 3 } },
+          reason: "version-incompatible",
+        },
+      ] as const) {
+        const events: string[] = [];
+        const brokerLayer = yield* makeDependencies({ events, descriptor: testCase.descriptor });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+        const error = yield* broker
+          .prepareRoute({ environment, route, cancellation: new AbortController().signal })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({ reason: testCase.reason });
+        expect(events).toEqual(["transport-trust", "fetch-descriptor"]);
+      }
+
+      const certificateEvents: string[] = [];
+      const certificateLayer = yield* makeDependencies({
+        events: certificateEvents,
+        verifyDirectHttps: () =>
+          Effect.fail(
+            new ConnectionBlockedError({
+              reason: "certificate-changed",
+              detail: "The pinned certificate changed.",
+            }),
+          ),
+      });
+      const certificateBroker = yield* ConnectionResolver.ConnectionResolver.pipe(
+        Effect.provide(certificateLayer),
+      );
+      const certificateError = yield* certificateBroker
+        .prepareRoute({ environment, route, cancellation: new AbortController().signal })
+        .pipe(Effect.flip);
+      expect(certificateError).toMatchObject({ reason: "certificate-changed" });
+      expect(certificateEvents).toEqual([]);
     }),
   );
 });

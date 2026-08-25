@@ -58,7 +58,15 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
     closed: Effect.never,
   };
   return EnvironmentSupervisor.EnvironmentSupervisor.of({
+    environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+      target: TARGET,
+      profile: Option.none(),
+    }),
     target: TARGET,
+    activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+    routeResults: yield* SubscriptionRef.make<
+      ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+    >([]),
     state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
     session: yield* SubscriptionRef.make(Option.some(session)),
     prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),

@@ -7,7 +7,11 @@ import {
   resolveRemoteWebSocketConnectionUrl,
 } from "./remote.ts";
 import { environmentMismatchError, mapRemoteEnvironmentError } from "../connection/errors.ts";
-import { ConnectionBlockedError, type ConnectionAttemptError } from "../connection/model.ts";
+import {
+  ConnectionBlockedError,
+  type ConnectionAttemptError,
+  type VerifiedRouteIdentity,
+} from "../connection/model.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
@@ -44,6 +48,12 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
   {
     readonly authorizeBearer: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
+      readonly httpBaseUrl: string;
+      readonly wsBaseUrl: string;
+      readonly bearerToken: string;
+    }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
+    readonly authorizeVerifiedBearer: (input: {
+      readonly identity: VerifiedRouteIdentity;
       readonly httpBaseUrl: string;
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
@@ -141,6 +151,35 @@ export const make = Effect.gen(function* () {
       };
     },
   );
+
+  const authorizeVerifiedBearer = Effect.fn(
+    "clientRuntime.connection.remote.authorizeVerifiedBearer",
+  )(function* (input: {
+    readonly identity: VerifiedRouteIdentity;
+    readonly httpBaseUrl: string;
+    readonly wsBaseUrl: string;
+    readonly bearerToken: string;
+  }) {
+    const socketUrl = yield* resolveRemoteWebSocketConnectionUrl({
+      wsBaseUrl: input.wsBaseUrl,
+      httpBaseUrl: input.httpBaseUrl,
+      bearerToken: input.bearerToken,
+    }).pipe(
+      Effect.mapError(mapRemoteEnvironmentError),
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+    );
+    return {
+      descriptor: input.identity.descriptor,
+      environmentId: input.identity.environmentId,
+      label: input.identity.descriptor.label,
+      httpBaseUrl: input.httpBaseUrl,
+      socketUrl,
+      httpAuthorization: {
+        _tag: "Bearer" as const,
+        token: input.bearerToken,
+      },
+    };
+  });
 
   const createDpopSocketUrl = Effect.fn("clientRuntime.connection.remote.createDpopSocketUrl")(
     function* (token: TokenStore.RemoteDpopAccessToken) {
@@ -313,6 +352,7 @@ export const make = Effect.gen(function* () {
 
   return RemoteEnvironmentAuthorization.of({
     authorizeBearer,
+    authorizeVerifiedBearer,
     authorizeDpop: (input) =>
       authorizeDpop(input).pipe(Effect.withSpan("environment.authorization")),
   });

@@ -25,11 +25,14 @@ import {
   EnvironmentCacheStore,
   EnvironmentCatalogStore,
   EnvironmentMigrationStore,
+  EnvironmentSecretStore,
   EnvironmentUiStateStore,
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
   EnvironmentId,
+  type DesktopBridge,
+  type DesktopSecretReference,
   type OrchestrationShellSnapshot,
   type OrchestrationThread,
   ProjectId,
@@ -48,11 +51,14 @@ import { afterEach, vi } from "vite-plus/test";
 
 import {
   type CatalogBackend,
+  activateCatalogV1ToV3Migration,
   commitCatalogMigrationMetadata,
   connectionStorageLayer,
   makeCatalogBackend,
   makeCatalogStore,
+  makeEnvironmentSecretStore,
   NORMALIZED_STORE_NAMES,
+  openConnectionDatabase,
 } from "./storage";
 
 const emptyCatalog = {
@@ -268,6 +274,30 @@ function openCatalogDatabase(factory: IDBFactory, databaseName: string): Promise
   });
 }
 
+function writeCatalogDocument(database: IDBDatabase, document: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction("catalog", "readwrite");
+    transaction.objectStore("catalog").put(document, "document");
+    transaction.addEventListener("complete", () => resolve());
+    transaction.addEventListener("error", () => reject(transaction.error));
+    transaction.addEventListener("abort", () => reject(transaction.error));
+  });
+}
+
+function deleteDatabaseValue(
+  database: IDBDatabase,
+  storeName: string,
+  key: IDBValidKey,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(storeName, "readwrite");
+    transaction.objectStore(storeName).delete(key);
+    transaction.addEventListener("complete", () => resolve());
+    transaction.addEventListener("error", () => reject(transaction.error));
+    transaction.addEventListener("abort", () => reject(transaction.error));
+  });
+}
+
 // ── Domain fixtures ──────────────────────────────────────────────────
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -285,6 +315,29 @@ const missingDurableEnvironmentId = "018f1f52-0d78-7d73-8dc8-7bd50db6f003";
 const missingDurableStorageId = "018f1f52-0d78-7d73-8dc8-7bd50db6f103";
 const decodeKnownEnvironment = Schema.decodeUnknownSync(KnownEnvironment);
 const decodeEnvironmentBinding = Schema.decodeUnknownSync(EnvironmentBinding);
+
+function encodeLegacyBearerCatalog(
+  registration: BearerConnectionRegistration,
+  storageInstanceId: string,
+) {
+  return encodeCatalog({
+    ...emptyCatalog,
+    targets: [registration.target],
+    profiles: [registration.profile],
+    credentials: [
+      {
+        connectionId: registration.target.connectionId,
+        credential: registration.credential,
+      },
+    ],
+    acceptedStorageIdentities: [
+      {
+        targetKey: `bearer:${registration.target.connectionId}`,
+        storageInstanceId,
+      },
+    ],
+  });
+}
 
 function normalizedKnownEnvironment() {
   return decodeKnownEnvironment({
@@ -1043,6 +1096,56 @@ describe("makeCatalogBackend (desktop bridge)", () => {
   );
 });
 
+describe("makeEnvironmentSecretStore", () => {
+  it.effect("routes opaque secret operations only through the desktop protected store", () =>
+    Effect.gen(function* () {
+      const secretRef =
+        "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+      const putSecret = vi.fn().mockResolvedValue(secretRef);
+      const getSecret = vi.fn().mockResolvedValue("protected-value");
+      const deleteSecret = vi.fn().mockResolvedValue(undefined);
+      const store = makeEnvironmentSecretStore({
+        putSecret,
+        getSecret,
+        deleteSecret,
+      } as unknown as DesktopBridge);
+
+      expect(yield* store.put(environmentId, "environment-session", "protected-value")).toBe(
+        secretRef,
+      );
+      expect(yield* store.get(secretRef)).toEqual(Option.some("protected-value"));
+      yield* store.delete(secretRef);
+
+      expect(putSecret).toHaveBeenCalledWith({
+        purpose: "environment-session",
+        value: "protected-value",
+      });
+      expect(getSecret).toHaveBeenCalledWith(secretRef);
+      expect(deleteSecret).toHaveBeenCalledWith(secretRef);
+    }),
+  );
+
+  it.effect("fails closed without a desktop secret provider and redacts provider failures", () =>
+    Effect.gen(function* () {
+      const unavailable = makeEnvironmentSecretStore(undefined);
+      const unavailableError = yield* unavailable
+        .put(environmentId, "environment-session", "must-not-appear")
+        .pipe(Effect.flip);
+      expect(unavailableError).toMatchObject({ operation: "put-environment-secret" });
+      expect(unavailableError.message).not.toContain("must-not-appear");
+
+      const rejected = makeEnvironmentSecretStore({
+        getSecret: vi.fn().mockRejectedValue(new Error("provider-canary")),
+      } as unknown as DesktopBridge);
+      const rejectedError = yield* rejected
+        .get("bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8")
+        .pipe(Effect.flip);
+      expect(rejectedError).toMatchObject({ operation: "get-environment-secret" });
+      expect(rejectedError.message).not.toContain("provider-canary");
+    }),
+  );
+});
+
 describe("makeCatalogBackend (IndexedDB)", () => {
   it.effect("compares existing and absent revisions without putting a document", () =>
     Effect.gen(function* () {
@@ -1272,6 +1375,160 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("deletes staged secret references after an aborted migration and retries once", () => {
+    const factory = new IDBFactory();
+    const firstRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    const secondRef =
+      "bibcode-secret:80a3dd71-952a-4eb6-a9a8-424a462e33c9" as DesktopSecretReference;
+    const putSecret = vi.fn().mockResolvedValueOnce(firstRef).mockResolvedValueOnce(secondRef);
+    const deleteSecret = vi.fn().mockResolvedValue(undefined);
+    const bridge = {
+      putSecret,
+      getSecret: vi.fn().mockResolvedValue(null),
+      deleteSecret,
+    } as unknown as DesktopBridge;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", { desktopBridge: bridge });
+    const legacyEnvironmentId = EnvironmentId.make(durableEnvironmentId);
+    const legacyTarget = new BearerConnectionTarget({
+      environmentId: legacyEnvironmentId,
+      label: "Legacy build host",
+      connectionId: "legacy-build-host",
+    });
+    const legacyRegistration = new BearerConnectionRegistration({
+      target: legacyTarget,
+      profile: new BearerConnectionProfile({
+        connectionId: legacyTarget.connectionId,
+        environmentId: legacyEnvironmentId,
+        label: legacyTarget.label,
+        httpBaseUrl: "https://build.example.test",
+        wsBaseUrl: "wss://build.example.test",
+      }),
+      credential: new BearerConnectionCredential({ token: "legacy-bearer-token" }),
+    });
+
+    return Effect.gen(function* () {
+      const database = yield* openConnectionDatabase();
+      yield* Effect.promise(() =>
+        writeCatalogDocument(
+          database,
+          encodeLegacyBearerCatalog(legacyRegistration, durableStorageId),
+        ),
+      );
+      const backend = makeCatalogBackend(database);
+      const secrets = makeEnvironmentSecretStore(bridge);
+
+      yield* activateCatalogV1ToV3Migration(database, backend, secrets, {
+        completedAt: now,
+        injectAbortBeforeReceipt: true,
+      }).pipe(Effect.flip);
+      expect(deleteSecret).toHaveBeenCalledWith(firstRef);
+      expect(yield* backend.read).not.toBeNull();
+
+      expect(
+        yield* activateCatalogV1ToV3Migration(database, backend, secrets, {
+          completedAt: now,
+        }),
+      ).toBe("applied");
+      database.close();
+
+      yield* Effect.gen(function* () {
+        const environments = yield* (yield* EnvironmentCatalogStore).list;
+        expect(environments[0]?.routes[0]?.secretRef).toBe(secondRef);
+        expect(yield* (yield* EnvironmentMigrationStore).load("catalog-v1-to-v3")).toMatchObject({
+          _tag: "Some",
+        });
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+    });
+  });
+
+  it.effect("imports legacy bearer secrets before publishing normalized rows and receipt", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    const putSecret = vi.fn().mockResolvedValue(secretRef);
+    const deleteSecret = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        putSecret,
+        getSecret: vi.fn().mockResolvedValue("legacy-bearer-token"),
+        deleteSecret,
+      },
+    });
+    const legacyEnvironmentId = EnvironmentId.make(durableEnvironmentId);
+    const legacyTarget = new BearerConnectionTarget({
+      environmentId: legacyEnvironmentId,
+      label: "Legacy build host",
+      connectionId: "legacy-build-host",
+    });
+    const legacyRegistration = new BearerConnectionRegistration({
+      target: legacyTarget,
+      profile: new BearerConnectionProfile({
+        connectionId: legacyTarget.connectionId,
+        environmentId: legacyEnvironmentId,
+        label: legacyTarget.label,
+        httpBaseUrl: "https://build.example.test",
+        wsBaseUrl: "wss://build.example.test",
+      }),
+      credential: new BearerConnectionCredential({ token: "legacy-bearer-token" }),
+    });
+
+    return Effect.gen(function* () {
+      const database = yield* openConnectionDatabase();
+      yield* Effect.promise(() =>
+        writeCatalogDocument(
+          database,
+          encodeLegacyBearerCatalog(legacyRegistration, durableStorageId),
+        ),
+      );
+      database.close();
+
+      yield* Effect.gen(function* () {
+        const catalog = yield* EnvironmentCatalogStore;
+        const migrations = yield* EnvironmentMigrationStore;
+        const legacyTargets = yield* ConnectionTargetStore;
+        const environments = yield* catalog.list;
+
+        expect(environments).toHaveLength(1);
+        expect(environments[0]?.routes[0]?.secretRef).toBe(secretRef);
+        expect(yield* migrations.load("catalog-v1-to-v3")).toMatchObject({ _tag: "Some" });
+        expect(yield* legacyTargets.list).toEqual([]);
+        expect(putSecret).toHaveBeenCalledWith({
+          purpose: "environment-session",
+          value: "legacy-bearer-token",
+        });
+        expect(deleteSecret).not.toHaveBeenCalled();
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+    });
+  });
+
+  it.effect("provides the protected desktop secret adapter without renderer persistence", () => {
+    const factory = new IDBFactory();
+    const secretRef =
+      "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8" as DesktopSecretReference;
+    const putSecret = vi.fn().mockResolvedValue(secretRef);
+    const getSecret = vi.fn().mockResolvedValue("protected-value");
+    const deleteSecret = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {
+      desktopBridge: { putSecret, getSecret, deleteSecret },
+    });
+
+    return Effect.gen(function* () {
+      const secrets = yield* EnvironmentSecretStore;
+      const storedRef = yield* secrets.put(environmentId, "environment-session", "protected-value");
+      expect(storedRef).toBe(secretRef);
+      expect(yield* secrets.get(storedRef)).toEqual(Option.some("protected-value"));
+      yield* secrets.delete(storedRef);
+      expect(deleteSecret).toHaveBeenCalledWith(secretRef);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("creates the normalized v3 stores and round-trips one aggregate atomically", () => {
     const factory = new IDBFactory();
     vi.stubGlobal("indexedDB", factory);
@@ -1352,6 +1609,12 @@ describe("connectionStorageLayer", () => {
             request.addEventListener("success", () => resolve(request.result));
             request.addEventListener("error", () => reject(request.error));
           }),
+      );
+
+      // This low-level committer test starts from the pre-migration state. The
+      // storage layer itself creates an empty receipt for clean installations.
+      yield* Effect.promise(() =>
+        deleteDatabaseValue(database, "migrationState", "catalog-v1-to-v3"),
       );
 
       const seed = database.transaction("catalog", "readwrite");

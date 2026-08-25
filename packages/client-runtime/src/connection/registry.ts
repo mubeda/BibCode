@@ -14,8 +14,10 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
+  BearerConnectionProfile,
   type ConnectionCatalogEntry,
   type ConnectionRegistration,
+  type KnownEnvironment,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
   SshConnectionProfile,
@@ -27,13 +29,24 @@ import * as Connectivity from "./connectivity.ts";
 import type {
   ConnectionAttemptError,
   ConnectionTarget,
+  EnvironmentRoute,
   NetworkStatus,
   SupervisorConnectionState,
+} from "./model.ts";
+import {
+  BearerConnectionTarget,
+  DesktopLoopbackRoute,
+  DesktopWslRoute,
+  PrimaryConnectionTarget,
+  SshConnectionTarget,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
+import { deriveWsBaseUrl } from "../environment/endpoint.ts";
+import { eligibleRoutes } from "./routeSelection.ts";
 
 const isSshConnectionProfile = Schema.is(SshConnectionProfile);
 
@@ -59,21 +72,38 @@ export class PlatformEnvironmentRemovalError extends Schema.TaggedErrorClass<Pla
   }
 }
 
+export interface EnvironmentRegistrationInput {
+  readonly environment: KnownEnvironment;
+  readonly sessionSecret?: {
+    readonly routeId: string;
+    readonly value: string;
+  };
+}
+
 export class EnvironmentRegistry extends Context.Service<
   EnvironmentRegistry,
   {
+    readonly environments: SubscriptionRef.SubscriptionRef<
+      ReadonlyMap<EnvironmentId, KnownEnvironment>
+    >;
+    /** Transitional projection for consumers that have not moved to environment aggregates yet. */
     readonly entries: SubscriptionRef.SubscriptionRef<
       ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
     >;
     readonly networkStatus: SubscriptionRef.SubscriptionRef<NetworkStatus>;
     readonly start: Effect.Effect<void>;
+    readonly registerEnvironment: (
+      input: EnvironmentRegistrationInput,
+    ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly register: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
-    readonly registerPlatform: (registration: PrimaryConnectionRegistration) => Effect.Effect<void>;
+    readonly registerPlatform: (
+      registration: PrimaryConnectionRegistration,
+    ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
-    ) => Effect.Effect<void>;
+    ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly remove: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<
@@ -126,12 +156,186 @@ export class EnvironmentRegistry extends Context.Service<
 >()("@bibcode/client-runtime/connection/registry/EnvironmentRegistry") {}
 
 interface EnvironmentServiceScope {
-  readonly entry: ConnectionCatalogEntry;
+  readonly entry: KnownEnvironment;
+  readonly legacyEntry: ConnectionCatalogEntry | null;
   readonly supervisor: EnvironmentSupervisor.EnvironmentSupervisor["Service"];
   readonly scope: Scope.Closeable;
 }
 
-export const make = Effect.gen(function* () {
+export interface EnvironmentRegistryOptions {
+  /** Bounds concurrent connection establishment without limiting healthy sessions. */
+  readonly maxConcurrentEnvironmentAttempts?: number;
+}
+
+const DEFAULT_MAX_CONCURRENT_ENVIRONMENT_ATTEMPTS = 4;
+const CATALOG_V1_TO_V3_MIGRATION_ID = "catalog-v1-to-v3";
+
+function environmentLabel(environment: KnownEnvironment): string {
+  return environment.alias ?? environment.descriptor?.label ?? "Environment";
+}
+
+function projectCatalogEntry(environment: KnownEnvironment): ConnectionCatalogEntry {
+  const route = eligibleRoutes(environment, { activeRouteId: null })[0];
+  const label = environmentLabel(environment);
+  if (route === undefined) {
+    return {
+      target: new UnavailableConnectionTarget({
+        environmentId: environment.environmentId,
+        label,
+        connectionId: `environment:${environment.environmentId}`,
+        configuredDistro: null,
+        detail: "This environment has no configured connection route.",
+      }),
+      profile: Option.none(),
+    };
+  }
+  switch (route._tag) {
+    case "DesktopLoopbackRoute":
+      if (route.secretRef === null) {
+        return {
+          target: new PrimaryConnectionTarget({
+            environmentId: environment.environmentId,
+            label,
+            httpBaseUrl: route.httpBaseUrl,
+            wsBaseUrl: route.wsBaseUrl,
+          }),
+          profile: Option.none(),
+        };
+      }
+      return bearerProjection(environment, route, route.httpBaseUrl, route.wsBaseUrl);
+    case "DesktopWslRoute":
+      return bearerProjection(environment, route, route.httpBaseUrl, route.wsBaseUrl);
+    case "DirectHttpsRoute":
+      return bearerProjection(
+        environment,
+        route,
+        route.httpsBaseUrl,
+        deriveWsBaseUrl(route.httpsBaseUrl),
+      );
+    case "SshTunnelRoute":
+      return {
+        target: new SshConnectionTarget({
+          environmentId: environment.environmentId,
+          label,
+          connectionId: route.routeId,
+        }),
+        profile: Option.some(
+          new SshConnectionProfile({
+            connectionId: route.routeId,
+            environmentId: environment.environmentId,
+            label,
+            target: route.target,
+          }),
+        ),
+      };
+  }
+}
+
+function bearerProjection(
+  environment: KnownEnvironment,
+  route: EnvironmentRoute,
+  httpBaseUrl: string,
+  wsBaseUrl: string,
+): ConnectionCatalogEntry {
+  const label = environmentLabel(environment);
+  return {
+    target: new BearerConnectionTarget({
+      environmentId: environment.environmentId,
+      label,
+      connectionId: route.routeId,
+    }),
+    profile: Option.some(
+      new BearerConnectionProfile({
+        connectionId: route.routeId,
+        environmentId: environment.environmentId,
+        label,
+        httpBaseUrl,
+        wsBaseUrl,
+      }),
+    ),
+  };
+}
+
+function normalizedPlatformRegistration(
+  registration: PlatformConnectionRegistration,
+): EnvironmentRegistrationInput | null {
+  if (registration._tag === "UnavailableConnectionRegistration") return null;
+  const descriptor = registration.descriptor;
+  if (descriptor === undefined) return null;
+  const route =
+    registration._tag === "PrimaryConnectionRegistration"
+      ? new DesktopLoopbackRoute({
+          routeId: "platform:primary",
+          environmentId: descriptor.environmentId,
+          label: registration.target.label,
+          priority: 0,
+          pinned: true,
+          autoconnect: true,
+          secretRef: null,
+          httpBaseUrl: registration.target.httpBaseUrl,
+          wsBaseUrl: registration.target.wsBaseUrl,
+        })
+      : new DesktopWslRoute({
+          routeId: registration.target.connectionId,
+          environmentId: descriptor.environmentId,
+          label: registration.target.label,
+          priority: 0,
+          pinned: true,
+          autoconnect: true,
+          secretRef: null,
+          bindingId: registration.target.connectionId,
+          httpBaseUrl: registration.profile.httpBaseUrl,
+          wsBaseUrl: registration.profile.wsBaseUrl,
+        });
+  return {
+    environment: {
+      environmentId: descriptor.environmentId,
+      acceptedStorageInstanceId: descriptor.storageInstanceId,
+      descriptor,
+      alias: registration.target.label,
+      hidden: false,
+      bindings: [],
+      routes: [route],
+    },
+    ...(registration._tag === "BearerConnectionRegistration"
+      ? {
+          sessionSecret: {
+            routeId: registration.target.connectionId,
+            value: registration.credential.token,
+          },
+        }
+      : {}),
+  };
+}
+
+function jitterRetryDelay(environmentId: EnvironmentId, baseDelayMs: number, failureCount: number) {
+  let hash = failureCount;
+  for (const character of environmentId) {
+    hash = (Math.imul(hash, 31) + character.charCodeAt(0)) >>> 0;
+  }
+  const factor = 0.8 + (hash % 401) / 1_000;
+  return baseDelayMs * factor;
+}
+
+export const make = Effect.fn("EnvironmentRegistry.make")(function* (
+  options?: EnvironmentRegistryOptions,
+) {
+  const maxConcurrentEnvironmentAttempts =
+    options?.maxConcurrentEnvironmentAttempts ?? DEFAULT_MAX_CONCURRENT_ENVIRONMENT_ATTEMPTS;
+  if (
+    !Number.isSafeInteger(maxConcurrentEnvironmentAttempts) ||
+    maxConcurrentEnvironmentAttempts < 1
+  ) {
+    return yield* Effect.die(
+      new Error("maxConcurrentEnvironmentAttempts must be a positive safe integer."),
+    );
+  }
+  const connectionAttemptSemaphore = yield* Semaphore.make(maxConcurrentEnvironmentAttempts);
+  const environmentGenerations = yield* Ref.make<ReadonlyMap<EnvironmentId, number>>(new Map());
+  const environmentCatalog = yield* Persistence.EnvironmentCatalogStore;
+  const environmentSecrets = yield* Persistence.EnvironmentSecretStore;
+  const environmentUiState = yield* Persistence.EnvironmentUiStateStore;
+  const migrationStore = yield* Persistence.EnvironmentMigrationStore;
   const storage = yield* Persistence.ConnectionTargetStore;
   const registrations = yield* Persistence.ConnectionRegistrationStore;
   const identities = yield* Persistence.AcceptedStorageIdentityStore;
@@ -143,8 +347,10 @@ export const make = Effect.gen(function* () {
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
-  const persistedTargets = yield* storage.list;
-  const initialEntries = new Map(
+  const normalizedEnvironments = yield* environmentCatalog.list;
+  const migrationReceipt = yield* migrationStore.load(CATALOG_V1_TO_V3_MIGRATION_ID);
+  const persistedTargets = Option.isNone(migrationReceipt) ? yield* storage.list : [];
+  const initialLegacyEntries = new Map(
     yield* Effect.forEach(
       persistedTargets,
       Effect.fn("EnvironmentRegistry.loadCatalogEntry")(function* (target) {
@@ -160,8 +366,26 @@ export const make = Effect.gen(function* () {
       { concurrency: "unbounded" },
     ),
   );
-  const entries =
-    yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(initialEntries);
+  const initialEnvironments = new Map<EnvironmentId, KnownEnvironment>(
+    normalizedEnvironments.map((environment) => [environment.environmentId, environment]),
+  );
+  for (const [environmentId, entry] of initialLegacyEntries) {
+    if (!initialEnvironments.has(environmentId)) {
+      initialEnvironments.set(environmentId, EnvironmentSupervisor.legacyCatalogEnvironment(entry));
+    }
+  }
+  const environments =
+    yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, KnownEnvironment>>(initialEnvironments);
+  const legacyEntries =
+    yield* Ref.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(initialLegacyEntries);
+  const entries = yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(
+    new Map(
+      [...initialEnvironments].map(([environmentId, environment]) => [
+        environmentId,
+        initialLegacyEntries.get(environmentId) ?? projectCatalogEntry(environment),
+      ]),
+    ),
+  );
   const networkStatus = yield* SubscriptionRef.make(yield* connectivity.status);
   const serviceScopes = yield* SubscriptionRef.make<
     ReadonlyMap<EnvironmentId, EnvironmentServiceScope>
@@ -225,16 +449,16 @@ export const make = Effect.gen(function* () {
         ),
     ).pipe(Effect.withSpan("EnvironmentRegistry.withLeaseLock"));
 
-  const getEntry = Effect.fn("EnvironmentRegistry.getEntry")(function* (
+  const getEnvironment = Effect.fn("EnvironmentRegistry.getEnvironment")(function* (
     environmentId: EnvironmentId,
   ) {
-    const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
-    if (entry === undefined) {
+    const environment = (yield* SubscriptionRef.get(environments)).get(environmentId);
+    if (environment === undefined) {
       return yield* new EnvironmentNotRegisteredError({
         environmentId,
       });
     }
-    return entry;
+    return environment;
   });
 
   const closeServiceScope = Effect.fn("EnvironmentRegistry.closeServiceScope")(function* (
@@ -252,13 +476,21 @@ export const make = Effect.gen(function* () {
   });
 
   const createServiceScope = Effect.fn("EnvironmentRegistry.createServiceScope")(
-    (entry: ConnectionCatalogEntry) =>
+    (environment: KnownEnvironment, legacyEntry: ConnectionCatalogEntry | null) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
-          const environmentId = entry.target.environmentId;
+          const environmentId = environment.environmentId;
+          const environmentGeneration = yield* Ref.modify(environmentGenerations, (current) => {
+            const generation = (current.get(environmentId) ?? 0) + 1;
+            return [generation, new Map(current).set(environmentId, generation)] as const;
+          });
           const scope = yield* Scope.make();
-          const supervisor = yield* EnvironmentSupervisor.make(entry, {
+          const supervisor = yield* EnvironmentSupervisor.make(legacyEntry ?? environment, {
             initiallyDesired: false,
+            environmentGeneration,
+            attemptSemaphore: connectionAttemptSemaphore,
+            jitterRetryDelayMs: (baseDelayMs, failureCount) =>
+              jitterRetryDelay(environmentId, baseDelayMs, failureCount),
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
             Effect.provideService(ConnectionDriver.ConnectionDriver, driver),
@@ -269,7 +501,7 @@ export const make = Effect.gen(function* () {
           yield* supervisor.connect;
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
-            next.set(environmentId, { entry, supervisor, scope });
+            next.set(environmentId, { entry: environment, legacyEntry, supervisor, scope });
             return next;
           });
           return supervisor;
@@ -283,15 +515,19 @@ export const make = Effect.gen(function* () {
     return yield* withLeaseLock(
       environmentId,
       Effect.gen(function* () {
-        const entry = yield* getEntry(environmentId);
+        const environment = yield* getEnvironment(environmentId);
+        const legacyEntry = (yield* Ref.get(legacyEntries)).get(environmentId) ?? null;
         const existing = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
         if (existing !== undefined) {
-          if (Equal.equals(existing.entry, entry)) {
+          if (
+            Equal.equals(existing.entry, environment) &&
+            Equal.equals(existing.legacyEntry, legacyEntry)
+          ) {
             return existing.supervisor;
           }
           yield* closeServiceScope(environmentId);
         }
-        return yield* createServiceScope(entry);
+        return yield* createServiceScope(environment, legacyEntry);
       }),
     );
   });
@@ -324,8 +560,8 @@ export const make = Effect.gen(function* () {
     stream: Stream.Stream<A, E, R>,
   ) =>
     Stream.concat(
-      Stream.fromEffect(SubscriptionRef.get(entries)),
-      SubscriptionRef.changes(entries),
+      Stream.fromEffect(SubscriptionRef.get(environments)),
+      SubscriptionRef.changes(environments),
     ).pipe(
       Stream.map((current) => Option.fromUndefinedOr(current.get(environmentId))),
       Stream.changes,
@@ -355,9 +591,9 @@ export const make = Effect.gen(function* () {
       return;
     }
     yield* Effect.forEach(
-      persistedTargets,
-      (target) =>
-        acquireSupervisor(target.environmentId).pipe(
+      (yield* SubscriptionRef.get(environments)).keys(),
+      (environmentId) =>
+        acquireSupervisor(environmentId).pipe(
           Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
         ),
       {
@@ -367,31 +603,144 @@ export const make = Effect.gen(function* () {
     );
   }).pipe(Effect.withSpan("EnvironmentRegistry.start"));
 
-  const installEntryLocked = Effect.fn("EnvironmentRegistry.installEntryLocked")(function* (
-    entry: ConnectionCatalogEntry,
-    options?: { readonly retainEquivalentRuntime?: boolean },
-  ) {
-    const target = entry.target;
-    const previous = (yield* SubscriptionRef.get(entries)).get(target.environmentId);
-    const existingScope = (yield* SubscriptionRef.get(serviceScopes)).get(target.environmentId);
-    if (
-      options?.retainEquivalentRuntime === true &&
-      previous !== undefined &&
-      Equal.equals(previous, entry) &&
-      existingScope !== undefined &&
-      Equal.equals(existingScope.entry, entry)
+  const installEnvironmentLocked = Effect.fn("EnvironmentRegistry.installEnvironmentLocked")(
+    function* (
+      environment: KnownEnvironment,
+      legacyEntry: ConnectionCatalogEntry | null,
+      options?: { readonly retainEquivalentRuntime?: boolean },
     ) {
-      return;
-    }
+      const environmentId = environment.environmentId;
+      const previous = (yield* SubscriptionRef.get(environments)).get(environmentId);
+      const previousLegacyEntry = (yield* Ref.get(legacyEntries)).get(environmentId) ?? null;
+      const existingScope = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+      if (
+        options?.retainEquivalentRuntime === true &&
+        previous !== undefined &&
+        Equal.equals(previous, environment) &&
+        Equal.equals(previousLegacyEntry, legacyEntry) &&
+        existingScope !== undefined &&
+        Equal.equals(existingScope.entry, environment) &&
+        Equal.equals(existingScope.legacyEntry, legacyEntry)
+      ) {
+        return;
+      }
 
-    yield* closeServiceScope(target.environmentId);
-    yield* SubscriptionRef.update(entries, (current) => {
-      const next = new Map(current);
-      next.set(target.environmentId, entry);
-      return next;
-    });
-    yield* createServiceScope(entry);
-  });
+      yield* closeServiceScope(environmentId);
+      yield* Ref.update(legacyEntries, (current) => {
+        const next = new Map(current);
+        if (legacyEntry === null) {
+          next.delete(environmentId);
+        } else {
+          next.set(environmentId, legacyEntry);
+        }
+        return next;
+      });
+      yield* SubscriptionRef.update(environments, (current) => {
+        const next = new Map(current);
+        next.set(environmentId, environment);
+        return next;
+      });
+      yield* SubscriptionRef.update(entries, (current) => {
+        const next = new Map(current);
+        next.set(environmentId, legacyEntry ?? projectCatalogEntry(environment));
+        return next;
+      });
+      yield* createServiceScope(environment, legacyEntry);
+    },
+  );
+
+  const installLegacyEntryLocked = Effect.fn("EnvironmentRegistry.installLegacyEntryLocked")(
+    (entry: ConnectionCatalogEntry, options?: { readonly retainEquivalentRuntime?: boolean }) =>
+      installEnvironmentLocked(
+        EnvironmentSupervisor.legacyCatalogEnvironment(entry),
+        entry,
+        options,
+      ),
+  );
+
+  const registerEnvironmentLocked = Effect.fn("EnvironmentRegistry.registerEnvironmentLocked")(
+    function* (input: EnvironmentRegistrationInput) {
+      const environmentId = input.environment.environmentId;
+      const current = (yield* SubscriptionRef.get(environments)).get(environmentId);
+      if (
+        current !== undefined &&
+        current.acceptedStorageInstanceId !== input.environment.acceptedStorageInstanceId
+      ) {
+        return yield* new Persistence.ConnectionPersistenceError({
+          operation: "put-environment",
+          message: "The environment reports a different accepted persistent store.",
+        });
+      }
+
+      const inputRouteIds = new Set(input.environment.routes.map((route) => route.routeId));
+      const mergedRoutes = [
+        ...(current?.routes.filter((route) => !inputRouteIds.has(route.routeId)) ?? []),
+        ...input.environment.routes,
+      ];
+      let importedSecretRef: string | null = null;
+      const previousSecretRef =
+        input.sessionSecret === undefined
+          ? null
+          : (current?.routes.find((route) => route.routeId === input.sessionSecret?.routeId)
+              ?.secretRef ?? null);
+
+      yield* Effect.gen(function* () {
+        if (input.sessionSecret !== undefined) {
+          if (!inputRouteIds.has(input.sessionSecret.routeId)) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "put-environment",
+              message: "The session secret does not match a registered environment route.",
+            });
+          }
+          importedSecretRef = yield* environmentSecrets.put(
+            environmentId,
+            "environment-session",
+            input.sessionSecret.value,
+          );
+        }
+
+        const nextEnvironment: KnownEnvironment = {
+          ...input.environment,
+          alias: input.environment.alias ?? current?.alias ?? null,
+          hidden: current?.hidden ?? input.environment.hidden,
+          bindings:
+            input.environment.bindings.length === 0 && current !== undefined
+              ? current.bindings
+              : input.environment.bindings,
+          routes: mergedRoutes.map((route) =>
+            input.sessionSecret !== undefined &&
+            route.routeId === input.sessionSecret.routeId &&
+            importedSecretRef !== null
+              ? { ...route, secretRef: importedSecretRef }
+              : route,
+          ),
+        };
+        yield* environmentCatalog.put(nextEnvironment);
+        yield* installEnvironmentLocked(nextEnvironment, null);
+      }).pipe(
+        Effect.onError(() =>
+          importedSecretRef === null
+            ? Effect.void
+            : environmentSecrets.delete(importedSecretRef).pipe(Effect.ignore),
+        ),
+      );
+
+      if (previousSecretRef !== null && previousSecretRef !== importedSecretRef) {
+        yield* environmentSecrets.delete(previousSecretRef).pipe(
+          Effect.catch(() =>
+            Effect.logWarning("Could not remove a superseded environment secret.", {
+              environmentId,
+            }),
+          ),
+        );
+      }
+    },
+  );
+
+  const registerEnvironment = Effect.fn("EnvironmentRegistry.registerEnvironment")(
+    (input: EnvironmentRegistrationInput) =>
+      withLeaseLock(input.environment.environmentId, registerEnvironmentLocked(input)),
+  );
 
   const register = Effect.fn("EnvironmentRegistry.register")(function* (
     registration: ConnectionRegistration,
@@ -410,8 +759,30 @@ export const make = Effect.gen(function* () {
           next.set(environmentId, registration.target);
           return next;
         });
-        yield* installEntryLocked(entry);
+        yield* installLegacyEntryLocked(entry);
       }),
+    );
+  });
+
+  const removePersistedPlatformShadow = Effect.fn(
+    "EnvironmentRegistry.removePersistedPlatformShadow",
+  )(function* (environmentId: EnvironmentId) {
+    const persistedTarget = (yield* Ref.get(persistedTargetsByEnvironment)).get(environmentId);
+    if (persistedTarget === undefined) return;
+    yield* registrations.remove(persistedTarget).pipe(
+      Effect.tap(() =>
+        Ref.update(persistedTargetsByEnvironment, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        }),
+      ),
+      Effect.catch((error) =>
+        Effect.logWarning(
+          "Could not remove a persisted registration shadowed by a platform environment.",
+          { environmentId, error },
+        ),
+      ),
     );
   });
 
@@ -427,6 +798,13 @@ export const make = Effect.gen(function* () {
             next.add(target.environmentId);
             return next;
           });
+
+          yield* removePersistedPlatformShadow(target.environmentId);
+          const normalized = normalizedPlatformRegistration(registration);
+          if (normalized !== null) {
+            yield* registerEnvironmentLocked(normalized);
+            return;
+          }
 
           // Secondary desktop-local backends (e.g. a parallel WSL backend) live
           // on their own loopback origin, so they authenticate with a bearer
@@ -455,31 +833,7 @@ export const make = Effect.gen(function* () {
             );
           }
 
-          const persistedTarget = (yield* Ref.get(persistedTargetsByEnvironment)).get(
-            target.environmentId,
-          );
-          if (persistedTarget !== undefined) {
-            yield* registrations.remove(persistedTarget).pipe(
-              Effect.tap(() =>
-                Ref.update(persistedTargetsByEnvironment, (current) => {
-                  const next = new Map(current);
-                  next.delete(target.environmentId);
-                  return next;
-                }),
-              ),
-              Effect.catch((error) =>
-                Effect.logWarning(
-                  "Could not remove a persisted registration shadowed by a platform environment.",
-                  {
-                    environmentId: target.environmentId,
-                    error,
-                  },
-                ),
-              ),
-            );
-          }
-
-          yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
+          yield* installLegacyEntryLocked(entry, { retainEquivalentRuntime: true });
         }),
       );
     },
@@ -501,6 +855,16 @@ export const make = Effect.gen(function* () {
             return next;
           });
           yield* closeServiceScope(environmentId);
+          yield* Ref.update(legacyEntries, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
+          yield* SubscriptionRef.update(environments, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
           yield* SubscriptionRef.update(entries, (current) => {
             const next = new Map(current);
             next.delete(environmentId);
@@ -573,45 +937,88 @@ export const make = Effect.gen(function* () {
             environmentId,
           });
         }
-        const target = (yield* getEntry(environmentId)).target;
-        const profile =
+        const environment = yield* getEnvironment(environmentId);
+        const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+        if (entry === undefined) {
+          return yield* new EnvironmentNotRegisteredError({ environmentId });
+        }
+        const target = entry.target;
+        const legacyEntry = (yield* Ref.get(legacyEntries)).get(environmentId);
+        const legacyProfile =
           target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget"
             ? yield* profiles.get(target.connectionId)
             : Option.none();
 
-        yield* registrations.remove(target);
-        yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+        if (legacyEntry !== undefined) {
+          yield* registrations.remove(target);
+          yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
+          yield* closeServiceScope(environmentId);
+          yield* Effect.all(
+            [
+              cache.clear(environmentId).pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("Could not clear cached environment data after removal.", {
+                    environmentId,
+                    error,
+                  }),
+                ),
+              ),
+              ownedDataCleanup.clear(environmentId),
+            ],
+            { concurrency: "unbounded", discard: true },
+          );
+        } else {
+          // Forget closes admission first, then clears client-owned secret/cache/UI data,
+          // and deletes normalized metadata only after those operations succeed.
+          yield* closeServiceScope(environmentId);
+          const secretReferences = [
+            ...new Set(
+              environment.routes.flatMap((route) =>
+                route.secretRef === null ? [] : [route.secretRef],
+              ),
+            ),
+          ];
+          yield* Effect.forEach(secretReferences, (secretRef) =>
+            environmentSecrets.delete(secretRef),
+          );
+          yield* cache.clear(environmentId);
+          yield* environmentUiState.clearEnvironment(environmentId);
+          yield* ownedDataCleanup.clear(environmentId);
+          yield* environmentCatalog.forget(environmentId);
+        }
+
+        yield* Ref.update(legacyEntries, (current) => {
           const next = new Map(current);
           next.delete(environmentId);
           return next;
         });
-        yield* closeServiceScope(environmentId);
+        yield* SubscriptionRef.update(environments, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
         yield* SubscriptionRef.update(entries, (current) => {
           const next = new Map(current);
           next.delete(environmentId);
           return next;
         });
-        yield* Effect.all(
-          [
-            cache.clear(environmentId).pipe(
-              Effect.catch((error) =>
-                Effect.logWarning("Could not clear cached environment data after removal.", {
-                  environmentId,
-                  error,
-                }),
-              ),
-            ),
-            ownedDataCleanup.clear(environmentId),
-          ],
-          { concurrency: "unbounded", discard: true },
-        );
 
-        if (
+        const normalizedSshTarget = environment.routes.find(
+          (route) => route._tag === "SshTunnelRoute",
+        )?.target;
+        const legacySshTarget =
           target._tag === "SshConnectionTarget" &&
-          Option.isSome(profile) &&
-          isSshConnectionProfile(profile.value)
-        ) {
-          yield* ssh.disconnect(profile.value.target).pipe(
+          Option.isSome(legacyProfile) &&
+          isSshConnectionProfile(legacyProfile.value)
+            ? legacyProfile.value.target
+            : null;
+        const sshTarget = normalizedSshTarget ?? legacySshTarget;
+        if (sshTarget !== null && sshTarget !== undefined) {
+          yield* ssh.disconnect(sshTarget).pipe(
             Effect.tapError((error) =>
               Effect.logWarning("Could not disconnect the managed SSH environment.", {
                 environmentId,
@@ -658,7 +1065,7 @@ export const make = Effect.gen(function* () {
       environmentId,
       Effect.uninterruptible(
         Effect.gen(function* () {
-          yield* getEntry(environmentId);
+          yield* getEnvironment(environmentId);
           const supervisor = (yield* SubscriptionRef.get(serviceScopes)).get(
             environmentId,
           )?.supervisor;
@@ -733,9 +1140,11 @@ export const make = Effect.gen(function* () {
   );
 
   return EnvironmentRegistry.of({
+    environments,
     entries,
     networkStatus,
     start,
+    registerEnvironment,
     register,
     registerPlatform,
     reconcilePlatform,
@@ -751,4 +1160,7 @@ export const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(EnvironmentRegistry, make);
+export const layer = Layer.effect(EnvironmentRegistry, make());
+
+export const layerWithOptions = (options: EnvironmentRegistryOptions) =>
+  Layer.effect(EnvironmentRegistry, make(options));

@@ -22,7 +22,7 @@ function isUrlWithProtocols(value: string, protocols: ReadonlySet<string>): bool
   }
 }
 
-function isLoopbackHostname(hostname: string): boolean {
+export function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase();
   return (
     normalized === "localhost" ||
@@ -309,6 +309,21 @@ export type ConnectionAttemptError =
   | ConnectionBlockedError
   | ConnectionStorageChangedError;
 
+export type VerifiedRouteTransportTrust =
+  | "loopback"
+  | "ssh-host-key"
+  | "system-tls"
+  | "pinned-spki";
+
+/** Identity proved from a transport-trusted descriptor before any credential access. */
+export interface VerifiedRouteIdentity {
+  readonly routeId: string;
+  readonly environmentId: EnvironmentId;
+  readonly storageInstanceId: string;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
+  readonly transportTrust: VerifiedRouteTransportTrust;
+}
+
 export type PreparedHttpAuthorization =
   | {
       readonly _tag: "Bearer";
@@ -327,6 +342,8 @@ export interface PreparedConnection {
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;
   readonly target: ConnectionTarget;
+  readonly route?: EnvironmentRoute;
+  readonly verifiedRouteIdentity?: VerifiedRouteIdentity;
 }
 
 export type SupervisorConnectionPhase =

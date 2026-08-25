@@ -2,11 +2,15 @@ import * as Effect from "effect/Effect";
 import type { ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 
 import * as Persistence from "../platform/persistence.ts";
+import type { KnownEnvironment } from "./catalog.ts";
 import {
   ConnectionBlockedError,
   ConnectionStorageChangedError,
   type ConnectionTarget,
+  type EnvironmentRoute,
   type PreparedConnection,
+  type VerifiedRouteIdentity,
+  type VerifiedRouteTransportTrust,
 } from "./model.ts";
 
 export type StorageIdentityDecision =
@@ -65,10 +69,78 @@ function identityPersistenceError(prepared: PreparedConnection): ConnectionBlock
   });
 }
 
+const CLIENT_PROTOCOL_MINIMUM = 1;
+const CLIENT_PROTOCOL_MAXIMUM = 1;
+
+export function verifyRouteIdentity(input: {
+  readonly environment: KnownEnvironment;
+  readonly route: EnvironmentRoute;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
+  readonly transportTrust: VerifiedRouteTransportTrust;
+}): Effect.Effect<VerifiedRouteIdentity, ConnectionBlockedError | ConnectionStorageChangedError> {
+  const { environment, route, descriptor, transportTrust } = input;
+  if (descriptor.environmentId !== environment.environmentId) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "environment-changed",
+        detail: `${route.label} reported a different environment identity.`,
+      }),
+    );
+  }
+  if (descriptor.storageInstanceId !== environment.acceptedStorageInstanceId) {
+    return Effect.fail(
+      new ConnectionStorageChangedError({
+        reason: "storage-changed",
+        detail: `${route.label} is reporting a different persistent store.`,
+        targetKey: `environment:${environment.environmentId}`,
+        acceptedStorageInstanceId: environment.acceptedStorageInstanceId,
+        reportedStorageInstanceId: descriptor.storageInstanceId,
+      }),
+    );
+  }
+  if (
+    descriptor.protocol.maximum < CLIENT_PROTOCOL_MINIMUM ||
+    descriptor.protocol.minimum > CLIENT_PROTOCOL_MAXIMUM
+  ) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "version-incompatible",
+        detail: `${route.label} does not support this client's connection protocol.`,
+      }),
+    );
+  }
+  return Effect.succeed({
+    routeId: route.routeId,
+    environmentId: descriptor.environmentId,
+    storageInstanceId: descriptor.storageInstanceId,
+    descriptor,
+    transportTrust,
+  });
+}
+
 export const verifyPreparedStorageIdentity = Effect.fn("verifyPreparedStorageIdentity")(function* (
   prepared: PreparedConnection,
   descriptor: ExecutionEnvironmentDescriptor = prepared.descriptor,
 ) {
+  if (prepared.verifiedRouteIdentity !== undefined) {
+    const verified = prepared.verifiedRouteIdentity;
+    if (descriptor.environmentId !== verified.environmentId) {
+      return yield* new ConnectionBlockedError({
+        reason: "environment-changed",
+        detail: `${prepared.label} changed environment identity after route verification.`,
+      });
+    }
+    if (descriptor.storageInstanceId !== verified.storageInstanceId) {
+      return yield* new ConnectionStorageChangedError({
+        reason: "storage-changed",
+        detail: `${prepared.label} changed persistent stores after route verification.`,
+        targetKey: `environment:${verified.environmentId}`,
+        acceptedStorageInstanceId: verified.storageInstanceId,
+        reportedStorageInstanceId: descriptor.storageInstanceId,
+      });
+    }
+    return;
+  }
   const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const targetKey = storageIdentityTargetKey(prepared.target);
   const reported = descriptor.storageInstanceId;

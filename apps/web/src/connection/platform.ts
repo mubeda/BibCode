@@ -167,6 +167,7 @@ export const provisionDesktopSshEnvironment = Effect.fn(
   return {
     environmentId: descriptor.environmentId,
     label: descriptor.label,
+    descriptor,
     bootstrap,
     bearerToken: access.access_token,
   };
@@ -257,6 +258,58 @@ const capabilitiesLayer = Layer.effectContext(
           bearerToken: access.access_token,
         };
       }),
+      inspect: Effect.fn("web.connectionPlatform.ssh.inspect")(function* (input) {
+        const bridge = window.desktopBridge;
+        if (bridge === undefined) {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail: "SSH environments are only available in the desktop app.",
+          });
+        }
+        if (input.hostKeyFingerprint !== null) {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail:
+              "Pinned SSH host-key verification requires desktop bridge support before this route can connect.",
+          });
+        }
+        if (input.cancellation.aborted) {
+          return yield* Effect.interrupt;
+        }
+        const bootstrap = yield* Effect.tryPromise({
+          try: () =>
+            bridge.ensureSshEnvironment(input.target, {
+              issuePairingToken: input.issuePairingToken,
+            }),
+          catch: sshPreparationError,
+        });
+        if (input.cancellation.aborted) {
+          return yield* Effect.interrupt;
+        }
+        const descriptor = yield* Effect.tryPromise({
+          try: () => bridge.fetchSshEnvironmentDescriptor(bootstrap.httpBaseUrl),
+          catch: sshPreparationError,
+        });
+        if (input.cancellation.aborted) {
+          return yield* Effect.interrupt;
+        }
+        return { bootstrap, descriptor };
+      }),
+      exchange: Effect.fn("web.connectionPlatform.ssh.exchange")(function* (input) {
+        const bridge = window.desktopBridge;
+        if (bridge === undefined) {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail: "SSH environments are only available in the desktop app.",
+          });
+        }
+        const access = yield* Effect.tryPromise({
+          try: () =>
+            bridge.bootstrapSshBearerSession(input.bootstrap.httpBaseUrl, input.pairingToken),
+          catch: sshPreparationError,
+        });
+        return access.access_token;
+      }),
       disconnect: Effect.fn("web.connectionPlatform.ssh.disconnect")(function* (target) {
         const bridge = window.desktopBridge;
         if (bridge === undefined) {
@@ -294,6 +347,7 @@ const loadPrimaryConnectionRegistration = Effect.fn(
       httpBaseUrl: resolved.target.httpBaseUrl,
       wsBaseUrl: resolved.target.wsBaseUrl,
     }),
+    descriptor,
   });
 });
 
@@ -362,6 +416,7 @@ const loadSecondaryConnectionRegistration = Effect.fn(
         wsBaseUrl,
       }),
       credential: new BearerConnectionCredential({ token: access.access_token }),
+      descriptor,
     }),
     expiresAtEpochMs: secondaryBearerExpiresAtEpochMs(issuedAtEpochMs, access.expires_in),
     refreshAtEpochMs: secondaryBearerRefreshAtEpochMs(issuedAtEpochMs, access.expires_in),

@@ -68,7 +68,15 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
   const prepared = yield* SubscriptionRef.make<Option.Option<PreparedConnection>>(Option.none());
   const retryCount = yield* Ref.make(0);
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+    environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+      target: TARGET,
+      profile: Option.none(),
+    }),
     target: TARGET,
+    activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+    routeResults: yield* SubscriptionRef.make<
+      ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+    >([]),
     state,
     session: activeSession,
     prepared,

@@ -1,4 +1,4 @@
-import { EnvironmentId, type ServerConfig } from "@bibcode/contracts";
+import { DurableEnvironmentId, type ServerConfig } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -11,14 +11,15 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import type { ConnectionCatalogEntry } from "./catalog.ts";
+import type { ConnectionCatalogEntry, KnownEnvironment } from "./catalog.ts";
 import * as Connectivity from "./connectivity.ts";
 import * as ConnectionDriver from "./driver.ts";
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
+  DesktopLoopbackRoute,
+  type EnvironmentRoute,
   PrimaryConnectionTarget,
-  RelayConnectionTarget,
   type ConnectionAttemptError,
   type ConnectionTarget,
   type NetworkStatus,
@@ -30,25 +31,17 @@ import * as ConnectionResolver from "./resolver.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
 
-const TARGET = new PrimaryConnectionTarget({
-  environmentId: EnvironmentId.make("environment-1"),
-  label: "Test environment",
-  httpBaseUrl: "https://environment.example.test",
-  wsBaseUrl: "wss://environment.example.test",
-});
+const ENVIRONMENT_ID = DurableEnvironmentId.make("00000000-0000-4000-8000-000000000001");
 
-const RELAY_TARGET = new RelayConnectionTarget({
-  environmentId: TARGET.environmentId,
-  label: TARGET.label,
+const TARGET = new PrimaryConnectionTarget({
+  environmentId: ENVIRONMENT_ID,
+  label: "Test environment",
+  httpBaseUrl: "http://127.0.0.1:48271",
+  wsBaseUrl: "ws://127.0.0.1:48271",
 });
 
 const TARGET_ENTRY: ConnectionCatalogEntry = {
   target: TARGET,
-  profile: Option.none(),
-};
-
-const RELAY_ENTRY: ConnectionCatalogEntry = {
-  target: RELAY_TARGET,
   profile: Option.none(),
 };
 
@@ -71,12 +64,44 @@ const PREPARED_CONNECTION: PreparedConnection = {
     },
   },
   httpBaseUrl: TARGET.httpBaseUrl,
-  socketUrl: "wss://environment.example.test/ws",
+  socketUrl: "ws://127.0.0.1:48271/ws",
   httpAuthorization: null,
   target: TARGET,
 };
 
 const TEST_RPC_CLIENT = {} as WsRpcProtocolClient;
+
+const PRIMARY_ROUTE = new DesktopLoopbackRoute({
+  routeId: "primary",
+  environmentId: ENVIRONMENT_ID,
+  label: "Primary route",
+  priority: 0,
+  pinned: false,
+  autoconnect: true,
+  secretRef: null,
+  httpBaseUrl: "http://127.0.0.1:48271",
+  wsBaseUrl: "ws://127.0.0.1:48271",
+});
+const FAILOVER_ROUTE = new DesktopLoopbackRoute({
+  ...PRIMARY_ROUTE,
+  routeId: "failover",
+  label: "Failover route",
+  priority: 10,
+  httpBaseUrl: "http://127.0.0.1:48272",
+  wsBaseUrl: "ws://127.0.0.1:48272",
+});
+
+function knownEnvironment(routes: ReadonlyArray<EnvironmentRoute>): KnownEnvironment {
+  return {
+    environmentId: ENVIRONMENT_ID,
+    acceptedStorageInstanceId: PREPARED_CONNECTION.descriptor.storageInstanceId,
+    descriptor: PREPARED_CONNECTION.descriptor,
+    alias: TARGET.label,
+    hidden: false,
+    bindings: [],
+    routes,
+  } as KnownEnvironment;
+}
 
 function transient(message = "Connection failed.") {
   return new ConnectionTransientError({
@@ -162,10 +187,10 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
   });
 
   const connect = Effect.fn("TestConnectionDriver.connect")(function* (
-    entry: ConnectionCatalogEntry,
+    input: ConnectionDriver.ConnectionDriverInput,
     reportProgress: (progress: ConnectionDriver.ConnectionDriverProgress) => Effect.Effect<void>,
   ) {
-    const target = entry.target;
+    const target = "target" in input ? input.target : PREPARED_CONNECTION.target;
     yield* reportProgress({ stage: "preparing" });
     const prepared = yield* prepare(target);
     yield* reportProgress({ stage: "opening", prepared });
@@ -230,6 +255,66 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
   };
 });
 
+const makeRouteHarness = Effect.fn("TestRouteConnectionHarness.make")(function* (options?: {
+  readonly attempt?: (
+    attempt: number,
+    input: ConnectionDriver.EnvironmentRouteConnectionAttempt,
+    reportProgress: (progress: ConnectionDriver.ConnectionDriverProgress) => Effect.Effect<void>,
+  ) => Effect.Effect<void, ConnectionAttemptError>;
+}) {
+  const attemptCount = yield* Ref.make(0);
+  const attempts = yield* Ref.make<
+    ReadonlyArray<ConnectionDriver.EnvironmentRouteConnectionAttempt>
+  >([]);
+  const releaseCount = yield* Ref.make(0);
+  const networkStatus = yield* SubscriptionRef.make<NetworkStatus>("online");
+  const connectivity = Connectivity.Connectivity.of({
+    status: SubscriptionRef.get(networkStatus),
+    changes: SubscriptionRef.changes(networkStatus),
+  });
+  const connect: ConnectionDriver.ConnectionDriver["Service"]["connect"] = Effect.fn(
+    "TestRouteConnectionDriver.connect",
+  )(function* (input, reportProgress) {
+    if ("target" in input) {
+      return yield* Effect.die(new Error("Expected a normalized route attempt."));
+    }
+    const attempt = yield* Ref.updateAndGet(attemptCount, (count) => count + 1);
+    yield* Ref.update(attempts, (current) => [...current, input]);
+    yield* reportProgress({ stage: "preparing" });
+    if (options?.attempt !== undefined) {
+      yield* options.attempt(attempt, input, reportProgress);
+    }
+    yield* reportProgress({ stage: "opening", prepared: PREPARED_CONNECTION });
+    const session = yield* Effect.acquireRelease(
+      Effect.succeed({
+        client: TEST_RPC_CLIENT,
+        initialConfig: Effect.die(new Error("Initial config is not used by supervisor tests.")),
+        ready: Effect.void,
+        probe: Effect.void,
+        closed: Effect.never,
+      } satisfies RpcSession.RpcSession),
+      () => Ref.update(releaseCount, (count) => count + 1),
+    );
+    yield* reportProgress({ stage: "synchronizing", prepared: PREPARED_CONNECTION });
+    return { prepared: PREPARED_CONNECTION, session };
+  });
+  return {
+    attempts,
+    releaseCount,
+    dependencies: Layer.mergeAll(
+      Layer.succeed(Connectivity.Connectivity, connectivity),
+      Layer.succeed(
+        ConnectionWakeups.ConnectionWakeups,
+        ConnectionWakeups.ConnectionWakeups.of({ changes: Stream.never }),
+      ),
+      Layer.succeed(
+        ConnectionDriver.ConnectionDriver,
+        ConnectionDriver.ConnectionDriver.of({ connect }),
+      ),
+    ),
+  };
+});
+
 const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(function* (
   acceptedStorageInstanceId: string | null,
   reportedStorageInstanceId: string,
@@ -259,6 +344,7 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
   };
   const resolver = ConnectionResolver.ConnectionResolver.of({
     prepare: () => Effect.succeed(prepared),
+    prepareRoute: () => Effect.succeed(prepared),
   });
   const sessions = RpcSession.RpcSessionFactory.of({
     connect: () =>
@@ -371,6 +457,109 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
 });
 
 describe("EnvironmentSupervisor", () => {
+  it.effect("fails over sequentially and publishes the active route plus bounded results", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeRouteHarness({
+        attempt: (attempt) =>
+          attempt === 1 ? Effect.fail(transient("The primary route is unavailable.")) : Effect.void,
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(
+        knownEnvironment([PRIMARY_ROUTE, FAILOVER_ROUTE]),
+        { initiallyDesired: true, environmentGeneration: 7 },
+      ).pipe(Effect.provide(harness.dependencies));
+
+      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
+
+      expect((yield* Ref.get(harness.attempts)).map((attempt) => attempt.route.routeId)).toEqual([
+        "primary",
+        "failover",
+      ]);
+      expect(yield* SubscriptionRef.get(supervisor.activeRouteId)).toBe("failover");
+      expect(yield* SubscriptionRef.get(supervisor.routeResults)).toMatchObject([
+        {
+          routeId: "primary",
+          environmentGeneration: 7,
+          routeGeneration: 1,
+          outcome: "transient-failure",
+        },
+        {
+          routeId: "failover",
+          environmentGeneration: 7,
+          routeGeneration: 2,
+          outcome: "connected",
+        },
+      ]);
+    }),
+  );
+
+  it.effect("blocks only the failed route and continues with another eligible route", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeRouteHarness({
+        attempt: (attempt) =>
+          attempt === 1 ? Effect.fail(blocked("The primary credential is invalid.")) : Effect.void,
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(
+        knownEnvironment([PRIMARY_ROUTE, FAILOVER_ROUTE]),
+        { initiallyDesired: true },
+      ).pipe(Effect.provide(harness.dependencies));
+
+      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* SubscriptionRef.get(supervisor.activeRouteId)).toBe("failover");
+      expect(
+        (yield* SubscriptionRef.get(supervisor.routeResults)).map((result) => [
+          result.routeId,
+          result.outcome,
+        ]),
+      ).toEqual([
+        ["primary", "blocked"],
+        ["failover", "connected"],
+      ]);
+    }),
+  );
+
+  it.effect("ignores late progress from a superseded route generation", () =>
+    Effect.gen(function* () {
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const staleReporter = yield* Ref.make<
+        null | ((progress: ConnectionDriver.ConnectionDriverProgress) => Effect.Effect<void>)
+      >(null);
+      const harness = yield* makeRouteHarness({
+        attempt: (attempt, _input, reportProgress) => {
+          if (attempt === 1) {
+            return Ref.set(staleReporter, reportProgress).pipe(
+              Effect.andThen(Deferred.succeed(firstAttemptStarted, undefined)),
+              Effect.andThen(Effect.never),
+            );
+          }
+          return attempt === 2 ? Effect.fail(transient()) : Effect.void;
+        },
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(
+        knownEnvironment([PRIMARY_ROUTE, FAILOVER_ROUTE]),
+        { initiallyDesired: true },
+      ).pipe(Effect.provide(harness.dependencies));
+
+      yield* Deferred.await(firstAttemptStarted);
+      yield* supervisor.retryNow;
+      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
+      const attempts = yield* Ref.get(harness.attempts);
+      expect(attempts.map((attempt) => attempt.routeGeneration)).toEqual([1, 2, 3]);
+      expect(attempts[0]?.cancellation.aborted).toBe(true);
+      expect(yield* SubscriptionRef.get(supervisor.activeRouteId)).toBe("failover");
+
+      const report = yield* Ref.get(staleReporter);
+      expect(report).not.toBeNull();
+      if (report !== null) {
+        yield* report({ stage: "opening", prepared: PREPARED_CONNECTION });
+      }
+      yield* Effect.yieldNow;
+
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
+      expect(yield* SubscriptionRef.get(supervisor.activeRouteId)).toBe("failover");
+    }),
+  );
+
   it.effect("blocks a changed store before opening or synchronizing the RPC session", () =>
     Effect.gen(function* () {
       const harness = yield* makeStorageIdentityHarness("store-a", "store-b");
@@ -1001,47 +1190,6 @@ describe("EnvironmentSupervisor", () => {
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);
       expect(yield* Ref.get(harness.releaseCount)).toBe(0);
       expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
-    }),
-  );
-
-  it.effect("releases and reconnects a relay session when credentials change", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness();
-      const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
-      yield* harness.wake("credentials-changed");
-      yield* awaitState(
-        supervisor.state,
-        (state) => state.phase === "connected" && state.generation === 2,
-      );
-
-      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
-      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
-    }),
-  );
-
-  it.effect("interrupts relay setup when credentials change", () =>
-    Effect.gen(function* () {
-      const firstAttemptStarted = yield* Deferred.make<void>();
-      const harness = yield* makeHarness({
-        prepare: (attempt) =>
-          attempt === 1
-            ? Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never))
-            : Effect.succeed(PREPARED_CONNECTION),
-      });
-      const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* Deferred.await(firstAttemptStarted);
-      yield* harness.wake("credentials-changed");
-      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
-
-      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
-      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
     }),
   );
 

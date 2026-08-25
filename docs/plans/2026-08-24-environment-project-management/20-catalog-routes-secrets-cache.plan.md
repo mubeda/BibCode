@@ -274,7 +274,7 @@ const STORE_NAMES = [
 
 Use compound keys for bindings and thread cache. Create indexes on `environmentId` for every dependent store so Forget can clear a bounded key range.
 
-- [ ] **Step 4: Implement one upgrade transaction per phase**
+- [x] **Step 4: Implement one upgrade transaction per phase**
 
 Decode raw v1 values with `LegacyConnectionCatalogV1`; discard Relay/Connect targets/tokens; preserve direct metadata and accepted storage IDs; stage secret imports; create a receipt; only then delete the legacy document.
 
@@ -285,7 +285,7 @@ transaction
 transaction.objectStore("catalog").delete("document");
 ```
 
-Dependency gate: the deterministic planner and atomic IndexedDB committer are implemented and prove rollback/retry/one-receipt behavior, but startup does not yet invoke destructive v1 deletion. Activation waits for Task 4 to import secrets through an OS provider and Task 5 to move the registry off legacy target stores; deleting first would strand existing direct connections or force plaintext/session loss. The deprecated v1 stores remain read only by the old adapter until that gate closes.
+Dependency gate resolved: startup stages legacy credentials into protected OS storage, publishes normalized rows and the receipt atomically, and deletes the legacy document in the same transaction. A failed or racing activation deletes staged secret references and leaves the legacy document available for retry. Once the receipt exists, the registry never reads legacy targets.
 
 - [x] **Step 5: Quarantine corrupt non-secret metadata**
 
@@ -295,7 +295,7 @@ Write only entry kind, hash, and bounded decoder error to local diagnostics. Nev
 
 Inject aborts before receipt, after secret import, and before legacy deletion. Verify retry has no duplicate environment/route and does not restore Relay-only records.
 
-- [ ] **Step 7: Run tests and commit**
+- [x] **Step 7: Run tests and commit**
 
 ```sh
 vp test run apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/storage.test.ts
@@ -395,7 +395,7 @@ git commit -m "feat(desktop): protect environment secrets with OS stores"
 
 - Produces: one environment supervisor, ordered route attempts, active route ID, and route-result history.
 
-- [ ] **Step 1: Write failing priority/stickiness/failover/generation tests**
+- [x] **Step 1: Write failing priority/stickiness/failover/generation tests**
 
 ```ts
 expect(selectRoute({ pinned: "ssh", healthy: "https", routes })).toBe("ssh");
@@ -404,13 +404,13 @@ await harness.completeAttempt(oldGeneration, oldRoute);
 expect(harness.activeRoute()).toBe(newRoute.routeId);
 ```
 
-- [ ] **Step 2: Run supervisor tests and confirm RED**
+- [x] **Step 2: Run supervisor tests and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts
 ```
 
-- [ ] **Step 3: Implement deterministic route ordering**
+- [x] **Step 3: Implement deterministic route ordering**
 
 ```ts
 export function eligibleRoutes(environment: KnownEnvironment, activeRouteId: string | null) {
@@ -427,19 +427,19 @@ export function eligibleRoutes(environment: KnownEnvironment, activeRouteId: str
 }
 ```
 
-- [ ] **Step 4: Move scope ownership to the environment aggregate**
+- [x] **Step 4: Move scope ownership to the environment aggregate**
 
 `EnvironmentServiceScope.entry` stores the `KnownEnvironment`; the supervisor exposes `activeRouteId`, `prepared`, `session`, `connect`, `disconnect`, and `retryNow`. One lease lock remains keyed by durable environment UUID.
 
-- [ ] **Step 5: Attempt routes sequentially with cancellation**
+- [x] **Step 5: Attempt routes sequentially with cancellation**
 
 Each attempt receives `{ environmentGeneration, routeGeneration, cancellation }`. A transient failure advances to the next eligible route; auth/version/identity/certificate failures mark only the affected route blocked and do not burn credentials or change identity.
 
-- [ ] **Step 6: Bound global connection pressure**
+- [x] **Step 6: Bound global connection pressure**
 
 Add a registry semaphore for simultaneous environment attempts (start with the measured current safe default, configurable in tests). Preserve per-environment backoff with jitter and cancel all pending route work on Forget.
 
-- [ ] **Step 7: Run runtime tests and commit**
+- [x] **Step 7: Run runtime tests and commit**
 
 ```sh
 vp test run packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts packages/client-runtime/src/connection/driver.test.ts
@@ -463,7 +463,7 @@ git commit -m "feat(connections): supervise multiple routes per environment"
 - Consumes: transport-verified minimal descriptor.
 - Produces: `VerifiedRouteIdentity`; pairing/session secret loads happen only afterward.
 
-- [ ] **Step 1: Write failing ordering and mismatch tests**
+- [x] **Step 1: Write failing ordering and mismatch tests**
 
 ```ts
 expect(harness.events).toEqual([
@@ -478,13 +478,13 @@ expect(harness.events).toEqual([
 expect(harness.secretReadsAfterMismatch).toBe(0);
 ```
 
-- [ ] **Step 2: Run resolver tests and confirm RED**
+- [x] **Step 2: Run resolver tests and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/connection/resolver.test.ts packages/client-runtime/src/connection/storageIdentity.test.ts
 ```
 
-- [ ] **Step 3: Add the verified identity value**
+- [x] **Step 3: Add the verified identity value**
 
 ```ts
 export interface VerifiedRouteIdentity {
@@ -496,15 +496,15 @@ export interface VerifiedRouteIdentity {
 }
 ```
 
-- [ ] **Step 4: Split resolver prepare into trust/identity/session phases**
+- [x] **Step 4: Split resolver prepare into trust/identity/session phases**
 
 No session broker receives a pairing credential or secret reference until `verifyRouteIdentity` succeeds. A storage mismatch offers an explicit later Adopt/New Environment decision but cannot mutate the accepted ID in this path.
 
-- [ ] **Step 5: Add downgrade/version/certificate cases**
+- [x] **Step 5: Add downgrade/version/certificate cases**
 
 Reject HTTP for non-loopback URLs, changed SPKI pins, invalid system TLS, descriptor environment mismatch, storage mismatch, and non-overlapping protocol ranges with typed blocked reasons.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```sh
 vp test run packages/client-runtime/src/connection/resolver.test.ts packages/client-runtime/src/connection/storageIdentity.test.ts packages/client-runtime/src/environment/descriptor.test.ts

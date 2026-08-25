@@ -1,5 +1,6 @@
 import {
   type DesktopSshEnvironmentTarget,
+  DurableEnvironmentId,
   EnvironmentId,
   type OrchestrationShellSnapshot,
   type OrchestrationThread,
@@ -30,6 +31,7 @@ import {
   SshConnectionProfile,
   type ConnectionCredential,
   type ConnectionProfile,
+  type KnownEnvironment,
   UnavailableConnectionRegistration,
 } from "./catalog.ts";
 import * as Connectivity from "./connectivity.ts";
@@ -40,6 +42,7 @@ import {
   ConnectionStorageChangedError,
   ConnectionTransientError,
   BearerConnectionTarget,
+  DesktopLoopbackRoute,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
@@ -67,6 +70,28 @@ const SECOND_TARGET = new PrimaryConnectionTarget({
   httpBaseUrl: "https://environment-2.example.test",
   wsBaseUrl: "wss://environment-2.example.test",
 });
+const NORMALIZED_ENVIRONMENT_ID = DurableEnvironmentId.make("00000000-0000-4000-8000-000000000091");
+const NORMALIZED_ENVIRONMENT = {
+  environmentId: NORMALIZED_ENVIRONMENT_ID,
+  acceptedStorageInstanceId: "00000000-0000-4000-8000-000000000092",
+  descriptor: null,
+  alias: "Normalized environment",
+  hidden: false,
+  bindings: [],
+  routes: [
+    new DesktopLoopbackRoute({
+      routeId: "normalized-loopback",
+      environmentId: NORMALIZED_ENVIRONMENT_ID,
+      label: "Normalized loopback",
+      priority: 0,
+      pinned: false,
+      autoconnect: true,
+      secretRef: null,
+      httpBaseUrl: "http://127.0.0.1:48291",
+      wsBaseUrl: "ws://127.0.0.1:48291",
+    }),
+  ],
+} as KnownEnvironment;
 
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
@@ -174,6 +199,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialProfiles: ReadonlyArray<ConnectionProfile> = [],
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
+    readonly initialEnvironments?: ReadonlyArray<KnownEnvironment>;
+    readonly migrationCompleted?: boolean;
+    readonly maxConcurrentEnvironmentAttempts?: number;
     readonly beforeSessionConnect?: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionAttemptError>;
@@ -191,6 +219,16 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   const storedTargets = yield* Ref.make(
     new Map(initialTargets.map((target) => [target.environmentId, target])),
   );
+  const storedEnvironments = yield* Ref.make(
+    new Map(
+      (options?.initialEnvironments ?? []).map((environment) => [
+        environment.environmentId,
+        environment,
+      ]),
+    ),
+  );
+  const storedEnvironmentSecrets = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  const targetListCount = yield* Ref.make(0);
   const shellCache = yield* Ref.make(new Map([[TARGET.environmentId, CACHED_SNAPSHOT]]));
   const threadCache = yield* Ref.make(
     new Map([[TARGET.environmentId, new Map([[CACHED_THREAD.id, CACHED_THREAD]])]]),
@@ -230,7 +268,71 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   >([]);
 
   const targetStore = Persistence.ConnectionTargetStore.of({
-    list: Ref.get(storedTargets).pipe(Effect.map((targets) => [...targets.values()])),
+    list: Ref.update(targetListCount, (count) => count + 1).pipe(
+      Effect.andThen(Ref.get(storedTargets)),
+      Effect.map((targets) => [...targets.values()]),
+    ),
+  });
+  const environmentCatalogStore = Persistence.EnvironmentCatalogStore.of({
+    list: Ref.get(storedEnvironments).pipe(Effect.map((current) => [...current.values()])),
+    load: (environmentId) =>
+      Ref.get(storedEnvironments).pipe(
+        Effect.map((current) => Option.fromUndefinedOr(current.get(environmentId))),
+      ),
+    put: (environment) =>
+      Ref.update(storedEnvironments, (current) =>
+        new Map(current).set(environment.environmentId, environment),
+      ),
+    updateRoutes: (environmentId, routes) =>
+      Ref.update(storedEnvironments, (current) => {
+        const environment = current.get(environmentId);
+        return environment === undefined
+          ? current
+          : new Map(current).set(environmentId, { ...environment, routes });
+      }),
+    listBindings: Effect.succeed([]),
+    putBinding: () => Effect.void,
+    forget: (environmentId) =>
+      Ref.update(storedEnvironments, (current) => {
+        const next = new Map(current);
+        next.delete(environmentId);
+        return next;
+      }),
+  });
+  const environmentSecretStore = Persistence.EnvironmentSecretStore.of({
+    put: (_environmentId, _purpose, value) => {
+      const secretRef = "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8";
+      return Ref.update(storedEnvironmentSecrets, (current) =>
+        new Map(current).set(secretRef, value),
+      ).pipe(Effect.as(secretRef));
+    },
+    get: (secretRef) =>
+      Ref.get(storedEnvironmentSecrets).pipe(
+        Effect.map((current) => Option.fromUndefinedOr(current.get(secretRef))),
+      ),
+    delete: (secretRef) =>
+      Ref.update(storedEnvironmentSecrets, (current) => {
+        const next = new Map(current);
+        next.delete(secretRef);
+        return next;
+      }),
+  });
+  const environmentUiStateStore = Persistence.EnvironmentUiStateStore.of({
+    load: Effect.succeed(Option.none()),
+    save: () => Effect.void,
+    clearEnvironment: () => Effect.void,
+  });
+  const environmentMigrationStore = Persistence.EnvironmentMigrationStore.of({
+    load: () =>
+      Effect.succeed(
+        options?.migrationCompleted === true
+          ? Option.some({
+              id: "catalog-v1-to-v3",
+              completedAt: "2026-08-25T00:00:00.000Z",
+            })
+          : Option.none(),
+      ),
+    save: () => Effect.void,
   });
   const registrationStore = Persistence.ConnectionRegistrationStore.of({
     register: (registration) =>
@@ -469,12 +571,14 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   const sshGateway = ClientCapabilities.SshEnvironmentGateway.of({
     provision: () => Effect.die(new Error("SSH provisioning is not used.")),
     prepare: () => Effect.die(new Error("SSH preparation is not used.")),
+    inspect: () => Effect.die(new Error("SSH inspection is not used.")),
+    exchange: () => Effect.die(new Error("SSH exchange is not used.")),
     disconnect: (target) => Ref.update(disconnectedSshTargets, (current) => [...current, target]),
   });
   const driver = ConnectionDriver.ConnectionDriver.of({
-    connect: (entry, reportProgress) =>
+    connect: (input, reportProgress) =>
       Effect.gen(function* () {
-        const target = entry.target;
+        const target = "target" in input ? input.target : PREPARED.target;
         if (target._tag === "UnavailableConnectionTarget") {
           return yield* new ConnectionTransientError({
             reason: "endpoint-unavailable",
@@ -509,10 +613,20 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   });
 
   const cacheLayer = Layer.succeed(Persistence.EnvironmentCacheStore, cacheStore);
-  const layer = EnvironmentRegistry.layer.pipe(
+  const registryLayer =
+    options?.maxConcurrentEnvironmentAttempts === undefined
+      ? EnvironmentRegistry.layer
+      : EnvironmentRegistry.layerWithOptions({
+          maxConcurrentEnvironmentAttempts: options.maxConcurrentEnvironmentAttempts,
+        });
+  const layer = registryLayer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.succeed(Persistence.ConnectionTargetStore, targetStore),
+        Layer.succeed(Persistence.EnvironmentCatalogStore, environmentCatalogStore),
+        Layer.succeed(Persistence.EnvironmentSecretStore, environmentSecretStore),
+        Layer.succeed(Persistence.EnvironmentUiStateStore, environmentUiStateStore),
+        Layer.succeed(Persistence.EnvironmentMigrationStore, environmentMigrationStore),
         Layer.succeed(Persistence.ConnectionRegistrationStore, registrationStore),
         Layer.succeed(Persistence.AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
         Layer.succeed(ConnectionProfileStore.ConnectionProfileStore, profileStore),
@@ -548,6 +662,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     acceptedStorageIdentities,
     acceptedStorageIdentityWrites,
     networkStatus,
+    targetListCount,
+    storedEnvironments,
+    storedEnvironmentSecrets,
   };
 });
 
@@ -568,6 +685,96 @@ function awaitConnectionState(
 }
 
 describe("EnvironmentRegistry", () => {
+  it.effect("uses normalized environments exclusively after the migration receipt", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([SSH_CONNECTION], [], [], {
+        initialEnvironments: [NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        expect([...(yield* SubscriptionRef.get(registry.environments)).keys()]).toEqual([
+          NORMALIZED_ENVIRONMENT_ID,
+        ]);
+        expect(yield* Ref.get(harness.targetListCount)).toBe(0);
+
+        const owned = yield* registry.run(
+          NORMALIZED_ENVIRONMENT_ID,
+          EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+            Effect.map((supervisor) => supervisor.environment),
+          ),
+        );
+        expect(owned).toEqual(NORMALIZED_ENVIRONMENT);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("stores enrollment secrets before publishing a normalized environment", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], { migrationCompleted: true });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.registerEnvironment({
+          environment: NORMALIZED_ENVIRONMENT,
+          sessionSecret: {
+            routeId: "normalized-loopback",
+            value: "protected-session-value",
+          },
+        });
+
+        const stored = (yield* Ref.get(harness.storedEnvironments)).get(NORMALIZED_ENVIRONMENT_ID);
+        const secretRef = stored?.routes[0]?.secretRef;
+        expect(secretRef).toMatch(/^bibcode-secret:/u);
+        expect((yield* Ref.get(harness.storedEnvironmentSecrets)).get(secretRef!)).toBe(
+          "protected-session-value",
+        );
+        expect(
+          (yield* SubscriptionRef.get(registry.environments)).get(NORMALIZED_ENVIRONMENT_ID),
+        ).toEqual(stored);
+
+        yield* registry.remove(NORMALIZED_ENVIRONMENT_ID);
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          false,
+        );
+        expect((yield* Ref.get(harness.storedEnvironmentSecrets)).size).toBe(0);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("reconciles descriptor-backed platform registrations into normalized storage", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], { migrationCompleted: true });
+      const target = new PrimaryConnectionTarget({
+        environmentId: NORMALIZED_ENVIRONMENT_ID,
+        label: "Local BiBCode",
+        httpBaseUrl: "http://127.0.0.1:48291",
+        wsBaseUrl: "ws://127.0.0.1:48291",
+      });
+      const descriptor = {
+        ...PREPARED.descriptor,
+        environmentId: NORMALIZED_ENVIRONMENT_ID,
+        label: target.label,
+        storageInstanceId: NORMALIZED_ENVIRONMENT.acceptedStorageInstanceId,
+      };
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.registerPlatform(new PrimaryConnectionRegistration({ target, descriptor }));
+
+        const stored = (yield* Ref.get(harness.storedEnvironments)).get(NORMALIZED_ENVIRONMENT_ID);
+        expect(stored).toMatchObject({
+          acceptedStorageInstanceId: NORMALIZED_ENVIRONMENT.acceptedStorageInstanceId,
+          routes: [{ _tag: "DesktopLoopbackRoute", routeId: "platform:primary" }],
+        });
+        expect(
+          (yield* SubscriptionRef.get(registry.environments)).get(NORMALIZED_ENVIRONMENT_ID),
+        ).toEqual(stored);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("hydrates connection profiles into catalog entries", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([SSH_CONNECTION], [SSH_PROFILE]);
@@ -630,6 +837,44 @@ describe("EnvironmentRegistry", () => {
         yield* Fiber.join(start);
 
         expect(yield* Ref.get(loadCount)).toBe(2);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("bounds simultaneous environment establishment without serializing live sessions", () =>
+    Effect.gen(function* () {
+      const firstStarted = yield* Deferred.make<void>();
+      const secondStarted = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const startedCount = yield* Ref.make(0);
+      const activeCount = yield* Ref.make(0);
+      const maxActiveCount = yield* Ref.make(0);
+      const harness = yield* makeHarness([TARGET, SECOND_TARGET], [], [], {
+        maxConcurrentEnvironmentAttempts: 1,
+        beforeSessionConnect: () =>
+          Effect.gen(function* () {
+            const started = yield* Ref.updateAndGet(startedCount, (count) => count + 1);
+            const active = yield* Ref.updateAndGet(activeCount, (count) => count + 1);
+            yield* Ref.update(maxActiveCount, (current) => Math.max(current, active));
+            yield* Deferred.succeed(started === 1 ? firstStarted : secondStarted, undefined);
+            if (started === 1) {
+              yield* Deferred.await(releaseFirst);
+            }
+          }).pipe(Effect.ensuring(Ref.update(activeCount, (count) => count - 1))),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* Deferred.await(firstStarted).pipe(Effect.timeout("1 second"));
+        for (let iteration = 0; iteration < 20; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+        expect(yield* Ref.get(startedCount)).toBe(1);
+
+        yield* Deferred.succeed(releaseFirst, undefined);
+        yield* Deferred.await(secondStarted).pipe(Effect.timeout("1 second"));
+        expect(yield* Ref.get(maxActiveCount)).toBe(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );

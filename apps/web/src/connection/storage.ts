@@ -14,6 +14,7 @@ import {
   EnvironmentCatalogStore,
   EnvironmentMigrationReceipt,
   EnvironmentMigrationStore,
+  EnvironmentSecretStore,
   EnvironmentUiStateDocument,
   EnvironmentUiStateStore,
   NormalizedEnvironmentCatalogRows,
@@ -33,12 +34,15 @@ import {
   ProfileStore,
 } from "@bibcode/client-runtime/connection";
 import {
+  type DesktopBridge,
+  type DesktopSecretReference,
   EnvironmentId,
   OrchestrationShellSnapshot,
   OrchestrationThread,
   ThreadId,
 } from "@bibcode/contracts";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -46,7 +50,11 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
-import type { CatalogMigrationMetadata } from "./catalogMigration.ts";
+import {
+  CATALOG_V1_TO_V3_MIGRATION_ID,
+  planCatalogV1ToV3Migration,
+  type CatalogMigrationMetadata,
+} from "./catalogMigration.ts";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
 const DATABASE_VERSION = 3;
@@ -147,6 +155,59 @@ function storageIdentityPersistenceError(
   });
 }
 
+type EnvironmentSecretPersistenceOperation =
+  | "put-environment-secret"
+  | "get-environment-secret"
+  | "delete-environment-secret";
+
+function environmentSecretPersistenceError(operation: EnvironmentSecretPersistenceOperation) {
+  return new ConnectionPersistenceError({
+    operation,
+    message: `Could not ${operation.replaceAll("-", " ")} using protected desktop storage.`,
+  });
+}
+
+/**
+ * Provides opaque secret references backed exclusively by the desktop OS store.
+ * Browser storage is deliberately not a fallback for credentials or key material.
+ */
+export function makeEnvironmentSecretStore(
+  bridge: DesktopBridge | undefined,
+): EnvironmentSecretStore["Service"] {
+  return EnvironmentSecretStore.of({
+    put: (_environmentId, purpose, value) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (bridge?.putSecret === undefined) {
+            throw new Error("Protected desktop secret storage is unavailable.");
+          }
+          return bridge.putSecret({ purpose, value });
+        },
+        catch: () => environmentSecretPersistenceError("put-environment-secret"),
+      }),
+    get: (secretRef) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (bridge?.getSecret === undefined) {
+            throw new Error("Protected desktop secret storage is unavailable.");
+          }
+          return bridge.getSecret(secretRef as DesktopSecretReference);
+        },
+        catch: () => environmentSecretPersistenceError("get-environment-secret"),
+      }).pipe(Effect.map(Option.fromNullishOr)),
+    delete: (secretRef) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (bridge?.deleteSecret === undefined) {
+            throw new Error("Protected desktop secret storage is unavailable.");
+          }
+          await bridge.deleteSecret(secretRef as DesktopSecretReference);
+        },
+        catch: () => environmentSecretPersistenceError("delete-environment-secret"),
+      }),
+  });
+}
+
 function catalogResetPersistenceError() {
   return new ConnectionPersistenceError({
     operation: "reset-connection-catalog",
@@ -224,7 +285,7 @@ function createNormalizedStores(database: IDBDatabase): void {
   }
 }
 
-const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
+export const openConnectionDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
   databaseName = DATABASE_NAME,
 ) {
   return yield* Effect.callback<IDBDatabase, ConnectionTransientError>((resume) => {
@@ -622,12 +683,103 @@ export function commitCatalogMigrationMetadata(
         }
         migrationStore.add(metadata.receipt);
       } catch (cause) {
-        transaction.abort();
+        if (typeof transaction.abort === "function") transaction.abort();
         fail(cause);
       }
     });
   }).pipe(Effect.withSpan("web.connectionStorage.commitCatalogMigrationMetadata"));
 }
+
+export interface CatalogMigrationActivationOptions {
+  readonly completedAt?: string;
+  readonly injectAbortBeforeReceipt?: boolean;
+}
+
+/** Imports legacy plaintext credentials before atomically publishing v3 metadata. */
+export const activateCatalogV1ToV3Migration = Effect.fn(
+  "web.connectionStorage.activateCatalogV1ToV3Migration",
+)(function* (
+  database: IDBDatabase,
+  backend: CatalogBackend,
+  secrets: EnvironmentSecretStore["Service"],
+  options?: CatalogMigrationActivationOptions,
+) {
+  const existingReceipt = yield* readDatabaseValue(
+    database,
+    MIGRATION_STATE_STORE_NAME,
+    CATALOG_V1_TO_V3_MIGRATION_ID,
+  );
+  if (existingReceipt !== undefined) {
+    return "already-applied" as const;
+  }
+
+  const legacyRaw = yield* backend.read;
+
+  const completedAt =
+    options?.completedAt ?? (yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)));
+  const plan = yield* Effect.tryPromise({
+    try: () =>
+      planCatalogV1ToV3Migration(
+        legacyRaw === null || legacyRaw.trim() === ""
+          ? EMPTY_CONNECTION_CATALOG_DOCUMENT
+          : legacyRaw,
+        { completedAt },
+      ),
+    catch: () => normalizedPersistenceError("save-migration-receipt", "Migration planning failed."),
+  });
+  const importedReferences: string[] = [];
+
+  return yield* Effect.gen(function* () {
+    const secretReferences = new Map<string, string>();
+    for (const pending of plan.sessionSecretImports) {
+      const secretRef = yield* secrets.put(pending.environmentId, pending.purpose, pending.value);
+      importedReferences.push(secretRef);
+      secretReferences.set(`${pending.environmentId}:${pending.routeId}`, secretRef);
+    }
+
+    let attachedSecretCount = 0;
+    const environments = plan.metadata.environments.map((environment) => ({
+      ...environment,
+      routes: environment.routes.map((route) => {
+        const secretRef = secretReferences.get(`${environment.environmentId}:${route.routeId}`);
+        if (secretRef === undefined) return route;
+        attachedSecretCount += 1;
+        return { ...route, secretRef };
+      }),
+    }));
+    if (attachedSecretCount !== plan.sessionSecretImports.length) {
+      return yield* normalizedPersistenceError(
+        "save-migration-receipt",
+        "A staged secret did not match a normalized route.",
+      );
+    }
+
+    const metadata: CatalogMigrationMetadata = {
+      ...plan.metadata,
+      environments,
+    };
+    const outcome = yield* commitCatalogMigrationMetadata(database, metadata, {
+      deleteLegacyDocument: legacyRaw !== null,
+      ...(options?.injectAbortBeforeReceipt === undefined
+        ? {}
+        : { injectAbortBeforeReceipt: options.injectAbortBeforeReceipt }),
+    });
+    if (outcome === "already-applied") {
+      yield* Effect.forEach(importedReferences, (secretRef) => secrets.delete(secretRef), {
+        concurrency: "unbounded",
+        discard: true,
+      }).pipe(Effect.ignore);
+    }
+    return outcome;
+  }).pipe(
+    Effect.onError(() =>
+      Effect.forEach(importedReferences, (secretRef) => secrets.delete(secretRef), {
+        concurrency: "unbounded",
+        discard: true,
+      }).pipe(Effect.ignore),
+    ),
+  );
+});
 
 function replaceEnvironmentRows(database: IDBDatabase, environment: KnownEnvironment) {
   return Effect.callback<void, ConnectionTransientError>((resume) => {
@@ -1057,11 +1209,21 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
 
 export const connectionStorageLayer = Layer.effectContext(
   Effect.gen(function* () {
-    const database = yield* Effect.acquireRelease(openDatabase(), (database) =>
+    const database = yield* Effect.acquireRelease(openConnectionDatabase(), (database) =>
       Effect.sync(() => database.close()),
     );
     const backend = makeCatalogBackend(database);
     yield* migrateLegacyRendererCatalog(backend);
+    const environmentSecretStore = makeEnvironmentSecretStore(
+      typeof window === "undefined" ? undefined : window.desktopBridge,
+    );
+    yield* activateCatalogV1ToV3Migration(database, backend, environmentSecretStore).pipe(
+      Effect.catch(() =>
+        Effect.logWarning(
+          "Normalized environment catalog migration was deferred without exposing its cause.",
+        ),
+      ),
+    );
     const catalog = yield* makeCatalogStore(backend);
 
     const readNormalizedCatalog = readNormalizedEnvironmentRows(database).pipe(
@@ -1487,6 +1649,7 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(EnvironmentUiStateStore, environmentUiStateStore),
       Context.add(EnvironmentCacheManifestStore, environmentCacheManifestStore),
       Context.add(EnvironmentMigrationStore, environmentMigrationStore),
+      Context.add(EnvironmentSecretStore, environmentSecretStore),
       Context.add(ConnectionRegistrationStore, registrationStore),
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),

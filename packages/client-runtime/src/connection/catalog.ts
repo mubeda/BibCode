@@ -200,6 +200,7 @@ export class PrimaryConnectionRegistration extends Schema.TaggedClass<PrimaryCon
   "PrimaryConnectionRegistration",
   {
     target: PrimaryConnectionTarget,
+    descriptor: Schema.optionalKey(ExecutionEnvironmentDescriptor),
   },
 ) {}
 
@@ -216,6 +217,7 @@ export class BearerConnectionRegistration extends Schema.TaggedClass<BearerConne
     target: BearerConnectionTarget,
     profile: BearerConnectionProfile,
     credential: BearerConnectionCredential,
+    descriptor: Schema.optionalKey(ExecutionEnvironmentDescriptor),
   },
 ) {}
 

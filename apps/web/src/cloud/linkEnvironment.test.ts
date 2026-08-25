@@ -30,6 +30,8 @@ import { afterEach, beforeEach, vi } from "vite-plus/test";
 import {
   AVAILABLE_CONNECTION_STATE,
   EnvironmentSupervisor,
+  legacyCatalogEnvironment,
+  type EnvironmentRouteResult,
   type PreparedConnection,
   PrimaryConnectionTarget,
 } from "@bibcode/client-runtime/connection";
@@ -145,7 +147,10 @@ function registryLayer(options?: {
         wsBaseUrl: TARGET.wsBaseUrl,
       });
       const supervisor = EnvironmentSupervisor.of({
+        environment: legacyCatalogEnvironment({ target, profile: Option.none() }),
         target,
+        activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+        routeResults: yield* SubscriptionRef.make<ReadonlyArray<EnvironmentRouteResult>>([]),
         state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
         session: yield* SubscriptionRef.make(Option.some(session)),
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),

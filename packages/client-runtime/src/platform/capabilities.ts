@@ -4,6 +4,7 @@ import {
   type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
+  type ExecutionEnvironmentDescriptor,
 } from "@bibcode/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -19,6 +20,12 @@ export interface PreparedSshEnvironment {
 export interface ProvisionedSshEnvironment extends PreparedSshEnvironment {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
+}
+
+export interface InspectedSshEnvironment {
+  readonly bootstrap: DesktopSshEnvironmentBootstrap;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
 }
 
 export class CloudSession extends Context.Service<
@@ -54,6 +61,20 @@ export class SshEnvironmentGateway extends Context.Service<
       readonly expectedEnvironmentId: EnvironmentId;
       readonly target: DesktopSshEnvironmentTarget;
     }) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
+    /** Establishes host-key-checked transport and reads identity without consuming pairing. */
+    readonly inspect: (input: {
+      readonly connectionId: string;
+      readonly expectedEnvironmentId: EnvironmentId;
+      readonly target: DesktopSshEnvironmentTarget;
+      readonly hostKeyFingerprint: string | null;
+      readonly issuePairingToken: boolean;
+      readonly cancellation: AbortSignal;
+    }) => Effect.Effect<InspectedSshEnvironment, ConnectionAttemptError>;
+    /** Consumes an inspected one-time credential only after identity verification succeeds. */
+    readonly exchange: (input: {
+      readonly bootstrap: DesktopSshEnvironmentBootstrap;
+      readonly pairingToken: string;
+    }) => Effect.Effect<string, ConnectionAttemptError>;
     readonly disconnect: (
       target: DesktopSshEnvironmentTarget,
     ) => Effect.Effect<void, ConnectionAttemptError>;

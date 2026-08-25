@@ -30,6 +30,24 @@ import {
 } from "@bibcode/client-runtime/connection";
 import { EnvironmentRpcRequestObserver } from "@bibcode/client-runtime/rpc";
 
+function platformDescriptor() {
+  return {
+    environmentId: "00000000-0000-4000-8000-000000000041",
+    label: "Primary",
+    platform: { os: "linux", arch: "x64" },
+    serverVersion: "0.0.0-test",
+    storageInstanceId: "00000000-0000-4000-8000-000000000042",
+    protocol: { minimum: 1, maximum: 1 },
+    capabilities: {
+      repositoryIdentity: true,
+      worktreeCatalog: false,
+      worktreeCatalogRefreshReason: false,
+      vcsStatusSummary: false,
+      activityProtocolVersion: null,
+    },
+  } as const;
+}
+
 // ── Controllable mock state ──────────────────────────────────────────
 const pf = vi.hoisted(() => ({
   isHostedStatic: false,
@@ -37,7 +55,7 @@ const pf = vi.hoisted(() => ({
   desktopPrimaryBearer: null as null | (() => Promise<string | null>),
   primaryTarget: null as unknown,
   secondaryRead: { _tag: "Success", bootstraps: [] as unknown[] } as unknown,
-  descriptor: { environmentId: "environment-primary", label: "Primary" } as unknown,
+  descriptor: platformDescriptor() as unknown,
   bearerAccess: { access_token: "secondary-token", expires_in: 3_600 } as unknown,
   descriptorCalls: [] as string[],
   bearerBootstrapCalls: [] as string[],
@@ -181,7 +199,15 @@ function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge
         label: "SSH environment",
         platform: { os: "linux", arch: "x64" },
         serverVersion: "0.0.0-test",
-        capabilities: { repositoryIdentity: true },
+        storageInstanceId: "00000000-0000-4000-8000-000000000052",
+        protocol: { minimum: 1, maximum: 1 },
+        capabilities: {
+          repositoryIdentity: true,
+          worktreeCatalog: false,
+          worktreeCatalogRefreshReason: false,
+          vcsStatusSummary: false,
+          activityProtocolVersion: null,
+        },
       };
     },
     bootstrapSshBearerSession: async () => {
@@ -281,7 +307,7 @@ function resetPf(): void {
   pf.desktopPrimaryBearer = null;
   pf.primaryTarget = null;
   pf.secondaryRead = { _tag: "Success", bootstraps: [] };
-  pf.descriptor = { environmentId: "environment-primary", label: "Primary" };
+  pf.descriptor = platformDescriptor();
   pf.bearerAccess = { access_token: "secondary-token", expires_in: 3_600 };
   pf.descriptorCalls = [];
   pf.bearerBootstrapCalls = [];

@@ -83,7 +83,15 @@ describe("environment shell synchronization", () => {
         Option.some(session(client)),
       );
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+          target: TARGET,
+          profile: Option.none(),
+        }),
         target: TARGET,
+        activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+        routeResults: yield* SubscriptionRef.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+        >([]),
         state: supervisorState,
         session: activeSession,
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
@@ -168,7 +176,15 @@ describe("environment shell synchronization", () => {
         Option.none(),
       );
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+          target: TARGET,
+          profile: Option.none(),
+        }),
         target: TARGET,
+        activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+        routeResults: yield* SubscriptionRef.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+        >([]),
         state: supervisorState,
         session: activeSession,
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
@@ -232,7 +248,15 @@ describe("environment shell synchronization", () => {
           Option.some(firstSession),
         );
         const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+            target: TARGET,
+            profile: Option.none(),
+          }),
           target: TARGET,
+          activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+          routeResults: yield* SubscriptionRef.make<
+            ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+          >([]),
           state: supervisorState,
           session: activeSession,
           prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
@@ -400,7 +424,15 @@ describe("environment shell synchronization", () => {
         Option.some(session(client)),
       );
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+          target: TARGET,
+          profile: Option.none(),
+        }),
         target: TARGET,
+        activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+        routeResults: yield* SubscriptionRef.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+        >([]),
         state: supervisorState,
         session: activeSession,
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
@@ -473,7 +505,15 @@ describe("environment shell synchronization", () => {
         Option.some(session(client)),
       );
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+          target: TARGET,
+          profile: Option.none(),
+        }),
         target: TARGET,
+        activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+        routeResults: yield* SubscriptionRef.make<
+          ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+        >([]),
         state: supervisorState,
         session: activeSession,
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
@@ -644,7 +684,15 @@ describe("environment shell synchronization", () => {
           Option.some(session(client)),
         );
         const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          environment: EnvironmentSupervisor.legacyCatalogEnvironment({
+            target: TARGET,
+            profile: Option.none(),
+          }),
           target: TARGET,
+          activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+          routeResults: yield* SubscriptionRef.make<
+            ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
+          >([]),
           state: supervisorState,
           session: activeSession,
           prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),

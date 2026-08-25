@@ -1,3 +1,4 @@
+import type { ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import { RelayEnvironmentConnectScope } from "@bibcode/contracts/relay";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,6 +15,7 @@ import {
   BearerConnectionCredential,
   BearerConnectionProfile,
   type ConnectionCatalogEntry,
+  type KnownEnvironment,
   SshConnectionProfile,
 } from "./catalog.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
@@ -25,25 +27,72 @@ import {
   profileMissingError,
 } from "./errors.ts";
 import type {
-  BearerConnectionTarget,
   ConnectionTarget,
+  DirectHttpsRoute,
+  EnvironmentRoute,
   PreparedConnection,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  VerifiedRouteIdentity,
 } from "./model.ts";
 import {
+  BearerConnectionTarget,
   ConnectionBlockedError,
   ConnectionTransientError,
+  isLoopbackHostname,
+  PrimaryConnectionTarget as PrimaryConnectionTargetClass,
+  SshConnectionTarget as SshConnectionTargetClass,
   type ConnectionAttemptError,
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
+import * as Persistence from "../platform/persistence.ts";
+import { deriveWsBaseUrl } from "../environment/endpoint.ts";
+import { verifyRouteIdentity } from "./storageIdentity.ts";
+
+export interface RoutePreparationInput {
+  readonly environment: KnownEnvironment;
+  readonly route: EnvironmentRoute;
+  readonly cancellation: AbortSignal;
+}
+
+export interface RouteTransportSecurityService {
+  readonly verifyDirectHttps: (
+    route: DirectHttpsRoute,
+    cancellation: AbortSignal,
+  ) => Effect.Effect<void, ConnectionAttemptError>;
+}
+
+export class RouteTransportSecurity extends Context.Reference<RouteTransportSecurityService>(
+  "@bibcode/client-runtime/connection/resolver/RouteTransportSecurity",
+  {
+    defaultValue: () => ({
+      verifyDirectHttps: (route, cancellation) => {
+        if (cancellation.aborted) {
+          return Effect.interrupt;
+        }
+        if (route.trust._tag === "PinnedSpki") {
+          return Effect.fail(
+            new ConnectionBlockedError({
+              reason: "unsupported",
+              detail: "Pinned SPKI verification requires a trusted desktop transport verifier.",
+            }),
+          );
+        }
+        return Effect.void;
+      },
+    }),
+  },
+) {}
 
 export class ConnectionResolver extends Context.Service<
   ConnectionResolver,
   {
     readonly prepare: (
       entry: ConnectionCatalogEntry,
+    ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
+    readonly prepareRoute: (
+      input: RoutePreparationInput,
     ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
   }
 >()("@bibcode/client-runtime/connection/resolver/ConnectionResolver") {}
@@ -58,6 +107,57 @@ function primarySocketUrl(target: PrimaryConnectionTarget): string {
     url.pathname = "/ws";
   }
   return url.toString();
+}
+
+function isSecureLoopbackPair(httpBaseUrl: string, wsBaseUrl: string): boolean {
+  try {
+    const http = new URL(httpBaseUrl);
+    const socket = new URL(wsBaseUrl);
+    return (
+      (http.protocol === "http:" || http.protocol === "https:") &&
+      (socket.protocol === "ws:" || socket.protocol === "wss:") &&
+      isLoopbackHostname(http.hostname) &&
+      isLoopbackHostname(socket.hostname) &&
+      http.username === "" &&
+      http.password === "" &&
+      socket.username === "" &&
+      socket.password === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+function routeTarget(route: EnvironmentRoute): ConnectionTarget {
+  switch (route._tag) {
+    case "DesktopLoopbackRoute":
+      if (route.secretRef === null) {
+        return new PrimaryConnectionTargetClass({
+          environmentId: route.environmentId,
+          label: route.label,
+          httpBaseUrl: route.httpBaseUrl,
+          wsBaseUrl: route.wsBaseUrl,
+        });
+      }
+      return new BearerConnectionTarget({
+        environmentId: route.environmentId,
+        label: route.label,
+        connectionId: route.routeId,
+      });
+    case "DesktopWslRoute":
+    case "DirectHttpsRoute":
+      return new BearerConnectionTarget({
+        environmentId: route.environmentId,
+        label: route.label,
+        connectionId: route.routeId,
+      });
+    case "SshTunnelRoute":
+      return new SshConnectionTargetClass({
+        environmentId: route.environmentId,
+        label: route.label,
+        connectionId: route.routeId,
+      });
+  }
 }
 
 const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary")(function* () {
@@ -259,6 +359,229 @@ export const make = Effect.gen(function* () {
   const primary = yield* makePrimaryBroker();
   const bearer = yield* makeBearerBroker();
   const relay = yield* makeRelayBroker();
+  const routeTransportSecurity = yield* RouteTransportSecurity;
+  const routeSecrets = yield* Persistence.EnvironmentSecretStore;
+  const routePrimaryAuth = yield* ClientCapabilities.PrimaryEnvironmentAuth;
+  const routeSsh = yield* ClientCapabilities.SshEnvironmentGateway;
+  const routeAuthorization = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+  const routeHttpClient = yield* HttpClient.HttpClient;
+
+  const fetchRouteDescriptor = (httpBaseUrl: string, cancellation: AbortSignal) =>
+    Effect.gen(function* () {
+      if (cancellation.aborted) {
+        return yield* Effect.interrupt;
+      }
+      const descriptor = yield* fetchRemoteEnvironmentDescriptor({ httpBaseUrl }).pipe(
+        Effect.mapError(mapRemoteEnvironmentError),
+        Effect.provideService(HttpClient.HttpClient, routeHttpClient),
+      );
+      if (cancellation.aborted) {
+        return yield* Effect.interrupt;
+      }
+      return descriptor;
+    });
+
+  const loadRouteSecret = Effect.fn("clientRuntime.connection.broker.loadRouteSecret")(function* (
+    secretRef: string,
+    routeLabel: string,
+  ) {
+    const secret = yield* routeSecrets.get(secretRef).pipe(
+      Effect.mapError(
+        () =>
+          new ConnectionBlockedError({
+            reason: "authentication",
+            detail: `${routeLabel} authorization is unavailable from the protected secret store.`,
+          }),
+      ),
+    );
+    if (Option.isNone(secret)) {
+      return yield* new ConnectionBlockedError({
+        reason: "authentication",
+        detail: `${routeLabel} requires administrator pairing.`,
+      });
+    }
+    return secret.value;
+  });
+
+  const authorizeVerified = Effect.fn("clientRuntime.connection.broker.authorizeVerified")(
+    function* (input: {
+      readonly identity: VerifiedRouteIdentity;
+      readonly route: EnvironmentRoute;
+      readonly httpBaseUrl: string;
+      readonly wsBaseUrl: string;
+      readonly bearerToken: string;
+    }) {
+      const authorized = yield* routeAuthorization.authorizeVerifiedBearer({
+        identity: input.identity,
+        httpBaseUrl: input.httpBaseUrl,
+        wsBaseUrl: input.wsBaseUrl,
+        bearerToken: input.bearerToken,
+      });
+      return {
+        ...authorized,
+        target: routeTarget(input.route),
+        route: input.route,
+        verifiedRouteIdentity: input.identity,
+      } satisfies PreparedConnection;
+    },
+  );
+
+  const prepareRoute = Effect.fn("clientRuntime.connection.broker.prepareRoute")(function* (
+    input: RoutePreparationInput,
+  ) {
+    const { environment, route, cancellation } = input;
+    if (route.environmentId !== environment.environmentId) {
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: `${route.label} does not belong to the selected environment.`,
+      });
+    }
+    if (cancellation.aborted) {
+      return yield* Effect.interrupt;
+    }
+
+    let descriptor: ExecutionEnvironmentDescriptor;
+    let httpBaseUrl: string;
+    let wsBaseUrl: string;
+    let transportTrust: VerifiedRouteIdentity["transportTrust"];
+    let sshBootstrap: ClientCapabilities.InspectedSshEnvironment["bootstrap"] | null = null;
+
+    switch (route._tag) {
+      case "DesktopLoopbackRoute":
+      case "DesktopWslRoute":
+        if (!isSecureLoopbackPair(route.httpBaseUrl, route.wsBaseUrl)) {
+          return yield* new ConnectionBlockedError({
+            reason: "configuration",
+            detail: `${route.label} must use a loopback-only HTTP/WebSocket endpoint.`,
+          });
+        }
+        httpBaseUrl = route.httpBaseUrl;
+        wsBaseUrl = route.wsBaseUrl;
+        transportTrust = "loopback";
+        descriptor = yield* fetchRouteDescriptor(httpBaseUrl, cancellation);
+        break;
+      case "DirectHttpsRoute":
+        yield* routeTransportSecurity.verifyDirectHttps(route, cancellation);
+        httpBaseUrl = route.httpsBaseUrl;
+        wsBaseUrl = deriveWsBaseUrl(route.httpsBaseUrl);
+        transportTrust = route.trust._tag === "PinnedSpki" ? "pinned-spki" : "system-tls";
+        descriptor = yield* fetchRouteDescriptor(httpBaseUrl, cancellation);
+        break;
+      case "SshTunnelRoute": {
+        const inspected = yield* routeSsh.inspect({
+          connectionId: route.routeId,
+          expectedEnvironmentId: environment.environmentId,
+          target: route.target,
+          hostKeyFingerprint: route.hostKeyFingerprint,
+          issuePairingToken: route.secretRef === null,
+          cancellation,
+        });
+        sshBootstrap = inspected.bootstrap;
+        httpBaseUrl = inspected.bootstrap.httpBaseUrl;
+        wsBaseUrl = inspected.bootstrap.wsBaseUrl;
+        transportTrust = "ssh-host-key";
+        descriptor = inspected.descriptor;
+        break;
+      }
+    }
+
+    const identity = yield* verifyRouteIdentity({
+      environment,
+      route,
+      descriptor,
+      transportTrust,
+    });
+    if (cancellation.aborted) {
+      return yield* Effect.interrupt;
+    }
+
+    switch (route._tag) {
+      case "DesktopLoopbackRoute": {
+        if (route.secretRef !== null) {
+          const bearerToken = yield* loadRouteSecret(route.secretRef, route.label);
+          return yield* authorizeVerified({
+            identity,
+            route,
+            httpBaseUrl,
+            wsBaseUrl,
+            bearerToken,
+          });
+        }
+        const bearerToken = yield* routePrimaryAuth.bearerToken;
+        if (Option.isSome(bearerToken)) {
+          return yield* authorizeVerified({
+            identity,
+            route,
+            httpBaseUrl,
+            wsBaseUrl,
+            bearerToken: bearerToken.value,
+          });
+        }
+        const target = routeTarget(route);
+        if (target._tag !== "PrimaryConnectionTarget") {
+          return yield* new ConnectionBlockedError({
+            reason: "configuration",
+            detail: `${route.label} has an invalid loopback route configuration.`,
+          });
+        }
+        return {
+          environmentId: identity.environmentId,
+          label: identity.descriptor.label,
+          descriptor: identity.descriptor,
+          httpBaseUrl,
+          socketUrl: primarySocketUrl(target),
+          httpAuthorization: null,
+          target,
+          route,
+          verifiedRouteIdentity: identity,
+        } satisfies PreparedConnection;
+      }
+      case "DesktopWslRoute":
+      case "DirectHttpsRoute": {
+        if (route.secretRef === null) {
+          return yield* new ConnectionBlockedError({
+            reason: "authentication",
+            detail: `${route.label} requires administrator pairing.`,
+          });
+        }
+        const bearerToken = yield* loadRouteSecret(route.secretRef, route.label);
+        return yield* authorizeVerified({
+          identity,
+          route,
+          httpBaseUrl,
+          wsBaseUrl,
+          bearerToken,
+        });
+      }
+      case "SshTunnelRoute": {
+        if (sshBootstrap === null) {
+          return yield* new ConnectionBlockedError({
+            reason: "configuration",
+            detail: `${route.label} did not establish an SSH tunnel.`,
+          });
+        }
+        const bearerToken =
+          route.secretRef === null
+            ? sshBootstrap.pairingToken === null
+              ? yield* new ConnectionBlockedError({
+                  reason: "authentication",
+                  detail: `${route.label} did not issue a pairing credential.`,
+                })
+              : yield* routeSsh.exchange({
+                  bootstrap: sshBootstrap,
+                  pairingToken: sshBootstrap.pairingToken,
+                })
+            : yield* loadRouteSecret(route.secretRef, route.label);
+        return yield* authorizeVerified({
+          identity,
+          route,
+          httpBaseUrl,
+          wsBaseUrl,
+          bearerToken,
+        });
+      }
+    }
+  });
   const ssh = yield* makeSshBroker();
 
   const prepare = Effect.fn("clientRuntime.connection.broker.prepare")(function* (
@@ -286,7 +609,7 @@ export const make = Effect.gen(function* () {
     }
   });
 
-  return ConnectionResolver.of({ prepare });
+  return ConnectionResolver.of({ prepare, prepareRoute });
 });
 
 export const layer = Layer.effect(ConnectionResolver, make);

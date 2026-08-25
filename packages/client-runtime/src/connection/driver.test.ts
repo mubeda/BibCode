@@ -179,6 +179,7 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
           reportedStorage(catalogEntry.target.environmentId),
         ),
       ),
+    prepareRoute: () => Effect.die(new Error("Normalized routes are not used by this harness.")),
   });
   const sessions = RpcSessionFactory.RpcSessionFactory.of({
     connect: (connection) =>

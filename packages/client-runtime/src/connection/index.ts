@@ -26,9 +26,26 @@ export * as ProfileStore from "./profileStore.ts";
 export {
   EnvironmentNotRegisteredError,
   EnvironmentRegistry,
+  type EnvironmentRegistrationInput,
+  type EnvironmentRegistryOptions,
   PlatformEnvironmentRemovalError,
 } from "./registry.ts";
-export { ConnectionResolver } from "./resolver.ts";
+export {
+  ConnectionResolver,
+  RouteTransportSecurity,
+  type RoutePreparationInput,
+  type RouteTransportSecurityService,
+} from "./resolver.ts";
+export {
+  eligibleRoutes,
+  selectRoute,
+  type EnvironmentRouteSelectionOptions,
+} from "./routeSelection.ts";
 export * from "./storageIdentity.ts";
-export { EnvironmentSupervisor, type EnvironmentSupervisorOptions } from "./supervisor.ts";
+export {
+  EnvironmentSupervisor,
+  legacyCatalogEnvironment,
+  type EnvironmentRouteResult,
+  type EnvironmentSupervisorOptions,
+} from "./supervisor.ts";
 export * as Wakeups from "./wakeups.ts";
