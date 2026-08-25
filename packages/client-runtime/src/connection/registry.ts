@@ -128,6 +128,7 @@ export class EnvironmentRegistry extends Context.Service<
     ) => Effect.Effect<
       void,
       | Persistence.ConnectionPersistenceError
+      | ConnectionAttemptError
       | EnvironmentNotRegisteredError
       | PlatformEnvironmentRemovalError
     >;
@@ -1191,6 +1192,29 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
       .pipe(Effect.tapError(() => setAdmissionPhase(environmentId, generation, "open")));
     yield* closeServiceScope(environmentId);
 
+    const sshTargets = [
+      ...new Map(
+        environment.routes.flatMap((route) =>
+          route._tag === "SshTunnelRoute" && route.hostKeyFingerprint !== null
+            ? [
+                [
+                  JSON.stringify([route.target, route.hostKeyFingerprint]),
+                  {
+                    target: route.target,
+                    hostKeyFingerprint: route.hostKeyFingerprint,
+                  },
+                ] as const,
+              ]
+            : [],
+        ),
+      ).values(),
+    ];
+    yield* Effect.forEach(
+      sshTargets,
+      ({ target, hostKeyFingerprint }) => ssh.disconnect(target, hostKeyFingerprint),
+      { concurrency: 1, discard: true },
+    ).pipe(Effect.tapError(() => markRepair("native-cleanup-failed")));
+
     const cacheManifest = yield* cacheManifests
       .load(environmentId)
       .pipe(Effect.tapError(() => markRepair("metadata-deletion-failed")));
@@ -1228,26 +1252,6 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
       return next;
     });
     yield* setAdmissionPhase(environmentId, generation, "forgotten");
-
-    const sshTargets = environment.routes.flatMap((route) =>
-      route._tag === "SshTunnelRoute" && route.hostKeyFingerprint !== null
-        ? [
-            {
-              target: route.target,
-              hostKeyFingerprint: route.hostKeyFingerprint,
-            },
-          ]
-        : [],
-    );
-    yield* Effect.forEach(
-      sshTargets,
-      ({ target, hostKeyFingerprint }) =>
-        ssh.disconnect(target, hostKeyFingerprint).pipe(Effect.ignore),
-      {
-        concurrency: "unbounded",
-        discard: true,
-      },
-    );
   });
 
   const forget = Effect.fn("EnvironmentRegistry.forget")(function* (environmentId: EnvironmentId) {

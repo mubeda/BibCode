@@ -577,6 +577,8 @@ function createTauriDesktopBridge(
       tauriInvoke<unknown>("desktop_bridge_install_ssh_server", { decision }).then(
         decodeSshSetupResult,
       ),
+    cancelSshOperation: (input) =>
+      tauriInvokeDesktop<boolean>("desktop_bridge_cancel_ssh_operation", { input }),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),
     disconnectSshEnvironment: (target, options) =>

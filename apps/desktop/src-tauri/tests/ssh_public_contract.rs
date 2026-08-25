@@ -41,7 +41,7 @@ async fn public_environment_manager_surfaces_native_ssh_connection_failures() {
         .expect_err("pairing must require an already verified live tunnel");
     assert!(pairing_error.contains("active, host-key-verified"));
 
-    let disconnect_error = manager
+    manager
         .disconnect_environment(
             app.handle(),
             &prompts,
@@ -52,11 +52,7 @@ async fn public_environment_manager_surfaces_native_ssh_connection_failures() {
             },
         )
         .await
-        .expect_err("closed local port should reject remote cleanup");
-    assert!(
-        disconnect_error.contains("SSH stop command failed"),
-        "{disconnect_error}"
-    );
+        .expect("local disconnect must not contact or stop the unreachable remote service");
 
     let prompt_error = prompts
         .request_password(

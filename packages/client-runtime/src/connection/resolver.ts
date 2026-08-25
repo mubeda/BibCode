@@ -52,6 +52,8 @@ import { verifyRouteIdentity } from "./storageIdentity.ts";
 export interface RoutePreparationInput {
   readonly environment: KnownEnvironment;
   readonly route: EnvironmentRoute;
+  readonly environmentGeneration?: number;
+  readonly routeGeneration?: number;
   readonly cancellation: AbortSignal;
 }
 
@@ -453,6 +455,12 @@ export const make = Effect.gen(function* () {
         const inspected = yield* routeSsh.inspect({
           target: route.target,
           hostKeyFingerprint: route.hostKeyFingerprint,
+          ...(input.environmentGeneration === undefined
+            ? {}
+            : { environmentGeneration: input.environmentGeneration }),
+          ...(input.routeGeneration === undefined
+            ? {}
+            : { bindingGeneration: input.routeGeneration }),
           cancellation,
         });
         sshBootstrap = inspected.bootstrap;

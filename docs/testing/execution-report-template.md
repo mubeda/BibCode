@@ -71,7 +71,8 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Hide/restore runtime-retention result:
 - Single-route removal and retained-environment result:
 - Forget ordered lifecycle result:
-- Injected secret/transaction failure and redacted repair receipt result:
+- Native SSH local-cleanup/no-network result and repair phase on failure:
+- Injected native/secret/transaction failure and redacted repair receipt result:
 - Restart with pending repair and successful retry result:
 - Remote server/projects/worktrees/data retained after local Forget:
 

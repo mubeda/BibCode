@@ -1312,6 +1312,14 @@ describe("tauriDesktopBridge", () => {
         expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       }),
     ).resolves.toBeNull();
+    await expect(
+      bridge.cancelSshOperation?.({
+        target: sshTarget,
+        operationId: "019d2a2e-0d0e-7000-8000-000000000013",
+        environmentGeneration: 8,
+        bindingGeneration: 21,
+      }),
+    ).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
     await expect(
@@ -1352,6 +1360,14 @@ describe("tauriDesktopBridge", () => {
       target: sshTarget,
       options: {
         expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_cancel_ssh_operation", {
+      input: {
+        target: sshTarget,
+        operationId: "019d2a2e-0d0e-7000-8000-000000000013",
+        environmentGeneration: 8,
+        bindingGeneration: 21,
       },
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_set_wsl_backend_enabled", {

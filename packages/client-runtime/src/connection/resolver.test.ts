@@ -684,6 +684,63 @@ describe("ConnectionResolver normalized routes", () => {
     }),
   );
 
+  it.effect("threads the exact environment and route generations into SSH inspection", () =>
+    Effect.gen(function* () {
+      let observed: {
+        readonly environmentGeneration: number | undefined;
+        readonly bindingGeneration: number | undefined;
+      } | null = null;
+      const sshRoute = new SshTunnelRoute({
+        routeId: "ssh-route",
+        environmentId: ENVIRONMENT_ID,
+        label: "SSH",
+        priority: 0,
+        pinned: false,
+        autoconnect: true,
+        secretRef: "ssh-secret",
+        target: SSH_TARGET,
+        hostKeyFingerprint: "SHA256:known-host-key",
+      });
+      const brokerLayer = yield* makeDependencies({
+        inspectSsh: (input) =>
+          Effect.sync(() => {
+            observed = {
+              environmentGeneration: input.environmentGeneration,
+              bindingGeneration: input.bindingGeneration,
+            };
+            return {
+              bootstrap: {
+                target: input.target,
+                httpBaseUrl: "http://127.0.0.1:4010",
+                wsBaseUrl: "ws://127.0.0.1:4010",
+                hostKeyFingerprint: "SHA256:known-host-key",
+              },
+              descriptor: {
+                ...DESCRIPTOR,
+                environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000099"),
+              },
+            };
+          }),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      yield* broker
+        .prepareRoute({
+          environment: { ...environment, routes: [sshRoute] },
+          route: sshRoute,
+          environmentGeneration: 8,
+          routeGeneration: 21,
+          cancellation: new AbortController().signal,
+        })
+        .pipe(Effect.flip);
+
+      expect(observed).toEqual({
+        environmentGeneration: 8,
+        bindingGeneration: 21,
+      });
+    }),
+  );
+
   it.effect("never creates SSH pairing after environment storage or protocol mismatch", () =>
     Effect.gen(function* () {
       for (const descriptor of [

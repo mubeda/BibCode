@@ -24,6 +24,7 @@ commands.allow = [
   "desktop_bridge_discover_ssh_hosts",
   "desktop_bridge_prepare_ssh_server",
   "desktop_bridge_install_ssh_server",
+  "desktop_bridge_cancel_ssh_operation",
   "desktop_bridge_ensure_ssh_environment",
   "desktop_bridge_disconnect_ssh_environment",
   "desktop_bridge_fetch_environment_descriptor",

@@ -26,6 +26,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_discover_ssh_hosts,
             desktop_bridge_prepare_ssh_server,
             desktop_bridge_install_ssh_server,
+            desktop_bridge_cancel_ssh_operation,
             desktop_bridge_ensure_ssh_environment,
             desktop_bridge_disconnect_ssh_environment,
             desktop_bridge_fetch_environment_descriptor,
@@ -164,6 +165,7 @@ pub fn run() {
         bridge::desktop_bridge_discover_ssh_hosts,
         bridge::desktop_bridge_prepare_ssh_server,
         bridge::desktop_bridge_install_ssh_server,
+        bridge::desktop_bridge_cancel_ssh_operation,
         bridge::desktop_bridge_ensure_ssh_environment,
         bridge::desktop_bridge_disconnect_ssh_environment,
         bridge::desktop_bridge_fetch_environment_descriptor,
@@ -225,7 +227,9 @@ pub fn run() {
             }
             tauri::RunEvent::Exit => {
                 app_handle.state::<wsl::WslDiscoveryService>().shutdown();
-                app_handle.state::<wsl_setup::WslSetupManager>().shutdown();
+                app_handle
+                    .state::<wsl_setup::WslSetupManager>()
+                    .cancel_all();
             }
             _ => {}
         });
@@ -235,7 +239,10 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
     app_handle.state::<wsl::WslDiscoveryService>().shutdown();
-    app_handle.state::<wsl_setup::WslSetupManager>().shutdown();
+    app_handle
+        .state::<wsl_setup::WslSetupManager>()
+        .shutdown()
+        .await;
     if let Err(error) = window::persist_main_window_state(app_handle) {
         tracing::warn!("failed to persist Tauri main window state during exit: {error}");
     }
@@ -284,6 +291,7 @@ mod context_menu;
 mod data_safety;
 mod preview;
 mod remote_host;
+mod remote_operation;
 mod secret_store;
 mod security;
 mod server_artifacts;

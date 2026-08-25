@@ -56,6 +56,25 @@ pub(crate) struct ResolvedServerArtifact {
     public_key: String,
 }
 
+#[cfg(test)]
+pub(crate) fn resolved_server_artifact_fixture(
+    record: ServerArtifactRecord,
+) -> ResolvedServerArtifact {
+    let manifest_url = url::Url::parse("https://releases.example.test/artifacts.json")
+        .expect("artifact fixture manifest URL");
+    ResolvedServerArtifact {
+        artifact_url: manifest_url
+            .join(&record.download_name)
+            .expect("artifact fixture download URL"),
+        signature_url: manifest_url
+            .join(&record.signature_name)
+            .expect("artifact fixture signature URL"),
+        manifest_url,
+        record,
+        public_key: String::new(),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ServerArtifactSource {
     client: reqwest::Client,
@@ -303,6 +322,7 @@ async fn fetch_limited(
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, String> {
     let response = tokio::select! {
+        biased;
         () = cancellation.cancelled() => return Err("Server artifact request was cancelled.".to_string()),
         response = client.get(url.clone()).send() => response,
     }
@@ -319,6 +339,7 @@ async fn fetch_limited(
     let mut stream = response.bytes_stream();
     loop {
         let chunk = tokio::select! {
+            biased;
             () = cancellation.cancelled() => return Err("Server artifact request was cancelled.".to_string()),
             chunk = stream.next() => chunk,
         };
@@ -446,6 +467,7 @@ impl ServerArtifactSource {
         progress: ServerArtifactProgress,
     ) -> Result<(), String> {
         let response = tokio::select! {
+            biased;
             () = cancellation.cancelled() => return Err("Server artifact download was cancelled.".to_string()),
             response = self.client.get(resolved.artifact_url.clone()).send() => response,
         }
@@ -472,6 +494,7 @@ impl ServerArtifactSource {
         let mut stream = response.bytes_stream();
         loop {
             let chunk = tokio::select! {
+                biased;
                 () = cancellation.cancelled() => return Err("Server artifact download was cancelled.".to_string()),
                 chunk = stream.next() => chunk,
             };
@@ -518,6 +541,20 @@ mod tests {
             architecture: architecture.to_string(),
             preferred_formats: vec!["tar.gz".to_string()],
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_server_artifact_download_admission() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let url =
+            url::Url::parse("https://127.0.0.1:9/artifacts.json").expect("cancelled artifact URL");
+
+        let error = fetch_limited(&reqwest::Client::new(), &url, 1024, &cancellation)
+            .await
+            .expect_err("cancelled downloads must not reach the network");
+
+        assert_eq!(error, "Server artifact request was cancelled.");
     }
 
     #[test]

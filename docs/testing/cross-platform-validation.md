@@ -169,11 +169,17 @@ must prove each of these cases:
    environment/route/admission generation cannot replace current state or
    resurrect forgotten metadata.
 9. **Forget:** verify the visible order `close admission -> cancel supervisor ->
-await scope -> delete secrets -> clear cache/UI -> delete routes/bindings ->
-delete environment`. Inject a secret failure and a transaction abort; the
-   redacted repair receipt must keep restart admission closed, all rows must
-   survive an abort, and one retry must remove every environment-owned row and
-   the receipt.
+await scope -> drain native SSH owners and local tunnel -> delete secrets ->
+clear cache/UI -> delete routes/bindings -> delete environment`. Inject native
+   cleanup, secret deletion, and transaction failures; the redacted repair receipt
+   must keep restart admission closed, metadata must remain when native cleanup
+   fails, all rows must survive a transaction abort, and one retry must remove
+   every environment-owned row and the receipt. Run native cleanup with an
+   unreachable SSH destination and prove it performs no network request, creates
+   no askpass helper, revokes prepared setup consent, rejects the prior generation,
+   and leaves the remote service/data untouched.
+   Also reject a changed saved pin while retaining the live tunnel and prove a
+   same-generation route attempt remains admissible after that rejected cleanup.
 
 For a packaged native run, exercise Hide/restore without a reconnect, remove one
 route while retaining the other route and projects, then Forget using only a
@@ -312,6 +318,12 @@ managed `current` binary winning backend selection, numeric loopback on both
 sides of the forward, and stable environment/storage identities. Separately
 show that `BIBCODE_WSL_SERVER_BINARY` or the cross-compiled target fallback
 still launches a development worktree when no managed runtime exists.
+Cancel once after the atomic switch, once while the managed backend restarts,
+and once during descriptor streaming. Each result must be `cancelled`, restore
+the previous target, and suppress all later progress from that request and
+generation. Start a newer setup generation and prove an old progress callback
+cannot publish into it. During desktop exit, hold rollback at a test barrier and
+prove shutdown does not return until rollback and staging cleanup release it.
 
 ### SSH trust, descriptor, and pairing evidence
 
@@ -321,6 +333,8 @@ ordering, and onboarding tests together:
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop remote_host:: --lib -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop remote_operation::tests:: --lib -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop server_artifacts::tests:: --lib -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests:: --lib -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
 vp test apps/web/src/connection/platform.test.ts apps/web/src/tauriDesktopBridge.test.ts packages/client-runtime/src/connection/resolver.test.ts packages/client-runtime/src/connection/onboarding.test.ts packages/contracts/src/ipc.test.ts
@@ -380,12 +394,17 @@ fail closed when it has neither `ss` nor readable Linux procfs for port
 selection, and when an installed/incompatible `ss` exits nonzero; do not record
 that fixture as macOS support.
 Desktop shutdown must leave no owned SSH, askpass, tunnel, or I/O task behind.
-Until the lifecycle-fencing task in the current plan lands, record route-attempt
-cancellation as unavailable rather than claiming that an in-flight native
-bridge command was interrupted. Host-independent parsers and command fixtures
-are compatibility evidence only; repeat Linux, macOS, and Windows OpenSSH
-probe, consent, install, service, tunnel, descriptor, and recovery behavior on
-the named native desktop.
+Exercise duplicate ensure, exact operation cancellation during password prompt,
+artifact download, transfer, install, and tunnel readiness, plus a newer
+environment/route generation and Forget while the old owner is still running.
+Record the UUID operation ID and numeric generations, never credentials. Prove
+the cancellation acknowledgement follows owner drain, cleanup does not open a
+new prompt, cancelled setup is not reported as failed, an occupied local port
+or early SSH exit publishes no tunnel, and late completion cannot resurrect a
+forgotten route. Host-independent parsers and command fixtures are
+compatibility evidence only; repeat Linux, macOS, and Windows OpenSSH probe,
+consent, install, service, tunnel, descriptor, cancellation, and recovery
+behavior on the named native desktop.
 
 ### VCS coordination gates
 

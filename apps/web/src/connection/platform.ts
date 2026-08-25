@@ -126,15 +126,94 @@ function clientMetadata() {
 
 function sshPreparationError(cause: unknown) {
   const message = cause instanceof Error ? cause.message : String(cause);
-  if (message.toLowerCase().includes("cancel")) {
-    return new ConnectionBlockedError({
-      reason: "authentication",
-      detail: message,
-    });
-  }
   return new ConnectionTransientError({
     reason: "remote-unavailable",
     detail: `Could not prepare the SSH environment: ${message}`,
+  });
+}
+
+function desktopSshPromise<A>(cancellation: AbortSignal, run: () => Promise<A>) {
+  return Effect.tryPromise({
+    try: run,
+    catch: sshPreparationError,
+  }).pipe(Effect.catch((error) => (cancellation.aborted ? Effect.interrupt : Effect.fail(error))));
+}
+
+function createSshOperationId(): string {
+  const randomUuid = globalThis.crypto?.randomUUID;
+  if (randomUuid === undefined) {
+    throw new Error("Secure UUID generation is unavailable for SSH operation fencing.");
+  }
+  return randomUuid.call(globalThis.crypto);
+}
+
+function ensureDesktopSshEnvironmentWithCancellation(
+  bridge: DesktopBridge,
+  input: {
+    readonly target: Parameters<DesktopBridge["ensureSshEnvironment"]>[0];
+    readonly hostKeyFingerprint: string | null;
+    readonly environmentGeneration?: number;
+    readonly bindingGeneration?: number;
+    readonly cancellation: AbortSignal;
+  },
+): ReturnType<DesktopBridge["ensureSshEnvironment"]> {
+  const operationId = createSshOperationId();
+  const fence = {
+    target: input.target,
+    operationId,
+    environmentGeneration: input.environmentGeneration ?? 0,
+    bindingGeneration: input.bindingGeneration ?? 0,
+  };
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      input.cancellation.removeEventListener("abort", onAbort);
+    };
+    const rejectOnce = (cause: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(cause);
+    };
+    const onAbort = () => {
+      const cancel = bridge.cancelSshOperation;
+      if (cancel === undefined) {
+        rejectOnce(
+          new Error("The desktop host does not support generation-fenced SSH cancellation."),
+        );
+        return;
+      }
+      void cancel(fence).then(
+        () => rejectOnce(new Error("SSH environment preparation was cancelled.")),
+        rejectOnce,
+      );
+    };
+
+    input.cancellation.addEventListener("abort", onAbort, { once: true });
+    if (input.cancellation.aborted) {
+      onAbort();
+      return;
+    }
+
+    void bridge
+      .ensureSshEnvironment(input.target, {
+        expectedHostKeyFingerprint: input.hostKeyFingerprint,
+        operationId,
+        environmentGeneration: fence.environmentGeneration,
+        bindingGeneration: fence.bindingGeneration,
+      })
+      .then((bootstrap) => {
+        if (input.cancellation.aborted || settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(bootstrap);
+      }, rejectOnce);
   });
 }
 
@@ -218,20 +297,25 @@ const capabilitiesLayer = Layer.effectContext(
         if (input.cancellation.aborted) {
           return yield* Effect.interrupt;
         }
-        const bootstrap = yield* Effect.tryPromise({
-          try: () =>
-            bridge.ensureSshEnvironment(input.target, {
-              expectedHostKeyFingerprint: input.hostKeyFingerprint,
-            }),
-          catch: sshPreparationError,
-        });
+        const bootstrap = yield* desktopSshPromise(input.cancellation, () =>
+          ensureDesktopSshEnvironmentWithCancellation(bridge, {
+            target: input.target,
+            hostKeyFingerprint: input.hostKeyFingerprint,
+            ...(input.environmentGeneration === undefined
+              ? {}
+              : { environmentGeneration: input.environmentGeneration }),
+            ...(input.bindingGeneration === undefined
+              ? {}
+              : { bindingGeneration: input.bindingGeneration }),
+            cancellation: input.cancellation,
+          }),
+        );
         if (input.cancellation.aborted) {
           return yield* Effect.interrupt;
         }
-        const descriptor = yield* Effect.tryPromise({
-          try: () => bridge.fetchSshEnvironmentDescriptor(bootstrap.httpBaseUrl),
-          catch: sshPreparationError,
-        });
+        const descriptor = yield* desktopSshPromise(input.cancellation, () =>
+          bridge.fetchSshEnvironmentDescriptor(bootstrap.httpBaseUrl),
+        );
         if (input.cancellation.aborted) {
           return yield* Effect.interrupt;
         }

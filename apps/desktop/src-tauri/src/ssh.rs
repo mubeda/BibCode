@@ -10,6 +10,10 @@ use crate::remote_host::{
     render_posix_remote_command,
     windows::WindowsRemoteHostAdapter,
 };
+use crate::remote_operation::{
+    RemoteHostCloseGuard, RemoteOperationClass, RemoteOperationCoordinator, RemoteOperationFence,
+    RemoteOperationLease, RemoteTunnelPermit,
+};
 use crate::server_artifacts::{
     ResolvedServerArtifact, ServerArtifactRecord, ServerArtifactRequest, ServerArtifactSource,
 };
@@ -35,6 +39,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SSH_DIRECTORY_NAME: &str = ".ssh";
@@ -50,6 +55,8 @@ const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_CONFIG_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 const SSH_CHILD_REAPER_CAPACITY: usize = 32;
+const SSH_PROVISIONING_CAPACITY: usize = 4;
+const SSH_TUNNEL_CAPACITY: usize = 16;
 const SSH_COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
 const SSH_REMOTE_SCRIPT_COMMAND_MARKER: &str = "Sending command: sh -s --";
 const SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV: &str = "BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT";
@@ -288,6 +295,9 @@ pub struct SshEnvironmentTarget {
 #[serde(rename_all = "camelCase")]
 pub struct SshEnvironmentEnsureOptions {
     pub expected_host_key_fingerprint: Option<String>,
+    pub operation_id: Option<String>,
+    pub environment_generation: Option<u64>,
+    pub binding_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -296,6 +306,9 @@ pub(crate) struct SshServerProbeInput {
     pub target: SshEnvironmentTarget,
     pub expected_host_key_fingerprint: Option<String>,
     pub managed_binary_path: Option<String>,
+    pub operation_id: Option<String>,
+    pub environment_generation: Option<u64>,
+    pub binding_generation: Option<u64>,
     #[serde(default)]
     pub service_mode: RemoteServiceMode,
     pub expected_environment_id: Option<String>,
@@ -308,6 +321,15 @@ pub(crate) struct SshSetupConsentDecision {
     pub request_id: String,
     pub probe_generation: u64,
     pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SshOperationCancelInput {
+    pub target: SshEnvironmentTarget,
+    pub operation_id: String,
+    pub environment_generation: u64,
+    pub binding_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -421,6 +443,7 @@ struct PreparedSshSetup {
     format: ArtifactFormat,
     paths: SshInstallPaths,
     expires_at: OffsetDateTime,
+    operation_fence: RemoteOperationFence,
 }
 
 #[derive(Default)]
@@ -677,6 +700,7 @@ impl SshEnvironmentLaunchPlan {
 struct ManagedSshTunnel {
     child: ManagedSshChild,
     bootstrap: SshEnvironmentBootstrap,
+    _permit: RemoteTunnelPermit,
 }
 
 pub struct SshEnvironmentManager {
@@ -685,6 +709,7 @@ pub struct SshEnvironmentManager {
     askpass_temporary_base: PathBuf,
     askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
     child_reaper: SshChildReaper,
+    operations: Arc<RemoteOperationCoordinator>,
     setup_state: Mutex<SshSetupState>,
     artifact_source: Result<ServerArtifactSource, String>,
 }
@@ -707,6 +732,10 @@ impl SshEnvironmentManager {
             askpass_temporary_base,
             askpass_launcher: Mutex::new(Weak::new()),
             child_reaper: SshChildReaper::new(),
+            operations: Arc::new(RemoteOperationCoordinator::new(
+                SSH_PROVISIONING_CAPACITY,
+                SSH_TUNNEL_CAPACITY,
+            )),
             setup_state: Mutex::new(SshSetupState::default()),
             artifact_source: ServerArtifactSource::production(),
         }
@@ -746,7 +775,62 @@ impl SshEnvironmentManager {
         Ok(created)
     }
 
+    fn operation_fence(
+        &self,
+        host_key: &str,
+        operation_id: Option<&str>,
+        environment_generation: Option<u64>,
+        binding_generation: Option<u64>,
+    ) -> Result<RemoteOperationFence, String> {
+        match (
+            operation_id,
+            environment_generation,
+            binding_generation,
+        ) {
+            (Some(operation_id), Some(environment_generation), Some(binding_generation)) => {
+                RemoteOperationFence::new(
+                    operation_id,
+                    environment_generation,
+                    binding_generation,
+                )
+            }
+            (None, None, None) => self
+                .operations
+                .current_fence(host_key, Uuid::new_v4().to_string()),
+            _ => Err(
+                "SSH operation ID, environment generation, and binding generation must be supplied together."
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn begin_operation(
+        &self,
+        target: &SshEnvironmentTarget,
+        fence: RemoteOperationFence,
+        class: RemoteOperationClass,
+    ) -> Result<RemoteOperationLease, String> {
+        self.operations
+            .begin(&target_connection_key(target), fence, class)
+            .await
+    }
+
+    pub(crate) async fn cancel_operation(
+        &self,
+        input: SshOperationCancelInput,
+    ) -> Result<bool, String> {
+        let target = normalize_ssh_environment_target(input.target)?;
+        let key = target_connection_key(&target);
+        let fence = RemoteOperationFence::new(
+            input.operation_id,
+            input.environment_generation,
+            input.binding_generation,
+        )?;
+        self.operations.cancel(&key, &fence).await
+    }
+
     pub(crate) async fn shutdown(&self) {
+        self.operations.shutdown().await;
         self.child_reaper.close();
         let tunnels = self
             .tunnels
@@ -774,6 +858,21 @@ impl SshEnvironmentManager {
         }
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
+        let fence = self.operation_fence(
+            &key,
+            options
+                .as_ref()
+                .and_then(|options| options.operation_id.as_deref()),
+            options
+                .as_ref()
+                .and_then(|options| options.environment_generation),
+            options
+                .as_ref()
+                .and_then(|options| options.binding_generation),
+        )?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Session)
+            .await?;
         if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
             validate_expected_host_key_fingerprint(
                 options
@@ -794,6 +893,7 @@ impl SshEnvironmentManager {
                 prompts,
                 target,
                 expected_host_key_fingerprint.as_deref(),
+                &owner,
             )
             .await?;
         validate_expected_host_key_fingerprint(
@@ -802,7 +902,7 @@ impl SshEnvironmentManager {
                 .and_then(|options| options.expected_host_key_fingerprint.as_deref()),
             &probe.host_key_fingerprint,
         )?;
-        self.ensure_tunnel(app, prompts, probe).await
+        self.ensure_tunnel_owned(app, prompts, probe, &owner).await
     }
 
     pub async fn probe<R: Runtime>(
@@ -811,7 +911,14 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         target: SshEnvironmentTarget,
     ) -> Result<SshHostProbe, String> {
-        self.probe_with_expected(app, prompts, target, None).await
+        let target = normalize_ssh_environment_target(target)?;
+        let key = target_connection_key(&target);
+        let fence = self.operation_fence(&key, None, None, None)?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Session)
+            .await?;
+        self.probe_with_expected(app, prompts, target, None, &owner)
+            .await
     }
 
     async fn probe_with_expected<R: Runtime>(
@@ -820,6 +927,7 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         target: SshEnvironmentTarget,
         expected_host_key_fingerprint: Option<&str>,
+        owner: &RemoteOperationLease,
     ) -> Result<SshHostProbe, String> {
         if !self.child_reaper.accepting() {
             return Err("SSH process owner is shutting down.".to_string());
@@ -828,17 +936,20 @@ impl SshEnvironmentManager {
         let key = target_connection_key(&target);
         let askpass_launcher = self.askpass_launcher()?;
         let expected_host_key_fingerprint = expected_host_key_fingerprint.map(str::to_string);
+        let operation_cancellation = owner.cancellation().clone();
         let host_key_fingerprint = self
-            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            .run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                let operation_cancellation = operation_cancellation.clone();
                 async move {
                     probe_ssh_host_key(
                         &target,
                         &auth,
                         askpass_launcher,
                         expected_host_key_fingerprint.as_deref(),
+                        &operation_cancellation,
                     )
                     .await
                 }
@@ -855,6 +966,22 @@ impl SshEnvironmentManager {
         app: &AppHandle<R>,
         prompts: &SshPasswordPromptManager,
         probe: SshHostProbe,
+    ) -> Result<SshEnvironmentBootstrap, String> {
+        let target = normalize_ssh_environment_target(probe.target.clone())?;
+        let key = target_connection_key(&target);
+        let fence = self.operation_fence(&key, None, None, None)?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Session)
+            .await?;
+        self.ensure_tunnel_owned(app, prompts, probe, &owner).await
+    }
+
+    async fn ensure_tunnel_owned<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        probe: SshHostProbe,
+        owner: &RemoteOperationLease,
     ) -> Result<SshEnvironmentBootstrap, String> {
         if !self.child_reaper.accepting() {
             return Err("SSH process owner is shutting down.".to_string());
@@ -873,28 +1000,34 @@ impl SshEnvironmentManager {
             .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
         let askpass_launcher = self.askpass_launcher()?;
         let expected_host_key_fingerprint = probe.host_key_fingerprint.clone();
+        let operation_cancellation = owner.cancellation().clone();
         let remote_launch = self
-            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            .run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                let operation_cancellation = operation_cancellation.clone();
                 async move {
                     launch_or_reuse_remote_server(
                         &target,
                         &auth,
                         askpass_launcher,
                         &expected_host_key_fingerprint,
+                        &operation_cancellation,
                     )
                     .await
                 }
             })
             .await?;
+        let tunnel_permit = self.operations.acquire_tunnel(owner).await?;
+        let tunnel_cancellation = owner.cancellation().clone();
         let tunnel_result = self
-            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            .run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let remote_launch = remote_launch.clone();
                 let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                let tunnel_cancellation = tunnel_cancellation.clone();
                 async move {
                     let plan = SshEnvironmentLaunchPlan::forward_with_auth(
                         target,
@@ -907,6 +1040,7 @@ impl SshEnvironmentManager {
                         &auth,
                         askpass_launcher,
                         &expected_host_key_fingerprint,
+                        &tunnel_cancellation,
                     )
                     .await?;
                     Ok((plan, child))
@@ -920,7 +1054,7 @@ impl SshEnvironmentManager {
                     .cached_auth_secret(&key)
                     .map(SshAuthOptions::with_secret)
                     .unwrap_or_else(SshAuthOptions::batch);
-                let _ = stop_remote_server(
+                let _ = stop_remote_server_bounded(
                     &target,
                     &cleanup_auth,
                     askpass_launcher,
@@ -939,7 +1073,9 @@ impl SshEnvironmentManager {
             expected_host_key_fingerprint,
             plan.remote_server_kind,
         );
-        if let Err((error, mut child)) = self.publish_tunnel(key, child, bootstrap.clone()) {
+        if let Err((error, mut child)) =
+            self.publish_tunnel(key, child, bootstrap.clone(), tunnel_permit, owner)
+        {
             child.terminate_and_reap().await;
             return Err(error);
         }
@@ -952,6 +1088,7 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         probe: SshHostProbe,
         remote_port: u16,
+        owner: &RemoteOperationLease,
     ) -> Result<SshEnvironmentBootstrap, String> {
         if remote_port == 0 {
             return Err("The SSH service reported an invalid loopback port.".to_string());
@@ -979,12 +1116,15 @@ impl SshEnvironmentManager {
             remote_port,
             server_kind: "external".to_string(),
         };
+        let tunnel_permit = self.operations.acquire_tunnel(owner).await?;
+        let tunnel_cancellation = owner.cancellation().clone();
         let tunnel_result = self
-            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            .run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let remote = remote.clone();
                 let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                let tunnel_cancellation = tunnel_cancellation.clone();
                 async move {
                     let plan = SshEnvironmentLaunchPlan::forward_with_auth(
                         target, local_port, remote, &auth,
@@ -994,6 +1134,7 @@ impl SshEnvironmentManager {
                         &auth,
                         askpass_launcher,
                         &expected_host_key_fingerprint,
+                        &tunnel_cancellation,
                     )
                     .await?;
                     Ok((plan, child))
@@ -1009,7 +1150,9 @@ impl SshEnvironmentManager {
             expected_host_key_fingerprint,
             "external",
         );
-        if let Err((error, mut child)) = self.publish_tunnel(key, child, bootstrap.clone()) {
+        if let Err((error, mut child)) =
+            self.publish_tunnel(key, child, bootstrap.clone(), tunnel_permit, owner)
+        {
             child.terminate_and_reap().await;
             return Err(error);
         }
@@ -1021,8 +1164,9 @@ impl SshEnvironmentManager {
         app: &AppHandle<R>,
         prompts: &SshPasswordPromptManager,
         probe: SshHostProbe,
+        owner: &RemoteOperationLease,
     ) -> Result<RemoteHostProbe, String> {
-        self.inspect_remote_host_at_binary(app, prompts, probe, None)
+        self.inspect_remote_host_at_binary(app, prompts, probe, None, owner)
             .await
     }
 
@@ -1032,6 +1176,7 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         probe: SshHostProbe,
         managed_binary_path: Option<String>,
+        owner: &RemoteOperationLease,
     ) -> Result<RemoteHostProbe, String> {
         let target = normalize_ssh_environment_target(probe.target)?;
         validate_expected_host_key_fingerprint(
@@ -1041,11 +1186,13 @@ impl SshEnvironmentManager {
         let key = target_connection_key(&target);
         let askpass_launcher = self.askpass_launcher()?;
         let expected_host_key_fingerprint = probe.host_key_fingerprint;
-        self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+        let operation_cancellation = owner.cancellation().clone();
+        self.run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
             let target = target.clone();
             let askpass_launcher = askpass_launcher.clone();
             let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
             let managed_binary_path = managed_binary_path.clone();
+            let operation_cancellation = operation_cancellation.clone();
             async move {
                 probe_remote_host(
                     &target,
@@ -1053,6 +1200,7 @@ impl SshEnvironmentManager {
                     askpass_launcher,
                     &expected_host_key_fingerprint,
                     managed_binary_path.as_deref(),
+                    &operation_cancellation,
                 )
                 .await
             }
@@ -1071,17 +1219,32 @@ impl SshEnvironmentManager {
             input.expected_environment_id.as_deref(),
             input.expected_storage_instance_id.as_deref(),
         )?;
-        let target = normalize_ssh_environment_target(input.target)?;
+        let target = normalize_ssh_environment_target(input.target.clone())?;
+        let key = target_connection_key(&target);
+        let operation_fence = self.operation_fence(
+            &key,
+            input.operation_id.as_deref(),
+            input.environment_generation,
+            input.binding_generation,
+        )?;
+        let owner = self
+            .begin_operation(
+                &target,
+                operation_fence.clone(),
+                RemoteOperationClass::Session,
+            )
+            .await?;
         let trust = self
             .probe_with_expected(
                 app,
                 prompts,
                 target.clone(),
                 input.expected_host_key_fingerprint.as_deref(),
+                &owner,
             )
             .await?;
         let mut host = self
-            .inspect_remote_host(app, prompts, trust.clone())
+            .inspect_remote_host(app, prompts, trust.clone(), &owner)
             .await?;
         if let Some(managed_binary_path) = input.managed_binary_path.as_deref() {
             validate_managed_binary_path(&host, managed_binary_path)?;
@@ -1091,6 +1254,7 @@ impl SshEnvironmentManager {
                     prompts,
                     trust.clone(),
                     Some(managed_binary_path.to_string()),
+                    &owner,
                 )
                 .await?;
         }
@@ -1145,7 +1309,6 @@ impl SshEnvironmentManager {
             } else {
                 host.architecture.as_manifest_value()
             };
-        let cancellation = tokio_util::sync::CancellationToken::new();
         let resolved = source
             .resolve(
                 &ServerArtifactRequest {
@@ -1154,7 +1317,7 @@ impl SshEnvironmentManager {
                     architecture: manifest_architecture.to_string(),
                     preferred_formats: vec![format.as_str().to_string()],
                 },
-                &cancellation,
+                owner.cancellation(),
             )
             .await?;
         if artifact_format(&resolved.record.format)? != format {
@@ -1201,6 +1364,9 @@ impl SshEnvironmentManager {
                 .format(&Rfc3339)
                 .map_err(|error| format!("Could not format SSH setup consent expiry: {error}"))?,
         };
+        if !owner.can_publish() {
+            return Err("SSH setup probe was superseded before consent publication.".to_string());
+        }
         self.store_prepared_setup(PreparedSshSetup {
             request_id: request_id.clone(),
             probe_generation,
@@ -1215,6 +1381,7 @@ impl SshEnvironmentManager {
             format,
             paths,
             expires_at,
+            operation_fence,
         })?;
         Ok(SshServerProbe {
             request_id,
@@ -1272,6 +1439,18 @@ impl SshEnvironmentManager {
         Ok(prepared)
     }
 
+    fn revoke_prepared_setups(&self, target: &SshEnvironmentTarget) -> Result<usize, String> {
+        let mut state = self
+            .setup_state
+            .lock()
+            .map_err(|error| format!("Could not access SSH setup state: {error}"))?;
+        let before = state.prepared.len();
+        state
+            .prepared
+            .retain(|_, prepared| prepared.target != *target);
+        Ok(before.saturating_sub(state.prepared.len()))
+    }
+
     pub(crate) async fn install_server<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -1302,7 +1481,20 @@ impl SshEnvironmentManager {
                 },
             ));
         }
-        let cancellation = tokio_util::sync::CancellationToken::new();
+        let install_fence = prepared
+            .operation_fence
+            .with_operation_id(prepared.request_id.clone())?;
+        let owner = self
+            .begin_operation(
+                &prepared.target,
+                install_fence,
+                RemoteOperationClass::Provisioning,
+            )
+            .await?;
+        // Cleanup must remain possible after the operation owner is cancelled.
+        // Every cleanup command is independently bounded by its command timeout,
+        // and cleanup never opens a new password prompt.
+        let cleanup_cancellation = CancellationToken::new();
         let source = self
             .artifact_source
             .as_ref()
@@ -1311,7 +1503,7 @@ impl SshEnvironmentManager {
             .download(
                 prepared.resolved.clone(),
                 staging_root,
-                &cancellation,
+                owner.cancellation(),
                 Arc::new(|_, _| {}),
             )
             .await
@@ -1321,7 +1513,7 @@ impl SshEnvironmentManager {
                 return Ok(ssh_setup_result(
                     &prepared,
                     SshSetupOutcome {
-                        status: SshSetupStatus::Failed,
+                        status: ssh_setup_failure_status(owner.cancellation()),
                         stage: RemoteInstallStage::Download,
                         mutation_status: MutationStatus::None,
                         cleanup_status: CleanupStatus::NotRequired,
@@ -1357,16 +1549,17 @@ impl SshEnvironmentManager {
         let stage_commands = adapter.stage_commands(&verified)?;
         for command in stage_commands {
             let output = match self
-                .execute_setup_command(app, prompts, &prepared, &command)
+                .execute_setup_command(app, prompts, &prepared, &command, &owner)
                 .await
             {
                 Ok(output) => output,
                 Err(error) => {
                     let cleanup = self
-                        .cleanup_setup(app, prompts, &prepared, &verified, false)
+                        .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
                         .await;
                     return Ok(ssh_setup_failure(
                         &prepared,
+                        owner.cancellation(),
                         RemoteInstallStage::Transfer,
                         MutationStatus::Partial,
                         cleanup,
@@ -1376,10 +1569,11 @@ impl SshEnvironmentManager {
             };
             if !output.succeeded() {
                 let cleanup = self
-                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Transfer,
                     MutationStatus::Partial,
                     cleanup,
@@ -1393,10 +1587,11 @@ impl SshEnvironmentManager {
                 validate_remote_artifact_verification(prepared.probe.os, &output, &verified)
             {
                 let cleanup = self
-                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Verify,
                     MutationStatus::Partial,
                     cleanup,
@@ -1414,16 +1609,17 @@ impl SshEnvironmentManager {
                             .is_some_and(|program| program == "mv"))
                 || matches!(prepared.format, ArtifactFormat::Zip);
             let output = match self
-                .execute_setup_command(app, prompts, &prepared, &command)
+                .execute_setup_command(app, prompts, &prepared, &command, &owner)
                 .await
             {
                 Ok(output) if output.succeeded() => output,
                 Ok(_) => {
                     let cleanup = self
-                        .cleanup_setup(app, prompts, &prepared, &verified, false)
+                        .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
                         .await;
                     return Ok(ssh_setup_failure(
                         &prepared,
+                        owner.cancellation(),
                         RemoteInstallStage::Install,
                         MutationStatus::Partial,
                         cleanup,
@@ -1433,15 +1629,15 @@ impl SshEnvironmentManager {
                 Err(error) => {
                     let cleanup = self
                         .cleanup_setup(
-                            app,
-                            prompts,
                             &prepared,
                             &verified,
                             promotion_outcome_is_unknown,
+                            &cleanup_cancellation,
                         )
                         .await;
                     return Ok(ssh_setup_failure(
                         &prepared,
+                        owner.cancellation(),
                         RemoteInstallStage::Install,
                         MutationStatus::Partial,
                         cleanup,
@@ -1456,10 +1652,11 @@ impl SshEnvironmentManager {
                 validate_remote_artifact_verification(prepared.probe.os, &output, &verified)
             {
                 let cleanup = self
-                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Verify,
                     MutationStatus::Partial,
                     cleanup,
@@ -1470,16 +1667,21 @@ impl SshEnvironmentManager {
         }
         for command in adapter.service_commands(&staged)? {
             match self
-                .execute_setup_command(app, prompts, &prepared, &command)
+                .execute_setup_command(app, prompts, &prepared, &command, &owner)
                 .await
             {
                 Ok(output) if output.succeeded() => {}
                 Ok(_) => {
                     let cleanup = self
-                        .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                        .recover_setup_after_service_mutation(
+                            &prepared,
+                            &verified,
+                            &cleanup_cancellation,
+                        )
                         .await;
                     return Ok(ssh_setup_failure(
                         &prepared,
+                        owner.cancellation(),
                         RemoteInstallStage::Start,
                         MutationStatus::Partial,
                         cleanup,
@@ -1488,10 +1690,15 @@ impl SshEnvironmentManager {
                 }
                 Err(error) => {
                     let cleanup = self
-                        .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                        .recover_setup_after_service_mutation(
+                            &prepared,
+                            &verified,
+                            &cleanup_cancellation,
+                        )
                         .await;
                     return Ok(ssh_setup_failure(
                         &prepared,
+                        owner.cancellation(),
                         RemoteInstallStage::Start,
                         MutationStatus::Partial,
                         cleanup,
@@ -1509,16 +1716,22 @@ impl SshEnvironmentManager {
                     host_key_fingerprint: prepared.host_key_fingerprint.clone(),
                 },
                 Some(prepared.paths.installed_binary.clone()),
+                &owner,
             )
             .await
         {
             Ok(probe) => probe,
             Err(error) => {
                 let cleanup = self
-                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .recover_setup_after_service_mutation(
+                        &prepared,
+                        &verified,
+                        &cleanup_cancellation,
+                    )
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Start,
                     MutationStatus::Partial,
                     cleanup,
@@ -1530,10 +1743,15 @@ impl SshEnvironmentManager {
             Ok(port) => port,
             Err(error) => {
                 let cleanup = self
-                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .recover_setup_after_service_mutation(
+                        &prepared,
+                        &verified,
+                        &cleanup_cancellation,
+                    )
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Start,
                     MutationStatus::Partial,
                     cleanup,
@@ -1550,16 +1768,22 @@ impl SshEnvironmentManager {
                     host_key_fingerprint: prepared.host_key_fingerprint.clone(),
                 },
                 service_port,
+                &owner,
             )
             .await
         {
             Ok(bootstrap) => bootstrap,
             Err(error) => {
                 let cleanup = self
-                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .recover_setup_after_service_mutation(
+                        &prepared,
+                        &verified,
+                        &cleanup_cancellation,
+                    )
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::Start,
                     MutationStatus::Partial,
                     cleanup,
@@ -1567,14 +1791,23 @@ impl SshEnvironmentManager {
                 ));
             }
         };
-        let descriptor = match fetch_ssh_setup_descriptor(&bootstrap.http_base_url).await {
+        let descriptor = match tokio::select! {
+            biased;
+            () = owner.cancelled() => Err("SSH setup was cancelled during descriptor verification.".to_string()),
+            result = fetch_ssh_setup_descriptor(&bootstrap.http_base_url) => result,
+        } {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 let cleanup = self
-                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .recover_setup_after_service_mutation(
+                        &prepared,
+                        &verified,
+                        &cleanup_cancellation,
+                    )
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::VerifyIdentity,
                     MutationStatus::Partial,
                     cleanup,
@@ -1586,10 +1819,15 @@ impl SshEnvironmentManager {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 let cleanup = self
-                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .recover_setup_after_service_mutation(
+                        &prepared,
+                        &verified,
+                        &cleanup_cancellation,
+                    )
                     .await;
                 return Ok(ssh_setup_failure(
                     &prepared,
+                    owner.cancellation(),
                     RemoteInstallStage::VerifyIdentity,
                     MutationStatus::Partial,
                     cleanup,
@@ -1597,8 +1835,21 @@ impl SshEnvironmentManager {
                 ));
             }
         };
+        if !owner.claim_completion() {
+            let cleanup = self
+                .recover_setup_after_service_mutation(&prepared, &verified, &cleanup_cancellation)
+                .await;
+            return Ok(ssh_setup_failure(
+                &prepared,
+                owner.cancellation(),
+                RemoteInstallStage::VerifyIdentity,
+                MutationStatus::Partial,
+                cleanup,
+                "SSH setup was cancelled or superseded before completion publication.".to_string(),
+            ));
+        }
         let cleanup_status = self
-            .cleanup_setup(app, prompts, &prepared, &verified, false)
+            .cleanup_setup(&prepared, &verified, false, &cleanup_cancellation)
             .await;
         Ok(ssh_setup_result(
             &prepared,
@@ -1624,30 +1875,70 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         prepared: &PreparedSshSetup,
         command: &RemoteCommand,
+        owner: &RemoteOperationLease,
     ) -> Result<RemoteCommandOutput, String> {
         let key = target_connection_key(&prepared.target);
         let askpass_launcher = self.askpass_launcher()?;
-        self.run_with_ssh_auth(app, prompts, &key, &prepared.target, |auth| {
-            let target = prepared.target.clone();
-            let askpass_launcher = askpass_launcher.clone();
-            let fingerprint = prepared.host_key_fingerprint.clone();
-            let command = command.clone();
-            let os = prepared.probe.os;
-            async move {
-                run_remote_command(&target, os, &command, &auth, askpass_launcher, &fingerprint)
+        let operation_cancellation = owner.cancellation().clone();
+        self.run_with_ssh_auth(
+            app,
+            prompts,
+            &key,
+            &prepared.target,
+            owner.cancellation(),
+            |auth| {
+                let target = prepared.target.clone();
+                let askpass_launcher = askpass_launcher.clone();
+                let fingerprint = prepared.host_key_fingerprint.clone();
+                let command = command.clone();
+                let os = prepared.probe.os;
+                let operation_cancellation = operation_cancellation.clone();
+                async move {
+                    run_remote_command(
+                        &target,
+                        os,
+                        &command,
+                        &auth,
+                        askpass_launcher,
+                        &fingerprint,
+                        &operation_cancellation,
+                    )
                     .await
-            }
-        })
+                }
+            },
+        )
         .await
     }
 
-    async fn cleanup_setup<R: Runtime>(
+    async fn execute_setup_cleanup_command(
         &self,
-        app: &AppHandle<R>,
-        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshSetup,
+        command: &RemoteCommand,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, String> {
+        let key = target_connection_key(&prepared.target);
+        let auth = self
+            .cached_auth_secret(&key)
+            .map(SshAuthOptions::with_secret)
+            .unwrap_or_else(SshAuthOptions::batch);
+        run_remote_command(
+            &prepared.target,
+            prepared.probe.os,
+            command,
+            &auth,
+            self.askpass_launcher()?,
+            &prepared.host_key_fingerprint,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn cleanup_setup(
+        &self,
         prepared: &PreparedSshSetup,
         verified: &VerifiedArtifact,
         remove_install_root: bool,
+        cancellation: &CancellationToken,
     ) -> CleanupStatus {
         let adapter = remote_host_adapter(prepared.probe.os);
         let Ok(commands) = adapter.cleanup_commands(verified, remove_install_root) else {
@@ -1655,7 +1946,7 @@ impl SshEnvironmentManager {
         };
         for command in commands {
             match self
-                .execute_setup_command(app, prompts, prepared, &command)
+                .execute_setup_cleanup_command(prepared, &command, cancellation)
                 .await
             {
                 Ok(output) if output.succeeded() => {}
@@ -1665,19 +1956,18 @@ impl SshEnvironmentManager {
         CleanupStatus::Completed
     }
 
-    async fn recover_setup_after_service_mutation<R: Runtime>(
+    async fn recover_setup_after_service_mutation(
         &self,
-        app: &AppHandle<R>,
-        prompts: &SshPasswordPromptManager,
         prepared: &PreparedSshSetup,
         verified: &VerifiedArtifact,
+        cancellation: &CancellationToken,
     ) -> CleanupStatus {
         let tunnel_closed = self.close_setup_tunnel(&prepared.target).await;
         let restored = self
-            .restore_previous_service(app, prompts, prepared, verified)
+            .restore_previous_service(prepared, verified, cancellation)
             .await;
         let cleaned = self
-            .cleanup_setup(app, prompts, prepared, verified, false)
+            .cleanup_setup(prepared, verified, false, cancellation)
             .await;
         if tunnel_closed == CleanupStatus::Completed
             && restored == CleanupStatus::Completed
@@ -1701,12 +1991,11 @@ impl SshEnvironmentManager {
         CleanupStatus::Completed
     }
 
-    async fn restore_previous_service<R: Runtime>(
+    async fn restore_previous_service(
         &self,
-        app: &AppHandle<R>,
-        prompts: &SshPasswordPromptManager,
         prepared: &PreparedSshSetup,
         verified: &VerifiedArtifact,
+        cancellation: &CancellationToken,
     ) -> CleanupStatus {
         let (
             Some(previous_version),
@@ -1744,24 +2033,30 @@ impl SshEnvironmentManager {
         };
         for command in commands {
             match self
-                .execute_setup_command(app, prompts, prepared, &command)
+                .execute_setup_cleanup_command(prepared, &command, cancellation)
                 .await
             {
                 Ok(output) if output.succeeded() => {}
                 _ => return CleanupStatus::Failed,
             }
         }
-        let Ok(restored_probe) = self
-            .inspect_remote_host_at_binary(
-                app,
-                prompts,
-                SshHostProbe {
-                    target: prepared.target.clone(),
-                    host_key_fingerprint: prepared.host_key_fingerprint.clone(),
-                },
-                Some(previous_binary.clone()),
-            )
-            .await
+        let key = target_connection_key(&prepared.target);
+        let auth = self
+            .cached_auth_secret(&key)
+            .map(SshAuthOptions::with_secret)
+            .unwrap_or_else(SshAuthOptions::batch);
+        let Ok(restored_probe) = probe_remote_host(
+            &prepared.target,
+            &auth,
+            match self.askpass_launcher() {
+                Ok(launcher) => launcher,
+                Err(_) => return CleanupStatus::Failed,
+            },
+            &prepared.host_key_fingerprint,
+            Some(&previous_binary),
+            cancellation,
+        )
+        .await
         else {
             return CleanupStatus::Failed;
         };
@@ -1794,6 +2089,10 @@ impl SshEnvironmentManager {
     ) -> Result<String, String> {
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
+        let fence = self.operation_fence(&key, None, None, None)?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Session)
+            .await?;
         let bootstrap = self
             .take_existing_bootstrap_if_running(&key)?
             .ok_or_else(|| {
@@ -1801,16 +2100,19 @@ impl SshEnvironmentManager {
             })?;
         let expected_host_key_fingerprint = bootstrap.host_key_fingerprint;
         let askpass_launcher = self.askpass_launcher()?;
-        self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+        let operation_cancellation = owner.cancellation().clone();
+        self.run_with_ssh_auth(app, prompts, &key, &target, owner.cancellation(), |auth| {
             let target = target.clone();
             let askpass_launcher = askpass_launcher.clone();
             let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+            let operation_cancellation = operation_cancellation.clone();
             async move {
                 issue_remote_pairing_token(
                     &target,
                     &auth,
                     askpass_launcher,
                     &expected_host_key_fingerprint,
+                    &operation_cancellation,
                 )
                 .await
             }
@@ -1820,8 +2122,8 @@ impl SshEnvironmentManager {
 
     pub async fn disconnect_environment<R: Runtime>(
         &self,
-        app: &AppHandle<R>,
-        prompts: &SshPasswordPromptManager,
+        _app: &AppHandle<R>,
+        _prompts: &SshPasswordPromptManager,
         target: SshEnvironmentTarget,
         options: SshEnvironmentDisconnectOptions,
     ) -> Result<(), String> {
@@ -1831,59 +2133,44 @@ impl SshEnvironmentManager {
         if !is_valid_sha256_host_key_fingerprint(&requested_host_key_fingerprint) {
             return Err("SSH disconnect requires a valid saved host-key fingerprint.".to_string());
         }
-        let tunnel = {
-            let mut tunnels = self
-                .tunnels
-                .lock()
-                .map_err(|error| format!("Could not access SSH tunnels: {error}"))?;
-            if let Some(active) = tunnels.get(&key) {
-                validate_expected_host_key_fingerprint(
-                    Some(&requested_host_key_fingerprint),
-                    &active.bootstrap.host_key_fingerprint,
-                )?;
-            }
-            tunnels.remove(&key)
-        };
-        let (askpass_launcher, expected_host_key_fingerprint, stop_target) = match tunnel {
-            Some(mut tunnel) => {
-                let askpass_launcher = tunnel.child.askpass_launcher().clone();
-                let expected_host_key_fingerprint = tunnel.bootstrap.host_key_fingerprint.clone();
-                let stop_target = tunnel.bootstrap.target.clone();
-                tunnel.child.terminate_and_reap().await;
-                (askpass_launcher, expected_host_key_fingerprint, stop_target)
-            }
-            None => {
-                let probe = self
-                    .probe_with_expected(
-                        app,
-                        prompts,
-                        target.clone(),
+        let close_guard: RemoteHostCloseGuard = self.operations.close_host(&key).await?;
+        let pin_result = match self.tunnels.lock() {
+            Ok(tunnels) => {
+                if let Some(active) = tunnels.get(&key) {
+                    validate_expected_host_key_fingerprint(
                         Some(&requested_host_key_fingerprint),
+                        &active.bootstrap.host_key_fingerprint,
                     )
-                    .await
-                    .map_err(disconnect_probe_failure_message)?;
-                (
-                    self.askpass_launcher()?,
-                    probe.host_key_fingerprint,
-                    target.clone(),
-                )
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(format!("Could not access SSH tunnels: {error}")),
+        };
+        if let Err(error) = pin_result {
+            let _ = close_guard.abort();
+            return Err(error);
+        }
+        if let Err(error) = self.revoke_prepared_setups(&target) {
+            let _ = close_guard.abort();
+            return Err(error);
+        }
+        let tunnel = match self.tunnels.lock() {
+            Ok(mut tunnels) => tunnels.remove(&key),
+            Err(error) => {
+                let _ = close_guard.reopen();
+                return Err(format!("Could not access SSH tunnels: {error}"));
             }
         };
-        self.run_with_ssh_auth(app, prompts, &key, &stop_target, |auth| {
-            let target = stop_target.clone();
-            let askpass_launcher = askpass_launcher.clone();
-            let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
-            async move {
-                stop_remote_server(
-                    &target,
-                    &auth,
-                    askpass_launcher,
-                    &expected_host_key_fingerprint,
-                )
-                .await
-            }
-        })
-        .await?;
+        self.clear_auth_secret(&key);
+        if let Some(mut tunnel) = tunnel {
+            tunnel.child.terminate_and_reap().await;
+        }
+        if !close_guard.reopen() {
+            return Err(
+                "SSH environment admission could not reopen after local cleanup.".to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -1911,6 +2198,7 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         target: &SshEnvironmentTarget,
         attempt: u8,
+        cancellation: &CancellationToken,
     ) -> Result<String, String> {
         let destination = build_ssh_host_spec(target)?;
         let prompt = if attempt == 1 {
@@ -1919,13 +2207,14 @@ impl SshEnvironmentManager {
             format!("SSH authentication failed. Enter the password for {destination} again.")
         };
         prompts
-            .request_password(
+            .request_password_cancellable(
                 app,
                 SshPasswordRequest {
                     destination,
                     username: target.username.clone(),
                     prompt,
                 },
+                cancellation,
             )
             .await
             .map_err(|error| error.to_string())
@@ -1937,6 +2226,7 @@ impl SshEnvironmentManager {
         prompts: &SshPasswordPromptManager,
         key: &str,
         target: &SshEnvironmentTarget,
+        cancellation: &CancellationToken,
         mut operation: F,
     ) -> Result<T, String>
     where
@@ -1950,7 +2240,14 @@ impl SshEnvironmentManager {
             .unwrap_or_else(SshAuthOptions::batch);
 
         loop {
-            match operation(auth.clone()).await {
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err("SSH operation was cancelled.".to_string());
+                }
+                result = operation(auth.clone()) => result,
+            };
+            match result {
                 Ok(result) => return Ok(result),
                 Err(error) if is_ssh_auth_failure(&error) => {
                     if auth.auth_secret.is_some() {
@@ -1960,10 +2257,20 @@ impl SshEnvironmentManager {
                         return Err(error);
                     }
                     prompted_attempts += 1;
-                    validate_effective_ssh_security_policy(target, self.askpass_launcher()?, true)
-                        .await?;
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err("SSH operation was cancelled.".to_string());
+                        }
+                        result = validate_effective_ssh_security_policy(
+                            target,
+                            self.askpass_launcher()?,
+                            true,
+                            cancellation,
+                        ) => result?,
+                    }
                     let secret = self
-                        .prompt_for_password(app, prompts, target, prompted_attempts)
+                        .prompt_for_password(app, prompts, target, prompted_attempts, cancellation)
                         .await?;
                     self.remember_auth_secret(key, secret.clone())?;
                     auth = SshAuthOptions::with_secret(secret);
@@ -2015,6 +2322,8 @@ impl SshEnvironmentManager {
         key: String,
         child: ManagedSshChild,
         bootstrap: SshEnvironmentBootstrap,
+        permit: RemoteTunnelPermit,
+        owner: &RemoteOperationLease,
     ) -> Result<(), (String, Box<ManagedSshChild>)> {
         let mut tunnels = match self.tunnels.lock() {
             Ok(tunnels) => tunnels,
@@ -2025,13 +2334,20 @@ impl SshEnvironmentManager {
                 ));
             }
         };
-        if !self.child_reaper.accepting() {
+        if !self.child_reaper.accepting() || !owner.can_publish() {
             return Err((
-                "SSH process owner is shutting down.".to_string(),
+                "SSH tunnel owner is shutting down, closing, or stale.".to_string(),
                 Box::new(child),
             ));
         }
-        tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        tunnels.insert(
+            key,
+            ManagedSshTunnel {
+                child,
+                bootstrap,
+                _permit: permit,
+            },
+        );
         Ok(())
     }
 }
@@ -2396,6 +2712,7 @@ fn ssh_setup_result(prepared: &PreparedSshSetup, outcome: SshSetupOutcome) -> Ss
 
 fn ssh_setup_failure(
     prepared: &PreparedSshSetup,
+    cancellation: &CancellationToken,
     stage: RemoteInstallStage,
     mutation_status: MutationStatus,
     cleanup_status: CleanupStatus,
@@ -2413,7 +2730,7 @@ fn ssh_setup_failure(
     let mut result = ssh_setup_result(
         prepared,
         SshSetupOutcome {
-            status: SshSetupStatus::Failed,
+            status: ssh_setup_failure_status(cancellation),
             stage: failure.stage,
             mutation_status: failure.mutation_status,
             cleanup_status: failure.cleanup_status,
@@ -2426,6 +2743,14 @@ fn ssh_setup_failure(
     result.previous_version = failure.previous_version;
     result.recovery_command = Some(failure.recovery_command);
     result
+}
+
+fn ssh_setup_failure_status(cancellation: &CancellationToken) -> SshSetupStatus {
+    if cancellation.is_cancelled() {
+        SshSetupStatus::Cancelled
+    } else {
+        SshSetupStatus::Failed
+    }
 }
 
 fn ssh_setup_recovery_command(prepared: &PreparedSshSetup) -> String {
@@ -3191,21 +3516,6 @@ fn is_ssh_private_environment_policy_failure(message: &str) -> bool {
         || message.starts_with("SSH password authentication through ProxyJump or ProxyCommand")
 }
 
-fn disconnect_probe_failure_message(error: String) -> String {
-    let preserves_redacted_classification = is_ssh_auth_failure(&error)
-        || error.starts_with("SSH host-key fingerprint changed.")
-        || error.starts_with("SSH host key changed.")
-        || error.starts_with("SSH host key is unknown or not accepted.")
-        || error.starts_with("This SSH target uses a custom KnownHostsCommand")
-        || error.starts_with("This SSH target's effective SendEnv policy")
-        || error.starts_with("SSH password authentication through ProxyJump or ProxyCommand");
-    if preserves_redacted_classification {
-        error
-    } else {
-        "SSH stop command failed before host-key verification.".to_string()
-    }
-}
-
 #[derive(Clone)]
 struct SshAskpassLauncher {
     inner: Arc<SshAskpassLauncherInner>,
@@ -3716,12 +4026,6 @@ impl ManagedSshChild {
         self.child.as_mut().expect("managed SSH child is live")
     }
 
-    fn askpass_launcher(&self) -> &SshAskpassLauncher {
-        self.askpass_launcher
-            .as_ref()
-            .expect("managed SSH child retains askpass ownership")
-    }
-
     fn release_reaped(&mut self) {
         debug_assert!(self.stderr_drain.is_none());
         self.child.take();
@@ -3933,6 +4237,7 @@ async fn validate_effective_ssh_security_policy(
     target: &SshEnvironmentTarget,
     askpass_launcher: SshAskpassLauncher,
     password_authentication_requested: bool,
+    cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let mut command = Command::new(ssh_command());
     configure_background_command(&mut command);
@@ -3948,9 +4253,15 @@ async fn validate_effective_ssh_security_policy(
         askpass_launcher,
         "resolve effective SSH configuration",
     )?;
-    let output = match tokio::time::timeout(SSH_CONFIG_RESOLUTION_TIMEOUT, child.wait_with_output())
-        .await
-    {
+    let wait = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            child.terminate_and_reap().await;
+            return Err("SSH configuration resolution was cancelled.".to_string());
+        }
+        result = tokio::time::timeout(SSH_CONFIG_RESOLUTION_TIMEOUT, child.wait_with_output()) => result,
+    };
+    let output = match wait {
         Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {
             return Err("SSH process owner is shutting down.".to_string());
         }
@@ -4026,6 +4337,7 @@ async fn release_remote_script_after_host_key<W>(
     verification_receiver: oneshot::Receiver<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
     operation: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -4037,12 +4349,18 @@ where
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
             return Err("SSH process owner is shutting down.".to_string());
         }
+        () = cancellation.cancelled() => {
+            return Err(format!("SSH {operation} command was cancelled."));
+        }
     };
     tokio::select! {
         result = stdin.write_all(script) => result
             .map_err(|error| format!("Failed to write SSH {operation} script: {error}"))?,
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
             return Err("SSH process owner is shutting down.".to_string());
+        }
+        () = cancellation.cancelled() => {
+            return Err(format!("SSH {operation} command was cancelled."));
         }
     }
     stdin
@@ -4051,18 +4369,28 @@ where
         .map_err(|error| format!("Failed to close SSH {operation} script input: {error}"))
 }
 
+struct RemoteSshScriptInvocation<'a> {
+    script: &'a str,
+    arguments: &'a [String],
+    operation: &'a str,
+}
+
 async fn run_remote_ssh_script(
     target: &SshEnvironmentTarget,
-    script: &str,
-    script_args: &[String],
+    invocation: RemoteSshScriptInvocation<'_>,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
-    operation: &str,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<String, String> {
-    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
-        .await?;
-    let mut args = build_remote_script_ssh_args(target, auth, script_args)?;
+    validate_effective_ssh_security_policy(
+        target,
+        askpass_launcher.clone(),
+        auth.interactive_auth,
+        cancellation,
+    )
+    .await?;
+    let mut args = build_remote_script_ssh_args(target, auth, invocation.arguments)?;
     insert_ssh_host_key_pin_args(&mut args);
     let environment = build_verified_ssh_child_environment(
         auth,
@@ -4084,18 +4412,20 @@ async fn run_remote_ssh_script(
     let mut child = spawn_managed_ssh_child(
         command,
         askpass_launcher,
-        &format!("run SSH {operation} command"),
+        &format!("run SSH {} command", invocation.operation),
     )?;
     let stdin = child
         .child_mut()
         .stdin
         .take()
-        .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
+        .ok_or_else(|| format!("SSH {} command did not expose stdin.", invocation.operation))?;
     let stdout = child.child_mut().stdout.take();
-    let stderr =
-        child.child_mut().stderr.take().ok_or_else(|| {
-            format!("SSH {operation} command did not expose host-key diagnostics.")
-        })?;
+    let stderr = child.child_mut().stderr.take().ok_or_else(|| {
+        format!(
+            "SSH {} command did not expose host-key diagnostics.",
+            invocation.operation
+        )
+    })?;
     let (verification_sender, verification_receiver) = oneshot::channel();
     let (stderr_sender, stderr_receiver) = oneshot::channel();
     let stderr_drain = tokio::spawn(drain_ssh_command_stderr(
@@ -4107,10 +4437,11 @@ async fn run_remote_ssh_script(
     child.retain_stderr_drain(stderr_drain);
     let write_result = release_remote_script_after_host_key(
         stdin,
-        script.as_bytes(),
+        invocation.script.as_bytes(),
         verification_receiver,
         child.shutdown_receiver(),
-        operation,
+        invocation.operation,
+        cancellation,
     )
     .await;
     if let Err(error) = write_result {
@@ -4118,14 +4449,19 @@ async fn run_remote_ssh_script(
         return Err(error);
     }
 
-    let output = child
-        .wait_with_streamed_stderr_output(stdout, stderr_receiver)
-        .await
-        .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))?;
+    let output = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            child.terminate_and_reap().await;
+            return Err(format!("SSH {} command was cancelled.", invocation.operation));
+        }
+        result = child.wait_with_streamed_stderr_output(stdout, stderr_receiver) => result
+            .map_err(|error| format!("Failed to wait for SSH {} command: {error}", invocation.operation))?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ssh_remote_script_failure_message(
-            operation,
+            invocation.operation,
             &output.status.to_string(),
             &stderr,
         ));
@@ -4290,9 +4626,15 @@ async fn run_remote_command(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<RemoteCommandOutput, String> {
-    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
-        .await?;
+    validate_effective_ssh_security_policy(
+        target,
+        askpass_launcher.clone(),
+        auth.interactive_auth,
+        cancellation,
+    )
+    .await?;
     let (mut args, command_marker) =
         build_remote_command_ssh_args(target, auth, remote_os, command_spec)?;
     insert_ssh_host_key_pin_args(&mut args);
@@ -4337,26 +4679,31 @@ async fn run_remote_command(
         stderr_sender,
     ));
     child.retain_stderr_drain(stderr_drain);
-    let command_result = within_remote_command_deadline(command_spec.timeout, &operation, async {
-        write_remote_command_input_after_host_key(
-            stdin,
-            &command_spec.stdin,
-            remote_os,
-            verification_receiver,
-            child.shutdown_receiver(),
-            &operation,
-        )
-        .await?;
-        child
-            .wait_with_streamed_stderr_output_limit(
-                stdout,
-                stderr_receiver,
-                command_spec.max_output_bytes,
+    let command_result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            Err(format!("SSH {operation} command was cancelled."))
+        }
+        result = within_remote_command_deadline(command_spec.timeout, &operation, async {
+            write_remote_command_input_after_host_key(
+                stdin,
+                &command_spec.stdin,
+                remote_os,
+                verification_receiver,
+                child.shutdown_receiver(),
+                &operation,
             )
-            .await
-            .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))
-    })
-    .await;
+            .await?;
+            child
+                .wait_with_streamed_stderr_output_limit(
+                    stdout,
+                    stderr_receiver,
+                    command_spec.max_output_bytes,
+                )
+                .await
+                .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))
+        }) => result,
+    };
     let output = match command_result {
         Ok(output) => output,
         Err(error) => {
@@ -4393,6 +4740,7 @@ async fn probe_remote_host(
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
     managed_binary_path: Option<&str>,
+    cancellation: &CancellationToken,
 ) -> Result<RemoteHostProbe, String> {
     let kernel_command = RemoteCommand::standard(RemoteCommandPurpose::Kernel, "uname", ["-s"])?;
     let kernel = run_remote_command(
@@ -4402,6 +4750,7 @@ async fn probe_remote_host(
         auth,
         askpass_launcher.clone(),
         expected_host_key_fingerprint,
+        cancellation,
     )
     .await?;
     let kernel_name = kernel.stdout_text().unwrap_or_default().trim();
@@ -4429,6 +4778,7 @@ async fn probe_remote_host(
                 auth,
                 askpass_launcher.clone(),
                 expected_host_key_fingerprint,
+                cancellation,
             )
             .await?,
         );
@@ -4541,9 +4891,15 @@ async fn probe_ssh_host_key(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: Option<&str>,
+    cancellation: &CancellationToken,
 ) -> Result<String, String> {
-    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
-        .await?;
+    validate_effective_ssh_security_policy(
+        target,
+        askpass_launcher.clone(),
+        auth.interactive_auth,
+        cancellation,
+    )
+    .await?;
     let observation = if expected_host_key_fingerprint.is_none() {
         Some(SshHostKeyObservation::create(&askpass_launcher)?)
     } else {
@@ -4568,10 +4924,15 @@ async fn probe_ssh_host_key(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = spawn_managed_ssh_child(command, askpass_launcher, "probe SSH host-key trust")?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to run SSH host-key trust probe: {error}"))?;
+    let output = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            child.terminate_and_reap().await;
+            return Err("SSH host-key trust probe was cancelled.".to_string());
+        }
+        result = child.wait_with_output() => result
+            .map_err(|error| format!("Failed to run SSH host-key trust probe: {error}"))?,
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         if is_ssh_host_key_pin_failure(&stderr) {
@@ -4639,16 +5000,22 @@ async fn launch_or_reuse_remote_server(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<RemoteLaunchResult, String> {
     let state_key = remote_state_key(target);
+    let script = build_remote_launch_script();
+    let arguments = [state_key];
     let output = run_remote_ssh_script(
         target,
-        &build_remote_launch_script(),
-        &[state_key],
+        RemoteSshScriptInvocation {
+            script: &script,
+            arguments: &arguments,
+            operation: "launch",
+        },
         auth,
         askpass_launcher,
-        "launch",
         expected_host_key_fingerprint,
+        cancellation,
     )
     .await?;
     parse_remote_launch_result(&output)
@@ -4659,19 +5026,49 @@ async fn stop_remote_server(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let state_key = remote_state_key(target);
+    let arguments = [state_key];
     run_remote_ssh_script(
         target,
-        REMOTE_STOP_SCRIPT,
-        &[state_key],
+        RemoteSshScriptInvocation {
+            script: REMOTE_STOP_SCRIPT,
+            arguments: &arguments,
+            operation: "stop",
+        },
         auth,
         askpass_launcher,
-        "stop",
         expected_host_key_fingerprint,
+        cancellation,
     )
     .await
     .map(|_| ())
+}
+
+async fn stop_remote_server_bounded(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+    askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
+) -> Result<(), String> {
+    let cancellation = CancellationToken::new();
+    let stop = stop_remote_server(
+        target,
+        auth,
+        askpass_launcher,
+        expected_host_key_fingerprint,
+        &cancellation,
+    );
+    tokio::pin!(stop);
+    tokio::select! {
+        biased;
+        result = &mut stop => result,
+        () = tokio::time::sleep(SSH_READY_TIMEOUT) => {
+            cancellation.cancel();
+            stop.await
+        }
+    }
 }
 
 fn remote_pairing_command() -> &'static str {
@@ -4683,16 +5080,20 @@ async fn issue_remote_pairing_token(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<String, String> {
     let script = format!("{}\n", remote_pairing_command());
     let output = run_remote_ssh_script(
         target,
-        &script,
-        &[],
+        RemoteSshScriptInvocation {
+            script: &script,
+            arguments: &[],
+            operation: "pairing",
+        },
         auth,
         askpass_launcher,
-        "pairing",
         expected_host_key_fingerprint,
+        cancellation,
     )
     .await?;
     parse_remote_pairing_credential(&output)
@@ -4703,11 +5104,13 @@ async fn start_ssh_tunnel(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     expected_host_key_fingerprint: &str,
+    cancellation: &CancellationToken,
 ) -> Result<ManagedSshChild, String> {
     validate_effective_ssh_security_policy(
         &plan.target,
         askpass_launcher.clone(),
         auth.interactive_auth,
+        cancellation,
     )
     .await?;
     let mut args = plan.args.clone();
@@ -4745,15 +5148,28 @@ async fn start_ssh_tunnel(
     ));
     child.retain_stderr_drain(stderr_drain);
     let mut shutdown = child.shutdown_receiver();
-    tokio::select! {
-        result = tokio::time::timeout(SSH_READY_TIMEOUT, verification_receiver) => result
-            .map_err(|_| "SSH tunnel timed out before confirming its pinned destination host key.".to_string())?
-            .map_err(|_| "SSH tunnel verification diagnostics ended unexpectedly.".to_string())??,
+    let verification_result = tokio::select! {
+        result = tokio::time::timeout(SSH_READY_TIMEOUT, verification_receiver) => match result {
+            Err(_) => Err(
+                "SSH tunnel timed out before confirming its pinned destination host key."
+                    .to_string(),
+            ),
+            Ok(Err(_)) => {
+                Err("SSH tunnel verification diagnostics ended unexpectedly.".to_string())
+            }
+            Ok(Ok(result)) => result,
+        },
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
-            child.terminate_and_reap().await;
-            return Err("SSH process owner is shutting down.".to_string());
+            Err("SSH process owner is shutting down.".to_string())
+        }
+        () = cancellation.cancelled() => {
+            Err("SSH tunnel readiness was cancelled.".to_string())
         }
     };
+    if let Err(error) = verification_result {
+        child.terminate_and_reap().await;
+        return Err(error);
+    }
 
     let ready_result = tokio::select! {
         result = wait_for_ssh_tunnel_ready(
@@ -4763,6 +5179,9 @@ async fn start_ssh_tunnel(
         ) => result,
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
             Err("SSH process owner is shutting down.".to_string())
+        }
+        () = cancellation.cancelled() => {
+            Err("SSH tunnel readiness was cancelled.".to_string())
         }
     };
     if let Err(error) = ready_result {
@@ -4968,19 +5387,56 @@ impl SshPasswordPromptManager {
         app: &AppHandle<R>,
         request: SshPasswordRequest,
     ) -> PendingPromptResult {
+        let cancellation = CancellationToken::new();
+        self.request_password_cancellable(app, request, &cancellation)
+            .await
+    }
+
+    pub async fn request_password_cancellable<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        request: SshPasswordRequest,
+        cancellation: &CancellationToken,
+    ) -> PendingPromptResult {
         let request_id = Uuid::new_v4().simple().to_string();
-        self.request_password_with(request_id, request, SystemTime::now(), |payload| {
-            app.emit(SSH_PASSWORD_PROMPT_EVENT, payload)
-                .map_err(|error| error.to_string())
-        })
+        self.request_password_with_cancellation(
+            request_id,
+            request,
+            SystemTime::now(),
+            cancellation,
+            |payload| {
+                app.emit(SSH_PASSWORD_PROMPT_EVENT, payload)
+                    .map_err(|error| error.to_string())
+            },
+        )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn request_password_with(
         &self,
         request_id: String,
         request: SshPasswordRequest,
         requested_at: SystemTime,
+        emit: impl FnOnce(SshPasswordPromptPayload) -> Result<(), String>,
+    ) -> PendingPromptResult {
+        let cancellation = CancellationToken::new();
+        self.request_password_with_cancellation(
+            request_id,
+            request,
+            requested_at,
+            &cancellation,
+            emit,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_password_with_cancellation(
+        &self,
+        request_id: String,
+        request: SshPasswordRequest,
+        requested_at: SystemTime,
+        cancellation: &CancellationToken,
         emit: impl FnOnce(SshPasswordPromptPayload) -> Result<(), String>,
     ) -> PendingPromptResult {
         let expires_at = format_system_time(
@@ -5024,7 +5480,18 @@ impl SshPasswordPromptManager {
             });
         }
 
-        match tokio::time::timeout(self.timeout, receiver).await {
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                self.remove_pending(&request_id);
+                return Err(SshPasswordPromptRequestError::Cancelled {
+                    request_id,
+                    destination: request.destination,
+                });
+            }
+            result = tokio::time::timeout(self.timeout, receiver) => result,
+        };
+        match result {
             Ok(Ok(result)) => result,
             Ok(Err(_closed)) => Err(SshPasswordPromptRequestError::ServiceStopped {
                 request_id,
@@ -5409,6 +5876,15 @@ pub fn discover_ssh_hosts(home_dir: Option<PathBuf>) -> Result<Vec<DiscoveredSsh
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn setup_failure_status_preserves_explicit_cancellation() {
+        let active = CancellationToken::new();
+        assert_eq!(ssh_setup_failure_status(&active), SshSetupStatus::Failed);
+
+        active.cancel();
+        assert_eq!(ssh_setup_failure_status(&active), SshSetupStatus::Cancelled);
+    }
 
     fn provision_verified_artifact(os: RemoteHostOs) -> VerifiedArtifact {
         VerifiedArtifact {
@@ -6152,6 +6628,21 @@ mod tests {
             port: None,
         };
         let key = target_connection_key(&target);
+        let owner = manager
+            .begin_operation(
+                &target,
+                manager
+                    .operation_fence(&key, None, None, None)
+                    .expect("fixture tunnel fence"),
+                RemoteOperationClass::Session,
+            )
+            .await
+            .expect("fixture tunnel owner");
+        let tunnel_permit = manager
+            .operations
+            .acquire_tunnel(&owner)
+            .await
+            .expect("fixture tunnel permit");
         let published = manager.publish_tunnel(
             key.clone(),
             child,
@@ -6162,8 +6653,11 @@ mod tests {
                 "ws://127.0.0.1:41000/".to_string(),
                 "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             ),
+            tunnel_permit,
+            &owner,
         );
         assert!(published.is_ok(), "fixture tunnel should publish");
+        drop(owner);
 
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -6228,6 +6722,21 @@ mod tests {
         };
         let pinned = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let key = target_connection_key(&target);
+        let owner = manager
+            .begin_operation(
+                &target,
+                manager
+                    .operation_fence(&key, None, None, None)
+                    .expect("fixture tunnel fence"),
+                RemoteOperationClass::Session,
+            )
+            .await
+            .expect("fixture tunnel owner");
+        let tunnel_permit = manager
+            .operations
+            .acquire_tunnel(&owner)
+            .await
+            .expect("fixture tunnel permit");
         manager
             .publish_tunnel(
                 key,
@@ -6239,9 +6748,12 @@ mod tests {
                     "ws://127.0.0.1:41000/".to_string(),
                     pinned.to_string(),
                 ),
+                tunnel_permit,
+                &owner,
             )
             .map_err(|(error, _child)| error)
             .expect("fixture tunnel should publish");
+        drop(owner);
         let app = mock_builder()
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
@@ -6292,6 +6804,14 @@ mod tests {
                 .host_key_fingerprint,
             pinned
         );
+        let retry_fence = manager
+            .operation_fence(&target_connection_key(&target), None, None, None)
+            .expect("changed-pin retry fence");
+        let retry = manager
+            .begin_operation(&target, retry_fence, RemoteOperationClass::Session)
+            .await
+            .expect("a rejected disconnect must preserve same-generation admission");
+        drop(retry);
 
         manager.shutdown().await;
     }
@@ -6409,12 +6929,14 @@ mod tests {
             http_base_url: "http://127.0.0.1:9/".to_string(),
             ws_base_url: "ws://127.0.0.1:9/".to_string(),
         };
+        let operation_cancellation = CancellationToken::new();
         let owner = tokio::spawn(async move {
             start_ssh_tunnel(
                 &plan,
                 &SshAuthOptions::batch(),
                 launcher,
                 "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                &operation_cancellation,
             )
             .await
         });
@@ -6439,6 +6961,160 @@ mod tests {
         assert_eq!(error, "SSH process owner is shutting down.");
         assert_eq!(manager.child_reaper.active(), 0);
         assert!(!root.exists(), "shutdown must release the askpass root");
+    }
+
+    #[tokio::test]
+    async fn operation_cancellation_interrupts_and_reaps_unpublished_tunnel_readiness() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager = Arc::new(SshEnvironmentManager::with_askpass_temp_base(
+            temporary_base.path().to_path_buf(),
+        ));
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 60".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "exec sleep 60".to_string()],
+            )
+        };
+        let plan = SshEnvironmentLaunchPlan {
+            key: "operation-cancel-readiness".to_string(),
+            program,
+            args,
+            target: SshEnvironmentTarget {
+                alias: "fixture".to_string(),
+                hostname: "fixture.invalid".to_string(),
+                username: Some("fixture-user".to_string()),
+                port: None,
+            },
+            local_port: 9,
+            remote_port: 9,
+            remote_server_kind: "fixture",
+            http_base_url: "http://127.0.0.1:9/".to_string(),
+            ws_base_url: "ws://127.0.0.1:9/".to_string(),
+        };
+        let cancellation = CancellationToken::new();
+        let owner_cancellation = cancellation.clone();
+        let owner = tokio::spawn(async move {
+            start_ssh_tunnel(
+                &plan,
+                &SshAuthOptions::batch(),
+                launcher,
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                &owner_cancellation,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.child_reaper.wait_until_active(),
+        )
+        .await
+        .expect("unpublished tunnel should reserve ownership before readiness");
+
+        cancellation.cancel();
+        let error = match owner.await.expect("unpublished tunnel owner should join") {
+            Err(error) => error,
+            Ok(mut child) => {
+                child.terminate_and_reap().await;
+                panic!("operation cancellation must reject tunnel publication");
+            }
+        };
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(manager.child_reaper.active(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_port_race_fails_before_publication_and_reaps_the_child() {
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("local port race fixture should bind");
+        let local_port = occupied
+            .local_addr()
+            .expect("local port race fixture address")
+            .port();
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let root = launcher.root().to_path_buf();
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "[Console]::Error.WriteLine('bind 127.0.0.1:{local_port}: Address already in use'); exit 255"
+                    ),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "printf 'bind 127.0.0.1:{local_port}: Address already in use\\n' >&2; exit 255"
+                    ),
+                ],
+            )
+        };
+        let plan = SshEnvironmentLaunchPlan {
+            key: "occupied-local-port".to_string(),
+            program,
+            args,
+            target: SshEnvironmentTarget {
+                alias: "fixture".to_string(),
+                hostname: "fixture.invalid".to_string(),
+                username: Some("fixture-user".to_string()),
+                port: None,
+            },
+            local_port,
+            remote_port: 3773,
+            remote_server_kind: "fixture",
+            http_base_url: format!("http://127.0.0.1:{local_port}/"),
+            ws_base_url: format!("ws://127.0.0.1:{local_port}/"),
+        };
+
+        let error = match start_ssh_tunnel(
+            &plan,
+            &SshAuthOptions::batch(),
+            launcher,
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &CancellationToken::new(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(mut child) => {
+                child.terminate_and_reap().await;
+                panic!("an occupied local port must prevent tunnel publication");
+            }
+        };
+
+        assert!(error.contains("ended before confirming"), "{error}");
+        assert_eq!(
+            manager.child_reaper.active(),
+            0,
+            "the failed child must be reaped before failure is acknowledged"
+        );
+        assert!(!root.exists(), "reaping must release the askpass root");
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -6551,7 +7227,7 @@ mod tests {
             "failed ensure must release its askpass root"
         );
 
-        let disconnect_error = manager
+        manager
             .disconnect_environment(
                 app.handle(),
                 &prompts,
@@ -6562,15 +7238,133 @@ mod tests {
                 },
             )
             .await
-            .expect_err("an unreachable SSH target should not disconnect remotely");
-        assert!(disconnect_error.contains("SSH stop command failed"));
+            .expect("local disconnect must not contact the unreachable SSH target");
         assert_eq!(
             fs::read_dir(askpass_temporary_base.path())
                 .expect("askpass temporary base should remain readable")
                 .count(),
             0,
-            "failed disconnect must release its askpass root"
+            "local disconnect must not create or retain an askpass root"
         );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_revokes_prepared_consent_and_requires_a_newer_generation() {
+        use crate::server_artifacts::resolved_server_artifact_fixture;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let target = SshEnvironmentTarget {
+            alias: "prepared-host".to_string(),
+            hostname: "prepared-host.invalid".to_string(),
+            username: Some("dev".to_string()),
+            port: Some(22),
+        };
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let original_fence =
+            RemoteOperationFence::new("00000000-0000-4000-8000-000000000071", 7, 3)
+                .expect("probe fence");
+        let owner = manager
+            .begin_operation(
+                &target,
+                original_fence.clone(),
+                RemoteOperationClass::Session,
+            )
+            .await
+            .expect("probe generation should become current");
+        drop(owner);
+        let record = ServerArtifactRecord {
+            product: "bibcode-server".to_string(),
+            version: "0.4.2".to_string(),
+            os: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            format: "tar.gz".to_string(),
+            download_name: "bibcode-server.tar.gz".to_string(),
+            size: 1024,
+            sha256: "a".repeat(64),
+            signature_name: "bibcode-server.tar.gz.minisig".to_string(),
+        };
+        manager
+            .store_prepared_setup(PreparedSshSetup {
+                request_id: "prepared-request".to_string(),
+                probe_generation: 7,
+                target: target.clone(),
+                host_key_fingerprint: fingerprint.to_string(),
+                probe: provision_managed_path_probe(
+                    RemoteHostOs::Linux,
+                    "/home/dev/.local/share/bibcode/server",
+                ),
+                target_version: "0.4.2".to_string(),
+                service_mode: RemoteServiceMode::Workstation,
+                expected_environment_id: None,
+                expected_storage_instance_id: None,
+                resolved: resolved_server_artifact_fixture(record),
+                format: ArtifactFormat::TarGz,
+                paths: SshInstallPaths {
+                    remote_artifact: "/home/dev/server.tar.gz".to_string(),
+                    install_root: "/home/dev/.local/share/bibcode/server".to_string(),
+                    installed_binary: "/home/dev/.local/share/bibcode/server/current/bin/bibcode"
+                        .to_string(),
+                    data_root: "/home/dev/.bibcode".to_string(),
+                    remote_port: 3773,
+                },
+                expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(5),
+                operation_fence: original_fence.clone(),
+            })
+            .expect("prepared consent should be stored");
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        manager
+            .disconnect_environment(
+                app.handle(),
+                &prompts,
+                target.clone(),
+                SshEnvironmentDisconnectOptions {
+                    expected_host_key_fingerprint: fingerprint.to_string(),
+                },
+            )
+            .await
+            .expect("disconnect should perform local cleanup only");
+
+        let missing = manager
+            .take_prepared_setup(&SshSetupConsentDecision {
+                request_id: "prepared-request".to_string(),
+                probe_generation: 7,
+                accepted: true,
+            })
+            .err()
+            .expect("disconnect must revoke target-specific consent");
+        assert!(
+            missing.contains("missing, expired, or already used"),
+            "{missing}"
+        );
+        let stale = manager
+            .begin_operation(
+                &target,
+                original_fence
+                    .with_operation_id("00000000-0000-4000-8000-000000000072")
+                    .expect("stale retry fence"),
+                RemoteOperationClass::Session,
+            )
+            .await
+            .expect_err("disconnect must not reopen the prior generation");
+        assert!(stale.contains("generation is stale"), "{stale}");
+        let newer = manager
+            .begin_operation(
+                &target,
+                RemoteOperationFence::new("00000000-0000-4000-8000-000000000073", 8, 3)
+                    .expect("newer retry fence"),
+                RemoteOperationClass::Session,
+            )
+            .await
+            .expect("a newer generation should be admitted");
+        drop(newer);
         manager.shutdown().await;
     }
 
@@ -7028,6 +7822,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn operation_cancellation_removes_the_exact_pending_password_prompt() {
+        let manager = SshPasswordPromptManager::with_timeout(Duration::from_secs(30));
+        let cancellation = CancellationToken::new();
+        let task_manager = manager.clone();
+        let task_cancellation = cancellation.clone();
+        let request = tokio::spawn(async move {
+            task_manager
+                .request_password_with_cancellation(
+                    "cancelled-operation-prompt".to_string(),
+                    SshPasswordRequest {
+                        destination: "dev@example.test".to_string(),
+                        username: Some("dev".to_string()),
+                        prompt: "Password".to_string(),
+                    },
+                    SystemTime::now(),
+                    &task_cancellation,
+                    |_| Ok(()),
+                )
+                .await
+        });
+        while manager
+            .pending
+            .lock()
+            .expect("pending prompts")
+            .get("cancelled-operation-prompt")
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        let error = request
+            .await
+            .expect("password prompt owner joins")
+            .expect_err("operation cancellation cancels the prompt");
+        assert!(matches!(
+            error,
+            SshPasswordPromptRequestError::Cancelled { .. }
+        ));
+        assert!(
+            manager.pending.lock().expect("pending prompts").is_empty(),
+            "cancelled prompt must not remain resolvable or visible",
+        );
+    }
+
     #[test]
     fn builds_external_ssh_tunnel_launch_plan_with_exact_arguments() {
         let target = SshEnvironmentTarget {
@@ -7108,32 +7948,6 @@ mod tests {
         );
         assert!(validate_expected_host_key_fingerprint(Some(" "), "SHA256:observed").is_err());
         assert!(parse_ssh_host_key_fingerprint("debug1: no fingerprint here").is_err());
-    }
-
-    #[test]
-    fn disconnect_preserves_only_redacted_host_key_and_auth_failure_classes() {
-        for message in [
-            "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled.",
-            "SSH host key changed. Connection is blocked; verify the host out of band and update known_hosts explicitly before retrying.",
-            "SSH host key is unknown or not accepted. Verify the fingerprint out of band and add it through OpenSSH before retrying.",
-            "SSH authentication failed during host-key trust probe.",
-            "This SSH target uses a custom KnownHostsCommand, which is not supported with BiBCode host-key pinning.",
-            "This SSH target's effective SendEnv policy can forward BiBCode's private SSH authentication or host-key control variables.",
-            "SSH password authentication through ProxyJump or ProxyCommand is not supported because it could expose the destination password to the proxy process.",
-        ] {
-            assert_eq!(
-                disconnect_probe_failure_message(message.to_string()),
-                message,
-                "safe classifications must remain actionable"
-            );
-        }
-        assert_eq!(
-            disconnect_probe_failure_message(
-                "SSH host-key trust probe failed: private stderr value".to_string()
-            ),
-            "SSH stop command failed before host-key verification.",
-            "arbitrary subprocess detail must remain redacted"
-        );
     }
 
     #[test]
@@ -7440,13 +8254,18 @@ mod tests {
         let (stdin, mut remote_input) = tokio::io::duplex(128);
         let (fingerprint_sender, fingerprint_receiver) = oneshot::channel();
         let (_shutdown_sender, shutdown) = watch::channel(false);
-        let gate = tokio::spawn(release_remote_script_after_host_key(
-            stdin,
-            script,
-            fingerprint_receiver,
-            shutdown,
-            "launch",
-        ));
+        let gate = tokio::spawn(async move {
+            let cancellation = CancellationToken::new();
+            release_remote_script_after_host_key(
+                stdin,
+                script,
+                fingerprint_receiver,
+                shutdown,
+                "launch",
+                &cancellation,
+            )
+            .await
+        });
 
         let mut byte = [0_u8; 1];
         assert!(
@@ -7478,13 +8297,18 @@ mod tests {
         let (stdin, mut remote_input) = tokio::io::duplex(128);
         let (fingerprint_sender, fingerprint_receiver) = oneshot::channel();
         let (_shutdown_sender, shutdown) = watch::channel(false);
-        let gate = tokio::spawn(release_remote_script_after_host_key(
-            stdin,
-            script,
-            fingerprint_receiver,
-            shutdown,
-            "launch",
-        ));
+        let gate = tokio::spawn(async move {
+            let cancellation = CancellationToken::new();
+            release_remote_script_after_host_key(
+                stdin,
+                script,
+                fingerprint_receiver,
+                shutdown,
+                "launch",
+                &cancellation,
+            )
+            .await
+        });
         fingerprint_sender
             .send(Ok(()))
             .expect("fingerprint gate should remain live");

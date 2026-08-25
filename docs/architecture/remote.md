@@ -200,11 +200,38 @@ retained reaps and stderr I/O tasks before releasing the exact helper files.
 Cleanup never recursively removes an unexpected foreign entry from an askpass
 directory.
 
-Disconnect and Forget require the normalized route's saved host-key pin before
-they issue a remote stop. The pin is validated against an active tunnel before
-that tunnel is removed, so an invalid or changed caller pin leaves the live
-transport untouched. A legacy route without a pin can be removed locally, but
-BiBCode does not self-pin or run an unauthenticated remote uninstall/stop for it.
+Every native SSH attempt is owned by one UUID operation ID plus the current
+environment and route/binding generations. Only one operation may mutate a
+host generation. A newer generation cancels and drains the older owner before
+it may publish; a duplicate generation is rejected; exact cancellation waits
+for that owner to release its prompt, process, transfer, and readiness work.
+Global provisioning and live-tunnel admission are bounded separately, and SSH
+children reserve the bounded reaper before spawn. Forget closes host admission
+before cancellation, so a late command or tunnel cannot republish the forgotten
+generation.
+
+Cancellation reaches effective-config resolution, host-key probing, password
+presentation, signed-artifact resolution/download, transfer/install commands,
+tunnel readiness, and setup descriptor verification. Once mutation has begun,
+the owner retains its provisioning slot while rollback runs with a fresh,
+independently bounded cleanup token and the already cached authentication mode;
+rollback never opens a new password prompt. Descriptor validation and terminal
+completion share the coordinator fence: cancellation that wins first rolls the
+mutation back, while a completion claim that wins first makes replacement wait
+for final staging cleanup. The terminal setup result distinguishes `cancelled`
+from `failed` and reports whether cleanup completed. A tunnel that was already
+readiness-checked and published is retained for healthy route reuse; Disconnect
+or Forget owns its later local termination.
+
+Disconnect and Forget require the normalized route's saved host-key pin. The
+pin is validated against an active tunnel before that tunnel is removed, so an
+invalid or changed caller pin leaves the live transport and its prior admission
+fence untouched. Successful cleanup closes host admission, drains native owners, revokes target-specific
+setup consent, terminates and reaps the local tunnel, and clears cached local
+authentication before acknowledgement. It deliberately makes no SSH network
+request and leaves the remote service and all remote data untouched. A legacy
+route without a pin can be removed locally, but BiBCode does not self-pin or run
+an unauthenticated remote uninstall/stop for it.
 
 ### Desktop-managed WSL
 
@@ -239,6 +266,15 @@ authoritative discovery generation whose selected distribution is already
 `wsl.exe --distribution <name> --exec <program> <args...>` commands to read the
 Linux architecture, home/data roots, managed binary version, `tar`
 availability, and free space. No probe is interpolated into shell text.
+
+Each active WSL setup is keyed by its request ID and probe generation. Byte and
+stage progress is emitted only while that exact generation remains active.
+Cancellation during download, transfer, atomic install, backend restart, or
+descriptor verification preserves or restores the previous `current` target,
+uses an independent cleanup token, and suppresses stale progress/publication.
+The terminal progress event is serialized against the next generation and uses
+the exact result status (`completed`, `cancelled`, or `failed`). Desktop shutdown
+cancels every active setup and waits for rollback and staging cleanup to finish.
 
 An incompatible or absent managed runtime produces one short-lived,
 generation-bound consent document before mutation. It names the exact version,
@@ -338,9 +374,10 @@ cache, and settings. Removing one route leaves the environment and its other
 routes intact.
 
 Forget first closes client admission, cancels and awaits the environment
-supervisor, deletes this client's route and cache-key secrets, and atomically
-removes its routes, bindings, UI state, cache, and environment metadata. A
-redacted repair receipt keeps restart admission closed if cleanup is incomplete.
+supervisor, drains native SSH ownership and local tunnels, deletes this client's
+route and cache-key secrets, and atomically removes its routes, bindings, UI
+state, cache, and environment metadata. A redacted repair receipt keeps restart
+admission closed if native cleanup or persistence cleanup is incomplete.
 Forget does not stop or uninstall the remote server and does not delete remote
 projects, repositories, worktrees, or data. Those host operations require a
 separate explicit, online protocol; an offline client must report their outcome
@@ -392,10 +429,12 @@ and [Runtime and process model](./runtime-process-model.md).
   The older transient POSIX launch path still requires `ss` or readable Linux
   `/proc/net/tcp{,6}` for safe port selection and fails closed when occupancy is
   indeterminate.
-- Route-attempt cancellation does not yet interrupt an in-flight native SSH
-  bridge command. The lifecycle-fencing task in the current plan owns prompt,
-  setup, tunnel-publication, late-completion, and survivor cleanup races;
-  desktop shutdown remains the current native cleanup boundary.
+- Desktop route attempts pass their exact environment and route generations to
+  the native SSH owner. Aborting an in-flight ensure invokes exact native
+  cancellation and waits for owner drain; newer generations and Forget also
+  fence late publication. A readiness-checked tunnel that completed before the
+  abort remains an intentional reusable route transport until Disconnect or
+  Forget removes it.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

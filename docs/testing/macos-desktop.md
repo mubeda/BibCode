@@ -201,8 +201,12 @@ using any frame as evidence. At normal and minimum sizes verify:
   atomic promotion, requested workstation/headless service mode, loopback
   tunnel, canonical descriptor, native pairing, OS-secret persistence, and safe
   disconnect. Unknown/changed keys, declined consent, checksum failure, and
-  identity mismatch must stop before pairing, and no raw pairing value is
-  rendered;
+  identity mismatch must stop before pairing. Cancel an exact fenced operation
+  during password presentation, transfer/install, and tunnel readiness; verify
+  bounded rollback/reaping, no second cleanup prompt, and no late route
+  publication. Disconnect with the destination unreachable and verify the local
+  tunnel is reaped without a remote stop/uninstall request. No raw pairing value
+  is rendered;
 - WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
   from the ordinary macOS presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode

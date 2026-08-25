@@ -10,6 +10,7 @@ import {
   DesktopServerExposureStateSchema,
   DesktopSshEnvironmentBootstrapSchema,
   DesktopSshPairingInputSchema,
+  DesktopSshOperationCancelInputSchema,
   DesktopSshServerProbeSchema,
   DesktopSshSetupProbeInputSchema,
   DesktopSshSetupResultSchema,
@@ -48,6 +49,9 @@ const decodeDesktopSshEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopSshEnvironmentBootstrapSchema,
 );
 const decodeDesktopSshPairingInput = Schema.decodeUnknownSync(DesktopSshPairingInputSchema);
+const decodeDesktopSshOperationCancelInput = Schema.decodeUnknownSync(
+  DesktopSshOperationCancelInputSchema,
+);
 const decodeDesktopSshSetupProbeInput = Schema.decodeUnknownSync(DesktopSshSetupProbeInputSchema);
 const decodeDesktopSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
 const decodeDesktopSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
@@ -434,6 +438,31 @@ describe("Desktop staged SSH contract", () => {
     ).toMatchObject(descriptor);
   });
 
+  it("binds native cancellation to an exact operation and connection generation", () => {
+    const cancellation = decodeDesktopSshOperationCancelInput({
+      target: {
+        alias: "devbox",
+        hostname: "devbox.example",
+        username: "dev",
+        port: 22,
+      },
+      operationId: "019d2a2e-0d0e-7000-8000-000000000013",
+      environmentGeneration: 8,
+      bindingGeneration: 21,
+    });
+    expect(cancellation).toMatchObject({
+      operationId: "019d2a2e-0d0e-7000-8000-000000000013",
+      environmentGeneration: 8,
+      bindingGeneration: 21,
+    });
+    expect(() =>
+      decodeDesktopSshOperationCancelInput({
+        ...cancellation,
+        operationId: "not-a-uuid",
+      }),
+    ).toThrow();
+  });
+
   it("binds SSH setup to one host-key probe and an optional accepted identity pair", () => {
     const input = decodeDesktopSshSetupProbeInput({
       target: {
@@ -447,12 +476,21 @@ describe("Desktop staged SSH contract", () => {
       serviceMode: "workstation",
       expectedEnvironmentId: descriptor.environmentId,
       expectedStorageInstanceId: descriptor.storageInstanceId,
+      operationId: "019d2a2e-0d0e-7000-8000-000000000014",
+      environmentGeneration: 8,
+      bindingGeneration: 21,
     });
     expect(input.serviceMode).toBe("workstation");
     expect(() =>
       decodeDesktopSshSetupProbeInput({
         ...input,
         expectedStorageInstanceId: null,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeDesktopSshSetupProbeInput({
+        ...input,
+        bindingGeneration: undefined,
       }),
     ).toThrow();
 

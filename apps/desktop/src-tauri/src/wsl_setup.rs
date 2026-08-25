@@ -14,6 +14,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Clone)]
@@ -23,6 +24,9 @@ mod tests {
         wait_for_cancellation: Arc<AtomicBool>,
         fail_atomic_switch: Arc<AtomicBool>,
         previous_preserved: Arc<AtomicBool>,
+        block_rollback: Arc<AtomicBool>,
+        rollback_started: Arc<Notify>,
+        rollback_release: Arc<Notify>,
     }
 
     impl FakeHost {
@@ -33,6 +37,9 @@ mod tests {
                 wait_for_cancellation: Arc::new(AtomicBool::new(false)),
                 fail_atomic_switch: Arc::new(AtomicBool::new(false)),
                 previous_preserved: Arc::new(AtomicBool::new(true)),
+                block_rollback: Arc::new(AtomicBool::new(false)),
+                rollback_started: Arc::new(Notify::new()),
+                rollback_release: Arc::new(Notify::new()),
             })
         }
     }
@@ -89,6 +96,10 @@ mod tests {
             _cancellation: &'a CancellationToken,
         ) -> HostFuture<'a, ()> {
             Box::pin(async move {
+                if self.block_rollback.load(Ordering::SeqCst) {
+                    self.rollback_started.notify_one();
+                    self.rollback_release.notified().await;
+                }
                 self.previous_preserved.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -333,6 +344,7 @@ mod tests {
         while host.installs.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
+        assert!(manager.is_active(&consent.request_id, consent.probe_generation));
         let concurrent = manager
             .prepare(
                 &snapshot,
@@ -347,9 +359,13 @@ mod tests {
             .expect_err("concurrent setup must be rejected");
         assert!(concurrent.contains("already"));
         assert!(manager.cancel(&RemoteSetupCancelInput {
-            request_id: consent.request_id,
+            request_id: consent.request_id.clone(),
             generation: consent.probe_generation,
         }));
+        assert!(
+            !manager.is_active(&consent.request_id, consent.probe_generation),
+            "cancelled generations must stop publishing progress immediately"
+        );
         let outcome = install
             .await
             .expect("install task joins")
@@ -358,6 +374,170 @@ mod tests {
             panic!("cancelled install must not remain pending");
         };
         assert_eq!(result.status, WslSetupStatus::Cancelled);
+        assert!(host.previous_preserved.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_stops_publishing_after_a_newer_setup_begins() {
+        let host = FakeHost::new([
+            host_probe("x86_64", Some("0.4.1"), true, 1_000_000),
+            host_probe("x86_64", Some("0.4.1"), true, 1_000_000),
+        ]);
+        let manager = WslSetupManager::with_dependencies(host, FakeArtifacts::new(1024));
+        let snapshot = running_snapshot(10, WslDistroState::Running);
+        let temporary = tempfile::tempdir().expect("desktop staging root");
+
+        let first_probe = manager
+            .prepare(
+                &snapshot,
+                WslSetupProbeInput {
+                    distro: "Ubuntu".to_string(),
+                    discovery_generation: 10,
+                },
+                "0.4.2",
+                None,
+            )
+            .await
+            .expect("first setup consent");
+        let first_consent = first_probe.consent.expect("first setup-required consent");
+        let first_request_id = first_consent.request_id.clone();
+        let first_generation = first_consent.probe_generation;
+        let WslInstallAttempt::Pending(first_pending) = manager
+            .begin_install(
+                &snapshot,
+                RemoteSetupConsentDecision {
+                    request_id: first_request_id.clone(),
+                    probe_generation: first_generation,
+                    accepted: true,
+                },
+                temporary.path(),
+                progress_sink(),
+            )
+            .await
+            .expect("first install starts")
+        else {
+            panic!("first install should remain pending for identity verification");
+        };
+        assert!(manager.is_active(&first_request_id, first_generation));
+        let _ = manager
+            .fail_and_rollback(*first_pending, "replace first generation".to_string())
+            .await;
+
+        let second_probe = manager
+            .prepare(
+                &snapshot,
+                WslSetupProbeInput {
+                    distro: "Ubuntu".to_string(),
+                    discovery_generation: 10,
+                },
+                "0.4.2",
+                None,
+            )
+            .await
+            .expect("newer setup consent");
+        let second_consent = second_probe.consent.expect("newer setup-required consent");
+        let second_request_id = second_consent.request_id.clone();
+        let second_generation = second_consent.probe_generation;
+        assert!(second_generation > first_generation);
+        let WslInstallAttempt::Pending(second_pending) = manager
+            .begin_install(
+                &snapshot,
+                RemoteSetupConsentDecision {
+                    request_id: second_request_id.clone(),
+                    probe_generation: second_generation,
+                    accepted: true,
+                },
+                temporary.path(),
+                progress_sink(),
+            )
+            .await
+            .expect("newer install starts")
+        else {
+            panic!("newer install should remain pending for identity verification");
+        };
+
+        assert!(!manager.is_active(&first_request_id, first_generation));
+        assert!(manager.is_active(&second_request_id, second_generation));
+        let terminal_publications = AtomicUsize::new(0);
+        assert!(
+            !manager.publish_terminal_if_latest(first_generation, || {
+                terminal_publications.fetch_add(1, Ordering::SeqCst);
+            }),
+            "an older terminal event must not publish after a newer generation begins"
+        );
+        assert!(manager.publish_terminal_if_latest(second_generation, || {
+            terminal_publications.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(terminal_publications.load(Ordering::SeqCst), 1);
+        let _ = manager
+            .fail_and_rollback(*second_pending, "test cleanup".to_string())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_cancelled_setup_rollback_and_cleanup() {
+        let host = FakeHost::new([host_probe("x86_64", Some("0.4.1"), true, 1_000_000)]);
+        host.block_rollback.store(true, Ordering::SeqCst);
+        let manager = Arc::new(WslSetupManager::with_dependencies(
+            host.clone(),
+            FakeArtifacts::new(1024),
+        ));
+        let snapshot = running_snapshot(11, WslDistroState::Running);
+        let probe = manager
+            .prepare(
+                &snapshot,
+                WslSetupProbeInput {
+                    distro: "Ubuntu".to_string(),
+                    discovery_generation: 11,
+                },
+                "0.4.2",
+                None,
+            )
+            .await
+            .expect("shutdown fixture setup consent");
+        let consent = probe.consent.expect("shutdown fixture requires setup");
+        let temporary = tempfile::tempdir().expect("desktop staging root");
+        let WslInstallAttempt::Pending(pending) = manager
+            .begin_install(
+                &snapshot,
+                RemoteSetupConsentDecision {
+                    request_id: consent.request_id,
+                    probe_generation: consent.probe_generation,
+                    accepted: true,
+                },
+                temporary.path(),
+                progress_sink(),
+            )
+            .await
+            .expect("shutdown fixture reaches post-install verification")
+        else {
+            panic!("shutdown fixture must retain an active installed mutation");
+        };
+        let cancellation = pending.cancellation();
+        let rollback_manager = manager.clone();
+        let rollback = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            rollback_manager
+                .fail_and_rollback(*pending, "desktop shutdown cancelled setup".to_string())
+                .await
+        });
+        let shutdown_manager = manager.clone();
+        let shutdown = tokio::spawn(async move { shutdown_manager.shutdown().await });
+
+        tokio::time::timeout(Duration::from_secs(1), host.rollback_started.notified())
+            .await
+            .expect("shutdown cancellation starts rollback");
+        assert!(
+            !shutdown.is_finished(),
+            "desktop shutdown must wait while rollback owns the previous target"
+        );
+        host.rollback_release.notify_one();
+        let result = rollback.await.expect("rollback task joins");
+        assert_eq!(result.status, WslSetupStatus::Cancelled);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown drains rollback")
+            .expect("shutdown task joins");
         assert!(host.previous_preserved.load(Ordering::SeqCst));
     }
 
@@ -501,6 +681,7 @@ use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_kn
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
     process::{Child, Command},
+    sync::Notify,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -938,6 +1119,14 @@ impl PendingWslInstallation {
     pub(crate) fn expected_identity(&self) -> Option<&WslExpectedIdentity> {
         self.expected_identity.as_ref()
     }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
 
 pub(crate) enum WslInstallAttempt {
@@ -977,6 +1166,7 @@ struct WslSetupState {
 #[derive(Clone)]
 pub(crate) struct WslSetupManager {
     state: Arc<Mutex<WslSetupState>>,
+    changed: Arc<Notify>,
     host: Arc<dyn WslSetupHost>,
     artifacts: Arc<dyn WslArtifactProvider>,
     cancellation: CancellationToken,
@@ -1002,20 +1192,40 @@ impl WslSetupManager {
     ) -> Self {
         Self {
             state: Arc::default(),
+            changed: Arc::new(Notify::new()),
             host,
             artifacts,
             cancellation: CancellationToken::new(),
         }
     }
 
-    pub(crate) fn shutdown(&self) {
-        self.cancellation.cancel();
+    pub(crate) fn cancel_all(&self) {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.cancellation.cancel();
         for active in state.active.values() {
             active.cancellation.cancel();
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.cancel_all();
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let drained = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .is_empty();
+            if drained {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -1268,6 +1478,14 @@ impl WslSetupManager {
         pending: PendingWslInstallation,
         descriptor: Value,
     ) -> Result<WslSetupResult, String> {
+        if pending.cancellation.is_cancelled() {
+            return Ok(self
+                .fail_and_rollback(
+                    pending,
+                    "WSL setup was cancelled before identity publication.".to_string(),
+                )
+                .await);
+        }
         validate_setup_descriptor(
             &descriptor,
             &pending.target_version,
@@ -1275,7 +1493,14 @@ impl WslSetupManager {
             pending.expected_identity.as_ref(),
         )?;
         let cleanup = self.host.cleanup(&pending.distro, &pending.paths).await;
-        self.finish_active(&pending.request_id);
+        if !self.claim_active_completion(&pending.request_id, pending.generation) {
+            return Ok(self
+                .fail_and_rollback(
+                    pending,
+                    "WSL setup was cancelled or superseded during final cleanup.".to_string(),
+                )
+                .await);
+        }
         Ok(WslSetupResult {
             request_id: pending.request_id,
             generation: pending.generation,
@@ -1366,6 +1591,32 @@ impl WslSetupManager {
             && state.prepared.remove(&input.request_id).is_some()
     }
 
+    pub(crate) fn is_active(&self, request_id: &str, generation: u64) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active.get(request_id).is_some_and(|active| {
+            active.generation == generation && !active.cancellation.is_cancelled()
+        })
+    }
+
+    pub(crate) fn publish_terminal_if_latest(
+        &self,
+        generation: u64,
+        publish: impl FnOnce(),
+    ) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation {
+            return false;
+        }
+        publish();
+        true
+    }
+
     fn next_generation(&self) -> u64 {
         let mut state = self
             .state
@@ -1394,6 +1645,9 @@ impl WslSetupManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancellation.is_cancelled() {
+            return Err("WSL server setup owner is shutting down.".to_string());
+        }
         if state
             .active
             .values()
@@ -1437,6 +1691,9 @@ impl WslSetupManager {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancellation.is_cancelled() {
+            return Err("WSL server setup owner is shutting down.".to_string());
+        }
         if state
             .active
             .values()
@@ -1459,11 +1716,34 @@ impl WslSetupManager {
     }
 
     fn finish_active(&self, request_id: &str) {
-        self.state
+        let removed = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
             .remove(request_id);
+        if removed.is_some() {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn claim_active_completion(&self, request_id: &str, generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = !self.cancellation.is_cancelled()
+            && state.active.get(request_id).is_some_and(|active| {
+                active.generation == generation && !active.cancellation.is_cancelled()
+            });
+        if current {
+            state.active.remove(request_id);
+        }
+        drop(state);
+        if current {
+            self.changed.notify_waiters();
+        }
+        current
     }
 }
 

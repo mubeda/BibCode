@@ -7,6 +7,7 @@ import {
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import { afterEach, vi } from "vite-plus/test";
+import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -190,12 +191,21 @@ interface BridgeOptions {
   readonly accessToken?: string | null;
   readonly failBearer?: boolean;
   readonly failDisconnect?: boolean;
+  readonly onEnsure?: (options: {
+    readonly operationId?: string;
+    readonly environmentGeneration?: number;
+    readonly bindingGeneration?: number;
+  }) => void;
 }
 
 function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge {
   return {
-    ensureSshEnvironment: async (target: DesktopSshEnvironmentTarget) => {
+    ensureSshEnvironment: async (
+      target: DesktopSshEnvironmentTarget,
+      ensureOptions: Parameters<DesktopBridge["ensureSshEnvironment"]>[1],
+    ) => {
       calls.push("ensure");
+      options.onEnsure?.(ensureOptions ?? {});
       if (options.failEnsure !== undefined) {
         throw options.failEnsure;
       }
@@ -250,6 +260,10 @@ function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge
         throw new Error("disconnect failed");
       }
       return undefined;
+    },
+    cancelSshOperation: async () => {
+      calls.push("cancel");
+      return true;
     },
   } as unknown as DesktopBridge;
 }
@@ -628,6 +642,45 @@ describe("connectionPlatformLayer ssh gateway", () => {
       });
       expect(inspected.descriptor.environmentId).toBe(EnvironmentId.make("environment-ssh"));
       expect(calls).toEqual(["ensure", "descriptor"]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("cancels the exact native generation when an SSH attempt is aborted", () => {
+    const calls: string[] = [];
+    const cancellation = new AbortController();
+    let observedFence: {
+      readonly operationId?: string;
+      readonly environmentGeneration?: number;
+      readonly bindingGeneration?: number;
+    } | null = null;
+    const bridge = makeBridge(calls, {
+      onEnsure: (options) => {
+        observedFence = options;
+        cancellation.abort();
+      },
+    });
+    stubBrowser({ desktopBridge: bridge });
+    return Effect.gen(function* () {
+      const ssh = yield* SshEnvironmentGateway;
+      const exit = yield* Effect.exit(
+        ssh.inspect({
+          target: TARGET,
+          hostKeyFingerprint: "SHA256:known-host-key",
+          environmentGeneration: 8,
+          bindingGeneration: 21,
+          cancellation: cancellation.signal,
+        }),
+      );
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+      }
+      expect(calls).toEqual(["ensure", "cancel"]);
+      expect(observedFence).toMatchObject({
+        operationId: expect.any(String),
+        environmentGeneration: 8,
+        bindingGeneration: 21,
+      });
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 

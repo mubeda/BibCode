@@ -112,6 +112,7 @@ export class EnvironmentCatalogStore extends Context.Service<
 
 export const EnvironmentCleanupRepairPhase = Schema.Literals([
   "pending",
+  "native-cleanup-failed",
   "secret-deletion-failed",
   "metadata-deletion-failed",
 ]);

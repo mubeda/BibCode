@@ -252,6 +252,9 @@ When WSL and a supported distribution are usable:
   and insufficient-space failures all fail closed;
 - cancellation during streaming reaps the exact child and I/O tasks, cleans
   staging, and preserves the previous `current` target;
+- cancellation after the atomic switch, during backend restart, and during
+  descriptor streaming restores the previous target and suppresses stale
+  request/generation progress;
 - a failed atomic switch, backend restart, descriptor version/architecture/
   protocol/identity check, or cleanup reports typed mutation/cleanup status and
   restores the previous target;
@@ -358,8 +361,12 @@ Windows DPI states. Verify:
   credentials; on a disposable Windows OpenSSH target, verify explicit setup
   consent, signed artifact transfer and remote checksum/size validation,
   private ZIP extraction plus atomic directory promotion, the requested service
-  mode, loopback tunnel, canonical descriptor, and safe disconnect. Tailscale,
-  relay, exposure, and generic remote-retry UI remains absent;
+  mode, loopback tunnel, canonical descriptor, and safe disconnect. Cancel an
+  exact fenced operation during password presentation, transfer/install, and
+  tunnel readiness; verify bounded rollback/reaping, no second cleanup prompt,
+  no late route publication, and local disconnect with an unreachable target
+  performs no remote stop/uninstall request. Tailscale, relay, exposure, and generic
+  remote-retry UI remains absent;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt

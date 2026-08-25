@@ -583,7 +583,32 @@ export const DesktopSshPasswordPromptCancelledResultSchema = Schema.Struct({
 
 export const DesktopSshEnvironmentEnsureOptionsSchema = Schema.Struct({
   expectedHostKeyFingerprint: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  operationId: Schema.optionalKey(Schema.String.check(Schema.isUUID())),
+  environmentGeneration: Schema.optionalKey(NonNegativeInt),
+  bindingGeneration: Schema.optionalKey(NonNegativeInt),
+}).check(
+  Schema.makeFilter((input) => {
+    const supplied = [
+      input.operationId,
+      input.environmentGeneration,
+      input.bindingGeneration,
+    ].filter((value) => value !== undefined).length;
+    return supplied === 0 || supplied === 3 || "SSH operation fences must be supplied together.";
+  }),
+);
+
+export const DesktopSshOperationFenceSchema = Schema.Struct({
+  operationId: Schema.String.check(Schema.isUUID()),
+  environmentGeneration: NonNegativeInt,
+  bindingGeneration: NonNegativeInt,
 });
+export type DesktopSshOperationFence = typeof DesktopSshOperationFenceSchema.Type;
+
+export const DesktopSshOperationCancelInputSchema = Schema.Struct({
+  target: DesktopSshEnvironmentTargetSchema,
+  ...DesktopSshOperationFenceSchema.fields,
+});
+export type DesktopSshOperationCancelInput = typeof DesktopSshOperationCancelInputSchema.Type;
 
 export const DesktopSshEnvironmentEnsureInputSchema = Schema.Struct({
   target: DesktopSshEnvironmentTargetSchema,
@@ -878,18 +903,32 @@ export const DesktopSshSetupProbeInputSchema = Schema.Struct({
   target: DesktopSshEnvironmentTargetSchema,
   expectedHostKeyFingerprint: Schema.optionalKey(Schema.NullOr(Schema.String)),
   managedBinaryPath: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  operationId: Schema.optionalKey(Schema.String.check(Schema.isUUID())),
+  environmentGeneration: Schema.optionalKey(NonNegativeInt),
+  bindingGeneration: Schema.optionalKey(NonNegativeInt),
   serviceMode: Schema.optionalKey(RemoteHostServiceModeSchema),
   expectedEnvironmentId: Schema.optionalKey(Schema.NullOr(DurableEnvironmentId)),
   expectedStorageInstanceId: Schema.optionalKey(
     Schema.NullOr(Schema.String.check(Schema.isUUID())),
   ),
-}).check(
-  Schema.makeFilter(
-    ({ expectedEnvironmentId, expectedStorageInstanceId }) =>
-      (expectedEnvironmentId == null) === (expectedStorageInstanceId == null) ||
-      "Expected SSH environment and storage identities must be supplied together.",
-  ),
-);
+})
+  .check(
+    Schema.makeFilter(
+      ({ expectedEnvironmentId, expectedStorageInstanceId }) =>
+        (expectedEnvironmentId == null) === (expectedStorageInstanceId == null) ||
+        "Expected SSH environment and storage identities must be supplied together.",
+    ),
+  )
+  .check(
+    Schema.makeFilter((input) => {
+      const supplied = [
+        input.operationId,
+        input.environmentGeneration,
+        input.bindingGeneration,
+      ].filter((value) => value !== undefined).length;
+      return supplied === 0 || supplied === 3 || "SSH operation fences must be supplied together.";
+    }),
+  );
 export type DesktopSshSetupProbeInput = typeof DesktopSshSetupProbeInputSchema.Type;
 
 export const DesktopSshServerProbeSchema = Schema.Struct({
@@ -1493,9 +1532,15 @@ export interface DesktopBridge {
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   prepareSshServer: (input: DesktopSshSetupProbeInput) => Promise<DesktopSshServerProbe>;
   installSshServer: (decision: RemoteSetupConsentDecision) => Promise<DesktopSshSetupResult>;
+  cancelSshOperation?: (input: DesktopSshOperationCancelInput) => Promise<boolean>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
-    options?: { expectedHostKeyFingerprint?: string | null },
+    options?: {
+      expectedHostKeyFingerprint?: string | null;
+      operationId?: string;
+      environmentGeneration?: number;
+      bindingGeneration?: number;
+    },
   ) => Promise<DesktopSshEnvironmentBootstrap>;
   disconnectSshEnvironment: (
     target: DesktopSshEnvironmentTarget,

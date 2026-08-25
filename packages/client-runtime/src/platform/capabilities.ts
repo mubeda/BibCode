@@ -50,6 +50,8 @@ export class SshEnvironmentGateway extends Context.Service<
     readonly inspect: (input: {
       readonly target: DesktopSshEnvironmentTarget;
       readonly hostKeyFingerprint: string | null;
+      readonly environmentGeneration?: number;
+      readonly bindingGeneration?: number;
       readonly cancellation: AbortSignal;
     }) => Effect.Effect<InspectedSshEnvironment, ConnectionAttemptError>;
     /** Creates and redeems pairing only after the caller accepts the inspected identity. */

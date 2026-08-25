@@ -270,6 +270,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     readonly beforeEnvironmentSecretDelete?: (
       secretRef: string,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly beforeSshDisconnect?: (
+      target: DesktopSshEnvironmentTarget,
+      hostKeyFingerprint: string,
+    ) => Effect.Effect<void, ConnectionTransientError>;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -682,7 +686,14 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     inspect: () => Effect.die(new Error("SSH inspection is not used.")),
     exchange: () => Effect.die(new Error("SSH exchange is not used.")),
     disconnect: (target, hostKeyFingerprint) =>
-      Ref.update(disconnectedSshTargets, (current) => [...current, { target, hostKeyFingerprint }]),
+      Effect.gen(function* () {
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "disconnect-ssh"]);
+        yield* options?.beforeSshDisconnect?.(target, hostKeyFingerprint) ?? Effect.void;
+        yield* Ref.update(disconnectedSshTargets, (current) => [
+          ...current,
+          { target, hostKeyFingerprint },
+        ]);
+      }),
   });
   const driver = ConnectionDriver.ConnectionDriver.of({
     connect: (input, reportProgress) =>
@@ -1938,7 +1949,51 @@ describe("EnvironmentRegistry", () => {
             hostKeyFingerprint: SSH_HOST_KEY_FINGERPRINT,
           },
         ]);
+        expect(yield* Ref.get(harness.lifecycleEvents)).toEqual([
+          "close-admission",
+          "disconnect-ssh",
+          "clear-cache",
+          "clear-ui",
+          "delete-routes",
+          "delete-environment",
+        ]);
       }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("keeps metadata and a repair receipt when native SSH cleanup fails", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [SSH_NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+        beforeSshDisconnect: () =>
+          Effect.fail(
+            new ConnectionTransientError({
+              reason: "remote-unavailable",
+              detail: "Local SSH tunnel cleanup failed.",
+            }),
+          ),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+
+        const error = yield* registry.remove(SSH_ENVIRONMENT_ID).pipe(Effect.flip);
+
+        expect(error).toBeInstanceOf(ConnectionTransientError);
+        expect((yield* Ref.get(harness.storedEnvironments)).has(SSH_ENVIRONMENT_ID)).toBe(true);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([]);
+        expect([...(yield* Ref.get(harness.cleanupRepairs)).values()]).toEqual([
+          {
+            schemaVersion: 1,
+            environmentId: SSH_ENVIRONMENT_ID,
+            generation: expect.any(Number),
+            phase: "native-cleanup-failed",
+          },
+        ]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
 });

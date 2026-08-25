@@ -598,19 +598,19 @@ runbooks; those native executions are not claimed here.
 - Modify: `packages/contracts/src/ipc.ts`
 - Test: `apps/desktop/src-tauri/src/ssh.rs`, `wsl.rs`
 
-- [ ] **Step 1: Add race/failure tests**
+- [x] **Step 1: Add race/failure tests**
 
 Cover duplicate ensure, cancel during password prompt/download/transfer/install/tunnel readiness, desktop shutdown, late completion after Forget, local-port race, SSH exit before publish, stuck stderr, reaper saturation, and stale progress after a newer generation.
 
-- [ ] **Step 2: Give each operation one owner**
+- [x] **Step 2: Give each operation one owner**
 
 Use `operationId + environment/binding generation + CancellationToken`. Limit global provisioning, per-host mutation, active tunnels, WSL child forwards, and child reaper queues. Publish tunnel/binding changes only after readiness and generation checks.
 
-- [ ] **Step 3: Make Forget close admission first**
+- [x] **Step 3: Make Forget close admission first**
 
 Plan 20's removal lifecycle marks the environment closing, then this layer cancels setup, password prompts, downloads, transfers, tunnels, proxies, and backend children; waits/reaps; clears host auth material; and only then acknowledges host cleanup. Force remove records unknown remote outcome without pretending a remote stop/uninstall occurred.
 
-- [ ] **Step 4: Run stress/lifecycle tests and commit**
+- [x] **Step 4: Run stress/lifecycle tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests::manager -- --nocapture
@@ -619,6 +619,28 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl_transport::tests
 git add apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/wsl_transport.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts
 git commit -m "fix(desktop): own and reap remote environment operations"
 ```
+
+Implemented with an exact UUID plus environment/binding-generation coordinator,
+atomic terminal completion claims, separate provisioning/tunnel capacities,
+native cancellation through prompts/downloads/commands/readiness, and retained
+process/reaper ownership. WSL terminal publication is generation-serialized and
+desktop shutdown waits for rollback and staging cleanup. Forget now drains
+native ownership before persistence deletion, performs local-only SSH cleanup
+without contacting or stopping the remote service, revokes prepared consent,
+and records `native-cleanup-failed` while retaining metadata on failure.
+Successful cleanup requires a newer route generation; rejected pre-mutation
+cleanup atomically restores the prior admission fence.
+
+Validation passed all 392 desktop library tests, all 5 SSH public-contract
+tests, and 179 affected contract/client/web tests. `cargo fmt --all --check`,
+desktop `cargo check`, desktop all-target Clippy with warnings denied, `vp check`,
+and the complete workspace typecheck graph passed. `vp check` retains one
+pre-existing unused test-fixture warning in
+`apps/web/src/connection/storage.test.ts`. Independent review found and drove
+five lifecycle fixes plus one changed-pin admission regression; the final
+read-only re-review found no remaining Critical or Important issue. Native
+Linux, macOS, and Windows SSH/WSL runs remain required by the updated testing
+runbooks and are not claimed here.
 
 ### Task 9: Replace renderer polling with bridge events and route-aware state
 
