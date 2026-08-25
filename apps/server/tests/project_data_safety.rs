@@ -143,7 +143,11 @@ async fn fetch_axum_descriptor(client: &Client, handle: &bibcode_server::ServerH
     response.json().await.expect("environment descriptor JSON")
 }
 
-async fn fetch_connect_descriptor(client: &Client, handle: &bibcode_server::ServerHandle) -> Value {
+async fn fetch_connect_descriptor(
+    client: &Client,
+    handle: &bibcode_server::ServerHandle,
+    environment_id: &str,
+) -> Value {
     let credential = handle
         .startup_access()
         .expect("web startup access")
@@ -215,12 +219,12 @@ async fn fetch_connect_descriptor(client: &Client, handle: &bibcode_server::Serv
             "bibcode-cloud-health+jwt",
             json!({
                 "iss": "https://relay.example",
-                "aud": "bibcode-env:local",
+                "aud": format!("bibcode-env:{environment_id}"),
                 "sub": "project-data-safety-user",
                 "jti": Uuid::new_v4().to_string(),
                 "iat": now,
                 "exp": now + 300,
-                "environmentId": "local",
+                "environmentId": environment_id,
                 "nonce": Uuid::new_v4().to_string(),
                 "scope": ["environment:status"]
             }),
@@ -241,7 +245,7 @@ async fn fetch_connect_descriptor(client: &Client, handle: &bibcode_server::Serv
 }
 
 #[tokio::test]
-async fn descriptor_surfaces_publish_one_stable_uuid_without_local_path_leakage() {
+async fn descriptor_identities_survive_restart_and_remain_distinct_without_path_leakage() {
     let root = TempDir::new().expect("temporary absolute data root");
     let client = Client::builder()
         .no_proxy()
@@ -254,11 +258,17 @@ async fn descriptor_surfaces_publish_one_stable_uuid_without_local_path_leakage(
     let requested_root = first.data_root().requested.clone();
     let effective_root = first.data_root().effective.clone();
     let first_axum = fetch_axum_descriptor(&client, &first).await;
-    let first_connect = fetch_connect_descriptor(&client, &first).await;
     let first_storage_id = first_axum["storageInstanceId"]
         .as_str()
         .expect("new local server storage UUID");
+    let first_environment_id = first_axum["environmentId"]
+        .as_str()
+        .expect("new local server environment UUID");
+    let first_connect = fetch_connect_descriptor(&client, &first, first_environment_id).await;
     Uuid::parse_str(first_storage_id).expect("valid server storage UUID");
+    Uuid::parse_str(first_environment_id).expect("valid server environment UUID");
+    assert_ne!(first_environment_id, first_storage_id);
+    assert_eq!(first_connect["environmentId"], first_environment_id);
     assert_eq!(first_connect["storageInstanceId"], first_storage_id);
     assert_descriptor_is_path_redacted(&first_axum, &requested_root, &effective_root);
     assert_descriptor_is_path_redacted(&first_connect, &requested_root, &effective_root);
@@ -269,7 +279,12 @@ async fn descriptor_surfaces_publish_one_stable_uuid_without_local_path_leakage(
         .await
         .expect("second server start");
     let second_axum = fetch_axum_descriptor(&client, &second).await;
-    let second_connect = fetch_connect_descriptor(&client, &second).await;
+    let second_environment_id = second_axum["environmentId"]
+        .as_str()
+        .expect("restarted local server environment UUID");
+    let second_connect = fetch_connect_descriptor(&client, &second, second_environment_id).await;
+    assert_eq!(second_axum["environmentId"], first_environment_id);
+    assert_eq!(second_connect["environmentId"], first_environment_id);
     assert_eq!(second_axum["storageInstanceId"], first_storage_id);
     assert_eq!(second_connect["storageInstanceId"], first_storage_id);
     assert_descriptor_is_path_redacted(&second_axum, &requested_root, &effective_root);
@@ -324,15 +339,20 @@ async fn existing_unmarked_database_is_adopted_without_catalog_changes() {
 }
 
 #[tokio::test]
-async fn first_run_creates_the_database_and_one_valid_marker() {
+async fn first_run_creates_the_database_and_two_distinct_valid_markers() {
     let fixture = StoreFixture::new();
 
     let prepared = fixture.prepare().await.expect("prepare first run");
 
     assert_eq!(prepared.classification, StoreClassification::FirstRun);
     assert!(fixture.paths.database.is_file());
-    let marker = std::fs::read_to_string(&fixture.paths.environment_id).expect("marker");
-    Uuid::parse_str(marker.trim()).expect("marker UUID");
+    let environment_marker =
+        std::fs::read_to_string(&fixture.paths.environment_id).expect("environment marker");
+    let storage_marker =
+        std::fs::read_to_string(&fixture.paths.storage_instance_id).expect("storage marker");
+    Uuid::parse_str(environment_marker.trim()).expect("environment marker UUID");
+    Uuid::parse_str(storage_marker.trim()).expect("storage marker UUID");
+    assert_ne!(environment_marker, storage_marker);
 }
 
 #[tokio::test]
@@ -346,7 +366,11 @@ async fn existing_database_with_valid_marker_reuses_the_store() {
 
     assert_eq!(prepared.classification, StoreClassification::Existing);
     assert_eq!(
-        std::fs::read(&fixture.paths.environment_id).expect("marker bytes"),
+        std::fs::read(&fixture.paths.storage_instance_id).expect("storage marker bytes"),
+        original_marker
+    );
+    assert_ne!(
+        std::fs::read(&fixture.paths.environment_id).expect("environment marker bytes"),
         original_marker
     );
 }
@@ -577,7 +601,10 @@ async fn concurrent_adoption_of_a_recognized_store_converges_on_one_identity() {
 #[tokio::test]
 async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() {
     let (_root, config, paths) = crashed_store_fixture();
-    let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
+    let environment_before =
+        std::fs::read(&paths.environment_id).expect("crash-store environment marker");
+    let storage_before =
+        std::fs::read(&paths.storage_instance_id).expect("crash-store storage marker");
     assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
     assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
 
@@ -599,19 +626,30 @@ async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() 
     assert_eq!(prepared.classification, StoreClassification::Existing);
     assert_eq!(
         prepared.storage_instance_id.to_string(),
-        marker_text(&marker_before)
+        marker_text(&storage_before)
+    );
+    assert_eq!(
+        prepared.environment_id.to_string(),
+        marker_text(&environment_before)
     );
     assert_eq!(title, "Crash project");
     assert_eq!(
-        std::fs::read(&paths.environment_id).expect("marker remains"),
-        marker_before
+        std::fs::read(&paths.storage_instance_id).expect("storage marker remains"),
+        storage_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("environment marker remains"),
+        environment_before
     );
 }
 
 #[tokio::test]
 async fn crash_left_wal_without_shm_restarts_with_only_sqlite_coordination_recreated() {
     let (_root, config, paths) = crashed_store_fixture();
-    let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
+    let environment_before =
+        std::fs::read(&paths.environment_id).expect("crash-store environment marker");
+    let storage_before =
+        std::fs::read(&paths.storage_instance_id).expect("crash-store storage marker");
     let shared_memory = sqlite_sidecar(&paths.database, "-shm");
     std::fs::remove_file(&shared_memory).expect("remove crash-left SHM fixture");
     let mut expected_entries = directory_entry_names(&paths.state_dir);
@@ -639,7 +677,11 @@ async fn crash_left_wal_without_shm_restarts_with_only_sqlite_coordination_recre
     assert_eq!(prepared.classification, StoreClassification::Existing);
     assert_eq!(
         prepared.storage_instance_id.to_string(),
-        marker_text(&marker_before)
+        marker_text(&storage_before)
+    );
+    assert_eq!(
+        prepared.environment_id.to_string(),
+        marker_text(&environment_before)
     );
     assert_eq!(title, "Crash project");
     assert_eq!(integrity, "ok");
@@ -653,8 +695,12 @@ async fn crash_left_wal_without_shm_restarts_with_only_sqlite_coordination_recre
         "SQLite recreates its valid volatile WAL-index coordination file"
     );
     assert_eq!(
-        std::fs::read(&paths.environment_id).expect("marker remains"),
-        marker_before
+        std::fs::read(&paths.storage_instance_id).expect("storage marker remains"),
+        storage_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("environment marker remains"),
+        environment_before
     );
 }
 
@@ -729,6 +775,7 @@ async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_
     let storage_instance_id = Uuid::new_v4();
     fixture.write_marker(storage_instance_id);
     let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let environment_id = prepared.environment_id.to_string();
     let backup = create_verified_backup(
         &prepared.database,
         &prepared,
@@ -773,9 +820,22 @@ async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_
     assert_eq!(restored_title, "Before restore");
     assert_eq!(
         std::fs::read_to_string(&fixture.paths.environment_id)
-            .expect("restored marker")
+            .expect("restored environment marker")
+            .trim(),
+        environment_id
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.paths.storage_instance_id)
+            .expect("restored storage marker")
             .trim(),
         storage_instance_id.to_string()
+    );
+    assert!(result.preserved_directory.join("environment-id").is_file());
+    assert!(
+        result
+            .preserved_directory
+            .join("storage-instance-id")
+            .is_file()
     );
 
     let preserved_database = result.preserved_directory.join("state.sqlite");
@@ -805,9 +865,14 @@ async fn recovery_restore_rejects_a_backup_from_a_different_known_storage_identi
     .expect("create verified recovery generation");
     drop(prepared);
     tokio::time::sleep(Duration::from_millis(25)).await;
-    fixture.write_marker(Uuid::new_v4());
+    std::fs::write(
+        &fixture.paths.storage_instance_id,
+        format!("{}\n", Uuid::new_v4()),
+    )
+    .expect("different storage marker");
     let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
-    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
+    let marker_before =
+        std::fs::read(&fixture.paths.storage_instance_id).expect("live storage marker bytes");
     let entries_before = directory_entry_names(&fixture.paths.state_dir);
 
     let error = restore_backup(
@@ -827,8 +892,66 @@ async fn recovery_restore_rejects_a_backup_from_a_different_known_storage_identi
         database_before
     );
     assert_eq!(
-        std::fs::read(&fixture.paths.environment_id).expect("live marker remains"),
+        std::fs::read(&fixture.paths.storage_instance_id).expect("live storage marker remains"),
         marker_before
+    );
+    assert_eq!(
+        directory_entry_names(&fixture.paths.state_dir),
+        entries_before
+    );
+    assert!(!fixture.paths.recovery_journal().exists());
+}
+
+#[tokio::test]
+async fn recovery_restore_rejects_a_backup_from_a_different_known_environment_identity() {
+    let fixture = StoreFixture::with_project("Original project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    std::fs::write(
+        &fixture.paths.environment_id,
+        format!("{}\n", Uuid::new_v4()),
+    )
+    .expect("different environment marker");
+    let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
+    let environment_before =
+        std::fs::read(&fixture.paths.environment_id).expect("live environment marker bytes");
+    let storage_before =
+        std::fs::read(&fixture.paths.storage_instance_id).expect("live storage marker bytes");
+    let entries_before = directory_entry_names(&fixture.paths.state_dir);
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("different known environment identity must block restore");
+
+    assert!(matches!(error, RecoveryError::EnvironmentIdentityMismatch));
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("live database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("environment marker remains"),
+        environment_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.storage_instance_id).expect("storage marker remains"),
+        storage_before
     );
     assert_eq!(
         directory_entry_names(&fixture.paths.state_dir),
@@ -1023,6 +1146,7 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
     let storage_instance_id = Uuid::new_v4();
     fixture.write_marker(storage_instance_id);
     let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let environment_id = prepared.environment_id.to_string();
     let backup = create_verified_backup(
         &prepared.database,
         &prepared,
@@ -1054,7 +1178,13 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
     );
     assert_eq!(
         std::fs::read_to_string(&fixture.paths.environment_id)
-            .expect("verified marker installed")
+            .expect("verified environment marker installed")
+            .trim(),
+        environment_id
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.paths.storage_instance_id)
+            .expect("verified storage marker remains")
             .trim(),
         storage_instance_id.to_string()
     );
@@ -1063,8 +1193,12 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
 #[tokio::test]
 async fn recovery_start_empty_preserves_crash_left_sqlite_files_before_new_identity_creation() {
     let (_root, config, paths) = crashed_store_fixture();
-    let old_marker = std::fs::read_to_string(&paths.environment_id)
-        .expect("crash-left marker")
+    let old_environment_id = std::fs::read_to_string(&paths.environment_id)
+        .expect("crash-left environment marker")
+        .trim()
+        .to_owned();
+    let old_storage_id = std::fs::read_to_string(&paths.storage_instance_id)
+        .expect("crash-left storage marker")
         .trim()
         .to_owned();
     assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
@@ -1083,11 +1217,13 @@ async fn recovery_start_empty_preserves_crash_left_sqlite_files_before_new_ident
     assert!(!sqlite_sidecar(&paths.database, "-wal").exists());
     assert!(!sqlite_sidecar(&paths.database, "-shm").exists());
     assert!(!paths.environment_id.exists());
+    assert!(!paths.storage_instance_id.exists());
     for name in [
         "state.sqlite",
         "state.sqlite-wal",
         "state.sqlite-shm",
         "environment-id",
+        "storage-instance-id",
     ] {
         assert!(result.preserved_directory.join(name).is_file(), "{name}");
     }
@@ -1107,7 +1243,8 @@ async fn recovery_start_empty_preserves_crash_left_sqlite_files_before_new_ident
         .await
         .expect("normal startup creates explicit empty store");
     assert_eq!(prepared.classification, StoreClassification::FirstRun);
-    assert_ne!(prepared.storage_instance_id.to_string(), old_marker);
+    assert_ne!(prepared.environment_id.to_string(), old_environment_id);
+    assert_ne!(prepared.storage_instance_id.to_string(), old_storage_id);
 }
 
 #[tokio::test]
@@ -1246,6 +1383,7 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
     let storage_instance_id = Uuid::new_v4();
     fixture.write_marker(storage_instance_id);
     let prepared = fixture.prepare().await.expect("prepare inspection fixture");
+    let environment_id = prepared.environment_id;
     let backup = create_verified_backup(
         &prepared.database,
         &prepared,
@@ -1271,6 +1409,7 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
     .expect("inspect store");
 
     assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    assert_eq!(inspection.environment_id, Some(environment_id));
     assert_eq!(
         inspection
             .storage_instance_id

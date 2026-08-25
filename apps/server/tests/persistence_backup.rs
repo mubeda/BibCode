@@ -8,9 +8,9 @@ use std::{
 use bibcode_server::{
     ServerConfig,
     persistence::{
-        BackupTrigger, MIGRATIONS, StatePaths, StorageInstanceId, StoreClassification,
-        StoreOperationGuard, VerifiedBackup, create_verified_backup, inventory_verified_backups,
-        pending_migrations, prepare_store, run_migrations,
+        BackupTrigger, EnvironmentId, MIGRATIONS, StatePaths, StorageInstanceId,
+        StoreClassification, StoreOperationGuard, VerifiedBackup, create_verified_backup,
+        inventory_verified_backups, pending_migrations, prepare_store, run_migrations,
     },
     resolve_data_root,
 };
@@ -248,6 +248,11 @@ async fn creates_verified_pre_migration_backup_before_first_pending_migration() 
         .expect("one pre-migration backup");
 
     assert_eq!(backup.manifest.trigger, BackupTrigger::PreMigration);
+    assert_eq!(backup.manifest.manifest_version, 2);
+    assert_eq!(
+        backup.manifest.environment_id,
+        Some(prepared.environment_id)
+    );
     assert_eq!(
         backup.manifest.storage_instance_id,
         prepared.storage_instance_id
@@ -281,6 +286,43 @@ async fn creates_verified_pre_migration_backup_before_first_pending_migration() 
 }
 
 #[tokio::test]
+async fn legacy_backup_manifest_decoding_never_invents_an_environment_identity() {
+    let fixture = PersistedStoreFixture::current_schema_with_project("legacy-manifest-project");
+    let prepared = fixture.prepare().await.expect("prepare current store");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create current backup");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&backup.manifest_path).expect("current manifest bytes"))
+            .expect("current manifest JSON");
+    let object = manifest.as_object_mut().expect("manifest object");
+    object.remove("manifestVersion");
+    object.remove("environmentId");
+    fs::write(
+        &backup.manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("legacy manifest JSON"),
+    )
+    .expect("rewrite legacy manifest fixture");
+
+    let inventory = inventory_verified_backups(&prepared.paths, prepared.storage_instance_id)
+        .await
+        .expect("inventory legacy manifest");
+    assert!(inventory.issues.is_empty());
+    let [legacy]: [VerifiedBackup; 1] = inventory.verified.try_into().expect("one legacy backup");
+    assert_eq!(legacy.manifest.manifest_version, 1);
+    assert_eq!(legacy.manifest.environment_id, None);
+    assert_eq!(
+        legacy.manifest.storage_instance_id,
+        prepared.storage_instance_id
+    );
+}
+
+#[tokio::test]
 async fn refuses_migration_when_backup_publication_cannot_begin() {
     let fixture = PersistedStoreFixture::older_schema_with_project("project-a");
     fixture.block_backup_directory_with_file();
@@ -297,9 +339,13 @@ async fn refuses_migration_when_backup_publication_cannot_begin() {
     assert_eq!(fixture.database_bytes(), before);
     assert_eq!(fixture.schema_version(), schema_before);
     assert_eq!(
-        fs::read(&fixture.paths.environment_id).expect("marker remains"),
+        fs::read(&fixture.paths.storage_instance_id).expect("legacy marker becomes storage marker"),
         marker_before
     );
+    let environment_marker =
+        fs::read_to_string(&fixture.paths.environment_id).expect("environment marker published");
+    Uuid::parse_str(environment_marker.trim()).expect("environment marker UUID");
+    assert_ne!(environment_marker.as_bytes(), marker_before);
 }
 
 #[tokio::test]
@@ -895,7 +941,9 @@ async fn abort_after_operation_lock_acquisition_releases_immediately() {
 fn backup_manifest_never_serializes_the_effective_or_requested_root() {
     let fixture = PersistedStoreFixture::first_run();
     let manifest = bibcode_server::persistence::BackupManifest {
+        manifest_version: 2,
         backup_id: Uuid::new_v4(),
+        environment_id: Some(EnvironmentId::from_uuid(Uuid::new_v4())),
         storage_instance_id: fixture.storage_instance_id,
         created_at: "2026-08-09T00:00:00Z".to_owned(),
         state_kind: fixture.paths.state_kind,

@@ -2138,7 +2138,10 @@ fn current_directory(config: &ServerConfig) -> String {
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
     json!({
-        "environmentId": config.environment_id,
+        "environmentId": config
+            .environment_id
+            .expect("a running server has a prepared environment identity")
+            .to_string(),
         "label": config.environment_label,
         "platform": { "os": platform_os(), "arch": platform_arch() },
         "serverVersion": config.server_version,
@@ -2146,6 +2149,10 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        "protocol": {
+            "minimum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
+            "maximum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
+        },
         "capabilities": {
             "repositoryIdentity": true,
             "worktreeCatalog": true,
@@ -2232,6 +2239,10 @@ mod tests {
     use super::*;
 
     const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000004);
+
+    fn test_environment_id() -> crate::persistence::EnvironmentId {
+        crate::persistence::EnvironmentId::from_uuid(Uuid::new_v4())
+    }
 
     fn running_test_config(path: &Path) -> ServerConfig {
         let mut config = ServerConfig::new(path);
@@ -4390,7 +4401,7 @@ mod tests {
     async fn server_settings_expose_terminal_webgl_default_and_patch() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
-        config.environment_id = "environment-webgl".to_owned();
+        config.environment_id = Some(test_environment_id());
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
 
         let settings = control
@@ -4411,7 +4422,7 @@ mod tests {
     async fn concurrent_settings_updates_preserve_every_committed_patch() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
-        config.environment_id = "environment-concurrent-settings".to_owned();
+        config.environment_id = Some(test_environment_id());
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
         control.install_settings_update_barrier(24).await;
 
@@ -4472,7 +4483,7 @@ mod tests {
     async fn older_probe_completion_cannot_overwrite_newer_same_generation_snapshot() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
-        config.environment_id = "environment-provider-probe-order".to_owned();
+        config.environment_id = Some(test_environment_id());
         let settings_path = config.state_dir().join("settings.json");
         tokio::fs::create_dir_all(config.state_dir())
             .await
@@ -4572,7 +4583,7 @@ mod tests {
     async fn concurrent_settings_stream_discards_stale_provider_probes_in_commit_order() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
-        config.environment_id = "environment-concurrent-stream".to_owned();
+        config.environment_id = Some(test_environment_id());
         let settings_path = config.state_dir().join("settings.json");
         tokio::fs::create_dir_all(config.state_dir())
             .await
@@ -4811,7 +4822,7 @@ mod tests {
         for (name, original) in cases {
             let temp = tempfile::tempdir().expect("state directory");
             let mut config = ServerConfig::new(temp.path());
-            config.environment_id = format!("environment-invalid-{name}");
+            config.environment_id = Some(test_environment_id());
             let settings_path = config.state_dir().join("settings.json");
             tokio::fs::create_dir_all(config.state_dir())
                 .await
@@ -5049,12 +5060,16 @@ mod tests {
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
-        config.environment_id = "environment-1".to_owned();
+        let environment_id = test_environment_id();
+        config.environment_id = Some(environment_id);
         config.environment_label = "Environment One".to_owned();
         let control = NativeServerControl::new(config.clone(), json!({"policy":"test"})).await;
 
         let snapshot = control.config_snapshot().await;
-        assert_eq!(snapshot["environment"]["environmentId"], "environment-1");
+        assert_eq!(
+            snapshot["environment"]["environmentId"],
+            environment_id.to_string()
+        );
         assert_eq!(
             snapshot["environment"]["capabilities"]["worktreeCatalogRefreshReason"],
             true

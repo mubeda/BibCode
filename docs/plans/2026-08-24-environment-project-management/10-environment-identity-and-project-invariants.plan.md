@@ -53,7 +53,7 @@
 - Produces: `EnvironmentId(Uuid)`, `PreparedStore.environment_id`, `StatePaths.environment_id`, and `StatePaths.storage_instance_id`.
 - Migrates: legacy `environment-id` storage marker to `storage-instance-id` without changing its UUID.
 
-- [ ] **Step 1: Write failing first-run and legacy-marker tests**
+- [x] **Step 1: Write failing first-run and legacy-marker tests**
 
 ```rust
 #[tokio::test]
@@ -74,7 +74,7 @@ async fn legacy_marker_becomes_storage_id_and_retry_keeps_both_ids() {
 }
 ```
 
-- [ ] **Step 2: Run the focused persistence tests and confirm RED**
+- [x] **Step 2: Run the focused persistence tests and confirm RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::store -- --nocapture
@@ -82,7 +82,7 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::store --
 
 Expected: FAIL because `PreparedStore` has no environment identity and both meanings share `paths.environment_id`.
 
-- [ ] **Step 3: Add explicit paths and the environment ID value type**
+- [x] **Step 3: Add explicit paths and the environment ID value type**
 
 ```rust
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -97,7 +97,7 @@ pub struct StatePaths {
 
 Construct `environment-id` and `storage-instance-id` in `StatePaths::from_config`; rename marker helpers to accept the exact destination path rather than reading a semantic path internally.
 
-- [ ] **Step 4: Implement the locked, ordered migration**
+- [x] **Step 4: Implement the locked, ordered migration**
 
 When `storage-instance-id` is absent and the legacy `environment-id` exists, atomically move that exact file to `storage-instance-id` without replacement, using the platform's write-through primitive and syncing the containing directory where supported. This frees the semantic destination before publishing a new random `environment-id`. When both markers are absent, publish storage first and environment second. When only `storage-instance-id` exists, treat it as an interrupted migration and publish the missing environment marker. When both exist, verify and reuse both.
 
@@ -114,11 +114,11 @@ verify_marker(&paths.environment_id, environment_id)?;
 
 Keep legacy interpretation only when `storage-instance-id` is absent. Never overwrite either marker after the semantic move; fsync each new file and use a durable same-directory publication/move primitive.
 
-- [ ] **Step 5: Add crash/race/corruption cases**
+- [x] **Step 5: Add crash/race/corruption cases**
 
 Cover: only legacy marker, only new storage marker, both markers, two racing prepares, malformed marker, database without markers, marker without database, and interruption after publishing storage but before environment.
 
-- [ ] **Step 6: Run focused tests and commit**
+- [x] **Step 6: Run focused tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::store -- --nocapture
@@ -142,7 +142,7 @@ git commit -m "feat(server): split environment and storage identities"
 - Consumes: `PreparedStore.environment_id` and `storage_instance_id`.
 - Produces: descriptor and backup/inspection documents with distinct `environmentId` and `storageInstanceId`.
 
-- [ ] **Step 1: Write a failing restart/restore identity integration test**
+- [x] **Step 1: Write a failing restart/restore identity integration test**
 
 ```rust
 #[tokio::test]
@@ -157,13 +157,13 @@ async fn descriptor_identity_survives_restart_and_storage_identity_is_separate()
 }
 ```
 
-- [ ] **Step 2: Run the integration test and confirm RED**
+- [x] **Step 2: Run the integration test and confirm RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test server_runtime descriptor_identity -- --nocapture
 ```
 
-- [ ] **Step 3: Make prepared persistence the only runtime identity source**
+- [x] **Step 3: Make prepared persistence the only runtime identity source**
 
 Remove `ServerConfig.environment_id` assignment as authority and set the runtime descriptor from prepared storage:
 
@@ -174,7 +174,7 @@ config.storage_instance_id = Some(prepared.storage_instance_id);
 
 Use a typed `EnvironmentId` field in the internal config; no CLI/env argument can set it.
 
-- [ ] **Step 4: Version backup and maintenance documents**
+- [x] **Step 4: Version backup and maintenance documents**
 
 ```rust
 pub struct BackupManifest {
@@ -213,7 +213,7 @@ git commit -m "feat(server): expose durable environment identity"
 
 - Produces: strict UUID identities, protocol range, platform, and minimal capability metadata.
 
-- [ ] **Step 1: Write failing contract assertions**
+- [x] **Step 1: Write failing contract assertions**
 
 ```ts
 expect(() => decodeDescriptor({ ...descriptor, environmentId: "local" })).toThrow();
@@ -223,13 +223,13 @@ expect(decodeDescriptor(descriptor)).toMatchObject({
 });
 ```
 
-- [ ] **Step 2: Run contract tests and confirm RED**
+- [x] **Step 2: Run contract tests and confirm RED**
 
 ```sh
 vp test run packages/contracts/src/environment.test.ts
 ```
 
-- [ ] **Step 3: Add schema-owned UUID and protocol fields**
+- [x] **Step 3: Add schema-owned UUID and protocol fields**
 
 ```ts
 export const EnvironmentId = Schema.UUID.pipe(Schema.brand("EnvironmentId"));
@@ -246,11 +246,11 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
 
 Keep the descriptor inventory-minimal: no project names, paths, client list, tokens, or diagnostics.
 
-- [ ] **Step 4: Update server serialization and legacy fixtures**
+- [x] **Step 4: Update server serialization and legacy fixtures**
 
 Generate UUID-backed test configs instead of literal `local`; update only active fixtures and preserve bounded legacy decoders where migration needs them.
 
-- [ ] **Step 5: Run contract parity and commit**
+- [x] **Step 5: Run contract parity and commit**
 
 ```sh
 vp test run packages/contracts/src/environment.test.ts

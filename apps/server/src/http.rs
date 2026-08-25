@@ -40,6 +40,7 @@ use crate::{
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
 pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
+pub const ENVIRONMENT_PROTOCOL_VERSION: u32 = 1;
 
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -264,6 +265,7 @@ struct EnvironmentDescriptor {
     platform: PlatformDescriptor,
     server_version: String,
     storage_instance_id: String,
+    protocol: ProtocolDescriptor,
     capabilities: EnvironmentCapabilities,
 }
 
@@ -271,6 +273,12 @@ struct EnvironmentDescriptor {
 struct PlatformDescriptor {
     os: &'static str,
     arch: &'static str,
+}
+
+#[derive(Serialize)]
+struct ProtocolDescriptor {
+    minimum: u32,
+    maximum: u32,
 }
 
 #[derive(Serialize)]
@@ -282,7 +290,10 @@ struct EnvironmentCapabilities {
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
     let config = state.config;
     Json(EnvironmentDescriptor {
-        environment_id: config.environment_id.clone(),
+        environment_id: config
+            .environment_id
+            .expect("a running server has a prepared environment identity")
+            .to_string(),
         label: config.environment_label.clone(),
         platform: PlatformDescriptor {
             os: platform_os(),
@@ -293,6 +304,10 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        protocol: ProtocolDescriptor {
+            minimum: ENVIRONMENT_PROTOCOL_VERSION,
+            maximum: ENVIRONMENT_PROTOCOL_VERSION,
+        },
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
         },

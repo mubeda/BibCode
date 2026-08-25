@@ -19,5 +19,6 @@ pub use state_files::{
     StateFileError, StateKind, StatePaths, read_json, write_bytes_atomically, write_json_atomically,
 };
 pub use store::{
-    PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError, prepare_store,
+    EnvironmentId, PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError,
+    prepare_store,
 };

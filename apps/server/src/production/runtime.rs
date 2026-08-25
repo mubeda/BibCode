@@ -326,7 +326,10 @@ impl ProductionRuntime {
             provider_runtime.clone(),
             terminal_manager.clone(),
             trace_diagnostics.clone(),
-            config.environment_id.clone(),
+            config
+                .environment_id
+                .expect("a running server has a prepared environment identity")
+                .to_string(),
         ));
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;

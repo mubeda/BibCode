@@ -21,12 +21,69 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct EnvironmentId(Uuid);
+
+impl EnvironmentId {
+    #[must_use]
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[must_use]
+    fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for EnvironmentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for EnvironmentId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvironmentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Uuid::parse_str(&value)
+            .map(Self)
+            .map_err(|_| de::Error::custom("environment ID must be a UUID"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StorageInstanceId(Uuid);
 
 impl StorageInstanceId {
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
+    }
+
+    #[must_use]
+    const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[must_use]
+    fn random() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 
@@ -57,6 +114,22 @@ impl<'de> Deserialize<'de> for StorageInstanceId {
     }
 }
 
+trait IdentityMarker: Copy + fmt::Display {
+    fn from_uuid(value: Uuid) -> Self;
+}
+
+impl IdentityMarker for EnvironmentId {
+    fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl IdentityMarker for StorageInstanceId {
+    fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreClassification {
     FirstRun,
@@ -67,6 +140,7 @@ pub enum StoreClassification {
 #[derive(Debug)]
 pub struct PreparedStore {
     pub database: Database,
+    pub environment_id: EnvironmentId,
     pub storage_instance_id: StorageInstanceId,
     pub classification: StoreClassification,
     pub paths: StatePaths,
@@ -84,15 +158,15 @@ pub enum StoreStartupError {
     },
     #[error("an incomplete project-data recovery operation remains at {path}")]
     RecoveryIncomplete { path: PathBuf },
-    #[error("failed to read storage instance marker {path}")]
+    #[error("failed to read identity marker {path}")]
     MarkerRead {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("storage instance marker {path} is malformed")]
+    #[error("identity marker {path} is malformed")]
     MarkerMalformed { path: PathBuf },
-    #[error("database {database} is missing while storage marker {marker} remains")]
+    #[error("database {database} is missing while identity marker {marker} remains")]
     DatabaseMissing { database: PathBuf, marker: PathBuf },
     #[error("database {path} is corrupt: {detail}")]
     CorruptDatabase { path: PathBuf, detail: String },
@@ -114,7 +188,7 @@ pub enum StoreStartupError {
     },
     #[error("failed to protect persistent storage before mutation")]
     Backup(#[source] BackupError),
-    #[error("failed to publish storage instance marker {path}")]
+    #[error("failed to publish identity marker {path}")]
     MarkerPublish {
         path: PathBuf,
         #[source]
@@ -144,20 +218,61 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
         return Err(StoreStartupError::RecoveryIncomplete { path });
     }
     let database_exists = try_exists(&paths.database)?;
-    let marker_exists = try_exists(&paths.environment_id)?;
-    let marker = marker_exists
-        .then(|| read_marker(&paths.environment_id))
+    let environment_marker = try_exists(&paths.environment_id)?
+        .then(|| read_marker::<EnvironmentId>(&paths.environment_id))
+        .transpose()?;
+    let storage_marker = try_exists(&paths.storage_instance_id)?
+        .then(|| read_marker::<StorageInstanceId>(&paths.storage_instance_id))
         .transpose()?;
 
-    match (database_exists, marker) {
-        (false, None) => prepare_first_run(paths).await,
-        (false, Some(_)) => Err(StoreStartupError::DatabaseMissing {
+    match (database_exists, environment_marker, storage_marker) {
+        (false, None, None) => prepare_first_run(paths).await,
+        (false, environment_marker, storage_marker) => Err(StoreStartupError::DatabaseMissing {
             database: paths.database,
-            marker: paths.environment_id,
+            marker: if storage_marker.is_some() {
+                paths.storage_instance_id
+            } else {
+                debug_assert!(environment_marker.is_some());
+                paths.environment_id
+            },
         }),
-        (true, None) => prepare_existing_unmarked(paths, &resolved_config.server_version).await,
-        (true, Some(storage_instance_id)) => {
-            prepare_existing(paths, storage_instance_id, &resolved_config.server_version).await
+        (true, None, None) => {
+            prepare_existing_unmarked(paths, &resolved_config.server_version).await
+        }
+        (true, Some(legacy), None) => {
+            prepare_existing_legacy(
+                paths,
+                StorageInstanceId::from_uuid(legacy.as_uuid()),
+                &resolved_config.server_version,
+            )
+            .await
+        }
+        (true, None, Some(storage_instance_id)) => {
+            prepare_existing_after_storage(
+                paths,
+                storage_instance_id,
+                &resolved_config.server_version,
+            )
+            .await
+        }
+        (true, Some(environment_id), Some(storage_instance_id))
+            if environment_id.as_uuid() == storage_instance_id.as_uuid() =>
+        {
+            finish_interrupted_legacy_migration(
+                paths,
+                storage_instance_id,
+                &resolved_config.server_version,
+            )
+            .await
+        }
+        (true, Some(environment_id), Some(storage_instance_id)) => {
+            prepare_existing(
+                paths,
+                environment_id,
+                storage_instance_id,
+                &resolved_config.server_version,
+            )
+            .await
         }
     }
 }
@@ -200,7 +315,10 @@ fn try_exists(path: &std::path::Path) -> Result<bool, StoreStartupError> {
     }
 }
 
-fn read_marker(path: &std::path::Path) -> Result<StorageInstanceId, StoreStartupError> {
+fn read_marker<T>(path: &std::path::Path) -> Result<T, StoreStartupError>
+where
+    T: IdentityMarker,
+{
     let bytes = std::fs::read(path).map_err(|source| StoreStartupError::MarkerRead {
         path: path.to_path_buf(),
         source,
@@ -211,7 +329,7 @@ fn read_marker(path: &std::path::Path) -> Result<StorageInstanceId, StoreStartup
         .ok_or_else(|| StoreStartupError::MarkerMalformed {
             path: path.to_path_buf(),
         })?;
-    Ok(StorageInstanceId(value))
+    Ok(T::from_uuid(value))
 }
 
 async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStartupError> {
@@ -222,9 +340,21 @@ async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStar
             source: Box::new(source),
         })?;
     migrate(&database, &paths.database).await?;
-    let storage_instance_id = publish_marker(&paths, StorageInstanceId(Uuid::new_v4())).await?;
+    let storage_instance_id = publish_marker(
+        &paths.state_dir,
+        &paths.storage_instance_id,
+        StorageInstanceId::random(),
+    )
+    .await?;
+    let environment_id = publish_marker(
+        &paths.state_dir,
+        &paths.environment_id,
+        EnvironmentId::random(),
+    )
+    .await?;
     Ok(PreparedStore {
         database,
+        environment_id,
         storage_instance_id,
         classification: StoreClassification::FirstRun,
         paths,
@@ -236,9 +366,21 @@ async fn prepare_existing_unmarked(
     app_version: &str,
 ) -> Result<PreparedStore, StoreStartupError> {
     validate_existing_store(&paths.database).await?;
-    let storage_instance_id = publish_marker(&paths, StorageInstanceId(Uuid::new_v4())).await?;
+    let storage_instance_id = publish_marker(
+        &paths.state_dir,
+        &paths.storage_instance_id,
+        StorageInstanceId::random(),
+    )
+    .await?;
+    let environment_id = publish_marker(
+        &paths.state_dir,
+        &paths.environment_id,
+        EnvironmentId::random(),
+    )
+    .await?;
     prepare_existing_database(
         paths,
+        environment_id,
         storage_instance_id,
         StoreClassification::ExistingUnmarked,
         app_version,
@@ -246,14 +388,84 @@ async fn prepare_existing_unmarked(
     .await
 }
 
+async fn prepare_existing_legacy(
+    paths: StatePaths,
+    storage_instance_id: StorageInstanceId,
+    app_version: &str,
+) -> Result<PreparedStore, StoreStartupError> {
+    validate_existing_store(&paths.database).await?;
+    migrate_legacy_storage_marker(&paths, storage_instance_id).await?;
+    let environment_id = publish_marker(
+        &paths.state_dir,
+        &paths.environment_id,
+        EnvironmentId::random(),
+    )
+    .await?;
+    prepare_existing_database(
+        paths,
+        environment_id,
+        storage_instance_id,
+        StoreClassification::Existing,
+        app_version,
+    )
+    .await
+}
+
+async fn prepare_existing_after_storage(
+    paths: StatePaths,
+    storage_instance_id: StorageInstanceId,
+    app_version: &str,
+) -> Result<PreparedStore, StoreStartupError> {
+    validate_existing_store(&paths.database).await?;
+    let environment_id = publish_marker(
+        &paths.state_dir,
+        &paths.environment_id,
+        EnvironmentId::random(),
+    )
+    .await?;
+    prepare_existing_database(
+        paths,
+        environment_id,
+        storage_instance_id,
+        StoreClassification::Existing,
+        app_version,
+    )
+    .await
+}
+
+async fn finish_interrupted_legacy_migration(
+    paths: StatePaths,
+    storage_instance_id: StorageInstanceId,
+    app_version: &str,
+) -> Result<PreparedStore, StoreStartupError> {
+    validate_existing_store(&paths.database).await?;
+    remove_marker(&paths.state_dir, &paths.environment_id).await?;
+    let environment_id = publish_marker(
+        &paths.state_dir,
+        &paths.environment_id,
+        EnvironmentId::random(),
+    )
+    .await?;
+    prepare_existing_database(
+        paths,
+        environment_id,
+        storage_instance_id,
+        StoreClassification::Existing,
+        app_version,
+    )
+    .await
+}
+
 async fn prepare_existing(
     paths: StatePaths,
+    environment_id: EnvironmentId,
     storage_instance_id: StorageInstanceId,
     app_version: &str,
 ) -> Result<PreparedStore, StoreStartupError> {
     validate_existing_store(&paths.database).await?;
     prepare_existing_database(
         paths,
+        environment_id,
         storage_instance_id,
         StoreClassification::Existing,
         app_version,
@@ -263,6 +475,7 @@ async fn prepare_existing(
 
 async fn prepare_existing_database(
     paths: StatePaths,
+    environment_id: EnvironmentId,
     storage_instance_id: StorageInstanceId,
     classification: StoreClassification,
     app_version: &str,
@@ -285,6 +498,7 @@ async fn prepare_existing_database(
     } else {
         let backup_context = PreparedStore {
             database: inspection_database.clone(),
+            environment_id,
             storage_instance_id,
             classification,
             paths: paths.clone(),
@@ -313,6 +527,7 @@ async fn prepare_existing_database(
     apply_pending_migrations(&database, &paths.database, pending).await?;
     Ok(PreparedStore {
         database,
+        environment_id,
         storage_instance_id,
         classification,
         paths,
@@ -473,13 +688,69 @@ async fn apply_pending_migrations(
         })
 }
 
-async fn publish_marker(
+async fn migrate_legacy_storage_marker(
     paths: &StatePaths,
-    proposed: StorageInstanceId,
-) -> Result<StorageInstanceId, StoreStartupError> {
-    let temporary_path = paths
-        .state_dir
-        .join(format!(".environment-id.{}.tmp", Uuid::new_v4()));
+    expected: StorageInstanceId,
+) -> Result<(), StoreStartupError> {
+    let observed = read_marker::<StorageInstanceId>(&paths.environment_id)?;
+    if observed != expected {
+        return Err(StoreStartupError::MarkerMalformed {
+            path: paths.environment_id.clone(),
+        });
+    }
+    match fs::hard_link(&paths.environment_id, &paths.storage_instance_id).await {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let published = read_marker::<StorageInstanceId>(&paths.storage_instance_id)?;
+            if published != expected {
+                return Err(StoreStartupError::MarkerMalformed {
+                    path: paths.storage_instance_id.clone(),
+                });
+            }
+        }
+        Err(source) => {
+            return Err(StoreStartupError::MarkerPublish {
+                path: paths.storage_instance_id.clone(),
+                source,
+            });
+        }
+    }
+    sync_state_directory(&paths.state_dir).map_err(|source| StoreStartupError::MarkerPublish {
+        path: paths.storage_instance_id.clone(),
+        source,
+    })?;
+    remove_marker(&paths.state_dir, &paths.environment_id).await
+}
+
+async fn remove_marker(
+    state_dir: &std::path::Path,
+    marker_path: &std::path::Path,
+) -> Result<(), StoreStartupError> {
+    fs::remove_file(marker_path)
+        .await
+        .map_err(|source| StoreStartupError::MarkerPublish {
+            path: marker_path.to_path_buf(),
+            source,
+        })?;
+    sync_state_directory(state_dir).map_err(|source| StoreStartupError::MarkerPublish {
+        path: marker_path.to_path_buf(),
+        source,
+    })
+}
+
+async fn publish_marker<T>(
+    state_dir: &std::path::Path,
+    marker_path: &std::path::Path,
+    proposed: T,
+) -> Result<T, StoreStartupError>
+where
+    T: IdentityMarker,
+{
+    let marker_name = marker_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("identity");
+    let temporary_path = state_dir.join(format!(".{marker_name}.{}.tmp", Uuid::new_v4()));
     let result = async {
         let mut temporary = OpenOptions::new()
             .write(true)
@@ -487,21 +758,21 @@ async fn publish_marker(
             .open(&temporary_path)
             .await
             .map_err(|source| StoreStartupError::MarkerPublish {
-                path: paths.environment_id.clone(),
+                path: marker_path.to_path_buf(),
                 source,
             })?;
         temporary
             .write_all(format!("{proposed}\n").as_bytes())
             .await
             .map_err(|source| StoreStartupError::MarkerPublish {
-                path: paths.environment_id.clone(),
+                path: marker_path.to_path_buf(),
                 source,
             })?;
         temporary
             .sync_all()
             .await
             .map_err(|source| StoreStartupError::MarkerPublish {
-                path: paths.environment_id.clone(),
+                path: marker_path.to_path_buf(),
                 source,
             })?;
         drop(temporary);
@@ -509,28 +780,28 @@ async fn publish_marker(
         // A same-directory hard link is the portable atomic no-replace publish primitive:
         // it fails when any final entry exists, while the linked bytes are already flushed.
         // Cleanup below removes only the staging name and never the published final link.
-        match fs::hard_link(&temporary_path, &paths.environment_id).await {
+        match fs::hard_link(&temporary_path, marker_path).await {
             Ok(()) => {
-                sync_state_directory(&paths.state_dir).map_err(|source| {
+                sync_state_directory(state_dir).map_err(|source| {
                     StoreStartupError::MarkerPublish {
-                        path: paths.environment_id.clone(),
+                        path: marker_path.to_path_buf(),
                         source,
                     }
                 })?;
                 Ok(proposed)
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let published = read_marker(&paths.environment_id)?;
-                sync_state_directory(&paths.state_dir).map_err(|source| {
+                let published = read_marker::<T>(marker_path)?;
+                sync_state_directory(state_dir).map_err(|source| {
                     StoreStartupError::MarkerPublish {
-                        path: paths.environment_id.clone(),
+                        path: marker_path.to_path_buf(),
                         source,
                     }
                 })?;
                 Ok(published)
             }
             Err(source) => Err(StoreStartupError::MarkerPublish {
-                path: paths.environment_id.clone(),
+                path: marker_path.to_path_buf(),
                 source,
             }),
         }
@@ -560,6 +831,304 @@ mod tests {
 
     use super::*;
 
+    fn prepared_test_config(root: &std::path::Path) -> ServerConfig {
+        let mut config = ServerConfig::new(root);
+        let resolved = crate::resolve_data_root(config.data_root_request.clone())
+            .expect("resolve test data root");
+        config.base_dir.clone_from(&resolved.effective);
+        config.resolved_data_root = Some(resolved);
+        config
+    }
+
+    fn marker_text(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("read identity marker")
+            .trim()
+            .to_owned()
+    }
+
+    async fn create_test_state(paths: &StatePaths) {
+        paths
+            .ensure_directories_without_database_side_effects()
+            .await
+            .expect("state directories");
+    }
+
+    fn create_current_test_database(paths: &StatePaths) {
+        let mut connection = rusqlite::Connection::open(&paths.database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+    }
+
+    fn write_test_marker(path: &std::path::Path, value: Uuid) {
+        std::fs::write(path, format!("{value}\n")).expect("identity marker fixture");
+    }
+
+    #[tokio::test]
+    async fn first_run_publishes_distinct_environment_and_storage_ids() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        let prepared = prepare_store(&config)
+            .await
+            .expect("prepare first-run store");
+
+        assert_ne!(
+            prepared.environment_id.to_string(),
+            prepared.storage_instance_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&prepared.paths.environment_id),
+            prepared.environment_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&prepared.paths.storage_instance_id),
+            prepared.storage_instance_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_marker_becomes_storage_id_and_retry_keeps_both_ids() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        create_current_test_database(&paths);
+        let legacy_storage_id = Uuid::new_v4();
+        write_test_marker(&paths.environment_id, legacy_storage_id);
+
+        let first = prepare_store(&config).await.expect("migrate legacy marker");
+        let first_environment_id = first.environment_id;
+        assert_eq!(
+            first.storage_instance_id.to_string(),
+            legacy_storage_id.to_string()
+        );
+        first.database.close().await;
+        let second = prepare_store(&config).await.expect("retry migrated store");
+
+        assert_eq!(second.environment_id, first_environment_id);
+        assert_eq!(
+            second.storage_instance_id.to_string(),
+            legacy_storage_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&second.paths.environment_id),
+            second.environment_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&second.paths.storage_instance_id),
+            legacy_storage_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_only_interruption_publishes_environment_and_preserves_storage() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        create_current_test_database(&paths);
+        let storage_id = Uuid::new_v4();
+        write_test_marker(&paths.storage_instance_id, storage_id);
+
+        let prepared = prepare_store(&config)
+            .await
+            .expect("finish interrupted marker publication");
+
+        assert_eq!(prepared.classification, StoreClassification::Existing);
+        assert_eq!(
+            prepared.storage_instance_id,
+            StorageInstanceId::from_uuid(storage_id)
+        );
+        assert_ne!(
+            prepared.environment_id.as_uuid(),
+            prepared.storage_instance_id.as_uuid()
+        );
+        assert_eq!(
+            marker_text(&paths.storage_instance_id),
+            storage_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&paths.environment_id),
+            prepared.environment_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn both_distinct_markers_are_reused_without_republication() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        create_current_test_database(&paths);
+        let environment_id = Uuid::new_v4();
+        let storage_id = Uuid::new_v4();
+        write_test_marker(&paths.environment_id, environment_id);
+        write_test_marker(&paths.storage_instance_id, storage_id);
+        let environment_bytes = std::fs::read(&paths.environment_id).expect("environment marker");
+        let storage_bytes = std::fs::read(&paths.storage_instance_id).expect("storage marker");
+
+        let prepared = prepare_store(&config)
+            .await
+            .expect("reuse identity markers");
+
+        assert_eq!(
+            prepared.environment_id,
+            EnvironmentId::from_uuid(environment_id)
+        );
+        assert_eq!(
+            prepared.storage_instance_id,
+            StorageInstanceId::from_uuid(storage_id)
+        );
+        assert_eq!(
+            std::fs::read(&paths.environment_id).expect("environment marker after prepare"),
+            environment_bytes
+        );
+        assert_eq!(
+            std::fs::read(&paths.storage_instance_id).expect("storage marker after prepare"),
+            storage_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_hard_link_markers_finish_interrupted_legacy_migration() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        create_current_test_database(&paths);
+        let legacy_id = Uuid::new_v4();
+        write_test_marker(&paths.environment_id, legacy_id);
+        std::fs::hard_link(&paths.environment_id, &paths.storage_instance_id)
+            .expect("interrupted hard-link migration fixture");
+
+        let prepared = prepare_store(&config)
+            .await
+            .expect("finish interrupted legacy migration");
+
+        assert_eq!(
+            prepared.storage_instance_id,
+            StorageInstanceId::from_uuid(legacy_id)
+        );
+        assert_ne!(prepared.environment_id.as_uuid(), legacy_id);
+        assert_eq!(
+            marker_text(&paths.storage_instance_id),
+            legacy_id.to_string()
+        );
+        assert_eq!(
+            marker_text(&paths.environment_id),
+            prepared.environment_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn racing_first_run_prepares_converge_on_both_identities() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+
+        let (first, second) = tokio::join!(prepare_store(&config), prepare_store(&config));
+        let first = first.expect("first racing prepare");
+        let second = second.expect("second racing prepare");
+
+        assert_eq!(first.environment_id, second.environment_id);
+        assert_eq!(first.storage_instance_id, second.storage_instance_id);
+        assert_ne!(
+            first.environment_id.as_uuid(),
+            first.storage_instance_id.as_uuid()
+        );
+        assert_eq!(
+            [first.classification, second.classification]
+                .into_iter()
+                .filter(|classification| *classification == StoreClassification::FirstRun)
+                .count(),
+            1
+        );
+        first.database.close().await;
+        second.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_without_markers_adopts_once_and_publishes_both_identities() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        create_current_test_database(&paths);
+
+        let first = prepare_store(&config)
+            .await
+            .expect("adopt unmarked database");
+        let environment_id = first.environment_id;
+        let storage_id = first.storage_instance_id;
+        assert_eq!(first.classification, StoreClassification::ExistingUnmarked);
+        first.database.close().await;
+        let second = prepare_store(&config)
+            .await
+            .expect("reuse adopted database");
+
+        assert_eq!(second.environment_id, environment_id);
+        assert_eq!(second.storage_instance_id, storage_id);
+        assert_eq!(second.classification, StoreClassification::Existing);
+    }
+
+    #[tokio::test]
+    async fn either_marker_without_database_blocks_first_run_without_mutation() {
+        for marker_name in ["environment", "storage"] {
+            let root = TempDir::new().expect("temporary store root");
+            let config = prepared_test_config(root.path());
+            let paths = StatePaths::from_config(&config);
+            create_test_state(&paths).await;
+            let marker_path = if marker_name == "environment" {
+                &paths.environment_id
+            } else {
+                &paths.storage_instance_id
+            };
+            let marker_bytes = format!("{}\n", Uuid::new_v4()).into_bytes();
+            std::fs::write(marker_path, &marker_bytes).expect("orphaned marker fixture");
+
+            let error = prepare_store(&config)
+                .await
+                .expect_err("orphaned marker must block first run");
+
+            assert!(matches!(error, StoreStartupError::DatabaseMissing { .. }));
+            assert!(!paths.database.exists());
+            assert_eq!(
+                std::fs::read(marker_path).expect("orphaned marker remains"),
+                marker_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_either_marker_blocks_without_rewriting_identity_files() {
+        for marker_name in ["environment", "storage"] {
+            let root = TempDir::new().expect("temporary store root");
+            let config = prepared_test_config(root.path());
+            let paths = StatePaths::from_config(&config);
+            create_test_state(&paths).await;
+            create_current_test_database(&paths);
+            let marker_path = if marker_name == "environment" {
+                &paths.environment_id
+            } else {
+                &paths.storage_instance_id
+            };
+            let malformed = format!("malformed-{marker_name}\n").into_bytes();
+            std::fs::write(marker_path, &malformed).expect("malformed marker fixture");
+
+            let error = prepare_store(&config)
+                .await
+                .expect_err("malformed marker must block startup");
+
+            assert!(matches!(error, StoreStartupError::MarkerMalformed { .. }));
+            assert_eq!(
+                std::fs::read(marker_path).expect("malformed marker remains"),
+                malformed
+            );
+        }
+    }
+
     #[tokio::test]
     async fn no_replace_publication_converges_on_one_marker_and_cleans_staging_files() {
         let root = TempDir::new().expect("temporary marker root");
@@ -568,12 +1137,12 @@ mod tests {
             .ensure_directories_without_database_side_effects()
             .await
             .expect("state directories");
-        let first_proposal = StorageInstanceId(Uuid::new_v4());
-        let second_proposal = StorageInstanceId(Uuid::new_v4());
+        let first_proposal = EnvironmentId::random();
+        let second_proposal = EnvironmentId::random();
 
         let (first, second) = tokio::join!(
-            publish_marker(&paths, first_proposal),
-            publish_marker(&paths, second_proposal)
+            publish_marker(&paths.state_dir, &paths.environment_id, first_proposal),
+            publish_marker(&paths.state_dir, &paths.environment_id, second_proposal)
         );
         let first = first.expect("first publication");
         let second = second.expect("second publication");
@@ -960,7 +1529,8 @@ mod tests {
         let malformed = b"not-a-storage-uuid\n";
         std::fs::write(&paths.environment_id, malformed).expect("malformed marker");
 
-        let error = read_marker(&paths.environment_id).expect_err("marker must fail");
+        let error =
+            read_marker::<EnvironmentId>(&paths.environment_id).expect_err("marker must fail");
 
         assert!(matches!(error, StoreStartupError::MarkerMalformed { .. }));
         assert_eq!(

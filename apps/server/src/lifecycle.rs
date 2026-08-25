@@ -159,6 +159,8 @@ impl ServerRuntime {
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         config.storage_instance_id = Some(prepared_store.storage_instance_id);
+        let environment_id = prepared_store.environment_id;
+        config.environment_id = Some(environment_id);
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
@@ -268,7 +270,10 @@ impl ServerRuntime {
                     },
                 );
                 let descriptor = serde_json::json!({
-                    "environmentId": config.environment_id,
+                    "environmentId": config
+                        .environment_id
+                        .expect("a running server has a prepared environment identity")
+                        .to_string(),
                     "label": config.environment_label,
                     "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
                     "serverVersion": config.server_version,
@@ -276,13 +281,20 @@ impl ServerRuntime {
                         .storage_instance_id
                         .expect("a running server has a prepared persistent store")
                         .to_string(),
+                    "protocol": {
+                        "minimum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
+                        "maximum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
+                    },
                     "capabilities": { "repositoryIdentity": true },
                 });
                 let connect = Arc::new(
                     ConnectMcpService::open(
                         config.database_path(),
                         ConnectMcpConfig {
-                            environment_id: config.environment_id.clone(),
+                            environment_id: config
+                                .environment_id
+                                .expect("a running server has a prepared environment identity")
+                                .to_string(),
                             descriptor,
                             mcp_endpoint: format!("http://{local_addr}/mcp"),
                             now_epoch_seconds: Arc::new(|| {
@@ -316,6 +328,7 @@ impl ServerRuntime {
                     runtime.clone(),
                     database.clone(),
                     state_paths.clone(),
+                    environment_id,
                     storage_instance_id,
                     store_classification,
                     config.server_version.clone(),

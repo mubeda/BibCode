@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Database, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths,
+    Database, EnvironmentId, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths,
     StorageInstanceId, StoreStartupError,
 };
 use crate::{
@@ -34,6 +34,8 @@ const SQLITE_PROGRESS_OPS: i32 = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const LEGACY_BACKUP_MANIFEST_VERSION: u32 = 1;
+const BACKUP_MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -42,11 +44,13 @@ pub enum BackupTrigger {
     PreUpdate,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupManifest {
+    pub manifest_version: u32,
     #[serde(with = "uuid_string")]
     pub backup_id: Uuid,
+    pub environment_id: Option<EnvironmentId>,
     pub storage_instance_id: StorageInstanceId,
     pub created_at: String,
     pub state_kind: StateKind,
@@ -55,6 +59,25 @@ pub struct BackupManifest {
     pub schema_version: i64,
     pub database_size_bytes: u64,
     pub sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifestWire {
+    #[serde(default)]
+    manifest_version: Option<u32>,
+    #[serde(with = "uuid_string")]
+    backup_id: Uuid,
+    #[serde(default)]
+    environment_id: Option<EnvironmentId>,
+    storage_instance_id: StorageInstanceId,
+    created_at: String,
+    state_kind: StateKind,
+    trigger: BackupTrigger,
+    app_version: String,
+    schema_version: i64,
+    database_size_bytes: u64,
+    sha256: String,
 }
 
 mod uuid_string {
@@ -75,6 +98,39 @@ mod uuid_string {
         let value = String::deserialize(deserializer)?;
         Uuid::parse_str(&value).map_err(|_| de::Error::custom("backup ID must be a UUID"))
     }
+}
+
+fn decode_backup_manifest(path: &Path, bytes: &[u8]) -> Result<BackupManifest, BackupError> {
+    let wire = serde_json::from_slice::<BackupManifestWire>(bytes).map_err(|source| {
+        BackupError::ManifestDecode {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let (manifest_version, environment_id) = match (wire.manifest_version, wire.environment_id) {
+        (None, None) => (LEGACY_BACKUP_MANIFEST_VERSION, None),
+        (Some(BACKUP_MANIFEST_VERSION), Some(environment_id)) => {
+            (BACKUP_MANIFEST_VERSION, Some(environment_id))
+        }
+        (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
+            return Err(BackupError::Verification(
+                "backup manifest identity version is unsupported or incomplete".to_owned(),
+            ));
+        }
+    };
+    Ok(BackupManifest {
+        manifest_version,
+        backup_id: wire.backup_id,
+        environment_id,
+        storage_instance_id: wire.storage_instance_id,
+        created_at: wire.created_at,
+        state_kind: wire.state_kind,
+        trigger: wire.trigger,
+        app_version: wire.app_version,
+        schema_version: wire.schema_version,
+        database_size_bytes: wire.database_size_bytes,
+        sha256: wire.sha256,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,12 +217,7 @@ impl VerifiedBackup {
     ) -> Result<bool, BackupError> {
         ensure_optional_active(cancellation, deadline)?;
         let bytes = read_manifest_bytes(&self.manifest_path)?;
-        let manifest = serde_json::from_slice::<BackupManifest>(&bytes).map_err(|source| {
-            BackupError::ManifestDecode {
-                path: self.manifest_path.clone(),
-                source,
-            }
-        })?;
+        let manifest = decode_backup_manifest(&self.manifest_path, &bytes)?;
         if manifest != self.manifest {
             return Ok(false);
         }
@@ -204,6 +255,7 @@ pub enum StoreInspectionStatus {
 #[derive(Clone, Debug)]
 pub struct StoreInspection {
     pub classification: StoreInspectionStatus,
+    pub environment_id: Option<EnvironmentId>,
     pub storage_instance_id: Option<StorageInstanceId>,
     pub backups: Vec<VerifiedBackup>,
     pub backup_issues: Vec<BackupInventoryIssue>,
@@ -227,6 +279,7 @@ pub struct RecoveryResult {
     pub operation_id: Uuid,
     pub action: RecoveryAction,
     pub preserved_directory: PathBuf,
+    pub environment_id: Option<EnvironmentId>,
     pub storage_instance_id: Option<StorageInstanceId>,
 }
 
@@ -238,6 +291,8 @@ pub enum RecoveryError {
     BackupNotFound,
     #[error("the selected backup belongs to a different storage instance")]
     StorageIdentityMismatch,
+    #[error("the selected backup belongs to a different environment")]
+    EnvironmentIdentityMismatch,
     #[error("the project-data store is currently owned by a running server")]
     StoreRunning,
     #[error("the store recovery journal already exists at {path}")]
@@ -534,6 +589,7 @@ pub async fn create_verified_backup(
         .format(&Rfc3339)
         .map_err(|error| BackupError::Verification(format!("UTC timestamp failed: {error}")))?;
     let paths = prepared.paths.clone();
+    let environment_id = prepared.environment_id;
     let storage_instance_id = prepared.storage_instance_id;
     let app_version = app_version.to_owned();
     let staging = tokio::task::spawn_blocking({
@@ -563,6 +619,7 @@ pub async fn create_verified_backup(
             move || {
                 finish_and_publish_backup(
                     &paths,
+                    environment_id,
                     storage_instance_id,
                     trigger,
                     &app_version,
@@ -621,6 +678,7 @@ pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, R
     if !path_entry_exists(&paths.base_dir)? {
         return Ok(StoreInspection {
             classification: StoreInspectionStatus::FirstRun,
+            environment_id: None,
             storage_instance_id: None,
             backups: Vec::new(),
             backup_issues: Vec::new(),
@@ -633,39 +691,29 @@ pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, R
     let journal_exists = path_entry_exists(&paths.recovery_journal())?;
     let staging = find_recovery_staging_entry(&paths)?;
     let database_exists = path_entry_exists(&paths.database)?;
-    let marker_exists = path_entry_exists(&paths.environment_id)?;
-    let marker = if marker_exists {
-        let bytes = fs::read(&paths.environment_id).map_err(|source| BackupError::Io {
-            path: paths.environment_id.clone(),
-            source,
-        })?;
-        std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|value| Uuid::parse_str(value.trim()).ok())
-            .map(StorageInstanceId::from_uuid)
-    } else {
-        None
-    };
+    let markers = IdentityMarkerInspection::read(&paths)?;
+    let environment_id = markers.environment_id();
+    let storage_instance_id = markers.storage_instance_id();
     let (classification, issue) = if journal_exists || staging.is_some() {
         (
             StoreInspectionStatus::RecoveryIncomplete,
             Some("An incomplete project-data recovery operation requires attention.".to_owned()),
         )
-    } else if marker_exists && marker.is_none() {
+    } else if markers.has_malformed_marker() {
         (
             StoreInspectionStatus::MarkerMalformed,
-            Some("The storage instance marker is malformed.".to_owned()),
+            Some("An environment or storage identity marker is malformed.".to_owned()),
         )
     } else {
-        match (database_exists, marker) {
-            (false, None) => (StoreInspectionStatus::FirstRun, None),
-            (false, Some(_)) => (
+        match (database_exists, markers.has_any_marker()) {
+            (false, false) => (StoreInspectionStatus::FirstRun, None),
+            (false, true) => (
                 StoreInspectionStatus::DatabaseMissing,
-                Some("The database is missing while its storage marker remains.".to_owned()),
+                Some("The database is missing while an identity marker remains.".to_owned()),
             ),
-            (true, marker) => {
+            (true, has_marker) => {
                 match super::store::validate_existing_store_for_inspection(&paths.database).await {
-                    Ok(()) if marker.is_some() => (StoreInspectionStatus::Existing, None),
+                    Ok(()) if has_marker => (StoreInspectionStatus::Existing, None),
                     Ok(()) => (StoreInspectionStatus::ExistingUnmarked, None),
                     Err(error) => {
                         let status = match &error {
@@ -683,14 +731,15 @@ pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, R
             }
         }
     };
-    let inventory = if let Some(storage_instance_id) = marker {
+    let inventory = if let Some(storage_instance_id) = storage_instance_id {
         inventory_verified_backups(&paths, storage_instance_id).await?
     } else {
         inventory_all_verified_backups(&paths).await?
     };
     Ok(StoreInspection {
         classification,
-        storage_instance_id: marker,
+        environment_id,
+        storage_instance_id,
         backups: inventory.verified,
         backup_issues: inventory.issues,
         requested_root: current.requested,
@@ -775,6 +824,76 @@ fn path_entry_exists(path: &Path) -> Result<bool, BackupError> {
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UuidMarkerState {
+    Missing,
+    Valid(Uuid),
+    Malformed,
+}
+
+impl UuidMarkerState {
+    const fn exists(self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+}
+
+fn inspect_uuid_marker(path: &Path) -> Result<UuidMarkerState, BackupError> {
+    if !path_entry_exists(path)? {
+        return Ok(UuidMarkerState::Missing);
+    }
+    let bytes = fs::read(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())
+        .map_or(UuidMarkerState::Malformed, UuidMarkerState::Valid))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IdentityMarkerInspection {
+    environment: UuidMarkerState,
+    storage: UuidMarkerState,
+}
+
+impl IdentityMarkerInspection {
+    fn read(paths: &StatePaths) -> Result<Self, BackupError> {
+        Ok(Self {
+            environment: inspect_uuid_marker(&paths.environment_id)?,
+            storage: inspect_uuid_marker(&paths.storage_instance_id)?,
+        })
+    }
+
+    const fn environment_id(self) -> Option<EnvironmentId> {
+        match (self.storage, self.environment) {
+            (UuidMarkerState::Missing, _) => None,
+            (_, UuidMarkerState::Valid(value)) => Some(EnvironmentId::from_uuid(value)),
+            (_, UuidMarkerState::Missing | UuidMarkerState::Malformed) => None,
+        }
+    }
+
+    const fn storage_instance_id(self) -> Option<StorageInstanceId> {
+        match self.storage {
+            UuidMarkerState::Valid(value) => Some(StorageInstanceId::from_uuid(value)),
+            UuidMarkerState::Missing => match self.environment {
+                UuidMarkerState::Valid(value) => Some(StorageInstanceId::from_uuid(value)),
+                UuidMarkerState::Missing | UuidMarkerState::Malformed => None,
+            },
+            UuidMarkerState::Malformed => None,
+        }
+    }
+
+    const fn has_malformed_marker(self) -> bool {
+        matches!(self.storage, UuidMarkerState::Malformed)
+            || matches!(self.environment, UuidMarkerState::Malformed)
+    }
+
+    const fn has_any_marker(self) -> bool {
+        self.environment.exists() || self.storage.exists()
     }
 }
 
@@ -872,25 +991,23 @@ fn restore_backup_blocking(
         return Err(RecoveryError::RootChanged);
     }
     ensure_no_recovery_in_progress(&paths)?;
-    let marker_exists = path_entry_exists(&paths.environment_id)?;
-    let marker_id = if marker_exists {
-        let marker_bytes = fs::read(&paths.environment_id).map_err(|source| BackupError::Io {
-            path: paths.environment_id.clone(),
-            source,
-        })?;
-        std::str::from_utf8(&marker_bytes)
-            .ok()
-            .and_then(|value| Uuid::parse_str(value.trim()).ok())
-            .map(StorageInstanceId::from_uuid)
-    } else {
-        None
-    };
+    let markers = IdentityMarkerInspection::read(&paths)?;
+    let marker_storage_id = markers.storage_instance_id();
+    let marker_environment_id = markers.environment_id();
     let selected = find_verified_backup_for_recovery(&paths, backup_id, cancellation, deadline)?
         .ok_or(RecoveryError::BackupNotFound)?;
-    if marker_id.is_some_and(|marker_id| selected.manifest.storage_instance_id != marker_id) {
+    if marker_storage_id.is_some_and(|marker_id| selected.manifest.storage_instance_id != marker_id)
+    {
         return Err(RecoveryError::StorageIdentityMismatch);
     }
+    if marker_environment_id.is_some()
+        && selected.manifest.environment_id.is_some()
+        && marker_environment_id != selected.manifest.environment_id
+    {
+        return Err(RecoveryError::EnvironmentIdentityMismatch);
+    }
     let restored_storage_id = selected.manifest.storage_instance_id;
+    let restored_environment_id = marker_environment_id.or(selected.manifest.environment_id);
 
     let root_boundary = inspect_root_directory(&paths.base_dir)?;
     let state_boundary = inspect_child_directory(&root_boundary, &paths.state_dir)?;
@@ -930,16 +1047,30 @@ fn restore_backup_blocking(
     let staging_boundary = inspect_child_directory(&root_boundary, &staging_directory)?;
     let staged_database = staging_directory.join(BACKUP_FILE_NAME);
     copy_verified_database(&selected, &staged_database, cancellation, deadline)?;
-    let staged_marker = staging_directory.join("environment-id");
-    let mut marker = private_create_new(&staged_marker)?;
-    marker
+    let staged_storage_marker = staging_directory.join("storage-instance-id");
+    let mut storage_marker = private_create_new(&staged_storage_marker)?;
+    storage_marker
         .write_all(format!("{restored_storage_id}\n").as_bytes())
-        .and_then(|()| marker.sync_all())
+        .and_then(|()| storage_marker.sync_all())
         .map_err(|source| BackupError::Io {
-            path: staged_marker.clone(),
+            path: staged_storage_marker.clone(),
             source,
         })?;
-    drop(marker);
+    drop(storage_marker);
+    let staged_environment_marker = restored_environment_id
+        .map(|environment_id| {
+            let path = staging_directory.join("environment-id");
+            let mut marker = private_create_new(&path)?;
+            marker
+                .write_all(format!("{environment_id}\n").as_bytes())
+                .and_then(|()| marker.sync_all())
+                .map_err(|source| BackupError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            Ok::<_, BackupError>(path)
+        })
+        .transpose()?;
     sync_directory(&staging_directory)?;
     ensure_active(cancellation, Some(deadline))?;
 
@@ -972,15 +1103,33 @@ fn restore_backup_blocking(
             preserve_live_file(&state_boundary, &sidecar, &preserved_boundary)?;
         }
     }
-    if marker_exists {
+    if markers.environment.exists() {
         preserve_live_file(&state_boundary, &paths.environment_id, &preserved_boundary)?;
+    }
+    if markers.storage.exists() {
+        preserve_live_file(
+            &state_boundary,
+            &paths.storage_instance_id,
+            &preserved_boundary,
+        )?;
     }
     sync_directory(&preserved_directory)?;
     sync_directory(&paths.state_dir)?;
     fault.inject(RecoveryFault::AfterPreserve)?;
 
     move_staged_file(&staging_boundary, &staged_database, &paths.database)?;
-    move_staged_file(&staging_boundary, &staged_marker, &paths.environment_id)?;
+    move_staged_file(
+        &staging_boundary,
+        &staged_storage_marker,
+        &paths.storage_instance_id,
+    )?;
+    if let Some(staged_environment_marker) = staged_environment_marker {
+        move_staged_file(
+            &staging_boundary,
+            &staged_environment_marker,
+            &paths.environment_id,
+        )?;
+    }
     sync_directory(&paths.state_dir)?;
     fs::remove_dir(&staging_directory).map_err(|source| BackupError::Io {
         path: staging_directory.clone(),
@@ -995,6 +1144,7 @@ fn restore_backup_blocking(
         operation_id,
         action: RecoveryAction::Restore,
         preserved_directory,
+        environment_id: restored_environment_id,
         storage_instance_id: Some(restored_storage_id),
     })
 }
@@ -1107,6 +1257,7 @@ fn preserve_and_start_empty_blocking(
         sqlite_sidecar_path(&paths.database, "-wal"),
         sqlite_sidecar_path(&paths.database, "-shm"),
         paths.environment_id.clone(),
+        paths.storage_instance_id.clone(),
     ] {
         match fs::symlink_metadata(&source) {
             Ok(_) => preserve_live_file(&state_boundary, &source, &preserved_boundary)?,
@@ -1131,6 +1282,7 @@ fn preserve_and_start_empty_blocking(
         operation_id,
         action: RecoveryAction::StartEmpty,
         preserved_directory,
+        environment_id: None,
         storage_instance_id: None,
     })
 }
@@ -1794,6 +1946,7 @@ fn prepare_staging_directory(
 #[allow(clippy::too_many_arguments)]
 fn finish_and_publish_backup(
     paths: &StatePaths,
+    environment_id: EnvironmentId,
     storage_instance_id: StorageInstanceId,
     trigger: BackupTrigger,
     app_version: &str,
@@ -1829,7 +1982,9 @@ fn finish_and_publish_backup(
     fault.inject(BackupFault::BeforeDatabaseSync)?;
     sync_file(&staging.database)?;
     let manifest = BackupManifest {
+        manifest_version: BACKUP_MANIFEST_VERSION,
         backup_id,
+        environment_id: Some(environment_id),
         storage_instance_id,
         created_at: created_at.to_owned(),
         state_kind: paths.state_kind,
@@ -1990,11 +2145,7 @@ fn verify_generation(
     let database = directory.join(BACKUP_FILE_NAME);
     let manifest_snapshot = inspect_plain_child_file(&generation, &manifest_path)?;
     let database_snapshot = inspect_plain_child_file(&generation, &database)?;
-    let manifest = serde_json::from_slice::<BackupManifest>(&read_manifest_bytes(&manifest_path)?)
-        .map_err(|source| BackupError::ManifestDecode {
-            path: manifest_path.clone(),
-            source,
-        })?;
+    let manifest = decode_backup_manifest(&manifest_path, &read_manifest_bytes(&manifest_path)?)?;
     if manifest.backup_id != expected_backup_id
         || manifest.storage_instance_id != expected_storage_instance_id
         || manifest.state_kind != boundary.state_kind_value
@@ -2722,6 +2873,7 @@ mod tests {
             .expect("source worker");
         let prepared = PreparedStore {
             database: database.clone(),
+            environment_id: crate::persistence::EnvironmentId::from_uuid(Uuid::new_v4()),
             storage_instance_id,
             classification: crate::persistence::StoreClassification::Existing,
             paths: paths.clone(),
@@ -2820,6 +2972,7 @@ mod tests {
                 .expect("online backup completes before injected seam");
             let error = finish_and_publish_backup(
                 &paths,
+                EnvironmentId::from_uuid(Uuid::new_v4()),
                 storage_instance_id,
                 BackupTrigger::PreMigration,
                 "seam-test",
@@ -2899,6 +3052,7 @@ mod tests {
         let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
         let prepared = PreparedStore {
             database: database.clone(),
+            environment_id: crate::persistence::EnvironmentId::from_uuid(Uuid::new_v4()),
             storage_instance_id,
             classification: crate::persistence::StoreClassification::Existing,
             paths: paths.clone(),
@@ -2995,6 +3149,7 @@ mod tests {
         let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
         let prepared = PreparedStore {
             database: database.clone(),
+            environment_id: crate::persistence::EnvironmentId::from_uuid(Uuid::new_v4()),
             storage_instance_id,
             classification: crate::persistence::StoreClassification::Existing,
             paths: paths.clone(),

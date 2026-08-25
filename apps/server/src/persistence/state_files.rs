@@ -40,6 +40,7 @@ pub struct StatePaths {
     pub terminal_logs_dir: PathBuf,
     pub anonymous_id: PathBuf,
     pub environment_id: PathBuf,
+    pub storage_instance_id: PathBuf,
     pub server_runtime_state: PathBuf,
     pub secrets_dir: PathBuf,
 }
@@ -72,6 +73,7 @@ impl StatePaths {
             terminal_logs_dir: logs_dir.join("terminals"),
             anonymous_id: state_dir.join("anonymous-id"),
             environment_id: state_dir.join("environment-id"),
+            storage_instance_id: state_dir.join("storage-instance-id"),
             server_runtime_state: state_dir.join("server-runtime.json"),
             secrets_dir: state_dir.join("secrets"),
             state_dir,
@@ -378,6 +380,14 @@ mod tests {
             base.join(".bibcode-storage.lock")
         );
         assert_eq!(production.database, base.join("userdata/state.sqlite"));
+        assert_eq!(
+            production.environment_id,
+            base.join("userdata/environment-id")
+        );
+        assert_eq!(
+            production.storage_instance_id,
+            base.join("userdata/storage-instance-id")
+        );
         assert_eq!(
             production.keybindings,
             base.join("userdata/keybindings.json")

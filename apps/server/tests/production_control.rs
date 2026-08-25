@@ -5,7 +5,7 @@ use std::{
 
 use bibcode_server::{
     ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig,
-    persistence::StorageInstanceId,
+    persistence::{EnvironmentId, StorageInstanceId},
     production::{
         control::NativeServerControl, runtime::finalize_rpc_registry,
         server_terminal::ProductionServerControl,
@@ -19,9 +19,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000003);
+const TEST_ENVIRONMENT_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000004);
 
 fn test_config(path: &Path) -> ServerConfig {
     let mut config = ServerConfig::new(path);
+    config.environment_id = Some(EnvironmentId::from_uuid(TEST_ENVIRONMENT_ID));
     config.storage_instance_id = Some(StorageInstanceId::from_uuid(TEST_STORAGE_INSTANCE_ID));
     config
 }
@@ -86,7 +88,6 @@ fn rpc_inventory_includes_activity_control_mutations_as_unary_methods() {
 async fn fixture() -> (TempDir, NativeServerControl) {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let mut config = test_config(directory.path());
-    config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
     let control = NativeServerControl::new(config, auth_descriptor()).await;
     finalize_rpc_registry(&complete_registry(), &control).expect("complete production registry");
@@ -106,7 +107,6 @@ async fn fixture_with_state_file(
         .await
         .expect("write state fixture");
     let mut config = test_config(directory.path());
-    config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
     let control = NativeServerControl::new(config, auth_descriptor()).await;
     finalize_rpc_registry(&complete_registry(), &control).expect("complete production registry");

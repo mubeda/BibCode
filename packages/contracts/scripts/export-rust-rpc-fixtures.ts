@@ -161,11 +161,12 @@ const schemaMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
   ast._tag === "Union" ? ast.types : [ast];
 
 const fixtureEnvironmentDescriptor = {
-  environmentId: "fixture",
+  environmentId: "00000000-0000-4000-8000-000000000001",
   label: "Fixture",
   platform: { os: "windows", arch: "x64" },
   serverVersion: "0.1.1",
   storageInstanceId: "00000000-0000-4000-8000-000000000002",
+  protocol: { minimum: 1, maximum: 1 },
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: true,

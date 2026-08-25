@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::{
     ServerConfig, ServerMode,
     persistence::{
-        BackupTrigger, Database, PreparedStore, StatePaths, StorageInstanceId, StoreClassification,
-        StoreOperationGuard, create_verified_backup,
+        BackupTrigger, Database, EnvironmentId, PreparedStore, StatePaths, StorageInstanceId,
+        StoreClassification, StoreOperationGuard, create_verified_backup,
     },
     production::runtime::ProductionRuntime,
 };
@@ -248,6 +248,7 @@ impl Drop for RpcPermitLease {
 #[serde(rename_all = "camelCase")]
 pub struct PrepareForUpdateResult {
     pub operation_id: String,
+    pub environment_id: EnvironmentId,
     pub storage_instance_id: StorageInstanceId,
     pub backup_id: String,
     pub drained_operations: u64,
@@ -272,6 +273,7 @@ pub struct UpdateMaintenance {
     runtime: Arc<ProductionRuntime>,
     database: Database,
     paths: StatePaths,
+    environment_id: EnvironmentId,
     storage_instance_id: StorageInstanceId,
     classification: StoreClassification,
     app_version: String,
@@ -288,6 +290,7 @@ impl UpdateMaintenance {
         runtime: Arc<ProductionRuntime>,
         database: Database,
         paths: StatePaths,
+        environment_id: EnvironmentId,
         storage_instance_id: StorageInstanceId,
         classification: StoreClassification,
         app_version: String,
@@ -302,6 +305,7 @@ impl UpdateMaintenance {
             runtime,
             database,
             paths,
+            environment_id,
             storage_instance_id,
             classification,
             app_version,
@@ -377,6 +381,7 @@ impl UpdateMaintenance {
             .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
         let context = PreparedStore {
             database: self.database.clone(),
+            environment_id: self.environment_id,
             storage_instance_id: self.storage_instance_id,
             classification: self.classification,
             paths: self.paths.clone(),
@@ -400,6 +405,7 @@ impl UpdateMaintenance {
         .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
         Ok(PrepareForUpdateResult {
             operation_id: operation_id.to_string(),
+            environment_id: self.environment_id,
             storage_instance_id: self.storage_instance_id,
             backup_id: backup.manifest.backup_id.to_string(),
             drained_operations,

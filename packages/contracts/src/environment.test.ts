@@ -9,10 +9,12 @@ const decodeExecutionEnvironmentDescriptor = Schema.decodeUnknownSync(
 );
 
 const descriptor = {
-  environmentId: "local",
+  environmentId: "018f0f74-9d2f-7b57-9f17-7ea4f26c7e42",
   label: "Local",
   platform: { os: "darwin" as const, arch: "arm64" as const },
   serverVersion: "0.1.0",
+  storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+  protocol: { minimum: 1, maximum: 1 },
 };
 
 const LegacyExecutionEnvironmentDescriptor = Schema.Struct({
@@ -90,53 +92,46 @@ describe("execution environment contracts", () => {
     ).toBe(true);
   });
 
-  it("defaults storage identity to null for an older remote descriptor", () => {
-    const decoded = decodeExecutionEnvironmentDescriptor({
-      ...descriptor,
-      capabilities: { repositoryIdentity: true },
-    });
-
-    expect(decoded.storageInstanceId).toBeNull();
+  it("requires strict durable UUID identities", () => {
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        environmentId: "local",
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        storageInstanceId: "third-party-store",
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
   });
 
   it("decodes a new server storage identity", () => {
     const decoded = decodeExecutionEnvironmentDescriptor({
       ...descriptor,
-      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       capabilities: { repositoryIdentity: true },
     });
 
     expect(decoded.storageInstanceId).toBe("0d93cbea-f237-4f37-8829-d816667be35f");
   });
 
-  it("accepts a non-UUID storage identity from a third-party server", () => {
-    const decoded = decodeExecutionEnvironmentDescriptor({
-      ...descriptor,
-      storageInstanceId: "third-party-store",
-      capabilities: { repositoryIdentity: true },
-    });
-
-    expect(decoded.storageInstanceId).toBe("third-party-store");
-  });
-
-  it("trims surrounding whitespace from a supplied storage identity", () => {
-    const decoded = decodeExecutionEnvironmentDescriptor({
-      ...descriptor,
-      storageInstanceId: "  third-party-store  ",
-      capabilities: { repositoryIdentity: true },
-    });
-
-    expect(decoded.storageInstanceId).toBe("third-party-store");
-  });
-
-  it("rejects a whitespace-only storage identity", () => {
+  it("requires a bounded protocol range", () => {
     expect(() =>
       decodeExecutionEnvironmentDescriptor({
         ...descriptor,
-        storageInstanceId: "   ",
+        protocol: { minimum: 2, maximum: 1 },
         capabilities: { repositoryIdentity: true },
       }),
     ).toThrow();
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true },
+      }).protocol,
+    ).toEqual({ minimum: 1, maximum: 1 });
   });
 
   it("defaults the activity protocol version for an old descriptor", () => {

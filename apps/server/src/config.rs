@@ -14,7 +14,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
-use crate::persistence::StorageInstanceId;
+use crate::persistence::{EnvironmentId, StorageInstanceId};
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -50,7 +50,7 @@ pub struct ServerConfig {
     #[doc(hidden)]
     pub desktop_wsl_transport: bool,
     pub unsafe_no_auth: bool,
-    pub environment_id: String,
+    pub environment_id: Option<EnvironmentId>,
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
@@ -78,7 +78,7 @@ impl ServerConfig {
             desktop_bootstrap_token: None,
             desktop_wsl_transport: false,
             unsafe_no_auth: false,
-            environment_id: "local".to_owned(),
+            environment_id: None,
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,

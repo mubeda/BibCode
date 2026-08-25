@@ -1,7 +1,14 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  DurableEnvironmentId,
+  EnvironmentId,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 
 export const ExecutionEnvironmentPlatformOs = Schema.Literals([
   "darwin",
@@ -33,14 +40,24 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
+export const ExecutionEnvironmentProtocol = Schema.Struct({
+  minimum: PositiveInt,
+  maximum: PositiveInt,
+}).check(
+  Schema.makeFilter(
+    ({ minimum, maximum }) =>
+      minimum <= maximum || "Protocol minimum must not exceed protocol maximum.",
+  ),
+);
+export type ExecutionEnvironmentProtocol = typeof ExecutionEnvironmentProtocol.Type;
+
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
-  environmentId: EnvironmentId,
+  environmentId: DurableEnvironmentId,
   label: TrimmedNonEmptyString,
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,
-  storageInstanceId: Schema.NullOr(TrimmedNonEmptyString).pipe(
-    Schema.withDecodingDefault(Effect.succeed(null)),
-  ),
+  storageInstanceId: Schema.String.check(Schema.isUUID()),
+  protocol: ExecutionEnvironmentProtocol,
   capabilities: ExecutionEnvironmentCapabilities,
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;

@@ -271,7 +271,15 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     .expect("environment response");
     assert_eq!(response.status(), StatusCode::OK);
     let descriptor: Value = response.json().await.expect("environment JSON");
-    assert_eq!(descriptor["environmentId"], "local");
+    let environment_id = descriptor["environmentId"]
+        .as_str()
+        .expect("environment identity");
+    let storage_instance_id = descriptor["storageInstanceId"]
+        .as_str()
+        .expect("storage identity");
+    Uuid::parse_str(environment_id).expect("environment UUID");
+    Uuid::parse_str(storage_instance_id).expect("storage UUID");
+    assert_ne!(environment_id, storage_instance_id);
     assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
     assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
     assert!(

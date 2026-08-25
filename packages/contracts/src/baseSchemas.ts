@@ -33,6 +33,10 @@ export const ProjectId = makeEntityId("ProjectId");
 export type ProjectId = typeof ProjectId.Type;
 export const EnvironmentId = makeEntityId("EnvironmentId");
 export type EnvironmentId = typeof EnvironmentId.Type;
+export const DurableEnvironmentId = Schema.String.check(Schema.isUUID()).pipe(
+  Schema.brand("EnvironmentId"),
+);
+export type DurableEnvironmentId = typeof DurableEnvironmentId.Type;
 export const CommandId = makeEntityId("CommandId");
 export type CommandId = typeof CommandId.Type;
 export const EventId = makeEntityId("EventId");
