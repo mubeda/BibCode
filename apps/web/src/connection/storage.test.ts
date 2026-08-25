@@ -7,6 +7,8 @@ import {
   ConnectionTransientError,
   CredentialStore,
   decideStorageIdentity,
+  EnvironmentBinding,
+  KnownEnvironment,
   PrimaryConnectionTarget,
   ProfileStore,
   type PreparedConnection,
@@ -19,7 +21,11 @@ import {
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionRegistrationStore,
   ConnectionTargetStore,
+  EnvironmentCacheManifestStore,
   EnvironmentCacheStore,
+  EnvironmentCatalogStore,
+  EnvironmentMigrationStore,
+  EnvironmentUiStateStore,
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
@@ -42,9 +48,11 @@ import { afterEach, vi } from "vite-plus/test";
 
 import {
   type CatalogBackend,
+  commitCatalogMigrationMetadata,
   connectionStorageLayer,
   makeCatalogBackend,
   makeCatalogStore,
+  NORMALIZED_STORE_NAMES,
 } from "./storage";
 
 const emptyCatalog = {
@@ -204,7 +212,7 @@ function makeFakeDatabase(fault: FaultMode = "none"): FakeDatabaseHandle {
     objectStoreNames: { contains: (name: string) => stores.has(name) },
     createObjectStore: (name: string) => {
       ensure(name);
-      return {};
+      return { createIndex: () => ({}) };
     },
     transaction: (storeName: string, _mode: string) =>
       new FakeTransaction(ensure(storeName), fault),
@@ -269,6 +277,39 @@ const projectId = ProjectId.make("project-1");
 const connectionId = "connection-1";
 const now = "2026-03-29T00:00:00.000Z";
 const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" } as const;
+const durableEnvironmentId = "018f1f52-0d78-7d73-8dc8-7bd50db6f001";
+const durableStorageId = "018f1f52-0d78-7d73-8dc8-7bd50db6f101";
+const otherDurableEnvironmentId = "018f1f52-0d78-7d73-8dc8-7bd50db6f002";
+const otherDurableStorageId = "018f1f52-0d78-7d73-8dc8-7bd50db6f102";
+const missingDurableEnvironmentId = "018f1f52-0d78-7d73-8dc8-7bd50db6f003";
+const missingDurableStorageId = "018f1f52-0d78-7d73-8dc8-7bd50db6f103";
+const decodeKnownEnvironment = Schema.decodeUnknownSync(KnownEnvironment);
+const decodeEnvironmentBinding = Schema.decodeUnknownSync(EnvironmentBinding);
+
+function normalizedKnownEnvironment() {
+  return decodeKnownEnvironment({
+    environmentId: durableEnvironmentId,
+    acceptedStorageInstanceId: durableStorageId,
+    descriptor: null,
+    alias: "Build Linux",
+    hidden: false,
+    bindings: [],
+    routes: [
+      {
+        _tag: "DirectHttpsRoute",
+        routeId: "route:https",
+        environmentId: durableEnvironmentId,
+        label: "Private HTTPS",
+        priority: 0,
+        pinned: true,
+        autoconnect: true,
+        secretRef: null,
+        httpsBaseUrl: "https://build.example.test",
+        trust: { _tag: "System" },
+      },
+    ],
+  });
+}
 
 function bearerRegistration(): BearerConnectionRegistration {
   return new BearerConnectionRegistration({
@@ -1231,6 +1272,284 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("creates the normalized v3 stores and round-trips one aggregate atomically", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const environment = normalizedKnownEnvironment();
+
+      expect(yield* catalog.list).toEqual([]);
+      yield* catalog.put(environment);
+      expect(yield* catalog.list).toEqual([environment]);
+      expect(yield* catalog.load(environment.environmentId)).toEqual(Option.some(environment));
+
+      yield* catalog.forget(environment.environmentId);
+      expect(yield* catalog.list).toEqual([]);
+
+      const database = yield* Effect.promise(
+        () =>
+          new Promise<IDBDatabase>((resolve, reject) => {
+            const request = factory.open("bibcode:connection-runtime", 3);
+            request.addEventListener("success", () => resolve(request.result));
+            request.addEventListener("error", () => reject(request.error));
+          }),
+      );
+      expect(
+        [...NORMALIZED_STORE_NAMES].every((name) => database.objectStoreNames.contains(name)),
+      ).toBe(true);
+      const transaction = database.transaction(
+        [
+          "environmentRoutes",
+          "environmentBindings",
+          "environmentUiState",
+          "environmentCacheManifest",
+          "threadCache",
+        ],
+        "readonly",
+      );
+      expect(
+        transaction.objectStore("environmentRoutes").indexNames.contains("environmentId"),
+      ).toBe(true);
+      expect(transaction.objectStore("environmentBindings").keyPath).toEqual(["_tag", "bindingId"]);
+      expect(
+        transaction.objectStore("environmentBindings").indexNames.contains("environmentId"),
+      ).toBe(true);
+      expect(
+        transaction.objectStore("environmentUiState").indexNames.contains("environmentId"),
+      ).toBe(true);
+      expect(
+        transaction.objectStore("environmentCacheManifest").indexNames.contains("environmentId"),
+      ).toBe(true);
+      expect(transaction.objectStore("threadCache").keyPath).toEqual(["environmentId", "threadId"]);
+      database.close();
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("rolls back an interrupted migration and commits one receipt on retry", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const migrations = yield* EnvironmentMigrationStore;
+      const environment = normalizedKnownEnvironment();
+      const metadata = {
+        environments: [environment],
+        receipt: { id: "catalog-v1-to-v3", completedAt: now },
+        quarantine: [],
+        discarded: { relayTargets: 0, remoteDpopTokens: 0 },
+      } as const;
+      const database = yield* Effect.promise(
+        () =>
+          new Promise<IDBDatabase>((resolve, reject) => {
+            const request = factory.open("bibcode:connection-runtime", 3);
+            request.addEventListener("success", () => resolve(request.result));
+            request.addEventListener("error", () => reject(request.error));
+          }),
+      );
+
+      const seed = database.transaction("catalog", "readwrite");
+      seed.objectStore("catalog").put("legacy-json", "document");
+      yield* Effect.promise(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            seed.addEventListener("complete", () => resolve());
+            seed.addEventListener("error", () => reject(seed.error));
+          }),
+      );
+
+      yield* commitCatalogMigrationMetadata(database, metadata, {
+        deleteLegacyDocument: true,
+        injectAbortBeforeReceipt: true,
+      }).pipe(Effect.flip);
+      expect(yield* catalog.list).toEqual([]);
+      expect(yield* migrations.load(metadata.receipt.id)).toEqual(Option.none());
+
+      expect(
+        yield* commitCatalogMigrationMetadata(database, metadata, {
+          deleteLegacyDocument: true,
+        }),
+      ).toBe("applied");
+      expect(yield* catalog.list).toEqual([environment]);
+      expect(
+        yield* commitCatalogMigrationMetadata(database, metadata, {
+          deleteLegacyDocument: true,
+        }),
+      ).toBe("already-applied");
+      expect(yield* migrations.load(metadata.receipt.id)).toEqual(Option.some(metadata.receipt));
+
+      const legacyValue = yield* Effect.promise(
+        () =>
+          new Promise<unknown>((resolve, reject) => {
+            const request = database
+              .transaction("catalog", "readonly")
+              .objectStore("catalog")
+              .get("document");
+            request.addEventListener("success", () => resolve(request.result));
+            request.addEventListener("error", () => reject(request.error));
+          }),
+      );
+      expect(legacyValue).toBeUndefined();
+      database.close();
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("rejects a route ID collision without publishing the second environment", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const first = normalizedKnownEnvironment();
+      const second = decodeKnownEnvironment({
+        ...first,
+        environmentId: otherDurableEnvironmentId,
+        acceptedStorageInstanceId: otherDurableStorageId,
+        alias: "Other Linux",
+        routes: first.routes.map((route) => ({
+          ...route,
+          environmentId: otherDurableEnvironmentId,
+        })),
+      });
+
+      yield* catalog.put(first);
+      expect((yield* catalog.put(second).pipe(Effect.flip)).operation).toBe("put-environment");
+      expect(yield* catalog.list).toEqual([first]);
+      expect(yield* catalog.load(second.environmentId)).toEqual(Option.none());
+
+      const missing = decodeKnownEnvironment({
+        ...first,
+        environmentId: missingDurableEnvironmentId,
+        acceptedStorageInstanceId: missingDurableStorageId,
+        routes: first.routes.map((route) => ({
+          ...route,
+          routeId: "route:https:missing",
+          environmentId: missingDurableEnvironmentId,
+        })),
+      });
+      expect(
+        (yield* catalog.updateRoutes(missing.environmentId, missing.routes).pipe(Effect.flip))
+          .operation,
+      ).toBe("update-environment-routes");
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("blocks a proved binding from being reassigned to another environment", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const first = normalizedKnownEnvironment();
+      const second = decodeKnownEnvironment({
+        ...first,
+        environmentId: otherDurableEnvironmentId,
+        acceptedStorageInstanceId: otherDurableStorageId,
+        alias: "Other Linux",
+        routes: first.routes.map((route) => ({
+          ...route,
+          routeId: "route:https:other",
+          environmentId: otherDurableEnvironmentId,
+        })),
+      });
+      yield* catalog.put(first);
+      yield* catalog.put(second);
+      const binding = decodeEnvironmentBinding({
+        _tag: "DesktopWslBinding",
+        bindingId: "wsl:Ubuntu",
+        distroName: "Ubuntu",
+        acceptedEnvironmentId: first.environmentId,
+        acceptedStorageInstanceIds: [durableStorageId],
+        acceptedAt: now,
+        lastDiscoveryGeneration: 1,
+        condition: "available",
+        detail: null,
+      });
+      yield* catalog.putBinding(binding);
+
+      const reassigned = decodeEnvironmentBinding({
+        ...binding,
+        acceptedEnvironmentId: second.environmentId,
+        acceptedStorageInstanceIds: [otherDurableStorageId],
+        lastDiscoveryGeneration: 2,
+      });
+      expect((yield* catalog.putBinding(reassigned).pipe(Effect.flip)).operation).toBe(
+        "put-environment-binding",
+      );
+      expect(yield* catalog.listBindings).toEqual([binding]);
+
+      const orphan = decodeEnvironmentBinding({
+        ...binding,
+        bindingId: "wsl:Missing",
+        distroName: "Missing",
+        acceptedEnvironmentId: missingDurableEnvironmentId,
+        acceptedStorageInstanceIds: [missingDurableStorageId],
+      });
+      expect((yield* catalog.putBinding(orphan).pipe(Effect.flip)).operation).toBe(
+        "put-environment-binding",
+      );
+      expect(yield* catalog.listBindings).toEqual([binding]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("persists exact UI, cache-manifest, and migration records in separate stores", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const ui = yield* EnvironmentUiStateStore;
+      const manifests = yield* EnvironmentCacheManifestStore;
+      const migrations = yield* EnvironmentMigrationStore;
+      const environment = normalizedKnownEnvironment();
+      const state = {
+        schemaVersion: 2,
+        selected: { environmentId: environment.environmentId, projectId: null, threadId: null },
+        expandedEnvironmentIds: [environment.environmentId],
+        expandedProjectKeys: [],
+        manuallyToggledKeys: [],
+        environmentOrder: [environment.environmentId],
+        pinnedEnvironmentIds: [],
+        projectOrderByEnvironment: {},
+      } as const;
+      const manifest = {
+        schemaVersion: 1,
+        environmentId: environment.environmentId,
+        storageInstanceId: durableStorageId,
+        keyRef: null,
+        persistence: "session-only",
+        lastSynchronizedAt: null,
+        maxBytes: 1024,
+        maxAgeMs: 60_000,
+        totalBytes: 0,
+      } as const;
+      const receipt = { id: "catalog-v1-to-v3", completedAt: now };
+
+      yield* ui.save(state);
+      yield* manifests.save(manifest);
+      yield* migrations.save(receipt);
+      expect(yield* ui.load).toEqual(Option.some(state));
+      expect(yield* manifests.load(manifest.environmentId)).toEqual(Option.some(manifest));
+      expect(yield* migrations.load(receipt.id)).toEqual(Option.some(receipt));
+
+      yield* ui.clearEnvironment(manifest.environmentId);
+      yield* manifests.remove(manifest.environmentId);
+      expect((yield* ui.load).pipe(Option.getOrThrow).selected).toBeNull();
+      expect(yield* manifests.load(manifest.environmentId)).toEqual(Option.none());
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("publishes corrupt catalog health and resets only through the explicit service", () => {
     const handle = installFakeIndexedDb();
     handle.stores.set("catalog", new Map([["document", "{malformed"]]));

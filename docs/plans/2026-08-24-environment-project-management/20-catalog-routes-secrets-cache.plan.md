@@ -242,7 +242,7 @@ git commit -m "refactor(storage): normalize environment persistence"
 - Migrates: IndexedDB v2 `catalog/shell/thread` into v3 normalized stores.
 - Produces: one transaction for environment/route/binding/migration receipt publication.
 
-- [ ] **Step 1: Write failing clean, Relay-only, mixed-route, corrupt, and retry migration tests**
+- [x] **Step 1: Write failing clean, Relay-only, mixed-route, corrupt, and retry migration tests**
 
 ```ts
 expect(await migrate(legacyRelayOnly)).toEqual({ environments: [], receipt: "catalog-v1-to-v3" });
@@ -250,13 +250,13 @@ expect((await migrate(legacyDirect)).environments[0]?.routes).toHaveLength(1);
 await expect(runTwiceAfterInjectedAbort(legacyDirect)).resolves.toMatchObject({ receiptCount: 1 });
 ```
 
-- [ ] **Step 2: Run focused storage tests and confirm RED**
+- [x] **Step 2: Run focused storage tests and confirm RED**
 
 ```sh
 vp test run apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/storage.test.ts
 ```
 
-- [ ] **Step 3: Create the exact v3 object stores**
+- [x] **Step 3: Create the exact v3 object stores**
 
 ```ts
 const DATABASE_VERSION = 3;
@@ -285,11 +285,13 @@ transaction
 transaction.objectStore("catalog").delete("document");
 ```
 
-- [ ] **Step 5: Quarantine corrupt non-secret metadata**
+Dependency gate: the deterministic planner and atomic IndexedDB committer are implemented and prove rollback/retry/one-receipt behavior, but startup does not yet invoke destructive v1 deletion. Activation waits for Task 4 to import secrets through an OS provider and Task 5 to move the registry off legacy target stores; deleting first would strand existing direct connections or force plaintext/session loss. The deprecated v1 stores remain read only by the old adapter until that gate closes.
+
+- [x] **Step 5: Quarantine corrupt non-secret metadata**
 
 Write only entry kind, hash, and bounded decoder error to local diagnostics. Never copy raw legacy credentials/tokens into quarantine output. Always synthesize/reconcile the primary platform binding so one corrupt remote cannot block launch.
 
-- [ ] **Step 6: Prove transactional cleanup and retry**
+- [x] **Step 6: Prove transactional cleanup and retry**
 
 Inject aborts before receipt, after secret import, and before legacy deletion. Verify retry has no duplicate environment/route and does not restore Relay-only records.
 

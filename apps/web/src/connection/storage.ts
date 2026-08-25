@@ -8,7 +8,16 @@ import {
   ConnectionRegistrationStore,
   ConnectionTargetStore,
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
+  EnvironmentCacheManifest,
+  EnvironmentCacheManifestStore,
   EnvironmentCacheStore,
+  EnvironmentCatalogStore,
+  EnvironmentMigrationReceipt,
+  EnvironmentMigrationStore,
+  EnvironmentUiStateDocument,
+  EnvironmentUiStateStore,
+  NormalizedEnvironmentCatalogRows,
+  assembleKnownEnvironments,
   registerConnectionInCatalog,
   removeCatalogValue,
   removeConnectionFromCatalog,
@@ -16,8 +25,11 @@ import {
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
+  EnvironmentBinding,
+  EnvironmentRoute,
   ConnectionTransientError,
   CredentialStore,
+  KnownEnvironment,
   ProfileStore,
 } from "@bibcode/client-runtime/connection";
 import {
@@ -34,11 +46,32 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
+import type { CatalogMigrationMetadata } from "./catalogMigration.ts";
+
 const DATABASE_NAME = "bibcode:connection-runtime";
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
+const ENVIRONMENTS_STORE_NAME = "environments";
+const ENVIRONMENT_ROUTES_STORE_NAME = "environmentRoutes";
+const ENVIRONMENT_BINDINGS_STORE_NAME = "environmentBindings";
+const ENVIRONMENT_UI_STATE_STORE_NAME = "environmentUiState";
+const ENVIRONMENT_CACHE_MANIFEST_STORE_NAME = "environmentCacheManifest";
+const ENCRYPTED_SHELL_CACHE_STORE_NAME = "shellCache";
+const ENCRYPTED_THREAD_CACHE_STORE_NAME = "threadCache";
+const MIGRATION_STATE_STORE_NAME = "migrationState";
+export const NORMALIZED_STORE_NAMES = [
+  ENVIRONMENTS_STORE_NAME,
+  ENVIRONMENT_ROUTES_STORE_NAME,
+  ENVIRONMENT_BINDINGS_STORE_NAME,
+  ENVIRONMENT_UI_STATE_STORE_NAME,
+  ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+  ENCRYPTED_SHELL_CACHE_STORE_NAME,
+  ENCRYPTED_THREAD_CACHE_STORE_NAME,
+  MIGRATION_STATE_STORE_NAME,
+] as const;
+const ENVIRONMENT_UI_STATE_KEY = "client";
 const CATALOG_KEY = "document";
 const MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS = 8;
 const CORRUPT_CATALOG_MESSAGE =
@@ -65,6 +98,16 @@ const decodeStoredShellSnapshot = Schema.decodeUnknownEffect(StoredShellSnapshot
 const encodeStoredShellSnapshot = Schema.encodeEffect(StoredShellSnapshotJson);
 const decodeStoredThreadSnapshot = Schema.decodeUnknownEffect(StoredThreadSnapshotJson);
 const encodeStoredThreadSnapshot = Schema.encodeEffect(StoredThreadSnapshotJson);
+const decodeNormalizedEnvironmentCatalogRows = Schema.decodeUnknownEffect(
+  NormalizedEnvironmentCatalogRows,
+);
+const decodeKnownEnvironment = Schema.decodeUnknownEffect(KnownEnvironment);
+const decodeEnvironmentRoutes = Schema.decodeUnknownEffect(Schema.Array(EnvironmentRoute));
+const decodeEnvironmentBindings = Schema.decodeUnknownEffect(Schema.Array(EnvironmentBinding));
+const decodeEnvironmentBinding = Schema.decodeUnknownEffect(EnvironmentBinding);
+const decodeEnvironmentUiStateDocument = Schema.decodeUnknownEffect(EnvironmentUiStateDocument);
+const decodeEnvironmentCacheManifest = Schema.decodeUnknownEffect(EnvironmentCacheManifest);
+const decodeEnvironmentMigrationReceipt = Schema.decodeUnknownEffect(EnvironmentMigrationReceipt);
 
 function catalogError(operation: string, cause: unknown) {
   return new ConnectionTransientError({
@@ -111,6 +154,76 @@ function catalogResetPersistenceError() {
   });
 }
 
+type NormalizedPersistenceOperation =
+  | "list-environments"
+  | "load-environment"
+  | "put-environment"
+  | "update-environment-routes"
+  | "list-environment-bindings"
+  | "put-environment-binding"
+  | "forget-environment"
+  | "load-environment-ui-state"
+  | "save-environment-ui-state"
+  | "clear-environment-ui-state"
+  | "load-cache-manifest"
+  | "save-cache-manifest"
+  | "delete-cache-manifest"
+  | "load-migration-receipt"
+  | "save-migration-receipt";
+
+function normalizedPersistenceError(operation: NormalizedPersistenceOperation, cause: unknown) {
+  return new ConnectionPersistenceError({
+    operation,
+    message: `Could not ${operation.replaceAll("-", " ")}: ${String(cause)}`,
+  });
+}
+
+function createNormalizedStores(database: IDBDatabase): void {
+  if (!database.objectStoreNames.contains(ENVIRONMENTS_STORE_NAME)) {
+    database.createObjectStore(ENVIRONMENTS_STORE_NAME, { keyPath: "environmentId" });
+  }
+  if (!database.objectStoreNames.contains(ENVIRONMENT_ROUTES_STORE_NAME)) {
+    const store = database.createObjectStore(ENVIRONMENT_ROUTES_STORE_NAME, {
+      keyPath: "routeId",
+    });
+    store.createIndex("environmentId", "environmentId", { unique: false });
+  }
+  if (!database.objectStoreNames.contains(ENVIRONMENT_BINDINGS_STORE_NAME)) {
+    const store = database.createObjectStore(ENVIRONMENT_BINDINGS_STORE_NAME, {
+      keyPath: ["_tag", "bindingId"],
+    });
+    store.createIndex("environmentId", "acceptedEnvironmentId", { unique: false });
+  }
+  if (!database.objectStoreNames.contains(ENVIRONMENT_UI_STATE_STORE_NAME)) {
+    const store = database.createObjectStore(ENVIRONMENT_UI_STATE_STORE_NAME);
+    store.createIndex("environmentId", "environmentOrder", {
+      unique: false,
+      multiEntry: true,
+    });
+  }
+  if (!database.objectStoreNames.contains(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME)) {
+    const store = database.createObjectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, {
+      keyPath: "environmentId",
+    });
+    store.createIndex("environmentId", "environmentId", { unique: true });
+  }
+  if (!database.objectStoreNames.contains(ENCRYPTED_SHELL_CACHE_STORE_NAME)) {
+    const store = database.createObjectStore(ENCRYPTED_SHELL_CACHE_STORE_NAME, {
+      keyPath: "environmentId",
+    });
+    store.createIndex("environmentId", "environmentId", { unique: true });
+  }
+  if (!database.objectStoreNames.contains(ENCRYPTED_THREAD_CACHE_STORE_NAME)) {
+    const store = database.createObjectStore(ENCRYPTED_THREAD_CACHE_STORE_NAME, {
+      keyPath: ["environmentId", "threadId"],
+    });
+    store.createIndex("environmentId", "environmentId", { unique: false });
+  }
+  if (!database.objectStoreNames.contains(MIGRATION_STATE_STORE_NAME)) {
+    database.createObjectStore(MIGRATION_STATE_STORE_NAME, { keyPath: "id" });
+  }
+}
+
 const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
   databaseName = DATABASE_NAME,
 ) {
@@ -132,6 +245,7 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
       if (!request.result.objectStoreNames.contains(THREAD_STORE_NAME)) {
         request.result.createObjectStore(THREAD_STORE_NAME);
       }
+      createNormalizedStores(request.result);
     });
     request.addEventListener("error", () => {
       resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
@@ -172,6 +286,87 @@ function writeDatabaseValue(
     });
     transaction.objectStore(storeName).put(value, key);
   }).pipe(Effect.withSpan("web.connectionStorage.writeDatabaseValue"));
+}
+
+function writeInlineDatabaseValue(database: IDBDatabase, storeName: string, value: unknown) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(storeName, "readwrite");
+    transaction.addEventListener("error", () => {
+      resume(
+        Effect.fail(catalogError("write", transaction.error ?? "Unknown IndexedDB write error")),
+      );
+    });
+    transaction.addEventListener("complete", () => {
+      resume(Effect.void);
+    });
+    transaction.objectStore(storeName).put(value);
+  }).pipe(Effect.withSpan("web.connectionStorage.writeInlineDatabaseValue"));
+}
+
+function upsertEnvironmentBinding(database: IDBDatabase, binding: EnvironmentBinding) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENT_BINDINGS_STORE_NAME, ENVIRONMENTS_STORE_NAME],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("put environment binding", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB binding error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "IndexedDB binding transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+
+    const store = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME);
+    const request = store.get([binding._tag, binding.bindingId]);
+    let currentLoaded = false;
+    let current: { readonly acceptedEnvironmentId?: unknown } | undefined;
+    let environmentLoaded = binding.acceptedEnvironmentId === null;
+    let environmentExists = binding.acceptedEnvironmentId === null;
+    const publish = () => {
+      if (!currentLoaded || !environmentLoaded) return;
+      if (!environmentExists) {
+        fail("A proved binding must reference a stored environment.");
+        transaction.abort();
+        return;
+      }
+      const currentEnvironmentId = current?.acceptedEnvironmentId;
+      if (
+        typeof currentEnvironmentId === "string" &&
+        currentEnvironmentId !== binding.acceptedEnvironmentId
+      ) {
+        fail("A proved binding cannot be reassigned to another environment.");
+        transaction.abort();
+        return;
+      }
+      store.put(binding);
+    };
+    request.addEventListener("success", () => {
+      current = request.result as { readonly acceptedEnvironmentId?: unknown } | undefined;
+      currentLoaded = true;
+      publish();
+    });
+    if (binding.acceptedEnvironmentId !== null) {
+      const environmentRequest = transaction
+        .objectStore(ENVIRONMENTS_STORE_NAME)
+        .get(binding.acceptedEnvironmentId);
+      environmentRequest.addEventListener("success", () => {
+        environmentLoaded = true;
+        environmentExists = environmentRequest.result !== undefined;
+        publish();
+      });
+    }
+  }).pipe(Effect.withSpan("web.connectionStorage.upsertEnvironmentBinding"));
 }
 
 function compareAndSetDatabaseValue(
@@ -295,6 +490,276 @@ function removeDatabaseValuesInRange(database: IDBDatabase, storeName: string, r
       cursor.continue();
     });
   }).pipe(Effect.withSpan("web.connectionStorage.removeDatabaseValuesInRange"));
+}
+
+function readAllDatabaseValues(database: IDBDatabase, storeName: string) {
+  return Effect.callback<ReadonlyArray<unknown>, ConnectionTransientError>((resume) => {
+    const request = database.transaction(storeName, "readonly").objectStore(storeName).getAll();
+    request.addEventListener("error", () => {
+      resume(Effect.fail(catalogError("read", request.error ?? "Unknown IndexedDB read error")));
+    });
+    request.addEventListener("success", () => {
+      resume(Effect.succeed(request.result));
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.readAllDatabaseValues"));
+}
+
+function readNormalizedEnvironmentRows(database: IDBDatabase) {
+  return Effect.callback<
+    {
+      readonly environments: ReadonlyArray<unknown>;
+      readonly routes: ReadonlyArray<unknown>;
+      readonly bindings: ReadonlyArray<unknown>;
+    },
+    ConnectionTransientError
+  >((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENTS_STORE_NAME, ENVIRONMENT_ROUTES_STORE_NAME, ENVIRONMENT_BINDINGS_STORE_NAME],
+      "readonly",
+    );
+    let settled = false;
+    let environments: ReadonlyArray<unknown> = [];
+    let routes: ReadonlyArray<unknown> = [];
+    let bindings: ReadonlyArray<unknown> = [];
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("read normalized catalog", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction abort"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.succeed({ environments, routes, bindings }));
+    });
+
+    const environmentRequest = transaction.objectStore(ENVIRONMENTS_STORE_NAME).getAll();
+    const routeRequest = transaction.objectStore(ENVIRONMENT_ROUTES_STORE_NAME).getAll();
+    const bindingRequest = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME).getAll();
+    environmentRequest.addEventListener("success", () => {
+      environments = environmentRequest.result;
+    });
+    routeRequest.addEventListener("success", () => {
+      routes = routeRequest.result;
+    });
+    bindingRequest.addEventListener("success", () => {
+      bindings = bindingRequest.result;
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.readNormalizedEnvironmentRows"));
+}
+
+function environmentRecord(environment: KnownEnvironment) {
+  const { bindings: _bindings, routes: _routes, ...record } = environment;
+  return record;
+}
+
+export interface CatalogMigrationCommitOptions {
+  readonly deleteLegacyDocument: boolean;
+  /** Deterministic transaction-abort seam used by migration recovery tests. */
+  readonly injectAbortBeforeReceipt?: boolean;
+}
+
+export function commitCatalogMigrationMetadata(
+  database: IDBDatabase,
+  metadata: CatalogMigrationMetadata,
+  options: CatalogMigrationCommitOptions,
+) {
+  return Effect.callback<"applied" | "already-applied", ConnectionTransientError>((resume) => {
+    const storeNames: string[] = [
+      ENVIRONMENTS_STORE_NAME,
+      ENVIRONMENT_ROUTES_STORE_NAME,
+      ENVIRONMENT_BINDINGS_STORE_NAME,
+      MIGRATION_STATE_STORE_NAME,
+    ];
+    if (options.deleteLegacyDocument) storeNames.push(CATALOG_STORE_NAME);
+    const transaction = database.transaction(storeNames, "readwrite");
+    let settled = false;
+    let outcome: "applied" | "already-applied" = "applied";
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("commit catalog migration", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB migration error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "IndexedDB migration transaction aborted"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.succeed(outcome));
+    });
+
+    const migrationStore = transaction.objectStore(MIGRATION_STATE_STORE_NAME);
+    const receiptRequest = migrationStore.get(metadata.receipt.id);
+    receiptRequest.addEventListener("success", () => {
+      if (receiptRequest.result !== undefined) {
+        outcome = "already-applied";
+        return;
+      }
+      try {
+        const environmentStore = transaction.objectStore(ENVIRONMENTS_STORE_NAME);
+        const routeStore = transaction.objectStore(ENVIRONMENT_ROUTES_STORE_NAME);
+        const bindingStore = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME);
+        for (const environment of metadata.environments) {
+          environmentStore.put(environmentRecord(environment));
+          for (const route of environment.routes) routeStore.add(route);
+          for (const binding of environment.bindings) bindingStore.add(binding);
+        }
+        if (options.deleteLegacyDocument) {
+          transaction.objectStore(CATALOG_STORE_NAME).delete(CATALOG_KEY);
+        }
+        if (options.injectAbortBeforeReceipt === true) {
+          transaction.abort();
+          return;
+        }
+        migrationStore.add(metadata.receipt);
+      } catch (cause) {
+        transaction.abort();
+        fail(cause);
+      }
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.commitCatalogMigrationMetadata"));
+}
+
+function replaceEnvironmentRows(database: IDBDatabase, environment: KnownEnvironment) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENTS_STORE_NAME, ENVIRONMENT_ROUTES_STORE_NAME, ENVIRONMENT_BINDINGS_STORE_NAME],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("replace normalized environment", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction abort"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+
+    const routeStore = transaction.objectStore(ENVIRONMENT_ROUTES_STORE_NAME);
+    const bindingStore = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME);
+    const routeKeysRequest = routeStore
+      .index("environmentId")
+      .getAllKeys(IDBKeyRange.only(environment.environmentId));
+    const bindingKeysRequest = bindingStore
+      .index("environmentId")
+      .getAllKeys(IDBKeyRange.only(environment.environmentId));
+    let routeKeys: ReadonlyArray<IDBValidKey> | null = null;
+    let bindingKeys: ReadonlyArray<IDBValidKey> | null = null;
+    const publish = () => {
+      if (routeKeys === null || bindingKeys === null) return;
+      transaction.objectStore(ENVIRONMENTS_STORE_NAME).put(environmentRecord(environment));
+      for (const key of routeKeys) routeStore.delete(key);
+      for (const key of bindingKeys) bindingStore.delete(key);
+      for (const route of environment.routes) routeStore.add(route);
+      for (const binding of environment.bindings) bindingStore.add(binding);
+    };
+    routeKeysRequest.addEventListener("success", () => {
+      routeKeys = routeKeysRequest.result;
+      publish();
+    });
+    bindingKeysRequest.addEventListener("success", () => {
+      bindingKeys = bindingKeysRequest.result;
+      publish();
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.replaceEnvironmentRows"));
+}
+
+function replaceEnvironmentRouteRows(
+  database: IDBDatabase,
+  environmentId: EnvironmentId,
+  routes: ReadonlyArray<EnvironmentRoute>,
+) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENTS_STORE_NAME, ENVIRONMENT_ROUTES_STORE_NAME],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("replace normalized routes", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction abort"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+    const environmentRequest = transaction.objectStore(ENVIRONMENTS_STORE_NAME).get(environmentId);
+    environmentRequest.addEventListener("success", () => {
+      if (environmentRequest.result === undefined) {
+        fail("Routes must reference a stored environment.");
+        transaction.abort();
+        return;
+      }
+      const store = transaction.objectStore(ENVIRONMENT_ROUTES_STORE_NAME);
+      const keysRequest = store.index("environmentId").getAllKeys(IDBKeyRange.only(environmentId));
+      keysRequest.addEventListener("success", () => {
+        for (const key of keysRequest.result) store.delete(key);
+        for (const route of routes) store.add(route);
+      });
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.replaceEnvironmentRouteRows"));
+}
+
+function removeNormalizedEnvironment(database: IDBDatabase, environmentId: EnvironmentId) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENTS_STORE_NAME, ENVIRONMENT_ROUTES_STORE_NAME, ENVIRONMENT_BINDINGS_STORE_NAME],
+      "readwrite",
+    );
+    let settled = false;
+    const fail = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("remove normalized environment", cause)));
+    };
+    transaction.addEventListener("error", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction error"),
+    );
+    transaction.addEventListener("abort", () =>
+      fail(transaction.error ?? "Unknown IndexedDB transaction abort"),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+    transaction.objectStore(ENVIRONMENTS_STORE_NAME).delete(environmentId);
+    const deleteDependentKeys = (storeName: string) => {
+      const store = transaction.objectStore(storeName);
+      const request = store.index("environmentId").getAllKeys(IDBKeyRange.only(environmentId));
+      request.addEventListener("success", () => {
+        for (const key of request.result) store.delete(key);
+      });
+    };
+    deleteDependentKeys(ENVIRONMENT_ROUTES_STORE_NAME);
+    deleteDependentKeys(ENVIRONMENT_BINDINGS_STORE_NAME);
+  }).pipe(Effect.withSpan("web.connectionStorage.removeNormalizedEnvironment"));
 }
 
 function threadCacheKey(environmentId: EnvironmentId, threadId: ThreadId) {
@@ -599,6 +1064,167 @@ export const connectionStorageLayer = Layer.effectContext(
     yield* migrateLegacyRendererCatalog(backend);
     const catalog = yield* makeCatalogStore(backend);
 
+    const readNormalizedCatalog = readNormalizedEnvironmentRows(database).pipe(
+      Effect.flatMap(decodeNormalizedEnvironmentCatalogRows),
+      Effect.mapError((cause) => normalizedPersistenceError("list-environments", cause)),
+    );
+    const environmentCatalogStore = EnvironmentCatalogStore.of({
+      list: readNormalizedCatalog.pipe(Effect.map(assembleKnownEnvironments)),
+      load: (environmentId) =>
+        readNormalizedCatalog.pipe(
+          Effect.map(assembleKnownEnvironments),
+          Effect.map((environments) =>
+            Option.fromUndefinedOr(
+              environments.find((environment) => environment.environmentId === environmentId),
+            ),
+          ),
+          Effect.mapError((cause) => normalizedPersistenceError("load-environment", cause)),
+        ),
+      put: (environment) =>
+        decodeKnownEnvironment(environment).pipe(
+          Effect.flatMap((decoded) => replaceEnvironmentRows(database, decoded)),
+          Effect.mapError((cause) => normalizedPersistenceError("put-environment", cause)),
+        ),
+      updateRoutes: (environmentId, routes) =>
+        Effect.gen(function* () {
+          const decoded = yield* decodeEnvironmentRoutes(routes).pipe(
+            Effect.mapError((cause) =>
+              normalizedPersistenceError("update-environment-routes", cause),
+            ),
+          );
+          if (
+            decoded.some((route) => route.environmentId !== environmentId) ||
+            decoded.filter((route) => route.pinned).length > 1
+          ) {
+            return yield* normalizedPersistenceError(
+              "update-environment-routes",
+              "Routes must share one environment and at most one may be pinned.",
+            );
+          }
+          yield* replaceEnvironmentRouteRows(database, environmentId, decoded).pipe(
+            Effect.mapError((cause) =>
+              normalizedPersistenceError("update-environment-routes", cause),
+            ),
+          );
+        }),
+      listBindings: readAllDatabaseValues(database, ENVIRONMENT_BINDINGS_STORE_NAME).pipe(
+        Effect.flatMap(decodeEnvironmentBindings),
+        Effect.mapError((cause) => normalizedPersistenceError("list-environment-bindings", cause)),
+      ),
+      putBinding: (binding) =>
+        decodeEnvironmentBinding(binding).pipe(
+          Effect.flatMap((decoded) => upsertEnvironmentBinding(database, decoded)),
+          Effect.mapError((cause) => normalizedPersistenceError("put-environment-binding", cause)),
+        ),
+      forget: (environmentId) =>
+        removeNormalizedEnvironment(database, environmentId).pipe(
+          Effect.mapError((cause) => normalizedPersistenceError("forget-environment", cause)),
+        ),
+    });
+
+    const loadEnvironmentUiState = readDatabaseValue(
+      database,
+      ENVIRONMENT_UI_STATE_STORE_NAME,
+      ENVIRONMENT_UI_STATE_KEY,
+    ).pipe(
+      Effect.flatMap((raw) =>
+        raw === undefined
+          ? Effect.succeed(Option.none())
+          : decodeEnvironmentUiStateDocument(raw).pipe(Effect.map(Option.some)),
+      ),
+      Effect.mapError((cause) => normalizedPersistenceError("load-environment-ui-state", cause)),
+    );
+    const saveEnvironmentUiState = (state: EnvironmentUiStateDocument) =>
+      decodeEnvironmentUiStateDocument(state).pipe(
+        Effect.flatMap((decoded) =>
+          writeDatabaseValue(
+            database,
+            ENVIRONMENT_UI_STATE_STORE_NAME,
+            ENVIRONMENT_UI_STATE_KEY,
+            decoded,
+          ),
+        ),
+        Effect.mapError((cause) => normalizedPersistenceError("save-environment-ui-state", cause)),
+      );
+    const environmentUiStateStore = EnvironmentUiStateStore.of({
+      load: loadEnvironmentUiState,
+      save: saveEnvironmentUiState,
+      clearEnvironment: (environmentId) =>
+        loadEnvironmentUiState.pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (state) => {
+                const projectOrderByEnvironment = Object.fromEntries(
+                  Object.entries(state.projectOrderByEnvironment).filter(
+                    ([key]) => key !== environmentId,
+                  ),
+                );
+                return saveEnvironmentUiState({
+                  ...state,
+                  selected: state.selected?.environmentId === environmentId ? null : state.selected,
+                  expandedEnvironmentIds: state.expandedEnvironmentIds.filter(
+                    (candidate) => candidate !== environmentId,
+                  ),
+                  environmentOrder: state.environmentOrder.filter(
+                    (candidate) => candidate !== environmentId,
+                  ),
+                  pinnedEnvironmentIds: state.pinnedEnvironmentIds.filter(
+                    (candidate) => candidate !== environmentId,
+                  ),
+                  projectOrderByEnvironment,
+                });
+              },
+            }),
+          ),
+          Effect.mapError((cause) =>
+            normalizedPersistenceError("clear-environment-ui-state", cause),
+          ),
+        ),
+    });
+
+    const environmentCacheManifestStore = EnvironmentCacheManifestStore.of({
+      load: (environmentId) =>
+        readDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId).pipe(
+          Effect.flatMap((raw) =>
+            raw === undefined
+              ? Effect.succeed(Option.none())
+              : decodeEnvironmentCacheManifest(raw).pipe(Effect.map(Option.some)),
+          ),
+          Effect.mapError((cause) => normalizedPersistenceError("load-cache-manifest", cause)),
+        ),
+      save: (manifest) =>
+        decodeEnvironmentCacheManifest(manifest).pipe(
+          Effect.flatMap((decoded) =>
+            writeInlineDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, decoded),
+          ),
+          Effect.mapError((cause) => normalizedPersistenceError("save-cache-manifest", cause)),
+        ),
+      remove: (environmentId) =>
+        removeDatabaseValue(database, ENVIRONMENT_CACHE_MANIFEST_STORE_NAME, environmentId).pipe(
+          Effect.mapError((cause) => normalizedPersistenceError("delete-cache-manifest", cause)),
+        ),
+    });
+
+    const environmentMigrationStore = EnvironmentMigrationStore.of({
+      load: (migrationId) =>
+        readDatabaseValue(database, MIGRATION_STATE_STORE_NAME, migrationId).pipe(
+          Effect.flatMap((raw) =>
+            raw === undefined
+              ? Effect.succeed(Option.none())
+              : decodeEnvironmentMigrationReceipt(raw).pipe(Effect.map(Option.some)),
+          ),
+          Effect.mapError((cause) => normalizedPersistenceError("load-migration-receipt", cause)),
+        ),
+      save: (receipt) =>
+        decodeEnvironmentMigrationReceipt(receipt).pipe(
+          Effect.flatMap((decoded) =>
+            writeInlineDatabaseValue(database, MIGRATION_STATE_STORE_NAME, decoded),
+          ),
+          Effect.mapError((cause) => normalizedPersistenceError("save-migration-receipt", cause)),
+        ),
+    });
+
     const catalogHealthStore = ConnectionCatalogHealthStore.of({
       state: catalog.health,
       reset: catalog.reset.pipe(Effect.mapError(catalogResetPersistenceError)),
@@ -857,6 +1483,10 @@ export const connectionStorageLayer = Layer.effectContext(
     });
 
     return Context.make(ConnectionTargetStore, targetStore).pipe(
+      Context.add(EnvironmentCatalogStore, environmentCatalogStore),
+      Context.add(EnvironmentUiStateStore, environmentUiStateStore),
+      Context.add(EnvironmentCacheManifestStore, environmentCacheManifestStore),
+      Context.add(EnvironmentMigrationStore, environmentMigrationStore),
       Context.add(ConnectionRegistrationStore, registrationStore),
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
