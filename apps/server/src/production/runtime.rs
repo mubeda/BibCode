@@ -1773,6 +1773,7 @@ mod tests {
             .await
             .expect("migrations");
         let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let fixture_at = now_iso();
         let terminal_scope = ActivityScopeSeed::terminal(
             "terminal:restart-active",
             "generation-restart-active",
@@ -1819,7 +1820,7 @@ mod tests {
                     )
                     .expect("terminal completed actor"),
                 ],
-                "2026-07-26T00:00:00Z".to_owned(),
+                fixture_at.clone(),
             )
             .await
             .expect("terminal activity persistence");
@@ -1836,7 +1837,7 @@ mod tests {
                     )
                     .expect("thread active actor"),
                 ],
-                "2026-07-26T00:00:00Z".to_owned(),
+                fixture_at,
             )
             .await
             .expect("thread activity persistence");
