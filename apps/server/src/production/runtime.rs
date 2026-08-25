@@ -1054,9 +1054,15 @@ mod tests {
             "Git fixture initialization failed: {}",
             String::from_utf8_lossy(&initialized.stderr)
         );
-        let config = ServerConfig::new(state.path())
+        let mut config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        config.environment_id = Some(crate::persistence::EnvironmentId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
