@@ -365,6 +365,7 @@ impl ServerRuntime {
                 auth: auth.clone(),
                 advertised_base_url: advertised_base_url.clone(),
                 update_maintenance: update_maintenance.clone(),
+                admission_gate: admission_gate.clone(),
                 main_shutdown: shutdown.clone(),
             },
         )

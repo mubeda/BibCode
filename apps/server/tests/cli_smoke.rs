@@ -5,6 +5,7 @@ use std::{
 
 use bibcode_server::{
     AuthCommand, Cli, CliAction, PairingOutputFormat, ServerConfig, ServerRuntime,
+    ServiceCliCommand, ServiceOperation, ServiceOutputFormat,
     local_control::protocol::{
         CONTROL_PROTOCOL_VERSION, ControlResponse, ControlResponseBody, read_request,
         write_response,
@@ -13,6 +14,7 @@ use bibcode_server::{
         BackupTrigger, EnvironmentId, StatePaths, create_verified_backup, prepare_store,
     },
     resolve_data_root,
+    service::ServiceMode,
 };
 use clap::Parser;
 use rusqlite::Connection;
@@ -42,6 +44,99 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }
+}
+
+#[test]
+fn service_cli_has_typed_modes_actions_and_loopback_target() {
+    let root = TempDir::new().expect("temporary service root");
+    let action = Cli::try_parse_from([
+        "bibcode",
+        "service",
+        "install",
+        "--mode",
+        "workstation",
+        "--format",
+        "json",
+        "--update",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "4773",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ])
+    .expect("service arguments parse")
+    .into_action()
+    .expect("service action resolves");
+
+    let CliAction::Service(ServiceCliCommand {
+        operation,
+        mode,
+        root: resolved,
+        bind,
+        format,
+    }) = action
+    else {
+        panic!("unexpected CLI action: {action:?}");
+    };
+    assert_eq!(operation, ServiceOperation::Install { update: true });
+    assert_eq!(mode, ServiceMode::Workstation);
+    assert_eq!(resolved.effective, root.path().canonicalize().unwrap());
+    assert_eq!(bind.to_string(), "127.0.0.1:4773");
+    assert_eq!(format, ServiceOutputFormat::Json);
+}
+
+#[test]
+fn service_cli_defaults_to_workstation_and_has_no_data_purge_flag() {
+    let root = TempDir::new().expect("temporary service root");
+    let action = Cli::try_parse_from([
+        "bibcode",
+        "service",
+        "status",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ])
+    .expect("default service arguments parse")
+    .into_action()
+    .expect("default service action resolves");
+    let CliAction::Service(command) = action else {
+        panic!("unexpected CLI action: {action:?}");
+    };
+    assert_eq!(command.mode, ServiceMode::Workstation);
+    assert_eq!(command.operation, ServiceOperation::Status);
+    assert_eq!(command.format, ServiceOutputFormat::Human);
+
+    let rejected = Cli::try_parse_from([
+        "bibcode",
+        "service",
+        "uninstall",
+        "--purge",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ]);
+    assert!(
+        rejected.is_err(),
+        "service uninstall must not expose data purge"
+    );
+}
+
+#[test]
+fn service_cli_rejects_non_loopback_bind_before_any_host_mutation() {
+    let root = TempDir::new().expect("temporary service root");
+    let error = Cli::try_parse_from([
+        "bibcode",
+        "service",
+        "install",
+        "--host",
+        "0.0.0.0",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ])
+    .expect("syntax parses")
+    .into_action()
+    .expect_err("managed service must remain loopback-only");
+
+    assert!(error.to_string().contains("loopback"));
 }
 
 #[test]

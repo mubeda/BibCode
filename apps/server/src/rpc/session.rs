@@ -158,7 +158,8 @@ impl RpcRegistry {
         }
     }
 
-    pub(crate) fn admission_gate(&self) -> RpcAdmissionGate {
+    #[doc(hidden)]
+    pub fn admission_gate(&self) -> RpcAdmissionGate {
         self.admission_gate.clone()
     }
 

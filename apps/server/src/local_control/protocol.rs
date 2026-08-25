@@ -76,7 +76,10 @@ pub enum ControlResponseBody {
         drained_operations: u64,
         expires_at: String,
     },
-    StopAccepted,
+    StopAccepted {
+        #[serde(default)]
+        drained_operations: u64,
+    },
     Error {
         code: String,
         message: String,
@@ -120,7 +123,10 @@ impl fmt::Debug for ControlResponseBody {
                 .field("drained_operations", drained_operations)
                 .field("expires_at", expires_at)
                 .finish(),
-            Self::StopAccepted => formatter.write_str("StopAccepted"),
+            Self::StopAccepted { drained_operations } => formatter
+                .debug_struct("StopAccepted")
+                .field("drained_operations", drained_operations)
+                .finish(),
             Self::Error { code, message } => formatter
                 .debug_struct("Error")
                 .field("code", code)

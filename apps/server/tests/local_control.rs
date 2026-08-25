@@ -1,14 +1,17 @@
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{
-    RpcRegistry, ServerConfig, ServerError, ServerRuntime,
+    RpcMutability, RpcRegistry, ServerConfig, ServerError, ServerRuntime,
     local_control::protocol::{
         CONTROL_PROTOCOL_VERSION, ControlRequest, ControlRequestBody, ControlResponse,
         ControlResponseBody, MAX_CONTROL_FRAME_BYTES, read_request, read_response, write_request,
     },
     persistence::EnvironmentId,
 };
+use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -23,6 +26,43 @@ fn request(body: ControlRequestBody) -> ControlRequest {
         request_id: Uuid::new_v4(),
         body,
     }
+}
+
+fn dpop_proof(signing_key: &SigningKey, method: &str, url: &str) -> String {
+    let point = signing_key.verifying_key().to_sec1_point(false);
+    let header = json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().expect("P-256 x coordinate")),
+            "y": URL_SAFE_NO_PAD.encode(point.y().expect("P-256 y coordinate")),
+        }
+    });
+    let mut normalized_url = url::Url::parse(url).expect("fixture URL");
+    normalized_url.set_query(None);
+    normalized_url.set_fragment(None);
+    let payload = json!({
+        "htm": method,
+        "htu": normalized_url.to_string(),
+        "jti": Uuid::new_v4().to_string(),
+        "iat": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_secs(),
+    });
+    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("DPoP header JSON"));
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("DPoP payload JSON"));
+    let signing_input = format!("{header}.{payload}");
+    let digest = Sha256::digest(signing_input.as_bytes());
+    let signature: Signature = signing_key
+        .sign_prehash(&digest)
+        .expect("sign DPoP fixture");
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
 }
 
 #[cfg(unix)]
@@ -401,11 +441,99 @@ async fn administrative_inventory_is_closed_and_stop_replies_before_shutdown() {
         .await
         .expect("stop acknowledgement precedes shutdown");
     assert_eq!(response.request_id, sent.request_id);
-    assert!(matches!(response.body, ControlResponseBody::StopAccepted));
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::StopAccepted {
+            drained_operations: 0
+        }
+    ));
     tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
         .await
         .expect("service stop cancels the server");
     handle.join().await.expect("join stopped server");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn service_stop_closes_admission_and_waits_for_admitted_mutations() {
+    let root = tempfile::tempdir().expect("temporary data root");
+    let registry = RpcRegistry::empty();
+    let admission = registry.admission_gate();
+    let admitted = admission
+        .admit(RpcMutability::Mutation)
+        .expect("admit mutation before drain");
+    let handle = ServerRuntime::start_with_registry(test_config(&root), registry)
+        .await
+        .expect("start server with held mutation");
+    let mut stream = connect(&root).await;
+    let sent = request(ControlRequestBody::ServiceStop);
+    let response_task = tokio::spawn(async move {
+        write_request(&mut stream, &sent)
+            .await
+            .expect("write service stop request");
+        read_response(&mut stream)
+            .await
+            .expect("read drained stop response")
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !response_task.is_finished(),
+        "stop acknowledgement must wait for admitted work"
+    );
+    assert!(
+        admission.admit(RpcMutability::Mutation).is_err(),
+        "new mutations must close while the service drains"
+    );
+
+    drop(admitted);
+    let response = tokio::time::timeout(Duration::from_secs(2), response_task)
+        .await
+        .expect("bounded stop response")
+        .expect("stop response task");
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::StopAccepted {
+            drained_operations: 1
+        }
+    ));
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+        .await
+        .expect("service stop cancels after drain");
+    handle.join().await.expect("join drained server");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn service_stop_deadline_reports_failure_then_forces_bounded_shutdown() {
+    let root = tempfile::tempdir().expect("temporary data root");
+    let registry = RpcRegistry::empty();
+    let admission = registry.admission_gate();
+    let admitted = admission
+        .admit(RpcMutability::Mutation)
+        .expect("admit mutation before bounded stop");
+    let config = test_config(&root)
+        .with_service_stop_drain_timeout_for_integration_test(Duration::from_millis(25));
+    let handle = ServerRuntime::start_with_registry(config, registry)
+        .await
+        .expect("start bounded-drain server");
+    let mut stream = connect(&root).await;
+    let sent = request(ControlRequestBody::ServiceStop);
+    write_request(&mut stream, &sent)
+        .await
+        .expect("write bounded service stop request");
+    let response = tokio::time::timeout(Duration::from_secs(1), read_response(&mut stream))
+        .await
+        .expect("bounded drain reply deadline")
+        .expect("bounded drain reply");
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::Error { ref code, .. } if code == "service_drain_failed"
+    ));
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_for_shutdown())
+        .await
+        .expect("drain deadline forces shutdown after the response");
+    drop(admitted);
+    handle.join().await.expect("join deadline-stopped server");
 }
 
 #[cfg(any(unix, windows))]
@@ -456,8 +584,12 @@ async fn create_pairing_issues_fixed_environment_administrator_access() {
         Some(credential.clone())
     );
 
+    let token_url = format!("{}/oauth/token", handle.advertised_base_url());
+    let signing_key = SigningKey::from_bytes((&[53_u8; 32]).into()).expect("paired DPoP key");
+    let proof = dpop_proof(&signing_key, "POST", &token_url);
     let token = reqwest::Client::new()
-        .post(format!("{}/oauth/token", handle.advertised_base_url()))
+        .post(token_url)
+        .header("dpop", proof)
         .form(&[
             (
                 "grant_type",

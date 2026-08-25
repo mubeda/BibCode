@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ServerConfig,
     auth::{AuthService, build_pairing_url},
-    maintenance::UpdateMaintenance,
+    maintenance::{RpcAdmissionGate, UpdateMaintenance},
     persistence::{EnvironmentId, StatePaths, StorageInstanceId},
 };
 
@@ -48,6 +48,8 @@ pub(crate) struct ControlDispatcher {
     auth: AuthService,
     advertised_base_url: url::Url,
     update_maintenance: Option<Arc<UpdateMaintenance>>,
+    admission_gate: RpcAdmissionGate,
+    service_stop_drain_timeout: Duration,
     main_shutdown: CancellationToken,
 }
 
@@ -62,6 +64,7 @@ pub(crate) struct LocalControlContext {
     pub auth: AuthService,
     pub advertised_base_url: String,
     pub update_maintenance: Option<Arc<UpdateMaintenance>>,
+    pub admission_gate: RpcAdmissionGate,
     pub main_shutdown: CancellationToken,
 }
 
@@ -79,6 +82,8 @@ pub(crate) async fn start(
         auth: context.auth,
         advertised_base_url,
         update_maintenance: context.update_maintenance,
+        admission_gate: context.admission_gate,
+        service_stop_drain_timeout: config.service_stop_drain_timeout,
         main_shutdown: context.main_shutdown.clone(),
     };
     let shutdown = CancellationToken::new();
@@ -216,10 +221,26 @@ impl ControlDispatcher {
                 }
             }
             ControlRequestBody::ServiceStop => {
-                return (
-                    response(request_id, ControlResponseBody::StopAccepted),
-                    true,
-                );
+                let deadline = tokio::time::Instant::now() + self.service_stop_drain_timeout;
+                return match self.admission_gate.close_and_drain(deadline).await {
+                    Ok(drained_operations) => (
+                        response(
+                            request_id,
+                            ControlResponseBody::StopAccepted { drained_operations },
+                        ),
+                        true,
+                    ),
+                    Err(_) => (
+                        response(
+                            request_id,
+                            safe_error(
+                                "service_drain_failed",
+                                "The service could not drain safely before the deadline.",
+                            ),
+                        ),
+                        true,
+                    ),
+                };
             }
         };
         (response(request_id, body), false)

@@ -37,6 +37,10 @@ pub(crate) enum ControlClientError {
     InvalidPairingResponse,
     #[error("the pairing credential reply has already expired")]
     PairingExpired,
+    #[error("the server rejected the service drain request")]
+    ServiceStopRejected,
+    #[error("the protected local control response was not a valid service stop acknowledgement")]
+    InvalidServiceStopResponse,
 }
 
 pub(crate) struct CreatedPairing {
@@ -108,6 +112,25 @@ pub(crate) async fn create_pairing(
         pairing_url,
         control_protocol_version: response.version,
     })
+}
+
+pub(crate) async fn stop_service(root: &ResolvedDataRoot) -> Result<u64, ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::ServiceStop,
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    match response.body {
+        ControlResponseBody::StopAccepted { drained_operations } => Ok(drained_operations),
+        ControlResponseBody::Error { .. } => Err(ControlClientError::ServiceStopRejected),
+        _ => Err(ControlClientError::InvalidServiceStopResponse),
+    }
 }
 
 async fn read_environment_id(paths: &StatePaths) -> Result<EnvironmentId, ControlClientError> {

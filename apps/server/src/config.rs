@@ -1,6 +1,7 @@
 use std::{
     fmt,
     io::{self, BufRead},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,6 +16,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::{EnvironmentId, StorageInstanceId};
+use crate::service::ServiceMode;
 use crate::transport::TransportIdentity;
 
 pub const DEFAULT_PORT: u16 = 3773;
@@ -61,6 +63,7 @@ pub struct ServerConfig {
     pub storage_instance_id: Option<StorageInstanceId>,
     pub(crate) transport_identity: TransportIdentity,
     pub(crate) managed_service_launch: bool,
+    pub(crate) service_stop_drain_timeout: Duration,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
 }
@@ -91,6 +94,7 @@ impl ServerConfig {
             storage_instance_id: None,
             transport_identity: TransportIdentity::LoopbackHttp,
             managed_service_launch: false,
+            service_stop_drain_timeout: Duration::from_secs(40),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
         }
@@ -130,6 +134,17 @@ impl ServerConfig {
     #[must_use]
     pub fn with_service_managed_launch(mut self) -> Self {
         self.managed_service_launch = true;
+        self
+    }
+
+    /// Overrides service-stop drain timing for deterministic integration tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_service_stop_drain_timeout_for_integration_test(
+        mut self,
+        drain_timeout: Duration,
+    ) -> Self {
+        self.service_stop_drain_timeout = drain_timeout;
         self
     }
 
@@ -248,6 +263,39 @@ enum CliCommand {
     Storage(StorageArgs),
     #[command(about = "Manage environment authentication through local control.")]
     Auth(AuthArgs),
+    #[command(about = "Manage the workstation or headless server service.")]
+    Service(ServiceArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[arg(long, value_enum, default_value_t, global = true)]
+    format: ServiceOutputFormat,
+
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceSubcommand {
+    #[command(about = "Inspect service registration and runtime state.")]
+    Status,
+    #[command(about = "Install and start a loopback-only managed service.")]
+    Install {
+        #[arg(
+            long,
+            help = "Replace an installed definition only after an explicit comparison."
+        )]
+        update: bool,
+    },
+    #[command(about = "Start an installed service.")]
+    Start,
+    #[command(about = "Drain and stop an installed service.")]
+    Stop,
+    #[command(about = "Drain and restart an installed service.")]
+    Restart,
+    #[command(about = "Remove service registration while preserving all project data.")]
+    Uninstall,
 }
 
 #[derive(Debug, Args)]
@@ -314,6 +362,33 @@ pub enum CliAction {
     Run(Box<ServerConfig>),
     Storage(StorageCommand),
     Auth(AuthCommand),
+    Service(ServiceCliCommand),
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceCliCommand {
+    pub operation: ServiceOperation,
+    pub mode: ServiceMode,
+    pub root: ResolvedDataRoot,
+    pub bind: SocketAddr,
+    pub format: ServiceOutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceOperation {
+    Status,
+    Install { update: bool },
+    Start,
+    Stop,
+    Restart,
+    Uninstall,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ServiceOutputFormat {
+    #[default]
+    Human,
+    Json,
 }
 
 #[derive(Clone, Debug)]
@@ -351,8 +426,8 @@ pub enum StorageCommand {
 
 #[derive(Clone, Debug, Default, Args)]
 struct ServerArgs {
-    #[arg(long, value_enum, env = "BIBCODE_MODE", global = true)]
-    mode: Option<ServerMode>,
+    #[arg(long, env = "BIBCODE_MODE", global = true)]
+    mode: Option<String>,
 
     #[arg(long, env = "BIBCODE_HOST", global = true)]
     host: Option<String>,
@@ -398,6 +473,16 @@ pub enum ConfigError {
     StorageCommandIsNotServer,
     #[error("authentication commands cannot be converted into a server configuration")]
     AuthCommandIsNotServer,
+    #[error("service commands cannot be converted into a server configuration")]
+    ServiceCommandIsNotServer,
+    #[error("invalid {command} mode {mode:?}; expected {expected}")]
+    InvalidCommandMode {
+        command: &'static str,
+        mode: String,
+        expected: &'static str,
+    },
+    #[error("managed services require a numeric loopback host, not {0:?}")]
+    InvalidServiceHost(String),
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -429,6 +514,7 @@ impl Cli {
             CliAction::Run(config) => Ok(*config),
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
             CliAction::Auth(_) => Err(ConfigError::AuthCommandIsNotServer),
+            CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
         }
     }
 
@@ -465,6 +551,32 @@ impl Cli {
                     format,
                 }));
             }
+            Some(CliCommand::Service(service)) => {
+                let mode = parse_service_mode(args.mode.as_deref())?;
+                let root = resolve_service_data_root(args.base_dir, mode)?;
+                let host = args.host.unwrap_or_else(|| "127.0.0.1".to_owned());
+                let ip = host
+                    .parse::<IpAddr>()
+                    .map_err(|_| ConfigError::InvalidServiceHost(host.clone()))?;
+                if !ip.is_loopback() {
+                    return Err(ConfigError::InvalidServiceHost(host));
+                }
+                let operation = match service.command {
+                    ServiceSubcommand::Status => ServiceOperation::Status,
+                    ServiceSubcommand::Install { update } => ServiceOperation::Install { update },
+                    ServiceSubcommand::Start => ServiceOperation::Start,
+                    ServiceSubcommand::Stop => ServiceOperation::Stop,
+                    ServiceSubcommand::Restart => ServiceOperation::Restart,
+                    ServiceSubcommand::Uninstall => ServiceOperation::Uninstall,
+                };
+                return Ok(CliAction::Service(ServiceCliCommand {
+                    operation,
+                    mode,
+                    root,
+                    bind: SocketAddr::new(ip, args.port.unwrap_or(DEFAULT_PORT)),
+                    format: service.format,
+                }));
+            }
             command => command,
         };
         let headless = matches!(command, Some(CliCommand::Serve));
@@ -472,6 +584,9 @@ impl Cli {
 
         let mode = args
             .mode
+            .as_deref()
+            .map(parse_server_mode)
+            .transpose()?
             .or_else(|| {
                 bootstrap.as_ref().map(|value| match value.mode {
                     ServerModeWire::Desktop => ServerMode::Desktop,
@@ -542,6 +657,67 @@ fn resolve_command_data_root(
         home_dir,
     );
     Ok(crate::data_root::resolve_data_root(request)?)
+}
+
+fn resolve_service_data_root(
+    cli_base_dir: Option<PathBuf>,
+    mode: ServiceMode,
+) -> Result<ResolvedDataRoot, ConfigError> {
+    if cli_base_dir.is_some() || bibcode_env_var("BIBCODE_HOME").is_some() {
+        return resolve_command_data_root(cli_base_dir);
+    }
+    let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+    let requested = match mode {
+        ServiceMode::Workstation => home_dir.join(".bibcode"),
+        ServiceMode::Headless => default_headless_data_root(),
+    };
+    Ok(crate::data_root::resolve_data_root(
+        DataRootRequest::explicit(DataRootSource::Default, requested, home_dir),
+    )?)
+}
+
+#[cfg(target_os = "linux")]
+fn default_headless_data_root() -> PathBuf {
+    PathBuf::from("/var/lib/bibcode")
+}
+
+#[cfg(target_os = "macos")]
+fn default_headless_data_root() -> PathBuf {
+    PathBuf::from("/Library/Application Support/BiBCode")
+}
+
+#[cfg(windows)]
+fn default_headless_data_root() -> PathBuf {
+    std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("BiBCode")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn default_headless_data_root() -> PathBuf {
+    PathBuf::from("/var/lib/bibcode")
+}
+
+fn parse_service_mode(value: Option<&str>) -> Result<ServiceMode, ConfigError> {
+    match value {
+        None => Ok(ServiceMode::Workstation),
+        Some(value) => {
+            ServiceMode::from_str(value, true).map_err(|_| ConfigError::InvalidCommandMode {
+                command: "service",
+                mode: value.to_owned(),
+                expected: "workstation or headless",
+            })
+        }
+    }
+}
+
+fn parse_server_mode(value: &str) -> Result<ServerMode, ConfigError> {
+    ServerMode::from_str(value, true).map_err(|_| ConfigError::InvalidCommandMode {
+        command: "server",
+        mode: value.to_owned(),
+        expected: "desktop or web",
+    })
 }
 
 fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {

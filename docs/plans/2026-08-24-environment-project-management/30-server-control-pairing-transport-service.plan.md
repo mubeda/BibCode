@@ -403,11 +403,11 @@ scheduled for deletion.
 - Modes: `workstation` (default) and `headless` (explicit).
 - Uninstall preserves the verified data root; data purge is not a `service uninstall` flag.
 
-- [ ] **Step 1: Write adapter contract tests with a fake command runner**
+- [x] **Step 1: Write adapter contract tests with a fake command runner**
 
 Assert exact argv/stdin and parsed state for Windows logon task/Windows Service, LaunchAgent/LaunchDaemon, systemd user/system unit, disabled/stopped/missing, insufficient authority, timeout, partial install rollback, running process, and uninstall preservation.
 
-- [ ] **Step 2: Define one platform-neutral service model**
+- [x] **Step 2: Define one platform-neutral service model**
 
 ```rust
 pub enum ServiceMode { Workstation, Headless }
@@ -427,21 +427,21 @@ pub struct ServiceStatus {
 
 Return structured JSON for SSH/desktop use and concise human output for administrators.
 
-- [ ] **Step 3: Implement workstation adapters**
+- [x] **Step 3: Implement workstation adapters**
 
 - Windows: per-user Task Scheduler logon trigger, interactive token/no stored password, loopback arguments.
 - macOS: user LaunchAgent plist in the correct user domain with explicit log/data paths.
 - Linux: systemd user unit with hardening compatible with provider/Git/process use; report linger separately and never enable it silently.
 
-- [ ] **Step 4: Implement explicit headless adapters**
+- [x] **Step 4: Implement explicit headless adapters**
 
 Require elevation, create/use the dedicated `bibcode` account, install Windows Service/LaunchDaemon/system unit, create only verified data/log/run directories with least privilege, and reject interactive-user credential assumptions. Account creation and removal are separately reported so rollback cannot delete a pre-existing account.
 
-- [ ] **Step 5: Make service commands idempotent and drain-aware**
+- [x] **Step 5: Make service commands idempotent and drain-aware**
 
 `install` of the matching definition returns current status; mismatch requires explicit update. `stop` asks the local control channel to close admission and drain first, then uses the service manager after a bounded deadline. `uninstall` removes binary registration/service metadata and preserves data.
 
-- [ ] **Step 6: Run service tests and commit**
+- [x] **Step 6: Run service tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test service_lifecycle -- --nocapture
@@ -449,6 +449,32 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke serv
 git add apps/server/src/config.rs apps/server/src/lib.rs apps/server/src/local_control apps/server/src/service apps/server/tests/service_lifecycle.rs apps/server/tests/cli_smoke.rs
 git commit -m "feat(server): manage workstation and headless services"
 ```
+
+Implementation note: service management now uses one validated typed target and
+one bounded no-shell command runner across systemd user/system units,
+LaunchAgents/LaunchDaemons, Task Scheduler logon tasks, and the Windows SCM.
+Definitions are loopback-only, exact-match installs are idempotent, mismatches
+require `--update`, failed fresh installs roll back only artifacts and accounts
+created by that attempt, and uninstall preserves the resolved data root. Linux
+linger is reported but never changed. Windows workstation tasks use an
+interactive token with XML passed over stdin; the headless SCM service uses its
+virtual service identity without a password. A hidden Windows service-host entry
+point implements SCM status and stop handling instead of pretending a console
+process is a native service.
+
+Stop, restart, update, and uninstall first ask the protected local-control
+channel to close RPC mutation admission and drain admitted work within a bounded
+deadline. Failure is explicit in JSON and human output before the requested
+service-manager stop is forced. The CLI exposes no data-purge option and reports
+the retained root and account handling separately.
+
+Direct macOS validation passed 20 service adapter/lifecycle tests, 14
+local-control tests, 17 serial CLI smoke tests, Rust formatting, server
+all-target Clippy with warnings denied, and `vp check` (with only the previously
+recorded Plan 20 unused-fixture warning). A native Windows check reached the
+platform C dependency build but cannot complete on this macOS host because the
+Windows SDK/MSVC headers are unavailable; the Windows-native gate remains in
+the cross-platform validation plan.
 
 ### Task 7: Expose safe service/update state to environment clients
 
