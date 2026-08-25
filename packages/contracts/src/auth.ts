@@ -209,10 +209,8 @@ export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Typ
 
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
-  credential: TrimmedNonEmptyString,
-  scopes: AuthEnvironmentScopes,
-  subject: TrimmedNonEmptyString,
-  label: Schema.optionalKey(TrimmedNonEmptyString),
+  credentialFingerprint: TrimmedNonEmptyString,
+  clientLabel: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
   expiresAt: Schema.DateTimeUtc,
 });
@@ -330,7 +328,6 @@ export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.T
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
-  scopes: Schema.optionalKey(AuthEnvironmentScopes),
 });
 export type AuthCreatePairingCredentialInput = typeof AuthCreatePairingCredentialInput.Type;
 

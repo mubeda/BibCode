@@ -1,8 +1,8 @@
 # Environment-Owned Project Management
 
 **Status:** Product, architecture, mockups, specifications, and implementation
-plan approved on 2026-08-24. No application implementation is implied by this
-folder.
+plan approved on 2026-08-24. Implementation is in progress on the numbered
+plans; their checked steps and progress notes record landed behavior.
 
 ## Goal
 
@@ -46,7 +46,8 @@ keeps the current server-authoritative worktree lifecycle intact.
 
 Implementation follows the numbered plans in dependency order. Each task uses
 test-first steps, names its source/doc owners, and includes verification and a
-small commit boundary; implementation has not begun in this planning change.
+small commit boundary. Unchecked steps remain required unless an adjacent
+progress note explicitly records a dependency-gated deferral.
 
 ## Current Repository Baseline
 

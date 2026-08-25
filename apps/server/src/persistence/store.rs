@@ -493,7 +493,10 @@ async fn prepare_existing_database(
             return Err(error);
         }
     };
-    let backup_result = if pending.is_empty() {
+    let scrubs_legacy_pairing_credentials = pending.iter().any(|migration| migration.id == 48);
+    let backup_result = if pending.is_empty() || scrubs_legacy_pairing_credentials {
+        // Migration 48 removes legacy plaintext pairing credentials. A normal pre-migration
+        // backup would preserve those secrets after the live database has been scrubbed.
         Ok(())
     } else {
         let backup_context = PreparedStore {
@@ -648,7 +651,10 @@ fn map_validation_error(error: &ExistingStoreValidationError) -> StoreStartupErr
 async fn migrate(database: &Database, path: &std::path::Path) -> Result<(), StoreStartupError> {
     database
         .call(|connection| {
-            run_migrations(connection, None)?;
+            let applied = run_migrations(connection, None)?;
+            if applied.iter().any(|migration| migration.id == 48) {
+                connection.pragma_update(None, "secure_delete", "OFF")?;
+            }
             Ok(())
         })
         .await
@@ -679,6 +685,26 @@ async fn apply_pending_migrations(
     database
         .call(move |connection| {
             apply_migrations(connection, &pending)?;
+            let hashed_pairing_migration_applied = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM effect_sql_migrations WHERE migration_id = 48)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if hashed_pairing_migration_applied {
+                // Repeat the truncating checkpoint on every existing-store startup. If the
+                // process stopped after migration 48 committed but before its first checkpoint,
+                // the next start must still remove the legacy plaintext bytes from the WAL.
+                let checkpoint_busy =
+                    connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                if checkpoint_busy != 0 {
+                    return Err(crate::persistence::PersistenceError::Corrupt(
+                        "pairing credential scrub checkpoint remained busy".to_owned(),
+                    ));
+                }
+                connection.pragma_update(None, "secure_delete", "OFF")?;
+            }
             Ok(())
         })
         .await
@@ -861,6 +887,57 @@ mod tests {
 
     fn write_test_marker(path: &std::path::Path, value: Uuid) {
         std::fs::write(path, format!("{value}\n")).expect("identity marker fixture");
+    }
+
+    #[tokio::test]
+    async fn pairing_hash_upgrade_scrubs_plaintext_without_copying_it_to_a_backup() {
+        let root = TempDir::new().expect("temporary store root");
+        let config = prepared_test_config(root.path());
+        let paths = StatePaths::from_config(&config);
+        create_test_state(&paths).await;
+        let raw_credential = "LEGACY-PAIRING-SECRET";
+        {
+            let mut connection =
+                rusqlite::Connection::open(&paths.database).expect("legacy fixture database");
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("legacy WAL mode");
+            run_migrations(&mut connection, Some(47)).expect("legacy migration prefix");
+            connection
+                .execute(
+                    "INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, \
+                     label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) \
+                     VALUES ('legacy-pairing', ?, 'one-time-token', '[\"access:read\"]', \
+                     'environment-administrator', NULL, NULL, '2026-08-25T12:00:00Z', \
+                     '2026-08-25T12:05:00Z', NULL, NULL)",
+                    [raw_credential],
+                )
+                .expect("legacy pairing row");
+        }
+
+        let prepared = prepare_store(&config)
+            .await
+            .expect("privacy migration prepares the store");
+        prepared.database.close().await;
+
+        let mut pending_paths = vec![root.path().to_path_buf()];
+        while let Some(path) = pending_paths.pop() {
+            for entry in std::fs::read_dir(path).expect("state directory traversal") {
+                let path = entry.expect("state entry").path();
+                if path.is_dir() {
+                    pending_paths.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).expect("state artifact bytes");
+                    assert!(
+                        !bytes
+                            .windows(raw_credential.len())
+                            .any(|window| window == raw_credential.as_bytes()),
+                        "legacy pairing secret remained in {}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

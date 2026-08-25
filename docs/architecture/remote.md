@@ -79,19 +79,27 @@ user's default is persisted by stable endpoint ID rather than by array position.
 
 ## Access methods
 
-### Direct bearer access
+### Direct administrator access
 
 Manual pairing produces a one-time bootstrap credential and advertised
-endpoint. The onboarding flow exchanges the bootstrap, verifies both returned
-environment and storage identity, stores the resulting credential behind an
-opaque OS-secret reference, and publishes a `DirectHttpsRoute` only after those
-steps succeed. A same-host desktop loopback enrollment uses the corresponding
-loopback route. WebSocket authorization uses a short-lived ticket rather than
-the bootstrap value.
+endpoint. The onboarding flow creates a client DPoP key, exchanges the
+bootstrap with an exact-method/exact-URL proof, verifies both returned
+environment and storage identity, stores the resulting DPoP material behind
+opaque OS-secret references, and publishes a `DirectHttpsRoute` only after
+those steps succeed. A same-host desktop loopback enrollment uses the
+corresponding loopback route. WebSocket authorization uses a one-use,
+short-lived ticket rather than the bootstrap or access token.
 
 Pairing links may carry a bootstrap in the URL fragment. Fragments are not sent
 to the hosting web server. Compatibility parsing accepts older query-form links,
 but newly generated links use the fragment form.
+
+The server retains only a SHA-256 hash and short fingerprint for a pairing.
+Consumption, client-session creation, and a bounded five-minute exchange
+receipt commit atomically. A same-key lost-response retry returns the same
+logical session; a different key fails. Administrative lists and access events
+never contain the raw pairing value, and revoking a client closes its live
+socket.
 
 ### BiBCode Connect
 
@@ -154,9 +162,10 @@ endpoint can install software, start a process, or use SSH.
 - Catalog rows persist only opaque secret references. Secret values cross the
   typed desktop bridge and remain in the operating-system credential store;
   renderer storage is not a credential fallback.
-- Bearer or DPoP authentication is performed over HTTP before a WebSocket is
-  opened. Only a single-purpose, short-lived `wsTicket` appears in the socket
-  URL.
+- Authentication is performed over HTTP before a WebSocket is opened. Remote
+  pairing sessions require DPoP; bearer exchange is limited to the host-local
+  desktop bootstrap. Only a single-purpose, one-use, short-lived `wsTicket`
+  appears in the socket URL.
 - DPoP binds compatibility Connect-issued relay and environment tokens to the
   client's proof key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently
@@ -215,12 +224,13 @@ environment-administrator scope set rather than exposing permission levels.
 
 ## Current limitations
 
-- OS-backed protection for the desktop connection catalog is implemented on
-  Windows; other platforms currently use renderer storage fallback.
+- Desktop secret references resolve through the native keyring on macOS/Linux
+  and DPAPI-protected per-user storage on Windows. Enrollment fails closed when
+  that provider is unavailable or locked; renderer storage is not a fallback.
 - The desktop SSH launcher and forwarding implementation exist, but fresh SSH
-  setup is currently blocked: its pairing step invokes the removed
-  `bibcode auth pairing create` command while the native CLI exposes only
-  `start` and `serve`.
+  setup is currently blocked until the desktop provisioning and loopback
+  forwarding work in the environment-management plan integrates the native
+  `bibcode auth pairing create` command.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

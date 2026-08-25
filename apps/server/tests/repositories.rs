@@ -1,14 +1,16 @@
 use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
-    AuthPairingLink, AuthSessionClient, CheckpointDiffBlob, CommandReceipt, Database,
-    NewAuthSession, NewOrchestrationEvent, ProjectionCheckpoint, ProjectionPendingApproval,
-    ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
-    ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
-    ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
-    WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome, run_migrations,
+    AuthPairingExchangeRequest, AuthPairingLink, AuthSessionClient, CheckpointDiffBlob,
+    CommandReceipt, Database, NewAuthSession, NewOrchestrationEvent, ProjectionCheckpoint,
+    ProjectionPendingApproval, ProjectionPendingTurnStart, ProjectionProject, ProjectionState,
+    ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
+    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurnById,
+    ProviderSessionRuntime, Repositories, WorktreeRemovalReceipt, WorktreeRepositoryPinOutcome,
+    run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const T0: &str = "2026-07-10T10:00:00.000Z";
 const T1: &str = "2026-07-10T10:01:00.000Z";
@@ -1572,11 +1574,14 @@ async fn turn_and_checkpoint_repositories_preserve_conflicts_and_roll_back_trans
 #[tokio::test]
 async fn auth_pairing_links_consume_and_revoke_atomically() {
     let repositories = migrated_repositories().await;
+    let credential_a = "credential-a";
+    let credential_b = "credential-b";
     let pairing = AuthPairingLink {
         id: "pairing-a".to_owned(),
-        credential: "credential-a".to_owned(),
+        credential_hash: Sha256::digest(credential_a).to_vec(),
+        credential_fingerprint: "sha256:91b7e2e2d164".to_owned(),
         method: "pairing".to_owned(),
-        scopes: json!(["rpc:read", {"delegated": ["rpc:write"]}]),
+        scopes: json!(["orchestration:read", "access:read"]),
         subject: "user-a".to_owned(),
         label: Some("Laptop".to_owned()),
         proof_key_thumbprint: Some("thumbprint-a".to_owned()),
@@ -1587,7 +1592,8 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
-        credential: "credential-b".to_owned(),
+        credential_hash: Sha256::digest(credential_b).to_vec(),
+        credential_fingerprint: "sha256:df9ecf4c79e5".to_owned(),
         proof_key_thumbprint: None,
         created_at: T2.to_owned(),
         ..pairing.clone()
@@ -1602,7 +1608,7 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         .expect("later pairing insert");
     assert_row_eq(
         &repositories
-            .get_auth_pairing_link_by_credential("credential-a".to_owned())
+            .get_auth_pairing_link_by_hash(Sha256::digest(credential_a).to_vec())
             .await
             .expect("pairing lookup")
             .expect("pairing exists"),
@@ -1618,47 +1624,101 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
             .collect::<Vec<_>>(),
         ["pairing-b", "pairing-a"]
     );
+    let schema = repositories
+        .database()
+        .call(|connection| {
+            let columns = connection
+                .prepare("PRAGMA table_info(auth_pairing_links)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let storage = connection.query_row(
+                "SELECT typeof(credential_hash) FROM auth_pairing_links WHERE id = 'pairing-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((columns, storage))
+        })
+        .await
+        .expect("pairing schema inspection");
+    assert!(!schema.0.iter().any(|column| column == "credential"));
+    assert!(schema.0.iter().any(|column| column == "credential_hash"));
     assert!(
-        repositories
-            .consume_auth_pairing_link(
-                "credential-a".to_owned(),
-                Some("wrong-thumbprint".to_owned()),
-                T2.to_owned(),
-                T2.to_owned(),
-            )
-            .await
-            .expect("wrong proof is handled")
-            .is_none()
+        schema
+            .0
+            .iter()
+            .any(|column| column == "credential_fingerprint")
     );
+    assert_eq!(schema.1, "blob");
+
+    let first_session = NewAuthSession {
+        session_id: "session-pairing-a".to_owned(),
+        subject: "user-a".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        method: "dpop-access-token".to_owned(),
+        client: auth_client("Laptop"),
+        proof_key_thumbprint: Some("thumbprint-a".to_owned()),
+        issued_at: T2.to_owned(),
+        expires_at: FUTURE.to_owned(),
+    };
+    let replay_session = NewAuthSession {
+        session_id: "must-not-be-created".to_owned(),
+        ..first_session.clone()
+    };
 
     let first_consumer = repositories.clone();
     let second_consumer = repositories.clone();
     let (first_result, second_result) = tokio::join!(
-        first_consumer.consume_auth_pairing_link(
-            "credential-a".to_owned(),
-            Some("thumbprint-a".to_owned()),
-            T2.to_owned(),
-            T2.to_owned(),
-        ),
-        second_consumer.consume_auth_pairing_link(
-            "credential-a".to_owned(),
-            Some("thumbprint-a".to_owned()),
-            TIME_3.to_owned(),
-            T2.to_owned(),
-        )
+        first_consumer.exchange_auth_pairing(AuthPairingExchangeRequest {
+            credential_hash: Sha256::digest(credential_a).to_vec(),
+            proof_key_thumbprint: "thumbprint-a".to_owned(),
+            requested_session: first_session,
+            consumed_at: T2.to_owned(),
+            receipt_expires_at: TIME_3.to_owned(),
+            now: T2.to_owned(),
+            max_active_sessions: 4_096,
+        }),
+        second_consumer.exchange_auth_pairing(AuthPairingExchangeRequest {
+            credential_hash: Sha256::digest(credential_a).to_vec(),
+            proof_key_thumbprint: "thumbprint-a".to_owned(),
+            requested_session: replay_session.clone(),
+            consumed_at: T2.to_owned(),
+            receipt_expires_at: TIME_3.to_owned(),
+            now: T2.to_owned(),
+            max_active_sessions: 4_096,
+        })
     );
-    let consumed = [
-        first_result.expect("first atomic consume"),
-        second_result.expect("second atomic consume"),
-    ];
-    assert_eq!(consumed.iter().filter(|row| row.is_some()).count(), 1);
-    let consumed_row = consumed
-        .into_iter()
-        .flatten()
-        .next()
-        .expect("one consumer wins");
-    assert_eq!(consumed_row.id, "pairing-a");
-    assert!(consumed_row.consumed_at.is_some());
+    let first_result = first_result
+        .expect("first atomic exchange")
+        .expect("first exchange is valid");
+    let second_result = second_result
+        .expect("same-key idempotent exchange")
+        .expect("same-key retry is valid");
+    assert_eq!(
+        first_result.session.session_id,
+        second_result.session.session_id
+    );
+    assert_ne!(first_result.replayed, second_result.replayed);
+    assert_eq!(first_result.pairing_id, "pairing-a");
+    assert_eq!(second_result.pairing_id, "pairing-a");
+    assert!(
+        repositories
+            .exchange_auth_pairing(AuthPairingExchangeRequest {
+                credential_hash: Sha256::digest(credential_a).to_vec(),
+                proof_key_thumbprint: "different-thumbprint".to_owned(),
+                requested_session: NewAuthSession {
+                    session_id: "different-client".to_owned(),
+                    proof_key_thumbprint: Some("different-thumbprint".to_owned()),
+                    ..replay_session
+                },
+                consumed_at: T2.to_owned(),
+                receipt_expires_at: TIME_3.to_owned(),
+                now: T2.to_owned(),
+                max_active_sessions: 4_096,
+            })
+            .await
+            .expect("different-key retry is handled")
+            .is_none()
+    );
     assert!(
         !repositories
             .revoke_auth_pairing_link("pairing-a".to_owned(), TIME_3.to_owned())
@@ -1695,6 +1755,7 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         scopes: json!(["rpc:read", "rpc:write", {"admin": true}]),
         method: "pairing".to_owned(),
         client: auth_client("Laptop"),
+        proof_key_thumbprint: None,
         issued_at: T1.to_owned(),
         expires_at: FUTURE.to_owned(),
     };

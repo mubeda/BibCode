@@ -211,6 +211,36 @@ request/response identity matching, URL-fragment validation, and absence of the
 credential from stderr. Confirm the client never calls an HTTP pairing route as
 a fallback.
 
+### Pairing and session-security evidence
+
+When pairing persistence, token exchange, DPoP, authorized-client management,
+or WebSocket admission changes, run:
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --lib auth::service::tests -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test repositories auth_pairing_links_consume_and_revoke_atomically -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test auth_http -- --nocapture
+vp test packages/contracts/src/auth.test.ts packages/contracts/src/authRustParity.test.ts packages/contracts/scripts/export-rust-auth-fixtures.test.ts
+vp test apps/web/src/components/settings/ConnectionsSettings.test.tsx apps/web/src/authBootstrap.test.ts
+```
+
+On a non-Windows host, use direct Cargo. Prove that the creation response is the
+only administrative response containing the raw pairing value; SQLite, WAL
+sidecars, migration-created backups, access snapshots/events, list responses,
+and public errors contain no raw value. Migration 48 must rebuild the table
+without `credential`, hash legacy values, truncate the WAL, and avoid creating
+a plaintext-preserving pre-migration backup. Do not claim that backups created
+by older application versions were rewritten or purged.
+
+Also record five-minute expiry; a two-proof-key consumption race; same-key
+lost-response idempotency; different-key and proofless rejection; bounded
+64-attempt/one-minute admission that does not consume a valid code; exact DPoP
+method/URL, timestamp, token-hash, and replay checks (including restart);
+bounded session, pairing, receipt, and WebSocket-ticket state; one-use ticket
+admission; and immediate socket close after client revocation. The settings UI
+must warn that access is full administrator with no permission levels, reveal a
+new credential once, and show only metadata/fingerprint afterward.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

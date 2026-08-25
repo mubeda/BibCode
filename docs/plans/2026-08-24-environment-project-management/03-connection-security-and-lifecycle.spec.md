@@ -162,9 +162,11 @@ The flow is device-authorization-inspired but remains BiBCode-local:
 5. Server atomically consumes the credential and issues a DPoP-bound session.
 6. Client stores private/session material only through its secret provider.
 
-The code is rate limited, never logged, never accepted twice, and cannot be
-extended or refreshed before consumption. Polling/backoff is bounded if a UI
-uses a separate-device verification interaction.
+The code is rate limited, never logged, and cannot create access twice. A
+same-code/same-DPoP-key lost-response retry may return the already committed
+logical session during the bounded receipt window; any different key fails. It
+cannot be extended or refreshed before consumption. Polling/backoff is bounded
+if a UI uses a separate-device verification interaction.
 
 ### Administrator Scopes
 

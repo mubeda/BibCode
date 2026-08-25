@@ -17,7 +17,7 @@ use super::{
         SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest,
         WebSocketTicketResult,
     },
-    service::{AuthError, AuthService, default_standard_scopes, format_iso, now_ms, parse_scopes},
+    service::{AuthError, AuthService, format_iso, now_ms, parse_scopes},
 };
 use crate::http::AppState;
 
@@ -232,27 +232,9 @@ async fn pairing_token(
         {
             return Err(AuthError::InvalidScope);
         }
-        let scopes = payload.scopes.unwrap_or_else(default_standard_scopes);
-        if scopes.is_empty()
-            || scopes
-                .iter()
-                .any(|scope| !super::model::ALL_SCOPES.contains(&scope.as_str()))
-            || scopes
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                != scopes.len()
-        {
-            return Err(AuthError::InvalidScope);
-        }
-        for scope in &scopes {
-            if !principal.has_scope(scope) {
-                return Err(AuthError::ScopeRequired(scope.clone()));
-            }
-        }
         state
             .auth
-            .issue_pairing(scopes, non_empty(payload.label))
+            .issue_environment_administrator_pairing(non_empty(payload.label))
             .await
     }
     .await;
@@ -486,7 +468,7 @@ impl IntoResponse for HttpAuthError {
                 "EnvironmentAuthInvalidError",
                 json!({ "code": "auth_invalid", "reason": "missing_credential", "traceId": trace_id }),
             ),
-            AuthError::InvalidCredential => error_response(
+            AuthError::InvalidCredential | AuthError::PairingAttemptRateLimited => error_response(
                 StatusCode::UNAUTHORIZED,
                 "EnvironmentAuthInvalidError",
                 json!({ "code": "auth_invalid", "reason": "invalid_credential", "traceId": trace_id }),

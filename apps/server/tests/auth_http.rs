@@ -166,45 +166,68 @@ async fn web_mode_exposes_a_one_time_administrative_startup_pairing_url() {
     assert!(startup.pairing_url.ends_with(&startup.credential));
 
     let client = Client::new();
-    let session = exchange_token(&client, &handle, &startup.credential, None).await;
-    assert!(
-        session["scope"]
-            .as_str()
-            .is_some_and(|scopes| scopes.contains("access:write"))
-    );
-    let replay = client
-        .post(http_url(&handle, "/oauth/token"))
-        .form(&token_form(&startup.credential, None))
+    let first = client
+        .post(http_url(&handle, "/api/auth/browser-session"))
+        .json(&json!({ "credential": &startup.credential }))
         .send()
         .await
-        .expect("startup pairing replay request");
-    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        .expect("startup browser pairing request");
+    let first_cookie = first
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("startup session cookie")
+        .clone();
+    let session = get_json(first, StatusCode::OK).await;
+    assert!(
+        session["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "access:write"))
+    );
+    let replay = client
+        .post(http_url(&handle, "/api/auth/browser-session"))
+        .json(&json!({ "credential": &startup.credential }))
+        .send()
+        .await
+        .expect("lost-response browser pairing retry");
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.headers().get(header::SET_COOKIE),
+        Some(&first_cookie)
+    );
 
     shutdown(handle).await;
 }
 
 #[tokio::test]
-async fn one_time_pairing_credentials_are_atomic_and_scope_constrained() {
+async fn one_time_pairing_credentials_are_atomic_dpop_bound_full_administrator() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
     let client = Client::new();
     let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
     let administrator_token = access_token(&administrator);
 
+    let issued_before = unix_seconds();
     let pairing = get_json(
         client
             .post(http_url(&handle, "/api/auth/pairing-token"))
             .bearer_auth(administrator_token)
-            .json(&json!({
-                "label": "Read-only client",
-                "scopes": ["orchestration:read"]
-            }))
+            .json(&json!({ "label": "Administrator client" }))
             .send()
             .await
             .expect("pairing token request"),
         StatusCode::OK,
     )
     .await;
+    let expires_at = time::OffsetDateTime::parse(
+        pairing["expiresAt"].as_str().expect("pairing expiry"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("RFC 3339 pairing expiry")
+    .unix_timestamp();
+    assert!(
+        expires_at >= issued_before + 299 && expires_at <= unix_seconds() + 301,
+        "pairing credential must expire after five minutes"
+    );
     let credential = pairing["credential"].as_str().expect("pairing credential");
     assert_eq!(credential.len(), 12);
     assert!(
@@ -213,39 +236,37 @@ async fn one_time_pairing_credentials_are_atomic_and_scope_constrained() {
             .all(|byte| b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(&byte))
     );
 
-    let paired = exchange_token(&client, &handle, credential, None).await;
-    assert_eq!(paired["scope"], "orchestration:read");
-
-    let replay = client
-        .post(http_url(&handle, "/oauth/token"))
-        .form(&token_form(credential, None))
-        .send()
-        .await
-        .expect("replayed exchange request");
-    assert_credential_headers(&replay);
-    let replay_error = get_json(replay, StatusCode::UNAUTHORIZED).await;
-    assert_eq!(replay_error["_tag"], "EnvironmentAuthInvalidError");
-    assert_eq!(replay_error["code"], "auth_invalid");
-    assert_eq!(replay_error["reason"], "invalid_credential");
-    assert!(
-        replay_error["traceId"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty())
-    );
-
-    let overbroad_pairing = get_json(
-        client
-            .post(http_url(&handle, "/api/auth/pairing-token"))
-            .bearer_auth(access_token(&paired))
-            .json(&json!({ "scopes": ["access:read"] }))
-            .send()
-            .await
-            .expect("overbroad pairing request"),
-        StatusCode::FORBIDDEN,
+    let signing_key = SigningKey::from_bytes((&[31_u8; 32]).into()).expect("DPoP key");
+    let paired = exchange_dpop_token(
+        &client,
+        &handle,
+        credential,
+        &signing_key,
+        "admin-pairing-1",
     )
     .await;
-    assert_eq!(overbroad_pairing["_tag"], "EnvironmentScopeRequiredError");
-    assert_eq!(overbroad_pairing["requiredScope"], "access:write");
+    let scopes = paired["scope"].as_str().expect("administrator scopes");
+    for required in [
+        "orchestration:read",
+        "orchestration:operate",
+        "terminal:operate",
+        "review:write",
+        "access:read",
+        "access:write",
+    ] {
+        assert!(scopes.contains(required));
+    }
+    assert!(!scopes.contains("relay:"));
+
+    let replay = exchange_dpop_token(
+        &client,
+        &handle,
+        credential,
+        &signing_key,
+        "admin-pairing-2",
+    )
+    .await;
+    assert_eq!(access_token(&paired), access_token(&replay));
 
     shutdown(handle).await;
 }
@@ -320,13 +341,15 @@ async fn pairing_links_and_client_sessions_can_be_listed_and_revoked() {
         StatusCode::OK,
     )
     .await;
-    let paired = exchange_token(
+    let paired_key = SigningKey::from_bytes((&[37_u8; 32]).into()).expect("paired DPoP key");
+    let paired = exchange_dpop_token(
         &client,
         &handle,
         second_pairing["credential"]
             .as_str()
             .expect("second credential"),
-        None,
+        &paired_key,
+        "revocable-client-pairing",
     )
     .await;
     let paired_token = access_token(&paired);
@@ -404,13 +427,15 @@ async fn pairing_links_and_client_sessions_can_be_listed_and_revoked() {
         StatusCode::OK,
     )
     .await;
-    let _third = exchange_token(
+    let third_key = SigningKey::from_bytes((&[41_u8; 32]).into()).expect("third DPoP key");
+    let _third = exchange_dpop_token(
         &client,
         &handle,
         third_pairing["credential"]
             .as_str()
             .expect("third credential"),
-        None,
+        &third_key,
+        "revoke-other-client-pairing",
     )
     .await;
     let revoked_others = get_json(
@@ -483,7 +508,7 @@ async fn websocket_requires_a_short_lived_ticket_or_request_credential() {
 }
 
 #[tokio::test]
-async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
+async fn websocket_authorizes_full_administrators_and_streams_auth_access_changes() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
     let client = Client::new();
@@ -512,13 +537,12 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     assert_eq!(snapshot["_tag"], "Chunk");
     assert_eq!(snapshot["requestId"], "101");
     assert_eq!(snapshot["values"][0]["type"], "snapshot");
-    assert_eq!(snapshot["values"][0]["version"], 1);
     assert!(
         snapshot["values"][0]["payload"]["clientSessions"]
             .as_array()
             .is_some_and(|sessions| sessions
                 .iter()
-                .any(|session| { session["current"] == true && session["connected"] == true }))
+                .any(|session| session["current"] == true && session["connected"] == true))
     );
     send_ws_json(
         &mut administrator_socket,
@@ -526,284 +550,81 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     )
     .await;
 
-    let live_pairing = get_json(
+    let pairing = get_json(
         client
             .post(http_url(&handle, "/api/auth/pairing-token"))
             .bearer_auth(administrator_token)
-            .json(&json!({ "label": "Live stream fixture" }))
+            .json(&json!({ "label": "Full administrator client" }))
             .send()
             .await
-            .expect("live pairing request"),
+            .expect("administrator pairing request"),
         StatusCode::OK,
     )
     .await;
     let upsert = next_ws_json(&mut administrator_socket).await;
     assert_eq!(upsert["_tag"], "Chunk");
     assert_eq!(upsert["values"][0]["type"], "pairingLinkUpserted");
-    assert_eq!(upsert["values"][0]["payload"]["id"], live_pairing["id"]);
-    administrator_socket
-        .close(None)
-        .await
-        .expect("close administrator WebSocket");
-
-    let restricted_pairing = get_json(
-        client
-            .post(http_url(&handle, "/api/auth/pairing-token"))
-            .bearer_auth(administrator_token)
-            .json(&json!({ "scopes": ["orchestration:read"] }))
-            .send()
-            .await
-            .expect("restricted pairing request"),
-        StatusCode::OK,
+    assert_eq!(upsert["values"][0]["payload"]["id"], pairing["id"]);
+    assert!(upsert["values"][0]["payload"].get("credential").is_none());
+    assert!(
+        upsert["values"][0]["payload"]["credentialFingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:"))
+    );
+    send_ws_json(
+        &mut administrator_socket,
+        json!({ "_tag": "Ack", "requestId": "101" }),
     )
     .await;
-    let restricted = exchange_token(
+
+    let paired_key = SigningKey::from_bytes((&[47_u8; 32]).into()).expect("paired DPoP key");
+    let paired = exchange_dpop_token(
         &client,
         &handle,
-        restricted_pairing["credential"]
-            .as_str()
-            .expect("restricted credential"),
-        None,
+        pairing["credential"].as_str().expect("pairing credential"),
+        &paired_key,
+        "websocket-admin-pairing",
     )
     .await;
-    let restricted_ticket = websocket_ticket(&client, &handle, access_token(&restricted)).await;
-    let (mut restricted_socket, _) = connect_async(format!(
-        "ws://{}/ws?wsTicket={restricted_ticket}",
+    for expected_type in ["pairingLinkRemoved", "clientUpserted"] {
+        let event = next_ws_json(&mut administrator_socket).await;
+        assert_eq!(event["_tag"], "Chunk");
+        assert_eq!(event["values"][0]["type"], expected_type);
+        send_ws_json(
+            &mut administrator_socket,
+            json!({ "_tag": "Ack", "requestId": "101" }),
+        )
+        .await;
+    }
+
+    let paired_ticket = dpop_websocket_ticket(
+        &client,
+        &handle,
+        access_token(&paired),
+        &paired_key,
+        "websocket-admin-ticket",
+    )
+    .await;
+    let (mut paired_socket, _) = connect_async(format!(
+        "ws://{}/ws?wsTicket={paired_ticket}",
         handle.local_addr()
     ))
     .await
-    .expect("restricted WebSocket");
-    for (id, tag) in [
-        ("110", "activity.getSnapshot"),
-        ("111", "activity.listRoster"),
-        ("112", "activity.listDetail"),
-    ] {
-        send_ws_json(
-            &mut restricted_socket,
-            json!({
-                "_tag": "Request",
-                "id": id,
-                "tag": tag,
-                "payload": {},
-                "headers": []
-            }),
-        )
-        .await;
-        let authorized = next_ws_json(&mut restricted_socket).await;
-        assert_eq!(authorized["_tag"], "Exit");
-        assert_eq!(authorized["requestId"], id);
-        assert_eq!(authorized["exit"]["_tag"], "Success");
-        assert_eq!(authorized["exit"]["value"]["tag"], tag);
-    }
-    for (id, tag) in [
-        ("114", "activity.cancelSubtree"),
-        ("115", "activity.retrySubtreeCancellation"),
-    ] {
-        send_ws_json(
-            &mut restricted_socket,
-            json!({
-                "_tag": "Request",
-                "id": id,
-                "tag": tag,
-                "payload": {},
-                "headers": []
-            }),
-        )
-        .await;
-        let denied = next_ws_json(&mut restricted_socket).await;
-        assert_eq!(denied["_tag"], "Exit");
-        assert_eq!(denied["exit"]["_tag"], "Failure");
-        assert_eq!(
-            denied["exit"]["cause"][0]["error"]["_tag"],
-            "EnvironmentAuthorizationError"
-        );
-        assert_eq!(
-            denied["exit"]["cause"][0]["error"]["requiredScope"],
-            "orchestration:operate"
-        );
-    }
+    .expect("paired administrator WebSocket");
     send_ws_json(
-        &mut restricted_socket,
-        json!({
-            "_tag": "Request",
-            "id": "113",
-            "tag": "subscribeActivity",
-            "payload": {},
-            "headers": []
-        }),
-    )
-    .await;
-    let activity_chunk = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(activity_chunk["_tag"], "Chunk");
-    assert_eq!(activity_chunk["requestId"], "113");
-    assert_eq!(activity_chunk["values"][0]["tag"], "subscribeActivity");
-    send_ws_json(
-        &mut restricted_socket,
-        json!({ "_tag": "Ack", "requestId": "113" }),
-    )
-    .await;
-    let activity_exit = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(activity_exit["_tag"], "Exit");
-    assert_eq!(activity_exit["exit"]["_tag"], "Success");
-
-    send_ws_json(
-        &mut restricted_socket,
+        &mut paired_socket,
         json!({
             "_tag": "Request",
             "id": "102",
-            "tag": "subscribeAuthAccess",
+            "tag": "server.getConfig",
             "payload": {},
             "headers": []
         }),
     )
     .await;
-    let denied = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(denied["_tag"], "Exit");
-    assert_eq!(denied["exit"]["_tag"], "Failure");
-    assert_eq!(
-        denied["exit"]["cause"][0]["error"]["_tag"],
-        "EnvironmentAuthorizationError"
-    );
-    assert_eq!(
-        denied["exit"]["cause"][0]["error"]["requiredScope"],
-        "access:read"
-    );
-
-    send_ws_json(
-        &mut restricted_socket,
-        json!({
-            "_tag": "Request",
-            "id": "103",
-            "tag": "server.consumeCodexRateLimitReset",
-            "payload": { "requestId": "request-123" },
-            "headers": []
-        }),
-    )
-    .await;
-    let reset_denied = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(reset_denied["_tag"], "Exit");
-    assert_eq!(reset_denied["exit"]["_tag"], "Failure");
-    assert_eq!(
-        reset_denied["exit"]["cause"][0]["error"]["_tag"],
-        "EnvironmentAuthorizationError"
-    );
-    assert_eq!(
-        reset_denied["exit"]["cause"][0]["error"]["requiredScope"],
-        "orchestration:operate"
-    );
-
-    let operate_pairing = get_json(
-        client
-            .post(http_url(&handle, "/api/auth/pairing-token"))
-            .bearer_auth(administrator_token)
-            .json(&json!({ "scopes": ["orchestration:operate"] }))
-            .send()
-            .await
-            .expect("operate pairing request"),
-        StatusCode::OK,
-    )
-    .await;
-    let operate = exchange_token(
-        &client,
-        &handle,
-        operate_pairing["credential"]
-            .as_str()
-            .expect("operate credential"),
-        None,
-    )
-    .await;
-    let operate_ticket = websocket_ticket(&client, &handle, access_token(&operate)).await;
-    let (mut operate_socket, _) = connect_async(format!(
-        "ws://{}/ws?wsTicket={operate_ticket}",
-        handle.local_addr()
-    ))
-    .await
-    .expect("operate WebSocket");
-    for (id, tag) in [
-        ("105", "activity.getSnapshot"),
-        ("106", "activity.listRoster"),
-        ("107", "activity.listDetail"),
-    ] {
-        send_ws_json(
-            &mut operate_socket,
-            json!({
-                "_tag": "Request",
-                "id": id,
-                "tag": tag,
-                "payload": {},
-                "headers": []
-            }),
-        )
-        .await;
-        let denied = next_ws_json(&mut operate_socket).await;
-        assert_eq!(denied["_tag"], "Exit");
-        assert_eq!(denied["exit"]["_tag"], "Failure");
-        assert_eq!(
-            denied["exit"]["cause"][0]["error"]["requiredScope"],
-            "orchestration:read"
-        );
-    }
-    send_ws_json(
-        &mut operate_socket,
-        json!({
-            "_tag": "Request",
-            "id": "108",
-            "tag": "subscribeActivity",
-            "payload": {},
-            "headers": []
-        }),
-    )
-    .await;
-    let stream_denied = next_ws_json(&mut operate_socket).await;
-    assert_eq!(stream_denied["_tag"], "Exit");
-    assert_eq!(stream_denied["exit"]["_tag"], "Failure");
-    assert_eq!(
-        stream_denied["exit"]["cause"][0]["error"]["requiredScope"],
-        "orchestration:read"
-    );
-    for (id, tag) in [
-        ("109", "activity.cancelSubtree"),
-        ("1090", "activity.retrySubtreeCancellation"),
-    ] {
-        send_ws_json(
-            &mut operate_socket,
-            json!({
-                "_tag": "Request",
-                "id": id,
-                "tag": tag,
-                "payload": {},
-                "headers": []
-            }),
-        )
-        .await;
-        let authorized = next_ws_json(&mut operate_socket).await;
-        assert_eq!(authorized["_tag"], "Exit");
-        assert_eq!(authorized["requestId"], id);
-        assert_eq!(authorized["exit"]["_tag"], "Success");
-        assert_eq!(authorized["exit"]["value"]["tag"], tag);
-    }
-    send_ws_json(
-        &mut operate_socket,
-        json!({
-            "_tag": "Request",
-            "id": "104",
-            "tag": "server.consumeCodexRateLimitReset",
-            "payload": { "requestId": "  " },
-            "headers": []
-        }),
-    )
-    .await;
-    let reset_authorized = next_ws_json(&mut operate_socket).await;
-    assert_eq!(reset_authorized["_tag"], "Exit");
-    assert_eq!(reset_authorized["exit"]["_tag"], "Failure");
-    assert_eq!(
-        reset_authorized["exit"]["cause"][0]["error"]["_tag"],
-        "ServerProviderUsageResetError"
-    );
-    operate_socket
-        .close(None)
-        .await
-        .expect("close operate WebSocket");
+    let authorized = next_ws_json(&mut paired_socket).await;
+    assert_eq!(authorized["_tag"], "Exit");
+    assert_eq!(authorized["exit"]["_tag"], "Success");
 
     let clients = get_json(
         client
@@ -815,50 +636,45 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
         StatusCode::OK,
     )
     .await;
-    let restricted_session_id = clients
+    let paired_session_id = clients
         .as_array()
         .expect("client list")
         .iter()
-        .find(|session| session["scopes"] == json!(["orchestration:read"]))
+        .find(|session| session["client"]["label"] == "Full administrator client")
         .and_then(|session| session["sessionId"].as_str())
-        .expect("restricted session id");
+        .expect("paired session id");
     let revoked = get_json(
         client
             .post(http_url(&handle, "/api/auth/clients/revoke"))
             .bearer_auth(administrator_token)
-            .json(&json!({ "sessionId": restricted_session_id }))
+            .json(&json!({ "sessionId": paired_session_id }))
             .send()
             .await
-            .expect("revoke restricted session"),
+            .expect("revoke paired administrator"),
         StatusCode::OK,
     )
     .await;
     assert_eq!(revoked["revoked"], true);
-    send_ws_json(
-        &mut restricted_socket,
-        json!({
-            "_tag": "Request",
-            "id": "103",
-            "tag": "server.getConfig",
-            "payload": {},
-            "headers": []
-        }),
-    )
-    .await;
-    let revoked_session = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(revoked_session["_tag"], "Defect");
-    assert_eq!(
-        revoked_session["defect"],
-        "Authenticated session is no longer valid"
+
+    let revoked_frame = timeout(Duration::from_secs(2), paired_socket.next())
+        .await
+        .expect("revoked WebSocket close timeout");
+    assert!(
+        matches!(
+            revoked_frame,
+            None | Some(Ok(tungstenite::Message::Close(_)))
+                | Some(Err(tungstenite::Error::ConnectionClosed))
+                | Some(Err(tungstenite::Error::AlreadyClosed))
+        ),
+        "revoked session must close without waiting for another request: {revoked_frame:?}"
     );
 
-    restricted_socket
+    administrator_socket
         .close(None)
         .await
-        .expect("close restricted WebSocket");
+        .expect("close administrator WebSocket");
     shutdown(handle).await;
 }
-
 #[tokio::test]
 async fn invalid_scope_and_missing_credentials_use_stable_error_shapes() {
     let temp = TempDir::new().expect("temporary base directory");
@@ -895,32 +711,6 @@ async fn invalid_scope_and_missing_credentials_use_stable_error_shapes() {
     assert_eq!(invalid_scope["_tag"], "EnvironmentRequestInvalidError");
     assert_eq!(invalid_scope["reason"], "invalid_scope");
 
-    let empty_scope = get_json(
-        client
-            .post(http_url(&handle, "/api/auth/pairing-token"))
-            .bearer_auth(access_token(&administrator))
-            .json(&json!({ "scopes": [] }))
-            .send()
-            .await
-            .expect("empty delegated scope request"),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert_eq!(empty_scope["reason"], "invalid_scope");
-
-    let unknown_delegated_scope = get_json(
-        client
-            .post(http_url(&handle, "/api/auth/pairing-token"))
-            .bearer_auth(access_token(&administrator))
-            .json(&json!({ "scopes": ["unknown:scope"] }))
-            .send()
-            .await
-            .expect("unknown delegated scope request"),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert_eq!(unknown_delegated_scope["reason"], "invalid_scope");
-
     let invalid_device = get_json(
         client
             .post(http_url(&handle, "/oauth/token"))
@@ -950,6 +740,21 @@ async fn invalid_scope_and_missing_credentials_use_stable_error_shapes() {
     )
     .await;
     assert_eq!(empty_label["_tag"], "EnvironmentRequestInvalidError");
+
+    let legacy_permission_levels = client
+        .post(http_url(&handle, "/api/auth/pairing-token"))
+        .bearer_auth(access_token(&administrator))
+        .json(&json!({
+            "label": "Misleading limited client",
+            "scopes": ["orchestration:read"]
+        }))
+        .send()
+        .await
+        .expect("legacy permission-level pairing request");
+    assert_eq!(
+        legacy_permission_levels.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 
     let malformed_token = get_json(
         client
@@ -1128,6 +933,137 @@ async fn dpop_tokens_validate_proof_binding_time_and_replay() {
 }
 
 #[tokio::test]
+async fn pairing_exchange_is_hashed_dpop_bound_idempotent_and_metadata_only() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let pairing = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(access_token(&administrator))
+            .json(&json!({ "label": "DPoP laptop" }))
+            .send()
+            .await
+            .expect("pairing request"),
+        StatusCode::OK,
+    )
+    .await;
+    let pairing_id = pairing["id"].as_str().expect("pairing id");
+    let credential = pairing["credential"]
+        .as_str()
+        .expect("one-time pairing credential")
+        .to_owned();
+
+    let links_response = client
+        .get(http_url(&handle, "/api/auth/pairing-links"))
+        .bearer_auth(access_token(&administrator))
+        .send()
+        .await
+        .expect("pairing list request");
+    let links_body = links_response.text().await.expect("pairing list body");
+    assert!(!links_body.contains(&credential));
+    let links: Value = serde_json::from_str(&links_body).expect("pairing list JSON");
+    let listed = links
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == pairing_id))
+        .expect("issued pairing is listed");
+    assert!(
+        listed["credentialFingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+    );
+    assert_eq!(listed["clientLabel"], "DPoP laptop");
+    for forbidden in ["credential", "scopes", "subject", "label"] {
+        assert!(
+            listed.get(forbidden).is_none(),
+            "forbidden field {forbidden}"
+        );
+    }
+
+    let first_key = SigningKey::from_bytes((&[19_u8; 32]).into()).expect("first DPoP key");
+    let second_key = SigningKey::from_bytes((&[23_u8; 32]).into()).expect("second DPoP key");
+    let first = exchange_dpop_token(
+        &client,
+        &handle,
+        &credential,
+        &first_key,
+        "pairing-exchange-1",
+    )
+    .await;
+    assert_eq!(first["token_type"], "DPoP");
+    let retry = exchange_dpop_token(
+        &client,
+        &handle,
+        &credential,
+        &first_key,
+        "pairing-exchange-2",
+    )
+    .await;
+    assert_eq!(access_token(&first), access_token(&retry));
+
+    let different_key = send_dpop_token_exchange(
+        &client,
+        &handle,
+        &credential,
+        &second_key,
+        "pairing-exchange-different-key",
+    )
+    .await;
+    assert_eq!(different_key.status(), StatusCode::UNAUTHORIZED);
+    let different_key_error = different_key
+        .text()
+        .await
+        .expect("different-key error body");
+    assert!(!different_key_error.contains(&credential));
+    let no_proof = client
+        .post(http_url(&handle, "/oauth/token"))
+        .form(&token_form(&credential, None))
+        .send()
+        .await
+        .expect("unconstrained pairing exchange");
+    assert_eq!(no_proof.status(), StatusCode::UNAUTHORIZED);
+
+    let ticket = dpop_websocket_ticket(
+        &client,
+        &handle,
+        access_token(&first),
+        &first_key,
+        "pairing-ticket-proof",
+    )
+    .await;
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?wsTicket={ticket}", handle.local_addr()))
+            .await
+            .expect("first ticket use");
+    socket.close(None).await.expect("close first socket");
+    let replayed_ticket =
+        connect_async(format!("ws://{}/ws?wsTicket={ticket}", handle.local_addr()))
+            .await
+            .expect_err("WebSocket ticket is one-use");
+    assert!(matches!(
+        replayed_ticket,
+        tungstenite::Error::Http(response)
+            if response.status() == StatusCode::UNAUTHORIZED
+    ));
+
+    shutdown(handle).await;
+    for entry in std::fs::read_dir(temp.path().join("userdata")).expect("userdata directory") {
+        let path = entry.expect("userdata entry").path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).expect("state artifact bytes");
+            assert!(
+                !bytes
+                    .windows(credential.len())
+                    .any(|window| window == credential.as_bytes()),
+                "raw pairing credential leaked into {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn dpop_replay_state_survives_a_server_restart() {
     let temp = TempDir::new().expect("temporary base directory");
     let first_config = ServerConfig::new(temp.path())
@@ -1234,7 +1170,15 @@ async fn sessions_pairings_consumption_and_revocation_survive_restarts() {
             .is_some_and(|items| items.iter().any(|item| item["id"] == pairing_id))
     );
 
-    let paired = exchange_token(&client, &second, &pairing_credential, None).await;
+    let paired_key = SigningKey::from_bytes((&[43_u8; 32]).into()).expect("restart DPoP key");
+    let paired = exchange_dpop_token(
+        &client,
+        &second,
+        &pairing_credential,
+        &paired_key,
+        "restart-pairing-exchange",
+    )
+    .await;
     let paired_token = access_token(&paired).to_owned();
     let clients = get_json(
         client
@@ -1279,125 +1223,75 @@ async fn sessions_pairings_consumption_and_revocation_survive_restarts() {
     )
     .await;
     assert_eq!(revoked_session["authenticated"], false);
-    let consumed_pairing = client
-        .post(http_url(&third, "/oauth/token"))
-        .form(&token_form(&pairing_credential, None))
-        .send()
-        .await
-        .expect("consumed pairing after second restart");
+    let consumed_pairing = send_dpop_token_exchange(
+        &client,
+        &third,
+        &pairing_credential,
+        &paired_key,
+        "revoked-receipt-retry",
+    )
+    .await;
     assert_eq!(consumed_pairing.status(), StatusCode::UNAUTHORIZED);
     shutdown(third).await;
 }
 
 #[tokio::test]
-async fn session_revocation_is_immediate_across_live_server_processes() {
+async fn a_second_live_server_cannot_share_one_environment_control_endpoint() {
     let temp = TempDir::new().expect("temporary base directory");
-    let client = Client::new();
     let first = start_desktop_server(&temp).await;
-    let administrator = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
-    let administrator_token = access_token(&administrator).to_owned();
-    let pairing = get_json(
-        client
-            .post(http_url(&first, "/api/auth/pairing-token"))
-            .bearer_auth(&administrator_token)
-            .json(&json!({ "label": "Cross-process client" }))
-            .send()
-            .await
-            .expect("cross-process pairing request"),
-        StatusCode::OK,
-    )
-    .await;
-    let paired = exchange_token(
-        &client,
-        &first,
-        pairing["credential"].as_str().expect("pairing credential"),
-        None,
-    )
-    .await;
-    let paired_token = access_token(&paired).to_owned();
+    let second_config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_desktop(DESKTOP_BOOTSTRAP)
+        .expect("desktop config");
+    let second = ServerRuntime::start_with_registry(second_config, RpcRegistry::empty()).await;
+    let error = match second {
+        Ok(second) => {
+            shutdown(second).await;
+            panic!("one environment has one protected local-control owner");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("another BiBCode control endpoint is already active")
+    );
 
-    let second = start_desktop_server(&temp).await;
-    let accepted_by_second = get_json(
-        client
-            .get(http_url(&second, "/api/auth/session"))
-            .bearer_auth(&paired_token)
-            .send()
-            .await
-            .expect("second server session request"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(accepted_by_second["authenticated"], true);
-
-    let clients = get_json(
-        client
-            .get(http_url(&first, "/api/auth/clients"))
-            .bearer_auth(&administrator_token)
-            .send()
-            .await
-            .expect("first server client list"),
-        StatusCode::OK,
-    )
-    .await;
-    let paired_session_id = clients
-        .as_array()
-        .expect("client list")
-        .iter()
-        .find(|session| session["client"]["label"] == "Cross-process client")
-        .and_then(|session| session["sessionId"].as_str())
-        .expect("paired session id");
-    let revoked = get_json(
-        client
-            .post(http_url(&first, "/api/auth/clients/revoke"))
-            .bearer_auth(&administrator_token)
-            .json(&json!({ "sessionId": paired_session_id }))
-            .send()
-            .await
-            .expect("first server revocation"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(revoked["revoked"], true);
-
-    let rejected_by_second = get_json(
-        client
-            .get(http_url(&second, "/api/auth/session"))
-            .bearer_auth(&paired_token)
-            .send()
-            .await
-            .expect("second server revoked-session request"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(rejected_by_second["authenticated"], false);
-
-    shutdown(second).await;
+    let client = Client::new();
+    let session = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
+    assert_eq!(session["token_type"], "Bearer");
     shutdown(first).await;
 }
 
 #[tokio::test]
-async fn simultaneous_live_server_starts_share_the_existing_store() {
+async fn simultaneous_live_server_starts_admit_exactly_one_control_owner() {
     let temp = TempDir::new().expect("temporary base directory");
     let initialized = start_desktop_server(&temp).await;
     shutdown(initialized).await;
 
-    let (first, second) = tokio::join!(start_desktop_server(&temp), start_desktop_server(&temp));
-    let client = Client::new();
-    let token = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
-    let accepted_by_second = get_json(
-        client
-            .get(http_url(&second, "/api/auth/session"))
-            .bearer_auth(access_token(&token))
-            .send()
-            .await
-            .expect("simultaneous second-server session request"),
-        StatusCode::OK,
-    )
-    .await;
-
-    assert_eq!(accepted_by_second["authenticated"], true);
-    shutdown(second).await;
-    shutdown(first).await;
+    let first_config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_desktop(DESKTOP_BOOTSTRAP)
+        .expect("first desktop config");
+    let second_config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_desktop(DESKTOP_BOOTSTRAP)
+        .expect("second desktop config");
+    let (first, second) = tokio::join!(
+        ServerRuntime::start_with_registry(first_config, RpcRegistry::empty()),
+        ServerRuntime::start_with_registry(second_config, RpcRegistry::empty())
+    );
+    match (first, second) {
+        (Ok(winner), Err(_)) | (Err(_), Ok(winner)) => shutdown(winner).await,
+        (Ok(first), Ok(second)) => {
+            shutdown(second).await;
+            shutdown(first).await;
+            panic!("only one protected control owner may start");
+        }
+        (Err(first), Err(second)) => {
+            panic!("one simultaneous starter must win: {first}; {second}")
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1477,7 +1371,11 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
         .expect("initial checkpoint signal");
 
     startup_started.store(true, Ordering::Release);
-    let second = start_desktop_server(&temp).await;
+    let second_config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_desktop(DESKTOP_BOOTSTRAP)
+        .expect("second desktop config");
+    let second = ServerRuntime::start_with_registry(second_config, RpcRegistry::empty()).await;
     startup_finished.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let successful_checkpoints = writer.join().expect("live-store writer thread");
@@ -1487,21 +1385,24 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
     );
     assert!(
         checkpoints_during_startup.load(Ordering::Acquire) > 0,
-        "at least one commit/checkpoint cycle overlaps second-server startup"
+        "at least one commit/checkpoint cycle overlaps the rejected startup"
     );
-    let accepted_by_second = get_json(
+    assert!(
+        second.is_err(),
+        "live environment control ownership rejects a second server"
+    );
+    let accepted_by_first = get_json(
         client
-            .get(http_url(&second, "/api/auth/session"))
+            .get(http_url(&first, "/api/auth/session"))
             .bearer_auth(&administrator_token)
             .send()
             .await
-            .expect("second server session request"),
+            .expect("first server remains available"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(accepted_by_second["authenticated"], true);
+    assert_eq!(accepted_by_first["authenticated"], true);
 
-    shutdown(second).await;
     shutdown(first).await;
 }
 
@@ -1628,6 +1529,65 @@ async fn exchange_token(
         .expect("token exchange request");
     assert_credential_headers(&response);
     get_json(response, StatusCode::OK).await
+}
+
+async fn send_dpop_token_exchange(
+    client: &Client,
+    handle: &ServerHandle,
+    credential: &str,
+    signing_key: &SigningKey,
+    jti: &str,
+) -> Response {
+    let token_url = http_url(handle, "/oauth/token");
+    let proof = dpop_proof(signing_key, "POST", &token_url, jti, unix_seconds(), None);
+    client
+        .post(token_url)
+        .header("dpop", proof)
+        .form(&token_form(credential, None))
+        .send()
+        .await
+        .expect("DPoP token exchange request")
+}
+
+async fn exchange_dpop_token(
+    client: &Client,
+    handle: &ServerHandle,
+    credential: &str,
+    signing_key: &SigningKey,
+    jti: &str,
+) -> Value {
+    let response = send_dpop_token_exchange(client, handle, credential, signing_key, jti).await;
+    assert_credential_headers(&response);
+    get_json(response, StatusCode::OK).await
+}
+
+async fn dpop_websocket_ticket(
+    client: &Client,
+    handle: &ServerHandle,
+    access_token: &str,
+    signing_key: &SigningKey,
+    jti: &str,
+) -> String {
+    let url = http_url(handle, "/api/auth/websocket-ticket");
+    let proof = dpop_proof(
+        signing_key,
+        "POST",
+        &url,
+        jti,
+        unix_seconds(),
+        Some(access_token),
+    );
+    let response = client
+        .post(url)
+        .header(header::AUTHORIZATION, format!("DPoP {access_token}"))
+        .header("dpop", proof)
+        .send()
+        .await
+        .expect("DPoP WebSocket ticket request");
+    get_json(response, StatusCode::OK).await["ticket"]
+        .as_str()
+        .expect("WebSocket ticket")
+        .to_owned()
 }
 
 async fn websocket_ticket(client: &Client, handle: &ServerHandle, token: &str) -> String {

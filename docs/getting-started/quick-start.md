@@ -46,6 +46,10 @@ ship or require Node.js.
 The pairing command uses the server's protected host-local socket or named pipe
 and never falls back to HTTP. If the server uses a non-default data root, pass
 the same absolute `--base-dir` used by `serve`. Treat its stdout as a secret.
+The credential expires after five minutes, grants the fixed full environment
+administrator scope set, and must be exchanged with DPoP. Copy it before
+closing the reveal-once result: subsequent settings/list responses show only a
+fingerprint and cannot recover the raw value.
 
 ## First run
 

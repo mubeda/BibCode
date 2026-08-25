@@ -104,9 +104,9 @@ pub struct WebSocketTicketResult {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePairingRequest {
     pub label: Option<String>,
-    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -123,11 +123,8 @@ pub struct PairingCredentialResult {
 #[serde(rename_all = "camelCase")]
 pub struct PairingLinkView {
     pub id: String,
-    pub credential: String,
-    pub scopes: Vec<String>,
-    pub subject: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    pub credential_fingerprint: String,
+    pub client_label: Option<String>,
     pub created_at: String,
     pub expires_at: String,
 }

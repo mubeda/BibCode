@@ -4,22 +4,24 @@
 //! TypeScript implementation's ISO timestamps as `TEXT`, and these APIs must
 //! not normalize or regenerate them while reading an existing database.
 
-use std::cmp::min;
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::{cmp::min, fmt::Write as _};
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::orchestration::{ProviderTurnDelivery, TurnDeliveryState};
 
 use super::{Database, PersistenceError, Result};
 
 pub type Timestamp = String;
+pub const BROWSER_PAIRING_RECEIPT_BINDING: &str = "urn:bibcode:browser-session-cookie";
 
 #[derive(Clone, Debug)]
 pub struct Repositories {
@@ -1042,25 +1044,195 @@ impl Repositories {
     }
 
     pub async fn create_auth_pairing_link(&self, row: AuthPairingLink) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)", params![row.id,row.credential,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at])?; Ok(()) }).await
+        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential_hash, credential_fingerprint, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)", params![row.id,row.credential_hash,row.credential_fingerprint,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at])?; Ok(()) }).await
     }
-    pub async fn consume_auth_pairing_link(
+    pub async fn exchange_auth_pairing(
         &self,
-        credential: String,
-        proof_key_thumbprint: Option<String>,
-        consumed_at: Timestamp,
-        now: Timestamp,
-    ) -> Result<Option<AuthPairingLink>> {
+        request: AuthPairingExchangeRequest,
+    ) -> Result<Option<AuthPairingExchange>> {
         self.database
             .call(move |connection| {
-                connection
+                let AuthPairingExchangeRequest {
+                    credential_hash,
+                    proof_key_thumbprint,
+                    requested_session,
+                    consumed_at,
+                    receipt_expires_at,
+                    now,
+                    max_active_sessions,
+                } = request;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_exchange_receipts WHERE expires_at <= ?",
+                    [now.as_str()],
+                )?;
+                let pairing = transaction
                     .query_row(
-                        PAIRING_RETURNING_SQL,
-                        params![consumed_at, credential, now, proof_key_thumbprint],
+                        &(PAIRING_SELECT.to_owned() + " WHERE credential_hash = ?"),
+                        [credential_hash],
                         decode_pairing_link,
                     )
-                    .optional()
-                    .map_err(Into::into)
+                    .optional()?;
+                let Some(pairing) = pairing else {
+                    transaction.commit()?;
+                    return Ok(None);
+                };
+                if pairing.revoked_at.is_some() || pairing.expires_at <= now {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+
+                if pairing.consumed_at.is_some() {
+                    let session = transaction
+                        .query_row(
+                            &(AUTH_SESSION_SELECT.to_owned()
+                                + " JOIN auth_pairing_exchange_receipts AS receipt \
+                                   ON receipt.session_id = auth_sessions.session_id \
+                                   WHERE receipt.pairing_id = ? \
+                                     AND receipt.proof_thumbprint = ? \
+                                     AND receipt.expires_at > ? \
+                                     AND auth_sessions.revoked_at IS NULL \
+                                     AND auth_sessions.expires_at > ?"),
+                            params![pairing.id, proof_key_thumbprint, now, now],
+                            decode_auth_session,
+                        )
+                        .optional()?;
+                    transaction.commit()?;
+                    return Ok(session.map(|session| AuthPairingExchange {
+                        pairing_id: pairing.id,
+                        session,
+                        replayed: true,
+                    }));
+                }
+                if pairing
+                    .proof_key_thumbprint
+                    .as_deref()
+                    .is_some_and(|expected| expected != proof_key_thumbprint)
+                {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                let browser_cookie_exchange =
+                    proof_key_thumbprint == BROWSER_PAIRING_RECEIPT_BINDING;
+                if (browser_cookie_exchange
+                    && (pairing.subject != "administrative-bootstrap"
+                        || requested_session.proof_key_thumbprint.is_some()))
+                    || (!browser_cookie_exchange
+                        && requested_session.proof_key_thumbprint.as_deref()
+                            != Some(proof_key_thumbprint.as_str()))
+                {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+
+                let granted_scopes = serde_json::from_value::<Vec<String>>(pairing.scopes.clone())
+                    .map_err(|error| {
+                        PersistenceError::Corrupt(format!(
+                            "persisted authentication scopes are invalid: {error}"
+                        ))
+                    })?;
+                let requested_scopes = if requested_session.scopes.is_null() {
+                    granted_scopes.clone()
+                } else {
+                    serde_json::from_value::<Vec<String>>(requested_session.scopes.clone())
+                        .map_err(|error| {
+                            PersistenceError::Corrupt(format!(
+                                "requested authentication scopes are invalid: {error}"
+                            ))
+                        })?
+                };
+                if requested_scopes.is_empty()
+                    || requested_scopes
+                        .iter()
+                        .any(|scope| !granted_scopes.contains(scope))
+                {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+
+                let active_sessions = transaction.query_row(
+                    "SELECT COUNT(*) FROM auth_sessions \
+                     WHERE revoked_at IS NULL AND expires_at > ?",
+                    [now.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if usize::try_from(active_sessions).unwrap_or(usize::MAX) >= max_active_sessions {
+                    return Err(PersistenceError::Corrupt(
+                        "active authentication session capacity exceeded".to_owned(),
+                    ));
+                }
+
+                let effective_label = pairing.label.clone().or(requested_session.client.label);
+                transaction.execute(
+                    "INSERT INTO auth_sessions (session_id, subject, scopes, method, \
+                     client_label, client_ip_address, client_user_agent, client_device_type, \
+                     client_os, client_browser, issued_at, expires_at, revoked_at, \
+                     proof_key_thumbprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                    params![
+                        requested_session.session_id,
+                        pairing.subject,
+                        encode_json(&serde_json::json!(requested_scopes))?,
+                        requested_session.method,
+                        effective_label,
+                        requested_session.client.ip_address,
+                        requested_session.client.user_agent,
+                        requested_session.client.device_type,
+                        requested_session.client.os,
+                        requested_session.client.browser,
+                        requested_session.issued_at,
+                        requested_session.expires_at,
+                        requested_session.proof_key_thumbprint,
+                    ],
+                )?;
+                let updated = transaction.execute(
+                    "UPDATE auth_pairing_links \
+                     SET consumed_at = ?, proof_key_thumbprint = ? \
+                     WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL \
+                       AND expires_at > ?",
+                    params![
+                        consumed_at,
+                        requested_session.proof_key_thumbprint,
+                        pairing.id,
+                        now
+                    ],
+                )?;
+                if updated != 1 {
+                    return Err(PersistenceError::Corrupt(
+                        "pairing exchange lost its immediate-transaction claim".to_owned(),
+                    ));
+                }
+                transaction.execute(
+                    "INSERT INTO auth_pairing_exchange_receipts \
+                     (pairing_id, proof_thumbprint, session_id, created_at, expires_at) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        pairing.id,
+                        proof_key_thumbprint,
+                        requested_session.session_id,
+                        consumed_at,
+                        receipt_expires_at,
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_exchange_receipts WHERE rowid IN (\
+                       SELECT rowid FROM auth_pairing_exchange_receipts \
+                       ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 4096\
+                     )",
+                    [],
+                )?;
+                let session = transaction.query_row(
+                    &(AUTH_SESSION_SELECT.to_owned() + " WHERE session_id = ?"),
+                    [requested_session.session_id],
+                    decode_auth_session,
+                )?;
+                let pairing_id = pairing.id;
+                transaction.commit()?;
+                Ok(Some(AuthPairingExchange {
+                    pairing_id,
+                    session,
+                    replayed: false,
+                }))
             })
             .await
     }
@@ -1090,16 +1262,16 @@ impl Repositories {
             })
             .await
     }
-    pub async fn get_auth_pairing_link_by_credential(
+    pub async fn get_auth_pairing_link_by_hash(
         &self,
-        credential: String,
+        credential_hash: Vec<u8>,
     ) -> Result<Option<AuthPairingLink>> {
         self.database
             .call(move |connection| {
                 connection
                     .query_row(
-                        &(PAIRING_SELECT.to_owned() + " WHERE credential = ?"),
-                        [credential],
+                        &(PAIRING_SELECT.to_owned() + " WHERE credential_hash = ?"),
+                        [credential_hash],
                         decode_pairing_link,
                     )
                     .optional()
@@ -1109,7 +1281,7 @@ impl Repositories {
     }
 
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at])?; Ok(()) }).await
+        self.database.call(move |connection| { connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, proof_key_thumbprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.proof_key_thumbprint])?; Ok(()) }).await
     }
     pub async fn get_auth_session(&self, session_id: String) -> Result<Option<AuthSession>> {
         self.database
@@ -1558,7 +1730,8 @@ pub struct ProjectionCheckpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthPairingLink {
     pub id: String,
-    pub credential: String,
+    pub credential_hash: Vec<u8>,
+    pub credential_fingerprint: String,
     pub method: String,
     pub scopes: Value,
     pub subject: String,
@@ -1585,8 +1758,19 @@ pub struct NewAuthSession {
     pub scopes: Value,
     pub method: String,
     pub client: AuthSessionClient,
+    pub proof_key_thumbprint: Option<String>,
     pub issued_at: Timestamp,
     pub expires_at: Timestamp,
+}
+#[derive(Clone, Debug)]
+pub struct AuthPairingExchangeRequest {
+    pub credential_hash: Vec<u8>,
+    pub proof_key_thumbprint: String,
+    pub requested_session: NewAuthSession,
+    pub consumed_at: Timestamp,
+    pub receipt_expires_at: Timestamp,
+    pub now: Timestamp,
+    pub max_active_sessions: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSession {
@@ -1595,10 +1779,18 @@ pub struct AuthSession {
     pub scopes: Value,
     pub method: String,
     pub client: AuthSessionClient,
+    pub proof_key_thumbprint: Option<String>,
     pub issued_at: Timestamp,
     pub expires_at: Timestamp,
     pub last_connected_at: Option<Timestamp>,
     pub revoked_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthPairingExchange {
+    pub pairing_id: String,
+    pub session: AuthSession,
+    pub replayed: bool,
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
@@ -1606,9 +1798,8 @@ const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text,
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
-const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at FROM auth_pairing_links";
-const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at FROM auth_sessions";
+const PAIRING_SELECT: &str = "SELECT id, credential_hash, credential_fingerprint, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at FROM auth_pairing_links";
+const AUTH_SESSION_SELECT: &str = "SELECT auth_sessions.session_id, auth_sessions.subject, auth_sessions.scopes, auth_sessions.method, auth_sessions.client_label, auth_sessions.client_ip_address, auth_sessions.client_user_agent, auth_sessions.client_device_type, auth_sessions.client_os, auth_sessions.client_browser, auth_sessions.issued_at, auth_sessions.expires_at, auth_sessions.last_connected_at, auth_sessions.revoked_at, auth_sessions.proof_key_thumbprint FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -1628,6 +1819,18 @@ fn encode_json(value: &Value) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
         PersistenceError::Corrupt(format!("could not encode JSON for SQLite TEXT: {error}"))
     })
+}
+
+pub(crate) fn hash_pairing_credential(credential: &str) -> Vec<u8> {
+    Sha256::digest(credential.as_bytes()).to_vec()
+}
+
+pub(crate) fn pairing_credential_fingerprint(hash: &[u8]) -> String {
+    let mut fingerprint = String::from("sha256:");
+    for byte in hash.iter().take(6) {
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    fingerprint
 }
 fn optional_json(value: &Option<Value>) -> Result<Option<String>> {
     value.as_ref().map(encode_json).transpose()
@@ -1935,16 +2138,17 @@ fn decode_checkpoint(row: &Row<'_>) -> rusqlite::Result<ProjectionCheckpoint> {
 fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
     Ok(AuthPairingLink {
         id: row.get(0)?,
-        credential: row.get(1)?,
-        method: row.get(2)?,
-        scopes: decode_json(row.get(3)?, "scopes")?,
-        subject: row.get(4)?,
-        label: row.get(5)?,
-        proof_key_thumbprint: row.get(6)?,
-        created_at: row.get(7)?,
-        expires_at: row.get(8)?,
-        consumed_at: row.get(9)?,
-        revoked_at: row.get(10)?,
+        credential_hash: row.get(1)?,
+        credential_fingerprint: row.get(2)?,
+        method: row.get(3)?,
+        scopes: decode_json(row.get(4)?, "scopes")?,
+        subject: row.get(5)?,
+        label: row.get(6)?,
+        proof_key_thumbprint: row.get(7)?,
+        created_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        consumed_at: row.get(10)?,
+        revoked_at: row.get(11)?,
     })
 }
 fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
@@ -1965,5 +2169,6 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         expires_at: row.get(11)?,
         last_connected_at: row.get(12)?,
         revoked_at: row.get(13)?,
+        proof_key_thumbprint: row.get(14)?,
     })
 }

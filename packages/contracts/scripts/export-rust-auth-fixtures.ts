@@ -312,7 +312,6 @@ addJsonFixture("responses/websocket-ticket.json", AuthWebSocketTicketResult, {
 
 addJsonFixture("requests/pairing-create.json", AuthCreatePairingCredentialInput, {
   label: "Fixture pairing link",
-  scopes: standardClientScopes,
 });
 addJsonFixture("responses/pairing-create.json", AuthPairingCredentialResult, {
   id: pairingId,
@@ -323,10 +322,8 @@ addJsonFixture("responses/pairing-create.json", AuthPairingCredentialResult, {
 addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
   {
     id: pairingId,
-    credential: pairingCredential,
-    scopes: standardClientScopes,
-    subject: "fixture-client",
-    label: "Fixture pairing link",
+    credentialFingerprint: "sha256:91b7e2e2d164",
+    clientLabel: "Fixture pairing link",
     createdAt: issuedAt,
     expiresAt: pairingExpiresAt,
   },

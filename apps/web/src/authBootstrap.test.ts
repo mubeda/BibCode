@@ -463,7 +463,6 @@ describe("resolveInitialServerAuthGateState", () => {
 
     const credential = await createServerPairingCredential({
       label: "Julius iPhone",
-      scopes: ["orchestration:read"],
     });
     expect(credential).toMatchObject({
       id: "pairing-link-1",
@@ -471,8 +470,6 @@ describe("resolveInitialServerAuthGateState", () => {
       label: "Julius iPhone",
     });
     expect(DateTime.formatIso(credential.expiresAt)).toBe("2026-04-05T00:00:00.000Z");
-    expect(testApi.calls.pairingCredential).toEqual([
-      { label: "Julius iPhone", scopes: ["orchestration:read"] },
-    ]);
+    expect(testApi.calls.pairingCredential).toEqual([{ label: "Julius iPhone" }]);
   });
 });

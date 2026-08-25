@@ -87,8 +87,9 @@ part of the initial HTTP request:
 https://server.example:3773/pair#token=PAIRING_CREDENTIAL
 ```
 
-The client exchanges the credential for a session. Treat the credential and
-pairing URL as passwords until the exchange completes.
+The client generates a DPoP key and exchanges the credential with a fresh proof
+for the exact token endpoint. The resulting session is bound to that key. Treat
+the credential and pairing URL as passwords until the exchange completes.
 
 For a configured hosted web app, use a URL shaped like:
 
@@ -120,8 +121,17 @@ only inside the URL fragment. JSON includes the explicitly documented
 secret.
 
 The issued session is a full environment administrator for the current
-feature: permission levels are not user-selectable. In the browser/hosted UI,
-review and revoke access from **Settings → Connections**.
+feature: permission levels are not user-selectable, and a paired client can
+operate projects and terminals and administer other client access. In the
+browser/hosted UI, **Settings → Connections** shows this warning before
+creation. The raw value is shown once in the creation result so it can be
+copied; closing that result permanently leaves only a fingerprint, label, and
+expiry. BiBCode stores a SHA-256 hash rather than a recoverable pairing value.
+
+If the exchange response is lost, retry with the same DPoP key within five
+minutes to recover the same logical session. Retrying with a different key or
+without DPoP is rejected. WebSocket tickets are also one-use, and revoking a
+client closes its active socket rather than waiting for its next request.
 
 ## Browser/hosted and future re-enabled desktop-managed SSH status
 
@@ -181,6 +191,8 @@ identity checks then apply.
 - Verify the certificate through system trust or an explicitly accepted pin;
   descriptor fingerprint metadata is not itself a trust decision.
 - Treat pairing URLs and credentials as secrets.
+- Copy a newly created pairing credential before closing its reveal-once
+  result; BiBCode cannot display it again.
 - In the browser/hosted UI, review and revoke sessions you no longer trust in
   **Settings → Connections**.
 - Credentials can leak through browser history, screenshots, logs, or copied

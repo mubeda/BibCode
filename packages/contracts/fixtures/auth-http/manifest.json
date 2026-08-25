@@ -138,7 +138,7 @@
         {
           "contentType": "application/json",
           "schema": "Objects",
-          "fingerprint": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a"
+          "fingerprint": "626587fff8bf87c39d36e36ca49c63b370791c4378dcf2d3319a1acb7ecb1f6c"
         }
       ],
       "successes": [
@@ -187,7 +187,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Arrays",
-          "fingerprint": "2aa72d24a01882ffaa95f36773d455c279e2cd863abdbc36b82da99ace977fc2"
+          "fingerprint": "d3d1db33c7e9f8f62e4602ef1d32be6bac4e3754d71500ebf2f0e2e68a6ff84a"
         }
       ],
       "errors": [
@@ -480,13 +480,13 @@
     "AuthClientSession": "ca6a71208b6e873ecd4f6d1a692a9cd7cdce900cfed520e9256754dbd6339f95",
     "AuthClientSessionList": "b06719a499829317cf7f7abbad18b2967ec04c049fc6aa47305cc36b11ae3b9b",
     "AuthClientSessionRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
-    "AuthCreatePairingCredentialInput": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a",
+    "AuthCreatePairingCredentialInput": "626587fff8bf87c39d36e36ca49c63b370791c4378dcf2d3319a1acb7ecb1f6c",
     "AuthEnvironmentScope": "0075f3b8e58d5c596cb62b1fab337228db16942bc03be9685fafa11f5aa8b08d",
     "AuthEnvironmentScopes": "c80c09a9ed11b43aa331fd500b6a7bba484dd93cfef92c7a014bb9812f3b4989",
     "AuthOtherClientSessionsRevokeResult": "09a01af283c067546b42a825ad343e48941492ad5c319c211e5f6b75f51d4af1",
     "AuthPairingCredentialResult": "57232db62fd57bd4c2dd35776b84fe2d264254d50ec46efd65ebe10436b4f8e0",
-    "AuthPairingLink": "5f9e80a3a34fc9371c02a0a9e4c28d1b5e6ec6dcc259e197ebac16879e033792",
-    "AuthPairingLinkList": "65474e4e4d88139c6b53fd39f8af62c7cb29db8b711adaa1ec9dd1f5bea482ee",
+    "AuthPairingLink": "37fc9c4b8423856c4a385ec2c1b8b25c92e11c0dea7ea5e090aa77b6d55e36b7",
+    "AuthPairingLinkList": "130c2810c2368a8b5e216d82ca86a82f3b45ca3ce27136c4cfc90d7d669426f9",
     "AuthPairingLinkRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
     "AuthRevokeClientSessionInput": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58",
     "AuthRevokePairingLinkInput": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968",

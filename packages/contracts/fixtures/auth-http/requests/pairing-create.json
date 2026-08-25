@@ -1,10 +1,3 @@
 {
-  "label": "Fixture pairing link",
-  "scopes": [
-    "orchestration:read",
-    "orchestration:operate",
-    "terminal:operate",
-    "review:write",
-    "relay:read"
-  ]
+  "label": "Fixture pairing link"
 }

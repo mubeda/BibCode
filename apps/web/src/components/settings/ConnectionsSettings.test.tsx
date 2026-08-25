@@ -704,14 +704,11 @@ function pairingLink(input: {
   readonly id: string;
   readonly label?: string;
   readonly expiresAt?: DateTime.Utc;
-  readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
 }): AuthPairingLink {
   return {
     id: input.id,
-    credential: `credential-${input.id}`,
-    scopes: input.scopes ?? STANDARD_SCOPES,
-    subject: `subject-${input.id}`,
-    ...(input.label === undefined ? {} : { label: input.label }),
+    credentialFingerprint: `sha256:${input.id}`,
+    clientLabel: input.label ?? null,
     createdAt: RECENT,
     expiresAt: input.expiresAt ?? FUTURE,
   } as AuthPairingLink;
@@ -903,7 +900,12 @@ beforeEach(() => {
   h.refreshDesktopNetworkAccessState.mockReset();
   h.refreshDesktopWslState.mockReset();
   h.createServerPairingCredential.mockReset();
-  h.createServerPairingCredential.mockResolvedValue({ id: "new", credential: "new-credential" });
+  h.createServerPairingCredential.mockResolvedValue({
+    id: "new",
+    credential: "new-credential",
+    label: "Kitchen tablet",
+    expiresAt: FUTURE,
+  });
   h.revokeServerPairingLink.mockReset();
   h.revokeServerPairingLink.mockResolvedValue(true);
   h.revokeServerClientSession.mockReset();
@@ -1280,11 +1282,7 @@ describe("ConnectionsSettings", () => {
     h.accessChangesQuery.data = accessSnapshot({
       pairingLinks: [
         pairingLink({ id: "pl-live", label: "Living room iPad" }),
-        pairingLink({
-          id: "pl-read-only",
-          label: "Read-only tablet",
-          scopes: [AuthOrchestrationReadScope],
-        }),
+        pairingLink({ id: "pl-admin", label: "Administrator tablet" }),
         pairingLink({ id: "pl-anonymous" }),
         pairingLink({ id: "pl-expired", expiresAt: PAST }),
       ],
@@ -1317,51 +1315,12 @@ describe("ConnectionsSettings", () => {
 
     expect(markup).toContain("Authorized clients");
     expect(markup).toContain("Living room iPad");
-    expect(markup).toContain("1 scope");
-    expect(markup).toContain("Pairing link");
-    expect(markup).not.toContain("credential-pl-expired");
+    expect(markup).toContain("Fingerprint sha256:pl-live");
+    expect(markup).toContain("cannot be recovered");
+    expect(markup).not.toContain("credential-pl-live");
     expect(markup).toContain("This device");
     expect(markup).toContain("macOS · Safari");
     expect(markup).toContain("This server controls its HTTPS listener where it is launched.");
-
-    // Copy the shareable pairing URL (current-origin fallback: no endpoints).
-    invoke(control("button", "Copy pairing URL for: URL"), "onClick");
-    expect(h.copies[0]?.value).toContain("https://app.example.com/pair");
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Pairing URL copied" }),
-    );
-
-    // Secure-context URL failures distinguish full URLs from raw codes.
-    h.toastAdd.mockClear();
-    h.copyBehavior = "error";
-    invoke(control("button", "Copy pairing URL for: URL"), "onClick");
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not copy pairing URL" }),
-    );
-    h.copyBehavior = "copy";
-
-    // Copy the raw pairing code from the grouped menu.
-    h.toastAdd.mockClear();
-    invoke(control("menu-item", "Copy code"), "onClick");
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Pairing code copied" }),
-    );
-
-    // Copy errors open the reveal dialog and surface an error toast.
-    h.toastAdd.mockClear();
-    h.copyBehavior = "error";
-    invoke(control("menu-item", "Copy code"), "onClick");
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not copy pairing code" }),
-    );
-    h.copyBehavior = "copy";
-
-    // The reveal textarea selects its content on focus/click.
-    const selectSpy = vi.fn();
-    const textarea = h.controls.find((entry) => entry.kind === "textarea");
-    invoke(textarea!, "onFocus", { currentTarget: { select: selectSpy } });
-    invoke(textarea!, "onClick", { currentTarget: { select: selectSpy } });
-    expect(selectSpy).toHaveBeenCalledTimes(2);
 
     // Revoke a pairing link (success then failure).
     invoke(findControls("button", "Revoke")[0]!, "onClick");
@@ -1410,25 +1369,24 @@ describe("ConnectionsSettings", () => {
       expect.objectContaining({ title: "Could not revoke other clients" }),
     );
 
-    // Create-link dialog: scope presets, checkbox toggles, create + cancel.
-    invoke(findControls("checkbox", "true")[0]!, "onCheckedChange", false);
-    invoke(findControls("checkbox", "false")[0]!, "onCheckedChange", true);
-    invoke(control("button", "Read only"), "onClick");
-    invoke(control("button", "Standard"), "onClick");
-    const labelInput = control("input", "e.g. Living room iPad");
+    // Pairing creation is explicit about full administrator access and has no permission picker.
+    expect(markup).toContain("full administrator access");
+    expect(markup).toContain("Permission levels are not available yet");
+    expect(findControls("checkbox", "true")).toHaveLength(0);
+    const labelInput = control("input", "e.g. Work laptop");
     invoke(labelInput, "onChange", { target: { value: "Kitchen tablet" } });
 
     h.toastAdd.mockClear();
-    clickButton("Create link");
+    clickButton("Create code");
     await flush();
     expect(h.createServerPairingCredential).toHaveBeenCalled();
     expect(h.toastAdd).not.toHaveBeenCalled();
 
     h.createServerPairingCredential.mockRejectedValueOnce(new Error("create failed"));
-    clickButton("Create link");
+    clickButton("Create code");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not create pairing URL" }),
+      expect.objectContaining({ title: "Could not create pairing code" }),
     );
 
     clickButton("Cancel");
@@ -1436,10 +1394,9 @@ describe("ConnectionsSettings", () => {
       invoke(dialog, "onOpenChange", false);
       invoke(dialog, "onOpenChange", true);
     }
-    invoke(control("button", "Done"), "onClick");
   });
 
-  it("falls back to reveal dialogs when the clipboard is unavailable on a loopback host", () => {
+  it("never re-reveals stored pairing secrets when the clipboard is unavailable", () => {
     stubBrowserWindow({ hostname: "localhost", secure: false, clipboard: false });
     h.hasCloudConfig = false;
     h.primarySessionState = {
@@ -1452,10 +1409,10 @@ describe("ConnectionsSettings", () => {
 
     const markup = render();
 
-    // Loopback host + no endpoints: no shareable URL, token-only guidance.
-    expect(markup).toContain("Show code");
-    expect(markup).toContain("Copy the token and pair from another client");
-    expect(markup).toContain("Clipboard copy is unavailable here.");
+    expect(markup).toContain("Fingerprint sha256:pl-local");
+    expect(markup).toContain("cannot be recovered");
+    expect(markup).not.toContain("credential-pl-local");
+    expect(markup).not.toContain("Show code");
   });
 
   it("shows the secure loopback transport notice for non-remote browser admins", () => {
@@ -1551,22 +1508,9 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("BiBCode Connect");
     expect(markup).toContain("Authorized clients");
 
-    // The pairing link resolves URLs against the advertised endpoints.
-    expect(markup).toContain("Copy pairing URL for: Tailscale HTTPS");
-    invoke(control("button", "Copy pairing URL for: Tailscale HTTPS"), "onClick");
-    expect(h.copies[0]?.value).toContain("machine.tailnet.ts.net");
-
-    // Endpoint copy menu contains backend URLs and hosted app links.
-    invoke(control("menu-item", "Tailscale HTTPS"), "onClick");
-    expect(h.copies[1]?.value).toContain("/pair?host=");
-
-    h.toastAdd.mockClear();
-    h.copyBehavior = "error";
-    invoke(control("menu-item", "Tailscale HTTPS"), "onClick");
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not copy hosted app link" }),
-    );
-    h.copyBehavior = "copy";
+    expect(markup).toContain("Fingerprint sha256:pl-desktop");
+    expect(markup).toContain("cannot be recovered");
+    expect(markup).not.toContain("credential-pl-desktop");
 
     // The tailscale-disable confirmation remains explicit.
     for (const entry of findControls("button", "Restart and disable")) {

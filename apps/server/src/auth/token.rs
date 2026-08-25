@@ -87,6 +87,7 @@ pub struct SessionClaims {
 pub struct WebSocketClaims {
     pub v: u8,
     pub kind: String,
+    pub jti: String,
     pub sid: String,
     pub iat: i64,
     pub exp: i64,

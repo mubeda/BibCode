@@ -322,11 +322,11 @@ git commit -m "feat(server): create pairing credentials through local control"
 - Modify: `packages/contracts/src/auth.ts`
 - Test: `apps/server/tests/repositories.rs`, `auth_http.rs`
 
-- [ ] **Step 1: Write failing persistence and exchange tests**
+- [x] **Step 1: Write failing persistence and exchange tests**
 
 Assert that raw credentials never occur in SQLite, snapshots, logs, pairing-list responses, or diagnostic errors. Cover five-minute expiry, two-client race, same-key lost-response retry, different-key retry, DPoP method/URL mismatch, replay, revocation, WebSocket ticket invalidation, and access capacity.
 
-- [ ] **Step 2: Replace plaintext storage with a hash**
+- [x] **Step 2: Replace plaintext storage with a hash**
 
 Add `credential_hash BLOB NOT NULL UNIQUE`, `credential_fingerprint TEXT NOT NULL`, and a bounded `auth_pairing_exchange_receipts` table. Migration hashes active legacy credentials in one transaction and drops the plaintext column by table rebuild.
 
@@ -338,11 +338,11 @@ fn pairing_hash(credential: &SecretString) -> [u8; 32] {
 
 Keep the raw value only in the issuance response and zeroize owned buffers where practical.
 
-- [ ] **Step 3: Make consumption atomic and sender-constrained**
+- [x] **Step 3: Make consumption atomic and sender-constrained**
 
 Inside one immediate transaction: look up the unconsumed hash, verify expiry and intended proof thumbprint, mark consumed, create the client/session, persist an exchange receipt keyed by `(pairing_id, proof_thumbprint)`, and return the session. A retry with the same credential hash and DPoP key during the short receipt window returns the same logical exchange result; any different key fails without creating access.
 
-- [ ] **Step 4: Remove credentials from administrative views**
+- [x] **Step 4: Remove credentials from administrative views**
 
 ```ts
 export const PairingLinkViewSchema = Schema.Struct({
@@ -356,11 +356,11 @@ export const PairingLinkViewSchema = Schema.Struct({
 
 The UI lists pairing/client metadata and revocation controls, never a reusable credential.
 
-- [ ] **Step 5: Prove DPoP/session lifecycle**
+- [x] **Step 5: Prove DPoP/session lifecycle**
 
 Use fresh `jti` values, exact `htu`/`htm`, timestamp/nonce bounds, bounded replay state, DPoP token type, one-use WebSocket tickets, revocation-driven socket close, and safe audit IDs.
 
-- [ ] **Step 6: Run persistence/auth tests and commit**
+- [x] **Step 6: Run persistence/auth tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test repositories auth_pairing -- --nocapture
@@ -369,6 +369,24 @@ vp test packages/contracts/src/auth.test.ts
 git add apps/server/src/persistence/migrations.rs apps/server/src/persistence/repositories.rs apps/server/src/auth packages/contracts/src/auth.ts packages/contracts/src/auth.test.ts apps/server/tests/repositories.rs apps/server/tests/auth_http.rs
 git commit -m "fix(auth): hash pairing credentials and bind exchange to DPoP"
 ```
+
+Implementation note: migration 48 rebuilds pairing storage without plaintext,
+uses secure deletion, skips a plaintext-preserving pre-migration backup, and
+repeats WAL truncation on later existing-store starts. Pairing exchange is one
+immediate transaction with a bounded same-key receipt, a 64-attempt/minute
+admission window, persisted proof binding, and non-consuming capacity failures.
+Administrative contracts/events are metadata-only; the UI warns about fixed
+full-administrator access and reveals a new code only until its creation dialog
+closes. One-use WebSocket tickets and auth revocation now close active sockets.
+
+Direct macOS validation passed the repository exchange test, 16-test auth HTTP
+suite, 11-test auth service suite, physical plaintext scrub test, six contract
+tests, 40 focused web tests, affected package typechecks, `vp check`, Rust
+formatting, and server all-target Clippy with warnings denied. The only
+`vp check` warning is the pre-existing unused `otherEnvironmentId` fixture in
+the already committed Plan 20 storage test. Plan-wide `vp run typecheck` remains
+deferred to Plan 60 because its known failures are confined to Connect fixtures
+scheduled for deletion.
 
 ### Task 6: Add typed workstation and headless service lifecycle
 

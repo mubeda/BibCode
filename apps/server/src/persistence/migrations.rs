@@ -10,6 +10,7 @@ use rusqlite::{
     params_from_iter,
     types::Value,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +43,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (13, "projection_thread_proposed_plans"),
     (20, "auth_pairing_links"),
     (20, "auth_sessions"),
+    (48, "auth_pairing_exchange_receipts"),
     (34, "activity_scopes"),
     (34, "activity_records"),
     (34, "activity_entries"),
@@ -675,6 +677,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
     Migration::new(46, "ProjectRepositoryClaims", migration_046),
     Migration::new(47, "OneActiveMainThread", migration_047),
+    Migration::new(48, "HashedPairingCredentials", migration_048),
 ];
 
 impl Migration {
@@ -2578,6 +2581,121 @@ fn migration_047(transaction: &Transaction<'_>) -> Result<()> {
     )
 }
 
+fn migration_048(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists(transaction, "auth_pairing_links")? {
+        return Ok(());
+    }
+    transaction.pragma_update(None, "secure_delete", "ON")?;
+
+    let legacy_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, \
+                    created_at, expires_at, consumed_at, revoked_at \
+             FROM auth_pairing_links",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE auth_pairing_links_v48 (
+          id TEXT PRIMARY KEY,
+          credential_hash BLOB NOT NULL UNIQUE CHECK(length(credential_hash) = 32),
+          credential_fingerprint TEXT NOT NULL,
+          method TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          label TEXT,
+          proof_key_thumbprint TEXT,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          revoked_at TEXT
+        );
+        "#,
+    )?;
+    for (
+        id,
+        credential,
+        method,
+        scopes,
+        subject,
+        label,
+        proof_key_thumbprint,
+        created_at,
+        expires_at,
+        consumed_at,
+        revoked_at,
+    ) in legacy_rows
+    {
+        let hash = Sha256::digest(credential.as_bytes()).to_vec();
+        let fingerprint = super::repositories::pairing_credential_fingerprint(&hash);
+        transaction.execute(
+            "INSERT INTO auth_pairing_links_v48 (id, credential_hash, credential_fingerprint, \
+             method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, \
+             consumed_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                id,
+                hash,
+                fingerprint,
+                method,
+                scopes,
+                subject,
+                label,
+                proof_key_thumbprint,
+                created_at,
+                expires_at,
+                consumed_at,
+                revoked_at,
+            ],
+        )?;
+    }
+    transaction.execute_batch(
+        r#"
+        DROP TABLE auth_pairing_links;
+        ALTER TABLE auth_pairing_links_v48 RENAME TO auth_pairing_links;
+
+        CREATE INDEX idx_auth_pairing_links_active
+        ON auth_pairing_links(revoked_at, consumed_at, expires_at);
+
+        CREATE TABLE auth_pairing_exchange_receipts (
+          pairing_id TEXT NOT NULL,
+          proof_thumbprint TEXT NOT NULL,
+          session_id TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          PRIMARY KEY (pairing_id, proof_thumbprint),
+          FOREIGN KEY (pairing_id) REFERENCES auth_pairing_links(id) ON DELETE CASCADE,
+          FOREIGN KEY (session_id) REFERENCES auth_sessions(session_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_auth_pairing_exchange_receipts_expiry
+        ON auth_pairing_exchange_receipts(expires_at, created_at);
+        "#,
+    )?;
+    if !table_has_column(transaction, "auth_sessions", "proof_key_thumbprint")? {
+        transaction
+            .execute_batch("ALTER TABLE auth_sessions ADD COLUMN proof_key_thumbprint TEXT")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2586,6 +2704,7 @@ mod tests {
         validate_existing_bibcode_store_with_control,
         validate_existing_bibcode_store_with_inspection_control,
     };
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -3098,7 +3217,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=47).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=48).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3117,10 +3236,63 @@ mod tests {
         assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
         assert_eq!(MIGRATIONS[45].name, "ProjectRepositoryClaims");
         assert_eq!(MIGRATIONS[46].name, "OneActiveMainThread");
+        assert_eq!(MIGRATIONS[47].name, "HashedPairingCredentials");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
         assert_eq!(migration.name, "RuntimeFixture");
+    }
+
+    #[test]
+    fn pairing_hash_migration_preserves_active_grants_without_plaintext() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(47))?;
+        let raw_credential = "LEGACYPAIRING";
+        connection.execute(
+            "INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, \
+             proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) \
+             VALUES ('legacy-pairing', ?, 'one-time-token', '[\"access:read\"]', \
+             'environment-administrator', 'Legacy laptop', NULL, \
+             '2026-08-25T12:00:00Z', '2026-08-25T12:05:00Z', NULL, NULL)",
+            [raw_credential],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [48]
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(auth_pairing_links)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(!columns.iter().any(|column| column == "credential"));
+        assert!(columns.iter().any(|column| column == "credential_hash"));
+        let (hash, fingerprint) = connection.query_row(
+            "SELECT credential_hash, credential_fingerprint \
+             FROM auth_pairing_links WHERE id = 'legacy-pairing'",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        assert_eq!(hash, Sha256::digest(raw_credential.as_bytes()).to_vec());
+        assert_eq!(
+            fingerprint,
+            crate::persistence::repositories::pairing_credential_fingerprint(&hash)
+        );
+        assert!(table_exists(&connection, "auth_pairing_exchange_receipts")?);
+        let session_columns = connection
+            .prepare("PRAGMA table_info(auth_sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            session_columns
+                .iter()
+                .any(|column| column == "proof_key_thumbprint")
+        );
+        Ok(())
     }
 
     #[test]

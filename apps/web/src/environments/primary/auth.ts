@@ -119,10 +119,8 @@ const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
 
 export interface ServerPairingLinkRecord {
   readonly id: string;
-  readonly credential: string;
-  readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
-  readonly subject: string;
-  readonly label?: string;
+  readonly credentialFingerprint: string;
+  readonly clientLabel: string | null;
   readonly createdAt: string;
   readonly expiresAt: string;
 }
@@ -366,7 +364,6 @@ export async function submitServerAuthCredential(credential: string): Promise<vo
 
 export async function createServerPairingCredential(input?: {
   readonly label?: string;
-  readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
 }): Promise<AuthPairingCredentialResult> {
   const trimmedLabel = input?.label?.trim();
   try {
@@ -375,10 +372,7 @@ export async function createServerPairingCredential(input?: {
         Effect.flatMap((client) =>
           client.auth.pairingCredential({
             headers: {},
-            payload: {
-              ...(trimmedLabel ? { label: trimmedLabel } : {}),
-              ...(input?.scopes ? { scopes: input.scopes } : {}),
-            },
+            payload: trimmedLabel ? { label: trimmedLabel } : {},
           }),
         ),
       ),
@@ -398,31 +392,13 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
         Effect.flatMap((client) => client.auth.pairingLinks({ headers: {} })),
       ),
     );
-    return pairingLinks.map((pairingLink) => {
-      const timestamps = {
-        createdAt: DateTime.formatIso(pairingLink.createdAt),
-        expiresAt: DateTime.formatIso(pairingLink.expiresAt),
-      };
-      if (pairingLink.label === undefined) {
-        return {
-          id: pairingLink.id,
-          credential: pairingLink.credential,
-          scopes: pairingLink.scopes,
-          subject: pairingLink.subject,
-          createdAt: timestamps.createdAt,
-          expiresAt: timestamps.expiresAt,
-        };
-      }
-      return {
-        id: pairingLink.id,
-        credential: pairingLink.credential,
-        scopes: pairingLink.scopes,
-        subject: pairingLink.subject,
-        label: pairingLink.label,
-        createdAt: timestamps.createdAt,
-        expiresAt: timestamps.expiresAt,
-      };
-    });
+    return pairingLinks.map((pairingLink) => ({
+      id: pairingLink.id,
+      credentialFingerprint: pairingLink.credentialFingerprint,
+      clientLabel: pairingLink.clientLabel,
+      createdAt: DateTime.formatIso(pairingLink.createdAt),
+      expiresAt: DateTime.formatIso(pairingLink.expiresAt),
+    }));
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "list-pairing-links",

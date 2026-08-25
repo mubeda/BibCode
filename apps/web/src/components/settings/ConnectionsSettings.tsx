@@ -1,8 +1,6 @@
 import {
-  ChevronDownIcon,
   ChevronsLeftRightEllipsisIcon,
   PlusIcon,
-  QrCodeIcon,
   RefreshCwIcon,
   TerminalIcon,
   TriangleAlertIcon,
@@ -10,18 +8,12 @@ import {
 import { useAuth } from "@clerk/react";
 import { type ReactNode, memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  AuthAccessReadScope,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
-  AuthOrchestrationOperateScope,
-  AuthOrchestrationReadScope,
-  AuthRelayReadScope,
   AuthRelayWriteScope,
-  AuthReviewWriteScope,
-  AuthStandardClientScopes,
-  AuthTerminalOperateScope,
   type AuthClientSession,
   type AuthEnvironmentScope,
+  type AuthPairingCredentialResult,
   type AuthPairingLink,
   type AdvertisedEndpoint,
   type DesktopDiscoveredSshHost,
@@ -55,7 +47,6 @@ import {
   useRelativeTimeTick,
 } from "./settingsLayout";
 import { Input } from "../ui/input";
-import { Checkbox } from "../ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -78,7 +69,6 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import { QRCodeSvg } from "../ui/qr-code";
 import { Skeleton } from "../ui/skeleton";
 import { Spinner } from "../ui/spinner";
 import { Switch } from "../ui/switch";
@@ -86,26 +76,15 @@ import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
-import { Group, GroupSeparator } from "../ui/group";
 import { AnimatedHeight } from "../AnimatedHeight";
-import {
-  Menu,
-  MenuGroup,
-  MenuGroupLabel,
-  MenuItem,
-  MenuPopup,
-  MenuSeparator,
-  MenuTrigger,
-} from "../ui/menu";
 import { Textarea } from "../ui/textarea";
-import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../pairingUrl";
+import { getPairingTokenFromUrl } from "../../pairingUrl";
 import { readHostedPairingRequest } from "../../hostedPairing";
 import {
   createServerPairingCredential,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
-  isLoopbackHostname,
   usePrimarySessionState,
   type ServerClientSessionRecord,
   type ServerPairingLinkRecord,
@@ -158,53 +137,6 @@ function formatAccessTimestamp(value: string): string {
   }
   return accessTimestampFormatter.format(parsed);
 }
-
-const PAIRING_SCOPE_OPTIONS: ReadonlyArray<{
-  readonly scope: AuthEnvironmentScope;
-  readonly title: string;
-  readonly description: string;
-}> = [
-  {
-    scope: AuthOrchestrationReadScope,
-    title: "View environment",
-    description: "Read threads, status, diffs, and configuration.",
-  },
-  {
-    scope: AuthOrchestrationOperateScope,
-    title: "Operate tasks",
-    description: "Start tasks and perform changes in the environment.",
-  },
-  {
-    scope: AuthTerminalOperateScope,
-    title: "Use terminals",
-    description: "Create terminals and send input to running shells.",
-  },
-  {
-    scope: AuthReviewWriteScope,
-    title: "Write reviews",
-    description: "Create comments while reviewing changes.",
-  },
-  {
-    scope: AuthAccessReadScope,
-    title: "View access",
-    description: "Inspect pairing links and authorized clients.",
-  },
-  {
-    scope: AuthAccessWriteScope,
-    title: "Manage access",
-    description: "Issue and revoke credentials for other clients.",
-  },
-  {
-    scope: AuthRelayReadScope,
-    title: "View relay",
-    description: "Inspect managed relay connectivity.",
-  },
-  {
-    scope: AuthRelayWriteScope,
-    title: "Manage relay",
-    description: "Change managed tunnel connectivity.",
-  },
-];
 
 function AccessScopeSummary({
   scopes,
@@ -551,11 +483,6 @@ function resolveAdvertisedEndpointPairingUrl(
   return resolveDesktopPairingUrl(endpoint.httpBaseUrl, credential);
 }
 
-function resolveCurrentOriginPairingUrl(credential: string): string {
-  const url = new URL("/pair", window.location.href);
-  return setPairingTokenOnUrl(url, credential).toString();
-}
-
 function isHostedAppPairingUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -597,9 +524,6 @@ type PairingLinkListRowProps = {
 
 const PairingLinkListRow = memo(function PairingLinkListRow({
   pairingLink,
-  endpointUrl,
-  endpoints,
-  defaultEndpointKey,
   presentation = "current",
   revokingPairingLinkId,
   onRevoke,
@@ -608,201 +532,6 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
   const expiresAtMs = useMemo(
     () => new Date(pairingLink.expiresAt).getTime(),
     [pairingLink.expiresAt],
-  );
-  const [isRevealDialogOpen, setIsRevealDialogOpen] = useState(false);
-
-  const currentOriginPairingUrl = useMemo(
-    () => resolveCurrentOriginPairingUrl(pairingLink.credential),
-    [pairingLink.credential],
-  );
-  const hostedPairingUrl = useMemo(
-    () =>
-      endpointUrl != null && endpointUrl !== ""
-        ? resolveHostedPairingUrl(endpointUrl, pairingLink.credential)
-        : null,
-    [endpointUrl, pairingLink.credential],
-  );
-  const endpointPairingUrl = useMemo(() => {
-    const endpoint = selectPairingEndpoint(endpoints, defaultEndpointKey);
-    return endpoint ? resolveAdvertisedEndpointPairingUrl(endpoint, pairingLink.credential) : null;
-  }, [defaultEndpointKey, endpoints, pairingLink.credential]);
-  const endpointCopyOptions = useMemo(() => {
-    const options: Array<{
-      readonly key: string;
-      readonly label: string;
-      readonly url: string;
-      readonly detail: string;
-    }> = [];
-    for (const endpoint of endpoints) {
-      if (endpoint.status === "unavailable") {
-        continue;
-      }
-      const url = resolveAdvertisedEndpointPairingUrl(endpoint, pairingLink.credential);
-      options.push({
-        key: endpointDefaultPreferenceKey(endpoint),
-        label: endpoint.label,
-        url,
-        detail: isHostedAppPairingUrl(url) ? "Hosted app link" : "Backend pairing URL",
-      });
-    }
-    return options;
-  }, [endpoints, pairingLink.credential]);
-  const shareablePairingUrl =
-    endpointPairingUrl ??
-    (endpointUrl != null && endpointUrl !== ""
-      ? (hostedPairingUrl ?? resolveDesktopPairingUrl(endpointUrl, pairingLink.credential))
-      : isLoopbackHostname(window.location.hostname)
-        ? null
-        : currentOriginPairingUrl);
-  const revealValue = shareablePairingUrl ?? pairingLink.credential;
-  const isShareableHostedAppPairingUrl =
-    shareablePairingUrl !== null && isHostedAppPairingUrl(shareablePairingUrl);
-  const canCopyToClipboard =
-    typeof window !== "undefined" &&
-    window.isSecureContext &&
-    navigator.clipboard?.writeText != null;
-
-  const { copyToClipboard } = useCopyToClipboard<"code" | "hosted-link" | "link">({
-    onCopy: (kind) => {
-      toastManager.add({
-        type: "success",
-        title:
-          kind === "hosted-link"
-            ? "Hosted app link copied"
-            : kind === "link"
-              ? "Pairing URL copied"
-              : "Pairing code copied",
-        description:
-          kind === "hosted-link"
-            ? "Open it in the browser on the device you want to connect."
-            : kind === "link"
-              ? "Open it in the client you want to pair to this environment."
-              : "Paste it into another client to finish pairing.",
-      });
-    },
-    onError: (error, kind) => {
-      setIsRevealDialogOpen(true);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: canCopyToClipboard
-            ? kind === "hosted-link"
-              ? "Could not copy hosted app link"
-              : kind === "link"
-                ? "Could not copy pairing URL"
-                : "Could not copy pairing code"
-            : "Clipboard copy unavailable",
-          description: canCopyToClipboard ? error.message : "Showing the full value instead.",
-        }),
-      );
-    },
-  });
-
-  const copyPairingValue = useCallback(
-    (value: string, kind: "code" | "hosted-link" | "link") => {
-      copyToClipboard(value, kind);
-    },
-    [copyToClipboard],
-  );
-
-  const copyKindForUrl = useCallback(
-    (url: string): "hosted-link" | "link" => (isHostedAppPairingUrl(url) ? "hosted-link" : "link"),
-    [],
-  );
-
-  const handleCopyCode = useCallback(() => {
-    copyPairingValue(pairingLink.credential, "code");
-  }, [copyPairingValue, pairingLink.credential]);
-
-  const handleCopyDefaultLink = useCallback(() => {
-    if (!shareablePairingUrl) return;
-    copyPairingValue(shareablePairingUrl, copyKindForUrl(shareablePairingUrl));
-  }, [copyKindForUrl, copyPairingValue, shareablePairingUrl]);
-
-  const expiresAbsolute = formatAccessTimestamp(pairingLink.expiresAt);
-
-  const primaryLabel = pairingLink.label ?? "Pairing link";
-  const defaultEndpointCopyOption =
-    endpointCopyOptions.find((option) => option.key === defaultEndpointKey) ??
-    endpointCopyOptions[0] ??
-    null;
-  const defaultEndpointCopyLabel = defaultEndpointCopyOption?.label ?? "URL";
-  const backendEndpointCopyOptions = endpointCopyOptions.filter(
-    (option) => !isHostedAppPairingUrl(option.url),
-  );
-  const hostedEndpointCopyOptions = endpointCopyOptions.filter((option) =>
-    isHostedAppPairingUrl(option.url),
-  );
-  const renderEndpointMenuItems = (
-    options: typeof endpointCopyOptions = endpointCopyOptions,
-    renderDetail = true,
-  ) =>
-    options.map((option) => (
-      <MenuItem
-        key={option.key}
-        onClick={() => copyPairingValue(option.url, copyKindForUrl(option.url))}
-      >
-        <span className="min-w-0 flex-1">
-          <span className="block truncate">{option.label}</span>
-          {renderDetail ? (
-            <span className="block truncate text-[11px] text-muted-foreground">
-              {option.detail}
-            </span>
-          ) : null}
-        </span>
-      </MenuItem>
-    ));
-  const renderPairingCodeMenuItem = (renderDetail = true) => (
-    <MenuItem onClick={handleCopyCode}>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate">Copy code</span>
-        {renderDetail ? (
-          <span className="block truncate text-[11px] text-muted-foreground">Token only</span>
-        ) : null}
-      </span>
-    </MenuItem>
-  );
-  const renderCompactEndpointGroup = (
-    label: string,
-    options: typeof endpointCopyOptions,
-    includeSeparator: boolean,
-  ) =>
-    options.length > 0 ? (
-      <>
-        {includeSeparator ? <MenuSeparator /> : null}
-        <MenuGroup>
-          <MenuGroupLabel>{label}</MenuGroupLabel>
-          {renderEndpointMenuItems(options, false)}
-        </MenuGroup>
-      </>
-    ) : null;
-  const renderGroupedCopyMenuItems = (options?: { codeFirst?: boolean }) => (
-    <>
-      {options?.codeFirst ? (
-        <>
-          <MenuGroup>
-            <MenuGroupLabel>Pairing code</MenuGroupLabel>
-            {renderPairingCodeMenuItem(false)}
-          </MenuGroup>
-          {endpointCopyOptions.length > 0 ? <MenuSeparator /> : null}
-        </>
-      ) : null}
-      {renderCompactEndpointGroup("Pairing URLs", backendEndpointCopyOptions, false)}
-      {renderCompactEndpointGroup(
-        "Hosted app link",
-        hostedEndpointCopyOptions,
-        backendEndpointCopyOptions.length > 0,
-      )}
-      {!options?.codeFirst ? (
-        <>
-          {endpointCopyOptions.length > 0 ? <MenuSeparator /> : null}
-          <MenuGroup>
-            <MenuGroupLabel>Pairing code</MenuGroupLabel>
-            {renderPairingCodeMenuItem(false)}
-          </MenuGroup>
-        </>
-      ) : null}
-    </>
   );
 
   if (expiresAtMs <= nowMs) {
@@ -818,158 +547,31 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
               tooltipText={`Link created at ${formatAccessTimestamp(pairingLink.createdAt)}`}
               dotClassName="bg-amber-400"
             />
-            <h3 className="text-sm font-medium text-foreground">{primaryLabel}</h3>
-            <Popover>
-              {shareablePairingUrl ? (
-                <>
-                  <PopoverTrigger
-                    openOnHover
-                    delay={250}
-                    closeDelay={100}
-                    render={
-                      <button
-                        type="button"
-                        className="inline-flex size-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground/50 outline-none hover:text-foreground"
-                        aria-label="Show QR code"
-                      />
-                    }
-                  >
-                    <QrCodeIcon aria-hidden className="size-3" />
-                  </PopoverTrigger>
-                  <PopoverPopup side="top" align="start" tooltipStyle className="w-max">
-                    <QRCodeSvg
-                      value={shareablePairingUrl}
-                      size={88}
-                      level="M"
-                      marginSize={2}
-                      title="Pairing link — scan to open on another device"
-                    />
-                  </PopoverPopup>
-                </>
-              ) : null}
-            </Popover>
+            <h3 className="text-sm font-medium text-foreground">
+              {pairingLink.clientLabel ?? "Pending administrator"}
+            </h3>
           </div>
-          <p className="text-xs text-muted-foreground" title={expiresAbsolute}>
+          <p className="text-xs text-muted-foreground">
             {formatExpiresInLabel(pairingLink.expiresAt, nowMs)}
             <span aria-hidden> · </span>
-            <AccessScopeSummary scopes={pairingLink.scopes} label="Pairing link scopes" />
+            Fingerprint {pairingLink.credentialFingerprint}
           </p>
-          {shareablePairingUrl === null ? (
-            <p className="text-[11px] text-muted-foreground/70">
-              Copy the token and pair from another client using this backend&apos;s reachable host.
-            </p>
-          ) : null}
+          <p className="text-[11px] text-muted-foreground/70">
+            The one-time secret was shown only when this link was created and cannot be recovered.
+          </p>
         </div>
-        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
-          <Dialog open={isRevealDialogOpen} onOpenChange={setIsRevealDialogOpen}>
-            {canCopyToClipboard ? (
-              <>
-                {shareablePairingUrl ? (
-                  <Group aria-label="Copy selected endpoint">
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      className="max-w-56"
-                      title={`Copy pairing URL for: ${defaultEndpointCopyLabel}`}
-                      onClick={handleCopyDefaultLink}
-                    >
-                      <span className="truncate">
-                        Copy pairing URL for: {defaultEndpointCopyLabel}
-                      </span>
-                    </Button>
-                    <GroupSeparator />
-                    <Menu>
-                      <MenuTrigger
-                        render={
-                          <Button
-                            size="icon-xs"
-                            variant="outline"
-                            aria-label="Choose endpoint to copy"
-                          />
-                        }
-                      >
-                        <ChevronDownIcon className="size-3.5" />
-                      </MenuTrigger>
-                      <MenuPopup align="end" className="min-w-60">
-                        {renderGroupedCopyMenuItems()}
-                      </MenuPopup>
-                    </Menu>
-                  </Group>
-                ) : (
-                  <Button size="xs" variant="outline" onClick={handleCopyCode}>
-                    Copy code
-                  </Button>
-                )}
-              </>
-            ) : (
-              <DialogTrigger render={<Button size="xs" variant="outline" />}>
-                {shareablePairingUrl ? "Show link" : "Show code"}
-              </DialogTrigger>
-            )}
-            <DialogPopup className="max-w-md">
-              <DialogHeader>
-                <DialogTitle>
-                  {shareablePairingUrl
-                    ? isShareableHostedAppPairingUrl
-                      ? "Hosted app pairing link"
-                      : "Pairing link"
-                    : "Pairing code"}
-                </DialogTitle>
-                <DialogDescription>
-                  {shareablePairingUrl
-                    ? isShareableHostedAppPairingUrl
-                      ? "Clipboard copy is unavailable here. Open or manually copy this hosted app link on the device you want to connect."
-                      : "Clipboard copy is unavailable here. Open or manually copy this full pairing URL on the device you want to connect."
-                    : "Clipboard copy is unavailable here. Manually copy this code into another client."}
-                </DialogDescription>
-              </DialogHeader>
-              <DialogPanel className="space-y-4">
-                <Textarea
-                  readOnly
-                  value={revealValue}
-                  rows={shareablePairingUrl ? 4 : 3}
-                  className="text-xs leading-relaxed"
-                  onFocus={(event) => event.currentTarget.select()}
-                  onClick={(event) => event.currentTarget.select()}
-                />
-                {shareablePairingUrl ? (
-                  <div className="flex justify-center rounded-xl border border-border/60 bg-muted/30 p-4">
-                    <QRCodeSvg
-                      value={shareablePairingUrl}
-                      size={132}
-                      level="M"
-                      marginSize={2}
-                      title="Pairing link — scan to open on another device"
-                    />
-                  </div>
-                ) : null}
-              </DialogPanel>
-              <DialogFooter variant="bare">
-                <Button variant="outline" onClick={() => setIsRevealDialogOpen(false)}>
-                  Done
-                </Button>
-                {canCopyToClipboard ? (
-                  <Button variant="outline" size="xs" onClick={handleCopyCode}>
-                    Copy code
-                  </Button>
-                ) : null}
-              </DialogFooter>
-            </DialogPopup>
-          </Dialog>
-          <Button
-            size="xs"
-            variant="destructive-outline"
-            disabled={revokingPairingLinkId === pairingLink.id}
-            onClick={() => void onRevoke(pairingLink.id)}
-          >
-            {revokingPairingLinkId === pairingLink.id ? "Revoking…" : "Revoke"}
-          </Button>
-        </div>
+        <Button
+          size="xs"
+          variant="destructive-outline"
+          disabled={revokingPairingLinkId === pairingLink.id}
+          onClick={() => void onRevoke(pairingLink.id)}
+        >
+          {revokingPairingLinkId === pairingLink.id ? "Revoking…" : "Revoke"}
+        </Button>
       </div>
     </div>
   );
 });
-
 type ConnectedClientListRowProps = {
   clientSession: ServerClientSessionRecord;
   presentation?: AccessSectionPresentation;
@@ -1063,37 +665,54 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
 }: AuthorizedClientsHeaderActionProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [pairingLabel, setPairingLabel] = useState("");
-  const [pairingScopes, setPairingScopes] = useState<ReadonlyArray<AuthEnvironmentScope>>([
-    ...AuthStandardClientScopes,
-  ]);
+  const [createdPairing, setCreatedPairing] = useState<AuthPairingCredentialResult | null>(null);
   const [isCreatingPairingLink, setIsCreatingPairingLink] = useState(false);
+  const canCopyToClipboard =
+    typeof window !== "undefined" &&
+    window.isSecureContext &&
+    navigator.clipboard?.writeText != null;
+  const { copyToClipboard } = useCopyToClipboard<"code">({
+    onCopy: () => {
+      toastManager.add({
+        type: "success",
+        title: "Pairing code copied",
+        description: "Use it now on the administrator client you want to connect.",
+      });
+    },
+    onError: (error) => {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not copy pairing code",
+          description: error.message,
+        }),
+      );
+    },
+  });
+
+  const clearDialogSecret = useCallback(() => {
+    setCreatedPairing(null);
+    setPairingLabel("");
+  }, []);
 
   const handleCreatePairingLink = useCallback(async () => {
     setIsCreatingPairingLink(true);
     try {
-      await createServerPairingCredential({ label: pairingLabel, scopes: pairingScopes });
-      setPairingLabel("");
-      setPairingScopes([...AuthStandardClientScopes]);
-      setDialogOpen(false);
+      const result = await createServerPairingCredential({ label: pairingLabel });
+      setCreatedPairing(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to create pairing URL.";
+      const message = error instanceof Error ? error.message : "Failed to create pairing code.";
       toastManager.add(
         stackedThreadToast({
           type: "error",
-          title: "Could not create pairing URL",
+          title: "Could not create pairing code",
           description: message,
         }),
       );
     } finally {
       setIsCreatingPairingLink(false);
     }
-  }, [pairingLabel, pairingScopes]);
-
-  const togglePairingScope = useCallback((scope: AuthEnvironmentScope, checked: boolean) => {
-    setPairingScopes((current) =>
-      checked ? [...current, scope] : current.filter((currentScope) => currentScope !== scope),
-    );
-  }, []);
+  }, [pairingLabel]);
 
   return (
     <div className="flex items-center gap-2">
@@ -1112,8 +731,7 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
         onOpenChange={(open) => {
           setDialogOpen(open);
           if (!open) {
-            setPairingLabel("");
-            setPairingScopes([...AuthStandardClientScopes]);
+            clearDialogSecret();
           }
         }}
       >
@@ -1127,103 +745,102 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
         />
         <DialogPopup className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Create pairing link</DialogTitle>
+            <DialogTitle>
+              {createdPairing ? "Copy this pairing code now" : "Create pairing code"}
+            </DialogTitle>
             <DialogDescription>
-              Generate a one-time link that another device can use to pair with this backend as an
-              authorized client.
+              {createdPairing
+                ? "For privacy, BiBCode stores only a hash. This secret cannot be shown again after you close this dialog."
+                : "The new client receives full administrator access. Permission levels are not available yet."}
             </DialogDescription>
           </DialogHeader>
-          <DialogPanel className="space-y-5">
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-foreground">
-                Client label (optional)
-              </span>
-              <Input
-                value={pairingLabel}
-                onChange={(event) => setPairingLabel(event.target.value)}
-                placeholder="e.g. Living room iPad"
-                disabled={isCreatingPairingLink}
-                autoFocus
-              />
-            </label>
-            <section className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-xs font-medium text-foreground">Permissions</h3>
-                  <p className="text-xs text-muted-foreground">
-                    Limit what the paired client can do.
-                  </p>
+          <DialogPanel className="space-y-4">
+            {createdPairing ? (
+              <>
+                <div
+                  role="alert"
+                  className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
+                >
+                  Anyone with this code can pair as an administrator until it expires or is used.
+                  Share it through a trusted private channel only.
                 </div>
-                <div className="flex gap-1">
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={isCreatingPairingLink}
-                    onClick={() => setPairingScopes([AuthOrchestrationReadScope])}
-                  >
-                    Read only
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={isCreatingPairingLink}
-                    onClick={() => setPairingScopes([...AuthStandardClientScopes])}
-                  >
-                    Standard
-                  </Button>
-                </div>
-              </div>
-              <div className="divide-y divide-border/60 rounded-lg border border-input bg-muted/25">
-                {PAIRING_SCOPE_OPTIONS.map(({ scope, title, description }) => (
-                  <label
-                    key={scope}
-                    className="flex cursor-pointer items-start gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40"
-                  >
-                    <Checkbox
-                      className="mt-0.5"
-                      checked={pairingScopes.includes(scope)}
-                      disabled={isCreatingPairingLink}
-                      onCheckedChange={(checked) => togglePairingScope(scope, checked === true)}
-                    />
-                    <span className="min-w-0">
-                      <span className="block text-xs font-medium text-foreground">{title}</span>
-                      <span className="block text-xs leading-snug text-muted-foreground">
-                        {description}
-                      </span>
-                    </span>
-                  </label>
-                ))}
-              </div>
-              {pairingScopes.length === 0 ? (
-                <p className="text-xs text-destructive">Select at least one permission.</p>
-              ) : pairingScopes.includes(AuthAccessWriteScope) ? (
-                <p className="text-xs text-warning">
-                  This client can create or revoke access for other devices.
+                <Textarea
+                  readOnly
+                  value={createdPairing.credential}
+                  rows={3}
+                  className="font-mono text-sm"
+                  onFocus={(event) => event.currentTarget.select()}
+                  onClick={(event) => event.currentTarget.select()}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Expires {DateTime.formatIso(createdPairing.expiresAt)}. A successful DPoP exchange
+                  consumes the code.
                 </p>
-              ) : null}
-            </section>
+              </>
+            ) : (
+              <>
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-foreground">
+                    Client label (optional)
+                  </span>
+                  <Input
+                    value={pairingLabel}
+                    onChange={(event) => setPairingLabel(event.target.value)}
+                    placeholder="e.g. Work laptop"
+                    disabled={isCreatingPairingLink}
+                    autoFocus
+                  />
+                </label>
+                <div className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+                  This grants full administrator access, including project, terminal, and access
+                  management. You can revoke the client later.
+                </div>
+              </>
+            )}
           </DialogPanel>
           <DialogFooter variant="bare">
-            <Button
-              variant="outline"
-              disabled={isCreatingPairingLink}
-              onClick={() => setDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              disabled={isCreatingPairingLink || pairingScopes.length === 0}
-              onClick={() => void handleCreatePairingLink()}
-            >
-              {isCreatingPairingLink ? "Creating…" : "Create link"}
-            </Button>
+            {createdPairing ? (
+              <>
+                {canCopyToClipboard ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => copyToClipboard(createdPairing.credential, "code")}
+                  >
+                    Copy code
+                  </Button>
+                ) : null}
+                <Button
+                  onClick={() => {
+                    clearDialogSecret();
+                    setDialogOpen(false);
+                  }}
+                >
+                  Done
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  disabled={isCreatingPairingLink}
+                  onClick={() => setDialogOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  disabled={isCreatingPairingLink}
+                  onClick={() => void handleCreatePairingLink()}
+                >
+                  {isCreatingPairingLink ? "Creating…" : "Create code"}
+                </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogPopup>
       </Dialog>
     </div>
   );
 });
-
 type PairingClientsListProps = {
   endpointUrl: string | null | undefined;
   endpoints: ReadonlyArray<AdvertisedEndpoint>;

@@ -1,16 +1,17 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, broadcast};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -25,8 +26,10 @@ use super::{
 };
 use crate::config::{ServerConfig, ServerMode};
 use crate::persistence::{
-    AuthPairingLink as PersistedPairingLink, AuthSession as PersistedAuthSession,
-    AuthSessionClient as PersistedAuthSessionClient, NewAuthSession, Repositories,
+    AuthPairingExchangeRequest, AuthPairingLink as PersistedPairingLink,
+    AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
+    BROWSER_PAIRING_RECEIPT_BINDING, NewAuthSession, Repositories, hash_pairing_credential,
+    pairing_credential_fingerprint,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -42,6 +45,9 @@ const PAIRING_REJECTION_LIMIT: u8 =
 const ACCESS_EVENT_CAPACITY: usize = 64;
 const MAX_ACTIVE_PAIRINGS: usize = 4_096;
 const MAX_ACTIVE_SESSIONS: usize = 4_096;
+const PAIRING_RECEIPT_TTL_MS: i64 = 5 * 60 * 1_000;
+const PAIRING_EXCHANGE_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_PAIRING_EXCHANGE_ATTEMPTS_PER_WINDOW: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum AuthError {
@@ -49,6 +55,7 @@ pub enum AuthError {
     InvalidCredential,
     InvalidScope,
     ScopeNotGranted,
+    PairingAttemptRateLimited,
     ScopeRequired(String),
     CurrentSessionRevokeNotAllowed,
     Internal(String),
@@ -77,6 +84,9 @@ struct DesktopBootstrap {
 struct AuthState {
     sessions: HashMap<String, SessionRecord>,
     pairings: HashMap<String, PairingRecord>,
+    pairing_receipts: HashMap<(Vec<u8>, String), PairingReceipt>,
+    pairing_exchange_attempts: VecDeque<Instant>,
+    used_websocket_tickets: HashMap<String, i64>,
 }
 
 #[derive(Clone)]
@@ -97,7 +107,8 @@ struct SessionRecord {
 #[derive(Clone)]
 struct PairingRecord {
     id: String,
-    credential: String,
+    credential_hash: Vec<u8>,
+    credential_fingerprint: String,
     scopes: Vec<String>,
     subject: String,
     label: Option<String>,
@@ -108,10 +119,10 @@ struct PairingRecord {
     revoked_at_ms: Option<i64>,
 }
 
-struct Grant {
-    scopes: Vec<String>,
-    subject: String,
-    label: Option<String>,
+#[derive(Clone)]
+struct PairingReceipt {
+    session_id: String,
+    expires_at_ms: i64,
 }
 
 pub struct IssuedSession {
@@ -245,6 +256,40 @@ impl AuthService {
         self.access_events.subscribe()
     }
 
+    pub(crate) fn cancel_session_on_revocation(
+        &self,
+        session_id: String,
+        shutdown: CancellationToken,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut events = self.access_events.subscribe();
+        async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    event = events.recv() => match event {
+                        Ok(AuthAccessEvent {
+                            change: AuthAccessChange::ClientRemoved {
+                                session_id: revoked_session_id,
+                            },
+                            ..
+                        }) if revoked_session_id == session_id => {
+                            shutdown.cancel();
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)
+                            | broadcast::error::RecvError::Closed) => {
+                            // Losing the revocation stream makes continued access unverifiable.
+                            // Close conservatively; the client can authenticate a new socket.
+                            shutdown.cancel();
+                            return;
+                        }
+                    },
+                }
+            }
+        }
+    }
+
     pub(crate) async fn access_snapshot(
         &self,
         current_session_id: &str,
@@ -285,12 +330,23 @@ impl AuthService {
         credential: &str,
         client: ClientMetadata,
     ) -> Result<IssuedSession, AuthError> {
-        let grant = self.consume_grant(credential, None).await?;
-        self.issue_session(
-            grant.subject,
-            grant.scopes,
+        if self.desktop_bootstrap_is_valid(credential) {
+            return self
+                .issue_session(
+                    "desktop-bootstrap".to_owned(),
+                    owned_scopes(ADMINISTRATIVE_SCOPES),
+                    "browser-session-cookie",
+                    client,
+                    None,
+                )
+                .await;
+        }
+        self.exchange_pairing(
+            credential,
+            None,
+            client,
             "browser-session-cookie",
-            apply_grant_label(client, grant.label),
+            BROWSER_PAIRING_RECEIPT_BINDING,
             None,
         )
         .await
@@ -303,27 +359,36 @@ impl AuthService {
         client: ClientMetadata,
         proof_key_thumbprint: Option<String>,
     ) -> Result<IssuedSession, AuthError> {
-        let grant = self
-            .consume_grant(credential, proof_key_thumbprint.as_deref())
-            .await?;
-        let scopes = requested_scopes.unwrap_or_else(|| grant.scopes.clone());
-        if !scopes
-            .iter()
-            .all(|scope| grant.scopes.iter().any(|granted| granted == scope))
-        {
-            return Err(AuthError::ScopeNotGranted);
+        if self.desktop_bootstrap_is_valid(credential) {
+            let granted_scopes = owned_scopes(ADMINISTRATIVE_SCOPES);
+            let scopes = requested_scopes.unwrap_or_else(|| granted_scopes.clone());
+            if !scopes.iter().all(|scope| granted_scopes.contains(scope)) {
+                return Err(AuthError::ScopeNotGranted);
+            }
+            let method = if proof_key_thumbprint.is_some() {
+                "dpop-access-token"
+            } else {
+                "bearer-access-token"
+            };
+            return self
+                .issue_session(
+                    "desktop-bootstrap".to_owned(),
+                    scopes,
+                    method,
+                    client,
+                    proof_key_thumbprint,
+                )
+                .await;
         }
-        let method = if proof_key_thumbprint.is_some() {
-            "dpop-access-token"
-        } else {
-            "bearer-access-token"
-        };
-        self.issue_session(
-            grant.subject,
-            scopes,
-            method,
-            apply_grant_label(client, grant.label),
-            proof_key_thumbprint,
+        let proof_key_thumbprint = proof_key_thumbprint.ok_or(AuthError::InvalidCredential)?;
+        let receipt_binding = proof_key_thumbprint.clone();
+        self.exchange_pairing(
+            credential,
+            requested_scopes,
+            client,
+            "dpop-access-token",
+            &receipt_binding,
+            Some(proof_key_thumbprint),
         )
         .await
     }
@@ -354,6 +419,7 @@ impl AuthService {
             || record.subject != claims.sub
             || record.method != claims.method
             || record.scopes != claims.scopes
+            || record.proof_key_thumbprint.as_deref() != claims.jkt.as_deref()
         {
             return Err(AuthError::InvalidCredential);
         }
@@ -396,6 +462,7 @@ impl AuthService {
         let claims = WebSocketClaims {
             v: 1,
             kind: "websocket".to_owned(),
+            jti: Uuid::new_v4().to_string(),
             sid: principal.session_id.clone(),
             iat: issued_at,
             exp: expires_at,
@@ -412,8 +479,26 @@ impl AuthService {
             .verify(token)
             .map_err(map_token_error_to_credential)?;
         let observed_at = now_ms();
-        if claims.v != 1 || claims.kind != "websocket" || claims.exp <= observed_at {
+        if claims.v != 1
+            || claims.kind != "websocket"
+            || claims.jti.is_empty()
+            || claims.exp <= observed_at
+        {
             return Err(AuthError::InvalidCredential);
+        }
+        {
+            let mut state = self.state.lock().await;
+            state
+                .used_websocket_tickets
+                .retain(|_, expires_at| *expires_at > observed_at);
+            if state.used_websocket_tickets.contains_key(&claims.jti)
+                || state.used_websocket_tickets.len() >= MAX_ACTIVE_SESSIONS
+            {
+                return Err(AuthError::InvalidCredential);
+            }
+            state
+                .used_websocket_tickets
+                .insert(claims.jti.clone(), claims.exp);
         }
         self.refresh_session_from_repository(&claims.sid, observed_at)
             .await?;
@@ -477,7 +562,6 @@ impl AuthService {
         let mut state = self.state.lock().await;
         if let Some(current) = state.sessions.get(session_id) {
             refreshed.connected_count = current.connected_count;
-            refreshed.proof_key_thumbprint = current.proof_key_thumbprint.clone();
         }
         state.sessions.insert(session_id.to_owned(), refreshed);
         Ok(())
@@ -570,7 +654,7 @@ impl AuthService {
         }
         let now = now_ms();
         let expires_at = now.saturating_add(ttl_ms);
-        let credential = {
+        let (credential, credential_hash) = {
             let mut state = self.state.lock().await;
             state.pairings.retain(|_, pairing| {
                 pairing.consumed_at_ms.is_none()
@@ -584,19 +668,22 @@ impl AuthService {
             }
             loop {
                 let candidate = generate_pairing_credential()?;
+                let candidate_hash = hash_pairing_credential(&candidate);
                 if !state
                     .pairings
                     .values()
-                    .any(|pairing| pairing.credential == candidate)
+                    .any(|pairing| pairing.credential_hash == candidate_hash)
                 {
-                    break candidate;
+                    break (candidate, candidate_hash);
                 }
             }
         };
+        let credential_fingerprint = pairing_credential_fingerprint(&credential_hash);
         let id = Uuid::new_v4().to_string();
         let record = PairingRecord {
             id: id.clone(),
-            credential: credential.clone(),
+            credential_hash,
+            credential_fingerprint,
             scopes,
             subject: subject.to_owned(),
             label: label.clone(),
@@ -888,75 +975,209 @@ impl AuthService {
         })
     }
 
-    async fn consume_grant(
+    fn desktop_bootstrap_is_valid(&self, credential: &str) -> bool {
+        let now = now_ms();
+        self.desktop_bootstrap.as_ref().is_some_and(|desktop| {
+            desktop.expires_at_ms > now && constant_time_text_equal(&desktop.credential, credential)
+        })
+    }
+
+    async fn exchange_pairing(
         &self,
         credential: &str,
-        proof_key_thumbprint: Option<&str>,
-    ) -> Result<Grant, AuthError> {
+        requested_scopes: Option<Vec<String>>,
+        client: ClientMetadata,
+        method: &str,
+        receipt_binding: &str,
+        proof_key_thumbprint: Option<String>,
+    ) -> Result<IssuedSession, AuthError> {
+        let _issuance = self.issuance.lock().await;
         let now = now_ms();
-        if let Some(desktop) = &self.desktop_bootstrap
-            && constant_time_text_equal(&desktop.credential, credential)
         {
-            return if desktop.expires_at_ms > now {
-                Ok(Grant {
-                    scopes: owned_scopes(ADMINISTRATIVE_SCOPES),
-                    subject: "desktop-bootstrap".to_owned(),
-                    label: None,
+            let mut state = self.state.lock().await;
+            let attempted_at = Instant::now();
+            while state
+                .pairing_exchange_attempts
+                .front()
+                .is_some_and(|previous| {
+                    attempted_at.saturating_duration_since(*previous)
+                        >= PAIRING_EXCHANGE_ATTEMPT_WINDOW
                 })
-            } else {
-                Err(AuthError::InvalidCredential)
-            };
+            {
+                state.pairing_exchange_attempts.pop_front();
+            }
+            if state.pairing_exchange_attempts.len() >= MAX_PAIRING_EXCHANGE_ATTEMPTS_PER_WINDOW {
+                return Err(AuthError::PairingAttemptRateLimited);
+            }
+            state.pairing_exchange_attempts.push_back(attempted_at);
         }
+        let credential_hash = hash_pairing_credential(credential);
+        let expires_at = now.saturating_add(if proof_key_thumbprint.is_some() {
+            DPOP_SESSION_TTL_MS
+        } else {
+            SESSION_TTL_MS
+        });
+        let session_id = Uuid::new_v4().to_string();
 
         if let Some(repositories) = &self.repositories {
-            let consumed = repositories
-                .consume_auth_pairing_link(
-                    credential.to_owned(),
-                    proof_key_thumbprint.map(str::to_owned),
-                    format_iso(now),
-                    format_iso(now),
-                )
+            let exchange = repositories
+                .exchange_auth_pairing(AuthPairingExchangeRequest {
+                    credential_hash,
+                    proof_key_thumbprint: receipt_binding.to_owned(),
+                    requested_session: NewAuthSession {
+                        session_id,
+                        subject: String::new(),
+                        scopes: requested_scopes
+                            .map_or(serde_json::Value::Null, |scopes| serde_json::json!(scopes)),
+                        method: method.to_owned(),
+                        client: PersistedAuthSessionClient {
+                            label: client.label,
+                            ip_address: client.ip_address,
+                            user_agent: client.user_agent,
+                            device_type: client.device_type,
+                            os: client.os,
+                            browser: client.browser,
+                        },
+                        proof_key_thumbprint,
+                        issued_at: format_iso(now),
+                        expires_at: format_iso(expires_at),
+                    },
+                    consumed_at: format_iso(now),
+                    receipt_expires_at: format_iso(now.saturating_add(PAIRING_RECEIPT_TTL_MS)),
+                    now: format_iso(now),
+                    max_active_sessions: MAX_ACTIVE_SESSIONS,
+                })
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?
                 .ok_or(AuthError::InvalidCredential)?;
-            let pairing = pairing_record_from_persisted(consumed)?;
-            self.state.lock().await.pairings.remove(&pairing.id);
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
-                id: pairing.id.clone(),
-            });
-            return Ok(Grant {
-                scopes: pairing.scopes,
-                subject: pairing.subject,
-                label: pairing.label,
-            });
+            let record = session_record_from_persisted(exchange.session)?;
+            let issued = self.issued_session(&record)?;
+            let view = record.view(false);
+            let mut state = self.state.lock().await;
+            state.pairings.remove(&exchange.pairing_id);
+            state
+                .sessions
+                .insert(record.session_id.clone(), record.clone());
+            drop(state);
+            if !exchange.replayed {
+                self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
+                    id: exchange.pairing_id,
+                });
+                self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+            }
+            return Ok(issued);
         }
 
         let mut state = self.state.lock().await;
+        state
+            .pairing_receipts
+            .retain(|_, receipt| receipt.expires_at_ms > now);
+        if let Some(receipt) = state
+            .pairing_receipts
+            .get(&(credential_hash.clone(), receipt_binding.to_owned()))
+            .cloned()
+        {
+            let record = state
+                .sessions
+                .get(&receipt.session_id)
+                .filter(|session| session.revoked_at_ms.is_none() && session.expires_at_ms > now)
+                .cloned()
+                .ok_or(AuthError::InvalidCredential)?;
+            return self.issued_session(&record);
+        }
+        if state
+            .pairing_receipts
+            .keys()
+            .any(|(hash, _)| constant_time_bytes_equal(hash, &credential_hash))
+        {
+            return Err(AuthError::InvalidCredential);
+        }
+        if state.sessions.len() >= MAX_ACTIVE_SESSIONS {
+            return Err(AuthError::Internal(
+                "active session capacity exceeded".to_owned(),
+            ));
+        }
+        if state.pairing_receipts.len() >= MAX_ACTIVE_PAIRINGS {
+            return Err(AuthError::Internal(
+                "pairing exchange receipt capacity exceeded".to_owned(),
+            ));
+        }
         let pairing = state
             .pairings
             .values_mut()
-            .find(|pairing| pairing.credential == credential)
+            .find(|pairing| constant_time_bytes_equal(&pairing.credential_hash, &credential_hash))
             .ok_or(AuthError::InvalidCredential)?;
+        let is_browser_cookie = receipt_binding == BROWSER_PAIRING_RECEIPT_BINDING;
         if pairing.revoked_at_ms.is_some()
             || pairing.consumed_at_ms.is_some()
             || pairing.expires_at_ms <= now
             || pairing
                 .proof_key_thumbprint
                 .as_deref()
-                .is_some_and(|expected| Some(expected) != proof_key_thumbprint)
+                .is_some_and(|expected| Some(expected) != proof_key_thumbprint.as_deref())
+            || (is_browser_cookie
+                && (pairing.subject != "administrative-bootstrap"
+                    || proof_key_thumbprint.is_some()))
+            || (!is_browser_cookie && proof_key_thumbprint.as_deref() != Some(receipt_binding))
         {
             return Err(AuthError::InvalidCredential);
         }
+        let scopes = requested_scopes.unwrap_or_else(|| pairing.scopes.clone());
+        if scopes.is_empty()
+            || !scopes
+                .iter()
+                .all(|scope| pairing.scopes.iter().any(|granted| granted == scope))
+        {
+            return Err(AuthError::ScopeNotGranted);
+        }
         pairing.consumed_at_ms = Some(now);
         let pairing_id = pairing.id.clone();
-        let grant = Grant {
-            scopes: pairing.scopes.clone(),
+        let record = SessionRecord {
+            session_id: session_id.clone(),
             subject: pairing.subject.clone(),
-            label: pairing.label.clone(),
+            scopes,
+            method: method.to_owned(),
+            client: apply_grant_label(client, pairing.label.clone()),
+            issued_at_ms: now,
+            expires_at_ms: expires_at,
+            revoked_at_ms: None,
+            last_connected_at_ms: None,
+            connected_count: 0,
+            proof_key_thumbprint,
         };
+        state.sessions.insert(session_id.clone(), record.clone());
+        state.pairing_receipts.insert(
+            (credential_hash, receipt_binding.to_owned()),
+            PairingReceipt {
+                session_id,
+                expires_at_ms: now.saturating_add(PAIRING_RECEIPT_TTL_MS),
+            },
+        );
         drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
-        Ok(grant)
+        self.emit_access_change(AuthAccessChange::ClientUpserted(record.view(false)));
+        self.issued_session(&record)
+    }
+
+    fn issued_session(&self, record: &SessionRecord) -> Result<IssuedSession, AuthError> {
+        let token = self
+            .signer
+            .issue(&SessionClaims {
+                v: 1,
+                kind: "session".to_owned(),
+                sid: record.session_id.clone(),
+                sub: record.subject.clone(),
+                scopes: record.scopes.clone(),
+                method: record.method.clone(),
+                jkt: record.proof_key_thumbprint.clone(),
+                iat: record.issued_at_ms,
+                exp: record.expires_at_ms,
+            })
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        Ok(IssuedSession {
+            token,
+            principal: record.principal(),
+        })
     }
 }
 
@@ -992,10 +1213,8 @@ impl PairingRecord {
     fn view(&self) -> PairingLinkView {
         PairingLinkView {
             id: self.id.clone(),
-            credential: self.credential.clone(),
-            scopes: self.scopes.clone(),
-            subject: self.subject.clone(),
-            label: self.label.clone(),
+            credential_fingerprint: self.credential_fingerprint.clone(),
+            client_label: self.label.clone(),
             created_at: format_iso(self.created_at_ms),
             expires_at: format_iso(self.expires_at_ms),
         }
@@ -1005,7 +1224,8 @@ impl PairingRecord {
 fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
     PersistedPairingLink {
         id: record.id.clone(),
-        credential: record.credential.clone(),
+        credential_hash: record.credential_hash.clone(),
+        credential_fingerprint: record.credential_fingerprint.clone(),
         method: "one-time-token".to_owned(),
         scopes: serde_json::json!(record.scopes),
         subject: record.subject.clone(),
@@ -1032,6 +1252,7 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
             os: record.client.os.clone(),
             browser: record.client.browser.clone(),
         },
+        proof_key_thumbprint: record.proof_key_thumbprint.clone(),
         issued_at: format_iso(record.issued_at_ms),
         expires_at: format_iso(record.expires_at_ms),
     }
@@ -1041,7 +1262,8 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
     let scopes = decode_persisted_scopes(row.scopes)?;
     Ok(PairingRecord {
         id: row.id,
-        credential: row.credential,
+        credential_hash: row.credential_hash,
+        credential_fingerprint: row.credential_fingerprint,
         scopes,
         subject: row.subject,
         label: row.label,
@@ -1089,7 +1311,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
             .map(parse_timestamp_ms)
             .transpose()?,
         connected_count: 0,
-        proof_key_thumbprint: None,
+        proof_key_thumbprint: row.proof_key_thumbprint,
     })
 }
 
@@ -1188,6 +1410,10 @@ fn constant_time_text_equal(left: &str, right: &str) -> bool {
     left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
 }
 
+fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && bool::from(left.ct_eq(right))
+}
+
 fn generate_pairing_credential() -> Result<String, AuthError> {
     let mut credential = String::with_capacity(PAIRING_LENGTH);
     while credential.len() < PAIRING_LENGTH {
@@ -1206,11 +1432,6 @@ fn generate_pairing_credential() -> Result<String, AuthError> {
         }
     }
     Ok(credential)
-}
-
-#[must_use]
-pub fn default_standard_scopes() -> Vec<String> {
-    owned_scopes(STANDARD_SCOPES)
 }
 
 #[cfg(test)]
@@ -1294,10 +1515,18 @@ mod tests {
             .issue_pairing(owned_scopes(STANDARD_SCOPES), None)
             .await
             .expect("pairing");
-        let first =
-            service.exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None);
-        let second =
-            service.exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None);
+        let first = service.exchange_bootstrap(
+            &pairing.credential,
+            None,
+            ClientMetadata::default(),
+            Some("first-client-proof".to_owned()),
+        );
+        let second = service.exchange_bootstrap(
+            &pairing.credential,
+            None,
+            ClientMetadata::default(),
+            Some("second-client-proof".to_owned()),
+        );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     }
@@ -1320,10 +1549,26 @@ mod tests {
 
         assert!(matches!(
             service
-                .exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None)
+                .exchange_bootstrap(
+                    &pairing.credential,
+                    None,
+                    ClientMetadata::default(),
+                    Some("expired-client-proof".to_owned()),
+                )
                 .await,
             Err(AuthError::InvalidCredential)
         ));
+        assert!(
+            service
+                .state
+                .lock()
+                .await
+                .pairings
+                .get(&pairing.id)
+                .expect("expired pairing remains inspectable")
+                .consumed_at_ms
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1481,7 +1726,7 @@ mod tests {
                 &pairing.credential,
                 Some(vec!["access:write".to_owned()]),
                 ClientMetadata::default(),
-                None,
+                Some("scope-client-proof".to_owned()),
             )
             .await,
             Err(AuthError::ScopeNotGranted)
@@ -1612,7 +1857,8 @@ mod tests {
                     id.clone(),
                     PairingRecord {
                         id,
-                        credential: format!("CREDENTIAL{index}"),
+                        credential_hash: hash_pairing_credential(&format!("CREDENTIAL{index}")),
+                        credential_fingerprint: format!("sha256:{index:012x}"),
                         scopes: owned_scopes(STANDARD_SCOPES),
                         subject: "test".to_owned(),
                         label: None,
@@ -1680,6 +1926,134 @@ mod tests {
                 )
                 .await,
             Err(AuthError::Internal(message)) if message == "active session capacity exceeded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn receipt_capacity_rejects_without_consuming_the_pairing() {
+        let service = service();
+        let pairing = service
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), None)
+            .await
+            .expect("pairing");
+        let now = now_ms();
+        {
+            let mut state = service.state.lock().await;
+            for index in 0..MAX_ACTIVE_PAIRINGS {
+                state.pairing_receipts.insert(
+                    (index.to_le_bytes().to_vec(), format!("proof-{index}")),
+                    PairingReceipt {
+                        session_id: format!("receipt-session-{index}"),
+                        expires_at_ms: now + PAIRING_RECEIPT_TTL_MS,
+                    },
+                );
+            }
+        }
+
+        assert!(matches!(
+            service
+                .exchange_bootstrap(
+                    &pairing.credential,
+                    None,
+                    ClientMetadata::default(),
+                    Some("new-client-proof".to_owned()),
+                )
+                .await,
+            Err(AuthError::Internal(message))
+                if message == "pairing exchange receipt capacity exceeded"
+        ));
+        {
+            let mut state = service.state.lock().await;
+            assert!(
+                state
+                    .pairings
+                    .get(&pairing.id)
+                    .expect("pairing remains after capacity rejection")
+                    .consumed_at_ms
+                    .is_none()
+            );
+            assert!(state.sessions.is_empty());
+            state.pairing_receipts.clear();
+        }
+        service
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata::default(),
+                Some("new-client-proof".to_owned()),
+            )
+            .await
+            .expect("pairing remains usable after receipt capacity clears");
+    }
+
+    #[tokio::test]
+    async fn pairing_attempts_are_rate_limited_without_consuming_a_valid_code() {
+        let service = service();
+        let pairing = service
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), None)
+            .await
+            .expect("pairing");
+        for index in 0..MAX_PAIRING_EXCHANGE_ATTEMPTS_PER_WINDOW {
+            assert!(matches!(
+                service
+                    .exchange_bootstrap(
+                        &format!("WRONGPAIRING{index}"),
+                        None,
+                        ClientMetadata::default(),
+                        Some(format!("attacker-proof-{index}")),
+                    )
+                    .await,
+                Err(AuthError::InvalidCredential)
+            ));
+        }
+        assert!(matches!(
+            service
+                .exchange_bootstrap(
+                    &pairing.credential,
+                    None,
+                    ClientMetadata::default(),
+                    Some("valid-client-proof".to_owned()),
+                )
+                .await,
+            Err(AuthError::PairingAttemptRateLimited)
+        ));
+        assert!(
+            service
+                .state
+                .lock()
+                .await
+                .pairings
+                .get(&pairing.id)
+                .expect("rate-limited pairing remains")
+                .consumed_at_ms
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_claims_must_match_the_stored_proof_key() {
+        let service = service();
+        let issued = service
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                Some("stored-proof".to_owned()),
+            )
+            .await
+            .expect("DPoP session");
+        assert!(service.authenticate_token(&issued.token).await.is_ok());
+        service
+            .state
+            .lock()
+            .await
+            .sessions
+            .get_mut(&issued.principal.session_id)
+            .expect("session row")
+            .proof_key_thumbprint = Some("different-proof".to_owned());
+        assert!(matches!(
+            service.authenticate_token(&issued.token).await,
+            Err(AuthError::InvalidCredential)
         ));
     }
 }

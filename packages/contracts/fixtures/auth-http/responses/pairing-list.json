@@ -1,16 +1,8 @@
 [
   {
     "id": "fixture-pairing-link",
-    "credential": "23456789ABCD",
-    "scopes": [
-      "orchestration:read",
-      "orchestration:operate",
-      "terminal:operate",
-      "review:write",
-      "relay:read"
-    ],
-    "subject": "fixture-client",
-    "label": "Fixture pairing link",
+    "credentialFingerprint": "sha256:91b7e2e2d164",
+    "clientLabel": "Fixture pairing link",
     "createdAt": "2026-01-01T00:00:00.000Z",
     "expiresAt": "2026-01-01T00:05:00.000Z"
   }

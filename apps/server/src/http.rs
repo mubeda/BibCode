@@ -221,9 +221,12 @@ async fn websocket(
             let session_id = principal.session_id.clone();
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
+            let revocation_guard =
+                auth.cancel_session_on_revocation(session_id.clone(), session_shutdown.clone());
             auth.mark_connected(&session_id).await;
             upgrade
                 .on_upgrade(move |socket| async move {
+                    let revocation_guard = tokio::spawn(revocation_guard);
                     let expiration_shutdown = session_shutdown.clone();
                     let expiration_guard = tokio::spawn(async move {
                         let remaining_ms = expires_at_ms.saturating_sub(
@@ -249,6 +252,7 @@ async fn websocket(
                     .await;
                     session_shutdown.cancel();
                     let _ = expiration_guard.await;
+                    let _ = revocation_guard.await;
                     auth.mark_disconnected(&session_id).await;
                 })
                 .into_response()
