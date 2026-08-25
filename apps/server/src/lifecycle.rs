@@ -614,6 +614,30 @@ impl Drop for ServerHandle {
 mod tests {
     use super::*;
 
+    async fn startup_session_cookie(
+        client: &reqwest::Client,
+        address: std::net::SocketAddr,
+        credential: &str,
+    ) -> String {
+        let response = client
+            .post(format!("http://{address}/api/auth/browser-session"))
+            .json(&serde_json::json!({ "credential": credential }))
+            .send()
+            .await
+            .expect("startup browser session should respond");
+        assert!(response.status().is_success());
+        response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .expect("startup browser session cookie")
+            .to_str()
+            .expect("ASCII startup cookie")
+            .split(';')
+            .next()
+            .expect("startup cookie pair")
+            .to_owned()
+    }
+
     #[tokio::test]
     async fn rejects_relative_programmatic_data_roots_before_creating_state() {
         let error = match ServerRuntime::start(ServerConfig::new("relative/.bibcode")).await {
@@ -683,35 +707,18 @@ mod tests {
                 .get("worktreeCatalogRefreshReason")
                 .is_none()
         );
-        let token = client
-            .post(format!("http://{}/oauth/token", production.local_addr()))
-            .form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:token-exchange",
-                ),
-                ("subject_token", startup.credential.as_str()),
-                (
-                    "subject_token_type",
-                    "urn:bibcode:params:oauth:token-type:environment-bootstrap",
-                ),
-                (
-                    "requested_token_type",
-                    "urn:ietf:params:oauth:token-type:access_token",
-                ),
-            ])
-            .send()
-            .await
-            .expect("startup credential should exchange")
-            .json::<serde_json::Value>()
-            .await
-            .expect("token response should decode");
+        let cookie = startup_session_cookie(
+            &client,
+            production.local_addr(),
+            startup.credential.as_str(),
+        )
+        .await;
         let snapshot = client
             .get(format!(
                 "http://{}/api/orchestration/snapshot",
                 production.local_addr()
             ))
-            .bearer_auth(token["access_token"].as_str().expect("access token"))
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .expect("orchestration snapshot should respond");
@@ -721,7 +728,7 @@ mod tests {
                 "http://{}/api/connect/link-state",
                 production.local_addr()
             ))
-            .bearer_auth(token["access_token"].as_str().expect("access token"))
+            .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
             .expect("connect link state should respond");
@@ -731,7 +738,7 @@ mod tests {
                 "http://{}/api/diagnostics/logs.zip",
                 production.local_addr()
             ))
-            .bearer_auth(token["access_token"].as_str().expect("access token"))
+            .header(reqwest::header::COOKIE, &cookie)
             .json(&serde_json::json!({"frontendLog":"unit lifecycle log"}))
             .send()
             .await
@@ -754,39 +761,15 @@ mod tests {
             .expect("fallback server should issue startup access")
             .credential
             .clone();
-        let fallback_token = client
-            .post(format!("http://{}/oauth/token", fallback.local_addr()))
-            .form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:token-exchange",
-                ),
-                ("subject_token", fallback_credential.as_str()),
-                (
-                    "subject_token_type",
-                    "urn:bibcode:params:oauth:token-type:environment-bootstrap",
-                ),
-                (
-                    "requested_token_type",
-                    "urn:ietf:params:oauth:token-type:access_token",
-                ),
-            ])
-            .send()
-            .await
-            .expect("fallback startup credential should exchange")
-            .json::<serde_json::Value>()
-            .await
-            .expect("fallback token response should decode");
+        let fallback_cookie =
+            startup_session_cookie(&client, fallback.local_addr(), fallback_credential.as_str())
+                .await;
         let response = client
             .post(format!(
                 "http://{}/api/orchestration/dispatch",
                 fallback.local_addr()
             ))
-            .bearer_auth(
-                fallback_token["access_token"]
-                    .as_str()
-                    .expect("fallback access token"),
-            )
+            .header(reqwest::header::COOKIE, &fallback_cookie)
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -798,11 +781,7 @@ mod tests {
                     "http://{}/api/diagnostics/logs.zip",
                     fallback.local_addr()
                 ))
-                .bearer_auth(
-                    fallback_token["access_token"]
-                        .as_str()
-                        .expect("fallback access token"),
-                )
+                .header(reqwest::header::COOKIE, &fallback_cookie)
                 .json(&serde_json::json!({"frontendLog":"fallback"}))
                 .send()
                 .await
@@ -812,21 +791,13 @@ mod tests {
                     "http://{}/api/assets/token/file",
                     fallback.local_addr()
                 ))
-                .bearer_auth(
-                    fallback_token["access_token"]
-                        .as_str()
-                        .expect("fallback access token"),
-                )
+                .header(reqwest::header::COOKIE, &fallback_cookie)
                 .send()
                 .await
                 .expect("fallback asset should respond"),
             client
                 .post(format!("http://{}/mcp", fallback.local_addr()))
-                .bearer_auth(
-                    fallback_token["access_token"]
-                        .as_str()
-                        .expect("fallback access token"),
-                )
+                .header(reqwest::header::COOKIE, &fallback_cookie)
                 .body("{}")
                 .send()
                 .await

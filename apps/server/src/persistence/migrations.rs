@@ -3378,9 +3378,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 31);
+        assert_eq!(second.len(), 32);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[30].id, 47);
+        assert_eq!(second[31].id, 48);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3392,7 +3392,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 27);
+        assert_eq!(application_table_count, 28);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3640,7 +3640,7 @@ mod tests {
             "#,
         )?;
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(47))?;
 
         assert_eq!(
             applied
@@ -3749,7 +3749,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            (34..=47).collect::<Vec<_>>()
+            (34..=48).collect::<Vec<_>>()
         );
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)

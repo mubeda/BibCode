@@ -24,6 +24,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use url::Url;
 use uuid::Uuid;
 
+#[path = "support/dpop.rs"]
+mod dpop;
+use dpop::{DpopSession, exchange_pairing};
+
 const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "opencode"];
 const SAME_LOG_PATH_CHILD_ENV: &str = "BIBCODE_TEST_SAME_LOG_PATH_CHILD_ROOT";
 const SAME_LOG_PATH_TEST: &str = "public_and_runtime_initializers_share_one_physical_log_writer";
@@ -86,32 +90,8 @@ async fn exchange_startup_credential(
     client: &Client,
     address: SocketAddr,
     credential: &str,
-) -> String {
-    let response = client
-        .post(endpoint(address, "/oauth/token"))
-        .form(&[
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:token-exchange",
-            ),
-            ("subject_token", credential),
-            (
-                "subject_token_type",
-                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
-            ),
-            (
-                "requested_token_type",
-                "urn:ietf:params:oauth:token-type:access_token",
-            ),
-        ])
-        .send()
-        .await
-        .expect("startup credential exchange");
-    assert_eq!(response.status(), StatusCode::OK);
-    response.json::<Value>().await.expect("token exchange JSON")["access_token"]
-        .as_str()
-        .expect("bearer access token")
-        .to_owned()
+) -> DpopSession {
+    exchange_pairing(client, &endpoint(address, "/oauth/token"), credential, 61).await
 }
 
 fn write_disabled_provider_settings(temp: &TempDir) -> PathBuf {
@@ -135,10 +115,10 @@ fn write_disabled_provider_settings(temp: &TempDir) -> PathBuf {
     settings_path
 }
 
-async fn fetch_server_config(client: &Client, address: SocketAddr, access_token: &str) -> Value {
-    let ticket_response = client
-        .post(endpoint(address, "/api/auth/websocket-ticket"))
-        .bearer_auth(access_token)
+async fn fetch_server_config(client: &Client, address: SocketAddr, access: &DpopSession) -> Value {
+    let ticket_url = endpoint(address, "/api/auth/websocket-ticket");
+    let ticket_response = access
+        .authorize(client.post(&ticket_url), "POST", &ticket_url)
         .send()
         .await
         .expect("WebSocket ticket response");
@@ -442,10 +422,10 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
         .expect("authenticated web startup access")
         .credential
         .clone();
-    let access_token = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
-    let ticket_response = client
-        .post(endpoint(handle.local_addr(), "/api/auth/websocket-ticket"))
-        .bearer_auth(&access_token)
+    let access = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
+    let ticket_url = endpoint(handle.local_addr(), "/api/auth/websocket-ticket");
+    let ticket_response = access
+        .authorize(client.post(&ticket_url), "POST", &ticket_url)
         .send()
         .await
         .expect("WebSocket ticket response");
@@ -530,12 +510,12 @@ async fn activity_access_tokens_are_rejected_by_a_different_environment() {
         .expect("first startup access")
         .credential
         .clone();
-    let first_token =
+    let first_access =
         exchange_startup_credential(&client, first.local_addr(), &first_credential).await;
 
-    let response = client
-        .post(endpoint(second.local_addr(), "/api/auth/websocket-ticket"))
-        .bearer_auth(first_token)
+    let ticket_url = endpoint(second.local_addr(), "/api/auth/websocket-ticket");
+    let response = first_access
+        .authorize(client.post(&ticket_url), "POST", &ticket_url)
         .send()
         .await
         .expect("cross-environment ticket request");
@@ -673,17 +653,14 @@ async fn custom_registry_uses_exact_fallback_http_responses() {
             .expect("unauthenticated fallback JSON response"),
     )
     .await;
-    let access_token =
+    let access =
         exchange_startup_credential(&client, handle.local_addr(), startup.credential.as_str())
             .await;
+    let snapshot_url = endpoint(handle.local_addr(), "/api/orchestration/snapshot");
 
     assert_json_wire(
-        client
-            .get(endpoint(
-                handle.local_addr(),
-                "/api/orchestration/snapshot",
-            ))
-            .bearer_auth(&access_token)
+        access
+            .authorize(client.get(&snapshot_url), "GET", &snapshot_url)
             .send()
             .await
             .expect("fallback JSON response"),
@@ -862,8 +839,8 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
         .expect("authenticated web startup access")
         .credential
         .clone();
-    let access_token = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
-    let config = fetch_server_config(&client, handle.local_addr(), &access_token).await;
+    let access = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
+    let config = fetch_server_config(&client, handle.local_addr(), &access).await;
     let providers = config["providers"].as_array().expect("provider snapshots");
     assert_eq!(providers.len(), PROVIDER_DRIVERS.len());
     for driver in PROVIDER_DRIVERS {
@@ -878,9 +855,9 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
         assert_eq!(provider["status"], "disabled");
     }
 
-    let snapshot_response = client
-        .get(endpoint(handle.local_addr(), "/api/orchestration/snapshot"))
-        .bearer_auth(&access_token)
+    let snapshot_url = endpoint(handle.local_addr(), "/api/orchestration/snapshot");
+    let snapshot_response = access
+        .authorize(client.get(&snapshot_url), "GET", &snapshot_url)
         .send()
         .await
         .expect("production snapshot response");

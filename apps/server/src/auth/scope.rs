@@ -76,6 +76,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.refreshProviders"
         | "server.refreshProviderUsage"
         | "server.removeKeybinding"
+        | "server.requestHostAction"
         | "server.signalProcess"
         | "server.updateProvider"
         | "server.updateSettings"

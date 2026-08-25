@@ -175,7 +175,9 @@ async fn attachment_abort_child() {
         state_dir,
         delivery,
     );
-    let rpc_config = ServerConfig::new(state.join("rpc-runtime"))
+    // Keep the Unix control socket below macOS's sockaddr_un path limit. The
+    // temporary root already isolates this child runtime.
+    let rpc_config = ServerConfig::new(state.join("r"))
         .with_bind("127.0.0.1", 0)
         .with_unsafe_no_auth();
     let runtime = ServerRuntime::start_with_registry(rpc_config, registry)

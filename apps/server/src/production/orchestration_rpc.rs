@@ -1708,10 +1708,9 @@ mod tests {
             .await
             .expect("identical historical command replays its original receipt");
 
-        assert_eq!(
-            replay,
-            serde_json::to_value(original).expect("original result")
-        );
+        let expected = encode_dispatch_result(original, true, "orchestration.dispatchCommand")
+            .expect("project result has the current public wire shape");
+        assert_eq!(replay, expected);
         assert_eq!(
             engine
                 .read_events(0)

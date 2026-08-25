@@ -1009,6 +1009,17 @@ mod tests {
     use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+    fn prepared_runtime_config(root: &std::path::Path) -> ServerConfig {
+        let mut config = ServerConfig::new(root).with_bind("127.0.0.1", 0);
+        config.environment_id = Some(crate::persistence::EnvironmentId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
+        config
+    }
+
     fn route_context() -> RouteContext {
         RouteContext {
             headers: HeaderMap::new(),
@@ -1054,7 +1065,7 @@ mod tests {
             "Git fixture initialization failed: {}",
             String::from_utf8_lossy(&initialized.stderr)
         );
-        let mut config = ServerConfig::new(state.path())
+        let mut config = prepared_runtime_config(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
         config.environment_id = Some(crate::persistence::EnvironmentId::from_uuid(
@@ -1302,7 +1313,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let config = ServerConfig::new(state.path())
+        let config = prepared_runtime_config(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
         let database = Database::open_in_memory().await.expect("database");
@@ -1472,7 +1483,7 @@ mod tests {
     async fn production_activity_rpc_stream_receives_producer_projection_deltas() {
         // Mutation caught: registering RPC with fresh projections that do not share producer buses.
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path())
+        let config = prepared_runtime_config(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
         let database = Database::open_in_memory().await.expect("database");
@@ -1626,7 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn http_dispatch_cannot_bypass_durable_or_worktree_authority() {
         let state = TempDir::new().expect("state");
-        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let config = prepared_runtime_config(state.path());
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1766,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn startup_interrupts_only_unresolved_terminal_activity() {
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let config = prepared_runtime_config(state.path());
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
         std::fs::write(
             config.state_dir().join("settings.json"),
@@ -1911,7 +1922,7 @@ mod tests {
     #[tokio::test]
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let config = prepared_runtime_config(state.path());
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
         std::fs::write(
             config.state_dir().join("settings.json"),
@@ -1978,7 +1989,7 @@ mod tests {
     #[tokio::test]
     async fn agent_activity_runtime_settings_updates_change_only_the_selected_source_controller() {
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path())
+        let config = prepared_runtime_config(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
         let database = Database::open_in_memory().await.expect("database");
@@ -2051,7 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn hardening_bootstrap_provider_observation_failure_does_not_abort_production_runtime() {
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let config = prepared_runtime_config(state.path());
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
         std::fs::write(
             config.state_dir().join("runtime"),
@@ -2084,7 +2095,7 @@ mod tests {
     #[tokio::test]
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
         let state = TempDir::new().expect("temporary state directory");
-        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let config = prepared_runtime_config(state.path());
         let database = Database::open_in_memory()
             .await
             .expect("in-memory database should open");
@@ -2447,7 +2458,7 @@ mod tests {
         git(&["add", "README.md"]);
         git(&["commit", "--quiet", "-m", "initial"]);
 
-        let config = ServerConfig::new(state.path())
+        let config = prepared_runtime_config(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
         let database = Database::open_in_memory().await.expect("database");

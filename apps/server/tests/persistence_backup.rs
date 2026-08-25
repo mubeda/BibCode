@@ -14,7 +14,7 @@ use bibcode_server::{
     },
     resolve_data_root,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -112,10 +112,6 @@ impl PersistedStoreFixture {
         prepare_store(&self.config).await
     }
 
-    fn database_bytes(&self) -> Vec<u8> {
-        fs::read(&self.paths.database).expect("database bytes")
-    }
-
     fn schema_version(&self) -> i64 {
         Connection::open_with_flags(&self.paths.database, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("schema reader")
@@ -211,6 +207,36 @@ fn insert_project(connection: &Connection, project_id: &str) {
             [project_id],
         )
         .expect("fixture project");
+    let thread_id = format!("{project_id}-main");
+    connection
+        .execute(
+            "INSERT INTO projection_threads (
+               thread_id, project_id, title, created_at, updated_at, kind
+             ) VALUES (?1, ?2, 'Main',
+                       '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z', 'default')",
+            params![thread_id, project_id],
+        )
+        .expect("fixture Main thread");
+    connection
+        .execute(
+            "INSERT INTO orchestration_events (
+               event_id, aggregate_kind, stream_id, stream_version, event_type,
+               occurred_at, command_id, actor_kind, payload_json, metadata_json
+             ) VALUES (?1, 'thread', ?2, 1, 'thread.created',
+                       '2026-08-09T00:00:00Z', ?3, 'client', ?4, '{}')",
+            params![
+                format!("{project_id}-main-created"),
+                thread_id,
+                format!("{project_id}-create"),
+                serde_json::json!({
+                    "projectId": project_id,
+                    "threadId": thread_id,
+                    "kind": "default",
+                })
+                .to_string(),
+            ],
+        )
+        .expect("fixture Main creation event");
 }
 
 fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
@@ -233,7 +259,7 @@ fn project_ids(database: &Path) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn creates_verified_pre_migration_backup_before_first_pending_migration() {
+async fn credential_scrub_upgrade_skips_a_plaintext_preserving_migration_backup() {
     let fixture = PersistedStoreFixture::older_schema_with_project("project-a");
 
     let prepared = fixture.prepare().await.expect("migration should succeed");
@@ -242,47 +268,12 @@ async fn creates_verified_pre_migration_backup_before_first_pending_migration() 
         .await
         .expect("backup inventory");
     assert!(inventory.issues.is_empty());
-    let [backup]: [VerifiedBackup; 1] = inventory
-        .verified
-        .try_into()
-        .expect("one pre-migration backup");
-
-    assert_eq!(backup.manifest.trigger, BackupTrigger::PreMigration);
-    assert_eq!(backup.manifest.manifest_version, 2);
-    assert_eq!(
-        backup.manifest.environment_id,
-        Some(prepared.environment_id)
-    );
-    assert_eq!(
-        backup.manifest.storage_instance_id,
-        prepared.storage_instance_id
-    );
-    assert_eq!(backup.manifest.state_kind, prepared.paths.state_kind);
-    assert!(backup.manifest.created_at.ends_with('Z'));
-    assert_eq!(backup.manifest.sha256.len(), 64);
-    assert_eq!(
-        backup.manifest.database_size_bytes,
-        fs::metadata(&backup.database)
-            .expect("backup metadata")
-            .len()
-    );
-    assert_eq!(project_ids(&backup.database), ["project-a"]);
     assert!(
-        backup
-            .manifest_matches_file()
-            .await
-            .expect("manifest check")
+        inventory.verified.is_empty(),
+        "migration 48 must not create a new artifact containing legacy plaintext credentials"
     );
-    assert_eq!(backup.quick_check().await.expect("quick check"), "ok");
-    assert_eq!(backup.manifest.schema_version, 38);
-    assert!(fixture.schema_version() > backup.manifest.schema_version);
-    let entries = fs::read_dir(&backup.directory)
-        .expect("backup generation entries")
-        .map(|entry| entry.expect("backup entry").file_name())
-        .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 2, "published backup has no SQLite sidecars");
-    assert!(entries.contains(&"state.sqlite".into()));
-    assert!(entries.contains(&"manifest.json".into()));
+    assert_eq!(fixture.schema_version(), 48);
+    assert_eq!(project_ids(&prepared.paths.database), ["project-a"]);
 }
 
 #[tokio::test]
@@ -323,21 +314,20 @@ async fn legacy_backup_manifest_decoding_never_invents_an_environment_identity()
 }
 
 #[tokio::test]
-async fn refuses_migration_when_backup_publication_cannot_begin() {
+async fn credential_scrub_upgrade_does_not_touch_a_blocked_backup_path() {
     let fixture = PersistedStoreFixture::older_schema_with_project("project-a");
     fixture.block_backup_directory_with_file();
-    let before = fixture.database_bytes();
     let schema_before = fixture.schema_version();
     let marker_before = fs::read(&fixture.paths.environment_id).expect("marker bytes");
 
-    let error = fixture.prepare().await.expect_err("backup must fail");
+    let prepared = fixture
+        .prepare()
+        .await
+        .expect("credential scrub does not publish a backup");
 
-    assert!(matches!(
-        error,
-        bibcode_server::persistence::StoreStartupError::Backup(_)
-    ));
-    assert_eq!(fixture.database_bytes(), before);
-    assert_eq!(fixture.schema_version(), schema_before);
+    assert_eq!(fs::read(&fixture.paths.backups_dir).unwrap(), b"blocked");
+    assert!(fixture.schema_version() > schema_before);
+    assert_eq!(project_ids(&prepared.paths.database), ["project-a"]);
     assert_eq!(
         fs::read(&fixture.paths.storage_instance_id).expect("legacy marker becomes storage marker"),
         marker_before
@@ -465,10 +455,14 @@ async fn active_wal_rows_are_captured_by_a_coherent_online_backup() {
     let (fixture, writer) = PersistedStoreFixture::older_wal_schema_with_project("wal-project");
 
     let prepared = fixture.prepare().await.expect("WAL migration succeeds");
-    let inventory = inventory_verified_backups(&prepared.paths, prepared.storage_instance_id)
-        .await
-        .expect("backup inventory");
-    let backup = inventory.verified.first().expect("WAL backup");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("WAL backup");
 
     assert_eq!(project_ids(&backup.database), ["wal-project"]);
     assert_eq!(backup.quick_check().await.expect("quick check"), "ok");

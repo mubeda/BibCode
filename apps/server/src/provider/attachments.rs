@@ -1004,7 +1004,13 @@ mod tests {
     #[tokio::test]
     async fn startup_removes_a_final_left_by_a_process_aborted_after_publication() {
         let state = TempDir::new().expect("state dir");
-        let config = crate::ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let mut config = crate::ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        config.environment_id = Some(crate::persistence::EnvironmentId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            uuid::Uuid::new_v4(),
+        ));
         let attachments_dir = config.state_dir().join("attachments");
         let ready = state.path().join("published");
         let output = Command::new(std::env::current_exe().expect("test executable"))

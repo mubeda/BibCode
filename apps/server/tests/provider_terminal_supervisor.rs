@@ -21,7 +21,7 @@ use bibcode_server::{
         AgentActivityDisableReport, AgentActivitySource,
     },
     diagnostics::{ProcessAttributionRegistry, ProcessIdentity},
-    persistence::{Database, StorageInstanceId, run_migrations},
+    persistence::{Database, EnvironmentId, StorageInstanceId, run_migrations},
     production::{
         agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
         control::NativeServerControl,
@@ -8337,6 +8337,9 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
     let mut config = ServerConfig::new(fixture.path());
     config.storage_instance_id = Some(StorageInstanceId::from_uuid(Uuid::from_u128(
         0x00000000000040008000000000000005,
+    )));
+    config.environment_id = Some(EnvironmentId::from_uuid(Uuid::from_u128(
+        0x00000000000040008000000000000006,
     )));
     let control = NativeServerControl::new(config, serde_json::json!({"policy":"test"})).await;
     control

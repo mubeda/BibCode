@@ -20,6 +20,10 @@ use std::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[path = "support/dpop.rs"]
+mod dpop;
+use dpop::exchange_pairing;
+
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
@@ -153,34 +157,8 @@ async fn fetch_connect_descriptor(
         .expect("web startup access")
         .credential
         .clone();
-    let token_response = client
-        .post(server_endpoint(handle, "/oauth/token"))
-        .form(&[
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:token-exchange",
-            ),
-            ("subject_token", credential.as_str()),
-            (
-                "subject_token_type",
-                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
-            ),
-            (
-                "requested_token_type",
-                "urn:ietf:params:oauth:token-type:access_token",
-            ),
-        ])
-        .send()
-        .await
-        .expect("startup credential exchange");
-    assert_eq!(token_response.status(), StatusCode::OK);
-    let access_token = token_response
-        .json::<Value>()
-        .await
-        .expect("access token JSON")["access_token"]
-        .as_str()
-        .expect("access token")
-        .to_owned();
+    let token_url = server_endpoint(handle, "/oauth/token");
+    let access = exchange_pairing(client, &token_url, &credential, 67).await;
     let cloud_keys = TempDir::new().expect("temporary Connect cloud key directory");
     let cloud_codec = PersistentJwtCodec::open(cloud_keys.path().join("cloud-keypair.json"))
         .await
@@ -189,9 +167,9 @@ async fn fetch_connect_descriptor(
         .key_pair()
         .await
         .expect("Connect cloud key pair");
-    let config_response = client
-        .post(server_endpoint(handle, "/api/connect/relay-config"))
-        .bearer_auth(&access_token)
+    let config_url = server_endpoint(handle, "/api/connect/relay-config");
+    let config_response = access
+        .authorize(client.post(&config_url), "POST", &config_url)
         .json(&json!({
             "relayUrl": "https://relay.example",
             "relayIssuer": "https://relay.example",
@@ -231,9 +209,9 @@ async fn fetch_connect_descriptor(
         )
         .await
         .expect("signed Connect health proof");
-    let response = client
-        .post(server_endpoint(handle, "/api/bibcode-connect/health"))
-        .bearer_auth(access_token)
+    let health_url = server_endpoint(handle, "/api/bibcode-connect/health");
+    let response = access
+        .authorize(client.post(&health_url), "POST", &health_url)
         .json(&json!({ "proof": proof }))
         .send()
         .await

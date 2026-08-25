@@ -96,6 +96,7 @@ fn migration_40_preserves_the_default_policy_for_a_version_39_project_projection
             [],
         )
         .expect("insert version 39 projection");
+    insert_canonical_main(&connection, "project-legacy");
 
     run_migrations(&mut connection, None).expect("migrate version 39 projection to current");
 
@@ -122,6 +123,7 @@ fn migration_41_preserves_a_null_repository_pin_for_a_legacy_project() {
             [],
         )
         .expect("insert version 40 projection");
+    insert_canonical_main(&connection, "project-legacy-pin");
 
     run_migrations(&mut connection, None).expect("migrate version 40 projection to current");
 
@@ -133,6 +135,39 @@ fn migration_41_preserves_a_null_repository_pin_for_a_legacy_project() {
         )
         .expect("read migrated repository pin");
     assert_eq!(repository_key, None);
+}
+
+fn insert_canonical_main(connection: &Connection, project_id: &str) {
+    let thread_id = format!("{project_id}-main");
+    connection
+        .execute(
+            "INSERT INTO projection_threads (
+               thread_id, project_id, title, created_at, updated_at, kind
+             ) VALUES (?1, ?2, 'Main',
+                       '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'default')",
+            rusqlite::params![thread_id, project_id],
+        )
+        .expect("insert canonical Main projection");
+    connection
+        .execute(
+            "INSERT INTO orchestration_events (
+               event_id, aggregate_kind, stream_id, stream_version, event_type,
+               occurred_at, command_id, actor_kind, payload_json, metadata_json
+             ) VALUES (?1, 'thread', ?2, 1, 'thread.created',
+                       '2026-01-01T00:00:00.000Z', ?3, 'client', ?4, '{}')",
+            rusqlite::params![
+                format!("{project_id}-main-created"),
+                thread_id,
+                format!("{project_id}-create"),
+                serde_json::json!({
+                    "projectId": project_id,
+                    "threadId": thread_id,
+                    "kind": "default",
+                })
+                .to_string(),
+            ],
+        )
+        .expect("insert canonical Main event");
 }
 
 fn fixture_root() -> PathBuf {
