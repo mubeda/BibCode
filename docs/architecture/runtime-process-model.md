@@ -8,17 +8,26 @@ create a second owner.
 
 ## Runtime topology
 
-| Runtime             | Host                                    | Listener                      | Lifecycle owner                                                  |
-| ------------------- | --------------------------------------- | ----------------------------- | ---------------------------------------------------------------- |
-| Desktop             | Tauri starts the Rust server in-process | Numeric loopback              | Tauri desktop bridge and protected local control                 |
-| Foreground web      | `bibcode start` or `bibcode serve`      | Loopback HTTP or direct HTTPS | Invoking terminal/service supervisor and protected local control |
-| Workstation service | Current interactive user                | Loopback HTTP                 | User Task Scheduler, LaunchAgent, or systemd user manager        |
-| Headless service    | Dedicated service identity              | Loopback HTTP                 | Windows SCM, LaunchDaemon, or systemd system manager             |
+| Runtime             | Host                                             | Listener                                                                   | Lifecycle owner                                                      |
+| ------------------- | ------------------------------------------------ | -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Desktop             | Tauri starts the Rust server in-process          | Numeric loopback                                                           | Tauri desktop bridge and protected local control                     |
+| Desktop WSL         | Tauri starts one Linux server per Running distro | Distro numeric loopback behind a distinct Windows numeric-loopback forward | Tauri backend supervisor plus supervised per-connection WSL children |
+| Foreground web      | `bibcode start` or `bibcode serve`               | Loopback HTTP or direct HTTPS                                              | Invoking terminal/service supervisor and protected local control     |
+| Workstation service | Current interactive user                         | Loopback HTTP                                                              | User Task Scheduler, LaunchAgent, or systemd user manager            |
+| Headless service    | Dedicated service identity                       | Loopback HTTP                                                              | Windows SCM, LaunchDaemon, or systemd system manager                 |
 
 Managed services never bind directly to a network interface. Remote access
 reaches their loopback listener through SSH forwarding or a separately trusted
 HTTPS terminator. A foreground server may use a direct HTTPS listener when it
 has a validated certificate/private-key pair.
+
+For WSL, the desktop starts the Windows loopback listener before the distro
+server, publishes it only after generation-fenced readiness, and keeps it alive
+for authenticated soft shutdown. It then cancels the listener, joins active
+forwards, and reaps the WSL server. Unexpected listener or server exit cleans
+up its peer before the existing bounded restart policy runs. Per-connection
+`wsl.exe` processes use Windows Job ownership and are never allowed to outlive
+their accepted socket or the desktop-owned listener.
 
 ## Service definitions
 

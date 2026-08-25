@@ -194,11 +194,15 @@ For source development, the desktop searches
 `BIBCODE_WSL_SERVER_BINARY` to a different Windows-side binary path when needed;
 the desktop translates it with `wslpath` for the selected distribution.
 
-The WSL launcher uses a fixed system `PATH` and starts `bibcode serve` directly.
-Verify a custom binary from Windows with:
+The WSL launcher uses a fixed system `PATH` and starts `bibcode serve` on
+`127.0.0.1` inside the distribution. The desktop exposes a different
+`127.0.0.1` port on Windows and forwards raw HTTP/WebSocket bytes through
+short-lived, supervised `wsl.exe` children. It does not discover a WSL IP,
+publish a wildcard listener, or offer an HTTP privacy override. Verify a custom
+binary from Windows with:
 
 ```powershell
-wsl.exe -d <distribution> -- /path/to/bibcode --version
+wsl.exe --distribution <distribution> --exec /path/to/bibcode --version
 ```
 
 When **WSL only** is enabled, a missing distribution, binary, or failed WSL

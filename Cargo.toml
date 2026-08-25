@@ -69,6 +69,7 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.0", features = [
   "fs",
+  "io-std",
   "io-util",
   "macros",
   "net",

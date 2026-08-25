@@ -706,6 +706,7 @@ mod tests {
                 label: label.to_owned(),
                 ..local_config()
             },
+            wsl_transport: None,
         }
     }
 
@@ -750,11 +751,12 @@ mod tests {
             label: "WSL (Ubuntu)".to_owned(),
             running_distro: "Ubuntu".to_owned(),
             port: 4_301,
-            renderer_host: "172.20.0.2".to_owned(),
+            server_loopback_port: 5_301,
             desktop_bootstrap_token: "wsl-token".to_owned(),
             binary_path: "/opt/bibcode/bin/bibcode".to_owned(),
             data_root: "/srv/bibcode projects".to_owned(),
-        });
+        })
+        .expect("valid WSL recovery plan");
 
         let resolved = resolve_project_data_target(&plan)
             .await

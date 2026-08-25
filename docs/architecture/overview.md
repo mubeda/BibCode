@@ -450,14 +450,16 @@ be excluded.
 
 Each included backend exposes an authenticated maintenance API only in desktop
 mode. Native desktop runtimes must be loopback-bound. An external WSL runtime
-may use its wildcard bind only when its desktop bootstrap explicitly marks the
-transport as WSL-owned; the ordinary native wildcard case remains denied. The
-maintenance owner admits status and other read traffic, rejects new mutating
-HTTP and WebSocket RPC operations, and keeps a permit until every admitted
-mutation has committed or failed. Preparation then drains existing mutation
-permits with a bound, quiesces runtime-owned writers, queues, providers,
-terminals, and background tasks, checkpoints SQLite's WAL, and publishes and
-reloads a verified `PreUpdate` backup while holding the store-operation lock.
+also binds only distro loopback. The Tauri host publishes a separate Windows
+loopback listener and forwards each accepted byte stream through one supervised
+`wsl.exe ... bibcode transport stdio-forward` child. No WSL bootstrap flag can
+authorize wildcard plaintext. The maintenance owner admits status and other
+read traffic, rejects new mutating HTTP and WebSocket RPC operations, and keeps
+a permit until every admitted mutation has committed or failed. Preparation
+then drains existing mutation permits with a bound, quiesces runtime-owned
+writers, queues, providers, terminals, and background tasks, checkpoints
+SQLite's WAL, and publishes and reloads a verified `PreUpdate` backup while
+holding the store-operation lock.
 
 Each in-process server runtime owns a distinct bounded process-attribution
 registry shared by its provider, terminal, provider-helper, and managed-endpoint

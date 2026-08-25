@@ -278,6 +278,26 @@ enum CliCommand {
     Auth(AuthArgs),
     #[command(about = "Manage the workstation or headless server service.")]
     Service(ServiceArgs),
+    #[command(about = "Run narrowly scoped internal byte transports.")]
+    Transport(TransportArgs),
+}
+
+#[derive(Debug, Args)]
+struct TransportArgs {
+    #[command(subcommand)]
+    command: TransportSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TransportSubcommand {
+    #[command(
+        name = "stdio-forward",
+        about = "Forward standard I/O to a numeric IPv4 loopback port."
+    )]
+    StdioForward {
+        #[arg(long)]
+        loopback_port: u16,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -376,6 +396,12 @@ pub enum CliAction {
     Storage(StorageCommand),
     Auth(AuthCommand),
     Service(ServiceCliCommand),
+    Transport(TransportCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportCommand {
+    StdioForward { loopback_port: u16 },
 }
 
 #[derive(Clone, Debug)]
@@ -491,6 +517,12 @@ pub enum ConfigError {
     AuthCommandIsNotServer,
     #[error("service commands cannot be converted into a server configuration")]
     ServiceCommandIsNotServer,
+    #[error("transport commands cannot be converted into a server configuration")]
+    TransportCommandIsNotServer,
+    #[error("transport stdio-forward accepts only --loopback-port")]
+    TransportServerOptionsForbidden,
+    #[error("transport stdio-forward requires a non-zero loopback port")]
+    TransportLoopbackPortZero,
     #[error("invalid {command} mode {mode:?}; expected {expected}")]
     InvalidCommandMode {
         command: &'static str,
@@ -531,6 +563,7 @@ impl Cli {
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
             CliAction::Auth(_) => Err(ConfigError::AuthCommandIsNotServer),
             CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
+            CliAction::Transport(_) => Err(ConfigError::TransportCommandIsNotServer),
         }
     }
 
@@ -591,6 +624,18 @@ impl Cli {
                     root,
                     bind: SocketAddr::new(ip, args.port.unwrap_or(DEFAULT_PORT)),
                     format: service.format,
+                }));
+            }
+            Some(CliCommand::Transport(transport)) => {
+                if args.has_transport_server_options() {
+                    return Err(ConfigError::TransportServerOptionsForbidden);
+                }
+                let TransportSubcommand::StdioForward { loopback_port } = transport.command;
+                if loopback_port == 0 {
+                    return Err(ConfigError::TransportLoopbackPortZero);
+                }
+                return Ok(CliAction::Transport(TransportCommand::StdioForward {
+                    loopback_port,
                 }));
             }
             command => command,
@@ -661,6 +706,22 @@ impl Cli {
         config.desktop_bootstrap_token = desktop_bootstrap_token;
         config.managed_service_mode = managed_service_mode;
         Ok(CliAction::Run(Box::new(config)))
+    }
+}
+
+impl ServerArgs {
+    fn has_transport_server_options(&self) -> bool {
+        self.mode.is_some()
+            || self.host.is_some()
+            || self.port.is_some()
+            || self.base_dir.is_some()
+            || self.static_dir.is_some()
+            || self.tls_certificate_chain.is_some()
+            || self.tls_private_key.is_some()
+            || self.dev_url.is_some()
+            || self.no_browser
+            || self.bootstrap_fd.is_some()
+            || self.managed_service_mode.is_some()
     }
 }
 

@@ -452,6 +452,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-web-kit",
  "portpicker",
+ "process-wrap",
  "reqwest",
  "serde",
  "serde_json",

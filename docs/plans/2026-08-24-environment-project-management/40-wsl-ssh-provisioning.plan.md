@@ -304,11 +304,11 @@ evidence rather than being claimed from this macOS host.
 - Test: `apps/desktop/src-tauri/src/wsl_transport.rs`
 - Test: `apps/server/tests/cli_smoke.rs`, `network_admission.rs`
 
-- [ ] **Step 1: Add failing transport security/lifecycle tests**
+- [x] **Step 1: Add failing transport security/lifecycle tests**
 
 Assert server argv uses `--host 127.0.0.1`, the Windows-facing listener binds only `127.0.0.1`/`::1`, byte streams preserve HTTP upgrade/WebSocket traffic, cancellation closes both halves, stalled copies time out only during setup, and all `wsl.exe` children are reaped.
 
-- [ ] **Step 2: Add a narrowly scoped internal forward command**
+- [x] **Step 2: Add a narrowly scoped internal forward command**
 
 ```text
 bibcode transport stdio-forward --loopback-port <u16>
@@ -316,7 +316,7 @@ bibcode transport stdio-forward --loopback-port <u16>
 
 The command accepts no host, URL, path, or shell input. It connects only to `127.0.0.1:<port>`, copies stdin/stdout bidirectionally with bounded setup, and exits when either side closes.
 
-- [ ] **Step 3: Implement the Windows loopback proxy**
+- [x] **Step 3: Implement the Windows loopback proxy**
 
 For each accepted Windows-loopback connection, spawn:
 
@@ -326,11 +326,11 @@ wsl.exe --distribution <validated-name> --exec <verified-bibcode-path> transport
 
 Pipe the socket to child stdin/stdout, bound stderr, associate the process with the desktop job/reaper, and generation-fence publication of the proxy URL.
 
-- [ ] **Step 4: Remove insecure WSL admission exceptions**
+- [x] **Step 4: Remove insecure WSL admission exceptions**
 
 Delete `WSL_BACKEND_BIND_HOST = "0.0.0.0"`, wildcard backend plans, and auth/service allowances keyed solely by `desktop_wsl_transport`. WSL ordinary traffic now arrives at the server on distro loopback and retains normal environment authentication.
 
-- [ ] **Step 5: Run transport/admission tests and commit**
+- [x] **Step 5: Run transport/admission tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl_transport -- --nocapture
@@ -339,6 +339,34 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke tran
 git add apps/desktop/src-tauri/src/wsl_transport.rs apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/lib.rs apps/server/src/config.rs apps/server/src/lib.rs apps/server/tests/cli_smoke.rs apps/server/tests/network_admission.rs
 git commit -m "fix(wsl): forward loopback traffic without wildcard HTTP"
 ```
+
+Implementation note: every WSL backend now listens on its own distro-local
+numeric loopback port, while a distinct desktop-owned numeric-loopback listener
+is the only URL published to the Windows client. The listener is started before
+the server, fenced by the backend generation, and retained through authenticated
+soft shutdown. Cancellation stops admission, joins active forwards, and reaps
+both the server and per-connection `wsl.exe` process trees under the existing
+bounded restart policy.
+
+The internal `bibcode transport stdio-forward --loopback-port <u16>` command
+accepts no host, URL, path, or shell input, connects only to `127.0.0.1`, uses a
+bounded setup deadline, and performs raw bidirectional copying without imposing
+a timeout on an established stream. Desktop forwarding uses exact structured
+`wsl.exe --distribution <name> --exec <binary> ...` arguments, a 64-connection
+cap, bounded stderr, generation-fenced publication, and supervised child-tree
+cleanup. Wildcard WSL binds and transport-name authentication exceptions were
+removed; ordinary environment authentication remains mandatory.
+
+Focused validation passed 5 desktop transport tests, 71 backend tests, 8 server
+network-admission tests, and 2 CLI transport tests. The complete desktop package
+passed 309 unit tests plus 7 bridge/SSH integration tests, and the complete
+server library passed 1,655 tests with 2 ignored; all server integration targets
+also passed. Desktop and server Clippy passed for all targets with warnings
+denied, Rust formatting, `vp check`, workspace typecheck, and diff checks passed.
+`vp check` retains one pre-existing unused-test-fixture warning. Native Windows
+execution remains required by the Windows runbook; a macOS-hosted Windows cross
+check could not compile because the Windows SDK headers are unavailable, so no
+native Windows result is claimed here.
 
 ### Task 5: Add explicit WSL server setup and version reconciliation
 

@@ -50,6 +50,7 @@ use thiserror::Error;
 pub use config::{
     AuthCommand, Cli, CliAction, ConfigError, PairingOutputFormat, ServerConfig, ServerMode,
     ServiceCliCommand, ServiceOperation, ServiceOutputFormat, StorageCommand, TlsFiles,
+    TransportCommand,
 };
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
@@ -96,6 +97,16 @@ pub enum RunError {
     ServiceBinary(#[source] std::io::Error),
     #[error("failed to encode service command output")]
     ServiceOutput(#[source] serde_json::Error),
+    #[error("timed out connecting the standard-I/O transport to 127.0.0.1:{port}")]
+    StdioForwardConnectTimeout { port: u16 },
+    #[error("failed to connect the standard-I/O transport to 127.0.0.1:{port}")]
+    StdioForwardConnect {
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("standard-I/O transport copy failed")]
+    StdioForwardCopy(#[source] std::io::Error),
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
@@ -104,6 +115,45 @@ pub async fn run_cli() -> Result<(), RunError> {
         CliAction::Storage(command) => run_storage_command(command).await,
         CliAction::Auth(command) => run_auth_command(command).await,
         CliAction::Service(command) => run_service_command(command).await,
+        CliAction::Transport(command) => run_transport_command(command).await,
+    }
+}
+
+const STDIO_FORWARD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn run_transport_command(command: TransportCommand) -> Result<(), RunError> {
+    match command {
+        TransportCommand::StdioForward { loopback_port } => {
+            let address =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, loopback_port));
+            let stream = tokio::time::timeout(
+                STDIO_FORWARD_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            .map_err(|_| RunError::StdioForwardConnectTimeout {
+                port: loopback_port,
+            })?
+            .map_err(|source| RunError::StdioForwardConnect {
+                port: loopback_port,
+                source,
+            })?;
+            let (mut server_read, mut server_write) = stream.into_split();
+            let mut stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+
+            tokio::select! {
+                copied = tokio::io::copy(&mut stdin, &mut server_write) => {
+                    copied.map_err(RunError::StdioForwardCopy)?;
+                }
+                copied = tokio::io::copy(&mut server_read, &mut stdout) => {
+                    copied.map_err(RunError::StdioForwardCopy)?;
+                    use tokio::io::AsyncWriteExt as _;
+                    stdout.flush().await.map_err(RunError::StdioForwardCopy)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

@@ -278,6 +278,7 @@ mod test_support;
 mod updates;
 mod window;
 mod wsl;
+mod wsl_transport;
 
 pub use bridge::{
     desktop_bridge_bootstrap_ssh_bearer_session, desktop_bridge_fetch_environment_descriptor,

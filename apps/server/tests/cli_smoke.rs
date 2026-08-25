@@ -5,7 +5,7 @@ use std::{
 
 use bibcode_server::{
     AuthCommand, Cli, CliAction, PairingOutputFormat, ServerConfig, ServerRuntime,
-    ServiceCliCommand, ServiceOperation, ServiceOutputFormat,
+    ServiceCliCommand, ServiceOperation, ServiceOutputFormat, TransportCommand,
     local_control::protocol::{
         CONTROL_PROTOCOL_VERSION, ControlResponse, ControlResponseBody, read_request,
         write_response,
@@ -44,6 +44,156 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }
+}
+
+#[test]
+fn transport_stdio_forward_accepts_only_a_numeric_loopback_port() {
+    let action = Cli::try_parse_from([
+        "bibcode",
+        "transport",
+        "stdio-forward",
+        "--loopback-port",
+        "4773",
+    ])
+    .expect("transport arguments parse")
+    .into_action()
+    .expect("transport action resolves");
+    assert!(matches!(
+        action,
+        CliAction::Transport(TransportCommand::StdioForward {
+            loopback_port: 4_773
+        })
+    ));
+
+    for forbidden in [
+        vec!["--host", "192.0.2.10"],
+        vec!["--base-dir", "/tmp/other-store"],
+        vec!["--port", "4774"],
+    ] {
+        let mut arguments = vec![
+            "bibcode",
+            "transport",
+            "stdio-forward",
+            "--loopback-port",
+            "4773",
+        ];
+        arguments.extend(forbidden);
+        assert!(
+            Cli::try_parse_from(arguments)
+                .expect("global syntax parses")
+                .into_action()
+                .expect_err("transport must reject every server listener option")
+                .to_string()
+                .contains("accepts only --loopback-port")
+        );
+    }
+
+    assert!(
+        Cli::try_parse_from([
+            "bibcode",
+            "transport",
+            "stdio-forward",
+            "--loopback-port",
+            "0",
+        ])
+        .expect("numeric syntax parses")
+        .into_action()
+        .expect_err("port zero is not a connectable loopback target")
+        .to_string()
+        .contains("non-zero")
+    );
+}
+
+#[tokio::test]
+async fn transport_stdio_forward_preserves_http_upgrade_bytes_without_a_stream_timeout() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("loopback fixture binds");
+    let port = listener.local_addr().expect("fixture address").port();
+    let port_argument = port.to_string();
+    let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args([
+            "transport",
+            "stdio-forward",
+            "--loopback-port",
+            port_argument.as_str(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("stdio forward child starts");
+    // macOS debug binaries can spend several seconds in process startup before
+    // the command's own bounded connect begins.
+    let accepted = timeout(Duration::from_secs(15), listener.accept()).await;
+    let (mut remote, peer) = match accepted {
+        Ok(accepted) => accepted.expect("loopback fixture accepts"),
+        Err(_) => {
+            let _ = child.start_kill();
+            let status = child.wait().await.expect("reap failed forward child");
+            let mut stderr = child.stderr.take().expect("failed forward stderr");
+            let mut stderr_bytes = Vec::new();
+            stderr
+                .read_to_end(&mut stderr_bytes)
+                .await
+                .expect("read failed forward stderr");
+            panic!(
+                "stdio forward {} did not connect before its setup deadline ({status}): {}",
+                env!("CARGO_BIN_EXE_bibcode"),
+                String::from_utf8_lossy(&stderr_bytes)
+            );
+        }
+    };
+    assert!(peer.ip().is_loopback());
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(child.try_wait().expect("inspect stalled forward"), None);
+
+    let request = b"GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\0\xff";
+    let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n\x81\x03raw";
+    let mut child_stdin = child.stdin.take().expect("forward stdin");
+    let mut child_stdout = child.stdout.take().expect("forward stdout");
+    child_stdin
+        .write_all(request)
+        .await
+        .expect("write request bytes");
+    let mut received_request = vec![0; request.len()];
+    remote
+        .read_exact(&mut received_request)
+        .await
+        .expect("remote receives exact request");
+    assert_eq!(received_request, request);
+
+    remote
+        .write_all(response)
+        .await
+        .expect("write response bytes");
+    let mut received_response = vec![0; response.len()];
+    child_stdout
+        .read_exact(&mut received_response)
+        .await
+        .expect("stdout receives exact response");
+    assert_eq!(received_response, response);
+
+    drop(child_stdin);
+    remote.shutdown().await.expect("close remote fixture");
+    drop(remote);
+    let status = timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("stdio forward exits when the stream closes")
+        .expect("stdio forward child is reaped");
+    let mut stderr = child.stderr.take().expect("forward stderr");
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .await
+        .expect("read forward stderr");
+    assert!(
+        status.success(),
+        "stdio forward failed: {}",
+        String::from_utf8_lossy(&stderr_bytes)
+    );
 }
 
 #[test]

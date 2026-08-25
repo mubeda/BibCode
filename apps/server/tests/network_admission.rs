@@ -331,6 +331,20 @@ async fn rejected_listener_configuration_has_no_persistent_state_side_effects() 
 }
 
 #[tokio::test]
+async fn desktop_bootstrap_authority_never_allows_wildcard_plaintext() {
+    let state = tempfile::tempdir().expect("state directory");
+    let config = ServerConfig::new(state.path())
+        .with_bind("0.0.0.0", 0)
+        .with_desktop("desktop-bootstrap-token")
+        .expect("desktop token is valid");
+
+    assert!(matches!(
+        validate_listener(&config).await,
+        Err(TransportError::NonLoopbackPlaintext { .. })
+    ));
+}
+
+#[tokio::test]
 async fn tls_listener_serves_https_metadata_and_never_downgrades_to_plaintext() {
     let state = tempfile::tempdir().expect("state directory");
     let tls = TlsFixture::valid();

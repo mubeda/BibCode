@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -35,7 +35,10 @@ use crate::{
     wsl::{
         WslDiscoveryHealth, WslDiscoveryService, WslDiscoverySnapshot, WslDistro, WslDistroState,
     },
+    wsl_transport::{WslTransportHandle, WslTransportPlan},
 };
+#[cfg(test)]
+use std::net::Ipv4Addr;
 
 mod ui_process_observer;
 
@@ -64,7 +67,6 @@ const PRIMARY_BACKEND_LOG_FILE_NAME: &str = "server-child.log";
 const WSL_BACKEND_LOG_FILE_PREFIX: &str = "server-child-wsl-";
 const WSL_BACKEND_LOG_FILE_EXTENSION: &str = ".log";
 const WSL_RUNTIME_INSTANCE_ID_PREFIX: &str = "desktop-wsl-runtime:";
-const WSL_BACKEND_BIND_HOST: &str = "0.0.0.0";
 const WSL_SERVER_SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,7 @@ pub struct BackendLaunchPlan {
     pub target: BackendLaunchTarget,
     pub log_path: Option<PathBuf>,
     pub config: BackendRunConfig,
+    pub(crate) wsl_transport: Option<WslTransportPlan>,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -186,10 +189,20 @@ pub struct WslBackendLaunchPlanInput {
     pub label: String,
     pub running_distro: String,
     pub port: u16,
-    pub renderer_host: String,
+    pub server_loopback_port: u16,
     pub desktop_bootstrap_token: String,
     pub binary_path: String,
     pub data_root: String,
+}
+
+struct WslBackendPlanRequest {
+    environment_id: String,
+    label: String,
+    running_distro: String,
+    local_port: u16,
+    server_loopback_port: u16,
+    desktop_bootstrap_token: String,
+    log_path: PathBuf,
 }
 
 impl BackendLaunchPlan {
@@ -207,6 +220,7 @@ impl BackendLaunchPlan {
             },
             log_path: None,
             config,
+            wsl_transport: None,
         }
     }
 
@@ -227,14 +241,20 @@ impl BackendLaunchPlan {
         self
     }
 
-    pub fn wsl(input: WslBackendLaunchPlanInput) -> Self {
+    pub fn wsl(input: WslBackendLaunchPlanInput) -> Result<Self, String> {
+        let transport = WslTransportPlan::new(
+            input.running_distro.clone(),
+            input.binary_path.clone(),
+            input.server_loopback_port,
+            input.port,
+        )?;
         let config = BackendRunConfig {
             environment_id: input.environment_id,
             label: input.label,
             running_distro: Some(input.running_distro.clone()),
             port: input.port,
-            bind_host: WSL_BACKEND_BIND_HOST.to_string(),
-            local_host: input.renderer_host,
+            bind_host: DESKTOP_LOOPBACK_HOST.to_string(),
+            local_host: DESKTOP_LOOPBACK_HOST.to_string(),
             desktop_bootstrap_token: input.desktop_bootstrap_token,
             server_exposure_mode: "local-only".to_string(),
             endpoint_url: None,
@@ -245,27 +265,30 @@ impl BackendLaunchPlan {
         let bootstrap = json!({
             "mode": DESKTOP_MODE,
             "noBrowser": true,
-            "port": config.port,
-            "host": &config.bind_host,
+            "port": input.server_loopback_port,
+            "host": DESKTOP_LOOPBACK_HOST,
             "desktopBootstrapToken": &config.desktop_bootstrap_token,
             "bibcodeHome": &input.data_root,
-            "wslTransport": true,
             "tailscaleServeEnabled": false,
             "tailscaleServePort": TAILSCALE_SERVE_PORT,
         });
         let args = vec![
-            "-d".to_string(),
+            "--distribution".to_string(),
             input.running_distro,
             "--exec".to_string(),
             "env".to_string(),
             format!("PATH={WSL_SERVER_SYSTEM_PATH}"),
             input.binary_path,
             "serve".to_string(),
+            "--host".to_string(),
+            DESKTOP_LOOPBACK_HOST.to_string(),
+            "--port".to_string(),
+            input.server_loopback_port.to_string(),
             "--bootstrap-fd".to_string(),
             BACKEND_BOOTSTRAP_FD.to_string(),
         ];
 
-        Self {
+        Ok(Self {
             target: BackendLaunchTarget::ExternalProcess {
                 program: "wsl.exe".to_string(),
                 args,
@@ -274,7 +297,8 @@ impl BackendLaunchPlan {
             },
             log_path: None,
             config,
-        }
+            wsl_transport: Some(transport),
+        })
     }
 }
 
@@ -330,15 +354,22 @@ struct ManagedBackendChild {
     run_id: u64,
     config: BackendRunConfig,
     child: Arc<AsyncMutex<Child>>,
+    wsl_transport: Option<WslTransportHandle>,
     stop_requested: Arc<AtomicBool>,
 }
 
 impl ManagedBackendChild {
-    fn new(run_id: u64, config: BackendRunConfig, child: Child) -> Self {
+    fn new(
+        run_id: u64,
+        config: BackendRunConfig,
+        child: Child,
+        wsl_transport: Option<WslTransportHandle>,
+    ) -> Self {
         Self {
             run_id,
             config,
             child: Arc::new(AsyncMutex::new(child)),
+            wsl_transport,
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -753,12 +784,15 @@ impl BackendSupervisor {
     async fn test_wsl_plan(&self, distro: &str) -> Result<BackendLaunchPlan, String> {
         resolve_wsl_launch_plan_for_distro(
             self.wsl_command_resolver.as_ref(),
-            distro.to_owned(),
-            DEFAULT_BACKEND_PORT,
-            "test-token".to_owned(),
-            PathBuf::from("test-backend.log"),
-            format!("{WSL_RUNTIME_INSTANCE_ID_PREFIX}test"),
-            format!("WSL {distro}"),
+            WslBackendPlanRequest {
+                environment_id: format!("{WSL_RUNTIME_INSTANCE_ID_PREFIX}test"),
+                label: format!("WSL {distro}"),
+                running_distro: distro.to_owned(),
+                local_port: DEFAULT_BACKEND_PORT,
+                server_loopback_port: DEFAULT_BACKEND_PORT + 1,
+                desktop_bootstrap_token: "test-token".to_owned(),
+                log_path: PathBuf::from("test-backend.log"),
+            },
         )
     }
 
@@ -1767,6 +1801,26 @@ async fn start_managed_backend(
             bootstrap_line,
             ..
         } => {
+            let wsl_transport = match plan.wsl_transport.clone() {
+                Some(transport_plan) => {
+                    let handle = WslTransportHandle::start(transport_plan, run_id).await?;
+                    let endpoint = handle.endpoint();
+                    if endpoint.generation != run_id || !endpoint.local_addr.ip().is_loopback() {
+                        let cleanup = handle.stop().await;
+                        let error =
+                            "The WSL transport endpoint failed its generation or loopback fence."
+                                .to_string();
+                        return Err(append_startup_cleanup_error(error, cleanup));
+                    }
+                    Some(handle)
+                }
+                None => None,
+            };
+            let mut config = plan.config.clone();
+            if let Some(transport) = &wsl_transport {
+                config.port = transport.endpoint().local_addr.port();
+            }
+
             let mut command = Command::new(program);
             configure_background_command(&mut command);
             command
@@ -1775,37 +1829,113 @@ async fn start_managed_backend(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            let mut child = command.spawn().map_err(|error| {
-                format!("Could not start desktop backend using {program}: {error}")
-            })?;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let cause = format!("Could not start desktop backend using {program}: {error}");
+                    let cleanup = stop_optional_wsl_transport(wsl_transport.as_ref()).await;
+                    return Err(append_startup_cleanup_error(cause, cleanup));
+                }
+            };
 
-            let mut stdin = child.stdin.take().ok_or_else(|| {
-                "Desktop backend child process did not expose stdin for bootstrap delivery."
-                    .to_string()
-            })?;
-            stdin
-                .write_all(bootstrap_line.as_bytes())
-                .await
-                .map_err(|error| format!("Could not write desktop backend bootstrap: {error}"))?;
-            drop(stdin);
-
+            let mut stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    let cause = "Desktop backend child process did not expose stdin for bootstrap delivery."
+                        .to_string();
+                    return Err(cleanup_failed_external_start(
+                        cause,
+                        &mut child,
+                        wsl_transport.as_ref(),
+                    )
+                    .await);
+                }
+            };
             drain_output("stdout", child.stdout.take(), plan.log_path.clone());
             drain_output("stderr", child.stderr.take(), plan.log_path.clone());
+            if let Err(error) = stdin.write_all(bootstrap_line.as_bytes()).await {
+                let cause = format!("Could not write desktop backend bootstrap: {error}");
+                return Err(cleanup_failed_external_start(
+                    cause,
+                    &mut child,
+                    wsl_transport.as_ref(),
+                )
+                .await);
+            }
+            drop(stdin);
 
-            let config = plan.config.clone();
             if let Err(error) = wait_for_http_ready(&config.http_base_url(), &readiness).await {
-                let _ = child.start_kill();
-                return Err(error);
+                return Err(cleanup_failed_external_start(
+                    error,
+                    &mut child,
+                    wsl_transport.as_ref(),
+                )
+                .await);
             }
 
             let pid = child.id();
             Ok((
                 config.clone(),
-                ManagedBackend::Child(Box::new(ManagedBackendChild::new(run_id, config, child))),
+                ManagedBackend::Child(Box::new(ManagedBackendChild::new(
+                    run_id,
+                    config,
+                    child,
+                    wsl_transport,
+                ))),
                 pid,
             ))
         }
     }
+}
+
+async fn cleanup_failed_external_start(
+    cause: String,
+    child: &mut Child,
+    wsl_transport: Option<&WslTransportHandle>,
+) -> String {
+    let child_cleanup = terminate_and_reap_backend_child(child).await;
+    let transport_cleanup = stop_optional_wsl_transport(wsl_transport).await;
+    append_startup_cleanup_error(
+        append_startup_cleanup_error(cause, child_cleanup),
+        transport_cleanup,
+    )
+}
+
+fn append_startup_cleanup_error(cause: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => cause,
+        Err(error) => format!("{cause}; startup cleanup failed: {error}"),
+    }
+}
+
+async fn stop_optional_wsl_transport(transport: Option<&WslTransportHandle>) -> Result<(), String> {
+    match transport {
+        Some(transport) => transport.stop().await,
+        None => Ok(()),
+    }
+}
+
+async fn terminate_and_reap_backend_child(child: &mut Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the failed desktop backend child: {error}"
+            ));
+        }
+    }
+    tokio::time::timeout(DEFAULT_BACKEND_SHUTDOWN_TIMEOUT, child.kill())
+        .await
+        .map_err(|_| {
+            format!(
+                "Timed out after {:?} while terminating the failed desktop backend child.",
+                DEFAULT_BACKEND_SHUTDOWN_TIMEOUT
+            )
+        })?
+        .map_err(|error| {
+            format!("Could not terminate and reap the failed desktop backend child: {error}")
+        })
 }
 
 #[cfg(test)]
@@ -1881,44 +2011,84 @@ fn spawn_backend_monitor(
 ) {
     tauri::async_runtime::spawn(async move {
         match backend {
-            ManagedBackend::Child(child) => {
-                loop {
-                    tokio::time::sleep(restart.monitor_interval).await;
-                    if child.stop_requested.load(Ordering::SeqCst) {
-                        return;
-                    }
+            ManagedBackend::Child(child) => loop {
+                tokio::time::sleep(restart.monitor_interval).await;
+                if child.stop_requested.load(Ordering::SeqCst) {
+                    return;
+                }
 
-                    let exit = {
-                        let mut process = child.child.lock().await;
-                        process.try_wait()
+                if let Some(result) = child
+                    .wsl_transport
+                    .as_ref()
+                    .and_then(WslTransportHandle::completed_result)
+                {
+                    let reason = match result {
+                        Ok(()) => "Desktop WSL loopback forwarder ended unexpectedly.".to_string(),
+                        Err(error) => {
+                            format!("Desktop WSL loopback forwarder failed unexpectedly: {error}")
+                        }
                     };
+                    if let Err(error) =
+                        stop_managed_child(child.as_ref().clone(), BackendShutdownConfig::default())
+                            .await
+                    {
+                        tracing::warn!(
+                            "failed to clean up a backend after its WSL forwarder ended: {error}"
+                        );
+                    }
+                    supervisor.schedule_restart(plan.clone(), readiness, restart, reason);
+                    return;
+                }
 
-                    match exit {
-                        Ok(None) => {}
-                        Ok(Some(status)) => {
-                            if child.stop_requested.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            supervisor.schedule_restart(
+                let exit = {
+                    let mut process = child.child.lock().await;
+                    process.try_wait()
+                };
+
+                match exit {
+                    Ok(None) => {}
+                    Ok(Some(status)) => {
+                        if child.stop_requested.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if let Err(error) =
+                            stop_optional_wsl_transport(child.wsl_transport.as_ref()).await
+                        {
+                            tracing::warn!(
+                                "failed to stop the WSL forwarder after its backend exited: {error}"
+                            );
+                        }
+                        supervisor.schedule_restart(
                             plan.clone(),
                             readiness,
                             restart,
-                            format!("Desktop backend child exited unexpectedly with status {status}."),
+                            format!(
+                                "Desktop backend child exited unexpectedly with status {status}."
+                            ),
                         );
-                            return;
-                        }
-                        Err(error) => {
-                            supervisor.schedule_restart(
-                                plan.clone(),
-                                readiness,
-                                restart,
-                                format!("Could not inspect desktop backend child status: {error}"),
+                        return;
+                    }
+                    Err(error) => {
+                        if let Err(cleanup_error) = stop_managed_child(
+                            child.as_ref().clone(),
+                            BackendShutdownConfig::default(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "failed to clean up an uninspectable desktop backend: {cleanup_error}"
                             );
-                            return;
                         }
+                        supervisor.schedule_restart(
+                            plan.clone(),
+                            readiness,
+                            restart,
+                            format!("Could not inspect desktop backend child status: {error}"),
+                        );
+                        return;
                     }
                 }
-            }
+            },
             ManagedBackend::Runtime(runtime) => {
                 if let Err(error) = runtime.wait_for_completion().await
                     && !runtime.stop_requested.load(Ordering::SeqCst)
@@ -1967,14 +2137,40 @@ async fn stop_managed_child(
             })
             .is_ok();
 
-    let mut process = child.child.lock().await;
-
-    if matches!(process.try_wait(), Ok(Some(_))) {
-        return Ok(());
+    if let Some(transport) = &child.wsl_transport {
+        transport.cancel();
     }
 
-    let graceful_requested =
-        soft_shutdown_requested || request_child_soft_termination(&mut process);
+    let mut process = child.child.lock().await;
+    let process_result =
+        stop_backend_child_process(&mut process, soft_shutdown_requested, shutdown).await;
+    drop(process);
+    let transport_result = stop_optional_wsl_transport(child.wsl_transport.as_ref()).await;
+
+    match (process_result, transport_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(process_error), Err(transport_error)) => Err(format!(
+            "{process_error}; WSL transport cleanup failed: {transport_error}"
+        )),
+    }
+}
+
+async fn stop_backend_child_process(
+    process: &mut Child,
+    soft_shutdown_requested: bool,
+    shutdown: BackendShutdownConfig,
+) -> Result<(), String> {
+    match process.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect desktop backend child status during shutdown: {error}"
+            ));
+        }
+    }
+    let graceful_requested = soft_shutdown_requested || request_child_soft_termination(process);
     if !graceful_requested && let Err(error) = process.start_kill() {
         tracing::debug!(
             "desktop backend child was already stopped or could not be killed: {error}"
@@ -2292,14 +2488,6 @@ fn resolve_wsl_server_binary(
     ))
 }
 
-fn resolve_wsl_renderer_host(resolver: &dyn WslCommandResolver, distro: &str) -> Option<String> {
-    let output = run_wsl_command(resolver, distro, &["hostname", "-I"]).ok()?;
-    output
-        .split_whitespace()
-        .find(|value| value.parse::<Ipv4Addr>().is_ok())
-        .map(ToOwned::to_owned)
-}
-
 fn resolve_wsl_data_root(
     resolver: &dyn WslCommandResolver,
     distro: &str,
@@ -2328,29 +2516,30 @@ fn resolve_wsl_data_root(
 
 fn resolve_wsl_launch_plan_for_distro(
     resolver: &dyn WslCommandResolver,
-    running_distro: String,
-    port: u16,
-    desktop_bootstrap_token: String,
-    log_path: PathBuf,
-    environment_id: String,
-    label: String,
+    request: WslBackendPlanRequest,
 ) -> Result<BackendLaunchPlan, String> {
-    let binary_path = resolve_wsl_server_binary(resolver, &running_distro)?;
-    let data_root = resolve_wsl_data_root(resolver, &running_distro)?;
-    let renderer_host = resolve_wsl_renderer_host(resolver, &running_distro)
-        .unwrap_or_else(|| DESKTOP_LOOPBACK_HOST.to_string());
-
-    Ok(BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
+    let WslBackendPlanRequest {
         environment_id,
         label,
         running_distro,
-        port,
-        renderer_host,
+        local_port,
+        server_loopback_port,
+        desktop_bootstrap_token,
+        log_path,
+    } = request;
+    let binary_path = resolve_wsl_server_binary(resolver, &running_distro)?;
+    let data_root = resolve_wsl_data_root(resolver, &running_distro)?;
+    BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
+        environment_id,
+        label,
+        running_distro,
+        port: local_port,
+        server_loopback_port,
         desktop_bootstrap_token,
         binary_path,
         data_root,
     })
-    .with_log_path(log_path))
+    .map(|plan| plan.with_log_path(log_path))
 }
 
 fn classify_primary_start_error(
@@ -2526,14 +2715,23 @@ fn default_launch_plans<R: Runtime>(
                     .map_err(|detail| BackendPlanError::Other { detail })?,
             )
         };
+        let server_loopback_port = pick_desktop_backend_port_excluding(&reserved_ports)
+            .ok_or_else(|| BackendPlanError::Other {
+                detail: "Could not find an available loopback port for every WSL server."
+                    .to_string(),
+            })?;
+        reserved_ports.push(server_loopback_port);
         let planned = resolve_wsl_launch_plan_for_distro(
             wsl_command_resolver,
-            distro_name.clone(),
-            port,
-            Uuid::new_v4().simple().to_string(),
-            log_path,
-            environment_id.clone(),
-            label.clone(),
+            WslBackendPlanRequest {
+                environment_id: environment_id.clone(),
+                label: label.clone(),
+                running_distro: distro_name.clone(),
+                local_port: port,
+                server_loopback_port,
+                desktop_bootstrap_token: Uuid::new_v4().simple().to_string(),
+                log_path,
+            },
         );
         match planned {
             Ok(plan) => plans.push(plan),
@@ -3689,11 +3887,12 @@ exit /b 9
             label: "WSL (Ubuntu)".to_string(),
             running_distro: "Ubuntu".to_string(),
             port: 5050,
-            renderer_host: "172.27.0.99".to_string(),
+            server_loopback_port: 5051,
             desktop_bootstrap_token: "desktop-token".to_string(),
             binary_path: "/tmp/bibcode's launch/bibcode".to_string(),
             data_root: "/srv/bibcode data".to_string(),
         })
+        .expect("valid WSL launch plan")
         .with_log_path(PathBuf::from(
             "C:/Users/mauro/.bibcode/dev/logs/server-child-wsl-Ubuntu.log",
         ));
@@ -3701,8 +3900,8 @@ exit /b 9
         assert_eq!(plan.config.environment_id, TEST_WSL_RUNTIME_ID);
         assert_eq!(plan.config.label, "WSL (Ubuntu)");
         assert_eq!(plan.config.running_distro, Some("Ubuntu".to_string()));
-        assert_eq!(plan.config.http_base_url(), "http://172.27.0.99:5050");
-        assert_eq!(plan.config.bind_host, "0.0.0.0");
+        assert_eq!(plan.config.http_base_url(), "http://127.0.0.1:5050");
+        assert_eq!(plan.config.bind_host, DESKTOP_LOOPBACK_HOST);
         assert!(matches!(
             plan.target,
             BackendLaunchTarget::ExternalProcess {
@@ -3713,13 +3912,17 @@ exit /b 9
             } if program == "wsl.exe"
                 && data_root.as_deref() == Some("/srv/bibcode data")
                 && args == &vec![
-                    "-d".to_string(),
+                    "--distribution".to_string(),
                     "Ubuntu".to_string(),
                     "--exec".to_string(),
                     "env".to_string(),
                     format!("PATH={WSL_SERVER_SYSTEM_PATH}"),
                     "/tmp/bibcode's launch/bibcode".to_string(),
                     "serve".to_string(),
+                    "--host".to_string(),
+                    "127.0.0.1".to_string(),
+                    "--port".to_string(),
+                    "5051".to_string(),
                     "--bootstrap-fd".to_string(),
                     "0".to_string(),
                 ]
@@ -3727,11 +3930,10 @@ exit /b 9
                     == json!({
                         "mode": "desktop",
                         "noBrowser": true,
-                        "port": 5050,
-                        "host": "0.0.0.0",
+                        "port": 5051,
+                        "host": "127.0.0.1",
                         "desktopBootstrapToken": "desktop-token",
                         "bibcodeHome": "/srv/bibcode data",
-                        "wslTransport": true,
                         "tailscaleServeEnabled": false,
                         "tailscaleServePort": 443,
                     })
@@ -3774,11 +3976,12 @@ exit /b 9
             label: "WSL (Ubuntu)".to_string(),
             running_distro: "Ubuntu".to_string(),
             port: 3774,
-            renderer_host: "172.27.0.99".to_string(),
+            server_loopback_port: 4774,
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
             data_root: "/home/test/.bibcode".to_string(),
-        });
+        })
+        .expect("valid WSL plan");
 
         {
             let mut state = supervisor
@@ -3807,7 +4010,7 @@ exit /b 9
         assert_eq!(bootstraps[0]["id"], "primary");
         assert_eq!(bootstraps[1]["id"], TEST_WSL_RUNTIME_ID);
         assert_eq!(bootstraps[1]["label"], "WSL (Ubuntu)");
-        assert_eq!(bootstraps[1]["httpBaseUrl"], "http://172.27.0.99:3774");
+        assert_eq!(bootstraps[1]["httpBaseUrl"], "http://127.0.0.1:3774");
     }
 
     #[test]
@@ -3822,11 +4025,12 @@ exit /b 9
             label: "WSL (Ubuntu)".to_string(),
             running_distro: "Ubuntu".to_string(),
             port: 3774,
-            renderer_host: "172.27.0.99".to_string(),
+            server_loopback_port: 4774,
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
             data_root: "/home/test/.bibcode".to_string(),
-        });
+        })
+        .expect("valid WSL plan");
 
         {
             let mut state = supervisor
@@ -3868,11 +4072,12 @@ exit /b 9
             label: "WSL (Debian)".to_string(),
             running_distro: "Debian".to_string(),
             port: 4_101,
-            renderer_host: "172.20.0.2".to_string(),
+            server_loopback_port: 5_101,
             desktop_bootstrap_token: "secondary-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
             data_root: "/home/test/.bibcode".to_string(),
-        });
+        })
+        .expect("valid WSL plan");
         {
             let mut state = supervisor
                 .state
@@ -3944,11 +4149,12 @@ exit /b 9
             label: "WSL (Ubuntu)".to_string(),
             running_distro: "Ubuntu".to_string(),
             port: 4_301,
-            renderer_host: "172.20.0.2".to_string(),
+            server_loopback_port: 5_301,
             desktop_bootstrap_token: "secondary-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
             data_root: "/home/test/.bibcode".to_string(),
-        });
+        })
+        .expect("valid WSL plan");
         {
             let mut state = supervisor
                 .state
@@ -4468,26 +4674,32 @@ exit /b 9
             Ok("/native-wsl/bibcode".to_string())
         );
         assert_eq!(
-            resolve_wsl_renderer_host(&resolver, "Ubuntu"),
-            Some("172.20.0.2".to_string())
-        );
-        assert_eq!(
             resolve_wsl_server_binary(&resolver, "Ubuntu"),
             Ok("/native-wsl/bibcode".to_string())
         );
         let plan = resolve_wsl_launch_plan_for_distro(
             &resolver,
-            "Ubuntu".to_string(),
-            3773,
-            "token".to_string(),
-            PathBuf::from("backend.log"),
-            TEST_WSL_RUNTIME_ID.to_string(),
-            "WSL Ubuntu".to_string(),
+            WslBackendPlanRequest {
+                environment_id: TEST_WSL_RUNTIME_ID.to_string(),
+                label: "WSL Ubuntu".to_string(),
+                running_distro: "Ubuntu".to_string(),
+                local_port: 3773,
+                server_loopback_port: 3774,
+                desktop_bootstrap_token: "token".to_string(),
+                log_path: PathBuf::from("backend.log"),
+            },
         )
         .expect("WSL launch plan should resolve");
-        assert_eq!(plan.config.local_host, "172.20.0.2");
+        assert_eq!(plan.config.bind_host, DESKTOP_LOOPBACK_HOST);
+        assert_eq!(plan.config.local_host, DESKTOP_LOOPBACK_HOST);
+        let BackendLaunchTarget::ExternalProcess { args, .. } = &plan.target else {
+            panic!("WSL launch must remain an owned external process");
+        };
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--host", DESKTOP_LOOPBACK_HOST])
+        );
         assert_eq!(plan.log_path, Some(PathBuf::from("backend.log")));
-        assert_eq!(resolve_wsl_renderer_host(&resolver, "Invalid"), None);
         assert!(
             resolve_wsl_path(&resolver, "Empty", Path::new(r"C:\bibcode"))
                 .unwrap_err()
@@ -4516,17 +4728,19 @@ exit /b 9
                 .unwrap_err()
                 .contains("Could not run wsl.exe")
         );
-        assert_eq!(resolve_wsl_renderer_host(&resolver, "Missing"), None);
         assert!(resolve_wsl_server_binary(&resolver, "Missing").is_err());
         assert!(
             resolve_wsl_launch_plan_for_distro(
                 &resolver,
-                "Missing".to_string(),
-                3773,
-                "token".to_string(),
-                PathBuf::from("backend.log"),
-                TEST_WSL_RUNTIME_ID.to_string(),
-                "WSL Missing".to_string(),
+                WslBackendPlanRequest {
+                    environment_id: TEST_WSL_RUNTIME_ID.to_string(),
+                    label: "WSL Missing".to_string(),
+                    running_distro: "Missing".to_string(),
+                    local_port: 3773,
+                    server_loopback_port: 3774,
+                    desktop_bootstrap_token: "token".to_string(),
+                    log_path: PathBuf::from("backend.log"),
+                },
             )
             .is_err()
         );
@@ -4670,11 +4884,12 @@ exit /b 9
             label: "WSL (Ubuntu)".to_string(),
             running_distro: "Ubuntu".to_string(),
             port: 3773,
-            renderer_host: "172.27.0.1".to_string(),
+            server_loopback_port: 4773,
             desktop_bootstrap_token: "desktop-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
             data_root: "/home/test/.bibcode".to_string(),
-        });
+        })
+        .expect("valid WSL plan");
         let error = classify_primary_start_error(&plan, "WSL process exited before readiness")
             .expect("WSL primary startup failures must remain typed");
 
@@ -5244,6 +5459,7 @@ exit /b 9
             },
             log_path: None,
             config: local_test_config(4_300),
+            wsl_transport: None,
         };
         let error = start_managed_backend(
             missing,
@@ -5628,7 +5844,7 @@ exit /b 9
         process.wait().await.expect("fixture child should exit");
         let mut config = local_test_config(4_350);
         config.local_host = "invalid host".to_string();
-        let child = ManagedBackendChild::new(9, config, process);
+        let child = ManagedBackendChild::new(9, config, process, None);
         assert_eq!(
             format!("{child:?}"),
             "ManagedBackendChild { run_id: 9, .. }"
@@ -5651,7 +5867,7 @@ exit /b 9
             .args(["-c", "exec sleep 30"])
             .spawn()
             .expect("fixture child should start");
-        let child = ManagedBackendChild::new(9, local_test_config(1), process);
+        let child = ManagedBackendChild::new(9, local_test_config(1), process, None);
         let observed_child = child.clone();
         assert_eq!(
             format!("{child:?}"),
@@ -5724,6 +5940,7 @@ $client.Dispose()
             },
             log_path: Some(temp.path().join("child.log")),
             config: local_test_config(port),
+            wsl_transport: None,
         };
 
         let (config, backend, pid) = start_managed_backend(
@@ -5804,6 +6021,7 @@ $client.Dispose()
             },
             log_path: None,
             config: local_test_config(port),
+            wsl_transport: None,
         };
         let (_config, backend, _pid) = start_managed_backend(
             plan,

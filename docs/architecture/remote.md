@@ -149,6 +149,33 @@ shutdown closes new SSH child admission, terminates live tunnels, and awaits all
 retained reaps before releasing the exact helper files. Cleanup never recursively
 removes an unexpected foreign entry from an askpass directory.
 
+### Desktop-managed WSL
+
+Each Running WSL distribution has its own Linux server bound to numeric distro
+loopback. The Tauri host binds a distinct numeric Windows loopback port and
+publishes only that local endpoint. Each accepted socket owns one structured,
+shell-free command:
+
+```text
+wsl.exe --distribution <validated-name> --exec <verified-bibcode-path> \
+  transport stdio-forward --loopback-port <distro-loopback-port>
+```
+
+The internal transport accepts only a non-zero numeric port, connects only to
+`127.0.0.1`, and copies opaque bytes in both directions. Its setup connection
+is bounded; an established HTTP upgrade or WebSocket stream has no transport
+deadline. Windows and distro ports are deliberately distinct so WSL NAT and
+mirrored networking cannot turn the forward into a wildcard or same-port bind
+collision.
+
+The desktop generation-fences the published endpoint and owns the listener,
+WSL server process, and every per-connection child as one lifecycle. Forward
+children use the shared process-tree supervisor (Windows Job Object on Windows),
+stderr and concurrency are bounded, and cancellation or either owner failing
+terminates and reaps the other side before restart. A distro name and Linux
+binary path are validated arguments, never shell text. Neither a WSL IP address
+nor a bootstrap compatibility flag grants network admission.
+
 ## Access versus launch
 
 Direct HTTPS routes expect a server to be reachable through an existing

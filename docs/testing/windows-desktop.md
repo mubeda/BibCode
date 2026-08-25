@@ -242,8 +242,12 @@ When WSL and a supported distribution are usable:
   usable bootstrap;
 - native and WSL paths do not collapse into one project identity;
 - a disposable WSL project can launch its supported session and terminal;
+- both the Linux server and Windows-facing endpoint bind numeric loopback, no
+  WSL IP or `0.0.0.0` endpoint is published, and an HTTP upgrade/WebSocket
+  remains usable while idle;
 - restart retains the correct environment identity; and
-- shutdown does not terminate unrelated WSL processes.
+- shutdown and a forced forward failure reap every BiBCode-owned `wsl.exe`
+  child without terminating unrelated WSL processes.
 
 When WSL is unavailable:
 
