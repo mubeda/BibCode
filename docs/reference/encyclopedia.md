@@ -110,6 +110,28 @@ previous target remains available until the desktop restarts the server and
 verifies its version, platform, protocol, environment identity, storage
 identity, and loopback transport.
 
+### WSL Discovery Snapshot
+
+A bounded, generation-numbered native observation containing discovery health
+and the installed distro names, WSL versions, default marker, and
+Running/Stopped state. It is topology evidence, not environment identity and
+not permission to start, install into, or unregister a distro. Failed reads
+retain the last accepted catalog bindings.
+
+### Remote Setup Consent
+
+A short-lived, one-use document bound to a target and probe generation. It
+shows the exact version, signed artifact source and verification state,
+destination, data root, workstation/headless mode, and bounded command
+summaries before WSL or SSH setup may mutate a host.
+
+### Remote Operation
+
+A desktop-owned WSL or SSH attempt identified by a UUID and generation fence.
+It owns its prompt, transfer, process, tunnel, rollback, and cleanup work until
+completion or acknowledged cancellation. A newer owner cannot publish until
+the previous owner has drained.
+
 ## Project And Workspace
 
 ### Project

@@ -162,19 +162,25 @@ minutes to recover the same logical session. Retrying with a different key or
 without DPoP is rejected. WebSocket tickets are also one-use, and revoking a
 client closes its active socket rather than waiting for its next request.
 
-## Browser/hosted and staged desktop-managed SSH status
+## Desktop-managed SSH
 
-The desktop contains an SSH launcher that can install a small runner under
-`~/.bibcode-ssh-launch/<state-key>`, start or reuse `bibcode serve` on remote
-loopback, and create a local port forward. The remote host must provide:
+The desktop uses the local OpenSSH client to enroll Linux, macOS, and Windows
+hosts, reuse or install a native BiBCode server, keep that server on remote
+loopback, and expose it through a desktop-owned numeric-loopback tunnel. The
+desktop machine needs `ssh` and its normal OpenSSH configuration. The remote
+machine needs a reachable OpenSSH server, enough staging space, and the shell or
+PowerShell capabilities reported by the probe. Provider CLIs and their
+credentials remain installed on that remote environment.
 
-- a compatible native `bibcode` executable on non-interactive `sh`'s `PATH`;
-- `curl` or `wget` for the readiness probe; and
-- `ss` or readable Linux `/proc/net/tcp` (and optionally `tcp6`) for safe
-  managed-port selection; and
-- each provider CLI and its credentials.
+The bounded, non-secret probe reports the operating system, architecture,
+installed BiBCode version, selected workstation/headless service mode and
+state, data root, protected-control availability, free bytes, and whether
+installation has user, noninteractive-administrator, or
+administrator-required authority. A compatible installation is reused. Setup
+uses a portable package and transfers it from the desktop, so the remote host
+does not need internet access, Node.js, npm, npx, or a package manager.
 
-The staged desktop engine now preserves the user's OpenSSH configuration and
+The desktop engine preserves the user's OpenSSH configuration and
 `known_hosts` policy, distinguishes an unknown key from a changed key, records
 the successfully observed fingerprint, establishes a numeric-loopback forward,
 and verifies the environment UUID, storage UUID, and protocol before pairing.
@@ -237,6 +243,15 @@ mode, port, and data root. A pre-v3 SSH entry without a saved host-key pin can
 be removed locally, but BiBCode will not guess a pin or run a remote stop;
 re-enroll it before remote administration.
 
+**Disconnect** and ordinary **Forget** are local operations: they drain the
+owned SSH work, close the tunnel, remove local authorization and catalog state,
+and leave the remote service and data unchanged. The current release does not
+offer remote uninstall from this dialog. If a later release offers it, it is an
+optional, separately confirmed host-administration operation. When the host is
+offline or remote cleanup cannot be proved, force local removal must explicitly
+warn that the server, projects, worktrees, credentials, and data may still be
+present on the remote machine.
+
 ## Windows Subsystem for Linux
 
 The optional WSL backend runs a native Linux `bibcode` binary. It does not invoke
@@ -250,6 +265,14 @@ Prerequisites:
   per-user disk space;
 - access to the signed BiBCode Server release manifest over HTTPS; and
 - provider CLIs and credentials installed inside the distribution.
+
+Every Running distro is shown. If it does not yet have a compatible server it
+is labeled **Setup required** and remains unchanged until you accept the exact
+one-use setup prompt. A distro you have already accepted remains in the
+environment list when it is Stopped, with a stopped/unavailable status. A
+stopped distro you have never accepted appears only in **Add Environment**; start
+it yourself before setup. BiBCode does not start stopped distros automatically
+and never invokes `wsl --unregister`.
 
 BiBCode never starts a stopped distribution merely to inspect or install it.
 For an absent or mismatched managed server, the desktop first shows the exact
@@ -286,6 +309,13 @@ binary from Windows with:
 ```powershell
 wsl.exe --distribution <distribution> --exec /path/to/bibcode --version
 ```
+
+Refresh is event-driven after startup and after WSL topology changes. Focus and
+manual refresh are coalesced, with a five-minute safety refresh for a missed
+event. A failed refresh retains previously accepted environments and does not
+silently treat a renamed distro or replacement UUID as the old server. A
+verified rename follows the server identity; an identity conflict is blocked
+for explicit recovery.
 
 When **WSL only** is enabled, a missing distribution, binary, or failed WSL
 startup leaves the local backend unavailable; the desktop does not silently

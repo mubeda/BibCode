@@ -57,6 +57,29 @@ native definition, not standalone binary package bytes.
 See [Server administration](../user/server-administration.md) for per-platform
 authority, accounts, defaults, and recovery.
 
+## Remote Environment Validation
+
+The repository has no command that bypasses OpenSSH host-key policy, starts a
+stopped WSL distro, or unregisters one. Use the focused owners documented in
+[Remote environment validation](../testing/remote-environments.md):
+
+```sh
+cargo test -p bibcode-server process:: --lib -- --nocapture
+cargo test -p bibcode-desktop remote_host:: --lib -- --nocapture
+cargo test -p bibcode-desktop remote_operation::tests:: --lib -- --nocapture
+cargo test -p bibcode-desktop wsl:: --lib -- --nocapture
+cargo test -p bibcode-desktop wsl_setup:: --lib -- --nocapture
+cargo test -p bibcode-desktop wsl_transport::tests:: --lib -- --nocapture
+cargo test -p bibcode-desktop ssh::tests:: --lib -- --nocapture
+cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
+vp test apps/web/src/connection/platform.test.ts apps/web/src/connection/desktopLocal.test.ts apps/web/src/tauriDesktopBridge.test.ts packages/client-runtime/src/connection/registry.test.ts packages/contracts/src/ipc.test.ts
+```
+
+On native Windows, prefix Rust commands with
+`node scripts/run-msvc-x64.mjs`. Native WSL, OpenSSH service-manager, PowerShell,
+launchd, systemd, and Windows Job evidence cannot be replaced by a simulated
+fixture on another host.
+
 ## Build And Quality
 
 - `vp run build`: build application, package, lint-plugin, and script outputs.

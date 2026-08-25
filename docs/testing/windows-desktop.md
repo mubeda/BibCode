@@ -231,6 +231,9 @@ the exact target before and after each destructive action.
 
 ## WSL matrix
 
+Follow the complete [Remote environment validation](./remote-environments.md)
+matrix in addition to this Windows-specific checklist.
+
 Record:
 
 ```powershell
@@ -241,7 +244,16 @@ wsl.exe --list --verbose
 When WSL and a supported distribution are usable:
 
 - Settings shows **Local environment** and WSL status/setup controls;
-- a stopped distribution is visible but no setup probe starts it;
+- every Running distro is visible, including **Setup required** when unproved;
+- an accepted Stopped distro remains in the environment hierarchy, while an
+  unaccepted stopped distro remains only in **Add Environment**, and no setup
+  probe starts it;
+- distro names containing spaces and non-ASCII characters retain exact state;
+- native discovery events update the renderer, focus/manual refresh is
+  single-flighted, and the five-minute safety wakeup is not a three-second poll;
+- failed/stale discovery retains accepted bindings, descriptor-proved rename
+  follows identity, a replacement UUID blocks, and `wsl --unregister` is never
+  invoked;
 - an absent or incompatible runtime returns one exact consent prompt containing
   version, architecture, signed source, size, managed destination, data root,
   process behavior, and bounded command summaries before mutation;

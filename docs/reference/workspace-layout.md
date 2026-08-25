@@ -3,8 +3,9 @@
 ## Product Applications
 
 - `/apps/desktop`: Tauri 2 desktop host. Rust owns native lifecycle, windows,
-  settings, menus, dialogs, updates, WSL/SSH preparation, and the in-process
-  server lifecycle.
+  settings, menus, dialogs, updates, event-driven WSL discovery/setup,
+  OpenSSH trust/provisioning/tunnels, retained native process reaping, and the
+  in-process server lifecycle.
 - `/apps/server`: Rust/Axum/Tokio server and native `bibcode` CLI. It owns
   providers, Git, files, terminals, persistence, orchestration, HTTP/WebSocket
   RPC, authentication, diagnostics, and relay integration.
@@ -18,6 +19,7 @@
   bridge, WebSocket/RPC, providers, models, sessions, and persisted protocol
   values.
 - `/packages/client-runtime`: shared connection supervision, RPC sessions,
+  normalized environment/binding/route catalogs, topology reconciliation,
   environment caches, and client state used by browser and desktop clients.
 - `/packages/shared`: cross-runtime TypeScript utilities exposed through
   explicit package subpaths.
@@ -50,6 +52,12 @@ packaged desktop build, the Tauri Rust host starts the server in-process,
 installs `window.desktopBridge`, and exposes only native host capabilities
 through Tauri commands/events. Browser mode connects directly to a native
 `bibcode` server and has no native bridge.
+
+Native discovery and host mutation stay separate. The desktop emits WSL
+topology and setup events and owns SSH processes; the client runtime reconciles
+those events into stable environment catalog rows; the web application renders
+the resulting hierarchy and consent/recovery surfaces. Distro names, SSH
+aliases, hostnames, URLs, and ports never become durable environment identity.
 
 ## UI Workspace Model
 

@@ -712,19 +712,19 @@ ghosts; the read-only re-review found no remaining Critical or Important issue.
 - Modify: `docs/testing/process-lifecycle.md`, `worktree-process-lifecycle.md`
 - Modify: `docs/testing/execution-report-template.md`
 
-- [ ] **Step 1: Document WSL visibility and safety exactly**
+- [x] **Step 1: Document WSL visibility and safety exactly**
 
 State that every Running distro appears, accepted Stopped distros remain, unaccepted stopped distros stay in Add Environment, setup requires consent, no automatic distro start occurs, unregister is never invoked, and traffic uses the loopback forwarder.
 
-- [ ] **Step 2: Document Linux/macOS/Windows SSH flows**
+- [x] **Step 2: Document Linux/macOS/Windows SSH flows**
 
 Include OpenSSH prerequisites, host-key handling, probe fields, consent screen, artifact verification/transfer, workstation/headless choices, pairing order, tunnel behavior, cancellation, partial-state recovery, and offline force removal consequences.
 
-- [ ] **Step 3: Add repeatable native evidence**
+- [x] **Step 3: Add repeatable native evidence**
 
 Require real Windows WSL UTF/state enumeration, stopped retention, rename/identity reconcile, no wildcard listener, Linux/macOS/Windows OpenSSH enrollment, host-key change blocking, no-remote-internet provisioning, cancellation/reaping, current worktree flows, and environment-specific folder picking.
 
-- [ ] **Step 4: Verify docs and commit**
+- [x] **Step 4: Verify docs and commit**
 
 ```sh
 git diff --check
@@ -733,3 +733,22 @@ node scripts/run-msvc-x64.mjs cargo clippy -p bibcode-desktop --all-targets -- -
 git add docs/architecture/remote.md docs/architecture/connection-runtime.md docs/architecture/runtime-process-model.md docs/user/remote-access.md docs/user/server-administration.md docs/reference/workspace-layout.md docs/reference/scripts.md docs/reference/encyclopedia.md docs/testing
 git commit -m "docs: describe safe WSL and SSH environment lifecycle"
 ```
+
+**Implementation note (2026-08-25):** Updated the architecture, user, and
+reference guides with event-driven WSL reconciliation, exact visibility and
+identity-conflict rules, OpenSSH probe/provisioning/pairing order, local-only
+Disconnect/Forget behavior, and the explicit future boundary between optional
+remote uninstall and offline force removal. Added the focused remote
+environment, process lifecycle, and worktree process lifecycle runbooks (the
+last two plan-named paths did not previously exist), linked them from the
+shared/native indexes, and expanded the execution report for native Windows
+WSL plus Linux/macOS/Windows OpenSSH evidence. `vp check` passed with the one
+pre-existing unused test-fixture warning, `vp run typecheck` passed, desktop
+all-target Clippy with warnings denied passed through the MSVC wrapper, the
+required safety-term audit found the documented guards and test evidence, and
+`git diff --check` passed. Review caught a zero-test generic process filter; it
+was replaced with current owners whose `--list` checks select 13 shell, 5 WSL
+transport, 7 remote-operation, 9 WSL discovery, 85 SSH, 40 terminal-manager,
+40 PTY, and 24 shared server-process tests. Native Windows/WSL and three-target
+OpenSSH execution remain procedures to run on their named hosts; this macOS
+documentation task does not claim those native results.

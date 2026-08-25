@@ -44,6 +44,22 @@ loopback environment descriptor. Setup cancellation shuts down and joins its
 child plus I/O tasks before the per-distribution concurrency slot is released;
 desktop shutdown cancels every active or prepared setup.
 
+The same Tauri lifetime owns desktop-managed SSH work. Each attempt has a UUID
+operation ID plus environment and route generations. Per-host mutation,
+provisioning, and live-tunnel admission are bounded independently. A replacement
+generation first cancels and drains its predecessor; exact cancellation waits
+through password presentation, transfer, remote mutation, rollback, tunnel
+readiness, and I/O settlement. Forget closes admission before draining, so a
+late child cannot republish a forgotten route. Desktop shutdown rejects new
+operations, cancels every owner, closes tunnels, and waits for retained child
+reapers and private askpass cleanup.
+
+WSL topology observation has a separate native owner. It emits bounded,
+generation-numbered snapshots and retains the last good distro list when a
+later read fails. The renderer consumes those events and has only a five-minute
+missed-event safety wakeup; it does not poll every few seconds. Reading the
+current bridge state is side-effect free, while refresh is an explicit command.
+
 ## Service definitions
 
 The platform-neutral service model records mode, state, startup owner, account,

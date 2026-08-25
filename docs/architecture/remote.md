@@ -233,6 +233,15 @@ request and leaves the remote service and all remote data untouched. A legacy
 route without a pin can be removed locally, but BiBCode does not self-pin or run
 an unauthenticated remote uninstall/stop for it.
 
+This local-only boundary is visible in removal UX. The ordinary action removes
+the client route, credentials, bindings, and cached presentation after its
+owned tunnel is drained; it cannot claim that the remote server or its data was
+removed. A future optional remote uninstall must be a separate, online,
+host-authorized operation with its own preview and result. If that operation is
+unavailable or fails, the user may explicitly force local removal only after a
+warning that the remote service, projects, worktrees, credentials, and data may
+continue to exist. Force removal must never infer success for remote cleanup.
+
 ### Desktop-managed WSL
 
 Each Running WSL distribution has its own Linux server bound to numeric distro
@@ -266,6 +275,24 @@ authoritative discovery generation whose selected distribution is already
 `wsl.exe --distribution <name> --exec <program> <args...>` commands to read the
 Linux architecture, home/data roots, managed binary version, `tar`
 availability, and free space. No probe is interpolated into shell text.
+
+Discovery is also separate from catalog acceptance. Every `Running`
+distribution is presented as an environment candidate. A previously accepted
+`Stopped` distribution remains in the environment hierarchy as unavailable;
+an unaccepted stopped distribution remains only in **Add Environment** until
+the user starts it. Running distributions without a compatible server are
+shown as **Setup required**, and setup never begins before one-use consent.
+BiBCode never invokes `wsl --unregister` or another distribution-deletion
+operation.
+
+The native discovery owner emits generation-numbered snapshots. The renderer
+subscribes once per mounted topology owner, single-flights focus/manual refresh,
+and uses a five-minute refresh only as a missed-event safety net. Failed or
+stale discovery retains accepted bindings and their last verified identity;
+it cannot convert a distro name into environment identity, delete a route, or
+adopt a replacement UUID. A verified rename moves the accepted binding to the
+new locator. A locator that reports another environment or storage UUID is
+blocked as an identity conflict until the user resolves it.
 
 Each active WSL setup is keyed by its request ID and probe generation. Byte and
 stage progress is emitted only while that exact generation remains active.

@@ -226,6 +226,20 @@ It does not delete the data root and exposes no `--purge` flag. Deleting server
 data is a separate destructive decision and is not part of service uninstall,
 client Forget, or route removal.
 
+For a desktop-managed SSH environment, **Disconnect** and **Forget** do not run
+these service commands remotely. They close and reap local tunnels and remove
+only that client's routes, secrets, bindings, caches, and presentation state.
+The server registration, binary, projects, repositories, worktrees,
+credentials, and data root remain on the remote host. The current UI has no
+remote-uninstall action. Any future optional remote uninstall must first show
+the exact host, mode, binary, service registration, and preserved data root,
+then report its remote result separately from local removal.
+
+If the destination is offline or remote cleanup fails, a force-local-removal
+choice must ask again and state these consequences. Confirmation means only
+"remove this client connection"; it must never be recorded as proof that the
+remote service or data was removed.
+
 ## Partial install and update recovery
 
 On a fresh failed install, BiBCode rolls back only service files and accounts

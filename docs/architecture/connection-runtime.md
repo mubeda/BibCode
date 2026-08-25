@@ -145,6 +145,35 @@ Startup never mixes the two models. Without a receipt the migration owner runs;
 with a receipt the registry ignores v1 targets. A secret-provider failure
 publishes neither normalized rows nor a receipt.
 
+### Desktop topology reconciliation
+
+The renderer owns one reference-counted desktop topology controller. Native
+local-bootstrap and WSL-discovery events are authoritative; focus and explicit
+refresh requests are coalesced, and a five-minute wakeup exists only to recover
+from a missed event. `getWslState` reads the current native snapshot and cannot
+launch discovery. `refreshWslDiscovery` is the explicit mutating request.
+
+WSL reconciliation is catalog-owned and generation-fenced:
+
+- every running distro is visible, including an unproved **Setup required**
+  candidate;
+- an accepted stopped or absent distro retains its environment identity and is
+  registered as unavailable;
+- an unaccepted stopped distro is discovery-only and appears in **Add
+  Environment**, not the accepted hierarchy;
+- stale or failed discovery retains the last accepted binding and route;
+- descriptor UUIDs, never distro names, prove a rename;
+- an accepted environment or storage UUID mismatch becomes
+  `identity-conflict` and cannot be auto-adopted; and
+- replacing an unproved locator row compare-deletes only the exact unchanged
+  row, so concurrent acceptance cannot be erased.
+
+An initial WSL bootstrap is withheld until discovery can attach its stable
+binding and route IDs. A legacy URL-derived bearer fallback is rejected and any
+previous volatile WSL route is transactionally replaced. Non-authoritative
+topology failure retains accepted environments even after a transient bootstrap
+credential expires.
+
 ## Accepted storage identity
 
 The schema-v1 connection catalog additively stores accepted non-null storage

@@ -3,6 +3,9 @@
 This page defines the procedure common to every native desktop validation.
 Pair it with the [Windows](./windows-desktop.md),
 [Linux](./linux-desktop.md), or [macOS](./macos-desktop.md) runbook.
+Use [Remote environments](./remote-environments.md) for WSL/SSH and
+[Process lifecycle](./process-lifecycle.md) plus [Worktree process
+lifecycle](./worktree-process-lifecycle.md) when those owners are in scope.
 
 ## Inputs
 
@@ -308,6 +311,16 @@ data root. Do not record credentials or raw environment output. Prove that a
 stopped distro is not started, consent is one-use, concurrent same-distro setup
 is rejected, and declining performs no mutation.
 
+Reconcile the native snapshot against `wsl.exe --list --verbose`, including
+spaces and non-ASCII distro names when a disposable fixture exists. Prove every
+Running distro appears, an unproved Running distro is **Setup required**, an
+accepted Stopped distro remains in the environment hierarchy, and an unaccepted
+stopped distro remains only in **Add Environment**. Native events must update
+the renderer without a three-second poll; focus/manual refresh coalesces and the
+five-minute timer is only a missed-event safety wakeup. Failed/stale discovery
+retains accepted identities. Verify descriptor-proved rename reconciliation,
+identity-conflict blocking, and absence of any `wsl --unregister` invocation.
+
 Exercise wrong architecture, manifest signature, artifact signature, size,
 SHA-256, missing `tar`, insufficient space, mid-stream cancellation, atomic
 switch failure, restart failure, and descriptor version/platform/protocol/
@@ -405,6 +418,14 @@ forgotten route. Host-independent parsers and command fixtures are
 compatibility evidence only; repeat Linux, macOS, and Windows OpenSSH probe,
 consent, install, service, tunnel, descriptor, cancellation, and recovery
 behavior on the named native desktop.
+
+Disconnect and Forget must remain local-only: close admission, drain native
+owners, reap the tunnel, clear local authentication/catalog state, and leave the
+remote service/data untouched. The current UI has no remote uninstall. Any
+future optional uninstall needs a separate host-authorized preview/result. If
+the host is offline or cleanup cannot be proved, force local removal must ask
+again, warn that the remote service, projects, worktrees, credentials, and data
+may remain, and never report remote cleanup success.
 
 ### VCS coordination gates
 

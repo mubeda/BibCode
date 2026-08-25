@@ -117,7 +117,12 @@ cross-target checks under non-native compatibility evidence.
 ## WSL provisioning evidence
 
 - Native Windows/WSL versions and distro state:
+- UTF/space distro enumeration and exact Running/Stopped comparison:
+- Running / accepted Stopped / unaccepted stopped visibility results:
+- Native event / coalesced refresh / five-minute safety result:
 - Discovery generation / setup generation:
+- Rename reconciliation / stale generation / identity-conflict result:
+- Automatic-start and `wsl --unregister` negative evidence:
 - Target version / architecture / signed artifact tuple and byte count:
 - Consent shown / declined / one-use replay / concurrent request results:
 - Missing tar / disk / trust / size / checksum failure results:
@@ -144,6 +149,13 @@ cross-target checks under non-native compatibility evidence.
 - Authenticated credential-free managed/`--no-startup-pairing` startup result:
 - OS-secret persistence-before-route/session result:
 - Route-cancellation support and shutdown SSH/askpass/tunnel/I/O survivor result:
+- Workstation/headless and no-remote-internet provisioning result:
+- Disconnect/Forget local-only result:
+- Optional remote-uninstall availability/result, or unavailable:
+- Offline force-removal warning and remote-state consequence:
+
+Repeat this section for Linux, macOS, and Windows OpenSSH targets. Missing
+native targets are unavailable evidence, not compatibility passes.
 
 ## VCS observation evidence
 
