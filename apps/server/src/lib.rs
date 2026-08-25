@@ -57,7 +57,7 @@ pub use data_root::{
 };
 pub use http::{
     DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ENVIRONMENT_DESCRIPTOR_PATH,
-    ROUTE_INVENTORY, RouteMethod, RouteSpec,
+    ENVIRONMENT_PROTOCOL_VERSION, ROUTE_INVENTORY, RouteMethod, RouteSpec,
 };
 pub use lifecycle::{ServerError, ServerHandle, ServerRuntime, StartupAccess};
 pub use maintenance::{

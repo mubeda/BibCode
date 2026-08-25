@@ -330,6 +330,12 @@ Cover unsigned-test, stable Windows missing credentials, invalid/expired certifi
 
 Use repository-environment secrets `BIBCODE_SERVER_SIGNING_PRIVATE_KEY` and `BIBCODE_SERVER_SIGNING_PRIVATE_KEY_PASSWORD` with a checked-in public verification key consumed by Plan 40. Sign every final installer/archive, SBOM, checksum file, and `artifacts.json` using the pinned Minisign-compatible repository command. Never reuse or expose the private Tauri updater key.
 
+Plan 40 checks in a dedicated pre-release fixture public key whose private half
+was deleted. Before any publication, replace that public key with the public
+half of the newly provisioned repository-environment server signing secret and
+prove that the desktop verifier accepts its signatures and rejects both the
+pre-release fixture key and the Tauri updater key.
+
 - [ ] **Step 3: Authenticode-sign stable Windows bytes**
 
 Import the code-signing PFX from protected secrets `WINDOWS_SIGNING_CERTIFICATE_PFX` and `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` into an ephemeral runner store, sign `bibcode.exe` before MSI assembly, sign the final MSI with SHA-256 and the documented timestamp service, verify with `signtool verify /pa /all`, then remove the ephemeral certificate. Stable jobs fail closed when configuration or timestamping is absent.

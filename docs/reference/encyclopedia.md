@@ -101,6 +101,15 @@ required. Restart success requires the expected version and the same
 environment/storage identities; package-byte rollback belongs to the signed
 distribution transaction.
 
+### Managed WSL Runtime
+
+The native Linux server package installed per WSL user under
+`$HOME/.local/share/bibcode/server`. Signed versions are immutable directories;
+`current` is switched atomically only after staged binary validation. The
+previous target remains available until the desktop restarts the server and
+verifies its version, platform, protocol, environment identity, storage
+identity, and loopback transport.
+
 ## Project And Workspace
 
 ### Project

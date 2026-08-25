@@ -185,14 +185,35 @@ Prerequisites:
 
 - Windows Subsystem for Linux and an installed distribution;
 - `wsl.exe` available to the desktop process;
-- a `bibcode` Linux binary matching the distribution architecture; and
+- a distribution that is already Running, with `tar` and sufficient free
+  per-user disk space;
+- access to the signed BiBCode Server release manifest over HTTPS; and
 - provider CLIs and credentials installed inside the distribution.
 
-For source development, the desktop searches
+BiBCode never starts a stopped distribution merely to inspect or install it.
+For an absent or mismatched managed server, the desktop first shows the exact
+target version/architecture, verified artifact source and size, install and
+data locations, process behavior, and command summaries. Nothing changes until
+you accept that one-use prompt. The app verifies the signed manifest and
+artifact on Windows, streams the package to WSL, verifies its hash again, and
+atomically switches the per-user managed runtime at
+`$HOME/.local/share/bibcode/server/current`.
+
+The previous version remains available until the restarted server proves its
+version, Linux architecture, supported protocol, environment/storage UUIDs,
+and loopback-only transport. Cancelling or failing any later step restores the
+previous version and reports whether cleanup completed. Setup does not modify
+the distribution's system packages, system service manager, provider
+credentials, projects, worktrees, or data root.
+
+For source development and existing worktree workflows, the desktop still
+searches
 `target/x86_64-unknown-linux-gnu/(debug|release)/bibcode` and
 `target/aarch64-unknown-linux-gnu/(debug|release)/bibcode`. Set
 `BIBCODE_WSL_SERVER_BINARY` to a different Windows-side binary path when needed;
-the desktop translates it with `wslpath` for the selected distribution.
+the desktop translates it with `wslpath` for the selected distribution. A
+verified managed `current` runtime takes precedence over these development
+fallbacks.
 
 The WSL launcher uses a fixed system `PATH` and starts `bibcode serve` on
 `127.0.0.1` inside the distribution. The desktop exposes a different

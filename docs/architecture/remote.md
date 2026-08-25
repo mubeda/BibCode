@@ -176,6 +176,35 @@ terminates and reaps the other side before restart. A distro name and Linux
 binary path are validated arguments, never shell text. Neither a WSL IP address
 nor a bootstrap compatibility flag grants network admission.
 
+WSL discovery and software setup are separate. Setup accepts only a fresh
+authoritative discovery generation whose selected distribution is already
+`Running`; it never starts a stopped distribution. The probe uses structured
+`wsl.exe --distribution <name> --exec <program> <args...>` commands to read the
+Linux architecture, home/data roots, managed binary version, `tar`
+availability, and free space. No probe is interpolated into shell text.
+
+An incompatible or absent managed runtime produces one short-lived,
+generation-bound consent document before mutation. It names the exact version,
+architecture, signed-manifest source, byte size, per-user install destination,
+data root, process behavior, and command summaries. Acceptance is one-use.
+The desktop downloads the exact Linux `tar.gz` manifest tuple over HTTPS,
+verifies the manifest and artifact with the compiled BiBCode Minisign trust
+anchor plus SHA-256 and exact size, streams it with bounded memory, and repeats
+SHA-256 inside WSL. Alternate manifest URLs cannot replace the compiled public
+key.
+
+Packages are extracted under
+`$HOME/.local/share/bibcode/server/versions`; only after the staged executable
+reports the consented version does a same-filesystem rename replace the
+`current` symlink. The previous target remains until the restarted,
+desktop-owned loopback server returns a descriptor with the consented version,
+Linux architecture, supported protocol, UUID environment/storage identities,
+and `loopback-http` transport. Cancellation, start failure, or descriptor
+failure restores the previous link, cleans exact staging paths, and reports
+typed partial/cleanup state. The backend prefers this managed `current` path;
+the explicit `BIBCODE_WSL_SERVER_BINARY` and cross-compiled target paths remain
+development fallbacks so existing source-worktree workflows continue to work.
+
 ## Access versus launch
 
 Direct HTTPS routes expect a server to be reachable through an existing

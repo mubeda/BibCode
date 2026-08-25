@@ -34,6 +34,9 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_get_server_exposure_state,
             desktop_bridge_set_tailscale_serve_enabled,
             desktop_bridge_get_advertised_endpoints,
+            desktop_bridge_prepare_wsl_server,
+            desktop_bridge_install_wsl_server,
+            desktop_bridge_cancel_wsl_setup,
             desktop_bridge_get_wsl_state,
             desktop_bridge_set_wsl_backend_enabled,
             desktop_bridge_set_wsl_distro,
@@ -87,6 +90,7 @@ pub fn run() {
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
         .manage(backend::BackendSupervisor::new())
         .manage(wsl::WslDiscoveryService::new())
+        .manage(wsl_setup::WslSetupManager::new())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(secret_store::DesktopSecretStore::new())
         .manage(context_menu::NativeContextMenuManager::new())
@@ -166,6 +170,9 @@ pub fn run() {
         bridge::desktop_bridge_get_server_exposure_state,
         bridge::desktop_bridge_set_tailscale_serve_enabled,
         bridge::desktop_bridge_get_advertised_endpoints,
+        bridge::desktop_bridge_prepare_wsl_server,
+        bridge::desktop_bridge_install_wsl_server,
+        bridge::desktop_bridge_cancel_wsl_setup,
         bridge::desktop_bridge_get_wsl_state,
         bridge::desktop_bridge_set_wsl_backend_enabled,
         bridge::desktop_bridge_set_wsl_distro,
@@ -212,7 +219,10 @@ pub fn run() {
                     tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
                 }
             }
-            tauri::RunEvent::Exit => app_handle.state::<wsl::WslDiscoveryService>().shutdown(),
+            tauri::RunEvent::Exit => {
+                app_handle.state::<wsl::WslDiscoveryService>().shutdown();
+                app_handle.state::<wsl_setup::WslSetupManager>().shutdown();
+            }
             _ => {}
         });
 }
@@ -221,6 +231,7 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
     app_handle.state::<wsl::WslDiscoveryService>().shutdown();
+    app_handle.state::<wsl_setup::WslSetupManager>().shutdown();
     if let Err(error) = window::persist_main_window_state(app_handle) {
         tracing::warn!("failed to persist Tauri main window state during exit: {error}");
     }
@@ -270,6 +281,7 @@ mod data_safety;
 mod preview;
 mod secret_store;
 mod security;
+mod server_artifacts;
 mod shell_environment;
 pub mod ssh;
 mod tailscale;
@@ -278,6 +290,7 @@ mod test_support;
 mod updates;
 mod window;
 mod wsl;
+mod wsl_setup;
 mod wsl_transport;
 
 pub use bridge::{

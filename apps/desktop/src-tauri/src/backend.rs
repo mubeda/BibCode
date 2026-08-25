@@ -35,6 +35,7 @@ use crate::{
     wsl::{
         WslDiscoveryHealth, WslDiscoveryService, WslDiscoverySnapshot, WslDistro, WslDistroState,
     },
+    wsl_setup::managed_wsl_server_binary,
     wsl_transport::{WslTransportHandle, WslTransportPlan},
 };
 #[cfg(test)]
@@ -1052,6 +1053,18 @@ impl BackendSupervisor {
                     .values()
                     .find_map(|slot| slot.launch_plan.as_ref())
             })
+            .map(|plan| plan.config.clone())
+    }
+
+    pub(crate) fn run_config_for_wsl_distro(&self, distro: &str) -> Option<BackendRunConfig> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .values()
+            .filter(|slot| slot.backend.is_some() && slot.last_error.is_none())
+            .filter_map(|slot| slot.launch_plan.as_ref())
+            .find(|plan| plan.config.running_distro.as_deref() == Some(distro))
             .map(|plan| plan.config.clone())
     }
 
@@ -2484,15 +2497,11 @@ fn resolve_wsl_server_binary(
     }
 
     Err(format!(
-        "Could not find a Linux bibcode server binary for WSL. Set {WSL_SERVER_BINARY_ENV} or build one under target/<triple>/(debug|release)/bibcode."
+        "BiBCode Server setup is required for this WSL distribution. Complete the explicit Environment setup flow, set {WSL_SERVER_BINARY_ENV}, or build a development binary under target/<triple>/(debug|release)/bibcode."
     ))
 }
 
-fn resolve_wsl_data_root(
-    resolver: &dyn WslCommandResolver,
-    distro: &str,
-) -> Result<String, String> {
-    let environment = run_wsl_command(resolver, distro, &["env"])?;
+fn resolve_wsl_data_root(distro: &str, environment: &str) -> Result<String, String> {
     let value = environment
         .lines()
         .find_map(|line| line.strip_prefix("BIBCODE_HOME="))
@@ -2527,8 +2536,25 @@ fn resolve_wsl_launch_plan_for_distro(
         desktop_bootstrap_token,
         log_path,
     } = request;
-    let binary_path = resolve_wsl_server_binary(resolver, &running_distro)?;
-    let data_root = resolve_wsl_data_root(resolver, &running_distro)?;
+    let environment = run_wsl_command(resolver, &running_distro, &["env"])?;
+    let data_root = resolve_wsl_data_root(&running_distro, &environment)?;
+    let home = environment
+        .lines()
+        .find_map(|line| line.strip_prefix("HOME="))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("WSL distro {running_distro} did not report HOME."))?;
+    let managed_binary = managed_wsl_server_binary(home)?;
+    let binary_path = if run_wsl_command(
+        resolver,
+        &running_distro,
+        &["test", "-x", managed_binary.as_str()],
+    )
+    .is_ok()
+    {
+        managed_binary
+    } else {
+        resolve_wsl_server_binary(resolver, &running_distro)?
+    };
     BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
         environment_id,
         label,
@@ -2978,6 +3004,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wsl_launch_prefers_the_verified_managed_current_binary() {
+        let supervisor = BackendSupervisor::with_wsl_resolver(Arc::new(
+            TestWslCommandResolver::new("managed-wsl"),
+        ));
+        let plan = supervisor
+            .test_wsl_plan("Managed")
+            .await
+            .expect("managed WSL plan");
+        let BackendLaunchTarget::ExternalProcess { args, .. } = plan.target else {
+            panic!("managed WSL plan must use the WSL process target");
+        };
+        assert!(args.iter().any(|arg| {
+            arg == "/home/bibcode-test/.local/share/bibcode/server/current/bin/bibcode"
+        }));
+        assert!(!args.iter().any(|arg| arg == "/managed-wsl/bibcode"));
+    }
+
+    #[tokio::test]
     async fn retained_fixture_connection_buffers_release_after_readiness() {
         let (port, ready, checkpoint, release, server) = spawn_retained_fixture_connection();
         let mut client =
@@ -3037,6 +3081,10 @@ if [ "$4" = "wslpath" ]; then
   printf '/{label}/bibcode\n'
   exit 0
 fi
+if [ "$4" = "test" ]; then
+  if [ "$2" = "Managed" ]; then exit 0; fi
+  exit 1
+fi
 if [ "$4" = "hostname" ]; then
   if [ "$2" = "Invalid" ]; then printf 'not-an-address\n'; else printf 'not-an-address 172.20.0.2\n'; fi
   exit 0
@@ -3075,6 +3123,10 @@ if "%4"=="wslpath" (
   if "%2"=="Empty" exit /b 0
   echo /{label}/bibcode
   exit /b 0
+)
+if "%4"=="test" (
+  if "%2"=="Managed" exit /b 0
+  exit /b 1
 )
 if "%4"=="hostname" (
   if "%2"=="Invalid" echo not-an-address

@@ -1,20 +1,22 @@
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::backend::{BackendPlanError, BackendRunConfig, BackendSupervisor};
 use crate::config::{
-    app_branding, read_json_file, resolve_pick_folder_default_path, state_dir, write_json_file,
+    app_branding, app_version, read_json_file, resolve_pick_folder_default_path, state_dir,
+    write_json_file,
 };
 use crate::context_menu::{
     ContextMenuPosition, NativeContextMenuManager, context_menu_request_from_values,
@@ -38,6 +40,11 @@ use crate::tailscale::{
 };
 use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
 use crate::wsl::{WslDiscoveryHealth, WslDiscoveryService, WslDiscoverySnapshot, WslDistro};
+use crate::wsl_setup::{
+    PendingWslInstallation, RemoteSetupCancelInput, RemoteSetupConsentDecision, RemoteSetupStage,
+    SetupProgressSink, WslExpectedIdentity, WslInstallAttempt, WslSetupManager, WslSetupProbeInput,
+    WslSetupResult, validate_setup_descriptor,
+};
 
 #[cfg(test)]
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
@@ -55,6 +62,8 @@ const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_WSL_SETUP_DESCRIPTOR_BYTES: usize = 256 * 1024;
+pub(crate) const WSL_SETUP_PROGRESS_EVENT: &str = "desktop:remote-setup-progress";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesktopSettings {
@@ -832,6 +841,7 @@ pub fn desktop_bridge_get_bridge_metadata(app: AppHandle<DesktopRuntime>) -> Val
             "clientSettings": true,
             "serverExposure": true,
             "wslDiscovery": true,
+            "wslProvisioning": true,
             "sshRemoteHttp": true,
             "connectionCatalog": true,
             "protectedConnectionCatalog": cfg!(target_os = "windows"),
@@ -1168,6 +1178,270 @@ pub async fn desktop_bridge_set_tailscale_serve_enabled(
     let restarted_config = backend.restart_default_if_active(app.clone()).await?;
     let current_config = restarted_config.or_else(|| backend.current_run_config());
     Ok(server_exposure_state(&settings, current_config.as_ref()))
+}
+
+fn wsl_setup_progress_sink(
+    app: AppHandle<DesktopRuntime>,
+    request_id: String,
+    generation: u64,
+) -> SetupProgressSink {
+    Arc::new(move |stage, completed_bytes, total_bytes| {
+        if let Err(error) = app.emit(
+            WSL_SETUP_PROGRESS_EVENT,
+            json!({
+                "requestId": request_id,
+                "generation": generation,
+                "stage": stage,
+                "status": "running",
+                "completedBytes": completed_bytes,
+                "totalBytes": total_bytes,
+                "message": null,
+            }),
+        ) {
+            tracing::warn!(
+                target: "bibcode_desktop_tauri::wsl_setup",
+                "could not emit WSL setup progress: {error}"
+            );
+        }
+    })
+}
+
+fn emit_wsl_setup_stage(
+    app: &AppHandle<DesktopRuntime>,
+    request_id: &str,
+    generation: u64,
+    stage: RemoteSetupStage,
+    status: &str,
+    message: Option<&str>,
+) {
+    if let Err(error) = app.emit(
+        WSL_SETUP_PROGRESS_EVENT,
+        json!({
+            "requestId": request_id,
+            "generation": generation,
+            "stage": stage,
+            "status": status,
+            "completedBytes": 0,
+            "totalBytes": null,
+            "message": message,
+        }),
+    ) {
+        tracing::warn!(
+            target: "bibcode_desktop_tauri::wsl_setup",
+            "could not emit WSL setup stage: {error}"
+        );
+    }
+}
+
+async fn fetch_wsl_setup_descriptor(config: &BackendRunConfig) -> Result<Value, String> {
+    let url = environment_endpoint_url(
+        &config.http_base_url(),
+        bibcode_server::ENVIRONMENT_DESCRIPTOR_PATH,
+    )?;
+    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
+        return Err(
+            "WSL setup identity verification requires the desktop-owned loopback HTTP endpoint."
+                .to_string(),
+        );
+    }
+    let response = remote_api_client()?
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| bridge_error("Could not reach the restarted WSL server", error))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "The restarted WSL server identity endpoint returned HTTP {}.",
+            status.as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WSL_SETUP_DESCRIPTOR_BYTES as u64)
+    {
+        return Err("The restarted WSL server identity descriptor is too large.".to_string());
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| bridge_error("Could not read the WSL identity descriptor", error))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_WSL_SETUP_DESCRIPTOR_BYTES {
+            return Err("The restarted WSL server identity descriptor is too large.".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| bridge_error("Could not decode the WSL identity descriptor", error))
+}
+
+async fn rollback_failed_wsl_setup(
+    app: &AppHandle<DesktopRuntime>,
+    backend: &BackendSupervisor,
+    setup: &WslSetupManager,
+    pending: PendingWslInstallation,
+    message: String,
+) -> WslSetupResult {
+    let mut result = setup.fail_and_rollback(pending, message).await;
+    if let Err(error) = backend.restart_default_if_active(app.clone()).await {
+        let recovery = format!("The preserved WSL server could not be restarted: {error}");
+        result.message = Some(match result.message.take() {
+            Some(message) => format!("{message} {recovery}"),
+            None => recovery,
+        });
+        result.cleanup_status = "failed";
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_prepare_wsl_server(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    setup: State<'_, WslSetupManager>,
+    input: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<WslSetupProbeInput>(input)
+        .map_err(|error| bridge_error("Could not decode the WSL setup probe", error))?;
+    let discovery = app.state::<WslDiscoveryService>().snapshot();
+    let expected_identity = match backend.run_config_for_wsl_distro(&input.distro) {
+        Some(config) => Some(WslExpectedIdentity::from_descriptor(
+            &fetch_wsl_setup_descriptor(&config).await?,
+        )?),
+        None => None,
+    };
+    let probe = setup
+        .prepare(&discovery, input, &app_version(&app), expected_identity)
+        .await?;
+    serde_json::to_value(probe)
+        .map_err(|error| bridge_error("Could not encode the WSL setup probe", error))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_install_wsl_server(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    setup: State<'_, WslSetupManager>,
+    input: Value,
+) -> Result<Value, String> {
+    let decision = serde_json::from_value::<RemoteSetupConsentDecision>(input)
+        .map_err(|error| bridge_error("Could not decode the WSL setup consent", error))?;
+    let request_id = decision.request_id.clone();
+    let generation = decision.probe_generation;
+    let progress = wsl_setup_progress_sink(app.clone(), request_id.clone(), generation);
+    let staging_root = state_dir(&app)?.join("runtime").join("server-artifacts");
+    let discovery = app.state::<WslDiscoveryService>().snapshot();
+    let attempt = setup
+        .begin_install(&discovery, decision, &staging_root, progress)
+        .await?;
+    let pending = match attempt {
+        WslInstallAttempt::Terminal(result) => {
+            return serde_json::to_value(result)
+                .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+        }
+        WslInstallAttempt::Pending(pending) => *pending,
+    };
+    emit_wsl_setup_stage(
+        &app,
+        &request_id,
+        generation,
+        RemoteSetupStage::Start,
+        "running",
+        None,
+    );
+
+    let current_discovery = app.state::<WslDiscoveryService>().snapshot();
+    if current_discovery.generation != pending.discovery_generation() {
+        let result = rollback_failed_wsl_setup(
+            &app,
+            &backend,
+            &setup,
+            pending,
+            "WSL discovery changed before the managed server could start.".to_string(),
+        )
+        .await;
+        return serde_json::to_value(result)
+            .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+    }
+
+    let start_result = backend.restart_default_if_active(app.clone()).await;
+    let config = match start_result {
+        Ok(Some(_)) => backend.run_config_for_wsl_distro(pending.distro()),
+        Ok(None) => None,
+        Err(error) => {
+            let result = rollback_failed_wsl_setup(
+                &app,
+                &backend,
+                &setup,
+                pending,
+                format!("Could not restart the desktop-owned WSL server: {error}"),
+            )
+            .await;
+            return serde_json::to_value(result)
+                .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+        }
+    };
+    let Some(config) = config else {
+        let result = rollback_failed_wsl_setup(
+            &app,
+            &backend,
+            &setup,
+            pending,
+            "The desktop-owned WSL backend was not active after installation.".to_string(),
+        )
+        .await;
+        return serde_json::to_value(result)
+            .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+    };
+
+    emit_wsl_setup_stage(
+        &app,
+        &request_id,
+        generation,
+        RemoteSetupStage::VerifyIdentity,
+        "running",
+        None,
+    );
+    let descriptor = match fetch_wsl_setup_descriptor(&config).await {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let result = rollback_failed_wsl_setup(&app, &backend, &setup, pending, error).await;
+            return serde_json::to_value(result)
+                .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+        }
+    };
+    if let Err(error) = validate_setup_descriptor(
+        &descriptor,
+        pending.target_version(),
+        pending.architecture(),
+        pending.expected_identity(),
+    ) {
+        let result = rollback_failed_wsl_setup(&app, &backend, &setup, pending, error).await;
+        return serde_json::to_value(result)
+            .map_err(|error| bridge_error("Could not encode the WSL setup result", error));
+    }
+    let result = setup.complete(pending, descriptor).await?;
+    emit_wsl_setup_stage(
+        &app,
+        &request_id,
+        generation,
+        RemoteSetupStage::VerifyIdentity,
+        "completed",
+        result.message.as_deref(),
+    );
+    serde_json::to_value(result)
+        .map_err(|error| bridge_error("Could not encode the WSL setup result", error))
+}
+
+#[tauri::command]
+pub fn desktop_bridge_cancel_wsl_setup(
+    setup: State<'_, WslSetupManager>,
+    input: Value,
+) -> Result<bool, String> {
+    let input = serde_json::from_value::<RemoteSetupCancelInput>(input)
+        .map_err(|error| bridge_error("Could not decode the WSL setup cancellation", error))?;
+    Ok(setup.cancel(&input))
 }
 
 #[tauri::command]
@@ -1642,6 +1916,35 @@ mod tests {
             tailscale_serve_enabled: false,
             tailscale_serve_port: 443,
         }
+    }
+
+    #[tokio::test]
+    async fn wsl_setup_descriptor_is_bounded_and_loopback_only() {
+        let (base_url, requests) =
+            spawn_json_test_server(r#"{"environmentId":"00000000-0000-4000-8000-000000000001"}"#);
+        let endpoint = url::Url::parse(&base_url).expect("loopback fixture URL");
+        let mut config = test_run_config();
+        config.port = endpoint.port().expect("fixture port");
+
+        let descriptor = fetch_wsl_setup_descriptor(&config)
+            .await
+            .expect("bounded loopback descriptor");
+        assert_eq!(
+            descriptor["environmentId"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert!(
+            requests
+                .recv()
+                .expect("identity request")
+                .starts_with("GET /.well-known/bibcode/environment HTTP/1.1")
+        );
+
+        config.local_host = "192.0.2.10".to_string();
+        let error = fetch_wsl_setup_descriptor(&config)
+            .await
+            .expect_err("non-loopback plain HTTP must fail closed");
+        assert!(error.contains("loopback HTTP"), "{error}");
     }
 
     fn unavailable_wsl_discovery() -> WslDiscoverySnapshot {
@@ -2488,6 +2791,7 @@ mod tests {
             crate::preview::host::is_supported()
         );
         assert_eq!(metadata["features"]["sshProvisioning"], true);
+        assert_eq!(metadata["features"]["wslProvisioning"], true);
         assert_eq!(metadata["features"]["menuEvents"], true);
         assert_eq!(metadata["features"]["updater"], false);
         assert_eq!(
@@ -2731,6 +3035,7 @@ mod tests {
             .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
             .manage(WslDiscoveryService::new())
+            .manage(WslSetupManager::new())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(DesktopSecretStore::new())
             .manage(NativeContextMenuManager::new())
@@ -2769,6 +3074,9 @@ mod tests {
                 desktop_bridge_get_server_exposure_state,
                 desktop_bridge_set_tailscale_serve_enabled,
                 desktop_bridge_get_advertised_endpoints,
+                desktop_bridge_prepare_wsl_server,
+                desktop_bridge_install_wsl_server,
+                desktop_bridge_cancel_wsl_setup,
                 desktop_bridge_get_wsl_state,
                 desktop_bridge_set_wsl_backend_enabled,
                 desktop_bridge_set_wsl_distro,

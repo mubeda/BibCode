@@ -372,39 +372,76 @@ native Windows result is claimed here.
 
 **Files:**
 
-- Modify: `apps/desktop/src-tauri/src/wsl.rs`, `bridge.rs`, `backend.rs`
-- Modify: `apps/desktop/src-tauri/src/updates.rs`
+- Create: `apps/desktop/src-tauri/src/server_artifacts.rs`, `wsl_setup.rs`
+- Modify: `apps/desktop/src-tauri/src/bridge.rs`, `backend.rs`, `lib.rs`, `Cargo.toml`
+- Modify: `apps/desktop/src-tauri/permissions/desktop-bridge.toml`
+- Modify: `apps/server/src/lib.rs`
+- Create: `packaging/server/server-release.pub`
 - Modify: `packages/contracts/src/ipc.ts`
-- Test: `apps/desktop/src-tauri/src/wsl.rs`, `bridge.rs`
+- Modify: living remote/WSL architecture, user, and testing documentation
+- Test: `apps/desktop/src-tauri/src/server_artifacts.rs`, `wsl_setup.rs`, `bridge.rs`, `backend.rs`
 
-- [ ] **Step 1: Write failing probe/install/cancel tests**
+- [x] **Step 1: Write failing probe/install/cancel tests**
 
 Cover absent binary, compatible binary, incompatible protocol, wrong architecture, checksum/signature failure, no `tar`, disk full, cancellation mid-transfer, failed atomic rename, previous version preservation, stopped distro, and concurrent setup requests.
 
-- [ ] **Step 2: Probe without starting stopped distros**
+- [x] **Step 2: Probe without starting stopped distros**
 
 Only run commands for a distro in a fresh authoritative Running snapshot. Use structured `wsl.exe --distribution <name> --exec <program> <args...>` calls to read `uname -m`, locate the managed binary, and execute `bibcode storage inspect --json`/descriptor probe as available.
 
-- [ ] **Step 3: Present consent before mutation**
+- [x] **Step 3: Present consent before mutation**
 
 Return exact version, architecture, verified source, download size, install destination under the distro user's home, data location, process/service behavior, and required commands. The bridge executes setup only with the matching one-time consent/probe generation.
 
-- [ ] **Step 4: Transfer and install atomically**
+- [x] **Step 4: Transfer and install atomically**
 
 Resolve the Linux portable artifact from the signed manifest, verify signature and SHA-256 on Windows, stream it with bounded memory to a distro temp file, verify SHA-256 again in WSL, extract into a versioned directory, then atomically switch the managed `current` link. Preserve the old version until descriptor verification succeeds.
 
-- [ ] **Step 5: Launch under current desktop ownership rules**
+- [x] **Step 5: Launch under current desktop ownership rules**
 
 Start the server only for Running distros, on distro loopback, with the existing data-root/process-group/log/restart policies and the Plan 4 transport. A setup failure leaves the row visible with actionable recovery and never fabricates an online environment.
 
-- [ ] **Step 6: Run WSL setup tests and commit**
+- [x] **Step 6: Run WSL setup tests and commit**
 
 ```sh
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl::tests::setup -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl_setup::tests:: -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop backend::tests::wsl -- --nocapture
-git add apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/updates.rs packages/contracts/src/ipc.ts
+git add Cargo.lock apps/desktop/src-tauri/Cargo.toml apps/desktop/src-tauri/permissions/desktop-bridge.toml apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/src/server_artifacts.rs apps/desktop/src-tauri/src/wsl_setup.rs apps/server/src/lib.rs packages/contracts/src/ipc.ts packages/contracts/src/ipc.test.ts packaging/server/server-release.pub docs/architecture/overview.md docs/architecture/remote.md docs/architecture/runtime-process-model.md docs/reference/encyclopedia.md docs/testing/cross-platform-validation.md docs/testing/execution-report-template.md docs/testing/windows-desktop.md docs/user/remote-access.md docs/plans/2026-08-24-environment-project-management/40-wsl-ssh-provisioning.plan.md docs/plans/2026-08-24-environment-project-management/70-server-distribution-ci-docs.plan.md
 git commit -m "feat(wsl): provision verified server runtimes with consent"
 ```
+
+Implementation note: the native desktop now exposes audited prepare/install/
+cancel bridge commands backed by one-use discovery/probe generations. Only an
+authoritatively Running distro can be probed. Every WSL command is a structured
+argument vector; setup never invokes a shell or starts a stopped distro.
+
+The artifact owner verifies an exact signed-manifest tuple, dedicated checked-in
+Minisign trust anchor (not the Tauri updater key), detached artifact signature, exact byte count, and
+SHA-256 before bounded streaming. WSL verifies SHA-256 again, validates the
+staged binary version, and atomically switches a per-user managed `current`
+symlink while retaining the prior target. Backend planning prefers that managed
+path and preserves `BIBCODE_WSL_SERVER_BINARY` plus cross-compiled development
+fallbacks. Restart success requires a bounded numeric-loopback descriptor with
+matching version, Linux architecture, protocol, environment UUID, and storage
+UUID. An upgrade captures the current running descriptor before mutation and
+requires those two identities to remain exact; a first install requires valid
+new UUIDs. Failure or cancellation rolls back and reports mutation/cleanup state.
+Shutdown cancels setup, and abnormal child exits abort and join every I/O task.
+
+Validation passed 44 contract tests, 6 focused WSL setup tests, 4 artifact
+trust tests, managed-path and development-fallback backend tests, the bounded
+loopback descriptor test, 321 complete desktop unit tests, 3 bridge contract
+tests, 4 SSH contract tests, desktop all-target Clippy with warnings denied,
+Rust formatting, `vp check`, and the complete workspace typecheck graph.
+`vp check` retains one pre-existing unused test-fixture warning. The initial
+complete desktop rerun exhausted the host's 140 GiB target cache; a targeted
+`cargo clean -p bibcode-desktop` removed 44.7 GiB of generated artifacts, and a
+non-incremental clean rebuild then passed. Real WSL execution was not claimed on
+this macOS host and remains required by the updated native Windows runbook.
+The checked-in Plan 40 key is the dedicated pre-release fixture public key; its
+private half was deleted. Plan 70 must provision the repository-environment
+server signing secret and replace this public half before publishing any server
+artifact.
 
 ### Task 6: Split SSH trust/probe/tunnel/descriptor/pairing stages
 

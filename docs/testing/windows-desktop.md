@@ -238,6 +238,23 @@ wsl.exe --list --verbose
 When WSL and a supported distribution are usable:
 
 - Settings shows **Local environment** and WSL status/setup controls;
+- a stopped distribution is visible but no setup probe starts it;
+- an absent or incompatible runtime returns one exact consent prompt containing
+  version, architecture, signed source, size, managed destination, data root,
+  process behavior, and bounded command summaries before mutation;
+- declining or reusing consent performs no mutation, and concurrent setup for
+  the same distro is rejected;
+- the signed manifest selects exactly one Linux architecture/version record;
+  manifest or artifact signature, size, checksum, architecture, missing `tar`,
+  and insufficient-space failures all fail closed;
+- cancellation during streaming reaps the exact child and I/O tasks, cleans
+  staging, and preserves the previous `current` target;
+- a failed atomic switch, backend restart, descriptor version/architecture/
+  protocol/identity check, or cleanup reports typed mutation/cleanup status and
+  restores the previous target;
+- a successful setup leaves the managed binary under
+  `$HOME/.local/share/bibcode/server/current/bin/bibcode`, and backend planning
+  prefers it while the explicit/source-worktree binary fallback remains usable;
 - Add Project offers **This device** plus only WSL locations with a matching
   usable bootstrap;
 - native and WSL paths do not collapse into one project identity;

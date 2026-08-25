@@ -293,6 +293,26 @@ adapter or cross-target check is compatibility evidence only; Task Scheduler,
 SCM, launchd, systemd, socket ACL, and certificate behavior require the named
 native host.
 
+### WSL provisioning evidence
+
+On native Windows with an explicitly disposable Running distribution, record
+the authoritative discovery and setup generations, probed architecture, target
+version, signed manifest/artifact tuple, byte count, managed destination, and
+data root. Do not record credentials or raw environment output. Prove that a
+stopped distro is not started, consent is one-use, concurrent same-distro setup
+is rejected, and declining performs no mutation.
+
+Exercise wrong architecture, manifest signature, artifact signature, size,
+SHA-256, missing `tar`, insufficient space, mid-stream cancellation, atomic
+switch failure, restart failure, and descriptor version/platform/protocol/
+identity mismatch. Record whether exact staging paths were removed, the prior
+`current` target remained or was restored, all setup children/I/O tasks were
+joined, and no unrelated WSL process was signalled. A success must show the
+managed `current` binary winning backend selection, numeric loopback on both
+sides of the forward, and stable environment/storage identities. Separately
+show that `BIBCODE_WSL_SERVER_BINARY` or the cross-compiled target fallback
+still launches a development worktree when no managed runtime exists.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

@@ -438,6 +438,19 @@ the resolver rejects connection attempts before creating a transport or
 session. Explicit disable or distro replacement is what removes that desired
 identity and clears its environment cache.
 
+The desktop provisions a missing or incompatible WSL runtime only after a
+fresh `Running`-distro probe and explicit one-use consent. A signed manifest
+selects the exact Linux architecture/version record; the desktop verifies its
+compiled Minisign trust anchor, size, signature, and SHA-256 before streaming,
+then WSL verifies SHA-256 again. Installation uses a per-user version directory
+and atomically replaces only
+`$HOME/.local/share/bibcode/server/current`. The prior target is retained until
+the restarted loopback descriptor proves version, platform, protocol,
+environment identity, and storage identity. Any cancellation, startup failure,
+or identity mismatch rolls the link back. Backend planning prefers the managed
+path and retains the explicit/source-built binary fallback used by development
+worktrees.
+
 ## Desktop update protection
 
 The Tauri host coordinates update installation across the complete local

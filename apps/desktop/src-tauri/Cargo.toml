@@ -19,7 +19,9 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
+futures-util.workspace = true
 libc.workspace = true
+minisign-verify.workspace = true
 portpicker.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -79,7 +81,6 @@ gtk.workspace = true
 cairo-rs.workspace = true
 
 [dev-dependencies]
-futures-util.workspace = true
 tauri = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true

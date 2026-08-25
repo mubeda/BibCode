@@ -752,6 +752,12 @@ export const RemoteSetupConsentSchema = Schema.Struct({
   transport: RemoteSetupTransportSchema,
   targetLabel: Schema.String,
   targetVersion: Schema.String,
+  artifactSource: Schema.String,
+  verification: Schema.Struct({
+    manifestSignature: Schema.Literal("verified"),
+    artifactSignature: Schema.Literals(["pending", "verified"]),
+    checksum: Schema.Literals(["pending", "verified"]),
+  }),
   artifact: ServerArtifactRecordSchema,
   installDestination: Schema.String,
   dataRoot: Schema.String,
@@ -806,6 +812,58 @@ export const RemoteSetupCancellationSchema = Schema.Struct({
   message: BoundedDesktopDiagnosticSchema,
 });
 export type RemoteSetupCancellation = typeof RemoteSetupCancellationSchema.Type;
+
+export const DesktopWslSetupProbeInputSchema = Schema.Struct({
+  distro: Schema.String,
+  discoveryGeneration: NonNegativeInt,
+});
+export type DesktopWslSetupProbeInput = typeof DesktopWslSetupProbeInputSchema.Type;
+
+export const DesktopWslSetupCompatibilitySchema = Schema.Literals(["compatible", "setupRequired"]);
+export type DesktopWslSetupCompatibility = typeof DesktopWslSetupCompatibilitySchema.Type;
+
+export const DesktopWslServerProbeSchema = Schema.Struct({
+  requestId: Schema.String,
+  probeGeneration: NonNegativeInt,
+  discoveryGeneration: NonNegativeInt,
+  distro: Schema.String,
+  compatibility: DesktopWslSetupCompatibilitySchema,
+  probe: RemoteHostProbeSchema,
+  installedBinaryPath: Schema.NullOr(Schema.String),
+  consent: Schema.NullOr(RemoteSetupConsentSchema),
+  detail: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(({ compatibility, consent }) =>
+    compatibility === "compatible"
+      ? consent === null || "A compatible WSL server must not fabricate install consent."
+      : consent !== null || "A setup-required WSL server must include explicit install consent.",
+  ),
+);
+export type DesktopWslServerProbe = typeof DesktopWslServerProbeSchema.Type;
+
+export const DesktopWslSetupResultSchema = Schema.Struct({
+  requestId: Schema.String,
+  generation: NonNegativeInt,
+  distro: Schema.String,
+  status: Schema.Literals(["completed", "failed", "cancelled"]),
+  stage: RemoteSetupStageSchema,
+  mutationStatus: Schema.Literals(["none", "partial", "completed"]),
+  cleanupStatus: Schema.Literals(["notRequired", "completed", "failed"]),
+  installedVersion: Schema.NullOr(Schema.String),
+  previousVersion: Schema.NullOr(Schema.String),
+  managedBinaryPath: Schema.NullOr(Schema.String),
+  dataRoot: Schema.String,
+  descriptor: Schema.NullOr(ExecutionEnvironmentDescriptor),
+  message: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(
+    ({ status, descriptor }) =>
+      status !== "completed" ||
+      descriptor !== null ||
+      "Completed WSL setup requires a verified environment descriptor.",
+  ),
+);
+export type DesktopWslSetupResult = typeof DesktopWslSetupResultSchema.Type;
 
 export interface DesktopWslState {
   // True when authoritative discovery contains at least one Running distro.

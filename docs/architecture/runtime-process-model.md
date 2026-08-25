@@ -29,6 +29,15 @@ up its peer before the existing bounded restart policy runs. Per-connection
 `wsl.exe` processes use Windows Job ownership and are never allowed to outlive
 their accepted socket or the desktop-owned listener.
 
+The Tauri host also owns WSL runtime provisioning. It probes only an already
+Running distribution, verifies an exact signed portable artifact on Windows,
+streams it to private per-user staging, verifies its hash again in WSL, and
+atomically switches the managed `current` symlink. The old version stays
+rollback-capable until the replacement process has returned a matching
+loopback environment descriptor. Setup cancellation shuts down and joins its
+child plus I/O tasks before the per-distribution concurrency slot is released;
+desktop shutdown cancels every active or prepared setup.
+
 ## Service definitions
 
 The platform-neutral service model records mode, state, startup owner, account,

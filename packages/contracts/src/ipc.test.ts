@@ -10,6 +10,9 @@ import {
   DesktopServerExposureStateSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
+  DesktopWslServerProbeSchema,
+  DesktopWslSetupProbeInputSchema,
+  DesktopWslSetupResultSchema,
   DesktopWslDiscoverySchema,
   RemoteHostProbeSchema,
   RemoteSetupCancellationSchema,
@@ -37,6 +40,9 @@ const decodeDesktopSecretReference = Schema.decodeUnknownSync(DesktopSecretRefer
 const decodeDesktopSecretStoreError = Schema.decodeUnknownSync(DesktopSecretStoreErrorSchema);
 const decodeDesktopServerExposureState = Schema.decodeUnknownSync(DesktopServerExposureStateSchema);
 const decodeDesktopWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
+const decodeDesktopWslSetupProbeInput = Schema.decodeUnknownSync(DesktopWslSetupProbeInputSchema);
+const decodeDesktopWslServerProbe = Schema.decodeUnknownSync(DesktopWslServerProbeSchema);
+const decodeDesktopWslSetupResult = Schema.decodeUnknownSync(DesktopWslSetupResultSchema);
 const decodeRemoteHostProbe = Schema.decodeUnknownSync(RemoteHostProbeSchema);
 const decodeRemoteSetupConsent = Schema.decodeUnknownSync(RemoteSetupConsentSchema);
 const decodeRemoteSetupConsentDecision = Schema.decodeUnknownSync(RemoteSetupConsentDecisionSchema);
@@ -151,6 +157,12 @@ describe("Remote setup contracts", () => {
       transport: "ssh",
       targetLabel: "build-host",
       targetVersion: "0.4.2",
+      artifactSource: "https://releases.example/artifacts.json",
+      verification: {
+        manifestSignature: "verified",
+        artifactSignature: "pending",
+        checksum: "pending",
+      },
       artifact: {
         product: "bibcode-server",
         version: "0.4.2",
@@ -218,6 +230,122 @@ describe("Remote setup contracts", () => {
         message: "Installation was cancelled; the previous version remains active.",
       }),
     ).toMatchObject({ status: "cancelled", mutationStatus: "partial" });
+  });
+});
+
+describe("Desktop WSL server setup contracts", () => {
+  it("binds a setup probe to an authoritative discovery generation", () => {
+    expect(
+      decodeDesktopWslSetupProbeInput({ distro: "Ubuntu-24.04", discoveryGeneration: 17 }),
+    ).toEqual({ distro: "Ubuntu-24.04", discoveryGeneration: 17 });
+  });
+
+  it("represents a compatible managed runtime without fabricating consent", () => {
+    expect(
+      decodeDesktopWslServerProbe({
+        requestId: "wsl-setup-1",
+        probeGeneration: 3,
+        discoveryGeneration: 17,
+        distro: "Ubuntu-24.04",
+        compatibility: "compatible",
+        probe: {
+          os: "linux",
+          architecture: "x86_64",
+          installedVersion: "0.4.2",
+          serviceMode: null,
+          serviceState: "stopped",
+          dataRoot: "/home/dev/.bibcode",
+          controlAvailable: false,
+        },
+        installedBinaryPath: "/home/dev/.local/share/bibcode/server/current/bin/bibcode",
+        consent: null,
+        detail: null,
+      }),
+    ).toMatchObject({ compatibility: "compatible", consent: null });
+  });
+
+  it("makes setup-required consent explicit and source-verifiable", () => {
+    const probe = decodeDesktopWslServerProbe({
+      requestId: "wsl-setup-2",
+      probeGeneration: 4,
+      discoveryGeneration: 18,
+      distro: "Debian",
+      compatibility: "setupRequired",
+      probe: {
+        os: "linux",
+        architecture: "aarch64",
+        installedVersion: null,
+        serviceMode: null,
+        serviceState: "notInstalled",
+        dataRoot: "/home/dev/.bibcode",
+        controlAvailable: false,
+      },
+      installedBinaryPath: null,
+      consent: {
+        requestId: "wsl-setup-2",
+        probeGeneration: 4,
+        transport: "wsl",
+        targetLabel: "Debian",
+        targetVersion: "0.4.2",
+        artifactSource: "https://releases.example/artifacts.json",
+        verification: {
+          manifestSignature: "verified",
+          artifactSignature: "pending",
+          checksum: "pending",
+        },
+        artifact: {
+          product: "bibcode-server",
+          version: "0.4.2",
+          os: "linux",
+          architecture: "aarch64",
+          format: "tar.gz",
+          downloadName: "bibcode-server-linux-aarch64.tar.gz",
+          size: 8192,
+          sha256: "b".repeat(64),
+          signatureName: "bibcode-server-linux-aarch64.tar.gz.sig",
+        },
+        installDestination: "/home/dev/.local/share/bibcode/server/versions/version-digest",
+        dataRoot: "/home/dev/.bibcode",
+        serviceMode: "workstation",
+        requiredCommands: ["transfer verified artifact", "switch managed current link"],
+        expiresAt: "2036-08-25T12:10:00.000Z",
+      },
+      detail: "BiBCode Server is not installed in this running distribution.",
+    });
+
+    expect(probe.consent?.verification).toEqual({
+      manifestSignature: "verified",
+      artifactSignature: "pending",
+      checksum: "pending",
+    });
+  });
+
+  it("requires a verified descriptor before setup can report completion", () => {
+    const completed = decodeDesktopWslSetupResult({
+      requestId: "wsl-setup-2",
+      generation: 5,
+      distro: "Debian",
+      status: "completed",
+      stage: "verifyIdentity",
+      mutationStatus: "completed",
+      cleanupStatus: "completed",
+      installedVersion: "0.4.2",
+      previousVersion: "0.4.1",
+      managedBinaryPath: "/home/dev/.local/share/bibcode/server/current/bin/bibcode",
+      dataRoot: "/home/dev/.bibcode",
+      descriptor: {
+        environmentId: "019d2a2e-0d0e-7000-8000-000000000001",
+        label: "Debian",
+        platform: { os: "linux", arch: "arm64" },
+        serverVersion: "0.4.2",
+        storageInstanceId: "019d2a2e-0d0e-7000-8000-000000000002",
+        protocol: { minimum: 1, maximum: 1 },
+        capabilities: { repositoryIdentity: true },
+      },
+      message: null,
+    });
+    expect(completed.status).toBe("completed");
+    expect(() => decodeDesktopWslSetupResult({ ...completed, descriptor: null })).toThrow();
   });
 });
 

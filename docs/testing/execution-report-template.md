@@ -113,6 +113,20 @@ Delete the unused result values above. Do not leave an ambiguous status.
 Repeat this section for every tested mode. Keep adapter simulations and
 cross-target checks under non-native compatibility evidence.
 
+## WSL provisioning evidence
+
+- Native Windows/WSL versions and distro state:
+- Discovery generation / setup generation:
+- Target version / architecture / signed artifact tuple and byte count:
+- Consent shown / declined / one-use replay / concurrent request results:
+- Missing tar / disk / trust / size / checksum failure results:
+- Transfer cancellation and child/I/O join result:
+- Atomic switch and previous-target preservation result:
+- Restart and descriptor version/platform/protocol/identity result:
+- Managed current path and development fallback result:
+- Loopback listeners/forward and unrelated-process survivor result:
+- Final staging cleanup and mutation/cleanup status:
+
 ## VCS observation evidence
 
 - Execution host and route: Native | WSL direct | SSH/server | Unavailable
