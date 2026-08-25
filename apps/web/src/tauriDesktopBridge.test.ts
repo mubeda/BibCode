@@ -1175,7 +1175,6 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.disconnectSshEnvironment(sshTarget)).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toBeNull();
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toBeNull();
@@ -1362,9 +1361,6 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.openExternal("not a URL")).resolves.toBe(false);
 
     await expect(bridge.getServerExposureState()).resolves.toMatchObject({ mode: "local-only" });
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toMatchObject({
-      mode: "local-only",
-    });
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toMatchObject({ tailscaleServeEnabled: false });

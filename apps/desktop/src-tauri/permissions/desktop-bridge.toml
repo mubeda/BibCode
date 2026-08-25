@@ -30,7 +30,6 @@ commands.allow = [
   "desktop_bridge_issue_ssh_web_socket_ticket",
   "desktop_bridge_resolve_ssh_password_prompt",
   "desktop_bridge_get_server_exposure_state",
-  "desktop_bridge_set_server_exposure_mode",
   "desktop_bridge_set_tailscale_serve_enabled",
   "desktop_bridge_get_advertised_endpoints",
   "desktop_bridge_get_wsl_state",

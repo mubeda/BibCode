@@ -39,7 +39,6 @@ const DESKTOP_MODE: &str = "desktop";
 const BACKEND_BOOTSTRAP_FD: &str = "0";
 const TAILSCALE_SERVE_PORT: u16 = 443;
 const DESKTOP_LOOPBACK_HOST: &str = "127.0.0.1";
-const DESKTOP_LAN_BIND_HOST: &str = "0.0.0.0";
 const DEFAULT_BACKEND_PORT: u16 = 3773;
 const MAX_TCP_PORT: u16 = u16::MAX;
 const DESKTOP_BACKEND_PORT_PROBE_HOSTS: [&str; 3] = ["127.0.0.1", "0.0.0.0", "::"];
@@ -113,7 +112,6 @@ struct BackendDesktopSettings {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendDesktopSettingsDocument {
-    server_exposure_mode: Option<String>,
     tailscale_serve_enabled: Option<bool>,
     tailscale_serve_port: Option<u64>,
     wsl_backend_enabled: Option<bool>,
@@ -2235,9 +2233,10 @@ struct WslDistroEntry {
 
 fn decode_wsl_command_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xff, 0xfe]) {
-        let values = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        let (chunks, _) = bytes[2..].as_chunks::<2>();
+        let values = chunks
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         return String::from_utf16_lossy(&values);
     }
@@ -2678,32 +2677,15 @@ fn resolve_backend_exposure(
 }
 
 fn resolve_backend_exposure_with(
-    settings: &BackendDesktopSettings,
-    port: u16,
-    resolve_advertised_host: impl FnOnce() -> Option<String>,
+    _settings: &BackendDesktopSettings,
+    _port: u16,
+    _resolve_advertised_host: impl FnOnce() -> Option<String>,
 ) -> ResolvedBackendExposure {
-    if settings.server_exposure_mode != "network-accessible" {
-        return ResolvedBackendExposure {
-            mode: "local-only".to_string(),
-            bind_host: DESKTOP_LOOPBACK_HOST.to_string(),
-            endpoint_url: None,
-            advertised_host: None,
-        };
-    }
-
-    match resolve_advertised_host() {
-        Some(advertised_host) => ResolvedBackendExposure {
-            mode: "network-accessible".to_string(),
-            bind_host: DESKTOP_LAN_BIND_HOST.to_string(),
-            endpoint_url: Some(format!("http://{advertised_host}:{port}")),
-            advertised_host: Some(advertised_host),
-        },
-        None => ResolvedBackendExposure {
-            mode: "local-only".to_string(),
-            bind_host: DESKTOP_LOOPBACK_HOST.to_string(),
-            endpoint_url: None,
-            advertised_host: None,
-        },
+    ResolvedBackendExposure {
+        mode: "local-only".to_string(),
+        bind_host: DESKTOP_LOOPBACK_HOST.to_string(),
+        endpoint_url: None,
+        advertised_host: None,
     }
 }
 
@@ -2782,10 +2764,7 @@ fn decode_backend_desktop_settings(raw: Option<&str>) -> BackendDesktopSettings 
 
     let wsl_only = document.wsl_only.unwrap_or(false);
     BackendDesktopSettings {
-        server_exposure_mode: match document.server_exposure_mode.as_deref() {
-            Some("network-accessible") => "network-accessible".to_string(),
-            _ => "local-only".to_string(),
-        },
+        server_exposure_mode: "local-only".to_string(),
         tailscale_serve_enabled: document.tailscale_serve_enabled.unwrap_or(false),
         tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
         wsl_backend_enabled: wsl_only || document.wsl_backend_enabled.unwrap_or(false),
@@ -4974,7 +4953,7 @@ exit /b 9
                 }"#,
             )),
             BackendDesktopSettings {
-                server_exposure_mode: "network-accessible".to_string(),
+                server_exposure_mode: "local-only".to_string(),
                 tailscale_serve_enabled: true,
                 tailscale_serve_port: 8_443,
                 wsl_backend_enabled: true,
@@ -4996,7 +4975,7 @@ exit /b 9
     }
 
     #[test]
-    fn network_exposure_uses_resolved_host_or_falls_back_closed() {
+    fn legacy_network_exposure_intent_is_ignored_without_resolving_a_lan_route() {
         let settings = BackendDesktopSettings {
             server_exposure_mode: "network-accessible".to_string(),
             tailscale_serve_enabled: false,
@@ -5006,17 +4985,15 @@ exit /b 9
             wsl_distro: None,
         };
 
+        let resolver_called = Cell::new(false);
+        let exposure = resolve_backend_exposure_with(&settings, 3_773, || {
+            resolver_called.set(true);
+            Some("10.0.0.8".to_string())
+        });
+
+        assert!(!resolver_called.get());
         assert_eq!(
-            resolve_backend_exposure_with(&settings, 3_773, || Some("10.0.0.8".to_string())),
-            ResolvedBackendExposure {
-                mode: "network-accessible".to_string(),
-                bind_host: "0.0.0.0".to_string(),
-                endpoint_url: Some("http://10.0.0.8:3773".to_string()),
-                advertised_host: Some("10.0.0.8".to_string()),
-            }
-        );
-        assert_eq!(
-            resolve_backend_exposure_with(&settings, 3_773, || None),
+            exposure,
             ResolvedBackendExposure {
                 mode: "local-only".to_string(),
                 bind_host: "127.0.0.1".to_string(),

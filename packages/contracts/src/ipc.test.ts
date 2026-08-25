@@ -7,6 +7,7 @@ import {
   DesktopSecretInputSchema,
   DesktopSecretReferenceSchema,
   DesktopSecretStoreErrorSchema,
+  DesktopServerExposureStateSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
   type DesktopUpdateState,
@@ -28,6 +29,30 @@ const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
 const decodeDesktopSecretInput = Schema.decodeUnknownSync(DesktopSecretInputSchema);
 const decodeDesktopSecretReference = Schema.decodeUnknownSync(DesktopSecretReferenceSchema);
 const decodeDesktopSecretStoreError = Schema.decodeUnknownSync(DesktopSecretStoreErrorSchema);
+const decodeDesktopServerExposureState = Schema.decodeUnknownSync(DesktopServerExposureStateSchema);
+
+describe("Desktop server exposure contract", () => {
+  it("represents only the packaged loopback listener", () => {
+    expect(
+      decodeDesktopServerExposureState({
+        mode: "local-only",
+        endpointUrl: null,
+        advertisedHost: null,
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+      }),
+    ).toMatchObject({ mode: "local-only" });
+    expect(() =>
+      decodeDesktopServerExposureState({
+        mode: "network-accessible",
+        endpointUrl: "http://192.0.2.10:3773",
+        advertisedHost: "192.0.2.10",
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+      }),
+    ).toThrow();
+  });
+});
 
 describe("Desktop secret-store contract", () => {
   it("round-trips opaque references without exposing an inventory operation", async () => {

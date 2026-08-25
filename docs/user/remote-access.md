@@ -1,44 +1,30 @@
 # Remote Access
 
-The v0.3.14 macOS, Linux, and Windows desktop UI is presented as local-only.
-Remote connection, pairing, SSH, Tailscale, network-exposure, and BiBCode
-Connect controls are hidden without removing their underlying implementation.
-Windows keeps **Settings → Local environment** for WSL. The browser/hosted UI
-retains the full remote workflow described below.
-
 Remote access connects a browser or another desktop app to the BiBCode server
 running on a different machine. That server owns projects, files, Git state,
 terminals, provider CLIs, credentials, and agent sessions.
 
-Use a trusted private network such as a LAN or tailnet. Do not expose a plain
-BiBCode HTTP endpoint directly to the public internet.
+Plain HTTP/WebSocket is restricted to loopback. This rule also applies on a
+trusted LAN or tailnet: BiBCode has no packaged switch or override that binds an
+unencrypted server to another interface.
 
-## Browser/hosted and future re-enabled desktop network access
+## Supported routes
 
-In the browser/hosted UI, or when this desktop presentation is re-enabled, use
-these controls to expose the backend embedded in the desktop app:
+- **Same machine:** loopback HTTP/WebSocket.
+- **WSL or SSH:** a desktop-owned loopback forwarder to the server's remote
+  loopback listener.
+- **Direct network:** HTTPS/WSS with a valid certificate and private key.
+- **Tailscale:** a MagicDNS HTTPS endpoint provided by Tailscale Serve in front
+  of the loopback backend.
 
-1. Open **Settings → Connections**.
-2. Under **Manage Local Backend**, enable **Network access**. The desktop app
-   restarts its backend bound to the network-accessible host.
-3. Inspect the reachable endpoints. The list can include loopback, LAN, Tailnet
-   IP, MagicDNS, or verified HTTPS endpoints.
-4. Choose the endpoint you want to use and select **Create Link** to issue a
-   pairing link.
+The desktop's **Remote transport** setting explains this boundary and does not
+offer a plaintext LAN toggle. Pairing links are presented for an available
+secure route; legacy LAN and Tailnet-IP HTTP candidates are ignored.
 
-The selected endpoint type becomes the default for later links. A LAN endpoint
-can remain the default across ordinary IP address changes.
+### Tailscale HTTPS
 
-- A loopback URL works only on the server machine.
-- A plain LAN or Tailnet HTTP URL can be used by a desktop client or by a page
-  served over HTTP.
-- An HTTPS-hosted web app cannot connect to an insecure HTTP/WS backend because
-  browsers block mixed content. Use an HTTPS/WSS endpoint in that case.
-
-### Tailscale endpoints
-
-When the desktop app can read `tailscale status --json`, it can add the machine's
-Tailnet IPv4 addresses and MagicDNS name to the endpoint list.
+When the desktop app can read `tailscale status --json`, it can discover the
+machine's MagicDNS name. Raw Tailnet IPv4 HTTP endpoints are not advertised.
 
 An HTTPS MagicDNS endpoint is shown as available only after its well-known
 BiBCode endpoint responds successfully. Configure Tailscale Serve separately to
@@ -51,13 +37,20 @@ Serve setup flags.
 `bibcode start` and `bibcode serve` run the same native server. `start` opens the
 startup URL in a browser by default; `serve` does not.
 
-For example, bind to a trusted Tailnet address and serve built web assets:
+For example, bind with TLS and serve built web assets:
 
 ```bash
 bibcode serve \
-  --host "$(tailscale ip -4)" \
+  --host 0.0.0.0 \
+  --tls-certificate-chain /etc/bibcode/server-chain.pem \
+  --tls-private-key /etc/bibcode/server-key.pem \
   --static-dir /path/to/BibCode/apps/web/dist
 ```
+
+The certificate and key flags are an atomic pair. Startup fails before durable
+server initialization if either file is missing, unusable, mismatched, expired,
+or not yet valid. A non-loopback bind without this pair is rejected; there is no
+insecure override.
 
 The server prints one JSON object to stdout. In authenticated web mode it has
 this shape:
@@ -65,11 +58,14 @@ this shape:
 ```json
 {
   "address": "100.64.0.10:3773",
-  "httpBaseUrl": "http://100.64.0.10:3773",
+  "httpBaseUrl": "https://server.example:3773",
   "token": "one-time-pairing-credential",
-  "pairingUrl": "http://100.64.0.10:3773/pair#token=one-time-pairing-credential"
+  "pairingUrl": "https://server.example:3773/pair#token=one-time-pairing-credential"
 }
 ```
+
+`httpBaseUrl` is the existing output key; its value uses `https://` for a TLS
+listener.
 
 The CLI does not print a QR code. It also has no `auth` or `project` subcommands,
 no positional working-directory argument, and no `--tailscale-serve` flags. Use
@@ -86,7 +82,7 @@ credential. The credential is carried in the URL fragment so it is not sent as
 part of the initial HTTP request:
 
 ```text
-http://server.example:3773/pair#token=PAIRING_CREDENTIAL
+https://server.example:3773/pair#token=PAIRING_CREDENTIAL
 ```
 
 The client exchanges the credential for a session. Treat the credential and
@@ -158,8 +154,10 @@ identity checks then apply.
 
 ## Security notes
 
-- Bind the server only to a trusted private address.
-- Prefer HTTPS/WSS whenever the browser page itself is served over HTTPS.
+- Plain HTTP/WebSocket is loopback-only. Use HTTPS/WSS for every direct network
+  listener, including private networks.
+- Verify the certificate through system trust or an explicitly accepted pin;
+  descriptor fingerprint metadata is not itself a trust decision.
 - Treat pairing URLs and credentials as secrets.
 - In the browser/hosted UI, review and revoke sessions you no longer trust in
   **Settings → Connections**.

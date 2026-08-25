@@ -56,7 +56,7 @@
 - Produces: `ValidatedListenerConfig { bind, scheme, tls }`.
 - Rejects: non-loopback plaintext, unusable TLS material, wildcard plaintext, and unsafe-auth release/service combinations before binding.
 
-- [ ] **Step 1: Write the admission matrix as failing table tests**
+- [x] **Step 1: Write the admission matrix as failing table tests**
 
 ```rust
 #[test]
@@ -71,7 +71,7 @@ fn listener_admission_matches_the_security_matrix() {
 
 Add cases for a hostname resolving to mixed loopback/non-loopback addresses, missing key, unreadable certificate, mismatched key, expired/not-yet-valid certificate, unsupported key, and `unsafe_no_auth` in service/package mode.
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test network_admission -- --nocapture
@@ -79,7 +79,7 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test network_admiss
 
 Expected: FAIL because `ServerConfig` exposes a free-form host and `lifecycle.rs` binds it directly.
 
-- [ ] **Step 3: Add typed listener configuration**
+- [x] **Step 3: Add typed listener configuration**
 
 ```rust
 pub struct TlsFiles {
@@ -101,7 +101,7 @@ pub struct ValidatedListenerConfig {
 
 Resolve the requested bind under a bounded startup deadline. Require every resolved address to satisfy the same policy; do not choose a convenient loopback result from a mixed set.
 
-- [ ] **Step 4: Make validation the only bind entry point**
+- [x] **Step 4: Make validation the only bind entry point**
 
 Replace `TcpListener::bind((config.host.as_str(), config.port))` with `transport::bind(validated)`. Desktop in-process, WSL, standalone CLI, service restart, and integration fixtures all call this path.
 
@@ -109,7 +109,9 @@ Replace `TcpListener::bind((config.host.as_str(), config.port))` with `transport
 
 Delete or replace `DESKTOP_LAN_BIND_HOST`, `network-accessible` plaintext planning, and the WSL wildcard HTTP exception. WSL must use the desktop-owned loopback transport designed in Plan 40.
 
-- [ ] **Step 6: Run focused tests and commit**
+Progress: the desktop LAN bind, mutation command, UI switch, and plaintext LAN/Tailnet endpoint candidates are removed. The WSL wildcard launch is intentionally left fail-closed until Plan 40 installs the desktop-owned loopback forwarder.
+
+- [x] **Step 6: Run focused tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test network_admission -- --nocapture
@@ -129,11 +131,11 @@ git commit -m "feat(server): enforce secure listener admission"
 - Test: `packages/contracts/src/environment.test.ts`
 - Test: `apps/server/tests/network_admission.rs`, `server_runtime.rs`
 
-- [ ] **Step 1: Add failing HTTPS descriptor tests**
+- [x] **Step 1: Add failing HTTPS descriptor tests**
 
 Start a TLS fixture and assert that HTTPS and WSS work, the descriptor reports a stable SHA-256 SPKI fingerprint and TLS capability, and plaintext against the same non-loopback configuration is never served.
 
-- [ ] **Step 2: Add direct dependencies already compatible with the lockfile**
+- [x] **Step 2: Add direct dependencies already compatible with the lockfile**
 
 ```toml
 rustls = "0.23.42"
@@ -143,7 +145,7 @@ rustls-pemfile = "2"
 
 Keep default crypto provider selection explicit and fail startup if initialization or certificate parsing fails.
 
-- [ ] **Step 3: Implement bounded TLS accept**
+- [x] **Step 3: Implement bounded TLS accept**
 
 ```rust
 pub enum BoundListener {
@@ -158,7 +160,7 @@ pub enum BoundListener {
 
 Feed accepted streams into the same Axum service, cap handshake time, cap concurrent handshakes, cancel handshakes at shutdown, and retain peer address for auth/audit without logging certificates or headers.
 
-- [ ] **Step 4: Extend the minimal descriptor**
+- [x] **Step 4: Extend the minimal descriptor**
 
 ```ts
 export const EnvironmentTransportIdentitySchema = Schema.Struct({
@@ -169,7 +171,7 @@ export const EnvironmentTransportIdentitySchema = Schema.Struct({
 
 Return the fingerprint only for the currently served certificate. Do not accept a descriptor fingerprint as self-authenticating; Plan 20 verifies it against system trust or an enrollment pin.
 
-- [ ] **Step 5: Run HTTPS, WS, shutdown, and descriptor tests**
+- [x] **Step 5: Run HTTPS, WS, shutdown, and descriptor tests**
 
 ```sh
 vp test packages/contracts/src/environment.test.ts

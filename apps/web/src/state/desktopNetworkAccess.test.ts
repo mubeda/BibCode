@@ -7,9 +7,9 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { createDesktopNetworkAccessStateAtom } from "./desktopNetworkAccess";
 
 const serverExposureState: DesktopServerExposureState = {
-  advertisedHost: "192.168.1.10",
-  endpointUrl: "http://192.168.1.10:37737",
-  mode: "network-accessible",
+  advertisedHost: null,
+  endpointUrl: null,
+  mode: "local-only",
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,
 };

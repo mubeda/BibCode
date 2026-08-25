@@ -257,10 +257,8 @@ fn default_desktop_settings() -> DesktopSettings {
 }
 
 fn normalize_server_exposure_mode(value: Option<&str>) -> String {
-    match value {
-        Some("network-accessible") => "network-accessible".to_string(),
-        _ => "local-only".to_string(),
-    }
+    let _ = value;
+    "local-only".to_string()
 }
 
 fn normalize_tailscale_serve_port(value: Option<u64>) -> u16 {
@@ -431,9 +429,9 @@ fn update_desktop_settings<R: Runtime>(
 fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunConfig>) -> Value {
     if let Some(config) = config {
         return json!({
-            "mode": &config.server_exposure_mode,
-            "endpointUrl": &config.endpoint_url,
-            "advertisedHost": &config.advertised_host,
+            "mode": "local-only",
+            "endpointUrl": null,
+            "advertisedHost": null,
             "tailscaleServeEnabled": config.tailscale_serve_enabled,
             "tailscaleServePort": config.tailscale_serve_port,
         });
@@ -575,27 +573,14 @@ fn tailscale_advertised_endpoint(
 }
 
 fn advertised_endpoints_for_config(config: &BackendRunConfig) -> Result<Vec<Value>, String> {
-    let mut endpoints = vec![advertised_endpoint(
+    Ok(vec![advertised_endpoint(
         format!("desktop-loopback:{}", config.port),
         "This machine",
         config.http_base_url(),
         "loopback",
         None,
         "Loopback endpoint for this desktop app.",
-    )?];
-
-    if let Some(endpoint_url) = &config.endpoint_url {
-        endpoints.push(advertised_endpoint(
-            format!("desktop-lan:{endpoint_url}"),
-            "Local network",
-            endpoint_url.clone(),
-            "lan",
-            Some(true),
-            "Reachable from devices on the same network.",
-        )?);
-    }
-
-    Ok(endpoints)
+    )?])
 }
 
 fn tailscale_endpoints_for_status(
@@ -604,17 +589,6 @@ fn tailscale_endpoints_for_status(
     magic_dns_reachable: bool,
 ) -> Result<Vec<Value>, String> {
     let mut endpoints = Vec::new();
-    for address in &status.tailnet_ipv4_addresses {
-        let http_base_url = format!("http://{address}:{}", config.port);
-        endpoints.push(tailscale_advertised_endpoint(
-            format!("tailscale-ip:{http_base_url}"),
-            "Tailscale IP",
-            http_base_url,
-            "available",
-            "mixed-content-blocked",
-            "Reachable from devices on the same Tailnet.",
-        )?);
-    }
 
     let Some(magic_dns_name) = &status.magic_dns_name else {
         return Ok(endpoints);
@@ -648,7 +622,7 @@ fn tailscale_endpoints_for_status(
 async fn tailscale_advertised_endpoints_for_config(
     config: &BackendRunConfig,
 ) -> Result<Vec<Value>, String> {
-    if config.server_exposure_mode != "network-accessible" && !config.tailscale_serve_enabled {
+    if !config.tailscale_serve_enabled {
         return Ok(Vec::new());
     }
 
@@ -687,9 +661,10 @@ fn decode_command_output(bytes: &[u8]) -> String {
             > 10;
 
     if likely_utf16_le {
-        let code_units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let code_units = chunks
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         String::from_utf16_lossy(&code_units)
             .trim_start_matches('\u{feff}')
@@ -1229,23 +1204,6 @@ pub fn desktop_bridge_get_server_exposure_state(
 ) -> Result<Value, String> {
     read_desktop_settings(&app)
         .map(|settings| server_exposure_state(&settings, backend.current_run_config().as_ref()))
-}
-
-#[tauri::command]
-pub async fn desktop_bridge_set_server_exposure_mode(
-    app: AppHandle<DesktopRuntime>,
-    backend: State<'_, BackendSupervisor>,
-    mode: String,
-) -> Result<Value, String> {
-    if !matches!(mode.as_str(), "local-only" | "network-accessible") {
-        return Err(format!("Unsupported server exposure mode: {mode}"));
-    }
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.server_exposure_mode = mode;
-    })?;
-    let restarted_config = backend.restart_default_if_active(app.clone()).await?;
-    let current_config = restarted_config.or_else(|| backend.current_run_config());
-    Ok(server_exposure_state(&settings, current_config.as_ref()))
 }
 
 #[tauri::command]
@@ -2191,7 +2149,7 @@ mod tests {
         assert_eq!(
             settings,
             DesktopSettings {
-                server_exposure_mode: "network-accessible".to_string(),
+                server_exposure_mode: "local-only".to_string(),
                 tailscale_serve_enabled: true,
                 tailscale_serve_port: 8443,
                 wsl_backend_enabled: true,
@@ -2278,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn server_exposure_state_prefers_runtime_state_when_available() {
+    fn server_exposure_state_never_publishes_legacy_plaintext_exposure() {
         let mut settings = default_desktop_settings();
         settings.tailscale_serve_enabled = true;
         settings.tailscale_serve_port = 8443;
@@ -2301,9 +2259,9 @@ mod tests {
         assert_eq!(
             server_exposure_state(&settings, Some(&config)),
             json!({
-                "mode": "network-accessible",
-                "endpointUrl": "http://192.168.1.20:13773",
-                "advertisedHost": "192.168.1.20",
+                "mode": "local-only",
+                "endpointUrl": null,
+                "advertisedHost": null,
                 "tailscaleServeEnabled": false,
                 "tailscaleServePort": 443,
             })
@@ -2346,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_endpoints_serialize_loopback_and_lan_routes() {
+    fn advertised_endpoints_never_publish_injected_plaintext_lan_routes() {
         let config = test_run_config();
         let loopback =
             advertised_endpoints_for_config(&config).expect("loopback endpoint should build");
@@ -2356,13 +2314,10 @@ mod tests {
 
         let mut network_config = config;
         network_config.endpoint_url = Some("http://192.168.1.20:13773/path".to_string());
-        let endpoints =
-            advertised_endpoints_for_config(&network_config).expect("LAN endpoint should build");
-        assert_eq!(endpoints.len(), 2);
-        assert_eq!(endpoints[1]["httpBaseUrl"], "http://192.168.1.20:13773/");
-        assert_eq!(endpoints[1]["wsBaseUrl"], "ws://192.168.1.20:13773/");
-        assert_eq!(endpoints[1]["isDefault"], true);
-        assert_eq!(endpoints[1]["reachability"], "lan");
+        let endpoints = advertised_endpoints_for_config(&network_config)
+            .expect("legacy LAN metadata should be ignored");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["httpBaseUrl"], "http://127.0.0.1:13773/");
     }
 
     #[test]
@@ -2626,35 +2581,22 @@ mod tests {
         let endpoints =
             tailscale_endpoints_for_status(&config, &status, true).expect("endpoints should build");
 
-        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints.len(), 1);
         assert_eq!(
             endpoints[0]["id"],
-            "tailscale-ip:http://100.100.100.100:13773"
+            "tailscale-magicdns:https://desktop.tail.ts.net:8443/"
         );
         assert_eq!(endpoints[0]["provider"]["id"], "tailscale");
         assert_eq!(endpoints[0]["provider"]["kind"], "private-network");
         assert_eq!(endpoints[0]["source"], "desktop-addon");
         assert_eq!(endpoints[0]["status"], "available");
-        assert_eq!(endpoints[0]["httpBaseUrl"], "http://100.100.100.100:13773/");
-        assert_eq!(endpoints[0]["wsBaseUrl"], "ws://100.100.100.100:13773/");
         assert_eq!(
-            endpoints[0]["compatibility"]["hostedHttpsApp"],
-            "mixed-content-blocked"
-        );
-
-        assert_eq!(
-            endpoints[1]["id"],
-            "tailscale-magicdns:https://desktop.tail.ts.net:8443/"
-        );
-        assert_eq!(endpoints[1]["label"], "Tailscale HTTPS");
-        assert_eq!(
-            endpoints[1]["httpBaseUrl"],
+            endpoints[0]["httpBaseUrl"],
             "https://desktop.tail.ts.net:8443/"
         );
-        assert_eq!(endpoints[1]["wsBaseUrl"], "wss://desktop.tail.ts.net:8443/");
-        assert_eq!(endpoints[1]["status"], "available");
+        assert_eq!(endpoints[0]["wsBaseUrl"], "wss://desktop.tail.ts.net:8443/");
         assert_eq!(
-            endpoints[1]["compatibility"]["hostedHttpsApp"],
+            endpoints[0]["compatibility"]["hostedHttpsApp"],
             "compatible"
         );
     }
@@ -2885,7 +2827,6 @@ mod tests {
                 desktop_bridge_issue_ssh_web_socket_ticket,
                 desktop_bridge_resolve_ssh_password_prompt,
                 desktop_bridge_get_server_exposure_state,
-                desktop_bridge_set_server_exposure_mode,
                 desktop_bridge_set_tailscale_serve_enabled,
                 desktop_bridge_get_advertised_endpoints,
                 desktop_bridge_get_wsl_state,
@@ -3024,13 +2965,6 @@ mod tests {
         }
         assert!(
             invoke(
-                "desktop_bridge_set_server_exposure_mode",
-                json!({"mode":"unsupported"}),
-            )
-            .is_err()
-        );
-        assert!(
-            invoke(
                 "desktop_bridge_set_client_settings",
                 json!({"settings":{"theme":"dark"}}),
             )
@@ -3077,13 +3011,6 @@ mod tests {
             "catalog persistence must fail closed without platform protection",
         );
         assert!(invoke("desktop_bridge_clear_connection_catalog", json!({})).is_ok());
-        assert!(
-            invoke(
-                "desktop_bridge_set_server_exposure_mode",
-                json!({"mode":"local-only"}),
-            )
-            .is_ok()
-        );
         assert!(
             invoke(
                 "desktop_bridge_set_tailscale_serve_enabled",

@@ -1,6 +1,5 @@
-import { act, type ReactElement, type ReactNode } from "react";
+import { type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
@@ -28,12 +27,6 @@ interface CapturedControl {
   readonly props: AnyProps;
 }
 
-interface MountedTree {
-  readonly container: HTMLDivElement;
-  readonly root: Root;
-}
-
-const mountedTrees: MountedTree[] = [];
 let domWindow: Window | null = null;
 
 const h = vi.hoisted(() => {
@@ -592,20 +585,6 @@ function render(node: ReactElement = <ConnectionsSettings />): string {
   return renderToStaticMarkup(node);
 }
 
-async function mountConnections(): Promise<HTMLDivElement> {
-  clearRegistries();
-  const container = document.createElement("div");
-  document.body.append(container);
-  const root = createRoot(container);
-  mountedTrees.push({ container, root });
-  await act(async () => root.render(<ConnectionsSettings />));
-  return container;
-}
-
-async function click(element: HTMLElement): Promise<void> {
-  await act(async () => element.click());
-}
-
 function findControls(kind: string, label: string): CapturedControl[] {
   const exact = h.controls.filter((entry) => entry.kind === kind && entry.label === label);
   if (exact.length > 0) return exact;
@@ -670,7 +649,6 @@ function stubBrowserWindow(options?: {
 }
 
 interface DesktopBridgeStub {
-  setServerExposureMode: ReturnType<typeof vi.fn>;
   setTailscaleServeEnabled: ReturnType<typeof vi.fn>;
   setWslBackendEnabled: ReturnType<typeof vi.fn>;
   setWslDistro: ReturnType<typeof vi.fn>;
@@ -690,7 +668,6 @@ function createDesktopBridgeStub(): DesktopBridgeStub {
     preflightError: null,
   };
   return {
-    setServerExposureMode: vi.fn(async () => ({})),
     setTailscaleServeEnabled: vi.fn(async () => ({})),
     setWslBackendEnabled: vi.fn(async () => wslState),
     setWslDistro: vi.fn(async () => wslState),
@@ -937,11 +914,7 @@ beforeEach(() => {
   consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
-afterEach(async () => {
-  for (const { root, container } of mountedTrees.splice(0)) {
-    await act(async () => root.unmount());
-    container.remove();
-  }
+afterEach(() => {
   document.body.replaceChildren();
   consoleErrorSpy.mockRestore();
   domWindow?.close();
@@ -1349,7 +1322,7 @@ describe("ConnectionsSettings", () => {
     expect(markup).not.toContain("credential-pl-expired");
     expect(markup).toContain("This device");
     expect(markup).toContain("macOS · Safari");
-    expect(markup).toContain("This backend is already configured for remote access.");
+    expect(markup).toContain("This server controls its HTTPS listener where it is launched.");
 
     // Copy the shareable pairing URL (current-origin fallback: no endpoints).
     invoke(control("button", "Copy pairing URL for: URL"), "onClick");
@@ -1485,7 +1458,7 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("Clipboard copy is unavailable here.");
   });
 
-  it("shows the local-only network notice for non-remote browser admins", () => {
+  it("shows the secure loopback transport notice for non-remote browser admins", () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;
     h.primarySessionState = {
@@ -1494,7 +1467,7 @@ describe("ConnectionsSettings", () => {
 
     const markup = render();
 
-    expect(markup).toContain("This backend is only reachable on this machine.");
+    expect(markup).toContain("This server is loopback-only.");
     expect(markup).not.toContain("Authorized clients");
   });
 
@@ -1514,10 +1487,10 @@ describe("ConnectionsSettings", () => {
     ];
     h.networkAccessQuery.data = {
       serverExposureState: {
-        mode: "network-accessible",
+        mode: "local-only",
         endpointUrl: "https://desktop.example.com",
         advertisedHost: "desktop.local",
-        tailscaleServeEnabled: false,
+        tailscaleServeEnabled: true,
         tailscaleServePort: 443,
       },
       advertisedEndpoints: [
@@ -1557,7 +1530,7 @@ describe("ConnectionsSettings", () => {
           id: "tailscale-magicdns:1",
           label: "Tailscale HTTPS",
           httpBaseUrl: "https://machine.tailnet.ts.net",
-          status: "unavailable",
+          status: "available",
           reachability: "private-network",
           hostedHttpsApp: "compatible",
         }),
@@ -1572,38 +1545,30 @@ describe("ConnectionsSettings", () => {
     const markup = render();
 
     expect(markup).toContain("Version drift");
-    expect(markup).toContain("Network access");
-    expect(markup).toContain("Reachable at");
-    expect(markup).toContain("http://192.168.1.20:5133");
+    expect(markup).toContain("Remote transport");
+    expect(markup).toContain("plaintext LAN HTTP is unavailable");
     expect(markup).toContain("Tailscale HTTPS");
     expect(markup).toContain("BiBCode Connect");
     expect(markup).toContain("Authorized clients");
 
     // The pairing link resolves URLs against the advertised endpoints.
-    expect(markup).toContain("Copy pairing URL for: LAN");
-    invoke(control("button", "Copy pairing URL for: LAN"), "onClick");
-    expect(h.copies[0]?.value).toContain("http://192.168.1.20:5133");
+    expect(markup).toContain("Copy pairing URL for: Tailscale HTTPS");
+    invoke(control("button", "Copy pairing URL for: Tailscale HTTPS"), "onClick");
+    expect(h.copies[0]?.value).toContain("machine.tailnet.ts.net");
 
     // Endpoint copy menu contains backend URLs and hosted app links.
-    invoke(control("menu-item", "Tailscale IP"), "onClick");
+    invoke(control("menu-item", "Tailscale HTTPS"), "onClick");
     expect(h.copies[1]?.value).toContain("/pair?host=");
-    invoke(control("menu-item", "LAN"), "onClick");
-    invoke(control("menu-item", "Loopback"), "onClick");
-    invoke(control("menu-item", "Odd Custom"), "onClick");
 
     h.toastAdd.mockClear();
     h.copyBehavior = "error";
-    invoke(control("menu-item", "Tailscale IP"), "onClick");
+    invoke(control("menu-item", "Tailscale HTTPS"), "onClick");
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not copy hosted app link" }),
     );
     h.copyBehavior = "copy";
 
-    // Network exposure switch stages a confirmation.
-    invoke(control("switch", "Enable network access"), "onCheckedChange", false);
-    invoke(control("switch", "Enable network access"), "onCheckedChange", true);
-
-    // The exposure confirm button is a no-op until a change is pending.
+    // The tailscale-disable confirmation remains explicit.
     for (const entry of findControls("button", "Restart and disable")) {
       invoke(entry, "onClick");
     }
@@ -1611,7 +1576,6 @@ describe("ConnectionsSettings", () => {
     // Only the tailscale-disable confirmation reaches the bridge.
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledTimes(1);
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: false, port: 443 });
-    expect(bridge.setServerExposureMode).not.toHaveBeenCalled();
     expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
 
     // Disabling tailscale can fail with a toast.
@@ -1686,52 +1650,6 @@ describe("ConnectionsSettings", () => {
     expect(control("switch", "Enable BiBCode Connect")).toBeDefined();
   });
 
-  it("confirms staged desktop exposure changes", async () => {
-    const bridge = stubDesktopWindow();
-    // Pin every null-initialised piece of dialog state to a pending value so
-    // the confirmation handlers run their apply paths.
-    h.stateOverrides.set(null, "network-accessible");
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        mode: "local-only",
-        endpointUrl: null,
-        advertisedHost: null,
-        tailscaleServeEnabled: false,
-        tailscaleServePort: 443,
-      },
-      advertisedEndpoints: [],
-    };
-    const markup = render();
-    expect(markup).toContain("Enable network access?");
-
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    for (const entry of findControls("button", "Restart and disable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(bridge.setServerExposureMode).toHaveBeenCalledWith("network-accessible");
-    expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
-
-    // Exposure change failures surface a toast.
-    h.toastAdd.mockClear();
-    bridge.setServerExposureMode.mockRejectedValueOnce(new Error("exposure failed"));
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not update network access" }),
-    );
-  });
-
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {
     stubDesktopWindow();
     h.stateOverrides.set(false, true);
@@ -1739,7 +1657,7 @@ describe("ConnectionsSettings", () => {
     h.stateOverrides.set("443", "0");
     h.networkAccessQuery.data = {
       serverExposureState: {
-        mode: "network-accessible",
+        mode: "local-only",
         endpointUrl: "https://desktop.example.com",
         advertisedHost: null,
         tailscaleServeEnabled: true,
@@ -1803,11 +1721,10 @@ describe("ConnectionsSettings", () => {
     expect(markup).toContain("Revoking…");
     expect(markup).toContain("Creating…");
 
-    // The endpoint rail is expanded and renders per-endpoint actions.
-    expect(markup).toContain("LAN");
-    expect(markup).toContain("Loopback");
-    invoke(control("button", "Set as default"), "onClick");
-    expect(h.uiState.setDefaultAdvertisedEndpointKey).toHaveBeenCalled();
+    // Plaintext LAN and loopback candidates are not presented as remote routes.
+    expect(markup).not.toContain("http://192.168.1.20:5133");
+    expect(markup).not.toContain("http://127.0.0.1:5133");
+    expect(markup).toContain("Tailscale HTTPS");
 
     // While tailscale updates are running the rail and confirm buttons all
     // render their busy labels; invoking them exercises the busy guards.
@@ -2224,10 +2141,10 @@ describe("ConnectionsSettings", () => {
     expect(control("switch", "Enable BiBCode Connect").props.disabled).toBe(true);
   });
 
-  it("renders each network reachability fallback and toggles endpoint details", async () => {
+  it("ignores legacy plaintext exposure metadata and explains the secure alternatives", () => {
     installMountedDesktopWindow();
     const exposureState = {
-      mode: "network-accessible",
+      mode: "local-only",
       endpointUrl: "https://desktop.example.com" as string | null,
       advertisedHost: null as string | null,
       tailscaleServeEnabled: false,
@@ -2237,31 +2154,6 @@ describe("ConnectionsSettings", () => {
       serverExposureState: exposureState,
       advertisedEndpoints: [],
     };
-
-    let markup = render();
-    expect(markup).toContain("Reachable at https://desktop.example.com");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: "desktop.lan",
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Pairing links use desktop.lan");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: null,
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Exposed on all interfaces.");
 
     h.networkAccessQuery.data = {
       serverExposureState: exposureState,
@@ -2279,24 +2171,10 @@ describe("ConnectionsSettings", () => {
         }),
       ],
     };
-    const container = await mountConnections();
-    const detailsToggle = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent?.includes("+1") === true,
-    );
-    expect(detailsToggle).toBeDefined();
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(container.textContent).toContain("http://192.168.1.20:5133");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("true");
-    expect(detailsToggle?.textContent).toContain("Hide");
-    expect(container.textContent).toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(detailsToggle?.textContent).toContain("+1");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
+    const markup = render();
+    expect(markup).toContain("plaintext LAN HTTP is unavailable");
+    expect(markup).not.toContain("http://192.168.1.20:5133");
+    expect(markup).not.toContain("http://192.168.1.21:5133");
   });
 
   it("shows a skeleton while the first relay refresh is in flight", () => {
