@@ -15,7 +15,7 @@ import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as RemoteEnvironmentAuthorization from "./service.ts";
 import * as TokenStore from "./tokenStore.ts";
 
-const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+const ENVIRONMENT_ID = EnvironmentId.make("00000000-0000-4000-8000-000000000041");
 const ENDPOINT = {
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
@@ -29,7 +29,8 @@ const DESCRIPTOR = {
     arch: "x64",
   },
   serverVersion: "0.0.0-test",
-  storageInstanceId: "store-current",
+  storageInstanceId: "00000000-0000-4000-8000-000000000042",
+  protocol: { minimum: 1, maximum: 1 },
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
@@ -199,12 +200,12 @@ describe("RemoteEnvironmentAuthorization", () => {
       const firstDescriptor = {
         ...DESCRIPTOR,
         label: "Current environment A",
-        storageInstanceId: "store-a",
+        storageInstanceId: "00000000-0000-4000-8000-000000000043",
       };
       const secondDescriptor = {
         ...DESCRIPTOR,
         label: "Current environment B",
-        storageInstanceId: "store-b",
+        storageInstanceId: "00000000-0000-4000-8000-000000000044",
       };
       const harness = yield* makeHarness({
         initialToken: cached,

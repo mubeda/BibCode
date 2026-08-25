@@ -47,11 +47,12 @@ describe("known environment bootstrap helpers", () => {
       },
     });
     const descriptor = {
-      environmentId: EnvironmentId.make("remote"),
+      environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000031"),
       label: "Remote environment",
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -76,11 +77,12 @@ describe("known environment bootstrap helpers", () => {
       },
     });
     const descriptor = {
-      environmentId: EnvironmentId.make("remote"),
+      environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000031"),
       label: "Remote environment",
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
-      storageInstanceId: null,
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,

@@ -60,7 +60,8 @@ const PREPARED_CONNECTION: PreparedConnection = {
     label: TARGET.label,
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
-    storageInstanceId: "store-test",
+    storageInstanceId: "00000000-0000-4000-8000-000000000012",
+    protocol: { minimum: 1, maximum: 1 },
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
@@ -231,11 +232,11 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
 
 const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(function* (
   acceptedStorageInstanceId: string | null,
-  reportedStorageInstanceId: string | null,
+  reportedStorageInstanceId: string,
   options?: {
     readonly beforeInitialConfig?: Effect.Effect<void>;
     readonly failAcceptance?: boolean;
-    readonly sessionReportedStorageInstanceId?: string | null;
+    readonly sessionReportedStorageInstanceId?: string;
   },
 ) {
   const acceptedIdentities = yield* Ref.make<Map<string, string>>(
@@ -497,23 +498,6 @@ describe("EnvironmentSupervisor", () => {
       });
       expect(yield* Ref.get(harness.sessionConnectCount)).toBe(0);
       expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
-    }),
-  );
-
-  it.effect("keeps an accepted store when an older server reports no storage identity", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeStorageIdentityHarness("store-a", null);
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
-
-      expect(yield* Ref.get(harness.acceptedIdentities)).toEqual(
-        new Map([["platform:primary", "store-a"]]),
-      );
-      expect(yield* Ref.get(harness.identityAcceptCount)).toBe(0);
-      expect(yield* Ref.get(harness.sessionConnectCount)).toBe(1);
     }),
   );
 

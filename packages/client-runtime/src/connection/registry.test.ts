@@ -77,6 +77,7 @@ const PREPARED: PreparedConnection = {
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
     storageInstanceId: "store-test",
+    protocol: { minimum: 1, maximum: 1 },
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,

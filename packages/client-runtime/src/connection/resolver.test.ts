@@ -35,7 +35,7 @@ import {
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
-const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+const ENVIRONMENT_ID = EnvironmentId.make("00000000-0000-4000-8000-000000000001");
 const ENDPOINT = {
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
@@ -49,7 +49,8 @@ const DESCRIPTOR = {
     arch: "x64",
   },
   serverVersion: "0.0.0-test",
-  storageInstanceId: "store-current",
+  storageInstanceId: "00000000-0000-4000-8000-000000000002",
+  protocol: { minimum: 1, maximum: 1 },
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,

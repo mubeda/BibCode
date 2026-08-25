@@ -16,14 +16,15 @@ import {
 import { installEnvironmentHttpTest } from "../../../test/environmentHttpTest";
 
 const BASE_ENVIRONMENT = {
-  environmentId: EnvironmentId.make("environment-local"),
+  environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000061"),
   label: "Local environment",
   platform: {
     os: "darwin",
     arch: "arm64",
   },
   serverVersion: "0.0.0-test",
-  storageInstanceId: null,
+  storageInstanceId: "00000000-0000-4000-8000-000000000062",
+  protocol: { minimum: 1, maximum: 1 },
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
@@ -86,7 +87,7 @@ describe("environmentBootstrap", () => {
       desktopBridge: undefined,
     });
     const descriptor = {
-      environmentId: EnvironmentId.make("environment-local"),
+      environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000061"),
       label: "Bootstrapped environment",
       platform: {
         os: "darwin",
@@ -94,6 +95,7 @@ describe("environmentBootstrap", () => {
       },
       serverVersion: "0.0.0-test",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -105,10 +107,10 @@ describe("environmentBootstrap", () => {
     writePrimaryEnvironmentDescriptor(descriptor);
 
     expect(getPrimaryKnownEnvironment()).toEqual({
-      id: "environment-local",
+      id: "00000000-0000-4000-8000-000000000061",
       label: "Bootstrapped environment",
       source: "window-origin",
-      environmentId: "environment-local",
+      environmentId: "00000000-0000-4000-8000-000000000061",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       descriptor,
       target: {

@@ -288,7 +288,7 @@ function bearerRegistration(): BearerConnectionRegistration {
   });
 }
 
-function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
+function primaryPrepared(storageInstanceId: string): PreparedConnection {
   const target = new PrimaryConnectionTarget({
     environmentId,
     label: "Primary environment",
@@ -304,6 +304,7 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -1394,6 +1395,7 @@ describe("connectionStorageLayer", () => {
           platform: { os: "linux", arch: "x64" },
           serverVersion: "0.0.0-test",
           storageInstanceId,
+          protocol: { minimum: 1, maximum: 1 },
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,

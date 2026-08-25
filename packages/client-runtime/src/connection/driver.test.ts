@@ -38,7 +38,7 @@ function target(suffix: string) {
 
 function prepared(
   connectionTarget: PrimaryConnectionTarget,
-  storageInstanceId: string | null,
+  storageInstanceId: string,
 ): PreparedConnection {
   return {
     environmentId: connectionTarget.environmentId,
@@ -49,6 +49,7 @@ function prepared(
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -68,10 +69,7 @@ function entry(connectionTarget: PrimaryConnectionTarget): ConnectionCatalogEntr
   return { target: connectionTarget, profile: Option.none() };
 }
 
-function serverConfig(
-  connection: PreparedConnection,
-  storageInstanceId: string | null,
-): ServerConfig {
+function serverConfig(connection: PreparedConnection, storageInstanceId: string): ServerConfig {
   return {
     environment: { ...connection.descriptor, storageInstanceId },
   } as ServerConfig;
@@ -155,10 +153,22 @@ const makeIdentityStore = Effect.fn("TestConnectionDriver.makeIdentityStore")(fu
 });
 
 const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
-  reportedByEnvironment: ReadonlyMap<string, string | null>,
-  sessionReportedByEnvironment: ReadonlyMap<string, string | null>,
+  reportedByEnvironment: ReadonlyMap<string, string>,
+  sessionReportedByEnvironment: ReadonlyMap<string, string>,
   identities: Persistence.AcceptedStorageIdentityStore["Service"],
 ) {
+  const reportedStorage = (environmentId: string) => {
+    const value = reportedByEnvironment.get(environmentId);
+    if (value === undefined)
+      throw new Error(`Missing reported storage fixture for ${environmentId}`);
+    return value;
+  };
+  const sessionStorage = (environmentId: string) => {
+    const value = sessionReportedByEnvironment.get(environmentId);
+    if (value === undefined)
+      throw new Error(`Missing session storage fixture for ${environmentId}`);
+    return value;
+  };
   const sessionCount = yield* Ref.make(0);
   const sessionReleaseCount = yield* Ref.make(0);
   const resolver = ConnectionResolver.ConnectionResolver.of({
@@ -166,7 +176,7 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
       Effect.succeed(
         prepared(
           catalogEntry.target as PrimaryConnectionTarget,
-          reportedByEnvironment.get(catalogEntry.target.environmentId) ?? null,
+          reportedStorage(catalogEntry.target.environmentId),
         ),
       ),
   });
@@ -177,10 +187,7 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
           Effect.as({
             client: {} as RpcSession["client"],
             initialConfig: Effect.succeed(
-              serverConfig(
-                connection,
-                sessionReportedByEnvironment.get(connection.environmentId) ?? null,
-              ),
+              serverConfig(connection, sessionStorage(connection.environmentId)),
             ),
             ready: Effect.void,
             probe: Effect.void,
@@ -308,10 +315,9 @@ describe("ConnectionDriver storage identity", () => {
     }),
   );
 
-  it.effect("connects accepted and nullable stores when identity mutation is unavailable", () =>
+  it.effect("connects an accepted store when identity mutation is unavailable", () =>
     Effect.gen(function* () {
       const acceptedTarget = target("accepted-read-only");
-      const nullableTarget = target("nullable-read-only");
       const store = yield* makeIdentityStore(
         new Map([["platform:primary", "store-a"]]),
         Effect.void,
@@ -329,16 +335,6 @@ describe("ConnectionDriver storage identity", () => {
       expect(Result.isSuccess(acceptedResult)).toBe(true);
       expect(yield* Ref.get(accepted.sessionCount)).toBe(1);
 
-      const nullable = yield* makeDriver(
-        new Map([[nullableTarget.environmentId, null]]),
-        new Map([[nullableTarget.environmentId, null]]),
-        store.identities,
-      );
-      const nullableResult = yield* Effect.scoped(
-        nullable.driver.connect(entry(nullableTarget), () => Effect.void).pipe(Effect.result),
-      );
-      expect(Result.isSuccess(nullableResult)).toBe(true);
-      expect(yield* Ref.get(nullable.sessionCount)).toBe(1);
       expect(yield* Ref.get(store.writes)).toEqual([]);
     }),
   );

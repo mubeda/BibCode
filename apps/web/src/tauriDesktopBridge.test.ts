@@ -287,7 +287,7 @@ const SENSITIVE_CONNECTION_CATALOG = JSON.stringify({
   ],
 });
 
-function sensitivePrepared(storageInstanceId: string | null): PreparedConnection {
+function sensitivePrepared(storageInstanceId: string): PreparedConnection {
   const environmentId = EnvironmentId.make("sensitive-environment");
   const target = new BearerConnectionTarget({
     environmentId,
@@ -303,6 +303,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       platform: { os: "windows", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,

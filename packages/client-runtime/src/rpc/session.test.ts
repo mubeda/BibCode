@@ -83,7 +83,7 @@ class TestWebSocket {
 }
 
 const TARGET = new PrimaryConnectionTarget({
-  environmentId: EnvironmentId.make("environment-1"),
+  environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000021"),
   label: "Test environment",
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
@@ -97,7 +97,8 @@ const PREPARED: PreparedConnection = {
     label: TARGET.label,
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
-    storageInstanceId: "store-test",
+    storageInstanceId: "00000000-0000-4000-8000-000000000022",
+    protocol: { minimum: 1, maximum: 1 },
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
@@ -121,7 +122,8 @@ const SERVER_CONFIG: ServerConfigType = {
       arch: "arm64",
     },
     serverVersion: "0.0.0-test",
-    storageInstanceId: null,
+    storageInstanceId: "00000000-0000-4000-8000-000000000022",
+    protocol: { minimum: 1, maximum: 1 },
     capabilities: {
       repositoryIdentity: true,
       worktreeCatalog: false,
