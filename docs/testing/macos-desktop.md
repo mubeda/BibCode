@@ -45,6 +45,9 @@ Select focused tests from affected source and verify at least:
 - Unix process-group ownership survives cancellation and natural leader exit,
   reaps late descendants, does not signal peer-runtime roots, and remains
   independent of the Windows-only Job implementation;
+- the local-control directory/socket remain owned by the service user with
+  modes `0700`/`0600`, reject a wrong peer UID before frame reads, replace only
+  a verified stale owned socket, and unlink only the current process's socket;
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
 - Activity observation timestamps and keyboard navigation remain correct; and

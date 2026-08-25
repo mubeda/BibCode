@@ -93,6 +93,39 @@ role-bearing records to scoped records. It removes existing pairing links and
 sessions without changing unrelated environment state. Upgraded clients must
 pair again; old roles are not silently promoted to scopes.
 
+### Protected local control
+
+Host-local administration does not cross the HTTP/WebSocket authentication
+boundary. Every native server owns a separate versioned control endpoint after
+its persistent identity and authentication state are ready:
+
+- macOS and Linux use `<state>/run/control.sock`. The existing or newly created
+  parent must be owned by the service user with mode `0700`, the socket has mode
+  `0600`, and the server checks peer credentials before reading a frame. A root
+  peer is accepted for a non-root service only during an explicit managed
+  service launch.
+- Windows uses `\\.\pipe\bibcode-<environment-id>`. Each instance is created
+  with an explicit protected DACL for the effective service-account SID and
+  Builtin Administrators, a deny entry for network logons, and remote-client
+  rejection. The server also validates the impersonated client token and
+  fail-stops if it cannot revert impersonation.
+
+The v1 protocol accepts one JSON request and one JSON response per connection,
+framed by a four-byte big-endian length and capped at 64 KiB with a five-second
+frame deadline. Its closed command inventory is `Status`, `CreatePairing`,
+`ServicePrepareUpdate`, and `ServiceStop`; it is not a general RPC, SQL, shell,
+filesystem, account, firewall, or purge channel. Public failures contain only a
+stable code and safe message. Pairing values and pairing URLs are redacted from
+debug output.
+
+`Status` and `ServiceStop` are active. Update preparation is active only when
+the desktop maintenance owner exists. `CreatePairing` is reserved but currently
+returns `command_unavailable` until the five-minute, single-use CLI issuance
+flow is implemented. Server shutdown stops control admission, drains accepted
+requests, and removes a Unix socket only while its device/inode ownership still
+matches this process; the database and runtime lock remain live until that
+drain completes.
+
 ## Standards profile
 
 - Bearer use follows the RFC 6750 authorization scheme.

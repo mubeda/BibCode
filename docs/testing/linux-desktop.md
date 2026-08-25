@@ -47,6 +47,9 @@ Select focused tests from affected source and verify at least:
   natural root exit, and late descendants, independently of the Windows-only
   Job implementation;
 - independent runtimes cannot terminate each other's process roots;
+- the local-control directory/socket remain owned by the service user with
+  modes `0700`/`0600`, reject a wrong peer UID before frame reads, replace only
+  a verified stale owned socket, and unlink only the current process's socket;
 - local-only desktop presentation omits WSL and remote-device controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
 - Linux AppImage/desktop identity and taskbar behavior remain covered.

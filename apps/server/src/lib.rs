@@ -14,6 +14,7 @@ mod environment_identity;
 pub mod git;
 mod http;
 mod lifecycle;
+pub mod local_control;
 pub mod logging;
 mod maintenance;
 pub mod mcp;

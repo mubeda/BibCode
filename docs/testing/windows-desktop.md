@@ -59,6 +59,10 @@ Select focused tests from affected source and verify at least:
   status probes after termination cannot consume or lose the terminal Job
   state;
 - independent runtimes cannot terminate each other's process roots;
+- the environment's `bibcode-<environment-id>` control pipe rejects remote
+  clients, is created from an explicit protected DACL rather than the process
+  default, admits only the effective service account or an enabled Builtin
+  Administrator token, and reverts impersonation before any await;
 - local Windows and WSL presentation follows current environment capability;
 - remote device, SSH, Tailscale, relay, and connection actions do not mount in
   ordinary desktop presentation; and

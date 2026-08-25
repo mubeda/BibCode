@@ -195,11 +195,11 @@ git commit -m "feat(server): serve validated HTTPS environments"
 - Commands: `Status`, `CreatePairing`, `ServicePrepareUpdate`, `ServiceStop`.
 - Not commands: arbitrary RPC, SQL, shell, filesystem, firewall, account creation, or purge.
 
-- [ ] **Step 1: Write failing protocol and authorization tests**
+- [x] **Step 1: Write failing protocol and authorization tests**
 
 Cover an allowed same-user peer, wrong UID/SID, remote Windows pipe client, world-readable Unix parent, oversize frame, partial frame, unsupported protocol, unknown command, timeout, disconnect, concurrent shutdown, stale endpoint, and secret redaction.
 
-- [ ] **Step 2: Define the bounded wire protocol**
+- [x] **Step 2: Define the bounded wire protocol**
 
 ```rust
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
@@ -223,19 +223,27 @@ pub struct ControlRequest {
 
 Use a four-byte big-endian length prefix and exactly one request/response per connection. Public errors contain a stable code and safe message only.
 
-- [ ] **Step 3: Implement Unix ownership checks**
+- [x] **Step 3: Implement Unix ownership checks**
 
 Create `<state>/run` with `0700`, atomically remove only a verified stale socket owned by the expected UID, bind `control.sock` with `0600`, and verify peer credentials before reading a frame. Accept the service UID; accept root only for explicit headless administration.
 
-- [ ] **Step 4: Implement Windows pipe security**
+- [x] **Step 4: Implement Windows pipe security**
 
 Use `\\.\pipe\bibcode-<environment-uuid>` with a security descriptor granting the service SID and Builtin Administrators, denying network logons, and rejecting a client whose impersonated token is outside that set. Do not rely on the process default DACL.
 
-- [ ] **Step 5: Own control shutdown in `ServerHandle`**
+- [x] **Step 5: Own control shutdown in `ServerHandle`**
 
 Start the control server after persistence/auth are ready, cancel it before releasing the store guard, drain in-flight control requests, and unlink the Unix socket only when this process still owns it.
 
 - [ ] **Step 6: Verify on native Unix and Windows paths and commit**
+
+Progress: native macOS protocol, lifecycle, runtime, maintenance, formatting,
+lint, and Clippy checks pass. The Windows module also cross-compiles in an
+isolated target harness, but a complete repository cross-check is blocked on
+this host by `aws-lc-sys` requiring Windows SDK headers. Keep this step open
+until the named-pipe tests run on a native Windows runner. Workspace TypeScript
+typecheck remains blocked only by Relay descriptor fixtures scheduled for
+removal in Plan 60; the affected Rust target checks pass.
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test local_control -- --nocapture

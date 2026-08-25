@@ -12,7 +12,7 @@ use crate::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
         UnavailableDesktopUiProcessObserver,
     },
-    http, logging,
+    http, local_control, logging,
     maintenance::{UpdateMaintenance, maintenance_routes_enabled},
     persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
@@ -44,6 +44,7 @@ pub struct ServerHandle {
     _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
     _log_sink: Arc<logging::LogSinkLease>,
+    local_control: Option<local_control::LocalControlHandle>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -65,6 +66,10 @@ pub enum ServerError {
     StateFiles(String),
     #[error("failed to initialize native server logging: {0}")]
     Logging(String),
+    #[error("failed to initialize the protected local control channel: {0}")]
+    LocalControlInitialize(String),
+    #[error("the protected local control channel failed: {0}")]
+    LocalControlServe(String),
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error("failed to initialize environment authentication: {0}")]
@@ -351,6 +356,16 @@ impl ServerRuntime {
         } else {
             None
         };
+        let local_control = local_control::start(
+            &config,
+            &state_paths,
+            environment_id,
+            storage_instance_id,
+            update_maintenance.clone(),
+            shutdown.clone(),
+        )
+        .await
+        .map_err(|error| ServerError::LocalControlInitialize(error.to_string()))?;
         let app = http::build_router(http::AppState {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
@@ -385,6 +400,7 @@ impl ServerRuntime {
             _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
             _log_sink: log_sink,
+            local_control: Some(local_control),
             shutdown,
             task: Some(task),
         })
@@ -520,6 +536,9 @@ impl ServerHandle {
     }
 
     pub fn shutdown(&self) {
+        if let Some(local_control) = &self.local_control {
+            local_control.shutdown();
+        }
         self.shutdown.cancel();
     }
 
@@ -528,16 +547,27 @@ impl ServerHandle {
     }
 
     pub async fn join(mut self) -> Result<(), ServerError> {
+        if let Some(local_control) = &self.local_control {
+            local_control.shutdown();
+        }
         let task = self.task.take().ok_or(ServerError::AlreadyJoined)?;
-        let result = match task.await {
+        let server_result = match task.await {
             Ok(result) => result.map_err(ServerError::Serve),
             Err(error) => Err(ServerError::Join(error)),
         };
+        let control_result = match self.local_control.as_mut() {
+            Some(local_control) => local_control
+                .join()
+                .await
+                .map_err(|error| ServerError::LocalControlServe(error.to_string())),
+            None => Ok(()),
+        };
+        self.local_control.take();
         drop(self._production_runtime.take());
         if let Some(database) = self.database.take() {
             database.close().await;
         }
-        result
+        server_result.and(control_result)
     }
 }
 
@@ -562,6 +592,9 @@ fn build_startup_access(
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
+        if let Some(local_control) = &self.local_control {
+            local_control.shutdown();
+        }
         self.shutdown.cancel();
         if let Some(task) = &self.task {
             task.abort();

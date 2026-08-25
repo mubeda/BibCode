@@ -169,6 +169,12 @@ endpoint can install software, start a process, or use SSH.
   and fragments. Loopback HTTP is limited to desktop-owned local forwarding.
 - Remote descriptors expose storage identity but never requested/effective
   roots, alias diagnostics, or other server filesystem paths.
+- Host-local status, pairing issuance, update preparation, and service stop are
+  a closed, bounded local-control protocol, not HTTP/RPC methods. Unix servers
+  require a service-owned `0700` parent, a `0600` socket, and an authorized peer
+  UID; Windows creates a remote-rejecting named pipe with an explicit
+  service-account/Administrators DACL and validates the impersonated client
+  token. Network administrator sessions do not gain host-control authority.
 
 Storage-identity mismatch protection applies equally to direct HTTPS,
 compatibility BiBCode Connect, WSL, and desktop-managed SSH routes: a different non-null
@@ -194,6 +200,12 @@ Forget does not stop or uninstall the remote server and does not delete remote
 projects, repositories, worktrees, or data. Those host operations require a
 separate explicit, online protocol; an offline client must report their outcome
 as unknown rather than success.
+
+The currently active host-local stop path sends its acknowledgement before
+cancelling the server, closes new local-control admission, drains accepted
+requests, and releases the database/store guard only after both network and
+control tasks join. Service installation/uninstallation and remote data purge
+remain outside that command and are not implied by Forget.
 
 ## Current limitations
 

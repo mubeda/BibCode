@@ -43,6 +43,8 @@ pub struct StatePaths {
     pub storage_instance_id: PathBuf,
     pub server_runtime_state: PathBuf,
     pub secrets_dir: PathBuf,
+    pub run_dir: PathBuf,
+    pub control_socket: PathBuf,
 }
 
 impl StatePaths {
@@ -56,6 +58,7 @@ impl StatePaths {
         };
         let logs_dir = state_dir.join("logs");
         let provider_logs_dir = logs_dir.join("provider");
+        let run_dir = state_dir.join("run");
         Self {
             base_dir: config.base_dir.clone(),
             state_kind,
@@ -76,6 +79,8 @@ impl StatePaths {
             storage_instance_id: state_dir.join("storage-instance-id"),
             server_runtime_state: state_dir.join("server-runtime.json"),
             secrets_dir: state_dir.join("secrets"),
+            control_socket: run_dir.join("control.sock"),
+            run_dir,
             state_dir,
             logs_dir,
             provider_logs_dir,

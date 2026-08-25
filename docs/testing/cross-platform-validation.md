@@ -183,6 +183,26 @@ After restart, confirm a pending cleanup receipt prevents connection attempts
 until retry. After successful Forget, confirm that the remote server and its
 projects/worktrees/data still exist because local Forget is not host purge.
 
+### Protected local-control evidence
+
+When the control protocol, authentication bootstrap, service/update lifecycle,
+server startup/shutdown, or state paths change, run:
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test local_control -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test server_runtime -- --nocapture
+```
+
+On non-Windows hosts, replace the launcher with direct Cargo. Record same-user
+success; wrong UID/SID and remote-client rejection; Unix parent/socket
+ownership and modes or the Windows explicit DACL; stale endpoint replacement;
+oversize, partial, unsupported-version, unknown-command, timeout, and disconnect
+outcomes; response-before-stop ordering; concurrent shutdown/drain; owned Unix
+unlink; and secret-free debug/error output. A Windows-target type-check on
+another host is compatibility evidence only: named-pipe ACL, remote rejection,
+impersonation/revert, and administrator/service-account admission require a
+native Windows run.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client
