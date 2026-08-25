@@ -92,6 +92,34 @@ const NORMALIZED_ENVIRONMENT = {
     }),
   ],
 } as KnownEnvironment;
+const NORMALIZED_ROUTE_SECRET_REF = "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8";
+const MULTI_ROUTE_NORMALIZED_ENVIRONMENT = {
+  ...NORMALIZED_ENVIRONMENT,
+  routes: [
+    new DesktopLoopbackRoute({
+      routeId: "normalized-loopback",
+      environmentId: NORMALIZED_ENVIRONMENT_ID,
+      label: "Normalized loopback",
+      priority: 0,
+      pinned: false,
+      autoconnect: true,
+      secretRef: NORMALIZED_ROUTE_SECRET_REF,
+      httpBaseUrl: "http://127.0.0.1:48291",
+      wsBaseUrl: "ws://127.0.0.1:48291",
+    }),
+    new DesktopLoopbackRoute({
+      routeId: "normalized-loopback-fallback",
+      environmentId: NORMALIZED_ENVIRONMENT_ID,
+      label: "Normalized loopback fallback",
+      priority: 1,
+      pinned: false,
+      autoconnect: true,
+      secretRef: null,
+      httpBaseUrl: "http://127.0.0.1:48292",
+      wsBaseUrl: "ws://127.0.0.1:48292",
+    }),
+  ],
+} as KnownEnvironment;
 
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
@@ -200,6 +228,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
     readonly initialEnvironments?: ReadonlyArray<KnownEnvironment>;
+    readonly initialCleanupRepairs?: ReadonlyArray<Persistence.EnvironmentCleanupRepairReceipt>;
     readonly migrationCompleted?: boolean;
     readonly maxConcurrentEnvironmentAttempts?: number;
     readonly beforeSessionConnect?: (
@@ -214,6 +243,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     readonly afterStorageIdentityAccept?: (
       identity: Persistence.AcceptedStorageIdentity,
     ) => Effect.Effect<void>;
+    readonly beforeEnvironmentSecretDelete?: (
+      secretRef: string,
+    ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -228,6 +260,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     ),
   );
   const storedEnvironmentSecrets = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  const cleanupRepairs = yield* Ref.make(
+    new Map(
+      (options?.initialCleanupRepairs ?? []).map((receipt) => [receipt.environmentId, receipt]),
+    ),
+  );
+  const lifecycleEvents = yield* Ref.make<ReadonlyArray<string>>([]);
   const targetListCount = yield* Ref.make(0);
   const shellCache = yield* Ref.make(new Map([[TARGET.environmentId, CACHED_SNAPSHOT]]));
   const threadCache = yield* Ref.make(
@@ -292,12 +330,6 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       }),
     listBindings: Effect.succeed([]),
     putBinding: () => Effect.void,
-    forget: (environmentId) =>
-      Ref.update(storedEnvironments, (current) => {
-        const next = new Map(current);
-        next.delete(environmentId);
-        return next;
-      }),
   });
   const environmentSecretStore = Persistence.EnvironmentSecretStore.of({
     put: (_environmentId, _purpose, value) => {
@@ -311,11 +343,60 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         Effect.map((current) => Option.fromUndefinedOr(current.get(secretRef))),
       ),
     delete: (secretRef) =>
-      Ref.update(storedEnvironmentSecrets, (current) => {
-        const next = new Map(current);
-        next.delete(secretRef);
-        return next;
+      Effect.gen(function* () {
+        yield* options?.beforeEnvironmentSecretDelete?.(secretRef) ?? Effect.void;
+        yield* Ref.update(storedEnvironmentSecrets, (current) => {
+          const next = new Map(current);
+          next.delete(secretRef);
+          return next;
+        });
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "delete-secrets"]);
       }),
+  });
+  const environmentCleanupStore = Persistence.EnvironmentCleanupStore.of({
+    repairs: Ref.get(cleanupRepairs).pipe(Effect.map((current) => [...current.values()])),
+    saveRepair: (receipt) =>
+      Ref.update(cleanupRepairs, (current) =>
+        new Map(current).set(receipt.environmentId, receipt),
+      ).pipe(
+        Effect.andThen(
+          receipt.phase === "pending"
+            ? Ref.update(lifecycleEvents, (current) => [...current, "close-admission"])
+            : Effect.void,
+        ),
+      ),
+    commitForget: (environmentId) =>
+      Effect.gen(function* () {
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "clear-cache"]);
+        yield* Ref.update(shellCache, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
+        yield* Ref.update(threadCache, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "clear-ui"]);
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "delete-routes"]);
+        yield* Ref.update(lifecycleEvents, (current) => [...current, "delete-environment"]);
+        yield* Ref.update(storedEnvironments, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
+        yield* Ref.update(cleanupRepairs, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
+      }),
+  });
+  const environmentCacheManifestStore = Persistence.EnvironmentCacheManifestStore.of({
+    load: () => Effect.succeed(Option.none()),
+    save: () => Effect.void,
+    remove: () => Effect.void,
   });
   const environmentUiStateStore = Persistence.EnvironmentUiStateStore.of({
     load: Effect.succeed(Option.none()),
@@ -604,7 +685,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
             probe: Effect.void,
             closed: Deferred.await(closed),
           } satisfies RpcSession.RpcSession),
-          () => Ref.update(releasedSessions, (count) => count + 1),
+          () =>
+            Ref.update(lifecycleEvents, (current) => [
+              ...current,
+              "cancel-supervisor",
+              "await-scope",
+            ]).pipe(Effect.andThen(Ref.update(releasedSessions, (count) => count + 1))),
         );
         yield* reportProgress({ stage: "synchronizing", prepared });
         yield* session.ready;
@@ -624,6 +710,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       Layer.mergeAll(
         Layer.succeed(Persistence.ConnectionTargetStore, targetStore),
         Layer.succeed(Persistence.EnvironmentCatalogStore, environmentCatalogStore),
+        Layer.succeed(Persistence.EnvironmentCleanupStore, environmentCleanupStore),
+        Layer.succeed(Persistence.EnvironmentCacheManifestStore, environmentCacheManifestStore),
         Layer.succeed(Persistence.EnvironmentSecretStore, environmentSecretStore),
         Layer.succeed(Persistence.EnvironmentUiStateStore, environmentUiStateStore),
         Layer.succeed(Persistence.EnvironmentMigrationStore, environmentMigrationStore),
@@ -665,6 +753,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     targetListCount,
     storedEnvironments,
     storedEnvironmentSecrets,
+    cleanupRepairs,
+    lifecycleEvents,
   };
 });
 
@@ -706,6 +796,218 @@ describe("EnvironmentRegistry", () => {
           ),
         );
         expect(owned).toEqual(NORMALIZED_ENVIRONMENT);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("hides and restores only client presentation metadata without restarting runtime", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          NORMALIZED_ENVIRONMENT_ID,
+          (state) => state.phase === "connected",
+        );
+
+        yield* registry.hide(NORMALIZED_ENVIRONMENT_ID);
+        expect(
+          (yield* Ref.get(harness.storedEnvironments)).get(NORMALIZED_ENVIRONMENT_ID)?.hidden,
+        ).toBe(true);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+
+        yield* registry.restore(NORMALIZED_ENVIRONMENT_ID);
+        expect(
+          (yield* Ref.get(harness.storedEnvironments)).get(NORMALIZED_ENVIRONMENT_ID)?.hidden,
+        ).toBe(false);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect(
+    "removes one route secret while retaining the environment and its remaining route",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness([], [], [], {
+          initialEnvironments: [MULTI_ROUTE_NORMALIZED_ENVIRONMENT],
+          migrationCompleted: true,
+        });
+        yield* Ref.set(
+          harness.storedEnvironmentSecrets,
+          new Map([[NORMALIZED_ROUTE_SECRET_REF, "protected-session-value"]]),
+        );
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.removeRoute(NORMALIZED_ENVIRONMENT_ID, "normalized-loopback");
+
+          const retained = (yield* Ref.get(harness.storedEnvironments)).get(
+            NORMALIZED_ENVIRONMENT_ID,
+          );
+          expect(retained?.routes.map((route) => route.routeId)).toEqual([
+            "normalized-loopback-fallback",
+          ]);
+          expect(
+            (yield* Ref.get(harness.storedEnvironmentSecrets)).has(NORMALIZED_ROUTE_SECRET_REF),
+          ).toBe(false);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it.effect("forgets in cleanup order and ignores registration that completes during cleanup", () =>
+    Effect.gen(function* () {
+      const deleteStarted = yield* Deferred.make<void>();
+      const continueDelete = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [MULTI_ROUTE_NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+        beforeEnvironmentSecretDelete: () =>
+          Deferred.succeed(deleteStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(continueDelete)),
+          ),
+      });
+      yield* Ref.set(
+        harness.storedEnvironmentSecrets,
+        new Map([[NORMALIZED_ROUTE_SECRET_REF, "protected-session-value"]]),
+      );
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          NORMALIZED_ENVIRONMENT_ID,
+          (state) => state.phase === "connected",
+        );
+
+        const forgetting = yield* registry
+          .forget(NORMALIZED_ENVIRONMENT_ID)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(deleteStarted);
+        yield* registry.registerEnvironment({ environment: MULTI_ROUTE_NORMALIZED_ENVIRONMENT });
+        yield* Deferred.succeed(continueDelete, undefined);
+        yield* Fiber.join(forgetting);
+
+        expect(yield* Ref.get(harness.lifecycleEvents)).toEqual([
+          "close-admission",
+          "cancel-supervisor",
+          "await-scope",
+          "delete-secrets",
+          "clear-cache",
+          "clear-ui",
+          "delete-routes",
+          "delete-environment",
+        ]);
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          false,
+        );
+        expect(yield* Ref.get(harness.cleanupRepairs)).toEqual(new Map());
+
+        yield* registry.registerEnvironment({
+          environment: MULTI_ROUTE_NORMALIZED_ENVIRONMENT,
+          sessionSecret: {
+            routeId: "normalized-loopback",
+            value: "new-authoritative-session",
+          },
+        });
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          true,
+        );
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps a redacted repair receipt and closed admission when secret deletion fails", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [MULTI_ROUTE_NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+        beforeEnvironmentSecretDelete: () =>
+          Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "delete-environment-secret",
+              message: "Protected secret cleanup failed.",
+            }),
+          ),
+      });
+      yield* Ref.set(
+        harness.storedEnvironmentSecrets,
+        new Map([[NORMALIZED_ROUTE_SECRET_REF, "must-not-appear"]]),
+      );
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          NORMALIZED_ENVIRONMENT_ID,
+          (state) => state.phase === "connected",
+        );
+
+        const error = yield* registry.forget(NORMALIZED_ENVIRONMENT_ID).pipe(Effect.flip);
+
+        expect(error).toMatchObject({ operation: "delete-environment-secret" });
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          true,
+        );
+        expect([...(yield* Ref.get(harness.cleanupRepairs)).values()]).toEqual([
+          {
+            schemaVersion: 1,
+            environmentId: NORMALIZED_ENVIRONMENT_ID,
+            generation: expect.any(Number),
+            phase: "secret-deletion-failed",
+          },
+        ]);
+        expect(yield* Effect.flip(registry.state(NORMALIZED_ENVIRONMENT_ID))).toMatchObject({
+          _tag: "EnvironmentNotRegisteredError",
+        });
+        expect([...(yield* Ref.get(harness.cleanupRepairs)).values()][0]).not.toHaveProperty(
+          "secret",
+        );
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps restart admission closed while a cleanup repair receipt exists", () =>
+    Effect.gen(function* () {
+      const repair = {
+        schemaVersion: 1,
+        environmentId: NORMALIZED_ENVIRONMENT_ID,
+        generation: 7,
+        phase: "metadata-deletion-failed",
+      } as const;
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [NORMALIZED_ENVIRONMENT],
+        initialCleanupRepairs: [repair],
+        migrationCompleted: true,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        for (let iteration = 0; iteration < 20; iteration += 1) yield* Effect.yieldNow;
+
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        expect(yield* Effect.flip(registry.state(NORMALIZED_ENVIRONMENT_ID))).toMatchObject({
+          _tag: "EnvironmentNotRegisteredError",
+        });
+
+        yield* registry.forget(NORMALIZED_ENVIRONMENT_ID);
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          false,
+        );
+        expect(yield* Ref.get(harness.cleanupRepairs)).toEqual(new Map());
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );

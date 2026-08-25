@@ -104,6 +104,33 @@ export class EnvironmentRegistry extends Context.Service<
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly hide: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<
+      void,
+      Persistence.ConnectionPersistenceError | EnvironmentNotRegisteredError
+    >;
+    readonly restore: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<
+      void,
+      Persistence.ConnectionPersistenceError | EnvironmentNotRegisteredError
+    >;
+    readonly removeRoute: (
+      environmentId: EnvironmentId,
+      routeId: string,
+    ) => Effect.Effect<
+      void,
+      Persistence.ConnectionPersistenceError | EnvironmentNotRegisteredError
+    >;
+    readonly forget: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<
+      void,
+      | Persistence.ConnectionPersistenceError
+      | EnvironmentNotRegisteredError
+      | PlatformEnvironmentRemovalError
+    >;
     readonly remove: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<
@@ -160,6 +187,18 @@ interface EnvironmentServiceScope {
   readonly legacyEntry: ConnectionCatalogEntry | null;
   readonly supervisor: EnvironmentSupervisor.EnvironmentSupervisor["Service"];
   readonly scope: Scope.Closeable;
+}
+
+type EnvironmentAdmissionPhase = "open" | "forgetting" | "forgotten" | "repair";
+
+interface EnvironmentAdmissionState {
+  readonly generation: number;
+  readonly phase: EnvironmentAdmissionPhase;
+}
+
+interface EnvironmentAdmissionTicket {
+  readonly generation: number;
+  readonly phase: "open" | "forgotten";
 }
 
 export interface EnvironmentRegistryOptions {
@@ -331,10 +370,10 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     );
   }
   const connectionAttemptSemaphore = yield* Semaphore.make(maxConcurrentEnvironmentAttempts);
-  const environmentGenerations = yield* Ref.make<ReadonlyMap<EnvironmentId, number>>(new Map());
   const environmentCatalog = yield* Persistence.EnvironmentCatalogStore;
+  const environmentCleanup = yield* Persistence.EnvironmentCleanupStore;
   const environmentSecrets = yield* Persistence.EnvironmentSecretStore;
-  const environmentUiState = yield* Persistence.EnvironmentUiStateStore;
+  const cacheManifests = yield* Persistence.EnvironmentCacheManifestStore;
   const migrationStore = yield* Persistence.EnvironmentMigrationStore;
   const storage = yield* Persistence.ConnectionTargetStore;
   const registrations = yield* Persistence.ConnectionRegistrationStore;
@@ -347,6 +386,18 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   const driver = yield* ConnectionDriver.ConnectionDriver;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
+  const cleanupRepairs = yield* environmentCleanup.repairs;
+  const environmentGenerations = yield* Ref.make<ReadonlyMap<EnvironmentId, number>>(
+    new Map(cleanupRepairs.map((receipt) => [receipt.environmentId, receipt.generation])),
+  );
+  const admissionStates = yield* Ref.make<ReadonlyMap<EnvironmentId, EnvironmentAdmissionState>>(
+    new Map(
+      cleanupRepairs.map((receipt) => [
+        receipt.environmentId,
+        { generation: receipt.generation, phase: "repair" as const },
+      ]),
+    ),
+  );
   const normalizedEnvironments = yield* environmentCatalog.list;
   const migrationReceipt = yield* migrationStore.load(CATALOG_V1_TO_V3_MIGRATION_ID);
   const persistedTargets = Option.isNone(migrationReceipt) ? yield* storage.list : [];
@@ -402,6 +453,89 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   const leaseLocks = yield* Ref.make<ReadonlyMap<EnvironmentId, LeaseLock>>(new Map());
   const leaseLocksGuard = yield* Semaphore.make(1);
   const started = yield* Ref.make(false);
+
+  const issueAdmissionTicket = Effect.fn("EnvironmentRegistry.issueAdmissionTicket")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    const current = (yield* Ref.get(admissionStates)).get(environmentId) ?? {
+      generation: 0,
+      phase: "open" as const,
+    };
+    return current.phase === "open" || current.phase === "forgotten"
+      ? ({
+          generation: current.generation,
+          phase: current.phase,
+        } satisfies EnvironmentAdmissionTicket)
+      : null;
+  });
+
+  const admitRegistration = Effect.fn("EnvironmentRegistry.admitRegistration")(function* (
+    environmentId: EnvironmentId,
+    ticket: EnvironmentAdmissionTicket | null,
+  ) {
+    if (ticket === null) return false;
+    return yield* Ref.modify(admissionStates, (states) => {
+      const current = states.get(environmentId) ?? {
+        generation: 0,
+        phase: "open" as const,
+      };
+      if (current.generation !== ticket.generation || current.phase !== ticket.phase) {
+        return [false, states] as const;
+      }
+      if (current.phase === "open") return [true, states] as const;
+      return [
+        true,
+        new Map(states).set(environmentId, {
+          generation: current.generation,
+          phase: "open",
+        }),
+      ] as const;
+    });
+  });
+
+  const beginForgetAdmission = Effect.fn("EnvironmentRegistry.beginForgetAdmission")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    const generation = yield* Ref.modify(admissionStates, (states) => {
+      const current = states.get(environmentId) ?? {
+        generation: 0,
+        phase: "open" as const,
+      };
+      const nextGeneration = current.generation + 1;
+      return [
+        nextGeneration,
+        new Map(states).set(environmentId, {
+          generation: nextGeneration,
+          phase: "forgetting",
+        }),
+      ] as const;
+    });
+    yield* Ref.update(environmentGenerations, (current) =>
+      new Map(current).set(environmentId, (current.get(environmentId) ?? 0) + 1),
+    );
+    return generation;
+  });
+
+  const setAdmissionPhase = (
+    environmentId: EnvironmentId,
+    generation: number,
+    phase: EnvironmentAdmissionPhase,
+  ) =>
+    Ref.update(admissionStates, (states) => {
+      const current = states.get(environmentId);
+      return current === undefined || current.generation !== generation
+        ? states
+        : new Map(states).set(environmentId, { generation, phase });
+    });
+
+  const ensureAdmissionOpen = Effect.fn("EnvironmentRegistry.ensureAdmissionOpen")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    const phase = (yield* Ref.get(admissionStates)).get(environmentId)?.phase ?? "open";
+    if (phase !== "open") {
+      return yield* new EnvironmentNotRegisteredError({ environmentId });
+    }
+  });
 
   const withLeaseLock = <A, E, R>(
     environmentId: EnvironmentId,
@@ -515,6 +649,7 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     return yield* withLeaseLock(
       environmentId,
       Effect.gen(function* () {
+        yield* ensureAdmissionOpen(environmentId);
         const environment = yield* getEnvironment(environmentId);
         const legacyEntry = (yield* Ref.get(legacyEntries)).get(environmentId) ?? null;
         const existing = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
@@ -737,19 +872,32 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     },
   );
 
-  const registerEnvironment = Effect.fn("EnvironmentRegistry.registerEnvironment")(
-    (input: EnvironmentRegistrationInput) =>
-      withLeaseLock(input.environment.environmentId, registerEnvironmentLocked(input)),
-  );
+  const registerEnvironment = Effect.fn("EnvironmentRegistry.registerEnvironment")(function* (
+    input: EnvironmentRegistrationInput,
+  ) {
+    const environmentId = input.environment.environmentId;
+    const ticket = yield* issueAdmissionTicket(environmentId);
+    if (ticket === null) return;
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        if (!(yield* admitRegistration(environmentId, ticket))) return;
+        yield* registerEnvironmentLocked(input);
+      }),
+    );
+  });
 
   const register = Effect.fn("EnvironmentRegistry.register")(function* (
     registration: ConnectionRegistration,
   ) {
     const entry = connectionRegistrationCatalogEntry(registration);
     const environmentId = entry.target.environmentId;
+    const ticket = yield* issueAdmissionTicket(environmentId);
+    if (ticket === null) return;
     yield* withLeaseLock(
       environmentId,
       Effect.gen(function* () {
+        if (!(yield* admitRegistration(environmentId, ticket))) return;
         if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
           return;
         }
@@ -787,12 +935,17 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   });
 
   const installPlatformRegistration = Effect.fn("EnvironmentRegistry.installPlatformRegistration")(
-    function* (registration: PlatformConnectionRegistration) {
+    function* (
+      registration: PlatformConnectionRegistration,
+      ticket: EnvironmentAdmissionTicket | null,
+    ) {
+      if (ticket === null) return;
       const entry = connectionRegistrationCatalogEntry(registration);
       const target = entry.target;
       yield* withLeaseLock(
         target.environmentId,
         Effect.gen(function* () {
+          if (!(yield* admitRegistration(target.environmentId, ticket))) return;
           yield* Ref.update(platformEnvironmentIds, (current) => {
             const next = new Set(current);
             next.add(target.environmentId);
@@ -906,7 +1059,8 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   const registerPlatform = Effect.fn("EnvironmentRegistry.registerPlatform")(function* (
     registration: PrimaryConnectionRegistration,
   ) {
-    yield* installPlatformRegistration(registration);
+    const ticket = yield* issueAdmissionTicket(registration.target.environmentId);
+    yield* installPlatformRegistration(registration, ticket);
   });
 
   // Reconcile the full set of platform-managed environments against what the
@@ -915,6 +1069,15 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   const reconcilePlatform = Effect.fn("EnvironmentRegistry.reconcilePlatform")(function* (
     platformRegistrations: ReadonlyArray<PlatformConnectionRegistration>,
   ) {
+    const pendingRegistrations = yield* Effect.forEach(
+      platformRegistrations,
+      Effect.fn("EnvironmentRegistry.issuePlatformAdmissionTicket")(function* (registration) {
+        return {
+          registration,
+          ticket: yield* issueAdmissionTicket(registration.target.environmentId),
+        } as const;
+      }),
+    );
     const desiredIds = new Set(
       platformRegistrations.map((registration) => registration.target.environmentId),
     );
@@ -925,7 +1088,171 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
         desiredIds.has(environmentId) ? Effect.void : removePlatformEnvironment(environmentId),
       { discard: true },
     );
-    yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
+    yield* Effect.forEach(
+      pendingRegistrations,
+      ({ registration, ticket }) => installPlatformRegistration(registration, ticket),
+      { discard: true },
+    );
+  });
+
+  const publishEnvironmentMetadataLocked = Effect.fn(
+    "EnvironmentRegistry.publishEnvironmentMetadataLocked",
+  )(function* (environment: KnownEnvironment) {
+    const environmentId = environment.environmentId;
+    const legacyEntry = (yield* Ref.get(legacyEntries)).get(environmentId) ?? null;
+    yield* SubscriptionRef.update(environments, (current) =>
+      new Map(current).set(environmentId, environment),
+    );
+    yield* SubscriptionRef.update(entries, (current) =>
+      new Map(current).set(environmentId, legacyEntry ?? projectCatalogEntry(environment)),
+    );
+    yield* SubscriptionRef.update(serviceScopes, (current) => {
+      const existing = current.get(environmentId);
+      return existing === undefined
+        ? current
+        : new Map(current).set(environmentId, { ...existing, entry: environment });
+    });
+  });
+
+  const setHidden = Effect.fn("EnvironmentRegistry.setHidden")(function* (
+    environmentId: EnvironmentId,
+    hidden: boolean,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        yield* ensureAdmissionOpen(environmentId);
+        const environment = yield* getEnvironment(environmentId);
+        if (environment.hidden === hidden) return;
+        const next = { ...environment, hidden };
+        yield* environmentCatalog.put(next);
+        yield* publishEnvironmentMetadataLocked(next);
+      }),
+    );
+  });
+
+  const hide = (environmentId: EnvironmentId) =>
+    setHidden(environmentId, true).pipe(Effect.withSpan("EnvironmentRegistry.hide"));
+  const restore = (environmentId: EnvironmentId) =>
+    setHidden(environmentId, false).pipe(Effect.withSpan("EnvironmentRegistry.restore"));
+
+  const removeRoute = Effect.fn("EnvironmentRegistry.removeRoute")(function* (
+    environmentId: EnvironmentId,
+    routeId: string,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        yield* ensureAdmissionOpen(environmentId);
+        const environment = yield* getEnvironment(environmentId);
+        const removedRoute = environment.routes.find((route) => route.routeId === routeId);
+        if (removedRoute === undefined) return;
+        if (removedRoute.secretRef !== null) {
+          yield* environmentSecrets.delete(removedRoute.secretRef);
+        }
+        const next: KnownEnvironment = {
+          ...environment,
+          routes: environment.routes.filter((route) => route.routeId !== routeId),
+        };
+        yield* environmentCatalog.updateRoutes(environmentId, next.routes);
+        yield* installEnvironmentLocked(next, null);
+        if (removedRoute._tag === "SshTunnelRoute") {
+          yield* ssh.disconnect(removedRoute.target).pipe(Effect.ignore);
+        }
+      }),
+    );
+  });
+
+  const forgetNormalizedEnvironmentLocked = Effect.fn(
+    "EnvironmentRegistry.forgetNormalizedEnvironmentLocked",
+  )(function* (environment: KnownEnvironment) {
+    const environmentId = environment.environmentId;
+    const generation = yield* beginForgetAdmission(environmentId);
+    const repairReceipt = (
+      phase: Persistence.EnvironmentCleanupRepairPhase,
+    ): Persistence.EnvironmentCleanupRepairReceipt => ({
+      schemaVersion: 1,
+      environmentId,
+      generation,
+      phase,
+    });
+    const markRepair = (phase: Persistence.EnvironmentCleanupRepairPhase) =>
+      environmentCleanup
+        .saveRepair(repairReceipt(phase))
+        .pipe(
+          Effect.ignore,
+          Effect.andThen(setAdmissionPhase(environmentId, generation, "repair")),
+        );
+
+    yield* environmentCleanup
+      .saveRepair(repairReceipt("pending"))
+      .pipe(Effect.tapError(() => setAdmissionPhase(environmentId, generation, "open")));
+    yield* closeServiceScope(environmentId);
+
+    const cacheManifest = yield* cacheManifests
+      .load(environmentId)
+      .pipe(Effect.tapError(() => markRepair("metadata-deletion-failed")));
+    const cacheKeyRef = Option.getOrNull(cacheManifest)?.keyRef ?? null;
+    const secretReferences = [
+      ...new Set([
+        ...environment.routes.flatMap((route) =>
+          route.secretRef === null ? [] : [route.secretRef],
+        ),
+        ...(cacheKeyRef === null ? [] : [cacheKeyRef]),
+      ]),
+    ];
+    yield* Effect.forEach(secretReferences, (secretRef) => environmentSecrets.delete(secretRef), {
+      concurrency: 1,
+      discard: true,
+    }).pipe(Effect.tapError(() => markRepair("secret-deletion-failed")));
+    yield* ownedDataCleanup.clear(environmentId);
+    yield* environmentCleanup
+      .commitForget(environmentId)
+      .pipe(Effect.tapError(() => markRepair("metadata-deletion-failed")));
+
+    yield* Ref.update(legacyEntries, (current) => {
+      const next = new Map(current);
+      next.delete(environmentId);
+      return next;
+    });
+    yield* SubscriptionRef.update(environments, (current) => {
+      const next = new Map(current);
+      next.delete(environmentId);
+      return next;
+    });
+    yield* SubscriptionRef.update(entries, (current) => {
+      const next = new Map(current);
+      next.delete(environmentId);
+      return next;
+    });
+    yield* setAdmissionPhase(environmentId, generation, "forgotten");
+
+    const sshTargets = environment.routes
+      .filter((route) => route._tag === "SshTunnelRoute")
+      .map((route) => route.target);
+    yield* Effect.forEach(sshTargets, (target) => ssh.disconnect(target).pipe(Effect.ignore), {
+      concurrency: "unbounded",
+      discard: true,
+    });
+  });
+
+  const forget = Effect.fn("EnvironmentRegistry.forget")(function* (environmentId: EnvironmentId) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+          return yield* new PlatformEnvironmentRemovalError({ environmentId });
+        }
+        const environment = yield* getEnvironment(environmentId);
+        if ((yield* Ref.get(legacyEntries)).has(environmentId)) {
+          return yield* new Persistence.ConnectionPersistenceError({
+            operation: "forget-environment",
+            message: "This legacy environment must use the compatibility removal path.",
+          });
+        }
+        yield* forgetNormalizedEnvironmentLocked(environment);
+      }),
+    );
   });
 
   const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
@@ -972,23 +1299,8 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
             { concurrency: "unbounded", discard: true },
           );
         } else {
-          // Forget closes admission first, then clears client-owned secret/cache/UI data,
-          // and deletes normalized metadata only after those operations succeed.
-          yield* closeServiceScope(environmentId);
-          const secretReferences = [
-            ...new Set(
-              environment.routes.flatMap((route) =>
-                route.secretRef === null ? [] : [route.secretRef],
-              ),
-            ),
-          ];
-          yield* Effect.forEach(secretReferences, (secretRef) =>
-            environmentSecrets.delete(secretRef),
-          );
-          yield* cache.clear(environmentId);
-          yield* environmentUiState.clearEnvironment(environmentId);
-          yield* ownedDataCleanup.clear(environmentId);
-          yield* environmentCatalog.forget(environmentId);
+          yield* forgetNormalizedEnvironmentLocked(environment);
+          return;
         }
 
         yield* Ref.update(legacyEntries, (current) => {
@@ -1148,6 +1460,10 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     register,
     registerPlatform,
     reconcilePlatform,
+    hide,
+    restore,
+    removeRoute,
+    forget,
     remove,
     removeRelayEnvironments,
     retryNow,

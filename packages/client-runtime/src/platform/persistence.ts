@@ -47,6 +47,8 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "list-environment-bindings",
       "put-environment-binding",
       "forget-environment",
+      "list-environment-cleanup-repairs",
+      "save-environment-cleanup-repair",
       "load-environment-ui-state",
       "save-environment-ui-state",
       "clear-environment-ui-state",
@@ -105,11 +107,45 @@ export class EnvironmentCatalogStore extends Context.Service<
     readonly putBinding: (
       binding: EnvironmentBinding,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
-    readonly forget: (
+  }
+>()("@bibcode/client-runtime/platform/persistence/EnvironmentCatalogStore") {}
+
+export const EnvironmentCleanupRepairPhase = Schema.Literals([
+  "pending",
+  "secret-deletion-failed",
+  "metadata-deletion-failed",
+]);
+export type EnvironmentCleanupRepairPhase = typeof EnvironmentCleanupRepairPhase.Type;
+
+/** Redacted, crash-persistent evidence that local Forget must be retried. */
+export const EnvironmentCleanupRepairReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  environmentId: DurableEnvironmentId,
+  generation: NonNegativeInt,
+  phase: EnvironmentCleanupRepairPhase,
+});
+export type EnvironmentCleanupRepairReceipt = typeof EnvironmentCleanupRepairReceipt.Type;
+
+/**
+ * Two-phase boundary for cancellation-safe local cleanup. Secret deletion happens
+ * between `saveRepair` and `commitForget`; the final commit removes every
+ * non-secret environment row and the repair receipt in one durable transaction.
+ */
+export class EnvironmentCleanupStore extends Context.Service<
+  EnvironmentCleanupStore,
+  {
+    readonly repairs: Effect.Effect<
+      ReadonlyArray<EnvironmentCleanupRepairReceipt>,
+      ConnectionPersistenceError
+    >;
+    readonly saveRepair: (
+      receipt: EnvironmentCleanupRepairReceipt,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly commitForget: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
   }
->()("@bibcode/client-runtime/platform/persistence/EnvironmentCatalogStore") {}
+>()("@bibcode/client-runtime/platform/persistence/EnvironmentCleanupStore") {}
 
 export const EnvironmentUiStateDocument = Schema.Struct({
   schemaVersion: Schema.Literal(2),

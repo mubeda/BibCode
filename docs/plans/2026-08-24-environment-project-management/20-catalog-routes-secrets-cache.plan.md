@@ -593,7 +593,7 @@ git commit -m "feat(cache): encrypt bounded environment snapshots"
 
 - Produces: `hide`, `restore`, `removeRoute`, and `forget`; host uninstall/purge remains outside this plan.
 
-- [ ] **Step 1: Write failing cleanup-order and late-reconnect tests**
+- [x] **Step 1: Write failing cleanup-order and late-reconnect tests**
 
 ```ts
 expect(harness.events).toEqual([
@@ -609,13 +609,13 @@ expect(harness.events).toEqual([
 expect(harness.replayedLateSuccess).toBe("ignored");
 ```
 
-- [ ] **Step 2: Run registry/storage tests and confirm RED**
+- [x] **Step 2: Run registry/storage tests and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/connection/registry.test.ts apps/web/src/connection/storage.test.ts
 ```
 
-- [ ] **Step 3: Add narrow lifecycle methods**
+- [x] **Step 3: Add narrow lifecycle methods**
 
 ```ts
 readonly hide: (environmentId: EnvironmentId) => Effect.Effect<void, PersistenceError>;
@@ -626,15 +626,15 @@ readonly forget: (environmentId: EnvironmentId) => Effect.Effect<void, Persisten
 
 Hide changes only client UI metadata. Remove-route retains the environment if another route/binding/cache record remains. Forget performs the full ordered cleanup.
 
-- [ ] **Step 4: Fence concurrent register/reconcile operations**
+- [x] **Step 4: Fence concurrent register/reconcile operations**
 
 Increment environment generation and set an admission tombstone before cancellation. Platform reconciliation may recreate a visible binding only after a new authoritative generation; stale work cannot resurrect forgotten metadata.
 
-- [ ] **Step 5: Clear all dependent stores in one IndexedDB transaction**
+- [x] **Step 5: Clear all dependent stores in one IndexedDB transaction**
 
 Delete route, binding, UI, manifest, shell, and thread rows through `environmentId` indexes. Delete OS secrets before final metadata removal; a failed secret deletion keeps a redacted repair receipt rather than pretending cleanup succeeded.
 
-- [ ] **Step 6: Run plan-level verification and commit**
+- [x] **Step 6: Run plan-level verification and commit**
 
 ```sh
 vp test run packages/client-runtime/src/connection packages/client-runtime/src/platform apps/web/src/connection

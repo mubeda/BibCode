@@ -22,6 +22,8 @@ import {
   EnvironmentCacheManifestStore,
   EnvironmentCacheStore,
   EnvironmentCatalogStore,
+  EnvironmentCleanupRepairReceipt,
+  EnvironmentCleanupStore,
   EnvironmentMigrationReceipt,
   EnvironmentMigrationStore,
   EnvironmentSecretStore,
@@ -90,6 +92,7 @@ const ENVIRONMENT_CACHE_MANIFEST_STORE_NAME = "environmentCacheManifest";
 const ENCRYPTED_SHELL_CACHE_STORE_NAME = "shellCache";
 const ENCRYPTED_THREAD_CACHE_STORE_NAME = "threadCache";
 const MIGRATION_STATE_STORE_NAME = "migrationState";
+const CLEANUP_REPAIR_KEY_PREFIX = "cleanup-repair:";
 export const NORMALIZED_STORE_NAMES = [
   ENVIRONMENTS_STORE_NAME,
   ENVIRONMENT_ROUTES_STORE_NAME,
@@ -142,6 +145,13 @@ const decodeEnvironmentCacheManifest = Schema.decodeUnknownEffect(EnvironmentCac
 const decodeEnvironmentCacheManifestSync = Schema.decodeUnknownSync(EnvironmentCacheManifest);
 const decodeEncryptedCacheEnvelope = Schema.decodeUnknownEffect(EncryptedCacheEnvelope);
 const decodeEnvironmentMigrationReceipt = Schema.decodeUnknownEffect(EnvironmentMigrationReceipt);
+const decodeEnvironmentCleanupRepairReceipt = Schema.decodeUnknownEffect(
+  EnvironmentCleanupRepairReceipt,
+);
+const decodeEnvironmentCleanupRepairReceipts = Schema.decodeUnknownEffect(
+  Schema.Array(EnvironmentCleanupRepairReceipt),
+);
+const decodeEnvironmentUiStateDocumentSync = Schema.decodeUnknownSync(EnvironmentUiStateDocument);
 
 function catalogError(operation: string, cause: unknown) {
   return new ConnectionTransientError({
@@ -249,6 +259,8 @@ type NormalizedPersistenceOperation =
   | "list-environment-bindings"
   | "put-environment-binding"
   | "forget-environment"
+  | "list-environment-cleanup-repairs"
+  | "save-environment-cleanup-repair"
   | "load-environment-ui-state"
   | "save-environment-ui-state"
   | "clear-environment-ui-state"
@@ -925,40 +937,159 @@ function replaceEnvironmentRouteRows(
   }).pipe(Effect.withSpan("web.connectionStorage.replaceEnvironmentRouteRows"));
 }
 
-function removeNormalizedEnvironment(database: IDBDatabase, environmentId: EnvironmentId) {
+function cleanupRepairKey(environmentId: EnvironmentId): string {
+  return `${CLEANUP_REPAIR_KEY_PREFIX}${environmentId}`;
+}
+
+function withoutEnvironmentUiState(
+  state: EnvironmentUiStateDocument,
+  environmentId: EnvironmentId,
+): EnvironmentUiStateDocument {
+  return {
+    ...state,
+    selected: state.selected?.environmentId === environmentId ? null : state.selected,
+    expandedEnvironmentIds: state.expandedEnvironmentIds.filter(
+      (candidate) => candidate !== environmentId,
+    ),
+    environmentOrder: state.environmentOrder.filter((candidate) => candidate !== environmentId),
+    pinnedEnvironmentIds: state.pinnedEnvironmentIds.filter(
+      (candidate) => candidate !== environmentId,
+    ),
+    projectOrderByEnvironment: Object.fromEntries(
+      Object.entries(state.projectOrderByEnvironment).filter(([key]) => key !== environmentId),
+    ),
+  };
+}
+
+function readEnvironmentCleanupRepairs(database: IDBDatabase) {
+  return Effect.callback<ReadonlyArray<unknown>, ConnectionTransientError>((resume) => {
+    const request = database
+      .transaction(ENVIRONMENT_UI_STATE_STORE_NAME, "readonly")
+      .objectStore(ENVIRONMENT_UI_STATE_STORE_NAME)
+      .getAll(IDBKeyRange.bound(CLEANUP_REPAIR_KEY_PREFIX, `${CLEANUP_REPAIR_KEY_PREFIX}\uffff`));
+    request.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError(
+            "list environment cleanup repairs",
+            request.error ?? "Unknown IndexedDB repair read error",
+          ),
+        ),
+      );
+    });
+    request.addEventListener("success", () => {
+      resume(Effect.succeed(request.result));
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.readEnvironmentCleanupRepairs"));
+}
+
+/** Atomically removes every non-secret row owned by one environment. */
+export function commitEnvironmentForget(database: IDBDatabase, environmentId: EnvironmentId) {
   return Effect.callback<void, ConnectionTransientError>((resume) => {
     const transaction = database.transaction(
-      [ENVIRONMENTS_STORE_NAME, ENVIRONMENT_ROUTES_STORE_NAME, ENVIRONMENT_BINDINGS_STORE_NAME],
+      [
+        ENVIRONMENTS_STORE_NAME,
+        ENVIRONMENT_ROUTES_STORE_NAME,
+        ENVIRONMENT_BINDINGS_STORE_NAME,
+        ENVIRONMENT_UI_STATE_STORE_NAME,
+        ENVIRONMENT_CACHE_MANIFEST_STORE_NAME,
+        ENCRYPTED_SHELL_CACHE_STORE_NAME,
+        ENCRYPTED_THREAD_CACHE_STORE_NAME,
+        SHELL_STORE_NAME,
+        THREAD_STORE_NAME,
+      ],
       "readwrite",
     );
     let settled = false;
-    const fail = (cause: unknown) => {
+    let abortCause: unknown;
+    const settleFailure = (cause: unknown) => {
       if (settled) return;
       settled = true;
-      resume(Effect.fail(catalogError("remove normalized environment", cause)));
+      resume(Effect.fail(catalogError("forget environment", cause)));
     };
-    transaction.addEventListener("error", () =>
-      fail(transaction.error ?? "Unknown IndexedDB transaction error"),
-    );
+    const failAndAbort = (cause: unknown) => {
+      abortCause ??= cause;
+      try {
+        transaction.abort();
+      } catch (abortError) {
+        settleFailure(abortError);
+      }
+    };
+    transaction.addEventListener("error", () => {
+      abortCause ??= transaction.error ?? "Unknown IndexedDB environment cleanup error";
+    });
     transaction.addEventListener("abort", () =>
-      fail(transaction.error ?? "Unknown IndexedDB transaction abort"),
+      settleFailure(abortCause ?? transaction.error ?? "IndexedDB environment cleanup aborted"),
     );
     transaction.addEventListener("complete", () => {
       if (settled) return;
       settled = true;
       resume(Effect.void);
     });
-    transaction.objectStore(ENVIRONMENTS_STORE_NAME).delete(environmentId);
-    const deleteDependentKeys = (storeName: string) => {
-      const store = transaction.objectStore(storeName);
-      const request = store.index("environmentId").getAllKeys(IDBKeyRange.only(environmentId));
-      request.addEventListener("success", () => {
-        for (const key of request.result) store.delete(key);
+
+    try {
+      const deleteIndexedRows = (storeName: string) => {
+        const store = transaction.objectStore(storeName);
+        const request = store.index("environmentId").getAllKeys(IDBKeyRange.only(environmentId));
+        request.addEventListener("error", () =>
+          failAndAbort(request.error ?? "Unknown IndexedDB dependent-key read error"),
+        );
+        request.addEventListener("success", () => {
+          try {
+            for (const key of request.result) store.delete(key);
+          } catch (cause) {
+            failAndAbort(cause);
+          }
+        });
+      };
+      deleteIndexedRows(ENVIRONMENT_ROUTES_STORE_NAME);
+      deleteIndexedRows(ENVIRONMENT_BINDINGS_STORE_NAME);
+      deleteIndexedRows(ENCRYPTED_THREAD_CACHE_STORE_NAME);
+
+      const legacyThreadStore = transaction.objectStore(THREAD_STORE_NAME);
+      const legacyThreadKeys = legacyThreadStore.getAllKeys(
+        IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
+      );
+      legacyThreadKeys.addEventListener("error", () =>
+        failAndAbort(legacyThreadKeys.error ?? "Unknown legacy thread-key read error"),
+      );
+      legacyThreadKeys.addEventListener("success", () => {
+        try {
+          for (const key of legacyThreadKeys.result) legacyThreadStore.delete(key);
+        } catch (cause) {
+          failAndAbort(cause);
+        }
       });
-    };
-    deleteDependentKeys(ENVIRONMENT_ROUTES_STORE_NAME);
-    deleteDependentKeys(ENVIRONMENT_BINDINGS_STORE_NAME);
-  }).pipe(Effect.withSpan("web.connectionStorage.removeNormalizedEnvironment"));
+
+      const uiStore = transaction.objectStore(ENVIRONMENT_UI_STATE_STORE_NAME);
+      const uiRequest = uiStore.get(ENVIRONMENT_UI_STATE_KEY);
+      uiRequest.addEventListener("error", () =>
+        failAndAbort(uiRequest.error ?? "Unknown environment UI-state read error"),
+      );
+      uiRequest.addEventListener("success", () => {
+        if (uiRequest.result === undefined) return;
+        try {
+          uiStore.put(
+            withoutEnvironmentUiState(
+              decodeEnvironmentUiStateDocumentSync(uiRequest.result),
+              environmentId,
+            ),
+            ENVIRONMENT_UI_STATE_KEY,
+          );
+        } catch (cause) {
+          failAndAbort(cause);
+        }
+      });
+
+      uiStore.delete(cleanupRepairKey(environmentId));
+      transaction.objectStore(ENVIRONMENTS_STORE_NAME).delete(environmentId);
+      transaction.objectStore(ENVIRONMENT_CACHE_MANIFEST_STORE_NAME).delete(environmentId);
+      transaction.objectStore(ENCRYPTED_SHELL_CACHE_STORE_NAME).delete(environmentId);
+      transaction.objectStore(SHELL_STORE_NAME).delete(environmentId);
+    } catch (cause) {
+      failAndAbort(cause);
+    }
+  }).pipe(Effect.withSpan("web.connectionStorage.commitEnvironmentForget"));
 }
 
 function threadCacheKey(environmentId: EnvironmentId, threadId: ThreadId) {
@@ -1685,10 +1816,6 @@ export const connectionStorageLayer = Layer.effectContext(
           Effect.flatMap((decoded) => upsertEnvironmentBinding(database, decoded)),
           Effect.mapError((cause) => normalizedPersistenceError("put-environment-binding", cause)),
         ),
-      forget: (environmentId) =>
-        removeNormalizedEnvironment(database, environmentId).pipe(
-          Effect.mapError((cause) => normalizedPersistenceError("forget-environment", cause)),
-        ),
     });
 
     const loadEnvironmentUiState = readDatabaseValue(
@@ -1723,27 +1850,8 @@ export const connectionStorageLayer = Layer.effectContext(
           Effect.flatMap(
             Option.match({
               onNone: () => Effect.void,
-              onSome: (state) => {
-                const projectOrderByEnvironment = Object.fromEntries(
-                  Object.entries(state.projectOrderByEnvironment).filter(
-                    ([key]) => key !== environmentId,
-                  ),
-                );
-                return saveEnvironmentUiState({
-                  ...state,
-                  selected: state.selected?.environmentId === environmentId ? null : state.selected,
-                  expandedEnvironmentIds: state.expandedEnvironmentIds.filter(
-                    (candidate) => candidate !== environmentId,
-                  ),
-                  environmentOrder: state.environmentOrder.filter(
-                    (candidate) => candidate !== environmentId,
-                  ),
-                  pinnedEnvironmentIds: state.pinnedEnvironmentIds.filter(
-                    (candidate) => candidate !== environmentId,
-                  ),
-                  projectOrderByEnvironment,
-                });
-              },
+              onSome: (state) =>
+                saveEnvironmentUiState(withoutEnvironmentUiState(state, environmentId)),
             }),
           ),
           Effect.mapError((cause) =>
@@ -2747,6 +2855,45 @@ export const connectionStorageLayer = Layer.effectContext(
           .pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });
 
+    const environmentCleanupStore = EnvironmentCleanupStore.of({
+      repairs: readEnvironmentCleanupRepairs(database).pipe(
+        Effect.flatMap(decodeEnvironmentCleanupRepairReceipts),
+        Effect.mapError((cause) =>
+          normalizedPersistenceError("list-environment-cleanup-repairs", cause),
+        ),
+      ),
+      saveRepair: (receipt) =>
+        decodeEnvironmentCleanupRepairReceipt(receipt).pipe(
+          Effect.flatMap((decoded) =>
+            writeDatabaseValue(
+              database,
+              ENVIRONMENT_UI_STATE_STORE_NAME,
+              cleanupRepairKey(decoded.environmentId),
+              decoded,
+            ),
+          ),
+          Effect.mapError((cause) =>
+            normalizedPersistenceError("save-environment-cleanup-repair", cause),
+          ),
+        ),
+      commitForget: (environmentId) =>
+        cacheMutationSemaphore.withPermits(1)(
+          commitEnvironmentForget(database, environmentId).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                sessionCacheManifests.delete(environmentId);
+                sessionCacheKeys.delete(environmentId);
+                resolvedCacheKeys.delete(environmentId);
+                for (const [key, envelope] of sessionCacheEnvelopes) {
+                  if (envelope.environmentId === environmentId) sessionCacheEnvelopes.delete(key);
+                }
+              }),
+            ),
+            Effect.mapError((cause) => normalizedPersistenceError("forget-environment", cause)),
+          ),
+        ),
+    });
+
     const migrateLegacyPlaintextCache = Effect.gen(function* () {
       const shellKeys = yield* readAllDatabaseKeys(database, SHELL_STORE_NAME).pipe(
         Effect.mapError((cause) => persistenceError("load-shell", cause)),
@@ -2804,6 +2951,7 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(EnvironmentCatalogStore, environmentCatalogStore),
       Context.add(EnvironmentUiStateStore, environmentUiStateStore),
       Context.add(EnvironmentCacheManifestStore, environmentCacheManifestStore),
+      Context.add(EnvironmentCleanupStore, environmentCleanupStore),
       Context.add(EnvironmentMigrationStore, environmentMigrationStore),
       Context.add(EnvironmentSecretStore, environmentSecretStore),
       Context.add(ConnectionRegistrationStore, registrationStore),

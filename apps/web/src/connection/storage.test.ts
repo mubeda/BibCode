@@ -24,6 +24,7 @@ import {
   EnvironmentCacheManifestStore,
   EnvironmentCacheStore,
   EnvironmentCatalogStore,
+  EnvironmentCleanupStore,
   EnvironmentMigrationStore,
   EnvironmentSecretStore,
   EnvironmentUiStateStore,
@@ -1615,7 +1616,7 @@ describe("connectionStorageLayer", () => {
       expect(yield* catalog.list).toEqual([environment]);
       expect(yield* catalog.load(environment.environmentId)).toEqual(Option.some(environment));
 
-      yield* catalog.forget(environment.environmentId);
+      yield* (yield* EnvironmentCleanupStore).commitForget(environment.environmentId);
       expect(yield* catalog.list).toEqual([]);
 
       const database = yield* Effect.promise(
@@ -1885,6 +1886,117 @@ describe("connectionStorageLayer", () => {
       expect(yield* manifests.load(manifest.environmentId)).toEqual(Option.none());
     }).pipe(Effect.provide(connectionStorageLayer));
   });
+
+  it.effect(
+    "retains a redacted repair receipt on abort and then forgets every local row atomically",
+    () => {
+      const factory = new IDBFactory();
+      vi.stubGlobal("indexedDB", factory);
+      vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+      vi.stubGlobal("window", {});
+      const environment = normalizedKnownEnvironment();
+      const environmentKey = environment.environmentId;
+      const repair = {
+        schemaVersion: 1,
+        environmentId: environmentKey,
+        generation: 7,
+        phase: "pending",
+      } as const;
+
+      return Effect.gen(function* () {
+        const catalog = yield* EnvironmentCatalogStore;
+        const cleanup = yield* EnvironmentCleanupStore;
+        const ui = yield* EnvironmentUiStateStore;
+        const manifests = yield* EnvironmentCacheManifestStore;
+        yield* catalog.put(environment);
+        yield* ui.save({
+          schemaVersion: 2,
+          selected: { environmentId: environmentKey, projectId: null, threadId: null },
+          expandedEnvironmentIds: [environmentKey],
+          expandedProjectKeys: [],
+          manuallyToggledKeys: [],
+          environmentOrder: [environmentKey],
+          pinnedEnvironmentIds: [environmentKey],
+          projectOrderByEnvironment: {},
+        });
+        yield* manifests.save({
+          schemaVersion: 1,
+          environmentId: environmentKey,
+          storageInstanceId: durableStorageId,
+          keyRef: null,
+          persistence: "durable",
+          lastSynchronizedAt: null,
+          maxBytes: 1_024,
+          maxAgeMs: 60_000,
+          totalBytes: 0,
+          entries: [],
+          quarantine: [],
+        });
+        yield* cleanup.saveRepair(repair);
+        yield* Effect.promise(() =>
+          writeIndexedDbRecord(factory, "shell", "legacy-shell", environmentKey),
+        );
+        yield* Effect.promise(() =>
+          writeIndexedDbRecord(factory, "thread", "legacy-thread", `${environmentKey}:${threadId}`),
+        );
+        yield* Effect.promise(() =>
+          writeIndexedDbRecord(factory, "shellCache", {
+            environmentId: environmentKey,
+            entityKind: "shell",
+          }),
+        );
+        yield* Effect.promise(() =>
+          writeIndexedDbRecord(factory, "threadCache", {
+            environmentId: environmentKey,
+            threadId,
+            entityKind: "thread",
+          }),
+        );
+
+        const originalDelete = IDBObjectStore.prototype.delete;
+        const deleteSpy = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(function (
+          this: IDBObjectStore,
+          key: IDBKeyRange | IDBValidKey,
+        ) {
+          if (this.name === "environments") throw new Error("abort-forget");
+          return originalDelete.call(this, key);
+        });
+        const failure = yield* cleanup.commitForget(environmentKey).pipe(Effect.flip);
+        deleteSpy.mockRestore();
+
+        expect(failure).toMatchObject({ operation: "forget-environment" });
+        expect(yield* catalog.load(environmentKey)).toEqual(Option.some(environment));
+        expect(yield* cleanup.repairs).toEqual([repair]);
+        expect((yield* ui.load).pipe(Option.getOrThrow).selected?.environmentId).toBe(
+          environmentKey,
+        );
+        expect(yield* manifests.load(environmentKey)).toMatchObject({ _tag: "Some" });
+
+        yield* cleanup.commitForget(environmentKey);
+
+        expect(yield* catalog.load(environmentKey)).toEqual(Option.none());
+        expect(yield* cleanup.repairs).toEqual([]);
+        expect((yield* ui.load).pipe(Option.getOrThrow).selected).toBeNull();
+        expect(yield* manifests.load(environmentKey)).toEqual(Option.none());
+        expect(
+          yield* Effect.promise(() => readIndexedDbValue(factory, "shell", environmentKey)),
+        ).toBeUndefined();
+        expect(
+          yield* Effect.promise(() =>
+            readIndexedDbValue(factory, "thread", `${environmentKey}:${threadId}`),
+          ),
+        ).toBeUndefined();
+        expect(
+          yield* Effect.promise(() => readIndexedDbValue(factory, "shellCache", environmentKey)),
+        ).toBeUndefined();
+        expect(
+          yield* Effect.promise(() =>
+            readIndexedDbValue(factory, "threadCache", [environmentKey, threadId]),
+          ),
+        ).toBeUndefined();
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.scoped);
+    },
+  );
 
   it.effect("publishes corrupt catalog health and resets only through the explicit service", () => {
     const handle = installFakeIndexedDb();
