@@ -16,7 +16,9 @@ use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
         OrchestrationError, canonical_command_digest,
-        engine::{CommandLifetimeGuard, OptionalNullable, TurnDeliveryResolutionAction},
+        engine::{
+            CommandLifetimeGuard, DispatchResult, OptionalNullable, TurnDeliveryResolutionAction,
+        },
         load_snapshot,
     },
     persistence::{OrchestrationEvent, ProjectionThread},
@@ -333,6 +335,7 @@ async fn dispatch_prepared_command(
     request_tag: String,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
+    let is_project_create = matches!(&command, OrchestrationCommand::ProjectCreate { .. });
     let delivery_cancellation = match &command {
         OrchestrationCommand::ThreadTurnDeliveryResolve {
             command_id,
@@ -456,7 +459,54 @@ async fn dispatch_prepared_command(
             .map_err(provider_command_error)?;
         }
     }
-    serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
+    encode_dispatch_result(result, is_project_create, &request_tag)
+}
+
+fn encode_dispatch_result(
+    result: DispatchResult,
+    is_project_create: bool,
+    request_tag: &str,
+) -> RpcResult {
+    if !is_project_create {
+        return serde_json::to_value(result)
+            .map_err(|error| invalid_request(request_tag, error.to_string()));
+    }
+
+    let invariant = |detail: String| {
+        orchestration_error(
+            "OrchestrationDispatchCommandError",
+            OrchestrationError::Invariant {
+                command_type: "project.create".to_owned(),
+                detail,
+            },
+        )
+    };
+    let project_id = result.project_id.ok_or_else(|| {
+        invariant("Committed project creation did not resolve a project ID.".to_owned())
+    })?;
+    let main_thread_id = result.thread_id.ok_or_else(|| {
+        invariant(format!(
+            "Committed project '{project_id}' does not have one provable canonical Main thread."
+        ))
+    })?;
+    match result.disposition.as_deref() {
+        Some("created") => Ok(json!({
+            "sequence": result.sequence,
+            "disposition": "created",
+            "projectId": project_id,
+            "mainThreadId": main_thread_id,
+        })),
+        Some("existing") => Ok(json!({
+            "sequence": result.sequence,
+            "disposition": "existing",
+            "projectId": project_id,
+            "mainThreadId": main_thread_id,
+            "reason": "same-local-repository",
+        })),
+        disposition => Err(invariant(format!(
+            "Committed project creation returned unsupported disposition {disposition:?}."
+        ))),
+    }
 }
 
 async fn dispatch_turn_command(

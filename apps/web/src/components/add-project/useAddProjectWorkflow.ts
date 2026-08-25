@@ -647,9 +647,12 @@ export function useAddProjectWorkflow(input: {
                 },
               }),
               (result) => {
+                if (result.disposition !== "created" && result.disposition !== "existing") {
+                  throw new Error("Project creation returned a non-project dispatch result.");
+                }
                 return {
-                  projectId: result.projectId ?? commandInput.projectId,
-                  ...(result.threadId ? { defaultThreadId: result.threadId } : {}),
+                  projectId: result.projectId,
+                  defaultThreadId: result.mainThreadId,
                 };
               },
             ),

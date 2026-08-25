@@ -2897,6 +2897,13 @@ async fn process_envelope(
                 .then(|| project_id.clone())
         });
         if let Some(existing_project_id) = existing_project_id {
+            let main_thread_id = canonical_default_thread_id(model, &existing_project_id)
+                .ok_or_else(|| OrchestrationError::Invariant {
+                    command_type: command.command_type().to_owned(),
+                    detail: format!(
+                        "Existing project '{existing_project_id}' does not have one provable canonical Main thread."
+                    ),
+                })?;
             let sequence = current_max_sequence(repositories).await?;
             repositories
                 .finalize_command_receipt(CommandReceipt {
@@ -2916,7 +2923,7 @@ async fn process_envelope(
             return Ok(ProcessEnvelopeOutcome {
                 result: DispatchResult {
                     sequence,
-                    thread_id: canonical_default_thread_id(model, &existing_project_id),
+                    thread_id: Some(main_thread_id),
                     project_id: Some(existing_project_id),
                     disposition: Some("existing".to_owned()),
                 },
@@ -9855,6 +9862,53 @@ mod tests {
 
         assert_eq!(duplicate.project_id.as_deref(), Some("project-1"));
         assert_eq!(duplicate.thread_id, created.thread_id);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_create_duplicate_rejects_an_existing_project_without_a_provable_main() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        Repositories::new(database.clone())
+            .upsert_project(ProjectionProject {
+                project_id: "project-without-main".to_owned(),
+                title: "Broken project".to_owned(),
+                workspace_root: "/canonical/requested-workspace".to_owned(),
+                default_model_selection: None,
+                scripts: json!([]),
+                worktree_discovery: default_worktree_discovery(),
+                worktree_repository_key: None,
+                created_at: "2026-07-20T00:00:00.000Z".to_owned(),
+                updated_at: "2026-07-20T00:00:00.000Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("broken legacy projection inserts");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        engine.set_project_command_effects(Arc::new(NeverCompletingHistoricalRootEffects));
+
+        let error = engine
+            .dispatch(project_create_command_at(
+                "duplicate-without-main",
+                "requested-project",
+                "requested-workspace",
+            ))
+            .await
+            .expect_err("duplicate cannot manufacture Main identity");
+
+        assert!(matches!(
+            error,
+            OrchestrationError::Invariant { detail, .. }
+                if detail.contains("provable canonical Main")
+        ));
         engine.shutdown().await;
     }
 

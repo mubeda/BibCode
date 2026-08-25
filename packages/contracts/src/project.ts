@@ -1,10 +1,33 @@
 import * as Schema from "effect/Schema";
-import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 
 const PROJECT_ENTRIES_MAX_LIMIT = 200;
 const PROJECT_WRITE_FILE_PATH_MAX_LENGTH = 512;
 const PROJECT_READ_FILE_PATH_MAX_LENGTH = 512;
 const PROJECT_ENTRY_PATH_MAX_LENGTH = 512;
+
+export const ProjectCreateResult = Schema.Union([
+  Schema.Struct({
+    sequence: NonNegativeInt,
+    disposition: Schema.Literal("created"),
+    projectId: ProjectId,
+    mainThreadId: ThreadId,
+  }),
+  Schema.Struct({
+    sequence: NonNegativeInt,
+    disposition: Schema.Literal("existing"),
+    projectId: ProjectId,
+    mainThreadId: ThreadId,
+    reason: Schema.Literal("same-local-repository"),
+  }),
+]);
+export type ProjectCreateResult = typeof ProjectCreateResult.Type;
 
 export const ProjectSearchEntriesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,

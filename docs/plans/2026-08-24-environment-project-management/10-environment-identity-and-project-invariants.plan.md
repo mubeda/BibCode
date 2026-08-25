@@ -353,9 +353,9 @@ git commit -m "feat(projects): claim local repositories transactionally"
 
 **Interfaces:**
 
-- Produces: `ProjectCreateEntryResult = created | existing` with `projectId` and `mainThreadId`.
+- Produces: `ProjectCreateResult = created | existing` with `projectId` and `mainThreadId` (`ProjectCreateEntryResult` remains the unrelated filesystem-entry RPC result).
 
-- [ ] **Step 1: Write failing created/existing contract tests**
+- [x] **Step 1: Write failing created/existing contract tests**
 
 ```ts
 const existing = decodeProjectCreateResult({
@@ -367,16 +367,16 @@ const existing = decodeProjectCreateResult({
 expect(existing.disposition).toBe("existing");
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 ```sh
 vp test run packages/contracts/src/project.test.ts
 ```
 
-- [ ] **Step 3: Define the discriminated result**
+- [x] **Step 3: Define the discriminated result**
 
 ```ts
-export const ProjectCreateEntryResult = Schema.Union([
+export const ProjectCreateResult = Schema.Union([
   Schema.Struct({
     disposition: Schema.Literal("created"),
     projectId: ProjectId,
@@ -391,15 +391,15 @@ export const ProjectCreateEntryResult = Schema.Union([
 ]);
 ```
 
-- [ ] **Step 4: Map engine results without manufacturing a client fallback**
+- [x] **Step 4: Map engine results without manufacturing a client fallback**
 
 The RPC returns the committed canonical Main ID in both branches. If a winning project lacks a provable Main, fail with invariant diagnostics rather than creating a second default thread.
 
-- [ ] **Step 5: Verify replay and duplicate RPC behavior**
+- [x] **Step 5: Verify replay and duplicate RPC behavior**
 
 Assert same command replay returns `created` for its original receipt, while a different command targeting the same repository returns `existing` and the same IDs.
 
-- [ ] **Step 6: Run contract/RPC tests and commit**
+- [x] **Step 6: Run contract/RPC tests and commit**
 
 ```sh
 vp test run packages/contracts/src/project.test.ts packages/contracts/src/orchestration.test.ts

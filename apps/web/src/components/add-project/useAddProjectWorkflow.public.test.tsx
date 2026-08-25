@@ -286,7 +286,12 @@ beforeEach(() => {
   harness.projects = [];
   harness.createProject.mockReset().mockImplementation(async (command) => {
     const input = command as { readonly input: { readonly projectId: string } };
-    return AsyncResult.success({ projectId: input.input.projectId, threadId: defaultThreadId });
+    return AsyncResult.success({
+      sequence: 1,
+      disposition: "created",
+      projectId: input.input.projectId,
+      mainThreadId: defaultThreadId,
+    });
   });
   harness.cloneRepository
     .mockReset()
@@ -529,7 +534,13 @@ describe("useAddProjectWorkflow public adapter", () => {
       },
     ];
     harness.createProject.mockResolvedValueOnce(
-      AsyncResult.success({ projectId: canonicalProjectId, threadId: canonicalThreadId }),
+      AsyncResult.success({
+        sequence: 2,
+        disposition: "existing",
+        projectId: canonicalProjectId,
+        mainThreadId: canonicalThreadId,
+        reason: "same-local-repository",
+      }),
     );
     await mountWorkflow();
 
@@ -552,7 +563,7 @@ describe("useAddProjectWorkflow public adapter", () => {
     });
   });
 
-  it("creates the legacy safety-net default thread when canonicalization returns no Main", async () => {
+  it("fails closed instead of manufacturing a Main when the server omits it", async () => {
     const existingProjectId = "legacy-project";
     harness.projects = [
       {
@@ -561,29 +572,15 @@ describe("useAddProjectWorkflow public adapter", () => {
         workspaceRoot: "/code/legacy",
       },
     ];
-    harness.createProject.mockResolvedValueOnce(
-      AsyncResult.success({ projectId: existingProjectId }),
-    );
+    harness.createProject.mockResolvedValueOnce(AsyncResult.success({ sequence: 1 }));
     await mountWorkflow();
 
     act(() => currentWorkflow.setHostPath("/code/legacy"));
     await act(async () => currentWorkflow.submitHostPath());
 
     expect(harness.createProject).toHaveBeenCalledTimes(1);
-    expect(harness.createThread).toHaveBeenCalledWith({
-      environmentId,
-      input: expect.objectContaining({
-        projectId: existingProjectId,
-        modelSelection: expect.objectContaining({ instanceId: claudeInstanceId }),
-      }),
-    });
-    expect(harness.createThread.mock.calls[0]?.[0].input).not.toHaveProperty("kind");
-    expect(harness.createThread.mock.calls[0]?.[0].input).not.toHaveProperty("worktreePath");
-    const createdThreadId = harness.createThread.mock.calls[0]?.[0].input.threadId;
-    expect(harness.navigate).toHaveBeenCalledWith({
-      to: "/$environmentId/$threadId",
-      params: { environmentId, threadId: createdThreadId },
-    });
+    expect(harness.createThread).not.toHaveBeenCalled();
+    expect(harness.navigate).not.toHaveBeenCalled();
   });
 
   it("keeps the canonical Main chat fallback when no provider is ready", async () => {

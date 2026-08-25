@@ -903,6 +903,61 @@ async fn canonical_duplicate_project_create_skips_git_initialization() {
 }
 
 #[tokio::test]
+async fn project_create_rpc_reports_created_replay_and_same_repository_existing_outcomes() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let mut socket = harness.connect().await;
+        let workspace = harness._temp.path().join("project-create-outcome");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let command = json!({
+            "type": "project.create",
+            "commandId": "create-outcome-project",
+            "projectId": "outcome-project",
+            "title": "Outcome Project",
+            "workspaceRoot": workspace,
+            "createWorkspaceRootIfMissing": false,
+            "initializeGit": true,
+            "createdAt": CREATED_AT,
+        });
+
+        let created = dispatch_command(&mut socket, "38", command.clone()).await;
+        assert_eq!(created["disposition"], json!("created"));
+        assert_eq!(created["projectId"], json!("outcome-project"));
+        assert!(created["mainThreadId"].is_string());
+        assert!(created.get("threadId").is_none());
+
+        let replayed = dispatch_command(&mut socket, "39", command).await;
+        assert_eq!(replayed, created, "same-command replay stays created");
+
+        let existing = dispatch_command(
+            &mut socket,
+            "40",
+            json!({
+                "type": "project.create",
+                "commandId": "create-outcome-project-duplicate",
+                "projectId": "outcome-project-duplicate",
+                "title": "Duplicate Outcome Project",
+                "workspaceRoot": workspace.join("."),
+                "createWorkspaceRootIfMissing": false,
+                "initializeGit": false,
+                "createdAt": CREATED_AT,
+            }),
+        )
+        .await;
+        assert_eq!(existing["disposition"], json!("existing"));
+        assert_eq!(existing["projectId"], created["projectId"]);
+        assert_eq!(existing["mainThreadId"], created["mainThreadId"]);
+        assert_eq!(existing["reason"], json!("same-local-repository"));
+        assert!(existing.get("threadId").is_none());
+
+        socket.close(None).await.expect("close WebSocket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
 async fn project_create_resolves_home_relative_paths_and_reuses_canonical_duplicates() {
     let harness = harness().await;
     let (home_temp, home_relative_root) = tempdir_in_home();

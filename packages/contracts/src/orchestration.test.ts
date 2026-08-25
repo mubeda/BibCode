@@ -86,24 +86,41 @@ it.effect("decodes an authoritative project identity from project creation", () 
   Effect.gen(function* () {
     const result = yield* decodeDispatchResult({
       sequence: 2,
+      disposition: "created",
       projectId: "existing-project",
+      mainThreadId: "default-thread-1",
     });
 
     assert.strictEqual(result.projectId, "existing-project");
+    assert.strictEqual(result.mainThreadId, "default-thread-1");
   }),
 );
 
-it.effect("decodes the canonical default thread returned by project creation", () =>
+it.effect("decodes an existing repository result with its canonical Main", () =>
   Effect.gen(function* () {
     const result = yield* decodeDispatchResult({
       sequence: 2,
+      disposition: "existing",
       projectId: "project-1",
-      threadId: "default-thread-1",
+      mainThreadId: "default-thread-1",
+      reason: "same-local-repository",
     });
 
-    assert.strictEqual(result.threadId, "default-thread-1");
+    assert.strictEqual(result.mainThreadId, "default-thread-1");
   }),
 );
+
+it("rejects the legacy ambiguous project-create dispatch shape", () => {
+  expectDecodeFailure(
+    DispatchResult,
+    {
+      sequence: 2,
+      projectId: "project-1",
+      threadId: "default-thread-1",
+    },
+    { rootTag: "AnyOf" },
+  );
+});
 
 function getOptionValue(
   options: ReadonlyArray<{ id: string; value: unknown }> | undefined,

@@ -22,6 +22,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { ProjectCreateResult } from "./project.ts";
 import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
@@ -1420,11 +1421,15 @@ export type ProjectionPendingApprovalStatus = typeof ProjectionPendingApprovalSt
 export const ProjectionPendingApprovalDecision = Schema.NullOr(ProviderApprovalDecision);
 export type ProjectionPendingApprovalDecision = typeof ProjectionPendingApprovalDecision.Type;
 
-export const DispatchResult = Schema.Struct({
+const GenericDispatchResult = Schema.Struct({
   sequence: NonNegativeInt,
-  projectId: Schema.optional(ProjectId),
   threadId: Schema.optional(ThreadId),
+  disposition: Schema.optionalKey(Schema.Never),
+  projectId: Schema.optionalKey(Schema.Never),
+  mainThreadId: Schema.optionalKey(Schema.Never),
+  reason: Schema.optionalKey(Schema.Never),
 });
+export const DispatchResult = Schema.Union([ProjectCreateResult, GenericDispatchResult]);
 export type DispatchResult = typeof DispatchResult.Type;
 
 export const OrchestrationGetTurnDiffInput = TurnCountRange.mapFields(

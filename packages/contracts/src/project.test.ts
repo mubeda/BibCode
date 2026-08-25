@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   ProjectCreateEntryError,
+  ProjectCreateResult,
   ProjectDeleteEntryError,
   ProjectDuplicateEntryError,
   ProjectListEntriesInput,
@@ -18,11 +19,63 @@ const withDecodedMessage = <T extends object>(props: T, message: unknown): T =>
 const decodeListEntriesInput = Schema.decodeUnknownSync(ProjectListEntriesInput);
 const decodeListError = Schema.decodeUnknownSync(ProjectListEntriesError);
 const decodeCreateError = Schema.decodeUnknownSync(ProjectCreateEntryError);
+const decodeProjectCreateResult = Schema.decodeUnknownSync(ProjectCreateResult);
 const decodeRenameError = Schema.decodeUnknownSync(ProjectRenameEntryError);
 const decodeDeleteError = Schema.decodeUnknownSync(ProjectDeleteEntryError);
 const decodeDuplicateError = Schema.decodeUnknownSync(ProjectDuplicateEntryError);
 const decodeSearchError = Schema.decodeUnknownSync(ProjectSearchEntriesError);
 const decodeWriteError = Schema.decodeUnknownSync(ProjectWriteFileError);
+
+describe("project creation results", () => {
+  it("decodes created and existing outcomes with the canonical Main identity", () => {
+    expect(
+      decodeProjectCreateResult({
+        sequence: 4,
+        disposition: "created",
+        projectId: "project-created",
+        mainThreadId: "thread-main-created",
+      }),
+    ).toEqual({
+      sequence: 4,
+      disposition: "created",
+      projectId: "project-created",
+      mainThreadId: "thread-main-created",
+    });
+    expect(
+      decodeProjectCreateResult({
+        sequence: 7,
+        disposition: "existing",
+        projectId: "project-existing",
+        mainThreadId: "thread-main-existing",
+        reason: "same-local-repository",
+      }),
+    ).toEqual({
+      sequence: 7,
+      disposition: "existing",
+      projectId: "project-existing",
+      mainThreadId: "thread-main-existing",
+      reason: "same-local-repository",
+    });
+  });
+
+  it("rejects incomplete or misleading project creation outcomes", () => {
+    expect(() =>
+      decodeProjectCreateResult({
+        sequence: 1,
+        disposition: "created",
+        projectId: "project-created",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectCreateResult({
+        sequence: 1,
+        disposition: "existing",
+        projectId: "project-existing",
+        mainThreadId: "thread-main-existing",
+      }),
+    ).toThrow();
+  });
+});
 
 describe("project RPC inputs", () => {
   it("accepts an omitted list limit and positive limits through 200", () => {
