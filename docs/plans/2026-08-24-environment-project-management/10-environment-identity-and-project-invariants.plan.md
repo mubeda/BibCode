@@ -274,7 +274,7 @@ git commit -m "feat(contracts): define durable environment descriptors"
 - Consumes: server-derived canonical Git common-directory key.
 - Produces: `project_repository_claims(project_id, repository_key, claimed_at)` and a transactional acquire/release API.
 
-- [ ] **Step 1: Write failing migration and concurrent-create tests**
+- [x] **Step 1: Write failing migration and concurrent-create tests**
 
 ```rust
 #[tokio::test]
@@ -287,13 +287,13 @@ async fn racing_creates_for_one_common_dir_return_one_project_and_main() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test project_repository_claims -- --nocapture
 ```
 
-- [ ] **Step 3: Add the claim table migration**
+- [x] **Step 3: Add the claim table migration**
 
 ```sql
 CREATE TABLE project_repository_claims (
@@ -310,7 +310,7 @@ WHERE p.deleted_at IS NULL;
 
 Fail migration with a diagnostic query if legacy rows contain conflicting active claims; do not choose a winner silently.
 
-- [ ] **Step 4: Resolve identity before mutation and acquire inside commit**
+- [x] **Step 4: Resolve identity before mutation and acquire inside commit**
 
 Extend `ProjectCommandEffects` with a structured result:
 
@@ -323,15 +323,15 @@ pub struct PreparedProjectRepository {
 
 Insert the claim in the same transaction as `project.created`/Main events. On unique conflict, reload the winning active project and return its canonical Main.
 
-- [ ] **Step 5: Release claims only through guarded project deletion**
+- [x] **Step 5: Release claims only through guarded project deletion**
 
 Delete the claim in the authoritative project-removal transaction only after current worktree-owner guards pass. Rebuild claims deterministically from project repository facts; do not repurpose client-provided remote identity.
 
-- [ ] **Step 6: Cover independent clones and worktrees**
+- [x] **Step 6: Cover independent clones and worktrees**
 
 Create two clones of one remote and assert distinct `repository_key` values/projects. Add a linked worktree and assert it resolves to the owning project's claim, preserving existing adoption/removal behavior.
 
-- [ ] **Step 7: Run project and worktree suites, then commit**
+- [x] **Step 7: Run project and worktree suites, then commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test project_repository_claims -- --nocapture

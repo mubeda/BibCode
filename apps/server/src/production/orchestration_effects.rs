@@ -23,12 +23,13 @@ use uuid::Uuid;
 use crate::{
     git::{
         CreateWorktreeInput, GitRepository, OutputPolicy, ProcessError, ProcessRequest,
-        ProcessRunner,
+        ProcessRunner, host_path_platform, worktree_repository_key,
     },
     orchestration::engine::{
         ActivityInput, BootstrapSetupInput, BootstrapSetupResult, BootstrapWorktree,
         BoxBootstrapFuture, BoxProjectCommandFuture, OrchestrationCommand, OrchestrationEngine,
-        ProjectCommandEffects, ThreadTurnBootstrapEffects, ThreadTurnStartBootstrapPrepareWorktree,
+        PreparedProjectRepository, ProjectCommandEffects, ThreadTurnBootstrapEffects,
+        ThreadTurnStartBootstrapPrepareWorktree,
     },
     persistence::{OrchestrationEvent, PersistenceError},
 };
@@ -182,7 +183,7 @@ impl ProjectCommandEffects for ProductionProjectCommandEffects {
         workspace_root: &'a str,
         create_if_missing: bool,
         initialize_git: bool,
-    ) -> BoxProjectCommandFuture<'a, ()> {
+    ) -> BoxProjectCommandFuture<'a, PreparedProjectRepository> {
         Box::pin(async move {
             let normalized =
                 normalize_project_workspace_root(Path::new(workspace_root), create_if_missing)
@@ -194,13 +195,35 @@ impl ProjectCommandEffects for ProductionProjectCommandEffects {
                     "workspace root changed while preparing project creation: expected {workspace_root}, resolved {normalized_display}"
                 ));
             }
+            let repository = GitRepository::default();
+            let cancellation = CancellationToken::new();
             if initialize_git {
-                GitRepository::default()
+                repository
                     .init(&normalized, &CancellationToken::new())
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            Ok(())
+            let repository_key = if repository
+                .is_repository(&normalized, &cancellation)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let common_dir = repository
+                    .resolve_common_dir(&normalized, &cancellation)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Some(
+                    worktree_repository_key(&common_dir, host_path_platform())
+                        .as_str()
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            Ok(PreparedProjectRepository {
+                canonical_workspace_root: normalized_display.into_owned(),
+                repository_key,
+            })
         })
     }
 }

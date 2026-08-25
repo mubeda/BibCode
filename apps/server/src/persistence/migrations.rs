@@ -52,6 +52,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (39, "provider_turn_outbox"),
     (39, "orchestration_attachment_refs"),
     (43, "worktree_removal_receipts"),
+    (46, "project_repository_claims"),
 ];
 
 #[derive(Debug, Error)]
@@ -672,6 +673,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(43, "DurableWorktreeRemovalReceipts", migration_043),
     Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
+    Migration::new(46, "ProjectRepositoryClaims", migration_046),
 ];
 
 impl Migration {
@@ -2394,6 +2396,57 @@ fn migration_045(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
+    if table_exists(transaction, "projection_projects")?
+        && table_exists(transaction, "project_worktree_repository_pins")?
+    {
+        let conflict = transaction
+            .query_row(
+                "SELECT pins.repository_key, GROUP_CONCAT(projects.project_id, ',') \
+                 FROM projection_projects AS projects \
+                 JOIN project_worktree_repository_pins AS pins USING (project_id) \
+                 WHERE projects.deleted_at IS NULL \
+                 GROUP BY pins.repository_key \
+                 HAVING COUNT(*) > 1 \
+                 ORDER BY pins.repository_key ASC \
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((repository_key, project_ids)) = conflict {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "cannot establish project repository claims: repository key '{repository_key}' is pinned by multiple active projects [{project_ids}]"
+            )));
+        }
+    }
+
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE project_repository_claims (
+          project_id TEXT PRIMARY KEY NOT NULL,
+          repository_key TEXT NOT NULL UNIQUE,
+          claimed_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+
+    if table_exists(transaction, "projection_projects")?
+        && table_exists(transaction, "project_worktree_repository_pins")?
+    {
+        transaction.execute_batch(
+            r#"
+            INSERT INTO project_repository_claims(project_id, repository_key, claimed_at)
+            SELECT projects.project_id, pins.repository_key, projects.created_at
+            FROM projection_projects AS projects
+            JOIN project_worktree_repository_pins AS pins USING(project_id)
+            WHERE projects.deleted_at IS NULL;
+            "#,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2914,7 +2967,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=45).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=46).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2929,6 +2982,9 @@ mod tests {
         );
         assert_eq!(MIGRATIONS[41].name, "ProjectWorktreeRepositoryPins");
         assert_eq!(MIGRATIONS[42].name, "DurableWorktreeRemovalReceipts");
+        assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
+        assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
+        assert_eq!(MIGRATIONS[45].name, "ProjectRepositoryClaims");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);

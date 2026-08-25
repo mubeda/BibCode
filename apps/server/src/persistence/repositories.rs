@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1285,6 +1285,123 @@ pub enum WorktreeRepositoryPinOutcome {
     Established,
     Matched,
     Mismatch { pinned_repository_key: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectRepositoryClaimOutcome {
+    Acquired,
+    Existing {
+        project_id: String,
+        main_thread_id: String,
+    },
+}
+
+pub(crate) fn acquire_project_repository_claim_tx(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    repository_key: &str,
+    claimed_at: &str,
+) -> Result<ProjectRepositoryClaimOutcome> {
+    let inserted = transaction.execute(
+        "INSERT INTO project_repository_claims(project_id, repository_key, claimed_at) \
+         VALUES (?, ?, ?) ON CONFLICT(repository_key) DO NOTHING",
+        params![project_id, repository_key, claimed_at],
+    )?;
+    if inserted == 1 {
+        transaction.execute(
+            "INSERT INTO project_worktree_repository_pins(project_id, repository_key) \
+             VALUES (?, ?) ON CONFLICT(project_id) DO NOTHING",
+            params![project_id, repository_key],
+        )?;
+        let pinned_key = transaction.query_row(
+            "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = ?",
+            [project_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if pinned_key != repository_key {
+            return Err(PersistenceError::Corrupt(format!(
+                "project '{project_id}' acquired repository claim '{repository_key}' but already has worktree repository pin '{pinned_key}'"
+            )));
+        }
+        return Ok(ProjectRepositoryClaimOutcome::Acquired);
+    }
+
+    let mut statement = transaction.prepare(
+        "SELECT projects.project_id, threads.thread_id \
+         FROM project_repository_claims AS claims \
+         JOIN projection_projects AS projects USING(project_id) \
+         JOIN projection_threads AS threads USING(project_id) \
+         WHERE claims.repository_key = ? \
+           AND projects.deleted_at IS NULL \
+           AND threads.kind = 'default' \
+           AND threads.deleted_at IS NULL \
+         ORDER BY projects.project_id ASC, threads.thread_id ASC \
+         LIMIT 2",
+    )?;
+    let winners = statement
+        .query_map([repository_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match winners.as_slice() {
+        [(project_id, main_thread_id)] => Ok(ProjectRepositoryClaimOutcome::Existing {
+            project_id: project_id.clone(),
+            main_thread_id: main_thread_id.clone(),
+        }),
+        [] => Err(PersistenceError::Corrupt(format!(
+            "repository claim '{repository_key}' has no active project with one canonical Main thread"
+        ))),
+        _ => Err(PersistenceError::Corrupt(format!(
+            "repository claim '{repository_key}' resolves to multiple active Main threads"
+        ))),
+    }
+}
+
+pub(crate) fn release_project_repository_claim_tx(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM project_repository_claims WHERE project_id = ?",
+        [project_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn finalize_existing_project_create_receipt_on(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    requested_project_id: &str,
+    winning_project_id: &str,
+    accepted_at: &str,
+    result_sequence: i64,
+    payload_digest: Option<&str>,
+) -> Result<()> {
+    let changed = transaction.execute(
+        "UPDATE orchestration_command_receipts \
+         SET aggregate_id = ?, accepted_at = ?, result_sequence = ?, \
+             status = 'accepted', error = NULL \
+         WHERE command_id = ? \
+           AND aggregate_kind = 'project' \
+           AND aggregate_id = ? \
+           AND status IN ('reserved', 'prepared') \
+           AND payload_digest IS ?",
+        params![
+            winning_project_id,
+            accepted_at,
+            result_sequence,
+            command_id,
+            requested_project_id,
+            payload_digest,
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PersistenceError::CommandReceiptConflict(
+            command_id.to_owned(),
+        ))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionThread {

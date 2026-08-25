@@ -24,10 +24,11 @@ use uuid::Uuid;
 use crate::orchestration::delivery::{CommandAdmission, TurnDeliveryState, TurnDeliveryTransition};
 use crate::persistence::{
     CheckpointDiffBlob, CommandReceipt, CommitFence, Database, NewOrchestrationEvent,
-    OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
-    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
-    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
-    finalize_command_receipt_on,
+    OrchestrationEvent, PersistenceError, ProjectRepositoryClaimOutcome, ProjectionPendingApproval,
+    ProjectionProject, ProjectionState, ProjectionThread, ProjectionThreadActivity,
+    ProjectionThreadMessage, ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn,
+    Repositories, acquire_project_repository_claim_tx, finalize_command_receipt_on,
+    finalize_existing_project_create_receipt_on, release_project_repository_claim_tx,
 };
 use crate::{
     checkpointing,
@@ -272,6 +273,12 @@ pub trait ThreadTurnBootstrapEffects: Send + Sync {
 pub type BoxProjectCommandFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedProjectRepository {
+    pub canonical_workspace_root: String,
+    pub repository_key: Option<String>,
+}
+
 pub trait ProjectCommandEffects: Send + Sync {
     fn normalize_workspace_root_lexically(&self, workspace_root: &str) -> String;
 
@@ -286,7 +293,7 @@ pub trait ProjectCommandEffects: Send + Sync {
         workspace_root: &'a str,
         create_if_missing: bool,
         initialize_git: bool,
-    ) -> BoxProjectCommandFuture<'a, ()>;
+    ) -> BoxProjectCommandFuture<'a, PreparedProjectRepository>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2760,6 +2767,20 @@ async fn process_envelope(
                     requested_id.clone()
                 }
             });
+            let disposition = replay_adoption
+                .as_ref()
+                .map(|result| result.1.clone())
+                .or_else(|| {
+                    requested_project_id.as_ref().map(|requested_id| {
+                        if receipt.aggregate_kind == "project"
+                            && receipt.aggregate_id != *requested_id
+                        {
+                            "existing".to_owned()
+                        } else {
+                            "created".to_owned()
+                        }
+                    })
+                });
             return Ok(ProcessEnvelopeOutcome {
                 result: DispatchResult {
                     sequence: receipt.result_sequence,
@@ -2772,7 +2793,7 @@ async fn process_envelope(
                             })
                         }),
                     project_id,
-                    disposition: replay_adoption.map(|result| result.1),
+                    disposition,
                 },
                 accepted_new: false,
             });
@@ -2897,7 +2918,7 @@ async fn process_envelope(
                     sequence,
                     thread_id: canonical_default_thread_id(model, &existing_project_id),
                     project_id: Some(existing_project_id),
-                    disposition: None,
+                    disposition: Some("existing".to_owned()),
                 },
                 accepted_new: true,
             });
@@ -2979,7 +3000,8 @@ async fn process_envelope(
         project_command_effects,
     )
     .await?;
-    prepare_project_create(&command, project_command_effects).await?;
+    let prepared_project_repository =
+        prepare_project_create(&command, project_command_effects).await?;
     hooks.maybe_pause_before_command_persist().await;
     ensure_command_active(cancellation)?;
     let aggregate = command.aggregate_ref();
@@ -2992,6 +3014,7 @@ async fn process_envelope(
         admission,
         commit_fence,
         projection_mode,
+        prepared_project_repository.as_ref(),
     )
     .await?;
     let adoption_result = worktree_adoption_result(&command, &persisted.committed)?;
@@ -3005,20 +3028,38 @@ async fn process_envelope(
     for event in &persisted.committed {
         let _ = events.send(event.clone());
     }
-    let project_id = project_create_identity.map(|(project_id, _)| project_id);
-    Ok(ProcessEnvelopeOutcome {
-        result: DispatchResult {
-            sequence: persisted.result_sequence,
-            thread_id: adoption_result
+    let requested_project_id = project_create_identity.map(|(project_id, _)| project_id);
+    let (project_id, thread_id, disposition) = match &persisted.project_repository_claim {
+        Some(ProjectRepositoryClaimOutcome::Existing {
+            project_id,
+            main_thread_id,
+        }) => (
+            Some(project_id.clone()),
+            Some(main_thread_id.clone()),
+            Some("existing".to_owned()),
+        ),
+        _ => {
+            let thread_id = adoption_result
                 .as_ref()
                 .map(|result| result.0.clone())
                 .or_else(|| {
-                    project_id
+                    requested_project_id
                         .as_deref()
                         .and_then(|project_id| canonical_default_thread_id(model, project_id))
-                }),
+                });
+            let disposition = adoption_result
+                .as_ref()
+                .map(|result| result.1.clone())
+                .or_else(|| requested_project_id.as_ref().map(|_| "created".to_owned()));
+            (requested_project_id, thread_id, disposition)
+        }
+    };
+    Ok(ProcessEnvelopeOutcome {
+        result: DispatchResult {
+            sequence: persisted.result_sequence,
+            thread_id,
             project_id,
-            disposition: adoption_result.map(|result| result.1),
+            disposition,
         },
         accepted_new: true,
     })
@@ -3271,7 +3312,7 @@ fn apply_prepared_worktree_identity(
 async fn prepare_project_create(
     command: &OrchestrationCommand,
     effects: Option<&dyn ProjectCommandEffects>,
-) -> Result<(), OrchestrationError> {
+) -> Result<Option<PreparedProjectRepository>, OrchestrationError> {
     let (
         Some(effects),
         OrchestrationCommand::ProjectCreate {
@@ -3282,7 +3323,7 @@ async fn prepare_project_create(
         },
     ) = (effects, command)
     else {
-        return Ok(());
+        return Ok(None);
     };
     effects
         .prepare_project_create(
@@ -3291,6 +3332,7 @@ async fn prepare_project_create(
             initialize_git.unwrap_or(false),
         )
         .await
+        .map(Some)
         .map_err(|detail| OrchestrationError::ProjectPreparation { detail })
 }
 
@@ -4451,6 +4493,7 @@ fn required_command_string(
 struct PersistCommandOutcome {
     committed: VecDeque<OrchestrationEvent>,
     result_sequence: i64,
+    project_repository_claim: Option<ProjectRepositoryClaimOutcome>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4463,6 +4506,7 @@ async fn persist_command(
     admission: Option<CommandAdmission>,
     commit_fence: Option<CommitFence>,
     projection_mode: ProjectionMode,
+    prepared_project_repository: Option<&PreparedProjectRepository>,
 ) -> Result<PersistCommandOutcome, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
@@ -4470,10 +4514,68 @@ async fn persist_command(
     let command_id = command_id.to_owned();
     let aggregate_kind = aggregate.0.to_owned();
     let aggregate_id = aggregate.1.to_owned();
+    let prepared_project_repository = prepared_project_repository.cloned();
     let committed = repositories
         .database()
         .call(move |connection| {
             let transaction = connection.transaction()?;
+            let project_repository_claim = match prepared_project_repository
+                .as_ref()
+                .and_then(|prepared| prepared.repository_key.as_deref())
+            {
+                Some(repository_key) if aggregate_kind == "project" => {
+                    let claimed_at = event_list
+                        .last()
+                        .map(|event| event.occurred_at.as_str())
+                        .ok_or_else(|| {
+                            PersistenceError::Corrupt(
+                                "planned project create emitted no events".to_owned(),
+                            )
+                        })?;
+                    let outcome = acquire_project_repository_claim_tx(
+                        &transaction,
+                        &aggregate_id,
+                        repository_key,
+                        claimed_at,
+                    )?;
+                    if let ProjectRepositoryClaimOutcome::Existing {
+                        project_id: winning_project_id,
+                        ..
+                    } = &outcome
+                    {
+                        let result_sequence = transaction.query_row(
+                            "SELECT COALESCE(MAX(sequence), 0) FROM orchestration_events",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        finalize_existing_project_create_receipt_on(
+                            &transaction,
+                            &command_id,
+                            &aggregate_id,
+                            winning_project_id,
+                            claimed_at,
+                            result_sequence,
+                            admission
+                                .as_ref()
+                                .map(|value| value.payload_digest.as_str()),
+                        )?;
+                        hooks.maybe_pause_before_command_finalization();
+                        let _commit_permit = commit_fence
+                            .as_ref()
+                            .map(CommitFence::acquire)
+                            .transpose()?;
+                        hooks.maybe_pause_after_command_finalization();
+                        transaction.commit()?;
+                        return Ok(PersistCommandOutcome {
+                            committed: VecDeque::new(),
+                            result_sequence,
+                            project_repository_claim: Some(outcome),
+                        });
+                    }
+                    Some(outcome)
+                }
+                _ => None,
+            };
             let mut committed = VecDeque::new();
             for planned in &event_list {
                 if projection_mode == ProjectionMode::UpdateExistingAssistantMessage
@@ -4556,6 +4658,7 @@ async fn persist_command(
             Ok(PersistCommandOutcome {
                 committed,
                 result_sequence,
+                project_repository_claim,
             })
         })
         .await
@@ -5202,7 +5305,9 @@ fn apply_projects_projector_tx(
         )?;
         }
         "project.deleted" => {
-            transaction.execute("UPDATE projection_projects SET deleted_at = ?, updated_at = ? WHERE project_id = ?", params![required_str(payload, "deletedAt")?, required_str(payload, "deletedAt")?, required_str(payload, "projectId")?])?;
+            let project_id = required_str(payload, "projectId")?;
+            transaction.execute("UPDATE projection_projects SET deleted_at = ?, updated_at = ? WHERE project_id = ?", params![required_str(payload, "deletedAt")?, required_str(payload, "deletedAt")?, &project_id])?;
+            release_project_repository_claim_tx(transaction, &project_id)?;
         }
         _ => {}
     }
@@ -8891,11 +8996,16 @@ mod tests {
 
         fn prepare_project_create<'a>(
             &'a self,
-            _workspace_root: &'a str,
+            workspace_root: &'a str,
             _create_if_missing: bool,
             _initialize_git: bool,
-        ) -> BoxProjectCommandFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxProjectCommandFuture<'a, PreparedProjectRepository> {
+            Box::pin(async move {
+                Ok(PreparedProjectRepository {
+                    canonical_workspace_root: workspace_root.to_owned(),
+                    repository_key: None,
+                })
+            })
         }
     }
 
@@ -8925,12 +9035,17 @@ mod tests {
 
         fn prepare_project_create<'a>(
             &'a self,
-            _workspace_root: &'a str,
+            workspace_root: &'a str,
             _create_if_missing: bool,
             _initialize_git: bool,
-        ) -> BoxProjectCommandFuture<'a, ()> {
+        ) -> BoxProjectCommandFuture<'a, PreparedProjectRepository> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                Ok(PreparedProjectRepository {
+                    canonical_workspace_root: workspace_root.to_owned(),
+                    repository_key: None,
+                })
+            })
         }
     }
 
@@ -8955,14 +9070,17 @@ mod tests {
 
         fn prepare_project_create<'a>(
             &'a self,
-            _workspace_root: &'a str,
+            workspace_root: &'a str,
             _create_if_missing: bool,
             _initialize_git: bool,
-        ) -> BoxProjectCommandFuture<'a, ()> {
+        ) -> BoxProjectCommandFuture<'a, PreparedProjectRepository> {
             Box::pin(async move {
                 self.prepare_entered.notify_one();
                 self.prepare_release.notified().await;
-                Ok(())
+                Ok(PreparedProjectRepository {
+                    canonical_workspace_root: workspace_root.to_owned(),
+                    repository_key: None,
+                })
             })
         }
     }
