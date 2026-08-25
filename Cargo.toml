@@ -9,6 +9,7 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["form", "http1", "json", "tokio", "ws"] }
 base64 = "0.22.1"
+bytes = "1.12.1"
 block2 = "0.6"
 cairo-rs = { version = "0.18", features = ["png"] }
 clap = { version = "4.6.2", features = ["derive", "env"] }
@@ -19,6 +20,9 @@ getrandom = "0.4.3"
 gtk = "0.18"
 hmac = "0.13.0"
 httpdate = "1.0.3"
+http-body-util = "0.1.4"
+hyper = { version = "1.10.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 junction = "2.0.0"
 keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
 libc = "0.2"

@@ -3,7 +3,6 @@ import {
   type AuthEnvironmentScope,
   type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
-  EnvironmentId,
   type ExecutionEnvironmentDescriptor,
 } from "@bibcode/contracts";
 import * as Context from "effect/Context";
@@ -15,12 +14,6 @@ import type { ConnectionAttemptError } from "../connection/model.ts";
 export interface PreparedSshEnvironment {
   readonly bootstrap: DesktopSshEnvironmentBootstrap;
   readonly bearerToken: string;
-}
-
-export interface ProvisionedSshEnvironment extends PreparedSshEnvironment {
-  readonly environmentId: EnvironmentId;
-  readonly label: string;
-  readonly descriptor: ExecutionEnvironmentDescriptor;
 }
 
 export interface InspectedSshEnvironment {
@@ -53,30 +46,19 @@ export class PrimaryEnvironmentAuth extends Context.Service<
 export class SshEnvironmentGateway extends Context.Service<
   SshEnvironmentGateway,
   {
-    readonly provision: (
-      target: DesktopSshEnvironmentTarget,
-    ) => Effect.Effect<ProvisionedSshEnvironment, ConnectionAttemptError>;
-    readonly prepare: (input: {
-      readonly connectionId: string;
-      readonly expectedEnvironmentId: EnvironmentId;
-      readonly target: DesktopSshEnvironmentTarget;
-    }) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
     /** Establishes host-key-checked transport and reads identity without consuming pairing. */
     readonly inspect: (input: {
-      readonly connectionId: string;
-      readonly expectedEnvironmentId: EnvironmentId;
       readonly target: DesktopSshEnvironmentTarget;
       readonly hostKeyFingerprint: string | null;
-      readonly issuePairingToken: boolean;
       readonly cancellation: AbortSignal;
     }) => Effect.Effect<InspectedSshEnvironment, ConnectionAttemptError>;
-    /** Consumes an inspected one-time credential only after identity verification succeeds. */
-    readonly exchange: (input: {
-      readonly bootstrap: DesktopSshEnvironmentBootstrap;
-      readonly pairingToken: string;
-    }) => Effect.Effect<string, ConnectionAttemptError>;
+    /** Creates and redeems pairing only after the caller accepts the inspected identity. */
+    readonly exchange: (
+      input: InspectedSshEnvironment,
+    ) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
     readonly disconnect: (
       target: DesktopSshEnvironmentTarget,
+      expectedHostKeyFingerprint: string,
     ) => Effect.Effect<void, ConnectionAttemptError>;
   }
 >()("@bibcode/client-runtime/platform/capabilities/SshEnvironmentGateway") {}

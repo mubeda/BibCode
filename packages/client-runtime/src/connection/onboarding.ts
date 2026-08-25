@@ -1,7 +1,7 @@
-import type {
-  DesktopSshEnvironmentTarget,
-  EnvironmentId,
+import {
   ExecutionEnvironmentDescriptor,
+  type DesktopSshEnvironmentTarget,
+  type EnvironmentId,
 } from "@bibcode/contracts";
 import { resolveRemotePairingTarget } from "@bibcode/shared/remote";
 import * as Context from "effect/Context";
@@ -39,6 +39,7 @@ import {
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import { verifyRouteIdentity } from "./storageIdentity.ts";
 
 export interface PairingConnectionInput {
   readonly pairingUrl?: string;
@@ -321,50 +322,155 @@ interface PreparedSshEnrollment {
   readonly sessionSecret: string;
 }
 
-const prepareSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.prepareSshEnrollment")(
+interface InspectedSshEnrollment {
+  readonly registration: SshConnectionRegistration;
+  readonly environment: KnownEnvironment;
+  readonly inspected: ClientCapabilities.InspectedSshEnvironment;
+}
+
+interface ExistingSshTarget {
+  readonly environment: KnownEnvironment;
+  readonly route: SshTunnelRoute;
+}
+
+function sshTargetIdentityKey(target: DesktopSshEnvironmentTarget): string {
+  const alias = target.alias.trim();
+  const destination = (alias || target.hostname.trim()).toLowerCase();
+  return JSON.stringify([destination, target.username?.trim() ?? "", target.port]);
+}
+
+function existingSshTargets(
+  environments: ReadonlyMap<EnvironmentId, KnownEnvironment>,
+  target: DesktopSshEnvironmentTarget,
+): ReadonlyArray<ExistingSshTarget> {
+  const targetKey = sshTargetIdentityKey(target);
+  const matches: ExistingSshTarget[] = [];
+  for (const environment of environments.values()) {
+    for (const route of environment.routes) {
+      if (route._tag === "SshTunnelRoute" && sshTargetIdentityKey(route.target) === targetKey) {
+        matches.push({ environment, route });
+      }
+    }
+  }
+  return matches;
+}
+
+const decodeSshDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+
+const inspectSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.inspectSshEnrollment")(
   function* (input: SshConnectionInput) {
     const gateway = yield* ClientCapabilities.SshEnvironmentGateway;
-    const provisioned = yield* gateway.provision(input.target);
-    const connectionId = `ssh:${provisioned.environmentId}`;
-    const label = input.label?.trim() || provisioned.label || provisioned.bootstrap.target.alias;
-
+    const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+    const environments = yield* SubscriptionRef.get(registry.environments);
+    const matchingTargets = existingSshTargets(environments, input.target);
+    if (matchingTargets.length > 1) {
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "This SSH target is already associated with multiple saved environments.",
+      });
+    }
+    const existingTarget = matchingTargets[0];
+    const inspected = yield* gateway.inspect({
+      target: input.target,
+      hostKeyFingerprint: existingTarget?.route.hostKeyFingerprint ?? null,
+      cancellation: new AbortController().signal,
+    });
+    const descriptor = yield* Effect.try({
+      try: () => decodeSshDescriptor(inspected.descriptor),
+      catch: () =>
+        new ConnectionBlockedError({
+          reason: "configuration",
+          detail: "The SSH environment returned an invalid identity descriptor.",
+        }),
+    });
+    if (descriptor.transport?.mode !== "loopback-http") {
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "SSH enrollment requires a loopback HTTP tunnel descriptor.",
+      });
+    }
+    if (
+      existingTarget?.route.hostKeyFingerprint !== null &&
+      existingTarget?.route.hostKeyFingerprint !== undefined &&
+      inspected.bootstrap.hostKeyFingerprint !== existingTarget.route.hostKeyFingerprint
+    ) {
+      return yield* new ConnectionBlockedError({
+        reason: "environment-changed",
+        detail: "The SSH target reported a different host-key fingerprint.",
+      });
+    }
+    const connectionId = `ssh:${descriptor.environmentId}`;
+    const label = input.label?.trim() || descriptor.label || inspected.bootstrap.target.alias;
+    const route = new SshTunnelRoute({
+      routeId: connectionId,
+      environmentId: descriptor.environmentId,
+      label,
+      priority: 0,
+      pinned: false,
+      autoconnect: true,
+      secretRef: null,
+      target: inspected.bootstrap.target,
+      hostKeyFingerprint: inspected.bootstrap.hostKeyFingerprint,
+    });
+    const acceptedEnvironment =
+      existingTarget?.environment ?? environments.get(descriptor.environmentId);
+    yield* verifyRouteIdentity({
+      environment:
+        acceptedEnvironment ??
+        ({
+          environmentId: descriptor.environmentId,
+          acceptedStorageInstanceId: descriptor.storageInstanceId,
+          descriptor,
+          alias: label,
+          hidden: false,
+          bindings: [],
+          routes: [route],
+        } satisfies KnownEnvironment),
+      route: existingTarget?.route ?? route,
+      descriptor,
+      transportTrust: "ssh-host-key",
+    });
     const registration = new SshConnectionRegistration({
       target: new SshConnectionTarget({
-        environmentId: provisioned.environmentId,
+        environmentId: descriptor.environmentId,
         label,
         connectionId,
       }),
       profile: new SshConnectionProfile({
         connectionId,
-        environmentId: provisioned.environmentId,
+        environmentId: descriptor.environmentId,
         label,
-        target: provisioned.bootstrap.target,
+        target: inspected.bootstrap.target,
       }),
     });
     return {
       registration,
       environment: {
-        environmentId: provisioned.descriptor.environmentId,
-        acceptedStorageInstanceId: provisioned.descriptor.storageInstanceId,
-        descriptor: provisioned.descriptor,
+        environmentId: descriptor.environmentId,
+        acceptedStorageInstanceId: descriptor.storageInstanceId,
+        descriptor,
         alias: label,
         hidden: false,
         bindings: [],
-        routes: [
-          new SshTunnelRoute({
-            routeId: connectionId,
-            environmentId: provisioned.descriptor.environmentId,
-            label,
-            priority: 0,
-            pinned: false,
-            autoconnect: true,
-            secretRef: null,
-            target: provisioned.bootstrap.target,
-            hostKeyFingerprint: null,
-          }),
-        ],
+        routes: [route],
       },
-      sessionSecret: provisioned.bearerToken,
+      inspected: {
+        bootstrap: inspected.bootstrap,
+        descriptor,
+      },
+    } satisfies InspectedSshEnrollment;
+  },
+);
+
+const prepareSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.prepareSshEnrollment")(
+  function* (input: SshConnectionInput) {
+    const inspectedEnrollment = yield* inspectSshEnrollment(input);
+    const gateway = yield* ClientCapabilities.SshEnvironmentGateway;
+    const exchanged = yield* gateway.exchange(inspectedEnrollment.inspected);
+    return {
+      registration: inspectedEnrollment.registration,
+      environment: inspectedEnrollment.environment,
+      sessionSecret: exchanged.bearerToken,
     } satisfies PreparedSshEnrollment;
   },
 );
@@ -372,7 +478,7 @@ const prepareSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.prep
 export const prepareSshRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.prepareSshRegistration",
 )(function* (input: SshConnectionInput) {
-  return (yield* prepareSshEnrollment(input)).registration;
+  return (yield* inspectSshEnrollment(input)).registration;
 });
 
 export const registerSshConnection = Effect.fn(

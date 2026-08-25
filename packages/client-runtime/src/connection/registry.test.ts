@@ -46,6 +46,7 @@ import {
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  SshTunnelRoute,
   type ConnectionTarget,
   type PreparedConnection,
   type SupervisorConnectionState,
@@ -176,8 +177,10 @@ const SSH_TARGET: DesktopSshEnvironmentTarget = {
   username: "developer",
   port: 22,
 };
+const SSH_ENVIRONMENT_ID = DurableEnvironmentId.make("00000000-0000-4000-8000-000000000093");
+const SSH_HOST_KEY_FINGERPRINT = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const SSH_CONNECTION = new SshConnectionTarget({
-  environmentId: EnvironmentId.make("environment-ssh"),
+  environmentId: SSH_ENVIRONMENT_ID,
   label: "SSH environment",
   connectionId: "ssh-connection",
 });
@@ -187,6 +190,27 @@ const SSH_PROFILE = new SshConnectionProfile({
   label: SSH_CONNECTION.label,
   target: SSH_TARGET,
 });
+const SSH_NORMALIZED_ENVIRONMENT = {
+  environmentId: SSH_ENVIRONMENT_ID,
+  acceptedStorageInstanceId: "00000000-0000-4000-8000-000000000094",
+  descriptor: null,
+  alias: SSH_CONNECTION.label,
+  hidden: false,
+  bindings: [],
+  routes: [
+    new SshTunnelRoute({
+      routeId: SSH_CONNECTION.connectionId,
+      environmentId: SSH_ENVIRONMENT_ID,
+      label: SSH_CONNECTION.label,
+      priority: 0,
+      pinned: false,
+      autoconnect: true,
+      secretRef: null,
+      target: SSH_TARGET,
+      hostKeyFingerprint: SSH_HOST_KEY_FINGERPRINT,
+    }),
+  ],
+} as KnownEnvironment;
 
 const CACHED_SNAPSHOT: OrchestrationShellSnapshot = {
   snapshotSequence: 1,
@@ -299,7 +323,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       ],
     ]),
   );
-  const disconnectedSshTargets = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
+  const disconnectedSshTargets = yield* Ref.make<
+    ReadonlyArray<{
+      readonly target: DesktopSshEnvironmentTarget;
+      readonly hostKeyFingerprint: string;
+    }>
+  >([]);
   const acceptedStorageIdentities = yield* Ref.make(new Map<string, string>());
   const acceptedStorageIdentityWrites = yield* Ref.make<
     ReadonlyArray<Persistence.AcceptedStorageIdentity>
@@ -650,11 +679,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       }),
   });
   const sshGateway = ClientCapabilities.SshEnvironmentGateway.of({
-    provision: () => Effect.die(new Error("SSH provisioning is not used.")),
-    prepare: () => Effect.die(new Error("SSH preparation is not used.")),
     inspect: () => Effect.die(new Error("SSH inspection is not used.")),
     exchange: () => Effect.die(new Error("SSH exchange is not used.")),
-    disconnect: (target) => Ref.update(disconnectedSshTargets, (current) => [...current, target]),
+    disconnect: (target, hostKeyFingerprint) =>
+      Ref.update(disconnectedSshTargets, (current) => [...current, { target, hostKeyFingerprint }]),
   });
   const driver = ConnectionDriver.ConnectionDriver.of({
     connect: (input, reportProgress) =>
@@ -1858,7 +1886,7 @@ describe("EnvironmentRegistry", () => {
       }),
   );
 
-  it.effect("removes all owned SSH state only on explicit removal", () =>
+  it.effect("removes legacy SSH state without inventing a missing host-key pin", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(
         [SSH_CONNECTION],
@@ -1885,7 +1913,31 @@ describe("EnvironmentRegistry", () => {
         expect((yield* Ref.get(harness.storedRemoteTokens)).has(SSH_CONNECTION.environmentId)).toBe(
           false,
         );
-        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("disconnects a normalized SSH route only with its saved host-key pin", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [SSH_NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* registry.remove(SSH_ENVIRONMENT_ID);
+
+        expect((yield* Ref.get(harness.storedEnvironments)).has(SSH_ENVIRONMENT_ID)).toBe(false);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([SSH_ENVIRONMENT_ID]);
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([
+          {
+            target: SSH_TARGET,
+            hostKeyFingerprint: SSH_HOST_KEY_FINGERPRINT,
+          },
+        ]);
       }).pipe(Effect.provide(harness.layer));
     }),
   );

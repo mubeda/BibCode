@@ -452,7 +452,7 @@ artifact.
 - Modify: `packages/contracts/src/ipc.ts`
 - Test: `apps/desktop/src-tauri/tests/ssh_public_contract.rs`
 
-- [ ] **Step 1: Write a failing ordering test**
+- [x] **Step 1: Write a failing ordering test**
 
 Record operations and require:
 
@@ -463,7 +463,7 @@ sshTrust -> probe -> ensureServer -> openTunnel -> fetchDescriptor
 
 Assert descriptor/storage/version/TLS failures never call pairing creation or redemption.
 
-- [ ] **Step 2: Replace `ensure_environment(issuePairingToken)` with staged methods**
+- [x] **Step 2: Replace `ensure_environment(issuePairingToken)` with staged methods**
 
 ```rust
 pub async fn probe(&self, target: &SshEnvironmentTarget) -> Result<RemoteHostProbe, SshError>;
@@ -473,15 +473,15 @@ pub async fn create_pairing(&self, target: &SshEnvironmentTarget) -> Result<Secr
 
 Remove `pairingToken` from `DesktopSshEnvironmentBootstrap`; a pairing credential is returned only from the explicit post-verification command and passed directly to secure redemption/storage.
 
-- [ ] **Step 3: Preserve native host-key policy**
+- [x] **Step 3: Preserve native host-key policy**
 
 Use the user's OpenSSH config and known_hosts resolution, never suppress host checking, surface changed/unknown-key results distinctly, and record only a non-secret host-key fingerprint after successful trust.
 
-- [ ] **Step 4: Update the client platform flow**
+- [x] **Step 4: Update the client platform flow**
 
 Delete the current `ensure -> pairing -> descriptor` ordering. Feed tunnel metadata into Plan 20 route verification, compare the descriptor to any accepted identities, then request/redeem pairing and immediately put resulting secret material in the OS secret provider.
 
-- [ ] **Step 5: Run SSH ordering and platform tests and commit**
+- [x] **Step 5: Run SSH ordering and platform tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
@@ -489,6 +489,27 @@ vp test apps/web/src/connection/platform.test.ts
 git add apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/tests/ssh_public_contract.rs apps/web/src/connection/platform.ts apps/web/src/connection/platform.test.ts packages/contracts/src/ipc.ts
 git commit -m "fix(ssh): verify remote identity before pairing"
 ```
+
+Implementation note: SSH registration now has explicit trust, probe, managed
+server launch, loopback tunnel, descriptor verification, pairing creation, and
+credential redemption stages. OpenSSH host-key policy is enforced before any
+password-capable work, saved routes re-pin the exact SHA-256 fingerprint, and
+private BiBCode SSH variables cannot leak through the ambient environment or
+`SendEnv`. Descriptor verification and one-time pairing redemption share one
+non-reconnecting HTTP/1.1 connection through the original tunnel, followed by
+an exact active-bootstrap check before credential creation. Disconnect also
+validates the saved fingerprint before removing an active tunnel. Managed
+remote launch currently supports Linux-like POSIX hosts and fails closed when
+neither `ss` nor readable Linux procfs can prove a loopback port free; the
+macOS and Windows adapters remain Task 7 work.
+
+Validation passed 355 complete desktop unit tests, 5 SSH and 4 bridge public
+contract tests, 172 focused TypeScript tests, the three server startup-pairing
+and CLI checks, desktop all-target Clippy with warnings denied, Rust formatting,
+`vp check`, and the complete workspace typecheck graph. `vp check` retains one
+pre-existing unused test-fixture warning. Independent review found no remaining
+Critical or Important issues and confirmed that no SSH pairing credential
+crosses into JavaScript.
 
 ### Task 7: Add Linux, macOS, and Windows remote adapters and consent-based install
 

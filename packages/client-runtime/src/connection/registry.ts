@@ -1156,8 +1156,10 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
         };
         yield* environmentCatalog.updateRoutes(environmentId, next.routes);
         yield* installEnvironmentLocked(next, null);
-        if (removedRoute._tag === "SshTunnelRoute") {
-          yield* ssh.disconnect(removedRoute.target).pipe(Effect.ignore);
+        if (removedRoute._tag === "SshTunnelRoute" && removedRoute.hostKeyFingerprint !== null) {
+          yield* ssh
+            .disconnect(removedRoute.target, removedRoute.hostKeyFingerprint)
+            .pipe(Effect.ignore);
         }
       }),
     );
@@ -1227,13 +1229,25 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     });
     yield* setAdmissionPhase(environmentId, generation, "forgotten");
 
-    const sshTargets = environment.routes
-      .filter((route) => route._tag === "SshTunnelRoute")
-      .map((route) => route.target);
-    yield* Effect.forEach(sshTargets, (target) => ssh.disconnect(target).pipe(Effect.ignore), {
-      concurrency: "unbounded",
-      discard: true,
-    });
+    const sshTargets = environment.routes.flatMap((route) =>
+      route._tag === "SshTunnelRoute" && route.hostKeyFingerprint !== null
+        ? [
+            {
+              target: route.target,
+              hostKeyFingerprint: route.hostKeyFingerprint,
+            },
+          ]
+        : [],
+    );
+    yield* Effect.forEach(
+      sshTargets,
+      ({ target, hostKeyFingerprint }) =>
+        ssh.disconnect(target, hostKeyFingerprint).pipe(Effect.ignore),
+      {
+        concurrency: "unbounded",
+        discard: true,
+      },
+    );
   });
 
   const forget = Effect.fn("EnvironmentRegistry.forget")(function* (environmentId: EnvironmentId) {
@@ -1319,9 +1333,10 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           return next;
         });
 
-        const normalizedSshTarget = environment.routes.find(
+        const normalizedSshRoute = environment.routes.find(
           (route) => route._tag === "SshTunnelRoute",
-        )?.target;
+        );
+        const normalizedSshTarget = normalizedSshRoute?.target;
         const legacySshTarget =
           target._tag === "SshConnectionTarget" &&
           Option.isSome(legacyProfile) &&
@@ -1329,8 +1344,9 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
             ? legacyProfile.value.target
             : null;
         const sshTarget = normalizedSshTarget ?? legacySshTarget;
-        if (sshTarget !== null && sshTarget !== undefined) {
-          yield* ssh.disconnect(sshTarget).pipe(
+        const sshHostKeyFingerprint = normalizedSshRoute?.hostKeyFingerprint ?? null;
+        if (sshTarget !== null && sshTarget !== undefined && sshHostKeyFingerprint !== null) {
+          yield* ssh.disconnect(sshTarget, sshHostKeyFingerprint).pipe(
             Effect.tapError((error) =>
               Effect.logWarning("Could not disconnect the managed SSH environment.", {
                 environmentId,

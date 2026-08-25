@@ -104,9 +104,13 @@ option. Exact commands and platform accounts are in
 
 ## Pairing
 
-On startup in authenticated web mode, the server issues an owner pairing
-credential. The credential is carried in the URL fragment so it is not sent as
-part of the initial HTTP request:
+By default, foreground authenticated web startup issues an owner pairing
+credential. `serve --no-startup-pairing` and
+`BIBCODE_NO_STARTUP_PAIRING=1` suppress it without disabling authentication;
+managed services and desktop/SSH-managed launches always suppress it. Create
+access later through `bibcode auth pairing create` on the server host. When a
+startup pairing is issued, its credential is carried in the URL fragment so it
+is not sent as part of the initial HTTP request:
 
 ```text
 https://server.example:3773/pair#token=PAIRING_CREDENTIAL
@@ -158,7 +162,7 @@ minutes to recover the same logical session. Retrying with a different key or
 without DPoP is rejected. WebSocket tickets are also one-use, and revoking a
 client closes its active socket rather than waiting for its next request.
 
-## Browser/hosted and future re-enabled desktop-managed SSH status
+## Browser/hosted and staged desktop-managed SSH status
 
 The desktop contains an SSH launcher that can install a small runner under
 `~/.bibcode-ssh-launch/<state-key>`, start or reuse `bibcode serve` on remote
@@ -166,12 +170,54 @@ loopback, and create a local port forward. The remote host must provide:
 
 - a compatible native `bibcode` executable on non-interactive `sh`'s `PATH`;
 - `curl` or `wget` for the readiness probe; and
+- `ss` or readable Linux `/proc/net/tcp` (and optionally `tcp6`) for safe
+  managed-port selection; and
 - each provider CLI and its credentials.
 
-The native pairing command now exists, but end-to-end setup of a new SSH
-environment remains unavailable until the desktop provisioning and
-loopback-forwarding work described in the current environment-management plan
-lands. Do not rely on the SSH **Add environment** flow yet.
+The staged desktop engine now preserves the user's OpenSSH configuration and
+`known_hosts` policy, distinguishes an unknown key from a changed key, records
+the successfully observed fingerprint, establishes a numeric-loopback forward,
+and verifies the environment UUID, storage UUID, and protocol before pairing.
+The native host opens one retained TCP stream through the verified tunnel,
+refetches the exact descriptor on that stream, then creates and redeems the
+pairing over the same connection. A tunnel exit or local forwarding-port reuse
+therefore fails rather than sending the raw one-time value to a replacement
+listener, and the pairing value never enters the web UI. The resulting
+administrator session is stored through the OS secret provider before the
+normalized route is published.
+
+BiBCode resolves the effective target configuration with bounded `ssh -G`
+before password-capable work. It keeps normal user/system `known_hosts`
+authoritative and adds a no-key-emitting destination checker that compares
+OpenSSH's SHA-256 fingerprint before user authentication. A configured custom
+`KnownHostsCommand` is not composable safely and is rejected with guidance; use
+ordinary `UserKnownHostsFile`/system host-key policy for this target. Broad or
+matching `SendEnv` rules that could forward BiBCode's private password or
+host-key control variables are also rejected. Narrow `SendEnv` to unrelated
+values such as locale variables before retrying.
+
+ProxyJump and ProxyCommand targets work only when the entire chain can use SSH
+keys or an agent. BiBCode does not ask for or reuse a destination password on a
+proxied route because the proxy process would inherit the password helper.
+Direct, non-proxied SSH targets may still use the desktop password prompt.
+
+An unknown host key requires the user to verify and accept the host through
+their normal OpenSSH workflow. A changed or revoked host key is a security
+event: stop, verify the remote host and expected key through a separate trusted
+channel, and update `known_hosts` only after that verification. BiBCode offers
+no bypass. A saved route also rejects a fingerprint that differs from the one
+accepted during enrollment.
+
+Desktop **Add environment > SSH** is available when the remote host already
+exposes a compatible native `bibcode` CLI and the current Linux-like POSIX `sh`
+command surface through OpenSSH. Safe managed-port selection fails closed when
+neither `ss` nor readable Linux procfs is present, or when the installed `ss`
+cannot run the required filtered listener query. Automatic remote installation
+and the native macOS and Windows adapters are not available yet: an incompatible
+host produces guidance and BiBCode does not silently download or run
+Node.js/package-manager fallbacks. A pre-v3 SSH entry without a saved host-key
+pin can be removed locally, but BiBCode will not guess a pin or run a remote
+stop; re-enroll it before remote administration.
 
 The launcher does not install Node.js, npm, npx, package-manager shims, or a
 BiBCode binary on the remote host.

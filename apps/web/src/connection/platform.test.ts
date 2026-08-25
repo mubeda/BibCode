@@ -142,8 +142,8 @@ import {
   canRetainCachedPlatformRegistrationAfterRefreshFailure,
   canReuseCachedPlatformRegistration,
   connectionPlatformLayer,
+  exchangeDesktopSshEnvironment,
   primaryRegistrationToRetainAfterTopologyRead,
-  provisionDesktopSshEnvironment,
   readPrimaryEnvironmentTargetResult,
   secondaryRegistrationsToRetainAfterTopologyRead,
   secondaryBearerExpiresAtEpochMs,
@@ -157,10 +157,27 @@ const TARGET: DesktopSshEnvironmentTarget = {
   port: 22,
 };
 
-const PREPARE_INPUT = {
-  connectionId: "ssh-connection",
-  expectedEnvironmentId: EnvironmentId.make("environment-ssh"),
+const SSH_DESCRIPTOR = {
+  environmentId: EnvironmentId.make("environment-ssh"),
+  label: "SSH environment",
+  platform: { os: "linux" as const, arch: "x64" as const },
+  serverVersion: "0.0.0-test",
+  storageInstanceId: "00000000-0000-4000-8000-000000000052",
+  protocol: { minimum: 1, maximum: 1 },
+  capabilities: {
+    repositoryIdentity: true,
+    worktreeCatalog: false,
+    worktreeCatalogRefreshReason: false,
+    vcsStatusSummary: false,
+    activityProtocolVersion: null,
+  },
+};
+
+const SSH_BOOTSTRAP = {
   target: TARGET,
+  httpBaseUrl: "http://127.0.0.1:3201/",
+  wsBaseUrl: "ws://127.0.0.1:3201/",
+  hostKeyFingerprint: "SHA256:known-host-key",
 };
 
 class ReadClerkTokenError extends Data.TaggedError("ReadClerkTokenError")<{
@@ -170,7 +187,7 @@ class ReadClerkTokenError extends Data.TaggedError("ReadClerkTokenError")<{
 interface BridgeOptions {
   readonly failDescriptor?: boolean;
   readonly failEnsure?: unknown;
-  readonly pairingToken?: string | null;
+  readonly accessToken?: string | null;
   readonly failBearer?: boolean;
   readonly failDisconnect?: boolean;
 }
@@ -186,7 +203,7 @@ function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge
         target,
         httpBaseUrl: "http://127.0.0.1:3201/",
         wsBaseUrl: "ws://127.0.0.1:3201/",
-        pairingToken: options.pairingToken === undefined ? "pairing-token" : options.pairingToken,
+        hostKeyFingerprint: "SHA256:known-host-key",
       };
     },
     fetchSshEnvironmentDescriptor: async () => {
@@ -210,13 +227,17 @@ function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge
         },
       };
     },
-    bootstrapSshBearerSession: async () => {
+    pairSshEnvironment: async () => {
+      calls.push("pairing");
+      if (options.accessToken === null) {
+        return null as never;
+      }
       calls.push("token");
       if (options.failBearer === true) {
         throw new Error("bearer denied");
       }
       return {
-        access_token: "bearer-token",
+        access_token: options.accessToken ?? "bearer-token",
         issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
         token_type: "Bearer",
         expires_in: 3_600,
@@ -326,69 +347,39 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("desktop SSH pairing", () => {
-  it.effect("fetches the descriptor before consuming the one-time credential", () =>
+  it.effect("exchanges only the identity already inspected by the caller", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
-      const provisioned = yield* provisionDesktopSshEnvironment(makeBridge(calls), TARGET);
-      expect(provisioned.environmentId).toBe(EnvironmentId.make("environment-ssh"));
-      expect(calls).toEqual(["ensure", "descriptor", "token"]);
+      const prepared = yield* exchangeDesktopSshEnvironment(makeBridge(calls), {
+        bootstrap: SSH_BOOTSTRAP,
+        descriptor: SSH_DESCRIPTOR,
+      });
+      expect(prepared.bearerToken).toBe("bearer-token");
+      expect(calls).toEqual(["pairing", "token"]);
     }),
   );
 
-  it.effect("does not consume the credential when descriptor discovery fails", () =>
+  it.effect("blocks exchange when the SSH environment issues no paired session", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
-      yield* provisionDesktopSshEnvironment(
-        makeBridge(calls, { failDescriptor: true }),
-        TARGET,
-      ).pipe(Effect.flip);
-      expect(calls).toEqual(["ensure", "descriptor"]);
-    }),
-  );
-
-  it.effect("blocks provisioning when the SSH environment issues no pairing token", () =>
-    Effect.gen(function* () {
-      const calls: string[] = [];
-      const error = yield* provisionDesktopSshEnvironment(
-        makeBridge(calls, { pairingToken: null }),
-        TARGET,
-      ).pipe(Effect.flip);
+      const error = yield* exchangeDesktopSshEnvironment(makeBridge(calls, { accessToken: null }), {
+        bootstrap: SSH_BOOTSTRAP,
+        descriptor: SSH_DESCRIPTOR,
+      }).pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionBlockedError);
-      expect(calls).toEqual(["ensure"]);
+      expect(calls).toEqual(["pairing"]);
     }),
   );
 
-  it.effect("maps a cancelled preparation to an authentication block", () =>
+  it.effect("propagates a bearer-session failure while exchanging", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
-      const error = yield* provisionDesktopSshEnvironment(
-        makeBridge(calls, { failEnsure: new Error("User cancelled the prompt") }),
-        TARGET,
-      ).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionBlockedError);
-    }),
-  );
-
-  it.effect("maps a non-cancel preparation failure to a transient error", () =>
-    Effect.gen(function* () {
-      const calls: string[] = [];
-      const error = yield* provisionDesktopSshEnvironment(
-        makeBridge(calls, { failEnsure: "boom" }),
-        TARGET,
-      ).pipe(Effect.flip);
+      const error = yield* exchangeDesktopSshEnvironment(makeBridge(calls, { failBearer: true }), {
+        bootstrap: SSH_BOOTSTRAP,
+        descriptor: SSH_DESCRIPTOR,
+      }).pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionTransientError);
-    }),
-  );
-
-  it.effect("propagates a bearer-session failure while preparing", () =>
-    Effect.gen(function* () {
-      const calls: string[] = [];
-      const error = yield* provisionDesktopSshEnvironment(
-        makeBridge(calls, { failBearer: true }),
-        TARGET,
-      ).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionTransientError);
-      expect(calls).toEqual(["ensure", "descriptor", "token"]);
+      expect(calls).toEqual(["pairing", "token"]);
     }),
   );
 });
@@ -624,50 +615,59 @@ describe("connectionPlatformLayer primary bearer credential", () => {
 });
 
 describe("connectionPlatformLayer ssh gateway", () => {
-  it.effect("provisions through the desktop bridge", () => {
-    const bridge = makeBridge([]);
+  it.effect("inspects through the desktop bridge without pairing", () => {
+    const calls: string[] = [];
+    const bridge = makeBridge(calls);
     stubBrowser({ desktopBridge: bridge });
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      const provisioned = yield* ssh.provision(TARGET);
-      expect(provisioned.environmentId).toBe(EnvironmentId.make("environment-ssh"));
+      const inspected = yield* ssh.inspect({
+        target: TARGET,
+        hostKeyFingerprint: "SHA256:known-host-key",
+        cancellation: new AbortController().signal,
+      });
+      expect(inspected.descriptor.environmentId).toBe(EnvironmentId.make("environment-ssh"));
+      expect(calls).toEqual(["ensure", "descriptor"]);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
-  it.effect("blocks provisioning when no desktop bridge is present", () => {
+  it.effect("blocks inspection when no desktop bridge is present", () => {
     stubBrowser();
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      const error = yield* ssh.provision(TARGET).pipe(Effect.flip);
+      const error = yield* ssh
+        .inspect({
+          target: TARGET,
+          hostKeyFingerprint: null,
+          cancellation: new AbortController().signal,
+        })
+        .pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionBlockedError);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
-  it.effect("prepares an SSH bearer session through the desktop bridge", () => {
-    const bridge = makeBridge([]);
+  it.effect("exchanges an accepted inspection through the desktop bridge", () => {
+    const calls: string[] = [];
+    const bridge = makeBridge(calls);
     stubBrowser({ desktopBridge: bridge });
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      const prepared = yield* ssh.prepare(PREPARE_INPUT);
+      const prepared = yield* ssh.exchange({
+        bootstrap: SSH_BOOTSTRAP,
+        descriptor: SSH_DESCRIPTOR,
+      });
       expect(prepared.bearerToken).toBe("bearer-token");
+      expect(calls).toEqual(["pairing", "token"]);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
-  it.effect("blocks preparation when no desktop bridge is present", () => {
+  it.effect("blocks exchange when no desktop bridge is present", () => {
     stubBrowser();
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      const error = yield* ssh.prepare(PREPARE_INPUT).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionBlockedError);
-    }).pipe(Effect.provide(connectionPlatformLayer));
-  });
-
-  it.effect("blocks preparation when the bridge issues no pairing token", () => {
-    const bridge = makeBridge([], { pairingToken: null });
-    stubBrowser({ desktopBridge: bridge });
-    return Effect.gen(function* () {
-      const ssh = yield* SshEnvironmentGateway;
-      const error = yield* ssh.prepare(PREPARE_INPUT).pipe(Effect.flip);
+      const error = yield* ssh
+        .exchange({ bootstrap: SSH_BOOTSTRAP, descriptor: SSH_DESCRIPTOR })
+        .pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionBlockedError);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
@@ -678,7 +678,7 @@ describe("connectionPlatformLayer ssh gateway", () => {
     stubBrowser({ desktopBridge: bridge });
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      yield* ssh.disconnect(TARGET);
+      yield* ssh.disconnect(TARGET, "SHA256:saved");
       expect(calls).toContain("disconnect");
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
@@ -687,7 +687,7 @@ describe("connectionPlatformLayer ssh gateway", () => {
     stubBrowser();
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      yield* ssh.disconnect(TARGET);
+      yield* ssh.disconnect(TARGET, "SHA256:saved");
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
@@ -696,7 +696,7 @@ describe("connectionPlatformLayer ssh gateway", () => {
     stubBrowser({ desktopBridge: bridge });
     return Effect.gen(function* () {
       const ssh = yield* SshEnvironmentGateway;
-      const error = yield* ssh.disconnect(TARGET).pipe(Effect.flip);
+      const error = yield* ssh.disconnect(TARGET, "SHA256:saved").pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionTransientError);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });

@@ -45,7 +45,6 @@ import {
   SshConnectionTarget as SshConnectionTargetClass,
   type ConnectionAttemptError,
 } from "./model.ts";
-import * as ConnectionProfileStore from "./profileStore.ts";
 import * as Persistence from "../platform/persistence.ts";
 import { deriveWsBaseUrl } from "../environment/endpoint.ts";
 import { verifyRouteIdentity } from "./storageIdentity.ts";
@@ -299,61 +298,35 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
   }, Effect.withSpan("clientRuntime.connection.broker.relay"));
 });
 
-const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(function* () {
-  const profiles = yield* ConnectionProfileStore.ConnectionProfileStore;
-  const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
-  const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
-
-  return Effect.fn("clientRuntime.connection.broker.ssh")(function* (
-    entry: ConnectionCatalogEntry & { readonly target: SshConnectionTarget },
-  ) {
-    const target = entry.target;
-    const profile = yield* Option.match(entry.profile, {
-      onNone: () => Effect.fail(profileMissingError(target.connectionId)),
-      onSome: Effect.succeed,
-    });
-    if (!isSshProfile(profile)) {
+const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(() =>
+  Effect.succeed(
+    Effect.fn("clientRuntime.connection.broker.ssh")(function* (
+      entry: ConnectionCatalogEntry & { readonly target: SshConnectionTarget },
+    ) {
+      const target = entry.target;
+      const profile = yield* Option.match(entry.profile, {
+        onNone: () => Effect.fail(profileMissingError(target.connectionId)),
+        onSome: Effect.succeed,
+      });
+      if (!isSshProfile(profile)) {
+        return yield* new ConnectionBlockedError({
+          reason: "configuration",
+          detail: `Connection profile ${target.connectionId} is not an SSH connection.`,
+        });
+      }
+      if (profile.environmentId !== target.environmentId) {
+        return yield* environmentMismatchError({
+          expected: target.environmentId,
+          actual: profile.environmentId,
+        });
+      }
       return yield* new ConnectionBlockedError({
         reason: "configuration",
-        detail: `Connection profile ${target.connectionId} is not an SSH connection.`,
+        detail: `${target.label} is a pre-v3 SSH entry and must be migrated or explicitly re-enrolled before pairing.`,
       });
-    }
-    if (profile.environmentId !== target.environmentId) {
-      return yield* environmentMismatchError({
-        expected: target.environmentId,
-        actual: profile.environmentId,
-      });
-    }
-    const prepared = yield* ssh.prepare({
-      connectionId: target.connectionId,
-      expectedEnvironmentId: target.environmentId,
-      target: profile.target,
-    });
-    yield* profiles.put(
-      new SshConnectionProfile({
-        connectionId: profile.connectionId,
-        environmentId: profile.environmentId,
-        label: profile.label,
-        target: prepared.bootstrap.target,
-      }),
-    );
-    const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
-      httpBaseUrl: prepared.bootstrap.httpBaseUrl,
-      wsBaseUrl: prepared.bootstrap.wsBaseUrl,
-      bearerToken: prepared.bearerToken,
-    });
-    return {
-      environmentId: authorized.environmentId,
-      label: authorized.label,
-      descriptor: authorized.descriptor,
-      httpBaseUrl: authorized.httpBaseUrl,
-      socketUrl: authorized.socketUrl,
-      httpAuthorization: authorized.httpAuthorization,
-      target,
-    } satisfies PreparedConnection;
-  });
-});
+    }),
+  ),
+);
 
 export const make = Effect.gen(function* () {
   const primary = yield* makePrimaryBroker();
@@ -436,6 +409,15 @@ export const make = Effect.gen(function* () {
         detail: `${route.label} does not belong to the selected environment.`,
       });
     }
+    if (
+      route._tag === "SshTunnelRoute" &&
+      (route.hostKeyFingerprint === null || route.secretRef === null)
+    ) {
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: `${route.label} must be explicitly re-enrolled before SSH pairing so its host fingerprint and administrator session can be persisted.`,
+      });
+    }
     if (cancellation.aborted) {
       return yield* Effect.interrupt;
     }
@@ -469,11 +451,8 @@ export const make = Effect.gen(function* () {
         break;
       case "SshTunnelRoute": {
         const inspected = yield* routeSsh.inspect({
-          connectionId: route.routeId,
-          expectedEnvironmentId: environment.environmentId,
           target: route.target,
           hostKeyFingerprint: route.hostKeyFingerprint,
-          issuePairingToken: route.secretRef === null,
           cancellation,
         });
         sshBootstrap = inspected.bootstrap;
@@ -560,18 +539,13 @@ export const make = Effect.gen(function* () {
             detail: `${route.label} did not establish an SSH tunnel.`,
           });
         }
-        const bearerToken =
-          route.secretRef === null
-            ? sshBootstrap.pairingToken === null
-              ? yield* new ConnectionBlockedError({
-                  reason: "authentication",
-                  detail: `${route.label} did not issue a pairing credential.`,
-                })
-              : yield* routeSsh.exchange({
-                  bootstrap: sshBootstrap,
-                  pairingToken: sshBootstrap.pairingToken,
-                })
-            : yield* loadRouteSecret(route.secretRef, route.label);
+        if (route.secretRef === null) {
+          return yield* new ConnectionBlockedError({
+            reason: "configuration",
+            detail: `${route.label} must be explicitly re-enrolled before SSH pairing.`,
+          });
+        }
+        const bearerToken = yield* loadRouteSecret(route.secretRef, route.label);
         return yield* authorizeVerified({
           identity,
           route,

@@ -21,6 +21,12 @@ reaches their loopback listener through SSH forwarding or a separately trusted
 HTTPS terminator. A foreground server may use a direct HTTPS listener when it
 has a validated certificate/private-key pair.
 
+Managed services and desktop/SSH-managed launches keep authentication enabled
+while suppressing reveal-once startup pairing output. A foreground supervisor
+may select the same behavior with `serve --no-startup-pairing`; later pairing
+must cross protected local control or the verified native SSH administration
+flow.
+
 For WSL, the desktop starts the Windows loopback listener before the distro
 server, publishes it only after generation-fenced readiness, and keeps it alive
 for authenticated soft shutdown. It then cancels the listener, joins active

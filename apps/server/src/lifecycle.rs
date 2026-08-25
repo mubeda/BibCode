@@ -214,19 +214,21 @@ impl ServerRuntime {
         )
         .await
         .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
-        let startup_access =
-            if config.mode == crate::config::ServerMode::Web && !config.unsafe_no_auth {
-                let issued = auth
-                    .issue_startup_pairing()
-                    .await
-                    .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
-                Some(build_startup_access(
-                    &advertised_base_url,
-                    issued.credential,
-                )?)
-            } else {
-                None
-            };
+        let startup_access = if config.mode == crate::config::ServerMode::Web
+            && config.startup_pairing_enabled
+            && !config.unsafe_no_auth
+        {
+            let issued = auth
+                .issue_startup_pairing()
+                .await
+                .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
+            Some(build_startup_access(
+                &advertised_base_url,
+                issued.credential,
+            )?)
+        } else {
+            None
+        };
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -816,5 +818,28 @@ mod tests {
         let ipv6 = build_startup_access("https://localhost:3774", "credential".to_string())
             .expect("IPv6 startup access should build");
         assert_eq!(ipv6.connection_string, "https://localhost:3774");
+    }
+
+    #[tokio::test]
+    async fn authenticated_server_can_start_without_minting_startup_pairing() {
+        let state = tempfile::tempdir().expect("server state directory");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .without_startup_pairing();
+        let server = ServerRuntime::start_with_registry(config, RpcRegistry::empty())
+            .await
+            .expect("authenticated server should start without startup pairing");
+
+        assert!(server.startup_access().is_none());
+        let response = reqwest::get(format!(
+            "http://{}/api/orchestration/snapshot",
+            server.local_addr()
+        ))
+        .await
+        .expect("protected endpoint should respond");
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.shutdown();
+        server.join().await.expect("server should stop cleanly");
     }
 }

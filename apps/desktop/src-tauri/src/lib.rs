@@ -27,7 +27,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_ensure_ssh_environment,
             desktop_bridge_disconnect_ssh_environment,
             desktop_bridge_fetch_environment_descriptor,
-            desktop_bridge_bootstrap_ssh_bearer_session,
+            desktop_bridge_pair_ssh_environment,
             desktop_bridge_fetch_ssh_session_state,
             desktop_bridge_issue_ssh_web_socket_ticket,
             desktop_bridge_resolve_ssh_password_prompt,
@@ -163,7 +163,7 @@ pub fn run() {
         bridge::desktop_bridge_ensure_ssh_environment,
         bridge::desktop_bridge_disconnect_ssh_environment,
         bridge::desktop_bridge_fetch_environment_descriptor,
-        bridge::desktop_bridge_bootstrap_ssh_bearer_session,
+        bridge::desktop_bridge_pair_ssh_environment,
         bridge::desktop_bridge_fetch_ssh_session_state,
         bridge::desktop_bridge_issue_ssh_web_socket_ticket,
         bridge::desktop_bridge_resolve_ssh_password_prompt,
@@ -294,9 +294,8 @@ mod wsl_setup;
 mod wsl_transport;
 
 pub use bridge::{
-    desktop_bridge_bootstrap_ssh_bearer_session, desktop_bridge_fetch_environment_descriptor,
-    desktop_bridge_fetch_ssh_session_state, desktop_bridge_get_bridge_metadata,
-    desktop_bridge_issue_ssh_web_socket_ticket,
+    desktop_bridge_fetch_environment_descriptor, desktop_bridge_fetch_ssh_session_state,
+    desktop_bridge_get_bridge_metadata, desktop_bridge_issue_ssh_web_socket_ticket,
 };
 pub use wsl::{
     WSL_DISCOVERY_CHANGED_EVENT, WslDiscoveryHealth, WslDiscoverySnapshot, WslDistro,

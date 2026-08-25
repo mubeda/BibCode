@@ -127,6 +127,23 @@ cross-target checks under non-native compatibility evidence.
 - Loopback listeners/forward and unrelated-process survivor result:
 - Final staging cleanup and mutation/cleanup status:
 
+## SSH trust, descriptor, and pairing evidence
+
+- Native desktop / OpenSSH client / disposable remote OS:
+- Effective SSH config source / alias / port:
+- Known / unknown / changed-or-revoked host-key results:
+- Observed and saved non-secret host-key fingerprint result:
+- Trust / probe / server / tunnel / descriptor ordered result:
+- Same-process host-key gate before launch/stop/pairing script bytes:
+- Numeric-loopback listeners and non-loopback/redirect/proxy rejection:
+- Descriptor byte bound and environment/storage/protocol result:
+- Exact native descriptor refetch result:
+- Mismatch-before-pairing negative evidence:
+- Native pairing create/redeem and raw-credential negative evidence:
+- Authenticated credential-free managed/`--no-startup-pairing` startup result:
+- OS-secret persistence-before-route/session result:
+- Route-cancellation support and shutdown SSH/askpass/tunnel/I/O survivor result:
+
 ## VCS observation evidence
 
 - Execution host and route: Native | WSL direct | SSH/server | Unavailable

@@ -19,7 +19,11 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 libc.workspace = true
 minisign-verify.workspace = true
 portpicker.workspace = true

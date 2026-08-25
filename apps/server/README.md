@@ -58,6 +58,13 @@ cargo run -p bibcode-server -- serve \
 The server fails before durable initialization when a TLS pair is incomplete,
 invalid, mismatched, expired, or not yet valid.
 
+Foreground web mode normally prints one reveal-once startup pairing. Use
+`--no-startup-pairing` (or `BIBCODE_NO_STARTUP_PAIRING=1`) when a supervisor or
+SSH-managed launch must not mint or log that credential. This does not disable
+authentication: create access later with `bibcode auth pairing create` through
+the protected local-control socket or named pipe. Desktop, SSH-managed, and
+installed-service launches suppress startup pairing automatically.
+
 ## Service administration
 
 The native CLI supports workstation and headless service definitions on

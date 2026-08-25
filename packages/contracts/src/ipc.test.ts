@@ -8,6 +8,8 @@ import {
   DesktopSecretReferenceSchema,
   DesktopSecretStoreErrorSchema,
   DesktopServerExposureStateSchema,
+  DesktopSshEnvironmentBootstrapSchema,
+  DesktopSshPairingInputSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
   DesktopWslServerProbeSchema,
@@ -39,6 +41,10 @@ const decodeDesktopSecretInput = Schema.decodeUnknownSync(DesktopSecretInputSche
 const decodeDesktopSecretReference = Schema.decodeUnknownSync(DesktopSecretReferenceSchema);
 const decodeDesktopSecretStoreError = Schema.decodeUnknownSync(DesktopSecretStoreErrorSchema);
 const decodeDesktopServerExposureState = Schema.decodeUnknownSync(DesktopServerExposureStateSchema);
+const decodeDesktopSshEnvironmentBootstrap = Schema.decodeUnknownSync(
+  DesktopSshEnvironmentBootstrapSchema,
+);
+const decodeDesktopSshPairingInput = Schema.decodeUnknownSync(DesktopSshPairingInputSchema);
 const decodeDesktopWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
 const decodeDesktopWslSetupProbeInput = Schema.decodeUnknownSync(DesktopWslSetupProbeInputSchema);
 const decodeDesktopWslServerProbe = Schema.decodeUnknownSync(DesktopWslServerProbeSchema);
@@ -369,6 +375,51 @@ describe("Desktop server exposure contract", () => {
         tailscaleServePort: 443,
       }),
     ).toThrow();
+  });
+});
+
+describe("Desktop staged SSH contract", () => {
+  const descriptor = {
+    environmentId: "019d2a2e-0d0e-7000-8000-000000000011",
+    label: "SSH environment",
+    platform: { os: "linux", arch: "x64" },
+    serverVersion: "0.4.2",
+    storageInstanceId: "019d2a2e-0d0e-7000-8000-000000000012",
+    protocol: { minimum: 1, maximum: 1 },
+    capabilities: { repositoryIdentity: true },
+  };
+
+  it("keeps pairing credentials out of tunnel metadata", () => {
+    const bootstrap = decodeDesktopSshEnvironmentBootstrap({
+      target: {
+        alias: "devbox",
+        hostname: "devbox.example",
+        username: "dev",
+        port: 22,
+      },
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      hostKeyFingerprint: "SHA256:known-host-key",
+      remotePort: 3773,
+      remoteServerKind: "managed",
+    });
+
+    expect(bootstrap.hostKeyFingerprint).toBe("SHA256:known-host-key");
+    expect("pairingToken" in bootstrap).toBe(false);
+  });
+
+  it("binds an explicit pairing request to the descriptor already verified by the client", () => {
+    expect(
+      decodeDesktopSshPairingInput({
+        target: {
+          alias: "devbox",
+          hostname: "devbox.example",
+          username: "dev",
+          port: 22,
+        },
+        descriptor,
+      }).descriptor,
+    ).toMatchObject(descriptor);
   });
 });
 

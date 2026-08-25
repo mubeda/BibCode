@@ -2,10 +2,12 @@ use std::{collections::BTreeSet, fs, time::Duration};
 
 use bibcode_desktop_lib::ssh::{
     DiscoveredSshHost, RemoteLaunchResult, SshAuthOptions, SshEnvironmentBootstrap,
-    SshEnvironmentLaunchPlan, SshEnvironmentManager, SshEnvironmentTarget,
-    SshPasswordPromptManager, SshPasswordPromptRequestError, SshPasswordPromptResolution,
-    SshPasswordPromptResolveError, SshPasswordRequest, default_home_dir, discover_ssh_hosts,
+    SshEnvironmentDisconnectOptions, SshEnvironmentLaunchPlan, SshEnvironmentManager,
+    SshEnvironmentTarget, SshHostKeyFailureKind, SshPasswordPromptManager,
+    SshPasswordPromptRequestError, SshPasswordPromptResolution, SshPasswordPromptResolveError,
+    SshPasswordRequest, classify_ssh_host_key_failure, default_home_dir, discover_ssh_hosts,
     parse_known_hosts_hostnames, parse_remote_launch_result, parse_remote_pairing_credential,
+    parse_ssh_host_key_fingerprint,
 };
 
 #[tokio::test]
@@ -29,12 +31,26 @@ async fn public_environment_manager_surfaces_native_ssh_connection_failures() {
         .await
         .expect_err("closed local port should reject remote bootstrap");
     assert!(
-        ensure_error.contains("SSH launch command failed"),
+        ensure_error.contains("SSH host-key trust probe failed"),
         "{ensure_error}"
     );
 
+    let pairing_error = manager
+        .create_pairing(app.handle(), &prompts, unreachable.clone())
+        .await
+        .expect_err("pairing must require an already verified live tunnel");
+    assert!(pairing_error.contains("active, host-key-verified"));
+
     let disconnect_error = manager
-        .disconnect_environment(app.handle(), &prompts, unreachable)
+        .disconnect_environment(
+            app.handle(),
+            &prompts,
+            unreachable,
+            SshEnvironmentDisconnectOptions {
+                expected_host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_string(),
+            },
+        )
         .await
         .expect_err("closed local port should reject remote cleanup");
     assert!(
@@ -79,9 +95,31 @@ fn public_launch_plans_normalize_targets_and_preserve_bootstrap_contracts() {
     assert_eq!(external.remote_server_kind, "external");
     assert_eq!(external.http_base_url, "http://127.0.0.1:45123/");
     assert!(external.args.windows(2).any(|pair| pair == ["-p", "2222"]));
+    assert!(
+        external
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-L", "127.0.0.1:45123:127.0.0.1:3773"]),
+        "the forward must bind numeric loopback even when OpenSSH GatewayPorts is enabled"
+    );
+    assert!(
+        external
+            .args
+            .iter()
+            .all(|argument| !argument.contains("StrictHostKeyChecking=no")
+                && !argument.contains("UserKnownHostsFile=/dev/null"))
+    );
     assert_eq!(
         external.args.last().map(String::as_str),
         Some("alice@devbox")
+    );
+    assert_eq!(
+        external
+            .args
+            .get(external.args.len() - 2)
+            .map(String::as_str),
+        Some("--"),
+        "OpenSSH options must terminate before the renderer-controlled destination"
     );
 
     let managed = SshEnvironmentLaunchPlan::forward_with_auth(
@@ -120,7 +158,7 @@ fn public_launch_plans_normalize_targets_and_preserve_bootstrap_contracts() {
         managed.remote_port,
         managed.http_base_url.clone(),
         managed.ws_base_url.clone(),
-        Some("pairing-token".to_string()),
+        "SHA256:managed-host-key".to_string(),
         "managed",
     );
     let external_bootstrap = SshEnvironmentBootstrap::external(
@@ -128,11 +166,14 @@ fn public_launch_plans_normalize_targets_and_preserve_bootstrap_contracts() {
         external.remote_port,
         external.http_base_url,
         external.ws_base_url,
-        None,
+        "SHA256:external-host-key".to_string(),
     );
     assert_eq!(bootstrap.remote_server_kind, "managed");
     assert_eq!(external_bootstrap.remote_server_kind, "external");
-    assert_eq!(external_bootstrap.pairing_token, None);
+    assert_eq!(
+        external_bootstrap.host_key_fingerprint,
+        "SHA256:external-host-key"
+    );
 
     assert!(
         SshEnvironmentLaunchPlan::external(
@@ -201,6 +242,34 @@ fn public_remote_parsers_cover_success_defaults_and_validation_errors() {
             "git.example".to_string(),
             "github.com".to_string(),
         ])
+    );
+}
+
+#[test]
+fn public_host_key_trust_contract_records_fingerprints_and_distinguishes_failures() {
+    assert_eq!(
+        parse_ssh_host_key_fingerprint(
+            "debug1: Server host key: ssh-ed25519 SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFG\n",
+        ),
+        Ok("SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFG".to_string())
+    );
+    assert_eq!(
+        classify_ssh_host_key_failure(
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.",
+        ),
+        SshHostKeyFailureKind::Changed
+    );
+    assert_eq!(
+        classify_ssh_host_key_failure(
+            "WARNING: REVOKED HOST KEY DETECTED!\nThe ED25519 host key is marked as revoked.",
+        ),
+        SshHostKeyFailureKind::Changed
+    );
+    assert_eq!(
+        classify_ssh_host_key_failure(
+            "No ED25519 host key is known for new.example and you have requested strict checking.\nHost key verification failed.",
+        ),
+        SshHostKeyFailureKind::Unknown
     );
 }
 

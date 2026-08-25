@@ -194,8 +194,15 @@ Use Codex Computer Use, not Orca. Confirm the executable path and PID before
 using any frame as evidence. At normal and minimum sizes verify:
 
 - Add Project has no Host selector or remote-device choice for the local Mac;
-- WSL, Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry
-  UI is absent from ordinary desktop presentation;
+- Settings > Connections exposes the desktop SSH enrollment card; with a
+  disposable Linux-like POSIX/OpenSSH host that already has a compatible native
+  `bibcode` plus `ss` or readable Linux procfs, verify host trust, loopback
+  tunnel, descriptor acceptance, native pairing, OS-secret persistence, and
+  safe disconnect. Record a native macOS remote target as unavailable until its
+  port/service adapter lands; unknown/changed keys and identity mismatches must
+  stop before pairing, and no raw pairing value is rendered;
+- WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
+  from the ordinary macOS presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
 - external worktree grouping, full paths, actions, physical identity, and

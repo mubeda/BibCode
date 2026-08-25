@@ -64,8 +64,10 @@ Select focused tests from affected source and verify at least:
   default, admits only the effective service account or an enabled Builtin
   Administrator token, and reverts impersonation before any await;
 - local Windows and WSL presentation follows current environment capability;
-- remote device, SSH, Tailscale, relay, and connection actions do not mount in
-  ordinary desktop presentation; and
+- Settings > Connections mounts the SSH enrollment card, while Tailscale,
+  relay, and generic remote-device actions remain absent. Treat native Windows
+  OpenSSH/PowerShell provisioning as unavailable until its adapter lands; do
+  not substitute a POSIX shell and call it a Windows pass; and
 - Claude, Codex, Cursor, and OpenCode are visible while Grok is absent.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
@@ -275,8 +277,9 @@ When WSL is unavailable:
 - local Windows projects remain usable.
 
 Do not install a distribution or change system WSL configuration without
-permission. SSH, Tailscale, relay, and remote-device targets remain absent in
-both branches of the matrix.
+permission. The Connections SSH card remains visible in both WSL branches;
+Tailscale, relay, and generic remote-device targets remain absent. Record the
+native Windows OpenSSH/PowerShell adapter as unavailable until implemented.
 
 ## Native tests and static gates
 
@@ -349,8 +352,10 @@ Windows DPI states. Verify:
 
 - Add Project shows **This device** and usable WSL locations only;
 - Local Environment is visible and never empty;
-- Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry UI is
-  absent from ordinary desktop presentation;
+- Settings > Connections shows SSH enrollment without rendering raw pairing
+  credentials; native Windows OpenSSH/PowerShell setup is explicitly
+  unavailable until its adapter lands, while Tailscale, relay, exposure, and
+  generic remote-retry UI remains absent;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt

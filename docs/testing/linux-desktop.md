@@ -156,8 +156,14 @@ environment in the report. At normal and minimum sizes verify:
 
 - Add Project has no Host selector or remote-device choice when only the local
   Linux environment is supported;
-- WSL, Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry
-  UI is absent from ordinary desktop presentation;
+- Settings > Connections exposes the desktop SSH enrollment card; with a
+  disposable Linux-like POSIX/OpenSSH host that already has a compatible native
+  `bibcode` plus `ss` or readable Linux procfs, verify host trust, loopback
+  tunnel, descriptor acceptance, native pairing, OS-secret persistence, and
+  safe disconnect. Unknown/changed keys and identity mismatches must stop before
+  pairing, and no raw pairing value is rendered;
+- WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
+  from the ordinary Linux presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
 - AppImage window identity, icon, launcher, and taskbar grouping are correct;

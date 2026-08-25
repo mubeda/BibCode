@@ -1,5 +1,14 @@
+use bytes::Bytes;
 use futures_util::StreamExt as _;
-use serde::Deserialize;
+use http_body_util::{BodyExt as _, Full};
+use hyper::{
+    Method, Request, Response,
+    body::Incoming,
+    client::conn::http1,
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
+};
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -31,8 +40,9 @@ use crate::security::{
     unprotect_string as unprotect_catalog_string,
 };
 use crate::ssh::{
-    SshEnvironmentEnsureOptions, SshEnvironmentManager, SshEnvironmentTarget,
-    SshPasswordPromptManager, SshPasswordPromptResolution, default_home_dir, discover_ssh_hosts,
+    SshEnvironmentBootstrap, SshEnvironmentDisconnectOptions, SshEnvironmentEnsureOptions,
+    SshEnvironmentManager, SshEnvironmentTarget, SshPasswordPromptManager,
+    SshPasswordPromptResolution, default_home_dir, discover_ssh_hosts,
 };
 use crate::tailscale::{
     TailscaleStatus, build_tailscale_https_base_url, probe_tailscale_https_endpoint,
@@ -62,6 +72,7 @@ const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_REMOTE_API_JSON_BYTES: usize = 256 * 1024;
 const MAX_WSL_SETUP_DESCRIPTOR_BYTES: usize = 256 * 1024;
 pub(crate) const WSL_SETUP_PROGRESS_EVENT: &str = "desktop:remote-setup-progress";
 
@@ -170,11 +181,180 @@ fn environment_endpoint_url(http_base_url: &str, pathname: &str) -> Result<url::
     Ok(url)
 }
 
-fn remote_api_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+fn ssh_loopback_endpoint_url(http_base_url: &str, pathname: &str) -> Result<url::Url, String> {
+    let url = environment_endpoint_url(http_base_url, pathname)?;
+    let numeric_loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !numeric_loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(
+            "SSH remote API requests require a numeric loopback HTTP tunnel endpoint.".to_string(),
+        );
+    }
+    Ok(url)
+}
+
+fn build_remote_api_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, String> {
+    builder
         .timeout(REMOTE_API_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .map_err(|error| bridge_error("Could not create the environment HTTP client", error))
+}
+
+fn remote_api_client() -> Result<reqwest::Client, String> {
+    build_remote_api_client(reqwest::Client::builder())
+}
+
+struct SshPairingConnection {
+    sender: http1::SendRequest<Full<Bytes>>,
+    authority: String,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl SshPairingConnection {
+    async fn connect(http_base_url: &str) -> Result<Self, String> {
+        let url = ssh_loopback_endpoint_url(http_base_url, "/")?;
+        let address = url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .zip(url.port())
+            .map(|(host, port)| std::net::SocketAddr::new(host, port))
+            .ok_or_else(|| {
+                "SSH pairing requires a numeric loopback HTTP tunnel endpoint.".to_string()
+            })?;
+        let authority = match address.ip() {
+            std::net::IpAddr::V4(host) => format!("{host}:{}", address.port()),
+            std::net::IpAddr::V6(host) => format!("[{host}]:{}", address.port()),
+        };
+        let (sender, connection) = tokio::time::timeout(REMOTE_API_REQUEST_TIMEOUT, async {
+            let stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|error| bridge_error("Could not reach the environment API", error))?;
+            stream
+                .set_nodelay(true)
+                .map_err(|error| bridge_error("Could not configure the environment API", error))?;
+            http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(|error| bridge_error("Could not open the environment API", error))
+        })
+        .await
+        .map_err(|_| "The SSH pairing connection timed out.".to_string())??;
+        let driver = tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "SSH pairing connection closed");
+            }
+        });
+        Ok(Self {
+            sender,
+            authority,
+            driver,
+        })
+    }
+
+    async fn get_json(&mut self, operation: &str, pathname: &str) -> Result<Value, String> {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(pathname)
+            .header(HOST, &self.authority)
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| bridge_error("Could not build the environment API request", error))?;
+        self.request_json(operation, request).await
+    }
+
+    async fn redeem(&mut self, credential: String) -> Result<Value, String> {
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE);
+            serializer.append_pair("subject_token", &credential);
+            serializer.append_pair("subject_token_type", AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE);
+            serializer.append_pair("requested_token_type", AUTH_ACCESS_TOKEN_TYPE);
+            serializer.append_pair("client_label", "BiBCode Tauri Desktop");
+            serializer.append_pair("client_device_type", "desktop");
+            serializer.finish()
+        };
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/oauth/token")
+            .header(HOST, &self.authority)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(CONTENT_LENGTH, body.len())
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|error| bridge_error("Could not build the environment API request", error))?;
+        let result = self
+            .request_json("bootstrap-bearer-session", request)
+            .await?;
+        canonicalize_ssh_access_token_result(&result)
+    }
+
+    async fn request_json(
+        &mut self,
+        operation: &str,
+        request: Request<Full<Bytes>>,
+    ) -> Result<Value, String> {
+        tokio::time::timeout(REMOTE_API_REQUEST_TIMEOUT, async {
+            let response = self.sender.send_request(request).await.map_err(|error| {
+                bridge_error("Could not reach the retained SSH tunnel connection", error)
+            })?;
+            fixed_connection_json_response(operation, response).await
+        })
+        .await
+        .map_err(|_| format!("SSH remote API request timed out during {operation}."))?
+    }
+}
+
+impl Drop for SshPairingConnection {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+async fn fixed_connection_json_response(
+    operation: &str,
+    response: Response<Incoming>,
+) -> Result<Value, String> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "[ssh_http:{}] SSH remote API request failed during {operation}.",
+            status.as_u16()
+        ));
+    }
+    if response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_REMOTE_API_JSON_BYTES as u64)
+    {
+        return Err(format!(
+            "SSH remote API response exceeded its size limit during {operation}."
+        ));
+    }
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|error| bridge_error("Could not read the environment API response", error))?;
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        if bytes.len().saturating_add(data.len()) > MAX_REMOTE_API_JSON_BYTES {
+            return Err(format!(
+                "SSH remote API response exceeded its size limit during {operation}."
+            ));
+        }
+        bytes.extend_from_slice(data);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| bridge_error("Could not decode the environment API response", error))
 }
 
 async fn remote_json_response(
@@ -189,9 +369,27 @@ async fn remote_json_response(
         ));
     }
 
-    response
-        .json::<Value>()
-        .await
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_API_JSON_BYTES as u64)
+    {
+        return Err(format!(
+            "SSH remote API response exceeded its size limit during {operation}."
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| bridge_error("Could not read the environment API response", error))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_API_JSON_BYTES {
+            return Err(format!(
+                "SSH remote API response exceeded its size limit during {operation}."
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
         .map_err(|error| bridge_error("Could not decode the environment API response", error))
 }
 
@@ -202,7 +400,7 @@ async fn remote_get_json(
     bearer_token: Option<String>,
 ) -> Result<Value, String> {
     let client = remote_api_client()?;
-    let mut request = client.get(environment_endpoint_url(&http_base_url, pathname)?);
+    let mut request = client.get(ssh_loopback_endpoint_url(&http_base_url, pathname)?);
     if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
     }
@@ -220,7 +418,7 @@ async fn remote_post_json(
     bearer_token: Option<String>,
 ) -> Result<Value, String> {
     let client = remote_api_client()?;
-    let mut request = client.post(environment_endpoint_url(&http_base_url, pathname)?);
+    let mut request = client.post(ssh_loopback_endpoint_url(&http_base_url, pathname)?);
     if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
     }
@@ -1087,38 +1285,226 @@ pub(crate) async fn desktop_bridge_delete_secret(
 pub async fn desktop_bridge_fetch_environment_descriptor(
     http_base_url: String,
 ) -> Result<Value, String> {
-    remote_get_json(
+    let descriptor = remote_get_json(
         "fetch-environment-descriptor",
         http_base_url,
         "/.well-known/bibcode/environment",
         None,
     )
-    .await
+    .await?;
+    canonicalize_ssh_environment_descriptor(&descriptor)
 }
 
 #[tauri::command]
-pub async fn desktop_bridge_bootstrap_ssh_bearer_session(
-    http_base_url: String,
-    credential: String,
+pub async fn desktop_bridge_pair_ssh_environment(
+    app: AppHandle<DesktopRuntime>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    target: SshEnvironmentTarget,
+    descriptor: Value,
 ) -> Result<Value, String> {
-    let client = remote_api_client()?;
-    let response = client
-        .post(environment_endpoint_url(&http_base_url, "/oauth/token")?)
-        .form(&[
-            ("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE.to_string()),
-            ("subject_token", credential),
-            (
-                "subject_token_type",
-                AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE.to_string(),
-            ),
-            ("requested_token_type", AUTH_ACCESS_TOKEN_TYPE.to_string()),
-            ("client_label", "BiBCode Tauri Desktop".to_string()),
-            ("client_device_type", "desktop".to_string()),
-        ])
-        .send()
-        .await
-        .map_err(|error| bridge_error("Could not reach the environment API", error))?;
-    remote_json_response("bootstrap-bearer-session", response).await
+    let bootstrap = ssh
+        .active_bootstrap(&target)?
+        .ok_or_else(|| "SSH pairing requires an active verified tunnel.".to_string())?;
+    let mut connection = SshPairingConnection::connect(&bootstrap.http_base_url).await?;
+    let observed = connection
+        .get_json(
+            "verify-before-pairing",
+            bibcode_server::ENVIRONMENT_DESCRIPTOR_PATH,
+        )
+        .await?;
+    validate_ssh_pairing_descriptor(&observed, &descriptor)?;
+    let retained_bootstrap = ssh.active_bootstrap(&target)?;
+    validate_retained_ssh_pairing_tunnel(&bootstrap, retained_bootstrap.as_ref())?;
+    let credential = ssh.create_pairing(&app, &prompts, target).await?;
+    connection.redeem(credential).await
+}
+
+fn validate_retained_ssh_pairing_tunnel(
+    expected: &SshEnvironmentBootstrap,
+    active: Option<&SshEnvironmentBootstrap>,
+) -> Result<(), String> {
+    if active != Some(expected) {
+        return Err(
+            "The verified SSH tunnel ended or changed before pairing; no credential was created."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_ssh_pairing_descriptor(observed: &Value, expected: &Value) -> Result<(), String> {
+    let expected = canonicalize_ssh_environment_descriptor(expected)?;
+    let observed = canonicalize_ssh_environment_descriptor(observed)?;
+    if observed != expected {
+        return Err(
+            "The SSH environment descriptor changed after identity verification; pairing was not created."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_ssh_environment_descriptor(descriptor: &Value) -> Result<Value, String> {
+    let descriptor = descriptor
+        .as_object()
+        .ok_or_else(|| "The verified SSH descriptor is not an object.".to_string())?;
+    let environment_id = descriptor
+        .get("environmentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no environment identity.".to_string())?;
+    let label = descriptor
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .ok_or_else(|| "The verified SSH descriptor has no valid label.".to_string())?;
+    let platform = descriptor
+        .get("platform")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid platform.".to_string())?;
+    let platform_os = platform
+        .get("os")
+        .and_then(Value::as_str)
+        .filter(|os| matches!(*os, "darwin" | "linux" | "windows" | "unknown"))
+        .ok_or_else(|| "The verified SSH descriptor has an invalid platform OS.".to_string())?;
+    let platform_arch = platform
+        .get("arch")
+        .and_then(Value::as_str)
+        .filter(|arch| matches!(*arch, "arm64" | "x64" | "other"))
+        .ok_or_else(|| {
+            "The verified SSH descriptor has an invalid platform architecture.".to_string()
+        })?;
+    let storage_id = descriptor
+        .get("storageInstanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no storage identity.".to_string())?;
+    let environment_id = uuid::Uuid::parse_str(environment_id)
+        .map_err(|_| "The verified SSH environment identity is invalid.".to_string())?;
+    let storage_id = uuid::Uuid::parse_str(storage_id)
+        .map_err(|_| "The verified SSH storage identity is invalid.".to_string())?;
+    let server_version = descriptor
+        .get("serverVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| "The verified SSH server version is invalid.".to_string())?;
+    let protocol = descriptor
+        .get("protocol")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid protocol range.".to_string())?;
+    let minimum = protocol
+        .get("minimum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The verified SSH protocol minimum is invalid.".to_string())?;
+    let maximum = protocol
+        .get("maximum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The verified SSH protocol maximum is invalid.".to_string())?;
+    if minimum == 0 || maximum == 0 || minimum > maximum {
+        return Err("The verified SSH protocol range is invalid.".to_string());
+    }
+    let supported = u64::from(bibcode_server::ENVIRONMENT_PROTOCOL_VERSION);
+    if minimum > supported || maximum < supported {
+        return Err(
+            "The verified SSH server protocol is incompatible with this desktop.".to_string(),
+        );
+    }
+    let capabilities = descriptor
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid capabilities.".to_string())?;
+    let capability = |name: &str| -> Result<bool, String> {
+        capabilities
+            .get(name)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    format!("The verified SSH descriptor has an invalid {name} capability.")
+                })
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let repository_identity = capability("repositoryIdentity")?;
+    let worktree_catalog = capability("worktreeCatalog")?;
+    let worktree_catalog_refresh_reason = capability("worktreeCatalogRefreshReason")?;
+    let vcs_status_summary = capability("vcsStatusSummary")?;
+    let activity_protocol_version = match capabilities.get("activityProtocolVersion") {
+        None | Some(Value::Null) => Value::Null,
+        Some(value) if value.as_u64() == Some(2) => json!(2),
+        Some(_) => {
+            return Err(
+                "The verified SSH descriptor has an invalid activity protocol capability."
+                    .to_string(),
+            );
+        }
+    };
+    let transport = descriptor
+        .get("transport")
+        .and_then(Value::as_object)
+        .and_then(|transport| transport.get("mode"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no transport identity.".to_string())?;
+    if transport != "loopback-http" {
+        return Err(
+            "The verified SSH descriptor does not identify a loopback HTTP transport.".to_string(),
+        );
+    }
+    Ok(json!({
+        "environmentId": environment_id.to_string(),
+        "label": label,
+        "platform": {
+            "os": platform_os,
+            "arch": platform_arch,
+        },
+        "serverVersion": server_version,
+        "storageInstanceId": storage_id.to_string(),
+        "protocol": {
+            "minimum": minimum,
+            "maximum": maximum,
+        },
+        "capabilities": {
+            "repositoryIdentity": repository_identity,
+            "worktreeCatalog": worktree_catalog,
+            "worktreeCatalogRefreshReason": worktree_catalog_refresh_reason,
+            "vcsStatusSummary": vcs_status_summary,
+            "activityProtocolVersion": activity_protocol_version,
+        },
+        "transport": {
+            "mode": "loopback-http",
+        },
+    }))
+}
+
+#[derive(Deserialize, Serialize)]
+struct SshAccessTokenResult {
+    access_token: String,
+    issued_token_type: String,
+    token_type: String,
+    expires_in: u64,
+    scope: String,
+}
+
+fn canonicalize_ssh_access_token_result(result: &Value) -> Result<Value, String> {
+    let result: SshAccessTokenResult = serde_json::from_value(result.clone())
+        .map_err(|_| "The SSH pairing response is not a valid access-token object.".to_string())?;
+    if result.access_token.trim().is_empty() || result.access_token.trim() != result.access_token {
+        return Err("The SSH pairing response has no valid access token.".to_string());
+    }
+    if result.issued_token_type != AUTH_ACCESS_TOKEN_TYPE {
+        return Err("The SSH pairing response has an invalid issued-token type.".to_string());
+    }
+    if result.token_type != "Bearer" {
+        return Err("The SSH pairing response has an invalid token type.".to_string());
+    }
+    if result.expires_in == 0 {
+        return Err("The SSH pairing response has an invalid expiry.".to_string());
+    }
+    if result.scope.trim().is_empty() || result.scope.trim() != result.scope {
+        return Err("The SSH pairing response has no valid scope.".to_string());
+    }
+    serde_json::to_value(result)
+        .map_err(|_| "Could not canonicalize the SSH pairing response.".to_string())
 }
 
 #[tauri::command]
@@ -1685,8 +2071,10 @@ pub async fn desktop_bridge_disconnect_ssh_environment(
     ssh: State<'_, SshEnvironmentManager>,
     prompts: State<'_, SshPasswordPromptManager>,
     target: SshEnvironmentTarget,
+    options: SshEnvironmentDisconnectOptions,
 ) -> Result<(), String> {
-    ssh.disconnect_environment(&app, &prompts, target).await
+    ssh.disconnect_environment(&app, &prompts, target, options)
+        .await
 }
 
 #[tauri::command]
@@ -2898,18 +3286,43 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_environment_descriptor_requests_well_known_endpoint() {
-        let (base_url, requests) = spawn_json_test_server(r#"{"environmentId":"env-tauri"}"#);
+        let body = r#"{"environmentId":"00000000-0000-4000-8000-000000000061","label":"  SSH environment  ","platform":{"os":"linux","arch":"x64"},"serverVersion":"  0.4.2  ","storageInstanceId":"00000000-0000-4000-8000-000000000062","protocol":{"minimum":1,"maximum":1},"capabilities":{"repositoryIdentity":true},"transport":{"mode":"loopback-http"}}"#;
+        let (base_url, requests) = spawn_json_test_server(body);
 
         let descriptor = desktop_bridge_fetch_environment_descriptor(base_url)
             .await
             .expect("descriptor request should succeed");
 
+        assert_eq!(descriptor["label"], "SSH environment");
+        assert_eq!(descriptor["serverVersion"], "0.4.2");
         assert_eq!(
-            descriptor,
-            serde_json::json!({ "environmentId": "env-tauri" })
+            descriptor["capabilities"],
+            json!({
+                "repositoryIdentity": true,
+                "worktreeCatalog": false,
+                "worktreeCatalogRefreshReason": false,
+                "vcsStatusSummary": false,
+                "activityProtocolVersion": null,
+            })
         );
         let request = requests.recv().expect("request should be captured");
         assert!(request.starts_with("GET /.well-known/bibcode/environment HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn fetch_environment_descriptor_rejects_malformed_shape_before_javascript() {
+        let (base_url, requests) = spawn_json_test_server(
+            r#"{"environmentId":"00000000-0000-4000-8000-000000000061","protocol":{}}"#,
+        );
+
+        let error = desktop_bridge_fetch_environment_descriptor(base_url)
+            .await
+            .expect_err("malformed SSH descriptor must fail at the native boundary");
+
+        assert!(error.contains("descriptor"), "{error}");
+        requests
+            .recv()
+            .expect("descriptor request should be captured");
     }
 
     #[tokio::test]
@@ -2939,6 +3352,12 @@ mod tests {
             .recv()
             .expect("malformed response request should be captured");
 
+        let error =
+            desktop_bridge_fetch_environment_descriptor("http://192.0.2.10:3773".to_string())
+                .await
+                .expect_err("non-loopback plain HTTP must not be treated as an SSH tunnel");
+        assert!(error.contains("numeric loopback HTTP"), "{error}");
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("closed endpoint fixture");
         let base_url = format!(
             "http://{}",
@@ -2955,11 +3374,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string())
-                .await
-                .is_err()
-        );
+        assert!(SshPairingConnection::connect(&base_url).await.is_err());
     }
 
     #[tokio::test]
@@ -2978,19 +3393,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_ssh_bearer_session_posts_oauth_token_exchange() {
-        let (base_url, requests) =
-            spawn_json_test_server(r#"{"access_token":"bearer-token","token_type":"Bearer"}"#);
+    async fn redeem_ssh_pairing_posts_oauth_token_exchange() {
+        let response = json!({
+            "access_token": "bearer-token",
+            "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "environment:read environment:write",
+            "credential": "bootstrap-token",
+            "unexpected": { "private": true },
+        });
+        let response_body = serde_json::to_string(&response).expect("token response should encode");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("token server should bind");
+        let address = listener.local_addr().expect("token server address");
+        let (sender, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("token server should accept");
+            sender
+                .send(read_test_http_request(&mut stream))
+                .expect("token request should be observable");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("token server should respond");
+        });
 
-        let session =
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "bootstrap-token".to_string())
-                .await
-                .expect("bootstrap request should succeed");
+        let mut connection = SshPairingConnection::connect(&format!("http://{address}"))
+            .await
+            .expect("pairing connection should open");
+        let session = connection
+            .redeem("bootstrap-token".to_string())
+            .await
+            .expect("bootstrap request should succeed");
 
         assert_eq!(
             session,
-            serde_json::json!({ "access_token": "bearer-token", "token_type": "Bearer" })
+            json!({
+                "access_token": "bearer-token",
+                "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "environment:read environment:write",
+            })
         );
+        assert!(!session.to_string().contains("bootstrap-token"));
+        assert!(session.get("unexpected").is_none());
         let request = requests.recv().expect("request should be captured");
         assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
         assert!(request.contains("subject_token=bootstrap-token"));
@@ -2999,6 +3449,336 @@ mod tests {
                 .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
         );
         assert!(request.contains("client_label=BiBCode+Tauri+Desktop"));
+    }
+
+    #[tokio::test]
+    async fn pairing_verification_and_redemption_share_one_preconnected_tunnel_stream() {
+        let descriptor_body = r#"{"environmentId":"retained-stream"}"#;
+        let token_body = serde_json::to_string(&json!({
+            "access_token": "retained-stream-token",
+            "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "environment:read environment:write",
+        }))
+        .expect("token response should encode");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("pairing server should bind");
+        let address = listener.local_addr().expect("pairing server address");
+        let (sender, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("pairing server should accept once");
+            drop(listener);
+
+            sender
+                .send(read_test_http_request(&mut stream))
+                .expect("descriptor request should be observable");
+            let descriptor_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{descriptor_body}",
+                descriptor_body.len(),
+            );
+            stream
+                .write_all(descriptor_response.as_bytes())
+                .expect("descriptor response should write");
+
+            sender
+                .send(read_test_http_request(&mut stream))
+                .expect("pairing request should be observable");
+            let token_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{token_body}",
+                token_body.len(),
+            );
+            stream
+                .write_all(token_response.as_bytes())
+                .expect("token response should write");
+        });
+
+        let mut connection = SshPairingConnection::connect(&format!("http://{address}"))
+            .await
+            .expect("retained pairing connection should open");
+        assert_eq!(
+            connection
+                .get_json("verify-before-pairing", "/.well-known/bibcode/environment")
+                .await
+                .expect("descriptor should use the retained stream"),
+            json!({ "environmentId": "retained-stream" })
+        );
+        let session = connection
+            .redeem("one-use-secret".to_string())
+            .await
+            .expect("redemption should reuse the retained stream after the listener closes");
+        assert_eq!(session["access_token"], "retained-stream-token");
+
+        let descriptor_request = requests
+            .recv()
+            .expect("descriptor request should be captured");
+        let pairing_request = requests.recv().expect("pairing request should be captured");
+        assert!(descriptor_request.starts_with("GET /.well-known/bibcode/environment HTTP/1.1"));
+        assert!(pairing_request.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(pairing_request.contains("subject_token=one-use-secret"));
+    }
+
+    #[tokio::test]
+    async fn ssh_pairing_never_follows_a_redirect_away_from_the_verified_tunnel() {
+        let destination =
+            TcpListener::bind(("127.0.0.1", 0)).expect("redirect destination should bind");
+        let destination_address = destination
+            .local_addr()
+            .expect("redirect destination address");
+        destination
+            .set_nonblocking(true)
+            .expect("redirect destination should be nonblocking");
+        let (destination_sender, destination_requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                match destination.accept() {
+                    Ok((mut stream, _)) => {
+                        destination_sender
+                            .send(read_test_http_request(&mut stream))
+                            .expect("redirected request should be observable");
+                        let body = r#"{"access_token":"redirected","token_type":"Bearer"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("redirect destination should respond");
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("redirect destination failed to accept: {error}"),
+                }
+            }
+        });
+
+        let redirect = TcpListener::bind(("127.0.0.1", 0)).expect("redirect source should bind");
+        let redirect_address = redirect.local_addr().expect("redirect source address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().expect("redirect source should accept");
+            let _request = read_test_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{destination_address}/oauth/token\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("redirect source should respond");
+        });
+
+        let mut connection = SshPairingConnection::connect(&format!("http://{redirect_address}"))
+            .await
+            .expect("pairing connection should open");
+        let error = connection
+            .redeem("pairing-credential".to_string())
+            .await
+            .expect_err("SSH pairing must reject redirects");
+        assert!(error.contains("ssh_http:307"), "{error}");
+        assert!(
+            destination_requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the pairing credential must not be redirected"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_remote_api_never_uses_an_http_proxy_for_the_verified_tunnel() {
+        let (target_base_url, target_requests) =
+            spawn_json_test_server(r#"{"environmentId":"direct-loopback"}"#);
+
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).expect("proxy fixture should bind");
+        let proxy_address = proxy.local_addr().expect("proxy fixture address");
+        proxy
+            .set_nonblocking(true)
+            .expect("proxy fixture should be nonblocking");
+        let (proxy_sender, proxy_requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                match proxy.accept() {
+                    Ok((mut stream, _)) => {
+                        proxy_sender
+                            .send(read_test_http_request(&mut stream))
+                            .expect("proxied request should be observable");
+                        let body = r#"{"environmentId":"proxied"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("proxy fixture should respond");
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("proxy fixture failed to accept: {error}"),
+                }
+            }
+        });
+
+        let client = build_remote_api_client(
+            reqwest::Client::builder().proxy(
+                reqwest::Proxy::all(format!("http://{proxy_address}"))
+                    .expect("explicit proxy should configure"),
+            ),
+        )
+        .expect("SSH remote API client should build");
+        let response = client
+            .get(format!("{target_base_url}/descriptor"))
+            .send()
+            .await
+            .expect("direct loopback request should succeed");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            target_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("target should receive the request")
+                .starts_with("GET /descriptor HTTP/1.1")
+        );
+        assert!(
+            proxy_requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the verified tunnel request must not use a proxy"
+        );
+    }
+
+    #[test]
+    fn ssh_pairing_blocks_a_stale_or_replaced_tunnel_before_credential_creation() {
+        let target = SshEnvironmentTarget {
+            alias: "devbox".to_string(),
+            hostname: "devbox.internal".to_string(),
+            username: Some("alice".to_string()),
+            port: Some(22),
+        };
+        let bootstrap = SshEnvironmentBootstrap::external(
+            target,
+            3773,
+            "http://127.0.0.1:45123/".to_string(),
+            "ws://127.0.0.1:45123/".to_string(),
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        );
+
+        validate_retained_ssh_pairing_tunnel(&bootstrap, Some(&bootstrap))
+            .expect("the exact live tunnel may proceed to credential creation");
+        let ended = validate_retained_ssh_pairing_tunnel(&bootstrap, None)
+            .expect_err("a dead tunnel must stop before credential creation");
+        assert!(ended.contains("no credential was created"), "{ended}");
+
+        let mut replacement = bootstrap.clone();
+        replacement.http_base_url = "http://127.0.0.1:45124/".to_string();
+        replacement.ws_base_url = "ws://127.0.0.1:45124/".to_string();
+        let changed = validate_retained_ssh_pairing_tunnel(&bootstrap, Some(&replacement))
+            .expect_err("a replacement listener/tunnel must stop before credential creation");
+        assert!(changed.contains("no credential was created"), "{changed}");
+    }
+
+    #[test]
+    fn ssh_pairing_requires_the_same_valid_compatible_descriptor() {
+        let descriptor = json!({
+            "environmentId": "00000000-0000-4000-8000-000000000061",
+            "label": "SSH environment",
+            "platform": { "os": "linux", "arch": "x64" },
+            "storageInstanceId": "00000000-0000-4000-8000-000000000062",
+            "serverVersion": "0.4.2",
+            "protocol": { "minimum": 1, "maximum": 1 },
+            "capabilities": { "repositoryIdentity": true },
+            "transport": { "mode": "loopback-http" },
+        });
+        validate_ssh_pairing_descriptor(&descriptor, &descriptor)
+            .expect("stable compatible descriptor");
+        let mut missing_label = descriptor.clone();
+        missing_label
+            .as_object_mut()
+            .expect("descriptor should be an object")
+            .remove("label");
+        assert!(validate_ssh_pairing_descriptor(&missing_label, &missing_label).is_err());
+        let mut wrong_transport = descriptor.clone();
+        wrong_transport["transport"] = json!({
+            "mode": "https",
+            "spkiSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        });
+        assert!(validate_ssh_pairing_descriptor(&wrong_transport, &wrong_transport).is_err());
+        let mut malformed_capabilities = descriptor.clone();
+        malformed_capabilities["capabilities"]["worktreeCatalog"] = json!("yes");
+        assert!(
+            validate_ssh_pairing_descriptor(&malformed_capabilities, &malformed_capabilities,)
+                .is_err()
+        );
+        assert!(
+            validate_ssh_pairing_descriptor(
+                &json!({
+                    "environmentId": "00000000-0000-4000-8000-000000000061",
+                    "label": "SSH environment",
+                    "platform": { "os": "linux", "arch": "x64" },
+                    "storageInstanceId": "00000000-0000-4000-8000-000000000063",
+                    "serverVersion": "0.4.2",
+                    "protocol": { "minimum": 1, "maximum": 1 },
+                    "capabilities": { "repositoryIdentity": true },
+                    "transport": { "mode": "loopback-http" },
+                }),
+                &descriptor,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_ssh_pairing_descriptor(
+                &descriptor,
+                &json!({
+                    "environmentId": "00000000-0000-4000-8000-000000000061",
+                    "label": "SSH environment",
+                    "platform": { "os": "linux", "arch": "x64" },
+                    "storageInstanceId": "00000000-0000-4000-8000-000000000062",
+                    "serverVersion": "0.4.2",
+                    "protocol": { "minimum": 2, "maximum": 2 },
+                    "capabilities": { "repositoryIdentity": true },
+                    "transport": { "mode": "loopback-http" },
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_pairing_requires_a_complete_access_token_result() {
+        let valid = json!({
+            "access_token": "bearer-token",
+            "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "environment:read environment:write",
+        });
+        canonicalize_ssh_access_token_result(&valid).expect("complete access token result");
+        for invalid in [
+            json!({"access_token":"bearer-token","token_type":"Bearer"}),
+            json!({
+                "access_token": "bearer-token",
+                "issued_token_type": "wrong",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "environment:read",
+            }),
+            json!({
+                "access_token": "bearer-token",
+                "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": " ",
+            }),
+            json!({
+                "access_token": "dpop-token",
+                "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
+                "token_type": "DPoP",
+                "expires_in": 3600,
+                "scope": "environment:read",
+            }),
+        ] {
+            assert!(canonicalize_ssh_access_token_result(&invalid).is_err());
+        }
     }
 
     #[tokio::test]
@@ -3067,7 +3847,7 @@ mod tests {
                 desktop_bridge_ensure_ssh_environment,
                 desktop_bridge_disconnect_ssh_environment,
                 desktop_bridge_fetch_environment_descriptor,
-                desktop_bridge_bootstrap_ssh_bearer_session,
+                desktop_bridge_pair_ssh_environment,
                 desktop_bridge_fetch_ssh_session_state,
                 desktop_bridge_issue_ssh_web_socket_ticket,
                 desktop_bridge_resolve_ssh_password_prompt,
@@ -3374,13 +4154,6 @@ mod tests {
             (
                 "desktop_bridge_fetch_environment_descriptor",
                 json!({"httpBaseUrl":"file:///tmp/blocked"}),
-            ),
-            (
-                "desktop_bridge_bootstrap_ssh_bearer_session",
-                json!({
-                    "httpBaseUrl":"file:///tmp/blocked",
-                    "credential":"credential",
-                }),
             ),
             (
                 "desktop_bridge_fetch_ssh_session_state",

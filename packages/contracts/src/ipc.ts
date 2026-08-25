@@ -544,7 +544,7 @@ export interface DesktopSshEnvironmentBootstrap {
   target: DesktopSshEnvironmentTarget;
   httpBaseUrl: string;
   wsBaseUrl: string;
-  pairingToken: string | null;
+  hostKeyFingerprint: string;
   remotePort?: number;
   remoteServerKind?: "external" | "managed";
 }
@@ -553,7 +553,7 @@ export const DesktopSshEnvironmentBootstrapSchema = Schema.Struct({
   target: DesktopSshEnvironmentTargetSchema,
   httpBaseUrl: Schema.String,
   wsBaseUrl: Schema.String,
-  pairingToken: Schema.NullOr(Schema.String),
+  hostKeyFingerprint: Schema.String,
   remotePort: Schema.optionalKey(Schema.Number),
   remoteServerKind: Schema.optionalKey(Schema.Literals(["external", "managed"])),
 });
@@ -582,7 +582,7 @@ export const DesktopSshPasswordPromptCancelledResultSchema = Schema.Struct({
 });
 
 export const DesktopSshEnvironmentEnsureOptionsSchema = Schema.Struct({
-  issuePairingToken: Schema.optionalKey(Schema.Boolean),
+  expectedHostKeyFingerprint: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 
 export const DesktopSshEnvironmentEnsureInputSchema = Schema.Struct({
@@ -595,6 +595,11 @@ export const DesktopSshEnvironmentEnsureResultSchema = Schema.Union([
   DesktopSshPasswordPromptCancelledResultSchema,
 ]);
 
+export const DesktopSshPairingInputSchema = Schema.Struct({
+  target: DesktopSshEnvironmentTargetSchema,
+  descriptor: ExecutionEnvironmentDescriptor,
+});
+
 export const DesktopSshHttpBaseUrlInputSchema = Schema.Struct({
   httpBaseUrl: Schema.String,
 });
@@ -602,11 +607,6 @@ export const DesktopSshHttpBaseUrlInputSchema = Schema.Struct({
 export const DesktopSshBearerRequestInputSchema = Schema.Struct({
   httpBaseUrl: Schema.String,
   bearerToken: Schema.String,
-});
-
-export const DesktopSshBearerBootstrapInputSchema = Schema.Struct({
-  httpBaseUrl: Schema.String,
-  credential: Schema.String,
 });
 
 export const DesktopSshPasswordPromptResolutionInputSchema = Schema.Struct({
@@ -1416,13 +1416,16 @@ export interface DesktopBridge {
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
-    options?: { issuePairingToken?: boolean },
+    options?: { expectedHostKeyFingerprint?: string | null },
   ) => Promise<DesktopSshEnvironmentBootstrap>;
-  disconnectSshEnvironment: (target: DesktopSshEnvironmentTarget) => Promise<void>;
+  disconnectSshEnvironment: (
+    target: DesktopSshEnvironmentTarget,
+    options: { expectedHostKeyFingerprint: string },
+  ) => Promise<void>;
   fetchSshEnvironmentDescriptor: (httpBaseUrl: string) => Promise<ExecutionEnvironmentDescriptor>;
-  bootstrapSshBearerSession: (
-    httpBaseUrl: string,
-    credential: string,
+  pairSshEnvironment: (
+    target: DesktopSshEnvironmentTarget,
+    descriptor: ExecutionEnvironmentDescriptor,
   ) => Promise<AuthAccessTokenResult>;
   fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) => Promise<AuthSessionState>;
   issueSshWebSocketTicket: (

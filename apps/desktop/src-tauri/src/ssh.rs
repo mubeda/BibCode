@@ -31,11 +31,27 @@ const SSH_READY_PATH: &str = "/.well-known/bibcode/environment";
 const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const SSH_CONFIG_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 const SSH_CHILD_REAPER_CAPACITY: usize = 32;
+const SSH_COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
+const SSH_REMOTE_SCRIPT_COMMAND_MARKER: &str = "Sending command: sh -s --";
+const SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV: &str = "BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT";
+const SSH_HOST_KEY_OBSERVATION_PATH_ENV: &str = "BIBCODE_SSH_HOST_KEY_OBSERVATION_PATH";
+const SSH_HOST_KEY_PIN_MISMATCH_MARKER: &str = "BIBCODE_SSH_HOST_KEY_PIN_MISMATCH";
+const SSH_HOST_KEY_PIN_HELPER_ENV: &str = "BIBCODE_SSH_HOST_KEY_PIN_HELPER";
+const SSH_INTERNAL_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "BIBCODE_SSH_AUTH_SECRET",
+    SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV,
+    SSH_HOST_KEY_OBSERVATION_PATH_ENV,
+    SSH_HOST_KEY_PIN_HELPER_ENV,
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+];
 const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
 const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
+const SSH_TRUST_PROBE_MARKER: &str = "bibcode-ssh-trust-ok";
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -53,8 +69,59 @@ if ($null -ne $env:BIBCODE_SSH_AUTH_SECRET) {
 [Console]::Error.WriteLine("BiBCode ssh-askpass invoked without BIBCODE_SSH_AUTH_SECRET.")
 exit 1
 "#;
+const HOST_KEY_PIN_POSIX_SCRIPT: &str = r#"#!/bin/sh
+invocation="${1-}"
+observed="${2-}"
+if [ "$invocation" = "ORDER" ]; then
+  exit 0
+fi
+if [ -n "${BIBCODE_SSH_HOST_KEY_OBSERVATION_PATH-}" ]; then
+  umask 077
+  if ! printf '%s\n' "$observed" > "$BIBCODE_SSH_HOST_KEY_OBSERVATION_PATH"; then
+    printf 'BIBCODE_SSH_HOST_KEY_OBSERVATION_FAILED\n' >&2
+    exit 1
+  fi
+fi
+if [ "${BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT+x}" = "x" ] &&
+   [ "$BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT" != "$observed" ]; then
+  printf 'BIBCODE_SSH_HOST_KEY_PIN_MISMATCH\n' >&2
+  exit 1
+fi
+if [ "${BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT+x}" != "x" ] &&
+   [ -z "${BIBCODE_SSH_HOST_KEY_OBSERVATION_PATH-}" ]; then
+  printf 'BIBCODE_SSH_HOST_KEY_PIN_CONFIGURATION_MISSING\n' >&2
+  exit 1
+fi
+exit 0
+"#;
+const HOST_KEY_PIN_WINDOWS_SCRIPT: &str = r#"$invocation = if ($args.Count -gt 0) { $args[0] } else { "" }
+$observed = if ($args.Count -gt 1) { $args[1] } else { "" }
+if ($invocation -eq "ORDER") {
+  exit 0
+}
+$observationPath = $env:BIBCODE_SSH_HOST_KEY_OBSERVATION_PATH
+if (-not [String]::IsNullOrEmpty($observationPath)) {
+  try {
+    [IO.File]::WriteAllText($observationPath, $observed + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+  } catch {
+    [Console]::Error.WriteLine("BIBCODE_SSH_HOST_KEY_OBSERVATION_FAILED")
+    exit 1
+  }
+}
+$expected = $env:BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT
+if ($null -ne $expected -and $expected -ne $observed) {
+  [Console]::Error.WriteLine("BIBCODE_SSH_HOST_KEY_PIN_MISMATCH")
+  exit 1
+}
+if ($null -eq $expected -and [String]::IsNullOrEmpty($observationPath)) {
+  [Console]::Error.WriteLine("BIBCODE_SSH_HOST_KEY_PIN_CONFIGURATION_MISSING")
+  exit 1
+}
+exit 0
+"#;
 
 const REMOTE_LAUNCH_SCRIPT: &str = r#"set -eu
+umask 077
 STATE_KEY="$1"
 STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
 SERVER_HOME="$HOME/.bibcode"
@@ -64,6 +131,9 @@ MANAGED_FILE="$STATE_DIR/managed"
 LOG_FILE="$STATE_DIR/server.log"
 RUNNER_FILE="$STATE_DIR/run-bibcode.sh"
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+: > "$LOG_FILE"
+chmod 600 "$LOG_FILE"
 cat >"$RUNNER_FILE" <<'SH'
 #!/bin/sh
 if command -v bibcode >/dev/null 2>&1; then
@@ -96,13 +166,29 @@ wait_ready() {
 port_in_use() {
   port="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+    if ss_output="$(ss -H -ltn "sport = :$port" 2>/dev/null)"; then
+      if [ -n "$ss_output" ]; then
+        return 0
+      fi
+      return 1
+    fi
+    printf 'Remote host ss could not perform the required listener probe safely.\n' >&2
+    return 2
+  fi
+  if [ -r /proc/net/tcp ]; then
+    socket_tables="/proc/net/tcp"
+    if [ -r /proc/net/tcp6 ]; then
+      socket_tables="$socket_tables /proc/net/tcp6"
+    fi
+    hex_port=$(printf '%04X' "$port")
+    # shellcheck disable=SC2086 -- fixed, locally constructed procfs paths.
+    awk -v suffix=":$hex_port" \
+      '$2 ~ suffix "$" && $4 == "0A" { found = 1 } END { exit found ? 0 : 1 }' \
+      $socket_tables 2>/dev/null
     return $?
   fi
-  hex_port=$(printf '%04X' "$port")
-  awk -v suffix=":$hex_port" \
-    '$2 ~ suffix "$" && $4 == "0A" { found = 1 } END { exit found ? 0 : 1 }' \
-    /proc/net/tcp /proc/net/tcp6 2>/dev/null
+  printf 'Remote host requires ss or readable Linux procfs for safe managed port selection.\n' >&2
+  return 2
 }
 pick_port() {
   start=$(cat "$PORT_FILE" 2>/dev/null || true)
@@ -112,10 +198,19 @@ pick_port() {
   end=$((start + @@REMOTE_PORT_SCAN_WINDOW@@))
   port="$start"
   while [ "$port" -lt "$end" ]; do
-    if ! port_in_use "$port"; then
-      printf '%s' "$port"
-      return 0
+    if port_in_use "$port"; then
+      port_status=0
+    else
+      port_status=$?
     fi
+    case "$port_status" in
+      0) ;;
+      1)
+        printf '%s' "$port"
+        return 0
+        ;;
+      *) return "$port_status" ;;
+    esac
     port=$((port + 1))
   done
   return 1
@@ -132,14 +227,13 @@ if [ -z "$REMOTE_PORT" ]; then
   printf 'Failed to find an available port on the remote host.\n' >&2
   exit 1
 fi
-nohup env BIBCODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
+nohup env BIBCODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" --no-startup-pairing >>"$LOG_FILE" 2>&1 < /dev/null &
 REMOTE_PID="$!"
 printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
 printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
 printf 'managed\n' >"$MANAGED_FILE"
 if ! wait_ready "$REMOTE_PORT" "@@REMOTE_READY_TIMEOUT_MS@@"; then
   printf 'Remote BiBCode server did not become ready on 127.0.0.1:%s.\n' "$REMOTE_PORT" >&2
-  tail -n 80 "$LOG_FILE" >&2 2>/dev/null || true
   kill "$REMOTE_PID" 2>/dev/null || true
   rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
   exit 1
@@ -174,7 +268,13 @@ pub struct SshEnvironmentTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshEnvironmentEnsureOptions {
-    pub issue_pairing_token: Option<bool>,
+    pub expected_host_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshEnvironmentDisconnectOptions {
+    pub expected_host_key_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -183,7 +283,7 @@ pub struct SshEnvironmentBootstrap {
     pub target: SshEnvironmentTarget,
     pub http_base_url: String,
     pub ws_base_url: String,
-    pub pairing_token: Option<String>,
+    pub host_key_fingerprint: String,
     pub remote_port: u16,
     pub remote_server_kind: &'static str,
 }
@@ -194,14 +294,14 @@ impl SshEnvironmentBootstrap {
         remote_port: u16,
         http_base_url: String,
         ws_base_url: String,
-        pairing_token: Option<String>,
+        host_key_fingerprint: String,
         remote_server_kind: &'static str,
     ) -> Self {
         Self {
             target,
             http_base_url,
             ws_base_url,
-            pairing_token,
+            host_key_fingerprint,
             remote_port,
             remote_server_kind,
         }
@@ -212,14 +312,14 @@ impl SshEnvironmentBootstrap {
         remote_port: u16,
         http_base_url: String,
         ws_base_url: String,
-        pairing_token: Option<String>,
+        host_key_fingerprint: String,
     ) -> Self {
         Self::new(
             target,
             remote_port,
             http_base_url,
             ws_base_url,
-            pairing_token,
+            host_key_fingerprint,
             "external",
         )
     }
@@ -270,6 +370,70 @@ impl SshAuthOptions {
             batch_mode: "no",
             interactive_auth: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshHostKeyFailureKind {
+    Changed,
+    Unknown,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshHostProbe {
+    pub target: SshEnvironmentTarget,
+    pub host_key_fingerprint: String,
+}
+
+pub fn parse_ssh_host_key_fingerprint(output: &str) -> Result<String, String> {
+    let mut last_fingerprint = None;
+    for line in output.lines() {
+        let normalized = line.to_ascii_lowercase();
+        if !normalized.contains("server host key:")
+            && !normalized.contains("server host certificate:")
+        {
+            continue;
+        }
+        if let Some(fingerprint) = line
+            .split_whitespace()
+            .find(|field| field.starts_with("SHA256:"))
+            && is_valid_sha256_host_key_fingerprint(fingerprint)
+        {
+            last_fingerprint = Some(fingerprint.to_string());
+        }
+    }
+    last_fingerprint.ok_or_else(|| {
+        "OpenSSH did not report the verified server host-key fingerprint.".to_string()
+    })
+}
+
+fn is_valid_sha256_host_key_fingerprint(fingerprint: &str) -> bool {
+    let Some(digest) = fingerprint.strip_prefix("SHA256:") else {
+        return false;
+    };
+    digest.len() == 43
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+pub fn classify_ssh_host_key_failure(output: &str) -> SshHostKeyFailureKind {
+    let normalized = output.to_ascii_lowercase();
+    if normalized.contains("remote host identification has changed")
+        || normalized.contains("possible dns spoofing detected")
+        || normalized.contains("revoked host key")
+        || normalized.contains("host key is marked as revoked")
+        || normalized.contains("offending") && normalized.contains("host key")
+    {
+        SshHostKeyFailureKind::Changed
+    } else if normalized.contains("host key verification failed")
+        || normalized.contains("host key is known")
+        || normalized.contains("authenticity of host")
+    {
+        SshHostKeyFailureKind::Unknown
+    } else {
+        SshHostKeyFailureKind::Other
     }
 }
 
@@ -329,8 +493,13 @@ impl SshEnvironmentLaunchPlan {
             "-n".to_string(),
             "-N".to_string(),
             "-L".to_string(),
-            format!("{local_port}:127.0.0.1:{remote_port}"),
+            format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
+            "-o".to_string(),
+            "LogLevel=DEBUG".to_string(),
+            "-o".to_string(),
+            "FingerprintHash=sha256".to_string(),
         ]);
+        args.push("--".to_string());
         args.push(build_ssh_host_spec(&target)?);
 
         Ok(Self {
@@ -444,17 +613,118 @@ impl SshEnvironmentManager {
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
         if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
+            validate_expected_host_key_fingerprint(
+                options
+                    .as_ref()
+                    .and_then(|options| options.expected_host_key_fingerprint.as_deref()),
+                &existing.host_key_fingerprint,
+            )?;
+            return Ok(existing);
+        }
+
+        let expected_host_key_fingerprint = options
+            .as_ref()
+            .and_then(|options| options.expected_host_key_fingerprint.as_deref())
+            .map(str::to_string);
+        let probe = self
+            .probe_with_expected(
+                app,
+                prompts,
+                target,
+                expected_host_key_fingerprint.as_deref(),
+            )
+            .await?;
+        validate_expected_host_key_fingerprint(
+            options
+                .as_ref()
+                .and_then(|options| options.expected_host_key_fingerprint.as_deref()),
+            &probe.host_key_fingerprint,
+        )?;
+        self.ensure_tunnel(app, prompts, probe).await
+    }
+
+    pub async fn probe<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        target: SshEnvironmentTarget,
+    ) -> Result<SshHostProbe, String> {
+        self.probe_with_expected(app, prompts, target, None).await
+    }
+
+    async fn probe_with_expected<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        target: SshEnvironmentTarget,
+        expected_host_key_fingerprint: Option<&str>,
+    ) -> Result<SshHostProbe, String> {
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        let target = normalize_ssh_environment_target(target)?;
+        let key = target_connection_key(&target);
+        let askpass_launcher = self.askpass_launcher()?;
+        let expected_host_key_fingerprint = expected_host_key_fingerprint.map(str::to_string);
+        let host_key_fingerprint = self
+            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+                let target = target.clone();
+                let askpass_launcher = askpass_launcher.clone();
+                let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                async move {
+                    probe_ssh_host_key(
+                        &target,
+                        &auth,
+                        askpass_launcher,
+                        expected_host_key_fingerprint.as_deref(),
+                    )
+                    .await
+                }
+            })
+            .await?;
+        Ok(SshHostProbe {
+            target,
+            host_key_fingerprint,
+        })
+    }
+
+    pub async fn ensure_tunnel<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        probe: SshHostProbe,
+    ) -> Result<SshEnvironmentBootstrap, String> {
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        let target = normalize_ssh_environment_target(probe.target)?;
+        let key = target_connection_key(&target);
+        if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
+            validate_expected_host_key_fingerprint(
+                Some(&probe.host_key_fingerprint),
+                &existing.host_key_fingerprint,
+            )?;
             return Ok(existing);
         }
 
         let local_port = portpicker::pick_unused_port()
             .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
         let askpass_launcher = self.askpass_launcher()?;
+        let expected_host_key_fingerprint = probe.host_key_fingerprint.clone();
         let remote_launch = self
             .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
-                async move { launch_or_reuse_remote_server(&target, &auth, askpass_launcher).await }
+                let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                async move {
+                    launch_or_reuse_remote_server(
+                        &target,
+                        &auth,
+                        askpass_launcher,
+                        &expected_host_key_fingerprint,
+                    )
+                    .await
+                }
             })
             .await?;
         let tunnel_result = self
@@ -462,6 +732,7 @@ impl SshEnvironmentManager {
                 let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
                 let remote_launch = remote_launch.clone();
+                let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
                 async move {
                     let plan = SshEnvironmentLaunchPlan::forward_with_auth(
                         target,
@@ -469,7 +740,13 @@ impl SshEnvironmentManager {
                         remote_launch,
                         &auth,
                     )?;
-                    let child = start_ssh_tunnel(&plan, &auth, askpass_launcher).await?;
+                    let child = start_ssh_tunnel(
+                        &plan,
+                        &auth,
+                        askpass_launcher,
+                        &expected_host_key_fingerprint,
+                    )
+                    .await?;
                     Ok((plan, child))
                 }
             })
@@ -481,35 +758,23 @@ impl SshEnvironmentManager {
                     .cached_auth_secret(&key)
                     .map(SshAuthOptions::with_secret)
                     .unwrap_or_else(SshAuthOptions::batch);
-                let _ = stop_remote_server(&target, &cleanup_auth, askpass_launcher).await;
+                let _ = stop_remote_server(
+                    &target,
+                    &cleanup_auth,
+                    askpass_launcher,
+                    &expected_host_key_fingerprint,
+                )
+                .await;
                 return Err(error);
             }
         };
 
-        let pairing_token = if options
-            .as_ref()
-            .and_then(|options| options.issue_pairing_token)
-            .unwrap_or(false)
-        {
-            Some(
-                self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
-                    let target = target.clone();
-                    let askpass_launcher = askpass_launcher.clone();
-                    async move {
-                        issue_remote_pairing_token(&target, &auth, askpass_launcher).await
-                    }
-                })
-                .await?,
-            )
-        } else {
-            None
-        };
         let bootstrap = SshEnvironmentBootstrap::new(
             target,
             plan.remote_port,
             plan.http_base_url,
             plan.ws_base_url,
-            pairing_token,
+            expected_host_key_fingerprint,
             plan.remote_server_kind,
         );
         if let Err((error, mut child)) = self.publish_tunnel(key, child, bootstrap.clone()) {
@@ -519,31 +784,110 @@ impl SshEnvironmentManager {
         Ok(bootstrap)
     }
 
+    pub fn active_bootstrap(
+        &self,
+        target: &SshEnvironmentTarget,
+    ) -> Result<Option<SshEnvironmentBootstrap>, String> {
+        let target = normalize_ssh_environment_target(target.clone())?;
+        self.take_existing_bootstrap_if_running(&target_connection_key(&target))
+    }
+
+    pub async fn create_pairing<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        target: SshEnvironmentTarget,
+    ) -> Result<String, String> {
+        let target = normalize_ssh_environment_target(target)?;
+        let key = target_connection_key(&target);
+        let bootstrap = self
+            .take_existing_bootstrap_if_running(&key)?
+            .ok_or_else(|| {
+                "SSH pairing requires an active, host-key-verified BiBCode tunnel.".to_string()
+            })?;
+        let expected_host_key_fingerprint = bootstrap.host_key_fingerprint;
+        let askpass_launcher = self.askpass_launcher()?;
+        self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            let target = target.clone();
+            let askpass_launcher = askpass_launcher.clone();
+            let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+            async move {
+                issue_remote_pairing_token(
+                    &target,
+                    &auth,
+                    askpass_launcher,
+                    &expected_host_key_fingerprint,
+                )
+                .await
+            }
+        })
+        .await
+    }
+
     pub async fn disconnect_environment<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         prompts: &SshPasswordPromptManager,
         target: SshEnvironmentTarget,
+        options: SshEnvironmentDisconnectOptions,
     ) -> Result<(), String> {
         let target = normalize_ssh_environment_target(target)?;
         let key = target_connection_key(&target);
-        let tunnel = self
-            .tunnels
-            .lock()
-            .map_err(|error| format!("Could not access SSH tunnels: {error}"))?
-            .remove(&key);
-        let askpass_launcher = match tunnel {
+        let requested_host_key_fingerprint = options.expected_host_key_fingerprint;
+        if !is_valid_sha256_host_key_fingerprint(&requested_host_key_fingerprint) {
+            return Err("SSH disconnect requires a valid saved host-key fingerprint.".to_string());
+        }
+        let tunnel = {
+            let mut tunnels = self
+                .tunnels
+                .lock()
+                .map_err(|error| format!("Could not access SSH tunnels: {error}"))?;
+            if let Some(active) = tunnels.get(&key) {
+                validate_expected_host_key_fingerprint(
+                    Some(&requested_host_key_fingerprint),
+                    &active.bootstrap.host_key_fingerprint,
+                )?;
+            }
+            tunnels.remove(&key)
+        };
+        let (askpass_launcher, expected_host_key_fingerprint, stop_target) = match tunnel {
             Some(mut tunnel) => {
                 let askpass_launcher = tunnel.child.askpass_launcher().clone();
+                let expected_host_key_fingerprint = tunnel.bootstrap.host_key_fingerprint.clone();
+                let stop_target = tunnel.bootstrap.target.clone();
                 tunnel.child.terminate_and_reap().await;
-                askpass_launcher
+                (askpass_launcher, expected_host_key_fingerprint, stop_target)
             }
-            None => self.askpass_launcher()?,
+            None => {
+                let probe = self
+                    .probe_with_expected(
+                        app,
+                        prompts,
+                        target.clone(),
+                        Some(&requested_host_key_fingerprint),
+                    )
+                    .await
+                    .map_err(disconnect_probe_failure_message)?;
+                (
+                    self.askpass_launcher()?,
+                    probe.host_key_fingerprint,
+                    target.clone(),
+                )
+            }
         };
-        self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
-            let target = target.clone();
+        self.run_with_ssh_auth(app, prompts, &key, &stop_target, |auth| {
+            let target = stop_target.clone();
             let askpass_launcher = askpass_launcher.clone();
-            async move { stop_remote_server(&target, &auth, askpass_launcher).await }
+            let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+            async move {
+                stop_remote_server(
+                    &target,
+                    &auth,
+                    askpass_launcher,
+                    &expected_host_key_fingerprint,
+                )
+                .await
+            }
         })
         .await?;
         Ok(())
@@ -622,13 +966,22 @@ impl SshEnvironmentManager {
                         return Err(error);
                     }
                     prompted_attempts += 1;
+                    validate_effective_ssh_security_policy(target, self.askpass_launcher()?, true)
+                        .await?;
                     let secret = self
                         .prompt_for_password(app, prompts, target, prompted_attempts)
                         .await?;
                     self.remember_auth_secret(key, secret.clone())?;
                     auth = SshAuthOptions::with_secret(secret);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if auth.auth_secret.is_some()
+                        && is_ssh_private_environment_policy_failure(&error)
+                    {
+                        self.clear_auth_secret(key);
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -652,11 +1005,11 @@ impl SshEnvironmentManager {
         {
             None => Ok(Some(tunnel.bootstrap.clone())),
             Some(_status) => {
-                let mut stale = tunnels.remove(key);
+                let stale = tunnels.remove(key);
                 drop(tunnels);
-                if let Some(stale) = stale.as_mut() {
-                    stale.child.release_reaped();
-                }
+                // Drop transfers the already-exited child together with its
+                // retained stderr observer to the bounded reaper. The permit
+                // remains active until both handles have been joined.
                 drop(stale);
                 Ok(None)
             }
@@ -714,18 +1067,60 @@ fn normalize_ssh_environment_target(
     Ok(target)
 }
 
+fn validate_expected_host_key_fingerprint(
+    expected: Option<&str>,
+    observed: &str,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if !is_valid_sha256_host_key_fingerprint(expected) {
+        return Err("The expected SSH host-key fingerprint is invalid.".to_string());
+    }
+    if expected != observed {
+        return Err(
+            "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_ssh_command_host_fingerprint(
+    expected: &str,
+    verbose_stderr: &str,
+) -> Result<(), String> {
+    let observed = parse_ssh_host_key_fingerprint(verbose_stderr)?;
+    validate_expected_host_key_fingerprint(Some(expected), &observed)
+}
+
 fn target_connection_key(target: &SshEnvironmentTarget) -> String {
+    let destination = effective_ssh_destination(target).to_ascii_lowercase();
+    let port = target
+        .port
+        .map(|port| format!("explicit:{port}"))
+        .unwrap_or_else(|| "ssh-config".to_string());
     format!(
+        "{}\u{0}{}\u{0}{}",
+        destination,
+        target.username.as_deref().unwrap_or_default(),
+        port
+    )
+}
+
+fn remote_state_key(target: &SshEnvironmentTarget) -> String {
+    // This names durable remote launch state created by older clients. Keep
+    // its historical shape separate from the in-memory effective-route key so
+    // upgrades can still find and stop an already managed server.
+    let historical_identity = format!(
         "{}\u{0}{}\u{0}{}\u{0}{}",
         target.alias,
         target.hostname,
         target.username.as_deref().unwrap_or_default(),
         target.port.map(|port| port.to_string()).unwrap_or_default()
-    )
-}
-
-fn remote_state_key(target: &SshEnvironmentTarget) -> String {
-    let digest = Sha256::digest(target_connection_key(target).as_bytes());
+    );
+    let digest = Sha256::digest(historical_identity.as_bytes());
     digest
         .iter()
         .take(8)
@@ -733,12 +1128,16 @@ fn remote_state_key(target: &SshEnvironmentTarget) -> String {
         .collect()
 }
 
-fn build_ssh_host_spec(target: &SshEnvironmentTarget) -> Result<String, String> {
-    let destination = if target.alias.trim().is_empty() {
+fn effective_ssh_destination(target: &SshEnvironmentTarget) -> &str {
+    if target.alias.trim().is_empty() {
         target.hostname.trim()
     } else {
         target.alias.trim()
-    };
+    }
+}
+
+fn build_ssh_host_spec(target: &SshEnvironmentTarget) -> Result<String, String> {
+    let destination = effective_ssh_destination(target);
     if destination.is_empty() {
         return Err("SSH target is missing its alias/hostname.".to_string());
     }
@@ -754,12 +1153,136 @@ fn base_ssh_args_with_auth(target: &SshEnvironmentTarget, auth: &SshAuthOptions)
         format!("BatchMode={}", auth.batch_mode),
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
+        "-o".to_string(),
+        "ControlMaster=no".to_string(),
+        "-o".to_string(),
+        "ControlPath=none".to_string(),
     ];
     if let Some(port) = target.port {
         args.push("-p".to_string());
         args.push(port.to_string());
     }
     args
+}
+
+fn build_ssh_config_resolution_args(target: &SshEnvironmentTarget) -> Result<Vec<String>, String> {
+    let mut args = vec!["-G".to_string()];
+    args.extend(base_ssh_args_with_auth(target, &SshAuthOptions::batch()));
+    args.extend(["--".to_string(), build_ssh_host_spec(target)?]);
+    Ok(args)
+}
+
+fn validate_effective_known_hosts_command(output: &str) -> Result<(), String> {
+    let configured = output.lines().find_map(|line| {
+        let line = line.trim();
+        let split_at = line.find(char::is_whitespace)?;
+        let (key, value) = line.split_at(split_at);
+        key.eq_ignore_ascii_case("knownhostscommand")
+            .then(|| value.trim())
+    });
+    match configured {
+        Some(value) if value.eq_ignore_ascii_case("none") => Ok(()),
+        Some(_) => Err(
+            "This SSH target uses a custom KnownHostsCommand, which is not supported with BiBCode host-key pinning. Use a normal user/system known_hosts entry or remove the custom command for this target before retrying."
+                .to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+fn validate_effective_send_env(output: &str) -> Result<(), String> {
+    let exposes_private_environment = output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        if !fields
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("sendenv"))
+        {
+            return false;
+        }
+        fields.any(|pattern| {
+            if pattern.starts_with('-') {
+                return false;
+            }
+            let pattern = pattern.to_ascii_uppercase();
+            !pattern.is_empty()
+                && SSH_INTERNAL_ENVIRONMENT_VARIABLES
+                    .iter()
+                    .any(|name| wildcard_matches(&pattern, &name.to_ascii_uppercase()))
+        })
+    });
+    if exposes_private_environment {
+        return Err(
+            "This SSH target's effective SendEnv policy can forward BiBCode's private SSH authentication or host-key control variables. Remove broad or matching SendEnv patterns for this target before retrying."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_effective_proxy_password_policy(
+    output: &str,
+    password_authentication_requested: bool,
+) -> Result<(), String> {
+    if !password_authentication_requested {
+        return Ok(());
+    }
+    let proxy_is_configured = output.lines().any(|line| {
+        let line = line.trim();
+        let split_at = line.find(char::is_whitespace);
+        let Some(split_at) = split_at else {
+            return false;
+        };
+        let (key, value) = line.split_at(split_at);
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "proxyjump" | "proxycommand"
+        ) && !value.trim().is_empty()
+            && !value.trim().eq_ignore_ascii_case("none")
+    });
+    if proxy_is_configured {
+        return Err(
+            "SSH password authentication through ProxyJump or ProxyCommand is not supported because it could expose the destination password to the proxy process. Configure key or agent authentication for the complete proxy chain before retrying."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn openssh_command_environment_path(argument: &Path) -> Result<String, String> {
+    let argument = argument
+        .to_str()
+        .ok_or_else(|| "SSH helper path is not valid Unicode.".to_string())?;
+    if argument.contains(['\0', '\r', '\n']) {
+        return Err("SSH helper path contains an unsupported control character.".to_string());
+    }
+    // OpenSSH argv-splits the fixed command template before expanding this
+    // environment value into its already-isolated argv element. Expansion is
+    // non-recursive, so spaces, '%', '${}', shell metacharacters, and quotes in
+    // the path remain literal without another quoting layer.
+    Ok(argument.to_string())
+}
+
+fn insert_ssh_host_key_pin_args(args: &mut Vec<String>) {
+    let verifier_command = if cfg!(windows) {
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${{{SSH_HOST_KEY_PIN_HELPER_ENV}}} %I %f"
+        )
+    } else {
+        format!("/bin/sh ${{{SSH_HOST_KEY_PIN_HELPER_ENV}}} %I %f")
+    };
+    let destination_guard = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    args.splice(
+        destination_guard..destination_guard,
+        [
+            "-o".to_string(),
+            "FingerprintHash=sha256".to_string(),
+            "-o".to_string(),
+            format!("KnownHostsCommand={verifier_command}"),
+        ],
+    );
 }
 
 fn build_ssh_child_environment(
@@ -784,6 +1307,55 @@ fn build_ssh_child_environment(
     environment
 }
 
+fn build_verified_ssh_child_environment(
+    auth: &SshAuthOptions,
+    askpass_launcher: &Path,
+    host_key_pin_verifier: &Path,
+    expected_host_key_fingerprint: Option<&str>,
+    observation_path: Option<&Path>,
+) -> Result<HashMap<String, String>, String> {
+    if expected_host_key_fingerprint.is_none() && observation_path.is_none() {
+        return Err(
+            "SSH host-key verification is missing its pin or observation owner.".to_string(),
+        );
+    }
+    let mut environment = build_ssh_child_environment(auth, askpass_launcher);
+    environment.insert(
+        SSH_HOST_KEY_PIN_HELPER_ENV.to_string(),
+        openssh_command_environment_path(host_key_pin_verifier)?,
+    );
+    if let Some(expected) = expected_host_key_fingerprint {
+        if !is_valid_sha256_host_key_fingerprint(expected) {
+            return Err("The expected SSH host-key fingerprint is invalid.".to_string());
+        }
+        environment.insert(
+            SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV.to_string(),
+            expected.to_string(),
+        );
+    }
+    if let Some(path) = observation_path {
+        environment.insert(
+            SSH_HOST_KEY_OBSERVATION_PATH_ENV.to_string(),
+            path.to_string_lossy().into_owned(),
+        );
+    }
+    Ok(environment)
+}
+
+fn apply_verified_ssh_child_environment(
+    command: &mut Command,
+    environment: HashMap<String, String>,
+) {
+    for name in SSH_INTERNAL_ENVIRONMENT_VARIABLES {
+        command.env_remove(name);
+    }
+    command.envs(environment);
+}
+
+fn is_ssh_host_key_pin_failure(message: &str) -> bool {
+    message.contains(SSH_HOST_KEY_PIN_MISMATCH_MARKER)
+}
+
 fn is_ssh_auth_failure(message: &str) -> bool {
     let normalized = message.to_lowercase();
     normalized.contains("authentication failed")
@@ -794,6 +1366,27 @@ fn is_ssh_auth_failure(message: &str) -> bool {
                 || normalized.contains("publickey")
                 || normalized.contains("hostbased")
                 || normalized.contains("gssapi-with-mic")))
+}
+
+fn is_ssh_private_environment_policy_failure(message: &str) -> bool {
+    message.starts_with("This SSH target uses a custom KnownHostsCommand")
+        || message.starts_with("This SSH target's effective SendEnv policy")
+        || message.starts_with("SSH password authentication through ProxyJump or ProxyCommand")
+}
+
+fn disconnect_probe_failure_message(error: String) -> String {
+    let preserves_redacted_classification = is_ssh_auth_failure(&error)
+        || error.starts_with("SSH host-key fingerprint changed.")
+        || error.starts_with("SSH host key changed.")
+        || error.starts_with("SSH host key is unknown or not accepted.")
+        || error.starts_with("This SSH target uses a custom KnownHostsCommand")
+        || error.starts_with("This SSH target's effective SendEnv policy")
+        || error.starts_with("SSH password authentication through ProxyJump or ProxyCommand");
+    if preserves_redacted_classification {
+        error
+    } else {
+        "SSH stop command failed before host-key verification.".to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -807,7 +1400,63 @@ struct SshAskpassLauncherInner {
     directory: PathBuf,
     files: Vec<PathBuf>,
     launcher: PathBuf,
+    host_key_pin_verifier: PathBuf,
     cleanup_sender: watch::Sender<bool>,
+}
+
+struct SshHostKeyObservation {
+    path: PathBuf,
+}
+
+impl SshHostKeyObservation {
+    fn create(launcher: &SshAskpassLauncher) -> Result<Self, String> {
+        let path = launcher.inner.directory.join(format!(
+            "host-key-observation-{}.txt",
+            Uuid::new_v4().simple()
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("Failed to create SSH host-key observation: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                let _ = fs::remove_file(&path);
+                return Err(format!(
+                    "Failed to protect SSH host-key observation: {error}"
+                ));
+            }
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read(&self) -> Result<String, String> {
+        let fingerprint = fs::read_to_string(&self.path)
+            .map_err(|error| format!("Failed to read SSH host-key observation: {error}"))?;
+        let fingerprint = fingerprint.trim();
+        if !is_valid_sha256_host_key_fingerprint(fingerprint) {
+            return Err(
+                "OpenSSH did not publish a valid destination host-key fingerprint.".to_string(),
+            );
+        }
+        Ok(fingerprint.to_string())
+    }
+}
+
+impl Drop for SshHostKeyObservation {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "failed to remove an exact SSH host-key observation");
+        }
+    }
 }
 
 impl SshAskpassLauncher {
@@ -825,16 +1474,23 @@ impl SshAskpassLauncher {
         } else {
             directory.join("ssh-askpass.sh")
         };
+        let host_key_pin_verifier = if cfg!(windows) {
+            directory.join("ssh-host-key-pin.ps1")
+        } else {
+            directory.join("ssh-host-key-pin.sh")
+        };
         let mut files = vec![launcher.clone()];
         if cfg!(windows) {
             files.push(directory.join("ssh-askpass.ps1"));
         }
+        files.push(host_key_pin_verifier.clone());
         let (cleanup_sender, _) = watch::channel(false);
         let inner = SshAskpassLauncherInner {
             root,
             directory,
             files,
             launcher,
+            host_key_pin_verifier,
             cleanup_sender,
         };
 
@@ -849,8 +1505,18 @@ impl SshAskpassLauncher {
                 ASKPASS_WINDOWS_SCRIPT,
                 None,
             )?;
+            write_askpass_file(
+                &inner.host_key_pin_verifier,
+                HOST_KEY_PIN_WINDOWS_SCRIPT,
+                None,
+            )?;
         } else {
             write_askpass_file(&inner.launcher, ASKPASS_POSIX_SCRIPT, Some(0o700))?;
+            write_askpass_file(
+                &inner.host_key_pin_verifier,
+                HOST_KEY_PIN_POSIX_SCRIPT,
+                Some(0o700),
+            )?;
         }
         Ok(Self {
             inner: Arc::new(inner),
@@ -860,6 +1526,10 @@ impl SshAskpassLauncher {
 
     fn path(&self) -> &Path {
         &self.inner.launcher
+    }
+
+    fn host_key_pin_verifier_path(&self) -> &Path {
+        &self.inner.host_key_pin_verifier
     }
 
     #[cfg(test)]
@@ -1007,11 +1677,20 @@ impl SshChildReaperPermit {
         self.shutdown_receiver.clone()
     }
 
-    fn spawn_reap(self, mut child: Child, askpass_launcher: SshAskpassLauncher) {
+    fn spawn_reap(
+        self,
+        mut child: Child,
+        askpass_launcher: SshAskpassLauncher,
+        stderr_drain: Option<tokio::task::JoinHandle<()>>,
+    ) {
         let runtime = self.runtime.clone();
         runtime.spawn(async move {
             let _ = child.start_kill();
             let _ = child.wait().await;
+            if let Some(stderr_drain) = stderr_drain {
+                stderr_drain.abort();
+                let _ = stderr_drain.await;
+            }
             drop(askpass_launcher);
             drop(self);
         });
@@ -1031,6 +1710,176 @@ struct ManagedSshChild {
     child: Option<Child>,
     askpass_launcher: Option<SshAskpassLauncher>,
     reaper_permit: Option<SshChildReaperPermit>,
+    stderr_drain: Option<tokio::task::JoinHandle<()>>,
+}
+
+async fn finish_ssh_background_task(mut task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(SSH_TUNNEL_SHUTDOWN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn read_bounded_ssh_output<R>(reader: R, limit: usize) -> io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SSH command output exceeded its size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn drain_ssh_command_stderr<R>(
+    mut reader: R,
+    verification_sender: oneshot::Sender<Result<(), String>>,
+    output_sender: oneshot::Sender<io::Result<Vec<u8>>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut verification_sender = Some(verification_sender);
+    let mut output = Vec::with_capacity(8 * 1024);
+    let result = async {
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(output);
+            }
+            if output.len().saturating_add(read) > SSH_COMMAND_OUTPUT_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSH command output exceeded its size limit",
+                ));
+            }
+            output.extend_from_slice(&buffer[..read]);
+            let diagnostics = String::from_utf8_lossy(&output);
+            if verification_sender.is_some() && is_ssh_host_key_pin_failure(&diagnostics) {
+                let sender = verification_sender
+                    .take()
+                    .expect("verification sender remains present");
+                let _ = sender.send(Err(
+                    "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+                        .to_string(),
+                ));
+            } else if verification_sender.is_some()
+                && diagnostics.contains(SSH_REMOTE_SCRIPT_COMMAND_MARKER)
+            {
+                let sender = verification_sender
+                    .take()
+                    .expect("verification sender remains present");
+                let _ = sender.send(Ok(()));
+            }
+        }
+    }
+    .await;
+    if let Some(sender) = verification_sender {
+        let message = match &result {
+            Ok(_) => "SSH command ended before confirming its pinned destination host key.",
+            Err(_) => "Could not read bounded SSH command verification diagnostics.",
+        };
+        let _ = sender.send(Err(message.to_string()));
+    }
+    let _ = output_sender.send(result);
+}
+
+async fn drain_ssh_tunnel_stderr<R>(
+    mut reader: R,
+    verification_sender: oneshot::Sender<Result<(), String>>,
+    auth_failure_observed: Arc<AtomicBool>,
+    local_port: u16,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut verification_sender = Some(verification_sender);
+    let main_tunnel_barrier = format!("Local forwarding listening on 127.0.0.1 port {local_port}.");
+    let mut observed = Vec::with_capacity(8 * 1024);
+    let mut observed_before_verification = 0_usize;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                if is_ssh_auth_failure(&String::from_utf8_lossy(&observed)) {
+                    auth_failure_observed.store(true, Ordering::Release);
+                }
+                if let Some(sender) = verification_sender.take() {
+                    let message = if auth_failure_observed.load(Ordering::Acquire) {
+                        "SSH authentication failed during tunnel handshake.".to_string()
+                    } else {
+                        "SSH tunnel ended before confirming its destination host-key fingerprint."
+                            .to_string()
+                    };
+                    let _ = sender.send(Err(message));
+                }
+                return;
+            }
+            Ok(read) => {
+                if verification_sender.is_some() {
+                    observed_before_verification =
+                        observed_before_verification.saturating_add(read);
+                    if observed_before_verification > SSH_COMMAND_OUTPUT_LIMIT {
+                        let sender = verification_sender
+                            .take()
+                            .expect("verification sender remains present");
+                        let _ = sender.send(Err(
+                            "SSH tunnel host-key diagnostics exceeded the size limit.".to_string(),
+                        ));
+                    }
+                }
+                observed.extend_from_slice(&buffer[..read]);
+                while let Some(line_end) = observed.iter().position(|byte| *byte == b'\n') {
+                    let line = observed.drain(..=line_end).collect::<Vec<_>>();
+                    let line = String::from_utf8_lossy(&line);
+                    if is_ssh_auth_failure(&line) {
+                        auth_failure_observed.store(true, Ordering::Release);
+                    }
+                    if is_ssh_host_key_pin_failure(&line) && verification_sender.is_some() {
+                        let sender = verification_sender
+                            .take()
+                            .expect("verification sender remains present");
+                        let _ = sender.send(Err(
+                            "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+                                .to_string(),
+                        ));
+                    } else if line.contains(&main_tunnel_barrier) && verification_sender.is_some() {
+                        // OpenSSH creates local forwarding listeners from ssh_session2,
+                        // after destination authentication. An implicit ProxyJump child
+                        // uses stdio forwarding (-W), so it cannot emit this exact marker.
+                        let sender = verification_sender
+                            .take()
+                            .expect("verification sender remains present");
+                        let _ = sender.send(Ok(()));
+                    }
+                }
+                if observed.len() > 16 * 1024 {
+                    if is_ssh_auth_failure(&String::from_utf8_lossy(&observed)) {
+                        auth_failure_observed.store(true, Ordering::Release);
+                    }
+                    let keep_from = observed.len().saturating_sub(512);
+                    observed.drain(..keep_from);
+                }
+            }
+            Err(_) => {
+                if let Some(sender) = verification_sender.take() {
+                    let _ = sender.send(Err(
+                        "Could not read SSH tunnel host-key diagnostics.".to_string()
+                    ));
+                }
+                return;
+            }
+        }
+    }
 }
 
 impl ManagedSshChild {
@@ -1043,6 +1892,7 @@ impl ManagedSshChild {
             child: Some(child),
             askpass_launcher: Some(askpass_launcher),
             reaper_permit: Some(reaper_permit),
+            stderr_drain: None,
         }
     }
 
@@ -1057,6 +1907,7 @@ impl ManagedSshChild {
     }
 
     fn release_reaped(&mut self) {
+        debug_assert!(self.stderr_drain.is_none());
         self.child.take();
         self.askpass_launcher.take();
         self.reaper_permit.take();
@@ -1067,6 +1918,7 @@ impl ManagedSshChild {
         let waited =
             tokio::time::timeout(SSH_TUNNEL_SHUTDOWN_TIMEOUT, self.child_mut().wait()).await;
         if matches!(waited, Ok(Ok(_))) {
+            self.finish_stderr_drain().await;
             self.release_reaped();
             return;
         }
@@ -1074,21 +1926,19 @@ impl ManagedSshChild {
     }
 
     async fn wait_with_output(&mut self) -> io::Result<std::process::Output> {
-        let mut stdout = self.child_mut().stdout.take();
-        let mut stderr = self.child_mut().stderr.take();
+        let stdout = self.child_mut().stdout.take();
+        let stderr = self.child_mut().stderr.take();
         let stdout_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stdout) = stdout.as_mut() {
-                stdout.read_to_end(&mut bytes).await?;
+            match stdout {
+                Some(stdout) => read_bounded_ssh_output(stdout, SSH_COMMAND_OUTPUT_LIMIT).await,
+                None => Ok(Vec::new()),
             }
-            Ok::<Vec<u8>, io::Error>(bytes)
         };
         let stderr_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(stderr) = stderr.as_mut() {
-                stderr.read_to_end(&mut bytes).await?;
+            match stderr {
+                Some(stderr) => read_bounded_ssh_output(stderr, SSH_COMMAND_OUTPUT_LIMIT).await,
+                None => Ok(Vec::new()),
             }
-            Ok::<Vec<u8>, io::Error>(bytes)
         };
         let mut shutdown = self
             .reaper_permit
@@ -1120,18 +1970,80 @@ impl ManagedSshChild {
         })
     }
 
+    async fn wait_with_streamed_stderr_output(
+        &mut self,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr_receiver: oneshot::Receiver<io::Result<Vec<u8>>>,
+    ) -> io::Result<std::process::Output> {
+        let stdout_task = async move {
+            match stdout {
+                Some(stdout) => read_bounded_ssh_output(stdout, SSH_COMMAND_OUTPUT_LIMIT).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let stderr_task = async move {
+            stderr_receiver.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "SSH stderr observer ended without output",
+                )
+            })?
+        };
+        let mut shutdown = self
+            .reaper_permit
+            .as_ref()
+            .expect("managed SSH child retains bounded cleanup ownership")
+            .shutdown_receiver();
+        let joined = {
+            let status_task = async {
+                tokio::select! {
+                    status = self.child_mut().wait() => status.map(|status| (status, false)),
+                    _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                        let _ = self.child_mut().start_kill();
+                        self.child_mut().wait().await.map(|status| (status, true))
+                    }
+                }
+            };
+            tokio::try_join!(status_task, stdout_task, stderr_task)
+        };
+        let ((status, interrupted), stdout, stderr) = match joined {
+            Ok(output) => output,
+            Err(error) => {
+                self.terminate_and_reap().await;
+                return Err(error);
+            }
+        };
+        self.finish_stderr_drain().await;
+        self.release_reaped();
+        if interrupted {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "SSH process owner is shutting down",
+            ));
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
     fn transfer_to_reaper(&mut self) {
+        let stderr_drain = self.stderr_drain.take();
         let Some(mut child) = self.child.take() else {
+            debug_assert!(stderr_drain.is_none());
             return;
         };
-        let askpass_launcher = self.askpass_launcher.take();
-        let reaper_permit = self.reaper_permit.take();
+        let askpass_launcher = self
+            .askpass_launcher
+            .take()
+            .expect("live managed SSH child retains askpass ownership");
+        let reaper_permit = self
+            .reaper_permit
+            .take()
+            .expect("live managed SSH child retains reaper ownership");
         let _ = child.start_kill();
-        if let (Some(askpass_launcher), Some(reaper_permit)) = (askpass_launcher, reaper_permit) {
-            reaper_permit.spawn_reap(child, askpass_launcher);
-        } else {
-            drop(child);
-        }
+        reaper_permit.spawn_reap(child, askpass_launcher, stderr_drain);
     }
 
     fn shutdown_receiver(&self) -> watch::Receiver<bool> {
@@ -1139,6 +2051,21 @@ impl ManagedSshChild {
             .as_ref()
             .expect("managed SSH child retains bounded cleanup ownership")
             .shutdown_receiver()
+    }
+
+    fn retain_stderr_drain(&mut self, task: tokio::task::JoinHandle<()>) {
+        assert!(
+            self.stderr_drain.is_none(),
+            "managed SSH child may own only one stderr drain"
+        );
+        self.stderr_drain = Some(task);
+    }
+
+    async fn finish_stderr_drain(&mut self) {
+        let Some(stderr_drain) = self.stderr_drain.take() else {
+            return;
+        };
+        finish_ssh_background_task(stderr_drain).await;
     }
 }
 
@@ -1170,6 +2097,51 @@ fn spawn_managed_ssh_child(
         .spawn()
         .map_err(|error| format!("Failed to {operation}: {error}"))?;
     Ok(ManagedSshChild::new(child, askpass_launcher, reaper_permit))
+}
+
+async fn validate_effective_ssh_security_policy(
+    target: &SshEnvironmentTarget,
+    askpass_launcher: SshAskpassLauncher,
+    password_authentication_requested: bool,
+) -> Result<(), String> {
+    let mut command = Command::new(ssh_command());
+    configure_background_command(&mut command);
+    apply_verified_ssh_child_environment(&mut command, HashMap::new());
+    command
+        .args(build_ssh_config_resolution_args(target)?)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = spawn_managed_ssh_child(
+        command,
+        askpass_launcher,
+        "resolve effective SSH configuration",
+    )?;
+    let output = match tokio::time::timeout(SSH_CONFIG_RESOLUTION_TIMEOUT, child.wait_with_output())
+        .await
+    {
+        Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        Ok(result) => result
+            .map_err(|error| format!("Failed to resolve effective SSH configuration: {error}"))?,
+        Err(_) => {
+            child.terminate_and_reap().await;
+            return Err("Effective SSH configuration resolution timed out.".to_string());
+        }
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "Could not resolve effective SSH configuration with status {}: {}",
+            output.status,
+            bounded_ssh_error_detail(&String::from_utf8_lossy(&output.stderr))
+        ));
+    }
+    let effective_config = String::from_utf8_lossy(&output.stdout);
+    validate_effective_known_hosts_command(&effective_config)?;
+    validate_effective_send_env(&effective_config)?;
+    validate_effective_proxy_password_policy(&effective_config, password_authentication_requested)
 }
 
 fn set_ssh_askpass_directory_permissions(directory: &Path) -> Result<(), String> {
@@ -1218,6 +2190,37 @@ fn build_remote_launch_script() -> String {
         )
 }
 
+async fn release_remote_script_after_host_key<W>(
+    mut stdin: W,
+    script: &[u8],
+    verification_receiver: oneshot::Receiver<Result<(), String>>,
+    mut shutdown: watch::Receiver<bool>,
+    operation: &str,
+) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = tokio::time::timeout(SSH_READY_TIMEOUT, verification_receiver) => result
+            .map_err(|_| format!("SSH {operation} command timed out before confirming its pinned destination host key."))?
+            .map_err(|_| format!("SSH {operation} command verification diagnostics ended unexpectedly."))??,
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+    };
+    tokio::select! {
+        result = stdin.write_all(script) => result
+            .map_err(|error| format!("Failed to write SSH {operation} script: {error}"))?,
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+    }
+    stdin
+        .shutdown()
+        .await
+        .map_err(|error| format!("Failed to close SSH {operation} script input: {error}"))
+}
+
 async fn run_remote_ssh_script(
     target: &SshEnvironmentTarget,
     script: &str,
@@ -1225,18 +2228,25 @@ async fn run_remote_ssh_script(
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
     operation: &str,
+    expected_host_key_fingerprint: &str,
 ) -> Result<String, String> {
-    let host_spec = build_ssh_host_spec(target)?;
-    let mut args = base_ssh_args_with_auth(target, auth);
-    args.push(host_spec);
-    args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
-    args.extend(script_args.iter().cloned());
+    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
+        .await?;
+    let mut args = build_remote_script_ssh_args(target, auth, script_args)?;
+    insert_ssh_host_key_pin_args(&mut args);
+    let environment = build_verified_ssh_child_environment(
+        auth,
+        askpass_launcher.path(),
+        askpass_launcher.host_key_pin_verifier_path(),
+        Some(expected_host_key_fingerprint),
+        None,
+    )?;
 
     let mut command = Command::new(ssh_command());
     configure_background_command(&mut command);
+    apply_verified_ssh_child_environment(&mut command, environment);
     command
         .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1246,38 +2256,80 @@ async fn run_remote_ssh_script(
         askpass_launcher,
         &format!("run SSH {operation} command"),
     )?;
-    let mut stdin = child
+    let stdin = child
         .child_mut()
         .stdin
         .take()
         .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
-    let mut shutdown = child.shutdown_receiver();
-    let write_result = tokio::select! {
-        result = stdin.write_all(script.as_bytes()) => result
-            .map_err(|error| format!("Failed to write SSH {operation} script: {error}")),
-        _ = wait_for_ssh_shutdown(&mut shutdown) => {
-            Err("SSH process owner is shutting down.".to_string())
-        }
-    };
-    drop(stdin);
+    let stdout = child.child_mut().stdout.take();
+    let stderr =
+        child.child_mut().stderr.take().ok_or_else(|| {
+            format!("SSH {operation} command did not expose host-key diagnostics.")
+        })?;
+    let (verification_sender, verification_receiver) = oneshot::channel();
+    let (stderr_sender, stderr_receiver) = oneshot::channel();
+    let stderr_drain = tokio::spawn(drain_ssh_command_stderr(
+        stderr,
+        verification_sender,
+        stderr_sender,
+    ));
+    child.retain_stderr_drain(stderr_drain);
+    let write_result = release_remote_script_after_host_key(
+        stdin,
+        script.as_bytes(),
+        verification_receiver,
+        child.shutdown_receiver(),
+        operation,
+    )
+    .await;
     if let Err(error) = write_result {
         child.terminate_and_reap().await;
         return Err(error);
     }
 
     let output = child
-        .wait_with_output()
+        .wait_with_streamed_stderr_output(stdout, stderr_receiver)
         .await
         .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "SSH {operation} command failed with status {}: {}",
-            output.status,
-            stderr.trim()
+        return Err(ssh_remote_script_failure_message(
+            operation,
+            &output.status.to_string(),
+            &stderr,
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn build_remote_script_ssh_args(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+    script_args: &[String],
+) -> Result<Vec<String>, String> {
+    let host_spec = build_ssh_host_spec(target)?;
+    let mut args = base_ssh_args_with_auth(target, auth);
+    args.extend([
+        "-o".to_string(),
+        "LogLevel=DEBUG".to_string(),
+        "-o".to_string(),
+        "FingerprintHash=sha256".to_string(),
+    ]);
+    args.extend(["--".to_string(), host_spec]);
+    args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
+    args.extend(script_args.iter().cloned());
+    Ok(args)
+}
+
+fn ssh_remote_script_failure_message(operation: &str, status: &str, stderr: &str) -> String {
+    if is_ssh_host_key_pin_failure(stderr) {
+        return "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+            .to_string();
+    }
+    if is_ssh_auth_failure(stderr) {
+        return format!("SSH authentication failed during {operation}.");
+    }
+    format!("SSH {operation} command failed with status {status}.")
 }
 
 fn last_non_empty_line(output: &str) -> Option<&str> {
@@ -1327,10 +2379,118 @@ pub fn parse_remote_launch_result(output: &str) -> Result<RemoteLaunchResult, St
     })
 }
 
+fn bounded_ssh_error_detail(output: &str) -> String {
+    let detail = output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("OpenSSH did not provide an error detail.");
+    detail.chars().take(512).collect()
+}
+
+async fn probe_ssh_host_key(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+    askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: Option<&str>,
+) -> Result<String, String> {
+    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
+        .await?;
+    let observation = if expected_host_key_fingerprint.is_none() {
+        Some(SshHostKeyObservation::create(&askpass_launcher)?)
+    } else {
+        None
+    };
+    let mut args = build_ssh_trust_probe_args(target, auth)?;
+    insert_ssh_host_key_pin_args(&mut args);
+    let environment = build_verified_ssh_child_environment(
+        auth,
+        askpass_launcher.path(),
+        askpass_launcher.host_key_pin_verifier_path(),
+        expected_host_key_fingerprint,
+        observation.as_ref().map(SshHostKeyObservation::path),
+    )?;
+    let mut command = Command::new(ssh_command());
+    configure_background_command(&mut command);
+    apply_verified_ssh_child_environment(&mut command, environment);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "probe SSH host-key trust")?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| format!("Failed to run SSH host-key trust probe: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        if is_ssh_host_key_pin_failure(&stderr) {
+            return Err(
+                "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+                    .to_string(),
+            );
+        }
+        return Err(match classify_ssh_host_key_failure(&stderr) {
+            SshHostKeyFailureKind::Changed => {
+                "SSH host key changed. Connection is blocked; verify the host out of band and update known_hosts explicitly before retrying.".to_string()
+            }
+            SshHostKeyFailureKind::Unknown => {
+                "SSH host key is unknown or not accepted. Verify the fingerprint out of band and add it through OpenSSH before retrying.".to_string()
+            }
+            SshHostKeyFailureKind::Other if is_ssh_auth_failure(&stderr) => format!(
+                "SSH authentication failed during host-key trust probe: {}",
+                bounded_ssh_error_detail(&stderr)
+            ),
+            SshHostKeyFailureKind::Other => format!(
+                "SSH host-key trust probe failed with status {}: {}",
+                output.status,
+                bounded_ssh_error_detail(&stderr)
+            ),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout
+        .lines()
+        .map(str::trim)
+        .any(|line| line == SSH_TRUST_PROBE_MARKER)
+    {
+        return Err("SSH host-key trust probe did not return the expected marker.".to_string());
+    }
+    match expected_host_key_fingerprint {
+        Some(expected) => Ok(expected.to_string()),
+        None => observation
+            .as_ref()
+            .expect("unenrolled trust probe owns an observation")
+            .read(),
+    }
+}
+
+fn build_ssh_trust_probe_args(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+) -> Result<Vec<String>, String> {
+    let host_spec = build_ssh_host_spec(target)?;
+    let mut args = base_ssh_args_with_auth(target, auth);
+    args.extend([
+        "-o".to_string(),
+        "LogLevel=DEBUG".to_string(),
+        "-o".to_string(),
+        "FingerprintHash=sha256".to_string(),
+        "--".to_string(),
+        host_spec,
+        "echo".to_string(),
+        SSH_TRUST_PROBE_MARKER.to_string(),
+    ]);
+    Ok(args)
+}
+
 async fn launch_or_reuse_remote_server(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
 ) -> Result<RemoteLaunchResult, String> {
     let state_key = remote_state_key(target);
     let output = run_remote_ssh_script(
@@ -1340,6 +2500,7 @@ async fn launch_or_reuse_remote_server(
         auth,
         askpass_launcher,
         "launch",
+        expected_host_key_fingerprint,
     )
     .await?;
     parse_remote_launch_result(&output)
@@ -1349,6 +2510,7 @@ async fn stop_remote_server(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
 ) -> Result<(), String> {
     let state_key = remote_state_key(target);
     run_remote_ssh_script(
@@ -1358,68 +2520,99 @@ async fn stop_remote_server(
         auth,
         askpass_launcher,
         "stop",
+        expected_host_key_fingerprint,
     )
     .await
     .map(|_| ())
+}
+
+fn remote_pairing_command() -> &'static str {
+    "bibcode auth pairing create --base-dir \"$HOME/.bibcode\" --format json"
 }
 
 async fn issue_remote_pairing_token(
     target: &SshEnvironmentTarget,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
 ) -> Result<String, String> {
-    let host_spec = build_ssh_host_spec(target)?;
-    let mut args = base_ssh_args_with_auth(target, auth);
-    args.push(host_spec);
-    args.extend([
-        "sh".to_string(),
-        "-lc".to_string(),
-        "bibcode auth pairing create --base-dir \"$HOME/.bibcode\" --json".to_string(),
-    ]);
-    let mut command = Command::new(ssh_command());
-    configure_background_command(&mut command);
-    command
-        .args(args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "run SSH pairing command")?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Failed to run SSH pairing command: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "SSH pairing command failed with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    parse_remote_pairing_credential(&String::from_utf8_lossy(&output.stdout))
+    let script = format!("{}\n", remote_pairing_command());
+    let output = run_remote_ssh_script(
+        target,
+        &script,
+        &[],
+        auth,
+        askpass_launcher,
+        "pairing",
+        expected_host_key_fingerprint,
+    )
+    .await?;
+    parse_remote_pairing_credential(&output)
 }
 
 async fn start_ssh_tunnel(
     plan: &SshEnvironmentLaunchPlan,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
 ) -> Result<ManagedSshChild, String> {
+    validate_effective_ssh_security_policy(
+        &plan.target,
+        askpass_launcher.clone(),
+        auth.interactive_auth,
+    )
+    .await?;
+    let mut args = plan.args.clone();
+    insert_ssh_host_key_pin_args(&mut args);
+    let environment = build_verified_ssh_child_environment(
+        auth,
+        askpass_launcher.path(),
+        askpass_launcher.host_key_pin_verifier_path(),
+        Some(expected_host_key_fingerprint),
+        None,
+    )?;
     let mut command = Command::new(&plan.program);
     configure_background_command(&mut command);
+    apply_verified_ssh_child_environment(&mut command, environment);
     command
-        .args(&plan.args)
-        .envs(build_ssh_child_environment(auth, askpass_launcher.path()))
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = spawn_managed_ssh_child(command, askpass_launcher, "start SSH tunnel")?;
 
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or_else(|| "SSH tunnel did not expose host-key diagnostics.".to_string())?;
+    let (verification_sender, verification_receiver) = oneshot::channel();
+    let auth_failure_observed = Arc::new(AtomicBool::new(false));
+    let stderr_drain = tokio::spawn(drain_ssh_tunnel_stderr(
+        stderr,
+        verification_sender,
+        auth_failure_observed.clone(),
+        plan.local_port,
+    ));
+    child.retain_stderr_drain(stderr_drain);
     let mut shutdown = child.shutdown_receiver();
+    tokio::select! {
+        result = tokio::time::timeout(SSH_READY_TIMEOUT, verification_receiver) => result
+            .map_err(|_| "SSH tunnel timed out before confirming its pinned destination host key.".to_string())?
+            .map_err(|_| "SSH tunnel verification diagnostics ended unexpectedly.".to_string())??,
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            child.terminate_and_reap().await;
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+    };
+
     let ready_result = tokio::select! {
-        result = wait_for_ssh_tunnel_ready(child.child_mut(), &plan.http_base_url) => result,
+        result = wait_for_ssh_tunnel_ready(
+            &mut child,
+            &plan.http_base_url,
+            auth_failure_observed.as_ref(),
+        ) => result,
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
             Err("SSH process owner is shutting down.".to_string())
         }
@@ -1432,27 +2625,34 @@ async fn start_ssh_tunnel(
     Ok(child)
 }
 
-async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Result<(), String> {
+async fn wait_for_ssh_tunnel_ready(
+    child: &mut ManagedSshChild,
+    http_base_url: &str,
+    auth_failure_observed: &AtomicBool,
+) -> Result<(), String> {
     let mut url = url::Url::parse(http_base_url)
         .map_err(|error| format!("Could not parse SSH tunnel URL: {error}"))?;
     url.set_path(SSH_READY_PATH);
     url.set_query(None);
     url.set_fragment(None);
-    let client = reqwest::Client::builder()
-        .timeout(SSH_READY_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| format!("Could not create SSH readiness client: {error}"))?;
+    let client = build_ssh_readiness_client(reqwest::Client::builder())?;
     let start = std::time::Instant::now();
     let mut last_error = String::new();
     while start.elapsed() <= SSH_READY_TIMEOUT {
         if let Some(status) = child
+            .child_mut()
             .try_wait()
             .map_err(|error| format!("Could not inspect SSH tunnel process: {error}"))?
         {
-            let stderr = read_child_stderr(child).await;
-            return Err(format!(
-                "SSH tunnel exited before becoming ready with status {status}: {stderr}"
-            ));
+            child.finish_stderr_drain().await;
+            if auth_failure_observed.load(Ordering::Acquire) {
+                return Err("SSH authentication failed during tunnel handshake.".to_string());
+            }
+            return Err(ssh_tunnel_early_exit_message(
+                &status.to_string(),
+                Option::<tokio::io::Empty>::None,
+            )
+            .await);
         }
         match client.get(url.clone()).send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
@@ -1470,15 +2670,27 @@ async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Re
     ))
 }
 
-async fn read_child_stderr(child: &mut Child) -> String {
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let mut output = String::new();
-    if stderr.read_to_string(&mut output).await.is_err() {
-        return String::new();
+fn build_ssh_readiness_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, String> {
+    builder
+        .timeout(SSH_READY_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("Could not create SSH readiness client: {error}"))
+}
+
+async fn ssh_tunnel_early_exit_message<R>(status: &str, stderr: Option<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if let Some(stderr) = stderr {
+        let _ = tokio::time::timeout(
+            SSH_TUNNEL_SHUTDOWN_TIMEOUT,
+            read_bounded_ssh_output(stderr, SSH_COMMAND_OUTPUT_LIMIT),
+        )
+        .await;
     }
-    output.trim().to_string()
+    format!("SSH tunnel exited before becoming ready with status {status}.")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2050,6 +3262,14 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     fn unique_temp_home() -> PathBuf {
         std::env::temp_dir().join(format!(
             "bibcode-tauri-ssh-test-{}-{}",
@@ -2137,7 +3357,9 @@ mod tests {
         assert!(
             !directory.join("ssh-askpass.sh").exists()
                 && !directory.join("ssh-askpass.cmd").exists()
-                && !directory.join("ssh-askpass.ps1").exists(),
+                && !directory.join("ssh-askpass.ps1").exists()
+                && !directory.join("ssh-host-key-pin.sh").exists()
+                && !directory.join("ssh-host-key-pin.ps1").exists(),
             "only the exact created helper files should be removed"
         );
     }
@@ -2305,6 +3527,252 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_tunnel_joins_its_stderr_task_before_reaper_shutdown_returns() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 60"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let reaper_permit = launcher
+            .reserve_child()
+            .expect("active SSH child should reserve cleanup ownership");
+        let child = command.spawn().expect("active SSH child fixture");
+        let mut child = ManagedSshChild::new(child, launcher, reaper_permit);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        child.retain_stderr_drain(tokio::spawn(async move {
+            let _drop_flag = DropFlag(task_dropped);
+            let _ = entered_sender.send(());
+            std::thread::sleep(Duration::from_millis(250));
+            std::future::pending::<()>().await;
+        }));
+        entered_receiver
+            .await
+            .expect("stderr task should enter its active poll");
+
+        drop(child);
+        tokio::time::timeout(Duration::from_secs(3), manager.shutdown())
+            .await
+            .expect("shutdown should join the transferred stderr task");
+
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "reaper shutdown must not return before the stderr task is dropped and joined"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn naturally_exited_published_tunnel_transfers_its_stderr_task_to_the_reaper() {
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let reaper_permit = launcher
+            .reserve_child()
+            .expect("published SSH child should reserve cleanup ownership");
+        let child = command
+            .spawn()
+            .expect("naturally exiting SSH child fixture");
+        let mut child = ManagedSshChild::new(child, launcher, reaper_permit);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        child.retain_stderr_drain(tokio::spawn(async move {
+            let _drop_flag = DropFlag(task_dropped);
+            let _ = entered_sender.send(());
+            std::thread::sleep(Duration::from_millis(250));
+            std::future::pending::<()>().await;
+        }));
+        entered_receiver
+            .await
+            .expect("stderr task should enter its active poll");
+        let target = SshEnvironmentTarget {
+            alias: "natural-exit".to_string(),
+            hostname: "natural-exit.invalid".to_string(),
+            username: None,
+            port: None,
+        };
+        let key = target_connection_key(&target);
+        let published = manager.publish_tunnel(
+            key.clone(),
+            child,
+            SshEnvironmentBootstrap::external(
+                target,
+                3773,
+                "http://127.0.0.1:41000/".to_string(),
+                "ws://127.0.0.1:41000/".to_string(),
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            ),
+        );
+        assert!(published.is_ok(), "fixture tunnel should publish");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if manager
+                    .take_existing_bootstrap_if_running(&key)
+                    .expect("stale tunnel inspection should succeed")
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("naturally exited tunnel should become stale");
+        manager.shutdown().await;
+
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "stale removal must join the retained stderr task before shutdown returns"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_disconnect_keeps_the_published_tunnel_alive() {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temporary_base = tempfile::tempdir().expect("askpass temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("askpass launcher should create");
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 60"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let reaper_permit = launcher
+            .reserve_child()
+            .expect("published SSH child should reserve cleanup ownership");
+        let child = command.spawn().expect("active SSH child fixture");
+        let child = ManagedSshChild::new(child, launcher, reaper_permit);
+        let target = SshEnvironmentTarget {
+            alias: "retained-tunnel".to_string(),
+            hostname: "retained-tunnel.invalid".to_string(),
+            username: None,
+            port: None,
+        };
+        let pinned = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let key = target_connection_key(&target);
+        manager
+            .publish_tunnel(
+                key,
+                child,
+                SshEnvironmentBootstrap::external(
+                    target.clone(),
+                    3773,
+                    "http://127.0.0.1:41000/".to_string(),
+                    "ws://127.0.0.1:41000/".to_string(),
+                    pinned.to_string(),
+                ),
+            )
+            .map_err(|(error, _child)| error)
+            .expect("fixture tunnel should publish");
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        let invalid = manager
+            .disconnect_environment(
+                app.handle(),
+                &prompts,
+                target.clone(),
+                SshEnvironmentDisconnectOptions {
+                    expected_host_key_fingerprint: "invalid".to_string(),
+                },
+            )
+            .await
+            .expect_err("an invalid saved pin must reject disconnect");
+        assert!(
+            invalid.contains("valid saved host-key fingerprint"),
+            "{invalid}"
+        );
+        assert_eq!(
+            manager
+                .active_bootstrap(&target)
+                .expect("active tunnel should remain inspectable")
+                .expect("invalid disconnect must retain the tunnel")
+                .host_key_fingerprint,
+            pinned
+        );
+
+        let changed = manager
+            .disconnect_environment(
+                app.handle(),
+                &prompts,
+                target.clone(),
+                SshEnvironmentDisconnectOptions {
+                    expected_host_key_fingerprint:
+                        "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+                },
+            )
+            .await
+            .expect_err("a changed saved pin must reject disconnect");
+        assert!(changed.contains("fingerprint changed"), "{changed}");
+        assert_eq!(
+            manager
+                .active_bootstrap(&target)
+                .expect("active tunnel should remain inspectable")
+                .expect("changed-pin disconnect must retain the tunnel")
+                .host_key_fingerprint,
+            pinned
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn manager_shutdown_terminates_child_owned_by_retained_waiter() {
         let temporary_base = tempfile::tempdir().expect("askpass temporary base");
         let manager =
@@ -2418,7 +3886,13 @@ mod tests {
             ws_base_url: "ws://127.0.0.1:9/".to_string(),
         };
         let owner = tokio::spawn(async move {
-            start_ssh_tunnel(&plan, &SshAuthOptions::batch(), launcher).await
+            start_ssh_tunnel(
+                &plan,
+                &SshAuthOptions::batch(),
+                launcher,
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .await
         });
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -2544,7 +4018,7 @@ mod tests {
             .ensure_environment(app.handle(), &prompts, target.clone(), None)
             .await
             .expect_err("an unreachable SSH target should not launch");
-        assert!(ensure_error.contains("SSH launch command failed"));
+        assert!(ensure_error.contains("SSH host-key trust probe failed"));
         assert_eq!(
             fs::read_dir(askpass_temporary_base.path())
                 .expect("askpass temporary base should remain readable")
@@ -2554,7 +4028,15 @@ mod tests {
         );
 
         let disconnect_error = manager
-            .disconnect_environment(app.handle(), &prompts, target)
+            .disconnect_environment(
+                app.handle(),
+                &prompts,
+                target,
+                SshEnvironmentDisconnectOptions {
+                    expected_host_key_fingerprint:
+                        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                },
+            )
             .await
             .expect_err("an unreachable SSH target should not disconnect remotely");
         assert!(disconnect_error.contains("SSH stop command failed"));
@@ -3034,7 +4516,7 @@ mod tests {
         let plan = SshEnvironmentLaunchPlan::external(target.clone(), 45123)
             .expect("launch plan should build");
 
-        assert_eq!(plan.key, "devbox\u{0}devbox.internal\u{0}alice\u{0}2222");
+        assert_eq!(plan.key, "devbox\u{0}alice\u{0}explicit:2222");
         assert_eq!(plan.program, ssh_command());
         assert_eq!(
             plan.args,
@@ -3043,6 +4525,10 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-p",
                 "2222",
                 "-o",
@@ -3054,7 +4540,12 @@ mod tests {
                 "-n",
                 "-N",
                 "-L",
-                "45123:127.0.0.1:3773",
+                "127.0.0.1:45123:127.0.0.1:3773",
+                "-o",
+                "LogLevel=DEBUG",
+                "-o",
+                "FingerprintHash=sha256",
+                "--",
                 "alice@devbox",
             ]
         );
@@ -3075,6 +4566,615 @@ mod tests {
     }
 
     #[test]
+    fn host_key_pin_comparison_fails_closed_without_weakening_openssh_policy() {
+        assert!(
+            validate_expected_host_key_fingerprint(
+                Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_expected_host_key_fingerprint(
+                Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            )
+            .expect_err("changed fingerprint must fail")
+            .contains("changed")
+        );
+        assert!(validate_expected_host_key_fingerprint(Some(" "), "SHA256:observed").is_err());
+        assert!(parse_ssh_host_key_fingerprint("debug1: no fingerprint here").is_err());
+    }
+
+    #[test]
+    fn disconnect_preserves_only_redacted_host_key_and_auth_failure_classes() {
+        for message in [
+            "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled.",
+            "SSH host key changed. Connection is blocked; verify the host out of band and update known_hosts explicitly before retrying.",
+            "SSH host key is unknown or not accepted. Verify the fingerprint out of band and add it through OpenSSH before retrying.",
+            "SSH authentication failed during host-key trust probe.",
+            "This SSH target uses a custom KnownHostsCommand, which is not supported with BiBCode host-key pinning.",
+            "This SSH target's effective SendEnv policy can forward BiBCode's private SSH authentication or host-key control variables.",
+            "SSH password authentication through ProxyJump or ProxyCommand is not supported because it could expose the destination password to the proxy process.",
+        ] {
+            assert_eq!(
+                disconnect_probe_failure_message(message.to_string()),
+                message,
+                "safe classifications must remain actionable"
+            );
+        }
+        assert_eq!(
+            disconnect_probe_failure_message(
+                "SSH host-key trust probe failed: private stderr value".to_string()
+            ),
+            "SSH stop command failed before host-key verification.",
+            "arbitrary subprocess detail must remain redacted"
+        );
+    }
+
+    #[test]
+    fn command_handshake_rejects_policy_trusted_host_key_drift() {
+        let expected = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let observed = "debug1: Server host key: ssh-ed25519 SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n";
+
+        let error = validate_ssh_command_host_fingerprint(expected, observed)
+            .expect_err("a fresh SSH command must not switch to another policy-trusted key");
+
+        assert!(error.contains("changed"), "{error}");
+        validate_ssh_command_host_fingerprint(
+            expected,
+            "debug1: Server host key: ssh-ed25519 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+            .expect("the probed key should remain valid");
+    }
+
+    #[test]
+    fn host_key_parser_selects_the_final_proxy_jump_destination() {
+        let output = concat!(
+            "debug1: Server host key: ssh-ed25519 ",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+            "debug1: Server host key: ssh-ed25519 ",
+            "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
+        );
+
+        assert_eq!(
+            parse_ssh_host_key_fingerprint(output).expect("destination key should parse"),
+            "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        );
+    }
+
+    #[test]
+    fn effective_config_rejects_a_custom_known_hosts_command_before_remote_auth() {
+        assert!(
+            validate_effective_known_hosts_command(
+                "host devbox\nknownhostscommand none\nhostname devbox.internal\n"
+            )
+            .is_ok()
+        );
+        let error = validate_effective_known_hosts_command(
+            "host devbox\nknownhostscommand /usr/local/bin/lookup %H %f\n",
+        )
+        .expect_err("custom KnownHostsCommand composition must fail closed");
+        assert!(error.contains("KnownHostsCommand"), "{error}");
+        assert!(error.contains("not supported"), "{error}");
+        validate_effective_known_hosts_command("host devbox\n")
+            .expect("OpenSSH omits the unset default command from -G output");
+    }
+
+    #[test]
+    fn effective_config_rejects_send_env_patterns_that_can_forward_private_ssh_state() {
+        validate_effective_send_env("sendenv LANG\nsendenv LC_*\n")
+            .expect("ordinary locale forwarding must remain supported");
+        validate_effective_send_env("sendenv -BIBCODE_*\n")
+            .expect("an explicit removal pattern does not forward private state");
+
+        for unsafe_config in [
+            "sendenv *\n",
+            "sendenv BIBCODE_*\n",
+            "sendenv BIBCODE_SSH_AUTH_* LANG\n",
+            "sendenv bibcode_ssh_host_key_pin_helper\n",
+        ] {
+            let error = validate_effective_send_env(unsafe_config)
+                .expect_err("matching SendEnv must fail before password-capable SSH");
+            assert!(error.contains("SendEnv"), "{error}");
+            assert!(error.contains("private SSH"), "{error}");
+        }
+    }
+
+    #[test]
+    fn effective_proxy_chains_allow_keys_but_reject_password_fallback() {
+        for effective_config in [
+            "proxyjump jump-host\n",
+            "proxycommand ssh -W %h:%p jump-host\n",
+        ] {
+            validate_effective_proxy_password_policy(effective_config, false)
+                .expect("key and agent authentication may use a configured proxy chain");
+            let error = validate_effective_proxy_password_policy(effective_config, true)
+                .expect_err("password-bearing SSH must not expose its secret to a proxy process");
+            assert!(error.contains("ProxyJump or ProxyCommand"), "{error}");
+            assert!(error.contains("key or agent authentication"), "{error}");
+        }
+        validate_effective_proxy_password_policy("proxyjump none\n", true)
+            .expect("an explicitly disabled proxy does not inherit the password helper");
+        validate_effective_proxy_password_policy("host devbox\n", true)
+            .expect("direct SSH password authentication remains supported");
+    }
+
+    #[test]
+    fn owned_ssh_environment_clears_ambient_private_values_before_readding_exact_state() {
+        let helper = Path::new("owned-host-key-helper");
+        let observation = Path::new("owned-host-key-observation");
+        let environment = build_verified_ssh_child_environment(
+            &SshAuthOptions::batch(),
+            Path::new("owned-askpass"),
+            helper,
+            None,
+            Some(observation),
+        )
+        .expect("owned environment should build");
+        let mut command = Command::new("ssh-fixture");
+        for name in SSH_INTERNAL_ENVIRONMENT_VARIABLES {
+            command.env(name, "ambient-attacker-controlled-value");
+        }
+
+        apply_verified_ssh_child_environment(&mut command, environment);
+
+        let command = command.as_std();
+        for removed in [
+            "BIBCODE_SSH_AUTH_SECRET",
+            SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV,
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == removed && value.is_none()),
+                "{removed} must be explicitly removed instead of inherited"
+            );
+        }
+        assert!(command.get_envs().any(|(name, value)| {
+            name == SSH_HOST_KEY_OBSERVATION_PATH_ENV && value == Some(observation.as_os_str())
+        }));
+        assert!(command.get_envs().any(|(name, value)| {
+            name == SSH_HOST_KEY_PIN_HELPER_ENV && value == Some(helper.as_os_str())
+        }));
+    }
+
+    #[test]
+    fn host_key_pin_option_quotes_helper_paths_and_precedes_the_destination() {
+        let helper = if cfg!(windows) {
+            Path::new("C:\\SSH Helpers\\%TEMP% & ^ pin verifier.ps1")
+        } else {
+            Path::new("/tmp/SSH Helpers/%value/$()/`tick`/pin'verifier.sh")
+        };
+        let mut args = vec![
+            "-o".to_string(),
+            "BatchMode=no".to_string(),
+            "--".to_string(),
+            "devbox".to_string(),
+        ];
+
+        insert_ssh_host_key_pin_args(&mut args);
+        let environment = build_verified_ssh_child_environment(
+            &SshAuthOptions::batch(),
+            Path::new("unused-askpass"),
+            helper,
+            Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            None,
+        )
+        .expect("pin helper environment should quote safely");
+
+        let destination_guard = args
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("destination options should terminate");
+        let pin_option = args[..destination_guard]
+            .windows(2)
+            .find(|pair| pair[0] == "-o" && pair[1].starts_with("KnownHostsCommand="))
+            .expect("pin command must be an OpenSSH option before the destination");
+        assert!(pin_option[1].ends_with(" %I %f"));
+        assert!(pin_option[1].contains(SSH_HOST_KEY_PIN_HELPER_ENV));
+        assert!(!pin_option[1].contains("SSH Helpers"));
+        if !cfg!(windows) {
+            assert!(pin_option[1].starts_with("KnownHostsCommand=/bin/sh "));
+        }
+        let isolated_helper = environment
+            .get(SSH_HOST_KEY_PIN_HELPER_ENV)
+            .expect("helper path must travel through a non-recursive environment expansion");
+        assert_eq!(
+            isolated_helper,
+            helper.to_str().expect("fixture path is Unicode")
+        );
+        assert!(isolated_helper.contains("SSH Helpers"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pin_helper_matches_without_adding_trust_and_rejects_drift() {
+        let temporary_base = tempfile::tempdir().expect("pin helper temporary base");
+        let manager =
+            SshEnvironmentManager::with_askpass_temp_base(temporary_base.path().to_path_buf());
+        let launcher = manager
+            .askpass_launcher()
+            .expect("pin helper should create");
+        let expected = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let matched = Command::new(launcher.host_key_pin_verifier_path())
+            .arg("HOSTNAME")
+            .arg(expected)
+            .env("BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT", expected)
+            .output()
+            .await
+            .expect("matching helper should run");
+        assert!(matched.status.success());
+        assert!(
+            matched.stdout.is_empty(),
+            "matching must add no trusted host key"
+        );
+
+        let changed = Command::new(launcher.host_key_pin_verifier_path())
+            .arg("HOSTNAME")
+            .arg("SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+            .env("BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT", expected)
+            .output()
+            .await
+            .expect("changed helper should run");
+        assert!(!changed.status.success());
+        assert!(
+            changed.stdout.is_empty(),
+            "drift must add no trusted host key"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&changed.stderr).trim(),
+            "BIBCODE_SSH_HOST_KEY_PIN_MISMATCH"
+        );
+
+        let ordering = Command::new(launcher.host_key_pin_verifier_path())
+            .arg("ORDER")
+            .arg("NONE")
+            .env("BIBCODE_SSH_EXPECTED_HOST_KEY_FINGERPRINT", expected)
+            .output()
+            .await
+            .expect("host-key ordering helper should run");
+        assert!(ordering.status.success());
+        assert!(ordering.stdout.is_empty());
+
+        let observation_path = launcher.root().join("unenrolled-host-key-observation.txt");
+        let observed = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let enrolled = Command::new(launcher.host_key_pin_verifier_path())
+            .arg("HOSTNAME")
+            .arg(observed)
+            .env(SSH_HOST_KEY_OBSERVATION_PATH_ENV, &observation_path)
+            .env_remove(SSH_EXPECTED_HOST_KEY_FINGERPRINT_ENV)
+            .output()
+            .await
+            .expect("unenrolled observation helper should run");
+        assert!(enrolled.status.success());
+        assert!(
+            enrolled.stdout.is_empty(),
+            "observation must add no trusted key"
+        );
+        assert_eq!(
+            fs::read_to_string(&observation_path)
+                .expect("observation should be recorded privately")
+                .trim(),
+            observed
+        );
+    }
+
+    #[tokio::test]
+    async fn command_stderr_observer_waits_for_the_main_remote_command_marker() {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let (fingerprint_sender, mut fingerprint_receiver) = oneshot::channel();
+        let (output_sender, output_receiver) = oneshot::channel();
+        let drain = tokio::spawn(drain_ssh_command_stderr(
+            reader,
+            fingerprint_sender,
+            output_sender,
+        ));
+        writer
+            .write_all(
+                concat!(
+                    "debug1: Server host key: ssh-ed25519 ",
+                    "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+                    "debug1: Server host key: ssh-ed25519 ",
+                    "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("proxy-jump fixture should write");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut fingerprint_receiver)
+                .await
+                .is_err(),
+            "a jump or destination key alone must not release command stdin"
+        );
+        writer
+            .write_all(b"debug1: Sending command: sh -s -- state-key\n")
+            .await
+            .expect("main-command marker should write");
+        fingerprint_receiver
+            .await
+            .expect("observer should report")
+            .expect("main command should confirm the pre-authenticated pin");
+
+        drop(writer);
+        drain.await.expect("stderr drain should finish");
+        output_receiver
+            .await
+            .expect("bounded output should be reported")
+            .expect("stderr fixture should remain bounded");
+    }
+
+    #[tokio::test]
+    async fn remote_script_gate_withholds_payload_until_pre_auth_pin_verification() {
+        let script = b"touch must-not-run\n";
+        let (stdin, mut remote_input) = tokio::io::duplex(128);
+        let (fingerprint_sender, fingerprint_receiver) = oneshot::channel();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let gate = tokio::spawn(release_remote_script_after_host_key(
+            stdin,
+            script,
+            fingerprint_receiver,
+            shutdown,
+            "launch",
+        ));
+
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), remote_input.read(&mut byte))
+                .await
+                .is_err(),
+            "the remote script must remain withheld before host-key verification"
+        );
+        fingerprint_sender
+            .send(Err(
+                "SSH host-key fingerprint changed before authentication.".to_string(),
+            ))
+            .expect("fingerprint gate should remain live");
+        let error = gate
+            .await
+            .expect("drifted gate should join")
+            .expect_err("a drifted host must reject the script");
+        assert!(error.contains("changed"), "{error}");
+        let mut rejected = Vec::new();
+        remote_input
+            .read_to_end(&mut rejected)
+            .await
+            .expect("rejected stdin should close");
+        assert!(
+            rejected.is_empty(),
+            "no script byte may reach a drifted host"
+        );
+
+        let (stdin, mut remote_input) = tokio::io::duplex(128);
+        let (fingerprint_sender, fingerprint_receiver) = oneshot::channel();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let gate = tokio::spawn(release_remote_script_after_host_key(
+            stdin,
+            script,
+            fingerprint_receiver,
+            shutdown,
+            "launch",
+        ));
+        fingerprint_sender
+            .send(Ok(()))
+            .expect("fingerprint gate should remain live");
+        let mut accepted = Vec::new();
+        remote_input
+            .read_to_end(&mut accepted)
+            .await
+            .expect("accepted stdin should close");
+        gate.await
+            .expect("accepted gate should join")
+            .expect("matching host key should release the script");
+        assert_eq!(accepted, script);
+    }
+
+    #[tokio::test]
+    async fn tunnel_stderr_observer_reports_the_actual_handshake_then_drains() {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let (sender, mut receiver) = oneshot::channel();
+        let auth_failure_observed = Arc::new(AtomicBool::new(false));
+        let drain = tokio::spawn(drain_ssh_tunnel_stderr(
+            reader,
+            sender,
+            auth_failure_observed,
+            45123,
+        ));
+        writer
+            .write_all(
+                concat!(
+                    "debug1: Server host key: ssh-ed25519 ",
+                    "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+                    "debug1: Server host key: ssh-ed25519 ",
+                    "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
+                    "private-before-handshake-barrier\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("tunnel stderr fixture should write");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut receiver)
+                .await
+                .is_err(),
+            "even buffered target-key diagnostics must wait for the main tunnel barrier"
+        );
+        writer
+            .write_all(b"debug1: Local forwarding listening on 127.0.0.1 port 45123.\n")
+            .await
+            .expect("main tunnel barrier should write");
+
+        receiver
+            .await
+            .expect("observer should report")
+            .expect("main tunnel barrier should confirm the pre-authenticated pin");
+        writer
+            .write_all(b"private-after-handshake\n")
+            .await
+            .expect("post-handshake stderr should keep draining");
+        drop(writer);
+        drain.await.expect("stderr drain should finish");
+    }
+
+    #[test]
+    fn remote_pairing_uses_the_current_cli_json_contract_without_http() {
+        let command = remote_pairing_command();
+        assert!(command.contains("--format json"));
+        assert!(!command.contains("--json"));
+        assert!(!command.contains("http"));
+    }
+
+    #[test]
+    fn remote_pairing_preserves_one_constant_openssh_command_boundary() {
+        let target = SshEnvironmentTarget {
+            alias: "devbox".to_string(),
+            hostname: "devbox.example.test".to_string(),
+            username: Some("developer".to_string()),
+            port: Some(2222),
+        };
+        let args = build_remote_script_ssh_args(&target, &SshAuthOptions::batch(), &[])
+            .expect("pairing SSH arguments should build");
+
+        assert_eq!(
+            &args[args.len() - 5..],
+            ["--", "developer@devbox", "sh", "-s", "--"]
+        );
+        assert!(!args.iter().any(|argument| argument == "-lc"));
+        assert!(!remote_pairing_command().contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn ssh_command_output_is_bounded_before_it_reaches_memory() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            let _ = writer.write_all(&[b'x'; 65]).await;
+        });
+
+        let error = read_bounded_ssh_output(reader, 64)
+            .await
+            .expect_err("oversize SSH output must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        write.await.expect("bounded output writer should join");
+    }
+
+    #[tokio::test]
+    async fn early_tunnel_exit_bounds_and_redacts_remote_stderr() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            let mut output = vec![b'x'; SSH_COMMAND_OUTPUT_LIMIT + 1];
+            output[..25].copy_from_slice(b"credential=private-value\n");
+            let _ = writer.write_all(&output).await;
+        });
+
+        let message = ssh_tunnel_early_exit_message("exit status: 1", Some(reader)).await;
+
+        assert_eq!(
+            message,
+            "SSH tunnel exited before becoming ready with status exit status: 1."
+        );
+        assert!(!message.contains("private-value"));
+        assert!(!message.contains("credential"));
+        write
+            .await
+            .expect("oversize tunnel stderr writer should join");
+    }
+
+    #[tokio::test]
+    async fn ssh_readiness_client_never_uses_an_http_proxy() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let target = TcpListener::bind(("127.0.0.1", 0)).expect("target fixture should bind");
+        let target_address = target.local_addr().expect("target fixture address");
+        let (target_sender, target_requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("target should accept");
+            let mut request = [0_u8; 2048];
+            let read = stream
+                .read(&mut request)
+                .expect("target request should read");
+            target_sender
+                .send(String::from_utf8_lossy(&request[..read]).to_string())
+                .expect("target request should be observable");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .expect("target should respond");
+        });
+
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).expect("proxy fixture should bind");
+        let proxy_address = proxy.local_addr().expect("proxy fixture address");
+        proxy
+            .set_nonblocking(true)
+            .expect("proxy fixture should be nonblocking");
+        let (proxy_sender, proxy_requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                match proxy.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let read = stream
+                            .read(&mut request)
+                            .expect("proxy request should read");
+                        proxy_sender
+                            .send(String::from_utf8_lossy(&request[..read]).to_string())
+                            .expect("proxy request should be observable");
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("proxy fixture failed to accept: {error}"),
+                }
+            }
+        });
+
+        let client = build_ssh_readiness_client(
+            reqwest::Client::builder().proxy(
+                reqwest::Proxy::all(format!("http://{proxy_address}"))
+                    .expect("explicit proxy should configure"),
+            ),
+        )
+        .expect("SSH readiness client should build");
+        client
+            .get(format!("http://{target_address}{SSH_READY_PATH}"))
+            .send()
+            .await
+            .expect("direct readiness request should succeed");
+
+        assert!(
+            target_requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("target should receive readiness request")
+                .starts_with(&format!("GET {SSH_READY_PATH} HTTP/1.1"))
+        );
+        assert!(
+            proxy_requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "SSH readiness must never use a proxy"
+        );
+    }
+
+    #[test]
+    fn ssh_pairing_failure_errors_never_echo_remote_stderr() {
+        let message = ssh_remote_script_failure_message(
+            "pairing",
+            "exit status: 1",
+            "credential=private-pairing-value",
+        );
+        assert!(message.contains("exit status: 1"));
+        assert!(!message.contains("private-pairing-value"));
+        assert!(!message.contains("credential"));
+    }
+
+    #[test]
     fn builds_batch_mode_args_from_auth_options() {
         let target = SshEnvironmentTarget {
             alias: "devbox".to_string(),
@@ -3090,6 +5190,10 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-p",
                 "2222",
             ]
@@ -3098,6 +5202,69 @@ mod tests {
             base_ssh_args_with_auth(&target, &SshAuthOptions::with_secret("hunter2".to_string()))
                 [1],
             "BatchMode=no",
+        );
+    }
+
+    #[test]
+    fn trust_probe_forces_sha256_and_a_fresh_openssh_handshake() {
+        let target = SshEnvironmentTarget {
+            alias: "devbox".to_string(),
+            hostname: "devbox.internal".to_string(),
+            username: Some("alice".to_string()),
+            port: Some(2222),
+        };
+
+        let args = build_ssh_trust_probe_args(&target, &SshAuthOptions::batch())
+            .expect("trust probe arguments should build");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "FingerprintHash=sha256"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "ControlPath=none"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "ControlMaster=no"])
+        );
+    }
+
+    #[test]
+    fn every_openssh_command_terminates_options_before_a_hostile_destination() {
+        let target = SshEnvironmentTarget {
+            alias: "-oProxyCommand=printf-pwned".to_string(),
+            hostname: "host.internal".to_string(),
+            username: None,
+            port: Some(2222),
+        };
+        let expected = "-oProxyCommand=printf-pwned";
+        let assert_guarded = |args: &[String]| {
+            let index = args
+                .iter()
+                .position(|argument| argument == expected)
+                .expect("hostile destination should remain a literal argument");
+            assert_eq!(
+                args.get(index.wrapping_sub(1)).map(String::as_str),
+                Some("--")
+            );
+        };
+
+        let tunnel = SshEnvironmentLaunchPlan::external(target.clone(), 45_123)
+            .expect("hostile-looking destination must remain data");
+        assert_guarded(&tunnel.args);
+        assert_guarded(
+            &build_ssh_trust_probe_args(&target, &SshAuthOptions::batch())
+                .expect("trust arguments should build"),
+        );
+        assert_guarded(
+            &build_remote_script_ssh_args(
+                &target,
+                &SshAuthOptions::batch(),
+                &["state-key".to_string()],
+            )
+            .expect("launch and disconnect arguments should build"),
         );
     }
 
@@ -3152,6 +5319,103 @@ mod tests {
         }
         assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v bibcode"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("native BiBCode CLI"));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains("--no-startup-pairing"));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains("umask 077"));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains(": > \"$LOG_FILE\""));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v ss"));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains("[ -r /proc/net/tcp ]"));
+        assert!(
+            REMOTE_LAUNCH_SCRIPT
+                .contains("requires ss or readable Linux procfs for safe managed port selection")
+        );
+        assert!(!REMOTE_LAUNCH_SCRIPT.contains("tail -n"));
+        assert!(
+            REMOTE_LAUNCH_SCRIPT
+                .find(": > \"$LOG_FILE\"")
+                .expect("managed log should be scrubbed")
+                < REMOTE_LAUNCH_SCRIPT
+                    .find("if [ \"$REMOTE_MANAGED\" = \"managed\" ]")
+                    .expect("managed reuse branch should exist"),
+            "upgrades must scrub legacy pairing output before reusing a live managed server"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_port_selection_fails_closed_when_installed_ss_cannot_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("remote port probe fixture");
+        let fake_ss = temporary.path().join("ss");
+        fs::write(&fake_ss, "#!/bin/sh\nexit 64\n").expect("failing ss fixture should write");
+        fs::set_permissions(&fake_ss, fs::Permissions::from_mode(0o700))
+            .expect("failing ss fixture should be executable");
+        let mut search_path = vec![temporary.path().to_path_buf()];
+        search_path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let search_path = std::env::join_paths(search_path).expect("fixture PATH should join");
+        let launch_script = build_remote_launch_script();
+        let selection_start = launch_script
+            .find("port_in_use() {")
+            .expect("port selection helper should exist");
+        let selection_end = launch_script
+            .find("REMOTE_PID=\"")
+            .expect("port selection helper should end before launch state");
+        let selection = &launch_script[selection_start..selection_end];
+        let script = format!("PORT_FILE=\"$BIBCODE_TEST_PORT_FILE\"\n{selection}\npick_port\n");
+
+        let output = Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", search_path)
+            .env(
+                "BIBCODE_TEST_PORT_FILE",
+                temporary.path().join("missing-port-file"),
+            )
+            .output()
+            .await
+            .expect("port selection fixture should execute");
+
+        assert!(!output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "a failed probe must choose no port"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("ss could not perform the required listener probe safely")
+        );
+    }
+
+    #[test]
+    fn remote_script_failures_never_echo_remote_stderr() {
+        let message = ssh_remote_script_failure_message(
+            "ensure-server",
+            "exit status: 1",
+            "pairingUrl=http://127.0.0.1/?pairing=private-value",
+        );
+        assert_eq!(
+            message,
+            "SSH ensure-server command failed with status exit status: 1."
+        );
+        assert!(!message.contains("private-value"));
+        assert!(!message.contains("pairingUrl"));
+
+        let auth = ssh_remote_script_failure_message(
+            "ensure-server",
+            "exit status: 255",
+            "Permission denied (publickey,password). private-value",
+        );
+        assert!(is_ssh_auth_failure(&auth));
+        assert!(!auth.contains("private-value"));
+
+        let pairing = ssh_remote_script_failure_message(
+            "pairing",
+            "exit status: 255",
+            "Permission denied (publickey,password). private-value",
+        );
+        assert!(is_ssh_auth_failure(&pairing));
+        assert!(!pairing.contains("private-value"));
     }
 
     #[test]
@@ -3167,7 +5431,7 @@ mod tests {
             3773,
             "http://127.0.0.1:45123/".to_string(),
             "ws://127.0.0.1:45123/".to_string(),
-            Some("pairing-token".to_string()),
+            "SHA256:external-host-key".to_string(),
         );
 
         assert_eq!(
@@ -3181,7 +5445,7 @@ mod tests {
                 },
                 "httpBaseUrl": "http://127.0.0.1:45123/",
                 "wsBaseUrl": "ws://127.0.0.1:45123/",
-                "pairingToken": "pairing-token",
+                "hostKeyFingerprint": "SHA256:external-host-key",
                 "remotePort": 3773,
                 "remoteServerKind": "external",
             })
@@ -3219,7 +5483,7 @@ mod tests {
             4111,
             "http://127.0.0.1:45123/".to_string(),
             "ws://127.0.0.1:45123/".to_string(),
-            None,
+            "SHA256:managed-host-key".to_string(),
             "managed",
         );
 
@@ -3234,7 +5498,7 @@ mod tests {
                 },
                 "httpBaseUrl": "http://127.0.0.1:45123/",
                 "wsBaseUrl": "ws://127.0.0.1:45123/",
-                "pairingToken": null,
+                "hostKeyFingerprint": "SHA256:managed-host-key",
                 "remotePort": 4111,
                 "remoteServerKind": "managed",
             })
@@ -3299,6 +5563,35 @@ mod tests {
         assert_eq!(plan.args[1], "BatchMode=no");
         assert!(!plan.args.iter().any(|argument| argument == "-p"));
         assert_eq!(plan.args.last().map(String::as_str), Some("alice@alias"));
+    }
+
+    #[test]
+    fn target_identity_matches_the_effective_open_ssh_destination_and_port_mode() {
+        let configured_port = SshEnvironmentTarget {
+            alias: "DevBox".to_string(),
+            hostname: "ignored-one.internal".to_string(),
+            username: Some("alice".to_string()),
+            port: None,
+        };
+        let same_destination = SshEnvironmentTarget {
+            alias: "devbox".to_string(),
+            hostname: "ignored-two.internal".to_string(),
+            username: Some("alice".to_string()),
+            port: None,
+        };
+        let explicit_port = SshEnvironmentTarget {
+            port: Some(22),
+            ..same_destination.clone()
+        };
+
+        assert_eq!(
+            target_connection_key(&configured_port),
+            target_connection_key(&same_destination)
+        );
+        assert_ne!(
+            target_connection_key(&configured_port),
+            target_connection_key(&explicit_port)
+        );
     }
 
     #[test]

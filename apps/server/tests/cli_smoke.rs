@@ -41,6 +41,7 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
         "--base-dir",
         "--bootstrap-fd",
         "--no-browser",
+        "--no-startup-pairing",
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }

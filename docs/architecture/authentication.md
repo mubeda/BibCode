@@ -35,7 +35,7 @@ Descriptor fingerprints are diagnostic metadata, not certificate trust.
 ## Pairing and token exchange
 
 1. An authorized host user creates a five-minute pairing through local control,
-   or authenticated web startup emits the initial owner pairing.
+   or a foreground authenticated web startup emits the initial owner pairing.
 2. The server persists only a SHA-256 hash and a short fingerprint. The raw
    credential is returned once and never appears in list or stream records.
 3. The client creates a DPoP key and proves possession for the exact token
@@ -54,6 +54,23 @@ backend. Method, URL, timestamp, token hash, and proof replay are all checked.
 Pairing links place the secret in the URL fragment so it is not sent with the
 initial page request. The fragment can still leak through screenshots, copied
 text, or browser history; treat the entire link as a password until exchange.
+
+`serve --no-startup-pairing` and `BIBCODE_NO_STARTUP_PAIRING=1` suppress that
+foreground startup credential without changing authentication. Managed
+services and desktop/SSH-managed launches always use this mode, so their logs
+remain credential-free; an authorized host user or native SSH administration
+flow creates pairing later through protected local control.
+
+For desktop-managed SSH, OpenSSH host trust and the forwarded environment and
+storage descriptor are verified before pairing creation. The native desktop
+opens each launch, stop, and pairing connection with the user's normal OpenSSH
+policy, but withholds the fixed remote script from stdin until that exact
+connection reports and matches the probed SHA-256 host-key fingerprint. It
+refetches and compares the descriptor immediately before it releases the
+protected-control pairing script, then redeems the credential through the
+active numeric-loopback tunnel. The raw pairing credential stays inside the
+native operation and never crosses into JavaScript; only the resulting
+administrator session reaches the normalized OS-secret persistence boundary.
 
 ## Revocation and restart behavior
 

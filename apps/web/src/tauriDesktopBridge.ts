@@ -20,10 +20,12 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  ExecutionEnvironmentDescriptor,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@bibcode/contracts";
 import { invoke as importedTauriInvoke, isTauri as isImportedTauri } from "@tauri-apps/api/core";
 import { listen as importedTauriListen } from "@tauri-apps/api/event";
+import * as Schema from "effect/Schema";
 
 import { startBrowserSurfaceSync } from "./browser/browserSurfaceSync";
 import { formatAppDisplayName } from "./branding.logic";
@@ -42,6 +44,7 @@ const UPDATE_STATE_EVENT = "desktop:update-state";
 const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
 const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
+const decodeSshEnvironmentDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
 
 type ConnectionCatalogProtectionCapability = "protected" | "unprotected" | "unknown";
 
@@ -564,12 +567,18 @@ function createTauriDesktopBridge(
     discoverSshHosts: () => tauriInvokeOr("desktop_bridge_discover_ssh_hosts", undefined, () => []),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),
-    disconnectSshEnvironment: (target) =>
-      tauriInvokeOr("desktop_bridge_disconnect_ssh_environment", { target }, () => undefined),
+    disconnectSshEnvironment: (target, options) =>
+      tauriInvokeOr(
+        "desktop_bridge_disconnect_ssh_environment",
+        { target, options },
+        () => undefined,
+      ),
     fetchSshEnvironmentDescriptor: (httpBaseUrl: string) =>
-      tauriInvoke("desktop_bridge_fetch_environment_descriptor", { httpBaseUrl }),
-    bootstrapSshBearerSession: (httpBaseUrl: string, credential: string) =>
-      tauriInvoke("desktop_bridge_bootstrap_ssh_bearer_session", { httpBaseUrl, credential }),
+      tauriInvoke<unknown>("desktop_bridge_fetch_environment_descriptor", { httpBaseUrl }).then(
+        decodeSshEnvironmentDescriptor,
+      ),
+    pairSshEnvironment: (target, descriptor) =>
+      tauriInvoke("desktop_bridge_pair_ssh_environment", { target, descriptor }),
     fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) =>
       tauriInvoke("desktop_bridge_fetch_ssh_session_state", { httpBaseUrl, bearerToken }),
     issueSshWebSocketTicket: (httpBaseUrl: string, bearerToken: string) =>

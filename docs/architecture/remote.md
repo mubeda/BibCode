@@ -70,6 +70,9 @@ Pre-v3 primary, bearer, relay, SSH, and unavailable target classes remain only
 as current compatibility inputs. The v1-to-v3 migration converts safe direct
 and SSH entries into routes and discards Relay-only entries and remote DPoP
 tokens. Once its receipt exists, startup reads normalized environments only.
+The legacy SSH broker itself cannot create a pairing: an entry that was not
+safely migrated must be explicitly re-enrolled so accepted storage and protocol
+identity are available before native pairing.
 
 ## Advertised endpoints
 
@@ -132,22 +135,76 @@ provider state. See [BiBCode Connect auth flow](../cloud/bibcode-connect-auth-fl
 ### Desktop-managed SSH
 
 The Tauri host owns SSH, not the server or React app. It validates the SSH
-profile, probes or launches `bibcode` remotely, establishes local forwarding,
-and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
-runtime. The resulting `SshConnectionTarget` enters the same authorization and
-RPC pipeline as other targets.
+profile, uses the user's OpenSSH configuration and `known_hosts` policy, probes
+or launches `bibcode` remotely, and establishes local forwarding. It never
+disables host-key checking or substitutes a private empty `known_hosts` file.
+Unknown and changed host keys are distinct failures, and a successful trust
+probe publishes only the observed non-secret host-key fingerprint. A saved SSH
+route pins that fingerprint in addition to continuing to use OpenSSH policy.
+
+Before any password-capable connection, the desktop resolves the bounded
+effective configuration with `ssh -G`. An effective custom `KnownHostsCommand`
+is unsupported and fails closed: composing arbitrary user lookup commands with
+BiBCode's verifier would make ordering and trust ambiguous. The connection then
+adds a destination-process `KnownHostsCommand` helper that receives OpenSSH's
+SHA-256 `%f` value before user authentication, compares it exactly with the
+saved pin (or writes the enrollment observation to a private one-use file), and
+emits no host-key line. The normal user/system `known_hosts` sources therefore
+remain independently authoritative; BiBCode's helper adds pinning but cannot
+make an unknown or changed key trusted. ProxyJump debug output and merged stderr
+are not trust inputs.
+
+Launch, stop, and pairing also wait for the destination command marker before
+writing any remote script byte. That is a secondary command/readiness barrier,
+after the pre-authentication pin check, and prevents a policy-trusted key
+rotation between probe and command from running the script on the wrong host.
+
+The native bootstrap contains only the target, numeric loopback HTTP/WebSocket
+endpoints, and observed host-key fingerprint. Through that tunnel, the client
+fetches a bounded descriptor and verifies the accepted environment UUID,
+storage UUID, and supported protocol before pairing is allowed. The native
+pairing command first opens one TCP stream through the verified tunnel, refetches
+and requires the exact same descriptor on that stream, creates the administrator
+pairing through the protected remote control channel, and redeems it over the
+same retained stream. If the tunnel exits, that stream fails closed; a local
+process that later rebinds the released forwarding port cannot receive the
+one-time credential. Native remote API
+requests reject redirects and disable system/environment proxies, so neither a
+server nor a proxy can replay a pairing form or bearer request away from the
+verified numeric-loopback endpoint. The raw pairing
+credential never crosses the desktop bridge into JavaScript. The returned
+administrator session is immediately placed behind the normalized route's OS
+secret reference before the route is published. The resulting
+`SshConnectionTarget` enters the same authorization and RPC pipeline as other
+targets. A normalized SSH route missing either that secret reference or its
+saved host fingerprint is blocked for explicit re-enrollment; it never creates
+an ephemeral pairing during reconnect.
 
 SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
 process supervision, or access to the user's SSH configuration.
 
 The desktop host creates an unpredictable private askpass directory only while
 an SSH command or live forwarding tunnel owns it. Passwords are passed only in
-the child environment and are never written into the static helper scripts.
+the direct destination SSH child's environment and are never written into the
+static helper scripts. Every SSH child first removes ambient BiBCode SSH and
+askpass variables, then adds only the values owned by that invocation. An
+effective `SendEnv` pattern that could forward any private BiBCode SSH variable
+is rejected before authentication. ProxyJump and ProxyCommand remain supported
+with key or agent authentication, but password fallback is rejected before the
+password prompt because a proxy child or command inherits the outer process
+environment. Direct SSH password authentication remains supported.
 Each child reserves bounded cleanup ownership before spawn; cancellation moves
 the child and helper lease together into the manager's retained reaper. Desktop
 shutdown closes new SSH child admission, terminates live tunnels, and awaits all
-retained reaps before releasing the exact helper files. Cleanup never recursively
-removes an unexpected foreign entry from an askpass directory.
+retained reaps and stderr I/O tasks before releasing the exact helper files.
+Cleanup never recursively removes an unexpected foreign entry from an askpass
+directory.
+
+Disconnect and Forget require the normalized route's saved host-key pin before
+they issue a remote stop. The pin is validated against an active tunnel before
+that tunnel is removed, so an invalid or changed caller pin leaves the live
+transport untouched. A legacy route without a pin can be removed locally, but
+BiBCode does not self-pin or run an unauthenticated remote uninstall/stop for it.
 
 ### Desktop-managed WSL
 
@@ -213,11 +270,15 @@ those remain separate steps internally:
 
 ```mermaid
 flowchart LR
-  Profile["SSH profile"] --> Probe["probe or launch remote bibcode"]
-  Probe --> Forward["establish local forwarding"]
-  Forward --> Bootstrap["return endpoint + bootstrap"]
-  Bootstrap --> Auth["environment token exchange"]
-  Auth --> RPC["Effect RPC session"]
+  Profile["SSH profile"] --> Trust["OpenSSH host trust"]
+  Trust --> Probe["probe remote host"]
+  Probe --> Launch["ensure remote bibcode"]
+  Launch --> Forward["establish local loopback forward"]
+  Forward --> Descriptor["fetch bounded descriptor"]
+  Descriptor --> Identity["verify environment + storage + protocol"]
+  Identity --> Pair["native create + redeem pairing"]
+  Pair --> Secret["persist session in OS secret provider"]
+  Secret --> RPC["Effect RPC session"]
 ```
 
 Keeping launch separate prevents connection code from assuming that every
@@ -308,10 +369,21 @@ and [Runtime and process model](./runtime-process-model.md).
 - Desktop secret references resolve through the native keyring on macOS/Linux
   and DPAPI-protected per-user storage on Windows. Enrollment fails closed when
   that provider is unavailable or locked; renderer storage is not a fallback.
-- The desktop SSH launcher and forwarding implementation exist, but fresh SSH
-  setup is currently blocked until the desktop provisioning and loopback
-  forwarding work in the environment-management plan integrates the native
-  `bibcode auth pairing create` command.
+- Desktop **Add environment > SSH** supports explicit enrollment when the
+  selected host already exposes a compatible native `bibcode` CLI and the
+  current Linux-like POSIX remote-command requirements through OpenSSH. Managed
+  port selection currently requires `ss` or readable Linux
+  `/proc/net/tcp{,6}` and fails closed when neither source exists or an
+  installed `ss` cannot execute the required filtered listener query; this
+  avoids treating an indeterminate/occupied port as free or accepting an
+  unrelated loopback listener. The macOS and Windows remote adapters and automatic cross-platform
+  remote installation are not implemented yet; an incompatible host fails with
+  guidance and does not fall back to Node.js or download executable bytes
+  implicitly.
+- Route-attempt cancellation does not yet interrupt an in-flight native SSH
+  bridge command. The lifecycle-fencing task in the current plan owns prompt,
+  setup, tunnel-publication, late-completion, and survivor cleanup races;
+  desktop shutdown remains the current native cleanup boundary.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies

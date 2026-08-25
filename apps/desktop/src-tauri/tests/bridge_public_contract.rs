@@ -7,9 +7,8 @@ use std::{
 
 use bibcode_desktop_lib::{
     WSL_DISCOVERY_CHANGED_EVENT, WslDiscoveryHealth, WslDiscoverySnapshot, WslDistro,
-    WslDistroState, desktop_bridge_bootstrap_ssh_bearer_session,
-    desktop_bridge_fetch_environment_descriptor, desktop_bridge_fetch_ssh_session_state,
-    desktop_bridge_issue_ssh_web_socket_ticket,
+    WslDistroState, desktop_bridge_fetch_environment_descriptor,
+    desktop_bridge_fetch_ssh_session_state, desktop_bridge_issue_ssh_web_socket_ticket,
 };
 use serde_json::json;
 
@@ -71,6 +70,22 @@ fn public_secret_bridge_exposes_only_put_get_and_delete() {
         allowed.iter().all(|command| !command.contains("list")),
         "the secret bridge must not expose an inventory operation"
     );
+}
+
+#[test]
+fn public_ssh_bridge_exposes_only_the_verified_native_pairing_command() {
+    let permissions: toml::Value =
+        toml::from_str(include_str!("../permissions/desktop-bridge.toml"))
+            .expect("desktop bridge permissions should parse");
+    let allowed = permissions["permission"][0]["commands"]["allow"]
+        .as_array()
+        .expect("desktop bridge allowlist should be an array")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect::<Vec<_>>();
+
+    assert!(allowed.contains(&"desktop_bridge_pair_ssh_environment"));
+    assert!(!allowed.contains(&"desktop_bridge_bootstrap_ssh_bearer_session"));
 }
 
 fn read_request(stream: &mut TcpStream) -> String {
@@ -137,12 +152,28 @@ fn spawn_json_server(status: &'static str, body: &'static str) -> (String, mpsc:
 
 #[tokio::test]
 async fn public_remote_bridge_commands_route_and_decode_environment_requests() {
-    let (base_url, requests) = spawn_json_server("200 OK", r#"{"environmentId":"environment-1"}"#);
+    let descriptor = r#"{"environmentId":"00000000-0000-4000-8000-000000000061","label":"SSH environment","platform":{"os":"linux","arch":"x64"},"serverVersion":"0.4.2","storageInstanceId":"00000000-0000-4000-8000-000000000062","protocol":{"minimum":1,"maximum":1},"capabilities":{"repositoryIdentity":true},"transport":{"mode":"loopback-http"}}"#;
+    let (base_url, requests) = spawn_json_server("200 OK", descriptor);
     assert_eq!(
         desktop_bridge_fetch_environment_descriptor(base_url)
             .await
             .expect("descriptor should load"),
-        json!({"environmentId":"environment-1"}),
+        json!({
+            "environmentId": "00000000-0000-4000-8000-000000000061",
+            "label": "SSH environment",
+            "platform": { "os": "linux", "arch": "x64" },
+            "serverVersion": "0.4.2",
+            "storageInstanceId": "00000000-0000-4000-8000-000000000062",
+            "protocol": { "minimum": 1, "maximum": 1 },
+            "capabilities": {
+                "repositoryIdentity": true,
+                "worktreeCatalog": false,
+                "worktreeCatalogRefreshReason": false,
+                "vcsStatusSummary": false,
+                "activityProtocolVersion": null,
+            },
+            "transport": { "mode": "loopback-http" },
+        }),
     );
     assert!(
         requests
@@ -164,20 +195,6 @@ async fn public_remote_bridge_commands_route_and_decode_environment_requests() {
             .expect("session request")
             .contains("authorization: Bearer bearer-token")
     );
-
-    let (base_url, requests) = spawn_json_server(
-        "200 OK",
-        r#"{"access_token":"token","token_type":"Bearer"}"#,
-    );
-    assert_eq!(
-        desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string())
-            .await
-            .expect("bearer session should bootstrap")["access_token"],
-        "token",
-    );
-    let request = requests.recv().expect("bootstrap request");
-    assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
-    assert!(request.contains("subject_token=credential"));
 
     let (base_url, requests) = spawn_json_server("200 OK", r#"{"ticket":"ticket-1"}"#);
     assert_eq!(

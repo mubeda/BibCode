@@ -313,6 +313,74 @@ sides of the forward, and stable environment/storage identities. Separately
 show that `BIBCODE_WSL_SERVER_BINARY` or the cross-compiled target fallback
 still launches a development worktree when no managed runtime exists.
 
+### SSH trust, descriptor, and pairing evidence
+
+When SSH trust, launch, tunneling, descriptor verification, pairing, or route
+enrollment changes, run the desktop SSH owner, bridge contract, connection
+ordering, and onboarding tests together:
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests:: --lib -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
+vp test apps/web/src/connection/platform.test.ts apps/web/src/tauriDesktopBridge.test.ts packages/client-runtime/src/connection/resolver.test.ts packages/client-runtime/src/connection/onboarding.test.ts packages/contracts/src/ipc.test.ts
+```
+
+On non-Windows hosts, replace the launcher with direct Cargo. Use a disposable
+SSH target for native evidence and record the actual OpenSSH client, effective
+configuration source, host alias, port, and non-secret host-key fingerprint.
+Never record passwords, private keys, pairing credentials, access tokens, or
+raw command output that could contain them.
+
+Prove the visible order `OpenSSH trust -> probe -> ensure server -> numeric
+loopback tunnel -> bounded descriptor -> environment/storage/protocol
+verification -> native pairing creation -> native redemption -> OS-secret
+persistence -> session`. An environment, storage, protocol, target, descriptor,
+or saved-host-fingerprint mismatch must stop before pairing. The native pairing
+operation must preconnect one TCP stream through the owned tunnel, refetch and
+require the exact verified descriptor on that stream, create the credential
+only afterward, and redeem it on that same stream. Close the forwarding
+listener after the descriptor response and prove redemption still uses the
+accepted connection; a replacement listener must receive no credential. No
+bridge payload, renderer state, log, error, or fixture snapshot may contain the
+raw pairing credential.
+
+For probe, launch, stop, pairing, and tunnel setup, prove that bounded `ssh -G`
+runs before password-capable work and that the destination process invokes
+BiBCode's fixed `KnownHostsCommand` helper before user authentication. The
+helper must compare OpenSSH's SHA-256 `%f`, emit no host-key entry, and leave
+normal user/system `known_hosts` independently authoritative. Enrollment may
+write the observed fingerprint only to its private one-use file. Mismatch must
+abort before askpass/userauth; the later destination command marker is only the
+secondary barrier that releases remote script stdin. A different policy-trusted
+key between probe and command must close without running the script. Confirm
+managed and `--no-startup-pairing` launches remain authenticated, expose no
+startup credential, and can still create pairing through protected local
+control.
+
+Exercise known-key success, first-seen/unknown key, changed or revoked key,
+saved-fingerprint mismatch, user cancellation at the OpenSSH prompt, auth
+failure, unreachable host, tunnel startup failure, non-loopback or nonnumeric
+HTTP rejection, redirect and HTTP-proxy bypass rejection, oversize/malformed
+descriptor and token replies, and remote pairing failure. Confirm there is no
+`StrictHostKeyChecking=no`, private empty
+`UserKnownHostsFile`, wildcard listener, or non-loopback plaintext HTTP escape.
+Reject an effective custom `KnownHostsCommand`. Reject effective `SendEnv`
+patterns that match `BIBCODE_SSH_*` or the password variable, while allowing
+unrelated locale forwarding, and prove ambient internal variables are removed
+before owned values are re-added. Exercise ProxyJump/ProxyCommand with key or
+agent authentication; prove a password fallback is rejected before prompting
+and no secret-bearing SSH process is spawned. A rejected invalid/changed-pin
+disconnect must leave the published tunnel active. A managed POSIX launch must
+fail closed when it has neither `ss` nor readable Linux procfs for port
+selection, and when an installed/incompatible `ss` exits nonzero; do not record
+that fixture as macOS support.
+Desktop shutdown must leave no owned SSH, askpass, tunnel, or I/O task behind.
+Until the lifecycle-fencing task in the current plan lands, record route-attempt
+cancellation as unavailable rather than claiming that an in-flight native
+bridge command was interrupted. Host-independent parsers and command fixtures
+are compatibility evidence only; repeat Linux, macOS, and Windows OpenSSH
+behavior on the named native desktop once those product adapters are enabled.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

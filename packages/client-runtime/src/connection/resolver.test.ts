@@ -33,6 +33,7 @@ import {
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  SshTunnelRoute,
   type ConnectionTarget,
   UnavailableConnectionTarget,
 } from "./model.ts";
@@ -104,7 +105,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly authorizeVerifiedBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeVerifiedBearer"];
   readonly primaryBearerToken?: string;
-  readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
+  readonly inspectSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["inspect"];
   readonly descriptor?: ExecutionEnvironmentDescriptor;
   readonly routeSecret?: string;
   readonly verifyDirectHttps?: ConnectionResolver.RouteTransportSecurityService["verifyDirectHttps"];
@@ -188,30 +189,29 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       (() => Effect.sync(() => options?.events?.push("transport-trust"))),
   });
   const ssh = ClientCapabilities.SshEnvironmentGateway.of({
-    provision: () => Effect.die("unused"),
-    prepare:
-      options?.prepareSsh ??
-      (() =>
-        Effect.succeed({
-          bootstrap: {
-            target: SSH_TARGET,
-            httpBaseUrl: "http://127.0.0.1:4010",
-            wsBaseUrl: "ws://127.0.0.1:4010",
-            pairingToken: null,
-          },
-          bearerToken: "ssh-bearer",
-        })),
-    inspect: (input) =>
-      Effect.succeed({
-        bootstrap: {
-          target: input.target,
-          httpBaseUrl: "http://127.0.0.1:4010",
-          wsBaseUrl: "ws://127.0.0.1:4010",
-          pairingToken: input.issuePairingToken ? "ssh-pairing" : null,
-        },
-        descriptor: options?.descriptor ?? DESCRIPTOR,
-      }),
-    exchange: () => Effect.succeed("ssh-bearer"),
+    inspect:
+      options?.inspectSsh ??
+      ((input) =>
+        Effect.sync(() =>
+          options?.events?.push(
+            "ssh-trust",
+            "probe",
+            "ensure-server",
+            "open-tunnel",
+            "fetch-descriptor",
+          ),
+        ).pipe(
+          Effect.as({
+            bootstrap: {
+              target: input.target,
+              httpBaseUrl: "http://127.0.0.1:4010",
+              wsBaseUrl: "ws://127.0.0.1:4010",
+              hostKeyFingerprint: input.hostKeyFingerprint ?? "SHA256:known-host-key",
+            },
+            descriptor: options?.descriptor ?? DESCRIPTOR,
+          }),
+        )),
+    exchange: () => Effect.die("unused"),
     disconnect: () => Effect.void,
   });
 
@@ -441,7 +441,7 @@ describe("ConnectionResolver", () => {
     }),
   );
 
-  it.effect("delegates SSH launch to the platform gateway before remote authorization", () =>
+  it.effect("blocks pre-v3 SSH entries before platform pairing", () =>
     Effect.gen(function* () {
       const preparedTargets = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
       const target = new SshConnectionTarget({
@@ -456,25 +456,26 @@ describe("ConnectionResolver", () => {
         target: SSH_TARGET,
       });
       const brokerLayer = yield* makeDependencies({
-        prepareSsh: (input) =>
+        inspectSsh: (input) =>
           Ref.update(preparedTargets, (values) => [...values, input.target]).pipe(
             Effect.as({
               bootstrap: {
                 target: input.target,
                 httpBaseUrl: "http://127.0.0.1:4010",
                 wsBaseUrl: "ws://127.0.0.1:4010",
-                pairingToken: null,
+                hostKeyFingerprint: "SHA256:known-host-key",
               },
-              bearerToken: "ssh-bearer",
+              descriptor: DESCRIPTOR,
             }),
           ),
       });
       const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
 
-      const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
-      expect(prepared.socketUrl).toContain("wsTicket=bearer");
-      expect(prepared.descriptor).toEqual(DESCRIPTOR);
-      expect(yield* Ref.get(preparedTargets)).toEqual([SSH_TARGET]);
+      const error = yield* broker
+        .prepare(catalogEntry(target, Option.some(profile)))
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({ reason: "configuration" });
+      expect(yield* Ref.get(preparedTargets)).toEqual([]);
     }),
   );
 
@@ -633,6 +634,99 @@ describe("ConnectionResolver normalized routes", () => {
         .pipe(Effect.flip);
       expect(certificateError).toMatchObject({ reason: "certificate-changed" });
       expect(certificateEvents).toEqual([]);
+    }),
+  );
+
+  it.effect("blocks an unpersisted SSH route before pairing or native work", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      const sshRoute = new SshTunnelRoute({
+        routeId: "ssh-route",
+        environmentId: ENVIRONMENT_ID,
+        label: "SSH",
+        priority: 0,
+        pinned: false,
+        autoconnect: true,
+        secretRef: null,
+        target: SSH_TARGET,
+        hostKeyFingerprint: "SHA256:known-host-key",
+      });
+      const sshEnvironment: KnownEnvironment = {
+        ...environment,
+        routes: [sshRoute],
+      };
+      const brokerLayer = yield* makeDependencies({
+        events,
+        authorizeVerifiedBearer: (input) =>
+          Effect.sync(() => events.push("open-session")).pipe(
+            Effect.as({
+              descriptor: input.identity.descriptor,
+              environmentId: input.identity.environmentId,
+              label: input.identity.descriptor.label,
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "ws://127.0.0.1:4010/ws?wsTicket=verified",
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            }),
+          ),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      const error = yield* broker
+        .prepareRoute({
+          environment: sshEnvironment,
+          route: sshRoute,
+          cancellation: new AbortController().signal,
+        })
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({ reason: "configuration" });
+      expect(events).toEqual([]);
+    }),
+  );
+
+  it.effect("never creates SSH pairing after environment storage or protocol mismatch", () =>
+    Effect.gen(function* () {
+      for (const descriptor of [
+        {
+          ...DESCRIPTOR,
+          environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000099"),
+        },
+        { ...DESCRIPTOR, storageInstanceId: "00000000-0000-4000-8000-000000000099" },
+        { ...DESCRIPTOR, protocol: { minimum: 2, maximum: 2 } },
+      ] satisfies ReadonlyArray<ExecutionEnvironmentDescriptor>) {
+        const events: string[] = [];
+        const sshRoute = new SshTunnelRoute({
+          routeId: "ssh-route",
+          environmentId: ENVIRONMENT_ID,
+          label: "SSH",
+          priority: 0,
+          pinned: false,
+          autoconnect: true,
+          secretRef: "ssh-secret",
+          target: SSH_TARGET,
+          hostKeyFingerprint: "SHA256:known-host-key",
+        });
+        const brokerLayer = yield* makeDependencies({ events, descriptor });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+
+        yield* broker
+          .prepareRoute({
+            environment: { ...environment, routes: [sshRoute] },
+            route: sshRoute,
+            cancellation: new AbortController().signal,
+          })
+          .pipe(Effect.flip);
+
+        expect(events).toEqual([
+          "ssh-trust",
+          "probe",
+          "ensure-server",
+          "open-tunnel",
+          "fetch-descriptor",
+        ]);
+      }
     }),
   );
 });

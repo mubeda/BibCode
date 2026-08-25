@@ -51,6 +51,23 @@ const defaultLocalEnvironmentBootstrap = {
   bootstrapToken: "bootstrap-token",
 };
 
+const defaultSshDescriptor = {
+  environmentId: "00000000-0000-4000-8000-000000000071",
+  label: "SSH environment",
+  platform: { os: "linux", arch: "x64" },
+  serverVersion: "0.4.2",
+  storageInstanceId: "00000000-0000-4000-8000-000000000072",
+  protocol: { minimum: 1, maximum: 1 },
+  capabilities: {
+    repositoryIdentity: true,
+    worktreeCatalog: false,
+    worktreeCatalogRefreshReason: false,
+    vcsStatusSummary: false,
+    activityProtocolVersion: null,
+  },
+  transport: { mode: "loopback-http" },
+} as const;
+
 function installTauriHarness(options?: {
   readonly previewSupported?: boolean;
   readonly protectedConnectionCatalog?: boolean;
@@ -73,6 +90,7 @@ function installTauriHarness(options?: {
   readonly clearConnectionCatalog?: () => void;
   readonly rejectFallbackCommands?: boolean;
   readonly rejectListeners?: boolean;
+  readonly sshDescriptor?: unknown;
 }) {
   const listeners = new Map<string, TauriEventHandler>();
   const unlisteners = new Map<string, ReturnType<typeof vi.fn>>();
@@ -151,7 +169,7 @@ function installTauriHarness(options?: {
           target: args?.target,
           httpBaseUrl: "http://127.0.0.1:3773/",
           wsBaseUrl: "ws://127.0.0.1:3773/",
-          pairingToken: "ssh-pairing-token",
+          hostKeyFingerprint: "SHA256:known-host-key",
           remotePort: 3773,
           remoteServerKind: "managed",
         });
@@ -209,8 +227,8 @@ function installTauriHarness(options?: {
         options?.clearConnectionCatalog?.();
         return Promise.resolve(undefined);
       case "desktop_bridge_fetch_environment_descriptor":
-        return Promise.resolve({ environmentId: "ssh-env" });
-      case "desktop_bridge_bootstrap_ssh_bearer_session":
+        return Promise.resolve(options?.sshDescriptor ?? defaultSshDescriptor);
+      case "desktop_bridge_pair_ssh_environment":
         return Promise.resolve({ access_token: "ssh-bearer" });
       case "desktop_bridge_fetch_ssh_session_state":
         return Promise.resolve({ authenticated: true });
@@ -452,11 +470,32 @@ describe("tauriDesktopBridge", () => {
     const bridge = await installBridge();
 
     await expect(bridge.fetchSshEnvironmentDescriptor("http://127.0.0.1:3773")).resolves.toEqual({
-      environmentId: "ssh-env",
+      ...defaultSshDescriptor,
     });
-    await expect(
-      bridge.bootstrapSshBearerSession("http://127.0.0.1:3773", "pairing-token"),
-    ).resolves.toEqual({ access_token: "ssh-bearer" });
+    const target = {
+      alias: "host-1",
+      hostname: "example.test",
+      username: null,
+      port: null,
+    };
+    const descriptor = {
+      environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000071"),
+      label: "SSH",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "0.4.2",
+      storageInstanceId: "00000000-0000-4000-8000-000000000072",
+      protocol: { minimum: 1, maximum: 1 },
+      capabilities: {
+        repositoryIdentity: true,
+        worktreeCatalog: false,
+        worktreeCatalogRefreshReason: false,
+        vcsStatusSummary: false,
+        activityProtocolVersion: null,
+      },
+    } as const;
+    await expect(bridge.pairSshEnvironment(target, descriptor)).resolves.toEqual({
+      access_token: "ssh-bearer",
+    });
     await expect(
       bridge.fetchSshSessionState("http://127.0.0.1:3773", "bearer-token"),
     ).resolves.toEqual({ authenticated: true });
@@ -467,9 +506,9 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_fetch_environment_descriptor", {
       httpBaseUrl: "http://127.0.0.1:3773",
     });
-    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_bootstrap_ssh_bearer_session", {
-      httpBaseUrl: "http://127.0.0.1:3773",
-      credential: "pairing-token",
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_pair_ssh_environment", {
+      target,
+      descriptor,
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_fetch_ssh_session_state", {
       httpBaseUrl: "http://127.0.0.1:3773",
@@ -479,6 +518,18 @@ describe("tauriDesktopBridge", () => {
       httpBaseUrl: "http://127.0.0.1:3773",
       bearerToken: "bearer-token",
     });
+  });
+
+  it("rejects a malformed SSH descriptor at the typed desktop boundary", async () => {
+    installTauriHarness({
+      sshDescriptor: {
+        ...defaultSshDescriptor,
+        protocol: {},
+      },
+    });
+    const bridge = await installBridge();
+
+    await expect(bridge.fetchSshEnvironmentDescriptor("http://127.0.0.1:3773")).rejects.toThrow();
   });
 
   it("exposes Tauri bridge metadata and structured unsupported errors", async () => {
@@ -526,7 +577,7 @@ describe("tauriDesktopBridge", () => {
       },
       httpBaseUrl: "http://127.0.0.1:3773/",
       wsBaseUrl: "ws://127.0.0.1:3773/",
-      pairingToken: "ssh-pairing-token",
+      hostKeyFingerprint: "SHA256:known-host-key",
       remotePort: 3773,
       remoteServerKind: "managed",
     });
@@ -1172,7 +1223,11 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.getClientSettings()).resolves.toBeNull();
     await expect(bridge.setClientSettings({} as never)).resolves.toBeNull();
     await expect(bridge.discoverSshHosts()).resolves.toBeNull();
-    await expect(bridge.disconnectSshEnvironment(sshTarget)).resolves.toBeNull();
+    await expect(
+      bridge.disconnectSshEnvironment(sshTarget, {
+        expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      }),
+    ).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
     await expect(
@@ -1211,6 +1266,9 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_discover_ssh_hosts", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_disconnect_ssh_environment", {
       target: sshTarget,
+      options: {
+        expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_set_wsl_backend_enabled", {
       enabled: true,
@@ -1345,12 +1403,17 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
     await expect(bridge.discoverSshHosts()).resolves.toEqual([]);
     await expect(
-      bridge.disconnectSshEnvironment({
-        alias: "fallback",
-        hostname: "fallback.test",
-        username: null,
-        port: null,
-      }),
+      bridge.disconnectSshEnvironment(
+        {
+          alias: "fallback",
+          hostname: "fallback.test",
+          username: null,
+          port: null,
+        },
+        {
+          expectedHostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        },
+      ),
     ).resolves.toBeUndefined();
     await expect(bridge.getAdvertisedEndpoints()).resolves.toEqual([]);
     await expect(bridge.pickFolder()).resolves.toBeNull();

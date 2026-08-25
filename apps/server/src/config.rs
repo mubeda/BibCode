@@ -55,6 +55,7 @@ pub struct ServerConfig {
     pub static_dir: Option<PathBuf>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
+    pub startup_pairing_enabled: bool,
     pub desktop_bootstrap_token: Option<String>,
     pub unsafe_no_auth: bool,
     pub environment_id: Option<EnvironmentId>,
@@ -87,6 +88,7 @@ impl ServerConfig {
             static_dir: None,
             dev_url: None,
             no_browser: false,
+            startup_pairing_enabled: true,
             desktop_bootstrap_token: None,
             unsafe_no_auth: false,
             environment_id: None,
@@ -136,6 +138,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_service_managed_launch(mut self, mode: ServiceMode) -> Self {
         self.managed_service_mode = Some(mode);
+        self.startup_pairing_enabled = false;
+        self
+    }
+
+    /// Starts an authenticated web server without minting or printing a startup pairing.
+    #[must_use]
+    pub fn without_startup_pairing(mut self) -> Self {
+        self.startup_pairing_enabled = false;
         self
     }
 
@@ -229,6 +239,21 @@ mod tests {
             config.data_root_request.requested,
             Some(PathBuf::from("/var/lib/bibcode"))
         );
+    }
+
+    #[test]
+    fn no_startup_pairing_keeps_web_auth_enabled_without_issuing_startup_access() {
+        let config = Cli::try_parse_from(["bibcode", "serve", "--no-startup-pairing"])
+            .expect("parse no-startup-pairing CLI")
+            .into_server_config()
+            .expect("build no-startup-pairing server config");
+
+        assert!(!config.startup_pairing_enabled);
+        assert!(!config.unsafe_no_auth);
+
+        let managed =
+            ServerConfig::new("state").with_service_managed_launch(ServiceMode::Workstation);
+        assert!(!managed.startup_pairing_enabled);
     }
 
     #[test]
@@ -492,6 +517,10 @@ struct ServerArgs {
     #[arg(long, env = "BIBCODE_NO_BROWSER", global = true)]
     no_browser: bool,
 
+    /// Keep authentication enabled but do not mint or print a startup pairing credential.
+    #[arg(long, env = "BIBCODE_NO_STARTUP_PAIRING", global = true)]
+    no_startup_pairing: bool,
+
     #[arg(long, env = "BIBCODE_BOOTSTRAP_FD", global = true)]
     bootstrap_fd: Option<i32>,
 
@@ -694,6 +723,8 @@ impl Cli {
             || args.no_browser
             || bootstrap.as_ref().is_some_and(|value| value.no_browser)
             || mode == ServerMode::Desktop;
+        config.startup_pairing_enabled =
+            !args.no_startup_pairing && managed_service_mode.is_none() && mode == ServerMode::Web;
         let desktop_bootstrap_token = bootstrap
             .as_ref()
             .map(|value| value.desktop_bootstrap_token.clone());
@@ -720,6 +751,7 @@ impl ServerArgs {
             || self.tls_private_key.is_some()
             || self.dev_url.is_some()
             || self.no_browser
+            || self.no_startup_pairing
             || self.bootstrap_fd.is_some()
             || self.managed_service_mode.is_some()
     }

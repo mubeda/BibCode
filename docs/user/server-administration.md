@@ -31,6 +31,13 @@ binary. Install it in its intended permanent location before registering the
 service. Use one explicit `--base-dir` consistently when the default is not
 appropriate.
 
+Managed services stay authenticated but never mint or print a startup pairing.
+Create administrator access explicitly through the protected local-control
+channel after startup. For a foreground or externally supervised server, pass
+`--no-startup-pairing` (or set `BIBCODE_NO_STARTUP_PAIRING=1`) for the same
+credential-free startup behavior. This flag is not an authentication bypass;
+protected HTTP and WebSocket requests still require a valid session.
+
 ## Listener and connection choices
 
 | Connection     | Server listener                                            | Client trust                                                    |

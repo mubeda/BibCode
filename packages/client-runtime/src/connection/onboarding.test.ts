@@ -1,24 +1,154 @@
-import { AuthStandardClientScopes, EnvironmentId } from "@bibcode/contracts";
+import {
+  AuthStandardClientScopes,
+  EnvironmentId,
+  type DesktopSshEnvironmentTarget,
+  type ExecutionEnvironmentDescriptor,
+} from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { ClientPresentation, SshEnvironmentGateway } from "../platform/capabilities.ts";
 import { BearerConnectionCredential, BearerConnectionProfile } from "./catalog.ts";
 import { EnvironmentRegistry, type EnvironmentRegistrationInput } from "./registry.ts";
-import { BearerConnectionTarget } from "./model.ts";
+import { BearerConnectionTarget, SshTunnelRoute } from "./model.ts";
 import {
   prepareBearerConnectionUpdate,
   preparePairingRegistration,
   prepareSshRegistration,
   registerPairingConnection,
+  registerSshConnection,
 } from "./onboarding.ts";
 
 const PAIRED_ENVIRONMENT_ID = "00000000-0000-4000-8000-000000000021";
 const PAIRED_STORAGE_ID = "00000000-0000-4000-8000-000000000022";
 const SSH_ENVIRONMENT_ID = "00000000-0000-4000-8000-000000000031";
+const SSH_STORAGE_ID = "00000000-0000-4000-8000-000000000032";
+
+function sshDescriptor(options?: { readonly environmentId?: string; readonly storageId?: string }) {
+  return {
+    environmentId: EnvironmentId.make(options?.environmentId ?? SSH_ENVIRONMENT_ID),
+    label: "Remote development box",
+    platform: { os: "linux" as const, arch: "x64" as const },
+    serverVersion: "0.0.0-test",
+    storageInstanceId: options?.storageId ?? SSH_STORAGE_ID,
+    protocol: { minimum: 1, maximum: 1 },
+    capabilities: {
+      repositoryIdentity: true,
+      worktreeCatalog: false,
+      worktreeCatalogRefreshReason: false,
+      vcsStatusSummary: false,
+      activityProtocolVersion: null,
+    },
+    transport: { mode: "loopback-http" as const },
+  };
+}
+
+function attemptSshEnrollmentWithDescriptor(descriptor: unknown) {
+  return Effect.gen(function* () {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.test",
+      username: "developer",
+      port: 22,
+    };
+    const bootstrap = {
+      target,
+      httpBaseUrl: "http://127.0.0.1:3201",
+      wsBaseUrl: "ws://127.0.0.1:3201",
+      hostKeyFingerprint: "SHA256:known-host-key",
+    };
+    const environments = yield* SubscriptionRef.make(new Map());
+    const registry = EnvironmentRegistry.of({
+      environments,
+    } as unknown as EnvironmentRegistry["Service"]);
+    let exchangeCalls = 0;
+    const gateway = SshEnvironmentGateway.of({
+      inspect: () =>
+        Effect.succeed({
+          bootstrap,
+          descriptor: descriptor as ExecutionEnvironmentDescriptor,
+        }),
+      exchange: () =>
+        Effect.sync(() => {
+          exchangeCalls += 1;
+          return { bootstrap, bearerToken: "must-not-exist" };
+        }),
+      disconnect: () => Effect.die("unused"),
+    });
+
+    const error = yield* prepareSshRegistration({ target }).pipe(
+      Effect.provideService(EnvironmentRegistry, registry),
+      Effect.provideService(SshEnvironmentGateway, gateway),
+      Effect.flip,
+    );
+    return { error, exchangeCalls };
+  });
+}
+
+function inspectSavedPinForTarget(
+  inputTarget: DesktopSshEnvironmentTarget,
+  savedTarget: DesktopSshEnvironmentTarget,
+) {
+  return Effect.gen(function* () {
+    const descriptor = sshDescriptor();
+    const route = new SshTunnelRoute({
+      routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
+      environmentId: descriptor.environmentId,
+      label: "Remote development box",
+      priority: 0,
+      pinned: false,
+      autoconnect: true,
+      secretRef: "ssh-secret",
+      target: savedTarget,
+      hostKeyFingerprint: "SHA256:saved-host-key",
+    });
+    const environments = yield* SubscriptionRef.make(
+      new Map([
+        [
+          descriptor.environmentId,
+          {
+            environmentId: descriptor.environmentId,
+            acceptedStorageInstanceId: descriptor.storageInstanceId,
+            descriptor,
+            alias: descriptor.label,
+            hidden: false,
+            bindings: [],
+            routes: [route],
+          },
+        ],
+      ]),
+    );
+    const registry = EnvironmentRegistry.of({
+      environments,
+    } as unknown as EnvironmentRegistry["Service"]);
+    const bootstrap = {
+      target: inputTarget,
+      httpBaseUrl: "http://127.0.0.1:3201",
+      wsBaseUrl: "ws://127.0.0.1:3201",
+      hostKeyFingerprint: "SHA256:saved-host-key",
+    };
+    let inspectedPin: string | null | undefined;
+    const gateway = SshEnvironmentGateway.of({
+      inspect: (input) =>
+        Effect.sync(() => {
+          inspectedPin = input.hostKeyFingerprint;
+          return { bootstrap, descriptor };
+        }),
+      exchange: () => Effect.succeed({ bootstrap, bearerToken: "bearer-token" }),
+      disconnect: () => Effect.die("unused"),
+    });
+
+    yield* prepareSshRegistration({ target: inputTarget }).pipe(
+      Effect.provideService(EnvironmentRegistry, registry),
+      Effect.provideService(SshEnvironmentGateway, gateway),
+    );
+    return inspectedPin;
+  });
+}
 
 const CLIENT_PRESENTATION_LAYER = Layer.succeed(
   ClientPresentation,
@@ -270,7 +400,7 @@ describe("connection onboarding", () => {
     }),
   );
 
-  it.effect("prepares an SSH registration from the provisioned platform environment", () =>
+  it.effect("prepares an SSH registration only after inspect and identity acceptance", () =>
     Effect.gen(function* () {
       const target = {
         alias: "devbox",
@@ -278,45 +408,25 @@ describe("connection onboarding", () => {
         username: "developer",
         port: 22,
       };
-      const registration = yield* prepareSshRegistration({
+      const environments = yield* SubscriptionRef.make(new Map());
+      const bootstrap = {
         target,
-      }).pipe(
-        Effect.provideService(
-          SshEnvironmentGateway,
-          SshEnvironmentGateway.of({
-            provision: () =>
-              Effect.succeed({
-                environmentId: EnvironmentId.make(SSH_ENVIRONMENT_ID),
-                label: "Remote development box",
-                descriptor: {
-                  environmentId: EnvironmentId.make(SSH_ENVIRONMENT_ID),
-                  label: "Remote development box",
-                  platform: { os: "linux", arch: "x64" },
-                  serverVersion: "0.0.0-test",
-                  storageInstanceId: "00000000-0000-4000-8000-000000000032",
-                  protocol: { minimum: 1, maximum: 1 },
-                  capabilities: {
-                    repositoryIdentity: true,
-                    worktreeCatalog: false,
-                    worktreeCatalogRefreshReason: false,
-                    vcsStatusSummary: false,
-                    activityProtocolVersion: null,
-                  },
-                },
-                bootstrap: {
-                  target,
-                  httpBaseUrl: "http://127.0.0.1:3201",
-                  wsBaseUrl: "ws://127.0.0.1:3201",
-                  pairingToken: "pairing-token",
-                },
-                bearerToken: "bearer-token",
-              }),
-            prepare: () => Effect.die("unused"),
-            inspect: () => Effect.die("unused"),
-            exchange: () => Effect.die("unused"),
-            disconnect: () => Effect.die("unused"),
-          }),
-        ),
+        httpBaseUrl: "http://127.0.0.1:3201",
+        wsBaseUrl: "ws://127.0.0.1:3201",
+        hostKeyFingerprint: "SHA256:known-host-key",
+      };
+      const registry = EnvironmentRegistry.of({
+        environments,
+      } as unknown as EnvironmentRegistry["Service"]);
+      const gateway = SshEnvironmentGateway.of({
+        inspect: () => Effect.succeed({ bootstrap, descriptor: sshDescriptor() }),
+        exchange: (input) =>
+          Effect.succeed({ bootstrap: input.bootstrap, bearerToken: "bearer-token" }),
+        disconnect: () => Effect.die("unused"),
+      });
+      const registration = yield* prepareSshRegistration({ target }).pipe(
+        Effect.provideService(EnvironmentRegistry, registry),
+        Effect.provideService(SshEnvironmentGateway, gateway),
       );
 
       expect(registration).toMatchObject({
@@ -333,6 +443,310 @@ describe("connection onboarding", () => {
           target,
         },
       });
+    }),
+  );
+
+  it.effect("does not pair when the inspected SSH descriptor is malformed", () =>
+    Effect.gen(function* () {
+      const result = yield* attemptSshEnrollmentWithDescriptor({
+        ...sshDescriptor(),
+        protocol: { minimum: 0, maximum: 1 },
+      });
+
+      expect(result.error).toMatchObject({ reason: "configuration" });
+      expect(result.exchangeCalls).toBe(0);
+    }),
+  );
+
+  it.effect("does not pair when the inspected SSH protocol is unsupported", () =>
+    Effect.gen(function* () {
+      const result = yield* attemptSshEnrollmentWithDescriptor({
+        ...sshDescriptor(),
+        protocol: { minimum: 2, maximum: 2 },
+      });
+
+      expect(result.error).toMatchObject({ reason: "version-incompatible" });
+      expect(result.exchangeCalls).toBe(0);
+    }),
+  );
+
+  it.effect("does not pair when the inspected SSH transport is not loopback HTTP", () =>
+    Effect.gen(function* () {
+      const result = yield* attemptSshEnrollmentWithDescriptor({
+        ...sshDescriptor(),
+        transport: { mode: "https", spkiSha256: "a".repeat(64) },
+      });
+
+      expect(result.error).toMatchObject({ reason: "configuration" });
+      expect(result.exchangeCalls).toBe(0);
+    }),
+  );
+
+  it.effect("reuses the saved pin for the same effective OpenSSH alias", () =>
+    Effect.gen(function* () {
+      const pin = yield* inspectSavedPinForTarget(
+        {
+          alias: "DEVBOX",
+          hostname: "ignored-two.internal",
+          username: "developer",
+          port: null,
+        },
+        {
+          alias: "devbox",
+          hostname: "ignored-one.internal",
+          username: "developer",
+          port: null,
+        },
+      );
+
+      expect(pin).toBe("SHA256:saved-host-key");
+    }),
+  );
+
+  it.effect("does not conflate an SSH-config port with explicit port 22", () =>
+    Effect.gen(function* () {
+      const pin = yield* inspectSavedPinForTarget(
+        {
+          alias: "devbox",
+          hostname: "ignored.internal",
+          username: "developer",
+          port: 22,
+        },
+        {
+          alias: "devbox",
+          hostname: "ignored.internal",
+          username: "developer",
+          port: null,
+        },
+      );
+
+      expect(pin).toBeNull();
+    }),
+  );
+
+  it.effect("persists the verified SSH route and session through the normalized registry", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      const target = {
+        alias: "devbox",
+        hostname: "devbox.example.test",
+        username: "developer",
+        port: 22,
+      };
+      let registered: EnvironmentRegistrationInput | undefined;
+      const environments = yield* SubscriptionRef.make(new Map());
+      const registry = EnvironmentRegistry.of({
+        environments,
+        registerEnvironment: (input: EnvironmentRegistrationInput) =>
+          Effect.sync(() => {
+            events.push("persist-route");
+            registered = input;
+          }),
+      } as unknown as EnvironmentRegistry["Service"]);
+      const bootstrap = {
+        target,
+        httpBaseUrl: "http://127.0.0.1:3201",
+        wsBaseUrl: "ws://127.0.0.1:3201",
+        hostKeyFingerprint: "SHA256:known-host-key",
+      };
+      const gateway = SshEnvironmentGateway.of({
+        inspect: () =>
+          Effect.sync(() => {
+            events.push("ssh-trust", "probe", "ensure-server", "open-tunnel", "fetch-descriptor");
+            return { bootstrap, descriptor: sshDescriptor() };
+          }),
+        exchange: (input) =>
+          Effect.sync(() => {
+            events.push("verify-environment-storage-protocol", "create-pairing", "redeem-pairing");
+            return { bootstrap: input.bootstrap, bearerToken: "bearer-token" };
+          }),
+        disconnect: () => Effect.die("unused"),
+      });
+
+      const environmentId = yield* registerSshConnection({ target }).pipe(
+        Effect.provideService(EnvironmentRegistry, registry),
+        Effect.provideService(SshEnvironmentGateway, gateway),
+      );
+
+      expect(environmentId).toBe(SSH_ENVIRONMENT_ID);
+      expect(events).toEqual([
+        "ssh-trust",
+        "probe",
+        "ensure-server",
+        "open-tunnel",
+        "fetch-descriptor",
+        "verify-environment-storage-protocol",
+        "create-pairing",
+        "redeem-pairing",
+        "persist-route",
+      ]);
+      expect(registered).toMatchObject({
+        environment: {
+          environmentId: SSH_ENVIRONMENT_ID,
+          acceptedStorageInstanceId: "00000000-0000-4000-8000-000000000032",
+          routes: [
+            {
+              _tag: "SshTunnelRoute",
+              routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
+              target,
+              hostKeyFingerprint: "SHA256:known-host-key",
+              secretRef: null,
+            },
+          ],
+        },
+        sessionSecret: {
+          routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
+          value: "bearer-token",
+        },
+      });
+    }),
+  );
+
+  it.effect("does not pair when an enrolled SSH target reports a different environment", () =>
+    Effect.gen(function* () {
+      const target = {
+        alias: "devbox",
+        hostname: "devbox.example.test",
+        username: "developer",
+        port: 22,
+      };
+      const existingDescriptor = sshDescriptor();
+      const existingRoute = new SshTunnelRoute({
+        routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
+        environmentId: existingDescriptor.environmentId,
+        label: "Remote development box",
+        priority: 0,
+        pinned: false,
+        autoconnect: true,
+        secretRef: "ssh-secret",
+        target,
+        hostKeyFingerprint: "SHA256:known-host-key",
+      });
+      const environments = yield* SubscriptionRef.make(
+        new Map([
+          [
+            existingDescriptor.environmentId,
+            {
+              environmentId: existingDescriptor.environmentId,
+              acceptedStorageInstanceId: existingDescriptor.storageInstanceId,
+              descriptor: existingDescriptor,
+              alias: existingDescriptor.label,
+              hidden: false,
+              bindings: [],
+              routes: [existingRoute],
+            },
+          ],
+        ]),
+      );
+      let exchangeCalls = 0;
+      const bootstrap = {
+        target,
+        httpBaseUrl: "http://127.0.0.1:3201",
+        wsBaseUrl: "ws://127.0.0.1:3201",
+        hostKeyFingerprint: "SHA256:known-host-key",
+      };
+      const registry = EnvironmentRegistry.of({
+        environments,
+        registerEnvironment: () => Effect.die("must not persist"),
+      } as unknown as EnvironmentRegistry["Service"]);
+      const gateway = SshEnvironmentGateway.of({
+        inspect: () =>
+          Effect.succeed({
+            bootstrap,
+            descriptor: sshDescriptor({
+              environmentId: "00000000-0000-4000-8000-000000000033",
+            }),
+          }),
+        exchange: () =>
+          Effect.sync(() => {
+            exchangeCalls += 1;
+            return { bootstrap, bearerToken: "must-not-exist" };
+          }),
+        disconnect: () => Effect.die("unused"),
+      });
+
+      const error = yield* registerSshConnection({ target }).pipe(
+        Effect.provideService(EnvironmentRegistry, registry),
+        Effect.provideService(SshEnvironmentGateway, gateway),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({ reason: "environment-changed" });
+      expect(exchangeCalls).toBe(0);
+    }),
+  );
+
+  it.effect("does not pair when an enrolled SSH target reports a different store", () =>
+    Effect.gen(function* () {
+      const target = {
+        alias: "devbox",
+        hostname: "devbox.example.test",
+        username: "developer",
+        port: 22,
+      };
+      const existingDescriptor = sshDescriptor();
+      const existingRoute = new SshTunnelRoute({
+        routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
+        environmentId: existingDescriptor.environmentId,
+        label: "Remote development box",
+        priority: 0,
+        pinned: false,
+        autoconnect: true,
+        secretRef: "ssh-secret",
+        target,
+        hostKeyFingerprint: "SHA256:known-host-key",
+      });
+      const environments = yield* SubscriptionRef.make(
+        new Map([
+          [
+            existingDescriptor.environmentId,
+            {
+              environmentId: existingDescriptor.environmentId,
+              acceptedStorageInstanceId: existingDescriptor.storageInstanceId,
+              descriptor: existingDescriptor,
+              alias: existingDescriptor.label,
+              hidden: false,
+              bindings: [],
+              routes: [existingRoute],
+            },
+          ],
+        ]),
+      );
+      let exchangeCalls = 0;
+      const bootstrap = {
+        target,
+        httpBaseUrl: "http://127.0.0.1:3201",
+        wsBaseUrl: "ws://127.0.0.1:3201",
+        hostKeyFingerprint: "SHA256:known-host-key",
+      };
+      const registry = EnvironmentRegistry.of({
+        environments,
+        registerEnvironment: () => Effect.die("must not persist"),
+      } as unknown as EnvironmentRegistry["Service"]);
+      const gateway = SshEnvironmentGateway.of({
+        inspect: () =>
+          Effect.succeed({
+            bootstrap,
+            descriptor: sshDescriptor({
+              storageId: "00000000-0000-4000-8000-000000000034",
+            }),
+          }),
+        exchange: () =>
+          Effect.sync(() => {
+            exchangeCalls += 1;
+            return { bootstrap, bearerToken: "must-not-exist" };
+          }),
+        disconnect: () => Effect.die("unused"),
+      });
+
+      const error = yield* registerSshConnection({ target }).pipe(
+        Effect.provideService(EnvironmentRegistry, registry),
+        Effect.provideService(SshEnvironmentGateway, gateway),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({ reason: "storage-changed" });
+      expect(exchangeCalls).toBe(0);
     }),
   );
 });
