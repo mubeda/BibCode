@@ -18,6 +18,12 @@ use crate::persistence::{EnvironmentId, StorageInstanceId};
 
 pub const DEFAULT_PORT: u16 = 3773;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TlsFiles {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ServerMode {
     Desktop,
@@ -42,18 +48,17 @@ pub struct ServerConfig {
     pub base_dir: PathBuf,
     pub data_root_request: DataRootRequest,
     pub resolved_data_root: Option<ResolvedDataRoot>,
+    pub tls: Option<TlsFiles>,
     pub static_dir: Option<PathBuf>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
     pub desktop_bootstrap_token: Option<String>,
-    /// True only for a desktop-owned server launched through the WSL bootstrap transport.
-    #[doc(hidden)]
-    pub desktop_wsl_transport: bool,
     pub unsafe_no_auth: bool,
     pub environment_id: Option<EnvironmentId>,
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    pub(crate) managed_service_launch: bool,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
 }
@@ -72,16 +77,17 @@ impl ServerConfig {
             ),
             resolved_data_root: None,
             base_dir,
+            tls: None,
             static_dir: None,
             dev_url: None,
             no_browser: false,
             desktop_bootstrap_token: None,
-            desktop_wsl_transport: false,
             unsafe_no_auth: false,
             environment_id: None,
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            managed_service_launch: false,
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
         }
@@ -108,6 +114,19 @@ impl ServerConfig {
     #[must_use]
     pub fn with_static_dir(mut self, static_dir: impl AsRef<Path>) -> Self {
         self.static_dir = Some(static_dir.as_ref().to_path_buf());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tls_files(mut self, tls: TlsFiles) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_service_managed_launch(mut self) -> Self {
+        self.managed_service_launch = true;
         self
     }
 
@@ -176,28 +195,6 @@ mod tests {
                 .with_desktop(String::new())
                 .is_err()
         );
-    }
-
-    #[test]
-    fn desktop_bootstrap_wsl_transport_is_explicit_and_defaults_closed() {
-        let base = serde_json::json!({
-            "mode": "desktop",
-            "noBrowser": true,
-            "port": 3773,
-            "bibcodeHome": null,
-            "host": "0.0.0.0",
-            "desktopBootstrapToken": "token",
-            "tailscaleServeEnabled": false,
-            "tailscaleServePort": 443
-        });
-        let native: DesktopBootstrap =
-            serde_json::from_value(base.clone()).expect("native bootstrap should decode");
-        assert!(!native.wsl_transport);
-        let mut wsl = base;
-        wsl["wslTransport"] = serde_json::json!(true);
-        let wsl: DesktopBootstrap =
-            serde_json::from_value(wsl).expect("WSL bootstrap should decode");
-        assert!(wsl.wsl_transport);
     }
 
     #[test]
@@ -318,6 +315,12 @@ struct ServerArgs {
     #[arg(long, global = true)]
     static_dir: Option<PathBuf>,
 
+    #[arg(long, requires = "tls_private_key", global = true)]
+    tls_certificate_chain: Option<PathBuf>,
+
+    #[arg(long, requires = "tls_certificate_chain", global = true)]
+    tls_private_key: Option<PathBuf>,
+
     #[arg(long, env = "VITE_DEV_SERVER_URL", global = true)]
     dev_url: Option<Url>,
 
@@ -355,8 +358,6 @@ struct DesktopBootstrap {
     bibcode_home: Option<PathBuf>,
     host: String,
     desktop_bootstrap_token: String,
-    #[serde(default)]
-    wsl_transport: bool,
     #[allow(dead_code)]
     tailscale_serve_enabled: bool,
     #[allow(dead_code)]
@@ -445,6 +446,12 @@ impl Cli {
         config.data_root_request = data_root_request;
         config.mode = mode;
         config.static_dir = args.static_dir;
+        config.tls = args.tls_certificate_chain.zip(args.tls_private_key).map(
+            |(certificate_chain, private_key)| TlsFiles {
+                certificate_chain,
+                private_key,
+            },
+        );
         config.dev_url = args.dev_url;
         config.no_browser = headless
             || args.no_browser
@@ -460,7 +467,6 @@ impl Cli {
             return Err(ConfigError::EmptyDesktopBootstrapToken);
         }
         config.desktop_bootstrap_token = desktop_bootstrap_token;
-        config.desktop_wsl_transport = bootstrap.as_ref().is_some_and(|value| value.wsl_transport);
         Ok(CliAction::Run(Box::new(config)))
     }
 }

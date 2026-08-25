@@ -495,7 +495,5 @@ pub(crate) fn maintenance_routes_enabled(config: &ServerConfig) -> bool {
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| address.is_loopback())
         || config.host.eq_ignore_ascii_case("localhost");
-    let desktop_owned_wsl_bind =
-        config.desktop_wsl_transport && matches!(config.host.as_str(), "0.0.0.0" | "::");
-    local_bind || desktop_owned_wsl_bind
+    local_bind
 }

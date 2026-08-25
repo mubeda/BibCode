@@ -400,51 +400,6 @@ async fn maintenance_routes_are_hidden_outside_local_desktop_mode() {
     assert_eq!(web_response.status(), StatusCode::NOT_FOUND);
     web.shutdown();
     web.join().await.expect("web join");
-
-    let exposed_root = tempfile::tempdir().expect("exposed data root");
-    let exposed = ServerRuntime::start(
-        ServerConfig::new(exposed_root.path())
-            .with_bind("0.0.0.0", 0)
-            .with_desktop("exposed-bootstrap")
-            .expect("desktop config"),
-    )
-    .await
-    .expect("exposed runtime");
-    let exposed_response = reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{}{}",
-            exposed.local_addr().port(),
-            MAINTENANCE_UPDATE_PREPARE_PATH
-        ))
-        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, "exposed-bootstrap")
-        .send()
-        .await
-        .expect("exposed response");
-    assert_eq!(exposed_response.status(), StatusCode::NOT_FOUND);
-    exposed.shutdown();
-    exposed.join().await.expect("exposed join");
-
-    let wsl_root = tempfile::tempdir().expect("WSL data root");
-    disable_provider_processes(wsl_root.path());
-    let mut wsl_config = ServerConfig::new(wsl_root.path())
-        .with_bind("0.0.0.0", 0)
-        .with_desktop("wsl-bootstrap")
-        .expect("WSL desktop config");
-    wsl_config.desktop_wsl_transport = true;
-    let wsl = ServerRuntime::start(wsl_config).await.expect("WSL runtime");
-    let wsl_response = reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{}{}",
-            wsl.local_addr().port(),
-            MAINTENANCE_UPDATE_PREPARE_PATH
-        ))
-        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, "wsl-bootstrap")
-        .send()
-        .await
-        .expect("WSL response");
-    assert_eq!(wsl_response.status(), StatusCode::OK);
-    wsl.shutdown();
-    wsl.join().await.expect("WSL join");
 }
 
 #[tokio::test]

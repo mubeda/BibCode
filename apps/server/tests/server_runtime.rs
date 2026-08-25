@@ -9,6 +9,7 @@ use std::{
 use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
     RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime, logging,
+    transport::TransportError,
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, redirect::Policy};
@@ -711,47 +712,6 @@ async fn custom_registry_uses_exact_fallback_http_responses() {
 }
 
 #[tokio::test]
-async fn unspecified_bind_uses_localhost_startup_access_and_waits_for_shutdown() {
-    let temp = TempDir::new().expect("temporary base directory");
-    let handle = ServerRuntime::start_with_registry(
-        ServerConfig::new(temp.path()).with_bind("0.0.0.0", 0),
-        RpcRegistry::empty(),
-    )
-    .await
-    .expect("unspecified-address server starts");
-    assert!(handle.local_addr().ip().is_unspecified());
-    let startup = handle
-        .startup_access()
-        .expect("authenticated web startup access");
-    assert!(!startup.credential.is_empty());
-    assert_eq!(
-        startup.connection_string,
-        format!("http://localhost:{}", handle.local_addr().port())
-    );
-    let pairing_url = Url::parse(&startup.pairing_url).expect("valid pairing URL");
-    assert_eq!(pairing_url.host_str(), Some("localhost"));
-    assert_eq!(pairing_url.port(), Some(handle.local_addr().port()));
-    assert_eq!(pairing_url.path(), "/pair");
-    assert_eq!(pairing_url.query(), None);
-    let fragment = pairing_url.fragment().expect("pairing URL fragment");
-    assert_eq!(
-        url::form_urlencoded::parse(fragment.as_bytes())
-            .into_owned()
-            .collect::<Vec<_>>(),
-        vec![("token".to_owned(), startup.credential.clone())]
-    );
-
-    handle.shutdown();
-    timeout(Duration::from_secs(2), handle.wait_for_shutdown())
-        .await
-        .expect("shutdown notification timeout");
-    timeout(Duration::from_secs(2), handle.join())
-        .await
-        .expect("shutdown join timeout")
-        .expect("unspecified-address server joins");
-}
-
-#[tokio::test]
 async fn existing_file_as_base_directory_returns_typed_creation_error() {
     let temp = TempDir::new().expect("temporary parent directory");
     let base_file = temp.path().join("base-file");
@@ -802,13 +762,16 @@ async fn occupied_listener_address_returns_typed_bind_error() {
         }
         Err(error) => error,
     };
-    assert_eq!(error.to_string(), "failed to bind the server listener");
+    assert_eq!(
+        error.to_string(),
+        "failed to bind the validated server listener"
+    );
     match error {
-        ServerError::Bind(source) => {
+        ServerError::Transport(TransportError::Bind { source }) => {
             assert_eq!(source.kind(), ErrorKind::AddrInUse);
             assert!(!source.to_string().trim().is_empty());
         }
-        other => panic!("expected Bind, got {other:?}"),
+        other => panic!("expected Transport::Bind, got {other:?}"),
     }
 }
 

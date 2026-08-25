@@ -32,6 +32,7 @@ pub mod server_settings;
 pub mod source_control;
 pub mod terminal;
 pub mod text_generation;
+pub mod transport;
 pub mod vcs;
 pub mod workspace;
 pub mod worktree_catalog;
@@ -43,7 +44,7 @@ use clap::Parser;
 use serde_json::json;
 use thiserror::Error;
 
-pub use config::{Cli, CliAction, ConfigError, ServerConfig, ServerMode, StorageCommand};
+pub use config::{Cli, CliAction, ConfigError, ServerConfig, ServerMode, StorageCommand, TlsFiles};
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
 };

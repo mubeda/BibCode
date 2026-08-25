@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use thiserror::Error;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -25,6 +25,7 @@ use crate::{
         server_terminal::ProcessTreeCleanup,
     },
     rpc::RpcRegistry,
+    transport::{self, TransportError},
 };
 
 const SIGNING_KEY_NAME: &str = "server-signing-key";
@@ -63,8 +64,8 @@ pub enum ServerError {
     StateFiles(String),
     #[error("failed to initialize native server logging: {0}")]
     Logging(String),
-    #[error("failed to bind the server listener")]
-    Bind(#[source] std::io::Error),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
     #[error("failed to initialize environment authentication: {0}")]
     AuthInitialize(String),
     #[error("failed to initialize SQLite persistence: {0}")]
@@ -138,6 +139,11 @@ impl ServerRuntime {
         process_tree_cleanup: ProcessTreeCleanup,
     ) -> Result<ServerHandle, ServerError> {
         let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
+        let validated_listener = transport::validate_listener(&config).await?;
+        let listener = transport::bind(validated_listener).await?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|source| TransportError::Bind { source })?;
         config.base_dir = resolved_data_root.effective.clone();
         config.resolved_data_root = Some(resolved_data_root.clone());
         tokio::fs::create_dir_all(&config.base_dir)
@@ -164,10 +170,6 @@ impl ServerRuntime {
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
-        let listener = TcpListener::bind((config.host.as_str(), config.port))
-            .await
-            .map_err(ServerError::Bind)?;
-        let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
         let state_directory = config.base_dir.join(if config.dev_url.is_some() {
             "dev"
         } else {
