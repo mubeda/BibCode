@@ -64,6 +64,7 @@ pub enum AuthError {
 #[derive(Clone)]
 pub struct AuthService {
     descriptor: AuthDescriptor,
+    direct_https: bool,
     desktop_bootstrap: Option<DesktopBootstrap>,
     signer: TokenSigner,
     state: Arc<Mutex<AuthState>>,
@@ -197,6 +198,7 @@ impl AuthService {
                 ],
                 session_cookie_name,
             },
+            direct_https: config.transport_identity.advertised_scheme() == "https",
             desktop_bootstrap,
             signer: TokenSigner::new(signing_secret),
             state: Arc::new(Mutex::new(AuthState::default())),
@@ -249,6 +251,11 @@ impl AuthService {
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.descriptor.session_cookie_name
+    }
+
+    #[must_use]
+    pub(crate) const fn direct_https(&self) -> bool {
+        self.direct_https
     }
 
     #[must_use]

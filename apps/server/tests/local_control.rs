@@ -419,7 +419,9 @@ async fn administrative_inventory_is_closed_and_stop_replies_before_shutdown() {
     let handle = start(&root).await;
 
     let mut stream = connect(&root).await;
-    let sent = request(ControlRequestBody::ServicePrepareUpdate);
+    let sent = request(ControlRequestBody::ServicePrepareUpdate {
+        target_version: None,
+    });
     write_request(&mut stream, &sent)
         .await
         .expect("write known administrative request");
@@ -626,20 +628,19 @@ async fn create_pairing_issues_fixed_environment_administrator_access() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn desktop_local_control_prepares_update_through_the_existing_maintenance_owner() {
+async fn production_local_control_prepares_update_without_exposing_network_maintenance_routes() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let config = test_config(&root)
-        .with_desktop("desktop-maintenance-test-token")
-        .expect("desktop server configuration")
-        .with_update_maintenance_timing_for_integration_test(
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        );
+    let config = test_config(&root).with_update_maintenance_timing_for_integration_test(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
     let handle = ServerRuntime::start(config)
         .await
-        .expect("start desktop server with local control");
+        .expect("start production server with local control");
     let mut stream = connect(&root).await;
-    let sent = request(ControlRequestBody::ServicePrepareUpdate);
+    let sent = request(ControlRequestBody::ServicePrepareUpdate {
+        target_version: None,
+    });
     write_request(&mut stream, &sent)
         .await
         .expect("write update preparation request");
@@ -657,7 +658,10 @@ async fn desktop_local_control_prepares_update_through_the_existing_maintenance_
     ));
 
     handle.shutdown();
-    handle.join().await.expect("join prepared desktop server");
+    handle
+        .join()
+        .await
+        .expect("join prepared production server");
 }
 
 #[test]

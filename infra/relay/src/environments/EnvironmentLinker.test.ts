@@ -65,20 +65,23 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
       expiresAtEpochSeconds: Math.floor(expiresAt.epochMilliseconds / 1_000),
     });
     const payload = {
-      iss: "bibcode-env:env-link-test",
+      iss: "bibcode-env:019c18d0-26b2-7a35-9e06-8568e640f450",
       aud: "https://relay.example.test",
-      sub: "env-link-test",
+      sub: "019c18d0-26b2-7a35-9e06-8568e640f450",
       jti: "link-proof-jti",
       iat: Math.floor(now.epochMilliseconds / 1_000),
       exp: Math.floor(expiresAt.epochMilliseconds / 1_000),
       challenge,
-      environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+      environmentId:
+        "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
       descriptor: {
-        environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+        environmentId:
+          "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
         label: "Link Test Environment",
         platform: { os: "darwin", arch: "arm64" },
         serverVersion: "0.0.0-test",
         storageInstanceId: "019c18d0-26b2-7a35-9e06-8568e640f44f",
+        protocol: { minimum: 1, maximum: 1 },
         capabilities: {
           repositoryIdentity: true,
           worktreeCatalog: false,
@@ -275,7 +278,7 @@ describe("EnvironmentLinker", () => {
       );
       expect(error).toMatchObject({
         _tag: "EnvironmentLinkProofExpired",
-        environmentId: "env-link-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
       });
       expect(error.message).toContain("link proof expired at");
     }).pipe(Effect.provide(testLayer())),
@@ -289,7 +292,10 @@ describe("EnvironmentLinker", () => {
         withSignedPayload(request, payload, { sub: "different-environment" }),
         withSignedPayload(request, payload, { scopes: [] }, { managedTunnelsEnabled: true }),
         withSignedPayload(request, payload, {
-          descriptor: { ...payload.descriptor, environmentId: "different" as never },
+          descriptor: {
+            ...payload.descriptor,
+            environmentId: "019c18d0-26b2-7a35-9e06-8568e640f452" as never,
+          },
         }),
       ];
       const errors = yield* Effect.forEach(cases, (candidate) =>
@@ -421,7 +427,7 @@ describe("EnvironmentLinker", () => {
     const events: Array<string> = [];
     const primary = new EnvironmentCredentials.EnvironmentCredentialCreatePersistenceError({
       stage: "insert-credential",
-      environmentId: "env-link-test",
+      environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
       cause: new Error("database unavailable"),
     });
 
@@ -475,7 +481,7 @@ describe("EnvironmentLinker", () => {
               events.push("revoke-link");
               return yield* new EnvironmentLinks.EnvironmentLinkRevokePersistenceError({
                 userId: "user_123",
-                environmentId: "env-link-test",
+                environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
                 cause: new Error("link cleanup unavailable"),
               });
             }),
@@ -483,7 +489,7 @@ describe("EnvironmentLinker", () => {
             Effect.gen(function* () {
               events.push("revoke-credentials");
               return yield* new EnvironmentCredentials.EnvironmentCredentialRevokePersistenceError({
-                environmentId: "env-link-test",
+                environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
                 cause: new Error("credential cleanup unavailable"),
               });
             }),
@@ -493,7 +499,7 @@ describe("EnvironmentLinker", () => {
               return yield* new ManagedEndpointProvider.ManagedEndpointDeprovisioningFailed({
                 stage: "remove-allocation",
                 userId: "user_123",
-                environmentId: "env-link-test",
+                environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
                 cause: new Error("endpoint cleanup unavailable"),
               });
             }),
@@ -504,7 +510,8 @@ describe("EnvironmentLinker", () => {
 
   it.effect("restores a pre-existing relink without deprovisioning its managed endpoint", () => {
     const previous: EnvironmentLinks.RelayLinkedEnvironmentRecord = {
-      environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+      environmentId:
+        "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
       label: "Previous Environment",
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
       endpoint: {
@@ -519,7 +526,7 @@ describe("EnvironmentLinker", () => {
     let deprovisioned = 0;
     const primary = new EnvironmentCredentials.EnvironmentCredentialCreatePersistenceError({
       stage: "insert-credential",
-      environmentId: "env-link-test",
+      environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
       cause: new Error("database unavailable"),
     });
 
@@ -567,7 +574,7 @@ describe("EnvironmentLinker", () => {
                 Effect.fail(
                   new EnvironmentLinks.EnvironmentLinkUpsertPersistenceError({
                     userId: "user_123",
-                    environmentId: "env-link-test",
+                    environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
                     cause: new Error("restore acknowledgement unavailable"),
                   }),
                 ),
@@ -590,7 +597,8 @@ describe("EnvironmentLinker", () => {
 
   it.effect("deprovisions an endpoint created by a failed relink", () => {
     const previous: EnvironmentLinks.RelayLinkedEnvironmentRecord = {
-      environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+      environmentId:
+        "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
       label: "Previous Unmanaged Environment",
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
       endpoint: {
@@ -605,7 +613,7 @@ describe("EnvironmentLinker", () => {
     let deprovisioned = 0;
     const primary = new EnvironmentCredentials.EnvironmentCredentialCreatePersistenceError({
       stage: "insert-credential",
-      environmentId: "env-link-test",
+      environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
       cause: new Error("database unavailable"),
     });
 
@@ -708,7 +716,8 @@ describe("EnvironmentLinker", () => {
       let priorCredentialActive = true;
       let replacementCredentialActive = false;
       const previous: EnvironmentLinks.RelayLinkedEnvironmentRecord = {
-        environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+        environmentId:
+          "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
         label: "Previous Environment",
         environmentPublicKey: environmentKeyPair.publicKey.trim(),
         endpoint: {
@@ -723,7 +732,7 @@ describe("EnvironmentLinker", () => {
         token: "bibcodeenv_undisclosed_replacement",
         credentialId: "replacement-credential",
         previousCredentialId: "prior-credential",
-        environmentId: "env-link-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
         environmentPublicKey: previous.environmentPublicKey,
       } as const;
       const layer = testLayer({
@@ -792,7 +801,8 @@ describe("EnvironmentLinker", () => {
       let orphanCleanup = 0;
       let endpointActive = true;
       const previous: EnvironmentLinks.RelayLinkedEnvironmentRecord = {
-        environmentId: "env-link-test" as RelayEnvironmentLinkProofPayload["environmentId"],
+        environmentId:
+          "019c18d0-26b2-7a35-9e06-8568e640f450" as RelayEnvironmentLinkProofPayload["environmentId"],
         label: "Previous Environment",
         environmentPublicKey: environmentKeyPair.publicKey.trim(),
         endpoint: {
@@ -813,7 +823,7 @@ describe("EnvironmentLinker", () => {
         token: "bibcodeenv_undisclosed_replacement",
         credentialId: "replacement-credential",
         previousCredentialId: "prior-credential",
-        environmentId: "env-link-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
         environmentPublicKey: previous.environmentPublicKey,
       } as const;
       const rollbackError = new EnvironmentCredentials.EnvironmentCredentialCreatePersistenceError({
@@ -893,7 +903,7 @@ describe("EnvironmentLinker", () => {
         token: "bibcodeenv_undisclosed_replacement",
         credentialId: "replacement-credential",
         previousCredentialId: null,
-        environmentId: "env-link-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
         environmentPublicKey: environmentKeyPair.publicKey.trim(),
       } as const;
       const layer = testLayer({
@@ -932,7 +942,7 @@ describe("EnvironmentLinker", () => {
     let credentialAttempts = 0;
     const primary = new EnvironmentLinks.EnvironmentLinkUpsertPersistenceError({
       userId: "user_123",
-      environmentId: "env-link-test",
+      environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
       cause: new Error("upsert acknowledgement unavailable"),
     });
 
@@ -996,7 +1006,7 @@ describe("EnvironmentLinker", () => {
         if (isEnvironmentLinkProofInvalid(result.failure)) {
           expect(result.failure).toMatchObject({
             userId: "user_123",
-            environmentId: "env-link-test",
+            environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
             reason: "invalid_signature_or_scope",
             stage: "verify_proof",
             cause: { _tag: "RelayJwtError" },
@@ -1027,7 +1037,7 @@ describe("EnvironmentLinker", () => {
         if (isEnvironmentLinkProofInvalid(result.failure)) {
           expect(result.failure).toMatchObject({
             userId: "user_123",
-            environmentId: "env-link-test",
+            environmentId: "019c18d0-26b2-7a35-9e06-8568e640f450",
             reason: "replayed_nonce",
             stage: "consume_proof_nonce",
           });

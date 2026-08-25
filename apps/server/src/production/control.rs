@@ -375,6 +375,7 @@ impl NativeServerControl {
             "providers": providers,
             "availableEditors": available_editors(),
             "observability": observability_snapshot(&self.state_directory),
+            "service": service_view(&self.config, &self.state_directory).await,
             "settings": settings,
         })
     }
@@ -1384,6 +1385,26 @@ impl ProductionServerControl for NativeServerControl {
                     Some(error) => Err(error.clone()),
                     None => Ok(control.config_snapshot().await),
                 },
+                "server.requestHostAction" => {
+                    let action = payload.get("action").and_then(Value::as_str);
+                    let Some(
+                        action
+                        @ ("install" | "start" | "stop" | "restart" | "uninstall" | "update"),
+                    ) = action
+                    else {
+                        return Err(json!({
+                            "_tag": "InvalidRequest",
+                            "method": method,
+                            "message": "A supported host action is required.",
+                        }));
+                    };
+                    Err(json!({
+                        "_tag": "ServerHostAuthorityRequiredError",
+                        "reason": "hostAuthorityRequired",
+                        "action": action,
+                        "allowedChannels": host_authority_channels(&control.config),
+                    }))
+                }
                 "server.getSettings" => match &control.settings_load_error {
                     Some(error) => Err(error.clone()),
                     None => Ok(control.settings.read().await.clone()),
@@ -2134,6 +2155,55 @@ fn current_directory(config: &ServerConfig) -> String {
         .unwrap_or_else(|_| config.base_dir.clone())
         .to_string_lossy()
         .into_owned()
+}
+
+async fn service_view(config: &ServerConfig, state_directory: &Path) -> Value {
+    let service_mode = config.managed_service_mode.map(|mode| mode.to_string());
+    let startup_mechanism = match (config.managed_service_mode, std::env::consts::OS) {
+        (None, _) => "manual",
+        (Some(crate::service::ServiceMode::Workstation), "windows") => "windowsLogonTask",
+        (Some(crate::service::ServiceMode::Headless), "windows") => "windowsService",
+        (Some(crate::service::ServiceMode::Workstation), "macos") => "launchAgent",
+        (Some(crate::service::ServiceMode::Headless), "macos") => "launchDaemon",
+        (Some(crate::service::ServiceMode::Workstation), _) => "systemdUser",
+        (Some(crate::service::ServiceMode::Headless), _) => "systemdSystem",
+    };
+    let bind = config.bound_addr.unwrap_or_else(|| {
+        let address = config
+            .host
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        std::net::SocketAddr::new(address, config.port)
+    });
+    json!({
+        "serviceMode": service_mode,
+        "startupMechanism": startup_mechanism,
+        "runtimeState": "running",
+        "version": config.server_version,
+        "bind": {
+            "scope": if bind.ip().is_loopback() { "loopback" } else { "network" },
+            "transport": config.transport_identity.advertised_scheme(),
+            "port": bind.port(),
+        },
+        "accountKind": if config.managed_service_mode == Some(crate::service::ServiceMode::Headless) {
+            "dedicatedServiceAccount"
+        } else {
+            "currentUser"
+        },
+        "update": crate::maintenance::update_view(state_directory, &config.server_version).await,
+        "hostControl": {
+            "available": false,
+            "reason": "hostAuthorityRequired",
+            "allowedChannels": host_authority_channels(config),
+        },
+    })
+}
+
+fn host_authority_channels(config: &ServerConfig) -> Vec<&'static str> {
+    match config.mode {
+        crate::ServerMode::Desktop => vec!["desktop", "localControl"],
+        crate::ServerMode::Web => vec!["localControl", "sshAdmin"],
+    }
 }
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {

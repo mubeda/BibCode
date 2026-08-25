@@ -376,6 +376,8 @@ fn render_plist(target: &ServiceTarget) -> String {
         "--base-dir".to_owned(),
         target.data_root.to_string_lossy().into_owned(),
         "--no-browser".to_owned(),
+        "--managed-service-mode".to_owned(),
+        target.mode.to_string(),
     ]
     .iter()
     .map(|argument| format!("    <string>{}</string>", xml_escape(argument)))

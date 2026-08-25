@@ -3,19 +3,68 @@ use std::{
     path::PathBuf,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{
     ServerConfig, ServerError, ServerRuntime, TlsFiles,
+    service::ServiceMode,
     transport::{
         ListenerSecurity, TransportError, validate_listener,
         validate_listener_with_resolved_addresses,
     },
 };
 use futures_util::SinkExt;
+use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use time::{Duration, OffsetDateTime};
 use x509_parser::parse_x509_certificate;
+
+fn dpop_proof(
+    signing_key: &SigningKey,
+    method: &str,
+    url: &str,
+    access_token: Option<&str>,
+) -> String {
+    let point = signing_key.verifying_key().to_sec1_point(false);
+    let header = json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().expect("P-256 x coordinate")),
+            "y": URL_SAFE_NO_PAD.encode(point.y().expect("P-256 y coordinate")),
+        }
+    });
+    let mut normalized_url = url::Url::parse(url).expect("fixture URL");
+    normalized_url.set_query(None);
+    normalized_url.set_fragment(None);
+    let mut payload = json!({
+        "htm": method,
+        "htu": normalized_url.to_string(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "iat": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_secs(),
+    });
+    if let Some(access_token) = access_token {
+        payload["ath"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes())));
+    }
+    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("DPoP header JSON"));
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("DPoP payload JSON"));
+    let signing_input = format!("{header}.{payload}");
+    let digest = Sha256::digest(signing_input.as_bytes());
+    let signature: Signature = signing_key
+        .sign_prehash(&digest)
+        .expect("sign DPoP fixture");
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
 
 struct TlsFixture {
     _directory: TempDir,
@@ -246,7 +295,7 @@ async fn unsafe_no_auth_is_impossible_for_packaged_service_or_remote_launches() 
 
     let service = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)
-        .with_service_managed_launch()
+        .with_service_managed_launch(ServiceMode::Workstation)
         .with_unsafe_no_auth();
     assert!(matches!(
         validate_listener(&service).await,
@@ -328,8 +377,11 @@ async fn tls_listener_serves_https_metadata_and_never_downgrades_to_plaintext() 
     assert_eq!(descriptor["transport"]["spkiSha256"], expected_fingerprint);
 
     let credential = startup_access.credential.clone();
-    let token = https
-        .post(format!("https://localhost:{port}/oauth/token"))
+    let signing_key = SigningKey::from_bytes((&[71_u8; 32]).into()).expect("DPoP signing key");
+    let token_url = format!("https://localhost:{port}/oauth/token");
+    let token_response = https
+        .post(&token_url)
+        .header("dpop", dpop_proof(&signing_key, "POST", &token_url, None))
         .form(&[
             (
                 "grant_type",
@@ -347,15 +399,26 @@ async fn tls_listener_serves_https_metadata_and_never_downgrades_to_plaintext() 
         ])
         .send()
         .await
-        .expect("HTTPS token exchange")
-        .json::<serde_json::Value>()
+        .expect("HTTPS token exchange");
+    let token_status = token_response.status();
+    let token_body = token_response
+        .text()
         .await
-        .expect("token JSON");
+        .expect("HTTPS token response body");
+    assert!(
+        token_status.is_success(),
+        "HTTPS token exchange failed with {token_status}: {token_body}"
+    );
+    let token: serde_json::Value = serde_json::from_str(&token_body).expect("token response JSON");
+    let access_token = token["access_token"].as_str().expect("access token");
+    let ticket_url = format!("https://localhost:{port}/api/auth/websocket-ticket");
     let ticket = https
-        .post(format!(
-            "https://localhost:{port}/api/auth/websocket-ticket"
-        ))
-        .bearer_auth(token["access_token"].as_str().expect("access token"))
+        .post(&ticket_url)
+        .header("authorization", format!("DPoP {access_token}"))
+        .header(
+            "dpop",
+            dpop_proof(&signing_key, "POST", &ticket_url, Some(access_token)),
+        )
         .send()
         .await
         .expect("HTTPS WebSocket ticket")

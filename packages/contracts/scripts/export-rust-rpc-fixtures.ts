@@ -290,9 +290,8 @@ const fixtureSignalProcessInput = {
 } as const;
 const fixturePairingLink = {
   id: "fixture-pairing-link",
-  credential: "23456789ABCD",
-  scopes: ["orchestration:read"],
-  subject: "fixture",
+  credentialFingerprint: "sha256:fixture-pairing-link",
+  clientLabel: "Fixture administrator",
   createdAt: fixtureDate,
   expiresAt: fixtureDate,
 } as const;
@@ -737,8 +736,8 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 97) {
-  throw new Error(`Expected 97 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 98) {
+  throw new Error(`Expected 98 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 18) {
@@ -754,8 +753,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 224) {
-  throw new Error(`Expected 224 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 226) {
+  throw new Error(`Expected 226 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 23) {
   throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

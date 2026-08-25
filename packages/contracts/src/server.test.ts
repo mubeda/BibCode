@@ -10,6 +10,7 @@ import {
   ServerProvider,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
+  ServerServiceView,
 } from "./server.ts";
 import {
   expectDecodeFailure,
@@ -22,6 +23,7 @@ const decodeProviderDriverKind = Schema.decodeUnknownSync(ProviderDriverKind);
 const decodeProviderUpdateError = Schema.decodeUnknownSync(ServerProviderUpdateError);
 const decodeProcessDiagnosticsEntry = Schema.decodeUnknownSync(ServerProcessDiagnosticsEntry);
 const decodeProcessResourceTotals = Schema.decodeUnknownSync(ServerProcessResourceTotals);
+const decodeServerServiceView = Schema.decodeUnknownSync(ServerServiceView);
 const encodeProviderUpdateError = Schema.encodeSync(ServerProviderUpdateError);
 
 const baseProviderSnapshot = {
@@ -37,6 +39,94 @@ const baseProviderSnapshot = {
   checkedAt: "2026-04-10T00:00:00.000Z",
   models: [],
 };
+
+describe("ServerServiceView", () => {
+  it("decodes the redacted runtime, update, bind, and host-authority posture", () => {
+    const decoded = decodeServerServiceView({
+      serviceMode: null,
+      startupMechanism: "manual",
+      runtimeState: "running",
+      version: "0.4.1",
+      bind: {
+        scope: "loopback",
+        transport: "http",
+        port: 3773,
+      },
+      accountKind: "currentUser",
+      update: {
+        phase: "idle",
+        currentVersion: "0.4.1",
+        targetVersion: null,
+        lastResult: null,
+      },
+      hostControl: {
+        available: false,
+        reason: "hostAuthorityRequired",
+        allowedChannels: ["localControl", "sshAdmin"],
+      },
+      binaryPath: "/Applications/BiBCode.app/Contents/MacOS/bibcode",
+      dataRoot: "/Users/alice/private-projects",
+      controlEndpoint: "/Users/alice/.bibcode/userdata/run/control.sock",
+      environment: { SECRET_TOKEN: "must-not-survive" },
+    });
+
+    expect(decoded).toMatchObject({
+      serviceMode: null,
+      startupMechanism: "manual",
+      runtimeState: "running",
+      bind: { scope: "loopback", transport: "http", port: 3773 },
+      accountKind: "currentUser",
+      hostControl: {
+        available: false,
+        reason: "hostAuthorityRequired",
+        allowedChannels: ["localControl", "sshAdmin"],
+      },
+    });
+    expect(decoded).not.toHaveProperty("binaryPath");
+    expect(decoded).not.toHaveProperty("dataRoot");
+    expect(decoded).not.toHaveProperty("controlEndpoint");
+    expect(decoded).not.toHaveProperty("environment");
+
+    const recovery = decodeServerServiceView({
+      ...decoded,
+      update: {
+        phase: "recoveryRequired",
+        currentVersion: "0.4.1",
+        targetVersion: "0.4.2",
+        lastResult: {
+          status: "failed",
+          at: "2026-08-25T12:00:00Z",
+          message: null,
+        },
+      },
+    });
+    expect(recovery.update.lastResult?.message).toBeNull();
+  });
+
+  it("rejects an unbounded or insecure service posture", () => {
+    expect(() =>
+      decodeServerServiceView({
+        serviceMode: "headless",
+        startupMechanism: "windowsService",
+        runtimeState: "running",
+        version: "0.4.1",
+        bind: { scope: "network", transport: "http", port: 3773 },
+        accountKind: "dedicatedServiceAccount",
+        update: {
+          phase: "idle",
+          currentVersion: "0.4.1",
+          targetVersion: null,
+          lastResult: null,
+        },
+        hostControl: {
+          available: false,
+          reason: "hostAuthorityRequired",
+          allowedChannels: ["localControl"],
+        },
+      }),
+    ).toThrow();
+  });
+});
 
 describe("ServerProvider", () => {
   it("defaults capability arrays when decoding provider snapshots", () => {

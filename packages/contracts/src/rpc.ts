@@ -160,6 +160,9 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  ServerHostActionInput,
+  ServerHostActionResult,
+  ServerHostAuthorityRequiredError,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -388,6 +391,7 @@ export const WS_METHODS = {
 
   // Server meta
   serverGetConfig: "server.getConfig",
+  serverRequestHostAction: "server.requestHostAction",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpsertKeybinding: "server.upsertKeybinding",
@@ -442,6 +446,12 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerRequestHostActionRpc = Rpc.make(WS_METHODS.serverRequestHostAction, {
+  payload: ServerHostActionInput,
+  success: ServerHostActionResult,
+  error: Schema.Union([ServerHostAuthorityRequiredError, EnvironmentAuthorizationError]),
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -1280,6 +1290,7 @@ export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
 
 export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
+  WsServerRequestHostActionRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpsertKeybindingRpc,

@@ -6,6 +6,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
   WsServerGetConfigRpc,
+  WsServerRequestHostActionRpc,
   WsServerConsumeCodexRateLimitResetRpc,
   WsServerRefreshProvidersRpc,
   WsVcsPullRpc,
@@ -37,6 +38,12 @@ import {
   WsWorktreeRemoveRpc,
 } from "./rpc.ts";
 
+const decodeServerHostActionInput = Schema.decodeUnknownSync(
+  WsServerRequestHostActionRpc.payloadSchema,
+);
+const decodeServerHostActionError = Schema.decodeUnknownSync(
+  WsServerRequestHostActionRpc.errorSchema,
+);
 const decodeSubscribeWorktreeCatalog = Schema.decodeUnknownSync(
   WsSubscribeWorktreeCatalogRpc.payloadSchema,
 );
@@ -109,6 +116,25 @@ describe("WS_METHODS", () => {
 });
 
 describe("individual RPC definitions", () => {
+  it("models host actions as an explicit out-of-band authority failure", () => {
+    expect(decodeServerHostActionInput({ action: "restart" })).toEqual({ action: "restart" });
+    expect(
+      decodeServerHostActionError({
+        _tag: "ServerHostAuthorityRequiredError",
+        reason: "hostAuthorityRequired",
+        action: "restart",
+        allowedChannels: ["desktop", "localControl", "sshAdmin"],
+      }),
+    ).toMatchObject({
+      reason: "hostAuthorityRequired",
+      action: "restart",
+      allowedChannels: ["desktop", "localControl", "sshAdmin"],
+    });
+    expect(WsRpcGroup.requests.get(WS_METHODS.serverRequestHostAction)).toBe(
+      WsServerRequestHostActionRpc,
+    );
+  });
+
   it("accepts workspace-unavailable failures at guarded unary boundaries", () => {
     const unavailable = {
       _tag: "WorkspaceUnavailableError",

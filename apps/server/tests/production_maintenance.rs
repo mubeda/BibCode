@@ -208,6 +208,80 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
             .await
             .expect("authenticated socket");
 
+    #[cfg(unix)]
+    let server_owned_pid = {
+        let pid_file = root.path().join("maintenance-owned-terminal.pid");
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "99",
+                    "tag": "terminal.open",
+                    "payload": {
+                        "threadId": "maintenance-thread",
+                        "terminalId": "maintenance-terminal",
+                        "cwd": root.path().to_string_lossy(),
+                        "cols": 80,
+                        "rows": 24,
+                        "command": {
+                            "executable": "/bin/sh",
+                            "args": [
+                                "-c",
+                                "echo $$ > \"$1\"; exec sleep 300",
+                                "bibcode-maintenance-test",
+                                pid_file.to_string_lossy()
+                            ]
+                        }
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("server-owned terminal open request");
+
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        let server_owned_pid = loop {
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid) => {
+                    break pid
+                        .trim()
+                        .parse::<u32>()
+                        .expect("server-owned terminal PID");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        Instant::now() < pid_deadline,
+                        "server-owned terminal did not publish its PID"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("read server-owned terminal PID: {error}"),
+            }
+        };
+
+        let response_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let frame = timeout(
+                response_deadline.saturating_duration_since(Instant::now()),
+                socket.next(),
+            )
+            .await
+            .expect("terminal open response timeout")
+            .expect("socket remains open")
+            .expect("terminal open response frame");
+            let response: Value =
+                serde_json::from_str(frame.to_text().expect("terminal open response text"))
+                    .expect("terminal open response JSON");
+            if response["requestId"] == "99" && response["_tag"] == "Exit" {
+                assert_eq!(response["exit"]["_tag"], "Success");
+                break;
+            }
+        }
+        server_owned_pid
+    };
+
     let unauthenticated = client
         .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
         .send()
@@ -225,6 +299,32 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
     let first = first.json::<Value>().await.expect("prepare JSON");
     assert_eq!(first["storageInstanceId"].as_str().map(str::len), Some(36));
     assert_eq!(first["backupId"].as_str().map(str::len), Some(36));
+
+    #[cfg(unix)]
+    {
+        let pid = server_owned_pid.to_string();
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let still_exists = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "kill -0 \"$1\" 2>/dev/null",
+                    "bibcode-maintenance-test",
+                    &pid,
+                ])
+                .status()
+                .expect("probe server-owned terminal process")
+                .success();
+            if !still_exists {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "update preparation left server-owned terminal process {pid} alive"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     let repeated = client
         .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
@@ -441,6 +541,143 @@ async fn commit_response_is_delivered_before_clean_backend_exit() {
         .await
         .expect("commit shuts down after its response");
     server.join().await.expect("server joins cleanly");
+}
+
+#[tokio::test]
+async fn committed_update_handoff_verifies_restart_and_reports_version_mismatch() {
+    let root = tempfile::tempdir().expect("data root");
+    disable_provider_processes(root.path());
+    let first_bootstrap = "restart-handoff-before";
+    let mut first_config = desktop_config(root.path(), first_bootstrap);
+    first_config.server_version = "1.2.3".to_owned();
+    let first = ServerRuntime::start(first_config)
+        .await
+        .expect("pre-update runtime");
+    let first_base = format!("http://{}", first.local_addr());
+    let client = reqwest::Client::new();
+
+    let prepared = client
+        .post(format!("{first_base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, first_bootstrap)
+        .json(&json!({ "targetVersion": "1.2.4" }))
+        .send()
+        .await
+        .expect("prepare response")
+        .json::<Value>()
+        .await
+        .expect("prepare JSON");
+    assert_eq!(prepared["currentVersion"], "1.2.3");
+    assert_eq!(prepared["targetVersion"], "1.2.4");
+
+    let committed = client
+        .post(format!(
+            "{first_base}{}",
+            bibcode_server::MAINTENANCE_UPDATE_COMMIT_PATH
+        ))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, first_bootstrap)
+        .json(&json!({ "operationId": prepared["operationId"] }))
+        .send()
+        .await
+        .expect("commit response");
+    assert_eq!(committed.status(), StatusCode::OK);
+    timeout(Duration::from_secs(2), first.wait_for_shutdown())
+        .await
+        .expect("committed runtime exits");
+    first.join().await.expect("committed runtime joins");
+
+    let second_bootstrap = "restart-handoff-after";
+    let mut second_config = desktop_config(root.path(), second_bootstrap);
+    second_config.server_version = "1.2.4".to_owned();
+    let second = ServerRuntime::start(second_config)
+        .await
+        .expect("post-update runtime");
+    let second_base = format!("http://{}", second.local_addr());
+    let descriptor = client
+        .get(format!(
+            "{second_base}{}",
+            bibcode_server::ENVIRONMENT_DESCRIPTOR_PATH
+        ))
+        .send()
+        .await
+        .expect("descriptor response")
+        .json::<Value>()
+        .await
+        .expect("descriptor JSON");
+    assert_eq!(descriptor["environmentId"], prepared["environmentId"]);
+    assert_eq!(
+        descriptor["storageInstanceId"],
+        prepared["storageInstanceId"]
+    );
+    assert_eq!(descriptor["serverVersion"], "1.2.4");
+
+    let status = client
+        .get(format!("{second_base}{MAINTENANCE_UPDATE_STATUS_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, second_bootstrap)
+        .send()
+        .await
+        .expect("post-update status response")
+        .json::<Value>()
+        .await
+        .expect("post-update status JSON");
+    assert_eq!(status["phase"], "succeeded");
+    assert_eq!(status["currentVersion"], "1.2.4");
+    assert_eq!(status["targetVersion"], "1.2.4");
+    assert_eq!(status["lastResult"]["status"], "succeeded");
+
+    let mismatch = client
+        .post(format!("{second_base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, second_bootstrap)
+        .json(&json!({ "targetVersion": "1.2.5" }))
+        .send()
+        .await
+        .expect("mismatch prepare response")
+        .json::<Value>()
+        .await
+        .expect("mismatch prepare JSON");
+    let committed = client
+        .post(format!(
+            "{second_base}{}",
+            bibcode_server::MAINTENANCE_UPDATE_COMMIT_PATH
+        ))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, second_bootstrap)
+        .json(&json!({ "operationId": mismatch["operationId"] }))
+        .send()
+        .await
+        .expect("mismatch commit response");
+    assert_eq!(committed.status(), StatusCode::OK);
+    timeout(Duration::from_secs(2), second.wait_for_shutdown())
+        .await
+        .expect("mismatch handoff runtime exits");
+    second.join().await.expect("mismatch handoff runtime joins");
+
+    let third_bootstrap = "restart-handoff-mismatch";
+    let mut third_config = desktop_config(root.path(), third_bootstrap);
+    third_config.server_version = "1.2.4".to_owned();
+    let third = ServerRuntime::start(third_config)
+        .await
+        .expect("mismatched post-update runtime");
+    let mismatch_status = client
+        .get(format!(
+            "http://{}{MAINTENANCE_UPDATE_STATUS_PATH}",
+            third.local_addr()
+        ))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, third_bootstrap)
+        .send()
+        .await
+        .expect("mismatch status response")
+        .json::<Value>()
+        .await
+        .expect("mismatch status JSON");
+    assert_eq!(mismatch_status["phase"], "recoveryRequired");
+    assert_eq!(mismatch_status["currentVersion"], "1.2.4");
+    assert_eq!(mismatch_status["targetVersion"], "1.2.5");
+    assert_eq!(mismatch_status["lastResult"]["status"], "failed");
+
+    third.shutdown();
+    third
+        .join()
+        .await
+        .expect("mismatched post-update runtime joins");
 }
 
 #[tokio::test]

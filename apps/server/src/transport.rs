@@ -470,7 +470,7 @@ fn reject_unsafe_auth_context(config: &ServerConfig) -> Result<(), TransportErro
     if !config.unsafe_no_auth {
         return Ok(());
     }
-    if config.managed_service_launch {
+    if config.managed_service_mode.is_some() {
         return Err(TransportError::UnsafeNoAuthForbidden {
             context: "a managed service launch",
         });

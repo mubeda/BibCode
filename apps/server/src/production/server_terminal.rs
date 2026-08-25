@@ -340,6 +340,7 @@ pub fn register_server_terminal_rpc(registry: &mut RpcRegistry, services: Server
 fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
     for method in [
         "server.getConfig",
+        "server.requestHostAction",
         "server.getSettings",
         "server.getTraceDiagnostics",
         "server.refreshProviders",

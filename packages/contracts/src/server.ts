@@ -1,11 +1,12 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import { EnvironmentHostAuthorityChannel, ExecutionEnvironmentDescriptor } from "./environment.ts";
 import { ServerAuthDescriptor } from "./auth.ts";
 import {
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
+  PortSchema,
   ProjectId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -230,6 +231,114 @@ export const ServerObservability = Schema.Struct({
   otlpMetricsEnabled: Schema.Boolean,
 });
 export type ServerObservability = typeof ServerObservability.Type;
+
+export const ServerServiceMode = Schema.Literals(["workstation", "headless"]);
+export type ServerServiceMode = typeof ServerServiceMode.Type;
+
+export const ServerStartupMechanism = Schema.Literals([
+  "manual",
+  "windowsLogonTask",
+  "windowsService",
+  "launchAgent",
+  "launchDaemon",
+  "systemdUser",
+  "systemdSystem",
+]);
+export type ServerStartupMechanism = typeof ServerStartupMechanism.Type;
+
+export const ServerServiceRuntimeState = Schema.Literals([
+  "starting",
+  "running",
+  "stopping",
+  "failed",
+]);
+export type ServerServiceRuntimeState = typeof ServerServiceRuntimeState.Type;
+
+export const ServerBindPosture = Schema.Struct({
+  scope: Schema.Literals(["loopback", "network"]),
+  transport: Schema.Literals(["http", "https"]),
+  port: PortSchema,
+}).check(
+  Schema.makeFilter(
+    ({ scope, transport }) =>
+      scope === "loopback" ||
+      transport === "https" ||
+      "A network-visible service bind must use HTTPS.",
+  ),
+);
+export type ServerBindPosture = typeof ServerBindPosture.Type;
+
+export const ServerUpdatePhase = Schema.Literals([
+  "idle",
+  "preparing",
+  "prepared",
+  "restarting",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "expired",
+  "recoveryRequired",
+]);
+export type ServerUpdatePhase = typeof ServerUpdatePhase.Type;
+
+export const ServerUpdateLastResult = Schema.Struct({
+  status: Schema.Literals(["succeeded", "failed", "cancelled", "expired"]),
+  at: IsoDateTime,
+  message: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type ServerUpdateLastResult = typeof ServerUpdateLastResult.Type;
+
+export const ServerUpdateView = Schema.Struct({
+  phase: ServerUpdatePhase,
+  currentVersion: TrimmedNonEmptyString,
+  targetVersion: Schema.NullOr(TrimmedNonEmptyString),
+  lastResult: Schema.NullOr(ServerUpdateLastResult),
+});
+export type ServerUpdateView = typeof ServerUpdateView.Type;
+
+export const ServerHostControlView = Schema.Struct({
+  available: Schema.Boolean,
+  reason: Schema.Literal("hostAuthorityRequired"),
+  allowedChannels: Schema.Array(EnvironmentHostAuthorityChannel),
+});
+export type ServerHostControlView = typeof ServerHostControlView.Type;
+
+export const ServerServiceView = Schema.Struct({
+  serviceMode: Schema.NullOr(ServerServiceMode),
+  startupMechanism: ServerStartupMechanism,
+  runtimeState: ServerServiceRuntimeState,
+  version: TrimmedNonEmptyString,
+  bind: ServerBindPosture,
+  accountKind: Schema.Literals(["currentUser", "dedicatedServiceAccount"]),
+  update: ServerUpdateView,
+  hostControl: ServerHostControlView,
+});
+export type ServerServiceView = typeof ServerServiceView.Type;
+
+export const ServerHostAction = Schema.Literals([
+  "install",
+  "start",
+  "stop",
+  "restart",
+  "uninstall",
+  "update",
+]);
+export type ServerHostAction = typeof ServerHostAction.Type;
+
+export const ServerHostActionInput = Schema.Struct({ action: ServerHostAction });
+export type ServerHostActionInput = typeof ServerHostActionInput.Type;
+
+export const ServerHostActionResult = Schema.Struct({ accepted: Schema.Literal(true) });
+export type ServerHostActionResult = typeof ServerHostActionResult.Type;
+
+export class ServerHostAuthorityRequiredError extends Schema.TaggedErrorClass<ServerHostAuthorityRequiredError>()(
+  "ServerHostAuthorityRequiredError",
+  {
+    reason: Schema.Literal("hostAuthorityRequired"),
+    action: ServerHostAction,
+    allowedChannels: Schema.Array(EnvironmentHostAuthorityChannel),
+  },
+) {}
 
 export const ServerTraceDiagnosticsErrorKind = Schema.Literals([
   "trace-file-not-found",
@@ -499,6 +608,7 @@ export const ServerConfig = Schema.Struct({
   providers: ServerProviders,
   availableEditors: Schema.Array(EditorId),
   observability: ServerObservability,
+  service: Schema.optionalKey(ServerServiceView),
   settings: ServerSettings,
 });
 export type ServerConfig = typeof ServerConfig.Type;

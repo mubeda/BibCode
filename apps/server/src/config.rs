@@ -62,7 +62,8 @@ pub struct ServerConfig {
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
     pub(crate) transport_identity: TransportIdentity,
-    pub(crate) managed_service_launch: bool,
+    pub(crate) bound_addr: Option<SocketAddr>,
+    pub(crate) managed_service_mode: Option<ServiceMode>,
     pub(crate) service_stop_drain_timeout: Duration,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
@@ -93,7 +94,8 @@ impl ServerConfig {
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
             transport_identity: TransportIdentity::LoopbackHttp,
-            managed_service_launch: false,
+            bound_addr: None,
+            managed_service_mode: None,
             service_stop_drain_timeout: Duration::from_secs(40),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
@@ -132,8 +134,8 @@ impl ServerConfig {
 
     #[doc(hidden)]
     #[must_use]
-    pub fn with_service_managed_launch(mut self) -> Self {
-        self.managed_service_launch = true;
+    pub fn with_service_managed_launch(mut self, mode: ServiceMode) -> Self {
+        self.managed_service_mode = Some(mode);
         self
     }
 
@@ -240,6 +242,17 @@ mod tests {
 
         assert_eq!(request.source, DataRootSource::Environment);
         assert_eq!(request.requested, Some(PathBuf::from("/var/lib/bibcode")));
+    }
+
+    #[test]
+    fn managed_service_launch_mode_survives_the_hidden_service_definition_argument() {
+        let config =
+            Cli::try_parse_from(["bibcode", "serve", "--managed-service-mode", "headless"])
+                .expect("parse managed service launch")
+                .into_server_config()
+                .expect("build managed service config");
+
+        assert_eq!(config.managed_service_mode, Some(ServiceMode::Headless));
     }
 }
 
@@ -455,6 +468,9 @@ struct ServerArgs {
 
     #[arg(long, env = "BIBCODE_BOOTSTRAP_FD", global = true)]
     bootstrap_fd: Option<i32>,
+
+    #[arg(long, value_enum, global = true, hide = true)]
+    managed_service_mode: Option<ServiceMode>,
 }
 
 #[derive(Debug, Error)]
@@ -580,6 +596,7 @@ impl Cli {
             command => command,
         };
         let headless = matches!(command, Some(CliCommand::Serve));
+        let managed_service_mode = args.managed_service_mode;
         let bootstrap = args.bootstrap_fd.map(read_bootstrap).transpose()?.flatten();
 
         let mode = args
@@ -642,6 +659,7 @@ impl Cli {
             return Err(ConfigError::EmptyDesktopBootstrapToken);
         }
         config.desktop_bootstrap_token = desktop_bootstrap_token;
+        config.managed_service_mode = managed_service_mode;
         Ok(CliAction::Run(Box::new(config)))
     }
 }

@@ -571,7 +571,7 @@ impl DesktopUpdateManager {
                 );
                 continue;
             }
-            match prepare_backend_for_update(&config).await {
+            match prepare_backend_for_update(&config, &downloaded.version).await {
                 Ok(result) => {
                     set_protection_status(
                         &mut protection,
@@ -864,6 +864,7 @@ fn set_protection_failure(
 
 async fn prepare_backend_for_update(
     config: &BackendRunConfig,
+    target_version: &str,
 ) -> Result<PrepareForUpdateResult, String> {
     let response = reqwest::Client::new()
         .post(format!(
@@ -875,6 +876,7 @@ async fn prepare_backend_for_update(
             DESKTOP_MAINTENANCE_TOKEN_HEADER,
             &config.desktop_bootstrap_token,
         )
+        .json(&json!({ "targetVersion": target_version }))
         .timeout(Duration::from_secs(45))
         .send()
         .await
@@ -1344,6 +1346,12 @@ mod tests {
             "primary protection should succeed: {blocked}"
         );
         assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
+        let persisted_update: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("userdata/server-update.json"))
+                .expect("prepared backend update status should persist"),
+        )
+        .expect("prepared backend update status should be JSON");
+        assert_eq!(persisted_update["targetVersion"], "99.0.0");
         assert!(
             supervisor
                 .snapshot_for_update()

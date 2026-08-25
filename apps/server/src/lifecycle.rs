@@ -13,7 +13,7 @@ use crate::{
         UnavailableDesktopUiProcessObserver,
     },
     http, local_control, logging,
-    maintenance::{UpdateMaintenance, maintenance_routes_enabled},
+    maintenance::{UpdateMaintenance, maintenance_routes_enabled, reconcile_update_status},
     persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
@@ -155,6 +155,7 @@ impl ServerRuntime {
             .advertised_base_url()
             .map_err(|source| TransportError::Bind { source })?;
         config.transport_identity = listener.transport_identity();
+        config.bound_addr = Some(local_addr);
         config.base_dir = resolved_data_root.effective.clone();
         config.resolved_data_root = Some(resolved_data_root.clone());
         tokio::fs::create_dir_all(&config.base_dir)
@@ -181,6 +182,14 @@ impl ServerRuntime {
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
+        reconcile_update_status(
+            &state_paths,
+            environment_id,
+            storage_instance_id,
+            &config.server_version,
+        )
+        .await
+        .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         let state_directory = config.base_dir.join(if config.dev_url.is_some() {
             "dev"
         } else {
@@ -337,25 +346,24 @@ impl ServerRuntime {
             }
         };
         let admission_gate = rpc_registry.admission_gate();
-        let update_maintenance = if maintenance_routes_enabled(&config) {
-            production_runtime.as_ref().map(|runtime| {
-                UpdateMaintenance::new(
-                    admission_gate.clone(),
-                    runtime.clone(),
-                    database.clone(),
-                    state_paths.clone(),
-                    environment_id,
-                    storage_instance_id,
-                    store_classification,
-                    config.server_version.clone(),
-                    shutdown.clone(),
-                    config.update_maintenance_drain_timeout,
-                    config.update_maintenance_lease,
-                )
-            })
-        } else {
-            None
-        };
+        let update_maintenance = production_runtime.as_ref().map(|runtime| {
+            UpdateMaintenance::new(
+                admission_gate.clone(),
+                runtime.clone(),
+                database.clone(),
+                state_paths.clone(),
+                environment_id,
+                storage_instance_id,
+                store_classification,
+                config.server_version.clone(),
+                shutdown.clone(),
+                config.update_maintenance_drain_timeout,
+                config.update_maintenance_lease,
+            )
+        });
+        let http_update_maintenance = maintenance_routes_enabled(&config)
+            .then(|| update_maintenance.clone())
+            .flatten();
         let local_control = local_control::start(
             &config,
             &state_paths,
@@ -378,7 +386,7 @@ impl ServerRuntime {
             http_routes,
             auth,
             admission_gate,
-            update_maintenance,
+            update_maintenance: http_update_maintenance,
         });
         let server_shutdown = shutdown.clone();
         let completion_signal = shutdown.clone();

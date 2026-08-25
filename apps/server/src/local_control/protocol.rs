@@ -23,7 +23,10 @@ pub enum ControlRequestBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         client_label: Option<String>,
     },
-    ServicePrepareUpdate,
+    ServicePrepareUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_version: Option<String>,
+    },
     ServiceStop,
 }
 

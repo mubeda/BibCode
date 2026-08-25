@@ -82,6 +82,14 @@ export const EnvironmentConnectionState = Schema.Literals([
 ]);
 export type EnvironmentConnectionState = typeof EnvironmentConnectionState.Type;
 
+/** Out-of-band authorities that may perform host-level environment actions. */
+export const EnvironmentHostAuthorityChannel = Schema.Literals([
+  "desktop",
+  "localControl",
+  "sshAdmin",
+]);
+export type EnvironmentHostAuthorityChannel = typeof EnvironmentHostAuthorityChannel.Type;
+
 export const RepositoryIdentityLocator = Schema.Struct({
   source: Schema.Literal("git-remote"),
   remoteName: TrimmedNonEmptyString,

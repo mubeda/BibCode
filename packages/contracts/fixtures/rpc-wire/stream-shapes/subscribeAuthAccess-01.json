@@ -8,9 +8,8 @@
       "type": "pairingLinkUpserted",
       "payload": {
         "id": "fixture-pairing-link",
-        "credential": "23456789ABCD",
-        "scopes": ["orchestration:read"],
-        "subject": "fixture",
+        "credentialFingerprint": "sha256:fixture-pairing-link",
+        "clientLabel": "Fixture administrator",
         "createdAt": "2026-01-01T00:00:00.000Z",
         "expiresAt": "2026-01-01T00:00:00.000Z"
       }

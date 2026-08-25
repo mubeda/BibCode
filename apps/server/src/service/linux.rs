@@ -389,8 +389,9 @@ fn render_unit(target: &ServiceTarget) -> String {
     let data_root = systemd_quote(&target.data_root.to_string_lossy());
     let host = target.bind.ip().to_string();
     service.push_str(&format!(
-        "ExecStart={executable} serve --host {host} --port {} --base-dir {data_root} --no-browser\n",
-        target.bind.port()
+        "ExecStart={executable} serve --host {host} --port {} --base-dir {data_root} --no-browser --managed-service-mode {}\n",
+        target.bind.port(),
+        target.mode,
     ));
     service.push_str(&format!("WorkingDirectory={data_root}\n"));
     let install_target = match target.mode {

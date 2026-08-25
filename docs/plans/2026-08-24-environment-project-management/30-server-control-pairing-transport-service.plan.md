@@ -486,11 +486,11 @@ the cross-platform validation plan.
 - Test: `packages/contracts/src/server.test.ts`, `rpc.test.ts`
 - Test: `apps/server/tests/production_control.rs`, `production_maintenance.rs`
 
-- [ ] **Step 1: Add failing view/authority tests**
+- [x] **Step 1: Add failing view/authority tests**
 
 Network clients may read service mode/state/version/update state but host mutations return `hostAuthorityRequired` with the allowed channel (`desktop`, `localControl`, or `sshAdmin`). Verify update drain/restart preserves environment/storage IDs and reaps server-owned children.
 
-- [ ] **Step 2: Add a redacted service view**
+- [x] **Step 2: Add a redacted service view**
 
 Expose startup mechanism, state, version, bind posture, account kind, update state, and whether the current route has host-control authority. Avoid raw control socket paths, service credentials, environment variables, and full sensitive filesystem paths unless already authorized by the existing server settings policy.
 
@@ -498,7 +498,7 @@ Expose startup mechanism, state, version, bind posture, account kind, update sta
 
 Prepare rejects new mutations, drains admitted work, persists update status, closes transports, performs the platform restart through the authorized host path, verifies the same environment/storage identity and compatible version, then commits. On failure restore the previous binary and report a bounded recovery state.
 
-- [ ] **Step 4: Run control/maintenance tests and commit**
+- [x] **Step 4: Run control/maintenance tests and commit**
 
 ```sh
 vp test packages/contracts/src/server.test.ts packages/contracts/src/rpc.test.ts
@@ -507,6 +507,42 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test production_mai
 git add packages/contracts/src/server.ts packages/contracts/src/server.test.ts packages/contracts/src/environment.ts packages/contracts/src/rpc.ts packages/contracts/src/rpc.test.ts apps/server/src/production/control.rs apps/server/src/production/http_routes.rs apps/server/src/production/runtime.rs apps/server/src/maintenance.rs apps/server/src/lifecycle.rs apps/server/tests/production_control.rs apps/server/tests/production_maintenance.rs
 git commit -m "feat(server): expose safe service and update state"
 ```
+
+Implementation note: `server.getConfig` now exposes a bounded, redacted
+service/update view and no service credential, control endpoint, raw process
+environment, binary path, data path, or backup path. Network host mutations
+fail closed with `hostAuthorityRequired` and enumerate only the applicable
+trusted channels: desktop/local-control for a desktop runtime and
+local-control/SSH administration for a server runtime. Managed service
+definitions inject an internal service-mode marker so the reported startup
+mechanism, account kind, and mode reflect the actual host definition.
+
+Update preparation now rejects new mutations, drains admitted work, reaps
+server-owned terminals, records bounded durable phases atomically, and hands
+restart back to the authorized desktop or local-control host. Startup
+reconciliation verifies the same environment and storage identities plus the
+expected version, reporting either success or `recoveryRequired`. The desktop
+updater supplies the exact downloaded target version. Direct HTTPS DPoP
+validation also now derives the request scheme from the TLS listener while
+preserving the existing trusted loopback reverse-proxy behavior.
+
+Step 3 intentionally remains open for Plan 70 Task 5: restoring replacement
+package bytes and the prior platform service definition belongs to the signed
+server-distribution transaction. This task implements the server-side
+admission, drain, durable handoff, identity/version verification, and bounded
+recovery state without creating a second package rollback owner.
+
+Validation passed 34 contract tests, 21 production-control tests, nine
+production-maintenance tests (including a real server-owned child reaping
+case), 14 local-control tests, 20 service lifecycle tests, 17 serial CLI smoke
+tests, seven network-admission tests, 16 auth HTTP tests, 43 relay environment
+tests, the desktop updater integration test, the Rust RPC wire gate,
+`cargo fmt --all --check`, server and desktop all-target Clippy with warnings
+denied, `vp check`, and the complete workspace `vp run typecheck` graph. The
+typecheck graph was run with a concurrency limit of one after an unconstrained
+run exhausted the web TypeScript process; the serial graph completed without
+errors. `vp check` retains only the previously recorded Plan 20 unused-fixture
+warning.
 
 ### Task 8: Update server security, service, and testing documentation
 

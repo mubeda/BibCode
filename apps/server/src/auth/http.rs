@@ -162,7 +162,7 @@ async fn token_inner(
         Some(proof) => {
             let proof = proof.to_str().map_err(|_| AuthError::InvalidCredential)?;
             Some(
-                auth.verify_dpop(proof, "POST", &request_url(headers, uri)?, None, None)
+                auth.verify_dpop(proof, "POST", &request_url(auth, headers, uri)?, None, None)
                     .await?,
             )
         }
@@ -386,7 +386,7 @@ async fn authenticate_request_for_method(
         auth.verify_dpop(
             proof,
             method,
-            &request_url(headers, uri)?,
+            &request_url(auth, headers, uri)?,
             Some(expected_thumbprint),
             Some(dpop_token),
         )
@@ -523,16 +523,17 @@ fn query_value(uri: &Uri, key: &str) -> Option<String> {
         .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
 }
 
-fn request_url(headers: &HeaderMap, uri: &Uri) -> Result<String, AuthError> {
+fn request_url(auth: &AuthService, headers: &HeaderMap, uri: &Uri) -> Result<String, AuthError> {
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("localhost");
-    let protocol = if headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        == Some("https")
+    let protocol = if auth.direct_https()
+        || headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            == Some("https")
     {
         "https"
     } else {

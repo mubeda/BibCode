@@ -8,10 +8,8 @@ describe("applyAuthAccessStreamEvent", () => {
   it("accumulates rapid pairing-link and client updates into one snapshot", () => {
     const pairingLink = {
       id: "pairing-link",
-      credential: "credential",
-      scopes: ["orchestration:read"],
-      subject: "subject",
-      label: "Phone",
+      credentialFingerprint: "sha256:test-pairing-link",
+      clientLabel: "Phone",
       createdAt: DateTime.makeUnsafe("2036-04-07T00:00:00.000Z"),
       expiresAt: DateTime.makeUnsafe("2036-04-07T00:05:00.000Z"),
     } as const;
@@ -56,10 +54,8 @@ describe("applyAuthAccessStreamEvent", () => {
         pairingLinks: [
           {
             id: "pairing-link",
-            credential: "credential",
-            scopes: ["orchestration:read"],
-            subject: "subject",
-            label: "Phone",
+            credentialFingerprint: "sha256:test-pairing-link",
+            clientLabel: "Phone",
             createdAt: DateTime.makeUnsafe("2036-04-07T00:00:00.000Z"),
             expiresAt: DateTime.makeUnsafe("2036-04-07T00:05:00.000Z"),
           },

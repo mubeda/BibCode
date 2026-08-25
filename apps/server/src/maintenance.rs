@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +13,8 @@ use crate::{
     ServerConfig, ServerMode,
     persistence::{
         BackupTrigger, Database, EnvironmentId, PreparedStore, StatePaths, StorageInstanceId,
-        StoreClassification, StoreOperationGuard, create_verified_backup,
+        StoreClassification, StoreOperationGuard, create_verified_backup, read_json,
+        write_json_atomically,
     },
     production::runtime::ProductionRuntime,
 };
@@ -25,6 +26,9 @@ pub const MAINTENANCE_UPDATE_STATUS_PATH: &str = "/api/maintenance/update/status
 pub const DESKTOP_MAINTENANCE_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
 
 const SHUTDOWN_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(25);
+const UPDATE_STATUS_SCHEMA_VERSION: u16 = 1;
+const UPDATE_STATUS_FILE: &str = "server-update.json";
+const MAX_UPDATE_VERSION_SCALARS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RpcMutability {
@@ -253,17 +257,207 @@ pub struct PrepareForUpdateResult {
     pub backup_id: String,
     pub drained_operations: u64,
     pub expires_at: String,
+    pub current_version: String,
+    pub target_version: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PersistedUpdatePhase {
+    Preparing,
+    Prepared,
+    Restarting,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Expired,
+    RecoveryRequired,
+}
+
+impl PersistedUpdatePhase {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Prepared => "prepared",
+            Self::Restarting => "restarting",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::RecoveryRequired => "recoveryRequired",
+        }
+    }
+
+    const fn terminal_result(self) -> Option<&'static str> {
+        match self {
+            Self::Succeeded => Some("succeeded"),
+            Self::Failed | Self::RecoveryRequired => Some("failed"),
+            Self::Cancelled => Some("cancelled"),
+            Self::Expired => Some("expired"),
+            Self::Preparing | Self::Prepared | Self::Restarting => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedUpdateStatus {
+    schema_version: u16,
+    phase: PersistedUpdatePhase,
+    operation_id: String,
+    environment_id: EnvironmentId,
+    storage_instance_id: StorageInstanceId,
+    source_version: String,
+    target_version: Option<String>,
+    backup_id: Option<String>,
+    updated_at: String,
+    message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 enum UpdatePhase {
     Idle,
-    Preparing(Uuid),
-    Prepared(PrepareForUpdateResult),
+    Preparing {
+        operation_id: Uuid,
+        target_version: Option<String>,
+    },
+    Prepared {
+        result: PrepareForUpdateResult,
+        target_version: Option<String>,
+    },
     Committed(Uuid),
     Cancelled(Uuid),
     Failed,
     Expired(Uuid),
+}
+
+fn update_status_path(state_directory: &Path) -> std::path::PathBuf {
+    state_directory.join(UPDATE_STATUS_FILE)
+}
+
+fn now_rfc3339() -> Result<String, MaintenanceError> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| MaintenanceError::Preparation(error.to_string()))
+}
+
+fn validate_target_version(
+    target_version: Option<String>,
+) -> Result<Option<String>, MaintenanceError> {
+    let Some(target_version) = target_version else {
+        return Ok(None);
+    };
+    let target_version = target_version.trim().to_owned();
+    if target_version.is_empty()
+        || target_version.chars().count() > MAX_UPDATE_VERSION_SCALARS
+        || target_version.chars().any(char::is_control)
+    {
+        return Err(MaintenanceError::Preparation(
+            "the target version is invalid".to_owned(),
+        ));
+    }
+    Ok(Some(target_version))
+}
+
+pub(crate) async fn reconcile_update_status(
+    paths: &StatePaths,
+    environment_id: EnvironmentId,
+    storage_instance_id: StorageInstanceId,
+    current_version: &str,
+) -> Result<(), MaintenanceError> {
+    let path = update_status_path(&paths.state_dir);
+    let Some(mut status) = read_json::<PersistedUpdateStatus>(&path)
+        .await
+        .map_err(|error| MaintenanceError::Preparation(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if status.schema_version != UPDATE_STATUS_SCHEMA_VERSION {
+        return Err(MaintenanceError::Preparation(
+            "the persisted update status version is unsupported".to_owned(),
+        ));
+    }
+    let identity_matches = status.environment_id == environment_id
+        && status.storage_instance_id == storage_instance_id;
+    let target_matches = status
+        .target_version
+        .as_deref()
+        .is_none_or(|target| target == current_version);
+    let reconciliation = if !identity_matches {
+        Some((
+            PersistedUpdatePhase::RecoveryRequired,
+            "The restarted server identity differs from the prepared update environment.",
+        ))
+    } else {
+        match status.phase {
+            PersistedUpdatePhase::Restarting if target_matches => Some((
+                PersistedUpdatePhase::Succeeded,
+                "The restarted server preserved identity and reached the expected version.",
+            )),
+            PersistedUpdatePhase::Restarting => Some((
+                PersistedUpdatePhase::RecoveryRequired,
+                "The restarted server did not reach the expected version.",
+            )),
+            PersistedUpdatePhase::Preparing | PersistedUpdatePhase::Prepared => Some((
+                PersistedUpdatePhase::RecoveryRequired,
+                "The update handoff was interrupted before a verified restart.",
+            )),
+            PersistedUpdatePhase::Succeeded
+            | PersistedUpdatePhase::Failed
+            | PersistedUpdatePhase::Cancelled
+            | PersistedUpdatePhase::Expired
+            | PersistedUpdatePhase::RecoveryRequired => None,
+        }
+    };
+    if let Some((phase, message)) = reconciliation {
+        status.phase = phase;
+        status.updated_at = now_rfc3339()?;
+        status.message = Some(message.to_owned());
+        write_json_atomically(path, &status)
+            .await
+            .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn update_view(state_directory: &Path, current_version: &str) -> Value {
+    let status = read_json::<PersistedUpdateStatus>(update_status_path(state_directory)).await;
+    let Ok(Some(status)) = status else {
+        if status.is_err() {
+            let at = OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
+            return json!({
+                "phase": "failed",
+                "currentVersion": current_version,
+                "targetVersion": null,
+                "lastResult": {
+                    "status": "failed",
+                    "at": at,
+                    "message": "The local update status could not be read safely.",
+                },
+            });
+        }
+        return json!({
+            "phase": "idle",
+            "currentVersion": current_version,
+            "targetVersion": null,
+            "lastResult": null,
+        });
+    };
+    let last_result = status.phase.terminal_result().map(|result| {
+        json!({
+            "status": result,
+            "at": status.updated_at,
+            "message": status.message,
+        })
+    });
+    json!({
+        "phase": status.phase.wire_name(),
+        "currentVersion": current_version,
+        "targetVersion": status.target_version,
+        "lastResult": last_result,
+    })
 }
 
 pub struct UpdateMaintenance {
@@ -315,21 +509,63 @@ impl UpdateMaintenance {
         })
     }
 
-    pub async fn prepare(self: &Arc<Self>) -> Result<PrepareForUpdateResult, MaintenanceError> {
+    async fn persist_status(
+        &self,
+        phase: PersistedUpdatePhase,
+        operation_id: Uuid,
+        target_version: Option<String>,
+        backup_id: Option<String>,
+        message: Option<String>,
+    ) -> Result<(), MaintenanceError> {
+        let status = PersistedUpdateStatus {
+            schema_version: UPDATE_STATUS_SCHEMA_VERSION,
+            phase,
+            operation_id: operation_id.to_string(),
+            environment_id: self.environment_id,
+            storage_instance_id: self.storage_instance_id,
+            source_version: self.app_version.clone(),
+            target_version,
+            backup_id,
+            updated_at: now_rfc3339()?,
+            message,
+        };
+        write_json_atomically(update_status_path(&self.paths.state_dir), &status)
+            .await
+            .map_err(|error| MaintenanceError::Preparation(error.to_string()))
+    }
+
+    pub async fn prepare(
+        self: &Arc<Self>,
+        target_version: Option<String>,
+    ) -> Result<PrepareForUpdateResult, MaintenanceError> {
+        let target_version = validate_target_version(target_version)?;
         let operation_id = loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let mut state = self.state.lock().await;
             match &*state {
-                UpdatePhase::Prepared(result) => return Ok(result.clone()),
-                UpdatePhase::Preparing(_) => {
+                UpdatePhase::Prepared {
+                    result,
+                    target_version: prepared_target,
+                } if prepared_target == &target_version => return Ok(result.clone()),
+                UpdatePhase::Prepared { .. } => return Err(MaintenanceError::OperationMismatch),
+                UpdatePhase::Preparing {
+                    target_version: preparing_target,
+                    ..
+                } if preparing_target != &target_version => {
+                    return Err(MaintenanceError::OperationMismatch);
+                }
+                UpdatePhase::Preparing { .. } => {
                     drop(state);
                     notified.await;
                 }
                 UpdatePhase::Idle => {
                     let operation_id = Uuid::new_v4();
-                    *state = UpdatePhase::Preparing(operation_id);
+                    *state = UpdatePhase::Preparing {
+                        operation_id,
+                        target_version: target_version.clone(),
+                    };
                     break operation_id;
                 }
                 UpdatePhase::Committed(_)
@@ -339,15 +575,59 @@ impl UpdateMaintenance {
             }
         };
 
-        let prepared = self.prepare_once(operation_id).await;
+        if let Err(error) = self
+            .persist_status(
+                PersistedUpdatePhase::Preparing,
+                operation_id,
+                target_version.clone(),
+                None,
+                None,
+            )
+            .await
+        {
+            *self.state.lock().await = UpdatePhase::Failed;
+            self.changed.notify_waiters();
+            return Err(error);
+        }
+
+        let prepared = self
+            .prepare_once(operation_id, target_version.clone())
+            .await;
         match prepared {
             Ok(result) => {
-                *self.state.lock().await = UpdatePhase::Prepared(result.clone());
+                if let Err(error) = self
+                    .persist_status(
+                        PersistedUpdatePhase::Prepared,
+                        operation_id,
+                        target_version.clone(),
+                        Some(result.backup_id.clone()),
+                        None,
+                    )
+                    .await
+                {
+                    *self.state.lock().await = UpdatePhase::Failed;
+                    self.changed.notify_waiters();
+                    self.shutdown.cancel();
+                    return Err(error);
+                }
+                *self.state.lock().await = UpdatePhase::Prepared {
+                    result: result.clone(),
+                    target_version,
+                };
                 self.changed.notify_waiters();
                 self.spawn_lease_expiry(operation_id);
                 Ok(result)
             }
             Err(error) => {
+                let _ = self
+                    .persist_status(
+                        PersistedUpdatePhase::Failed,
+                        operation_id,
+                        target_version,
+                        None,
+                        Some("Update preparation failed before a safe handoff.".to_owned()),
+                    )
+                    .await;
                 *self.state.lock().await = UpdatePhase::Failed;
                 self.changed.notify_waiters();
                 self.shutdown.cancel();
@@ -359,6 +639,7 @@ impl UpdateMaintenance {
     async fn prepare_once(
         &self,
         operation_id: Uuid,
+        target_version: Option<String>,
     ) -> Result<PrepareForUpdateResult, MaintenanceError> {
         let deadline = Instant::now()
             .checked_add(self.drain_timeout)
@@ -410,6 +691,8 @@ impl UpdateMaintenance {
             backup_id: backup.manifest.backup_id.to_string(),
             drained_operations,
             expires_at,
+            current_version: self.app_version.clone(),
+            target_version,
         })
     }
 
@@ -422,10 +705,30 @@ impl UpdateMaintenance {
                 return;
             };
             let mut state = maintenance.state.lock().await;
-            if matches!(&*state, UpdatePhase::Prepared(result) if result.operation_id == operation_id.to_string())
-            {
+            let prepared = match &*state {
+                UpdatePhase::Prepared {
+                    result,
+                    target_version,
+                } if result.operation_id == operation_id.to_string() => {
+                    Some((target_version.clone(), Some(result.backup_id.clone())))
+                }
+                _ => None,
+            };
+            if let Some((target_version, backup_id)) = prepared {
                 *state = UpdatePhase::Expired(operation_id);
                 drop(state);
+                if let Err(error) = maintenance
+                    .persist_status(
+                        PersistedUpdatePhase::Expired,
+                        operation_id,
+                        target_version,
+                        backup_id,
+                        Some("The prepared update lease expired before restart.".to_owned()),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "failed to persist expired update status");
+                }
                 maintenance.changed.notify_waiters();
                 maintenance.shutdown.cancel();
             }
@@ -435,11 +738,22 @@ impl UpdateMaintenance {
     pub async fn commit(&self, operation_id: Uuid) -> Result<(), MaintenanceError> {
         let mut state = self.state.lock().await;
         match &*state {
-            UpdatePhase::Prepared(result) if result.operation_id == operation_id.to_string() => {
+            UpdatePhase::Prepared {
+                result,
+                target_version,
+            } if result.operation_id == operation_id.to_string() => {
+                self.persist_status(
+                    PersistedUpdatePhase::Restarting,
+                    operation_id,
+                    target_version.clone(),
+                    Some(result.backup_id.clone()),
+                    None,
+                )
+                .await?;
                 *state = UpdatePhase::Committed(operation_id);
                 Ok(())
             }
-            UpdatePhase::Prepared(_) => Err(MaintenanceError::OperationMismatch),
+            UpdatePhase::Prepared { .. } => Err(MaintenanceError::OperationMismatch),
             _ => Err(MaintenanceError::NoPreparedOperation),
         }
     }
@@ -447,11 +761,22 @@ impl UpdateMaintenance {
     pub async fn cancel(&self, operation_id: Uuid) -> Result<(), MaintenanceError> {
         let mut state = self.state.lock().await;
         match &*state {
-            UpdatePhase::Prepared(result) if result.operation_id == operation_id.to_string() => {
+            UpdatePhase::Prepared {
+                result,
+                target_version,
+            } if result.operation_id == operation_id.to_string() => {
+                self.persist_status(
+                    PersistedUpdatePhase::Cancelled,
+                    operation_id,
+                    target_version.clone(),
+                    Some(result.backup_id.clone()),
+                    Some("The prepared update was cancelled by its host authority.".to_owned()),
+                )
+                .await?;
                 *state = UpdatePhase::Cancelled(operation_id);
                 Ok(())
             }
-            UpdatePhase::Prepared(_) => Err(MaintenanceError::OperationMismatch),
+            UpdatePhase::Prepared { .. } => Err(MaintenanceError::OperationMismatch),
             _ => Err(MaintenanceError::NoPreparedOperation),
         }
     }
@@ -465,23 +790,23 @@ impl UpdateMaintenance {
     }
 
     pub async fn status(&self) -> Value {
+        let mut view = update_view(&self.paths.state_dir, &self.app_version).await;
         match &*self.state.lock().await {
-            UpdatePhase::Idle => json!({"phase":"idle","result":null}),
-            UpdatePhase::Preparing(operation_id) => {
-                json!({"phase":"preparing","operationId":operation_id.to_string(),"result":null})
+            UpdatePhase::Idle | UpdatePhase::Failed => {
+                view["result"] = Value::Null;
             }
-            UpdatePhase::Prepared(result) => json!({"phase":"prepared","result":result}),
-            UpdatePhase::Committed(operation_id) => {
-                json!({"phase":"committed","operationId":operation_id.to_string(),"result":null})
+            UpdatePhase::Preparing { operation_id, .. }
+            | UpdatePhase::Committed(operation_id)
+            | UpdatePhase::Cancelled(operation_id)
+            | UpdatePhase::Expired(operation_id) => {
+                view["operationId"] = json!(operation_id.to_string());
+                view["result"] = Value::Null;
             }
-            UpdatePhase::Cancelled(operation_id) => {
-                json!({"phase":"cancelled","operationId":operation_id.to_string(),"result":null})
-            }
-            UpdatePhase::Failed => json!({"phase":"failed","result":null}),
-            UpdatePhase::Expired(operation_id) => {
-                json!({"phase":"expired","operationId":operation_id.to_string(),"result":null})
+            UpdatePhase::Prepared { result, .. } => {
+                view["result"] = json!(result);
             }
         }
+        view
     }
 }
 

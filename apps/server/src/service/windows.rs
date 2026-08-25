@@ -314,10 +314,11 @@ fn render_task_identity(target: &ServiceTarget) -> String {
 
 fn render_task_arguments(target: &ServiceTarget) -> String {
     format!(
-        "serve --host {} --port {} --base-dir {} --no-browser",
+        "serve --host {} --port {} --base-dir {} --no-browser --managed-service-mode {}",
         windows_quote(&target.bind.ip().to_string()),
         target.bind.port(),
-        windows_quote(&target.data_root.to_string_lossy())
+        windows_quote(&target.data_root.to_string_lossy()),
+        target.mode,
     )
 }
 
@@ -332,6 +333,8 @@ fn render_service_command_line(target: &ServiceTarget) -> String {
         "--base-dir".to_owned(),
         windows_quote(&target.data_root.to_string_lossy()),
         "--no-browser".to_owned(),
+        "--managed-service-mode".to_owned(),
+        target.mode.to_string(),
     ]
     .join(" ")
 }
@@ -356,7 +359,10 @@ mod host {
         StartServiceCtrlDispatcherW,
     };
 
-    use crate::{Cli, ServerRuntime, service::ServiceError};
+    use crate::{
+        Cli, ServerRuntime,
+        service::{ServiceError, ServiceMode},
+    };
 
     const SERVICE_NAME: &str = "BiBCode";
     const SERVICE_WAIT_HINT_MS: u32 = 40_000;
@@ -442,7 +448,7 @@ mod host {
             .map_err(|error| ServiceError::WindowsServiceHost(error.to_string()))?
             .into_server_config()
             .map_err(|error| ServiceError::WindowsServiceHost(error.to_string()))?
-            .with_service_managed_launch();
+            .with_service_managed_launch(ServiceMode::Headless);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

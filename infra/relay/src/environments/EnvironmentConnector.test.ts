@@ -138,6 +138,7 @@ function signHealthResponse(
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
       storageInstanceId: "019c18d0-26b2-7a35-9e06-8568e640f44f",
+      protocol: { minimum: 1, maximum: 1 },
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -191,7 +192,7 @@ function connectorTestLayer(
 function makeAllocations(
   allocation: ManagedEndpointAllocations.ManagedEndpointAllocation | null = {
     userId: "user_123",
-    environmentId: "env-connector-test",
+    environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
     hostname: "env.example.test",
     tunnelId: "tunnel-id",
     tunnelName: "tunnel-name",
@@ -225,7 +226,7 @@ function makeLinks(
     listForUser: () => Effect.succeed([]),
     getForUser: () =>
       Effect.succeed({
-        environmentId: "env-connector-test" as never,
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451" as never,
         label: "Connector Test Environment",
         endpoint: {
           httpBaseUrl: "https://env.example.test/",
@@ -287,7 +288,7 @@ describe("EnvironmentConnector", () => {
     "fails closed for missing links, allocations, configuration, and endpoint mismatch",
     () => {
       const execute = () => Effect.die("HTTP must not run");
-      const key = { userId: "user_123", environmentId: "env-connector-test" };
+      const key = { userId: "user_123", environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451" };
       const completeAllocation = {
         userId: key.userId,
         environmentId: key.environmentId,
@@ -347,7 +348,7 @@ describe("EnvironmentConnector", () => {
         return yield* Effect.flip(
           connector.connect({
             userId: "user_123",
-            environmentId: "env-connector-test",
+            environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
             clientProofKeyThumbprint,
           }),
         );
@@ -397,7 +398,7 @@ describe("EnvironmentConnector", () => {
         const connector = yield* EnvironmentConnector.EnvironmentConnector;
         return yield* connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         });
       }).pipe(Effect.provide(connectorTestLayer(execute)), Effect.withTracerEnabled(false));
     };
@@ -436,7 +437,7 @@ describe("EnvironmentConnector", () => {
         const connector = yield* EnvironmentConnector.EnvironmentConnector;
         return yield* connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test" as never,
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451" as never,
         });
       }).pipe(
         Effect.provide(
@@ -480,22 +481,22 @@ describe("EnvironmentConnector", () => {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
       const result = yield* connector.status({
         userId: "user_123",
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
       });
 
       expect(seenUrls).toEqual(["https://env.example.test/api/bibcode-connect/health"]);
       expect(seenProofs[0]).toMatchObject({
         iss: "https://relay.example.test",
-        aud: "bibcode-env:env-connector-test",
+        aud: "bibcode-env:019c18d0-26b2-7a35-9e06-8568e640f451",
         sub: "user_123",
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         scope: ["environment:status"],
       });
       expect(result).toMatchObject({
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         status: "online",
         descriptor: {
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           label: "Connector Test Environment",
         },
       });
@@ -515,7 +516,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.result(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -566,7 +567,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.result(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "client-proof-key-thumbprint",
         }),
       );
@@ -624,7 +625,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.result(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -644,7 +645,7 @@ describe("EnvironmentConnector", () => {
         connectorTestLayer(execute, {
           allocations: makeAllocations({
             userId: "user_123",
-            environmentId: "env-connector-test",
+            environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
             hostname: "env.example.test",
             tunnelId: "tunnel-id",
             tunnelName: "tunnel-name",
@@ -681,7 +682,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -711,11 +712,11 @@ describe("EnvironmentConnector", () => {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
       const result = yield* connector.status({
         userId: "user_123",
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
       });
 
       expect(result).toMatchObject({
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         status: "offline",
         error: "Managed endpoint health request failed: Environment is unavailable.",
         traceId: expect.any(String),
@@ -743,7 +744,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -768,7 +769,10 @@ describe("EnvironmentConnector", () => {
     return Effect.gen(function* () {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
       const error = yield* Effect.flip(
-        connector.status({ userId: "user_123", environmentId: "env-connector-test" }),
+        connector.status({
+          userId: "user_123",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
+        }),
       );
       expect(error).toMatchObject({
         _tag: "EnvironmentMintResponseInvalid",
@@ -802,7 +806,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -828,7 +832,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         }),
       );
 
@@ -865,22 +869,22 @@ describe("EnvironmentConnector", () => {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
       const result = yield* connector.connect({
         userId: "user_123",
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         clientProofKeyThumbprint: "client-proof-key-thumbprint",
       });
 
       expect(seenUrls).toEqual(["https://env.example.test/api/bibcode-connect/mint-credential"]);
       expect(seenProofs[0]).toMatchObject({
         iss: "https://relay.example.test",
-        aud: "bibcode-env:env-connector-test",
+        aud: "bibcode-env:019c18d0-26b2-7a35-9e06-8568e640f451",
         sub: "user_123",
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         clientProofKeyThumbprint: "client-proof-key-thumbprint",
         cnf: { jkt: "client-proof-key-thumbprint" },
         scope: ["environment:connect"],
       });
       expect(result).toMatchObject({
-        environmentId: "env-connector-test",
+        environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         credential: "pairing_credential",
         endpoint: {
           httpBaseUrl: "https://env.example.test/",
@@ -907,7 +911,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "client-proof-key-thumbprint",
         }),
       );
@@ -934,7 +938,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "client-proof-key-thumbprint",
         }),
       );
@@ -972,7 +976,7 @@ describe("EnvironmentConnector", () => {
       const result = yield* Effect.exit(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "client-proof-key-thumbprint",
         }),
       );
@@ -996,7 +1000,7 @@ describe("EnvironmentConnector", () => {
       const error = yield* Effect.flip(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "proof-thumbprint",
         }),
       );
@@ -1021,7 +1025,7 @@ describe("EnvironmentConnector", () => {
       const fiber = yield* connector
         .status({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
         })
         .pipe(Effect.forkScoped);
       yield* Effect.promise(() => requestStarted);
@@ -1058,13 +1062,16 @@ describe("EnvironmentConnector", () => {
           const connector = yield* EnvironmentConnector.EnvironmentConnector;
           if (operation === "status") {
             return yield* Effect.flip(
-              connector.status({ userId: "user_123", environmentId: "env-connector-test" }),
+              connector.status({
+                userId: "user_123",
+                environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
+              }),
             );
           }
           return yield* Effect.flip(
             connector.connect({
               userId: "user_123",
-              environmentId: "env-connector-test",
+              environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
               clientProofKeyThumbprint: "proof-thumbprint",
             }),
           );
@@ -1114,7 +1121,10 @@ describe("EnvironmentConnector", () => {
     const runStatus = Effect.gen(function* () {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
       return yield* Effect.flip(
-        connector.status({ userId: "user_123", environmentId: "env-connector-test" }),
+        connector.status({
+          userId: "user_123",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
+        }),
       );
     }).pipe(
       Effect.provide(
@@ -1128,7 +1138,7 @@ describe("EnvironmentConnector", () => {
       return yield* Effect.flip(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "proof-thumbprint",
         }),
       );
@@ -1144,7 +1154,7 @@ describe("EnvironmentConnector", () => {
       return yield* Effect.flip(
         connector.connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "proof-thumbprint",
         }),
       );
@@ -1177,7 +1187,7 @@ describe("EnvironmentConnector", () => {
       const resultFiber = yield* connector
         .connect({
           userId: "user_123",
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           clientProofKeyThumbprint: "client-proof-key-thumbprint",
         })
         .pipe(Effect.result, Effect.forkScoped);
@@ -1192,7 +1202,7 @@ describe("EnvironmentConnector", () => {
       if (Result.isFailure(result)) {
         expect(result.failure._tag).toBe("EnvironmentMintRequestTimedOut");
         expect(result.failure).toMatchObject({
-          environmentId: "env-connector-test",
+          environmentId: "019c18d0-26b2-7a35-9e06-8568e640f451",
           timeoutMs: EnvironmentConnector.ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS,
         });
       }

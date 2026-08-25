@@ -349,6 +349,12 @@ struct UpdateOperationInput {
     operation_id: String,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdatePrepareInput {
+    target_version: Option<String>,
+}
+
 fn authorized_update_maintenance(
     state: &AppState,
     headers: &HeaderMap,
@@ -368,14 +374,21 @@ fn authorized_update_maintenance(
     Ok(maintenance)
 }
 
-async fn update_prepare(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn update_prepare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    input: Option<Json<UpdatePrepareInput>>,
+) -> Response {
     let maintenance = match authorized_update_maintenance(&state, &headers) {
         Ok(maintenance) => maintenance,
         Err(status) => {
             return (status, status.canonical_reason().unwrap_or("Error")).into_response();
         }
     };
-    match maintenance.prepare().await {
+    match maintenance
+        .prepare(input.and_then(|Json(input)| input.target_version))
+        .await
+    {
         Ok(result) => (StatusCode::OK, [(CACHE_CONTROL, "no-store")], Json(result)).into_response(),
         Err(error) => maintenance_error_response(error),
     }

@@ -77,6 +77,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     unary("server.refreshProviders"),
     unary("server.refreshProviderUsage"),
     unary("server.removeKeybinding"),
+    unary("server.requestHostAction"),
     unary("server.signalProcess"),
     unary("server.updateProvider"),
     unary("server.updateSettings"),

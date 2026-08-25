@@ -89,7 +89,7 @@ pub(crate) async fn start(
     let shutdown = CancellationToken::new();
 
     #[cfg(unix)]
-    let endpoint = unix::UnixControlEndpoint::bind(_paths, config.managed_service_launch)
+    let endpoint = unix::UnixControlEndpoint::bind(_paths, config.managed_service_mode.is_some())
         .map_err(|error| LocalControlError::Prepare(error.to_string()))?;
 
     #[cfg(windows)]
@@ -194,7 +194,7 @@ impl ControlDispatcher {
                     ),
                 }
             }
-            ControlRequestBody::ServicePrepareUpdate => {
+            ControlRequestBody::ServicePrepareUpdate { target_version } => {
                 let Some(maintenance) = &self.update_maintenance else {
                     return (
                         response(
@@ -207,7 +207,7 @@ impl ControlDispatcher {
                         false,
                     );
                 };
-                match maintenance.prepare().await {
+                match maintenance.prepare(target_version).await {
                     Ok(prepared) => ControlResponseBody::UpdatePrepared {
                         operation_id: prepared.operation_id,
                         backup_id: prepared.backup_id,

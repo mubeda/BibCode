@@ -10,6 +10,7 @@ use bibcode_server::{
         control::NativeServerControl, runtime::finalize_rpc_registry,
         server_terminal::ProductionServerControl,
     },
+    service::ServiceMode,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -413,6 +414,19 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
     assert!(config["keybindings"].is_array());
     assert!(config["issues"].is_array());
     assert!(config["availableEditors"].is_array());
+    assert_eq!(config["service"]["serviceMode"], Value::Null);
+    assert_eq!(config["service"]["startupMechanism"], "manual");
+    assert_eq!(config["service"]["runtimeState"], "running");
+    assert_eq!(config["service"]["bind"]["scope"], "loopback");
+    assert_eq!(config["service"]["bind"]["transport"], "http");
+    assert_eq!(config["service"]["hostControl"]["available"], false);
+    assert_eq!(
+        config["service"]["hostControl"]["reason"],
+        "hostAuthorityRequired"
+    );
+    assert!(config["service"].get("binaryPath").is_none());
+    assert!(config["service"].get("dataRoot").is_none());
+    assert!(config["service"].get("controlEndpoint").is_none());
     assert_eq!(config["settings"], settings);
     for provider in config["providers"].as_array().expect("provider snapshots") {
         if provider["status"] == "ready" {
@@ -429,6 +443,65 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
             ));
         }
     }
+}
+
+#[tokio::test]
+async fn service_view_reports_managed_mode_account_and_route_authority_without_host_secrets() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let config = test_config(directory.path()).with_service_managed_launch(ServiceMode::Headless);
+    let control = NativeServerControl::new(config, auth_descriptor()).await;
+    finalize_rpc_registry(&complete_registry(), &control).expect("complete production registry");
+
+    let service = call(&control, "server.getConfig", json!({})).await["service"].clone();
+    let expected_startup = match std::env::consts::OS {
+        "windows" => "windowsService",
+        "macos" => "launchDaemon",
+        _ => "systemdSystem",
+    };
+    assert_eq!(service["serviceMode"], "headless");
+    assert_eq!(service["startupMechanism"], expected_startup);
+    assert_eq!(service["accountKind"], "dedicatedServiceAccount");
+    assert_eq!(
+        service["hostControl"]["allowedChannels"],
+        json!(["localControl", "sshAdmin"])
+    );
+    assert!(service.get("binaryPath").is_none());
+    assert!(service.get("dataRoot").is_none());
+    assert!(service.get("controlEndpoint").is_none());
+
+    let desktop_directory = tempfile::tempdir().expect("desktop state directory");
+    let desktop_config = test_config(desktop_directory.path())
+        .with_desktop("desktop-service-view-token")
+        .expect("desktop config");
+    let desktop = NativeServerControl::new(desktop_config, auth_descriptor()).await;
+    finalize_rpc_registry(&complete_registry(), &desktop).expect("complete desktop registry");
+    let desktop_service = call(&desktop, "server.getConfig", json!({})).await["service"].clone();
+    assert_eq!(
+        desktop_service["hostControl"]["allowedChannels"],
+        json!(["desktop", "localControl"])
+    );
+}
+
+#[tokio::test]
+async fn network_host_actions_fail_closed_with_the_allowed_out_of_band_channels() {
+    let (_directory, control) = fixture().await;
+
+    let error = control
+        .call(
+            "server.requestHostAction",
+            json!({ "action": "restart" }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("network RPC must not mutate the host service");
+
+    assert_eq!(error["_tag"], "ServerHostAuthorityRequiredError");
+    assert_eq!(error["reason"], "hostAuthorityRequired");
+    assert_eq!(error["action"], "restart");
+    assert_eq!(
+        error["allowedChannels"],
+        json!(["localControl", "sshAdmin"])
+    );
 }
 
 #[tokio::test]
