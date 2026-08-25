@@ -75,6 +75,27 @@ const EnvironmentUiPreferenceFields = {
 export const EnvironmentUiPreferences = Schema.Struct(EnvironmentUiPreferenceFields);
 export type EnvironmentUiPreferences = typeof EnvironmentUiPreferences.Type;
 
+export const KnownEnvironmentRecord = Schema.Struct({
+  environmentId: DurableEnvironmentId,
+  acceptedStorageInstanceId: StorageInstanceId,
+  descriptor: Schema.NullOr(ExecutionEnvironmentDescriptor),
+  ...EnvironmentUiPreferenceFields,
+}).check(
+  Schema.makeFilter(
+    (environment) =>
+      environment.descriptor === null ||
+      environment.descriptor.environmentId === environment.environmentId ||
+      "Descriptor environment identity must match the accepted environment identity.",
+  ),
+  Schema.makeFilter(
+    (environment) =>
+      environment.descriptor === null ||
+      environment.descriptor.storageInstanceId === environment.acceptedStorageInstanceId ||
+      "Descriptor storage identity must match the accepted storage identity.",
+  ),
+);
+export type KnownEnvironmentRecord = typeof KnownEnvironmentRecord.Type;
+
 function hasUniqueIdentifiers<Value, Identifier>(
   values: ReadonlyArray<Value>,
   getIdentifier: (value: Value) => Identifier,

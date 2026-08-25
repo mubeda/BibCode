@@ -160,7 +160,7 @@ git commit -m "refactor(connections): model environments with routes"
 
 - Produces: atomic environment catalog mutations, UI-state store, secret reference store, cache manifest store, and migration receipts.
 
-- [ ] **Step 1: Write failing referential-integrity tests**
+- [x] **Step 1: Write failing referential-integrity tests**
 
 ```ts
 it.effect("rejects an orphan route and clears dependents atomically", () =>
@@ -173,13 +173,13 @@ it.effect("rejects an orphan route and clears dependents atomically", () =>
 );
 ```
 
-- [ ] **Step 2: Run the platform tests and confirm RED**
+- [x] **Step 2: Run the platform tests and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/platform/storageDocument.test.ts
 ```
 
-- [ ] **Step 3: Define transaction-shaped services**
+- [x] **Step 3: Define transaction-shaped services**
 
 ```ts
 export class EnvironmentCatalogStore extends Context.Service<
@@ -202,7 +202,7 @@ export class EnvironmentCatalogStore extends Context.Service<
 
 Add `EnvironmentUiStateStore`, `EnvironmentSecretStore` (opaque values only through platform capability), `EnvironmentCacheManifestStore`, and `EnvironmentMigrationStore`.
 
-- [ ] **Step 4: Make legacy schema explicitly migration-only**
+- [x] **Step 4: Make legacy schema explicitly migration-only**
 
 ```ts
 export const LegacyConnectionCatalogV1 = Schema.Struct({
@@ -217,7 +217,9 @@ export const LegacyConnectionCatalogV1 = Schema.Struct({
 
 Do not export this decoder from the public platform index. Normal records are independent rows, not one replacement JSON document.
 
-- [ ] **Step 5: Run tests and commit**
+Implementation sequencing: `LegacyConnectionCatalogV1` is hidden from the public platform index and treats every legacy row as unknown migration input. The existing strict schema-v1 symbols remain as a deprecated named adapter only until Task 3 migrates the current web driver; normal v2 rows and services do not depend on legacy target variants.
+
+- [x] **Step 5: Run tests and commit**
 
 ```sh
 vp test run packages/client-runtime/src/platform/storageDocument.test.ts
