@@ -322,7 +322,7 @@ git commit -m "feat(web): migrate normalized environment catalog"
 
 - Produces: `putSecret`, `getSecret`, and `deleteSecret` with opaque references; no inventory/list operation.
 
-- [ ] **Step 1: Write failing IPC redaction and round-trip tests**
+- [x] **Step 1: Write failing IPC redaction and round-trip tests**
 
 ```ts
 const ref = await bridge.putSecret({ purpose: "environment-session", value: "secret-value" });
@@ -332,7 +332,7 @@ await bridge.deleteSecret(ref);
 expect(await bridge.getSecret(ref)).toBeNull();
 ```
 
-- [ ] **Step 2: Add the schema-only bridge contract**
+- [x] **Step 2: Add the schema-only bridge contract**
 
 ```ts
 export interface DesktopSecretInput {
@@ -347,11 +347,11 @@ export interface DesktopBridge {
 }
 ```
 
-- [ ] **Step 3: Pin platform dependencies**
+- [x] **Step 3: Pin platform dependencies**
 
 Use existing user-scoped DPAPI code on Windows. Add `keyring = "4.1.6"` with only Apple native Keychain on macOS and zbus Secret Service on Linux; do not enable a file/database keystore backend.
 
-- [ ] **Step 4: Implement the Rust capability boundary**
+- [x] **Step 4: Implement the Rust capability boundary**
 
 ```rust
 pub enum SecretPurpose { EnvironmentSession, DpopPrivateKey, CacheKey }
@@ -365,11 +365,11 @@ pub trait DesktopSecretProvider: Send + Sync {
 
 Validate the `bibcode-secret:<uuid>` reference format, scope entries to `com.bibcode.desktop`, protect Windows values with `CryptProtectData` user scope, and never include the value in `Display`, `Debug`, tracing, or IPC errors.
 
-- [ ] **Step 5: Fail closed on unavailable/locked providers**
+- [x] **Step 5: Fail closed on unavailable/locked providers**
 
 Return a typed `unavailable`/`locked` error so the renderer chooses session-only operation. Do not write a fallback file, Tauri store value, localStorage value, or IndexedDB credential.
 
-- [ ] **Step 6: Run platform-appropriate tests and commit**
+- [x] **Step 6: Run platform-appropriate tests and commit**
 
 ```sh
 vp test run packages/contracts/src/ipc.test.ts

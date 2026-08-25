@@ -285,6 +285,46 @@ export const DesktopThemeSchema = Schema.Literals(["light", "dark", "system"]);
 export const DesktopAppStageLabelSchema = Schema.Literals(["Dev", "Latest", "Nightly"]);
 export const DesktopBridgeHostSchema = Schema.Literal("tauri");
 
+export const DesktopSecretPurposeSchema = Schema.Literals([
+  "environment-session",
+  "dpop-private-key",
+  "cache-key",
+]);
+export type DesktopSecretPurpose = typeof DesktopSecretPurposeSchema.Type;
+
+export interface DesktopSecretInput {
+  readonly purpose: DesktopSecretPurpose;
+  readonly value: string;
+}
+
+export const DesktopSecretInputSchema = Schema.Struct({
+  purpose: DesktopSecretPurposeSchema,
+  value: Schema.String.check(Schema.isNonEmpty()),
+});
+
+export const DesktopSecretReferenceSchema = Schema.String.check(
+  Schema.isPattern(
+    /^bibcode-secret:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+  ),
+);
+export type DesktopSecretReference = typeof DesktopSecretReferenceSchema.Type;
+
+export const DesktopSecretStoreErrorCodeSchema = Schema.Literals([
+  "unavailable",
+  "locked",
+  "invalid-reference",
+  "failed",
+]);
+export type DesktopSecretStoreErrorCode = typeof DesktopSecretStoreErrorCodeSchema.Type;
+
+export interface DesktopSecretStoreError {
+  readonly code: DesktopSecretStoreErrorCode;
+}
+
+export const DesktopSecretStoreErrorSchema = Schema.Struct({
+  code: DesktopSecretStoreErrorCodeSchema,
+});
+
 export interface DesktopBridgeFeatureFlags {
   localBackend: boolean;
   localBearerToken: boolean;
@@ -1169,6 +1209,9 @@ export interface DesktopBridge {
   ) => Promise<boolean>;
   compareConnectionCatalog?: (expectedCatalog: string | null) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
+  putSecret?: (input: DesktopSecretInput) => Promise<DesktopSecretReference>;
+  getSecret?: (secretRef: DesktopSecretReference) => Promise<string | null>;
+  deleteSecret?: (secretRef: DesktopSecretReference) => Promise<void>;
   getProjectDataStatuses?: () => Promise<readonly DesktopProjectDataEnvironmentStatus[]>;
   onProjectDataStatusChanged?: (
     listener: (event: DesktopProjectDataStatusChangedEvent) => void,

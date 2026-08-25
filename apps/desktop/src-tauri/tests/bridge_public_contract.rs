@@ -11,6 +11,33 @@ use bibcode_desktop_lib::{
 };
 use serde_json::json;
 
+#[test]
+fn public_secret_bridge_exposes_only_put_get_and_delete() {
+    let permissions: toml::Value =
+        toml::from_str(include_str!("../permissions/desktop-bridge.toml"))
+            .expect("desktop bridge permissions should parse");
+    let allowed = permissions["permission"][0]["commands"]["allow"]
+        .as_array()
+        .expect("desktop bridge allowlist should be an array")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter(|command| command.contains("_secret"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        allowed,
+        [
+            "desktop_bridge_put_secret",
+            "desktop_bridge_get_secret",
+            "desktop_bridge_delete_secret",
+        ]
+    );
+    assert!(
+        allowed.iter().all(|command| !command.contains("list")),
+        "the secret bridge must not expose an inventory operation"
+    );
+}
+
 fn read_request(stream: &mut TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))

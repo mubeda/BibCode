@@ -16,6 +16,16 @@ pub fn unprotect_string(value: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) fn protect_secret_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    protect_bytes(bytes)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn unprotect_secret_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    unprotect_bytes(bytes)
+}
+
+#[cfg(target_os = "windows")]
 fn protect_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     platform_windows::protect_bytes(bytes)
 }

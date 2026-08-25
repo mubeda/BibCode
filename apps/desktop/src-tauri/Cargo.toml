@@ -42,9 +42,15 @@ url.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_System_Registry",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
@@ -65,6 +71,7 @@ windows = { workspace = true, features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+keyring.workspace = true
 webkit2gtk.workspace = true
 gtk.workspace = true
 cairo-rs.workspace = true

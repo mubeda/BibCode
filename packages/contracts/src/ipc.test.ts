@@ -4,6 +4,9 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   ContextMenuItemSchema,
   type DesktopBridge,
+  DesktopSecretInputSchema,
+  DesktopSecretReferenceSchema,
+  DesktopSecretStoreErrorSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
   type DesktopUpdateState,
@@ -22,6 +25,62 @@ const decodeProjectDataStatus = Schema.decodeUnknownSync(DesktopProjectDataEnvir
 const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
   DesktopProjectDataRecoveryResultSchema,
 );
+const decodeDesktopSecretInput = Schema.decodeUnknownSync(DesktopSecretInputSchema);
+const decodeDesktopSecretReference = Schema.decodeUnknownSync(DesktopSecretReferenceSchema);
+const decodeDesktopSecretStoreError = Schema.decodeUnknownSync(DesktopSecretStoreErrorSchema);
+
+describe("Desktop secret-store contract", () => {
+  it("round-trips opaque references without exposing an inventory operation", async () => {
+    const stored = new Map<string, string>();
+    const reference = "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8";
+    const bridge: Required<Pick<DesktopBridge, "putSecret" | "getSecret" | "deleteSecret">> = {
+      putSecret: async (input) => {
+        stored.set(reference, input.value);
+        return reference;
+      },
+      getSecret: async (secretRef) => stored.get(secretRef) ?? null,
+      deleteSecret: async (secretRef) => {
+        stored.delete(secretRef);
+      },
+    };
+
+    const secretRef = await bridge.putSecret({
+      purpose: "environment-session",
+      value: "secret-value",
+    });
+
+    expect(secretRef).toMatch(/^bibcode-secret:/u);
+    await expect(bridge.getSecret(secretRef)).resolves.toBe("secret-value");
+    await bridge.deleteSecret(secretRef);
+    await expect(bridge.getSecret(secretRef)).resolves.toBeNull();
+    expect("listSecrets" in bridge).toBe(false);
+  });
+
+  it("decodes only approved purposes and canonical opaque references", () => {
+    expect(
+      decodeDesktopSecretInput({ purpose: "dpop-private-key", value: "private material" }),
+    ).toEqual({ purpose: "dpop-private-key", value: "private material" });
+    expect(
+      decodeDesktopSecretReference("bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8"),
+    ).toBe("bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8");
+    expect(() =>
+      decodeDesktopSecretReference("bibcode-secret:70A3DD71952A4EB6A9A8424A462E33C8"),
+    ).toThrow();
+    expect(() =>
+      decodeDesktopSecretInput({ purpose: "telemetry-token", value: "blocked" }),
+    ).toThrow();
+  });
+
+  it("keeps provider failures typed and structurally unable to carry secret material", () => {
+    expect(decodeDesktopSecretStoreError({ code: "unavailable" })).toEqual({
+      code: "unavailable",
+    });
+    expect(decodeDesktopSecretStoreError({ code: "locked" })).toEqual({ code: "locked" });
+    const decoded = decodeDesktopSecretStoreError({ code: "locked", detail: "secret-value" });
+    expect(decoded).toEqual({ code: "locked" });
+    expect(JSON.stringify(decoded)).not.toContain("secret-value");
+  });
+});
 
 describe("Desktop project-data recovery contract", () => {
   it("exposes a disposable project data status invalidation subscription", () => {

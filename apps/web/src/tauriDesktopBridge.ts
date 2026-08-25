@@ -7,6 +7,7 @@ import type {
   DesktopBridgeHostMetadata,
   DesktopEnvironmentBootstrap,
   DesktopProjectDataStatusChangedEvent,
+  DesktopSecretStoreErrorCode,
   DesktopServerExposureState,
   DesktopSshPasswordPromptRequest,
   DesktopUpdateActionResult,
@@ -61,6 +62,10 @@ interface TauriDesktopCapabilityUnsupportedPayload {
   readonly message?: string;
 }
 
+interface TauriDesktopSecretStoreErrorPayload {
+  readonly code: DesktopSecretStoreErrorCode;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -75,6 +80,21 @@ function isTauriDesktopCapabilityUnsupportedPayload(
     typeof value.capability === "string" &&
     (value.message === undefined || typeof value.message === "string")
   );
+}
+
+function isDesktopSecretStoreErrorCode(value: unknown): value is DesktopSecretStoreErrorCode {
+  return (
+    value === "unavailable" ||
+    value === "locked" ||
+    value === "invalid-reference" ||
+    value === "failed"
+  );
+}
+
+function isTauriDesktopSecretStoreErrorPayload(
+  value: unknown,
+): value is TauriDesktopSecretStoreErrorPayload {
+  return isRecord(value) && isDesktopSecretStoreErrorCode(value.code);
 }
 
 function tauriInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -137,6 +157,21 @@ export class TauriDesktopCapabilityUnsupportedError extends Error {
   }
 }
 
+export class TauriDesktopSecretStoreError extends Error {
+  constructor(readonly code: DesktopSecretStoreErrorCode) {
+    super(
+      code === "locked"
+        ? "The operating-system secret provider is locked."
+        : code === "unavailable"
+          ? "The operating-system secret provider is unavailable."
+          : code === "invalid-reference"
+            ? "The secret reference is invalid."
+            : "The operating-system secret operation failed.",
+    );
+    this.name = "TauriDesktopSecretStoreError";
+  }
+}
+
 function normalizeTauriDesktopError(error: unknown): unknown {
   if (isTauriDesktopCapabilityUnsupportedPayload(error)) {
     return new TauriDesktopCapabilityUnsupportedError(
@@ -144,6 +179,9 @@ function normalizeTauriDesktopError(error: unknown): unknown {
       error.capability,
       error.message,
     );
+  }
+  if (isTauriDesktopSecretStoreErrorPayload(error)) {
+    return new TauriDesktopSecretStoreError(error.code);
   }
   return error;
 }
@@ -498,6 +536,9 @@ function createTauriDesktopBridge(
         writeBrowserClientSettings(settings),
       ),
     ...connectionCatalog,
+    putSecret: (input) => tauriInvokeDesktop("desktop_bridge_put_secret", { input }),
+    getSecret: (secretRef) => tauriInvokeDesktop("desktop_bridge_get_secret", { secretRef }),
+    deleteSecret: (secretRef) => tauriInvokeDesktop("desktop_bridge_delete_secret", { secretRef }),
     getProjectDataStatuses: () =>
       tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
     onProjectDataStatusChanged: (listener: (event: DesktopProjectDataStatusChangedEvent) => void) =>

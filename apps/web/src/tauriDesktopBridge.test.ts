@@ -69,6 +69,7 @@ function installTauriHarness(options?: {
   ) => boolean;
   readonly compareConnectionCatalog?: (expectedCatalog: string | null) => boolean;
   readonly rejectConnectionCatalogCompareAndSet?: unknown;
+  readonly rejectSecretStore?: unknown;
   readonly clearConnectionCatalog?: () => void;
   readonly rejectFallbackCommands?: boolean;
   readonly rejectListeners?: boolean;
@@ -121,6 +122,25 @@ function installTauriHarness(options?: {
           completed: false,
           state: { status: "disabled" },
         });
+      case "desktop_bridge_put_secret":
+        if (options?.rejectSecretStore !== undefined) {
+          return Promise.reject(options.rejectSecretStore);
+        }
+        return Promise.resolve("bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8");
+      case "desktop_bridge_get_secret":
+        if (options?.rejectSecretStore !== undefined) {
+          return Promise.reject(options.rejectSecretStore);
+        }
+        return Promise.resolve(
+          args?.secretRef === "bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8"
+            ? "secret-value"
+            : null,
+        );
+      case "desktop_bridge_delete_secret":
+        if (options?.rejectSecretStore !== undefined) {
+          return Promise.reject(options.rejectSecretStore);
+        }
+        return Promise.resolve(undefined);
       case "desktop_bridge_save_diagnostic_logs":
         return Promise.resolve("C:\\Users\\test\\Downloads\\diagnostics.zip");
       case "desktop_bridge_ensure_ssh_environment":
@@ -321,7 +341,7 @@ function sensitivePrepared(storageInstanceId: string): PreparedConnection {
 
 function readIndexedDbConnectionCatalog(factory: IDBFactory): Promise<string | null> {
   return new Promise((resolve, reject) => {
-    const open = factory.open("bibcode:connection-runtime", 2);
+    const open = factory.open("bibcode:connection-runtime", 3);
     open.addEventListener("error", () => reject(open.error));
     open.addEventListener("success", () => {
       const database = open.result;
@@ -520,6 +540,41 @@ describe("tauriDesktopBridge", () => {
         port: null,
       },
       options: undefined,
+    });
+  });
+
+  it("routes opaque secret operations without an inventory command", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    const reference = await bridge.putSecret?.({
+      purpose: "environment-session",
+      value: "secret-value",
+    });
+    expect(reference).toBe("bibcode-secret:70a3dd71-952a-4eb6-a9a8-424a462e33c8");
+    await expect(bridge.getSecret?.(reference!)).resolves.toBe("secret-value");
+    await expect(bridge.deleteSecret?.(reference!)).resolves.toBeUndefined();
+    expect("listSecrets" in bridge).toBe(false);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_put_secret", {
+      input: { purpose: "environment-session", value: "secret-value" },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_secret", {
+      secretRef: reference,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_delete_secret", {
+      secretRef: reference,
+    });
+  });
+
+  it("normalizes redacted secret-provider errors into stable typed failures", async () => {
+    installTauriHarness({ rejectSecretStore: { code: "locked" } });
+    const bridge = await installBridge();
+
+    await expect(
+      bridge.putSecret?.({ purpose: "cache-key", value: "seeded-secret-canary" }),
+    ).rejects.toMatchObject({
+      name: "TauriDesktopSecretStoreError",
+      code: "locked",
     });
   });
 

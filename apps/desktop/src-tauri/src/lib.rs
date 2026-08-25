@@ -20,6 +20,9 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_compare_connection_catalog,
             desktop_bridge_compare_and_set_connection_catalog,
             desktop_bridge_clear_connection_catalog,
+            desktop_bridge_put_secret,
+            desktop_bridge_get_secret,
+            desktop_bridge_delete_secret,
             desktop_bridge_discover_ssh_hosts,
             desktop_bridge_ensure_ssh_environment,
             desktop_bridge_disconnect_ssh_environment,
@@ -85,6 +88,7 @@ pub fn run() {
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
         .manage(backend::BackendSupervisor::new())
         .manage(bridge::ConnectionCatalogCoordinator::new())
+        .manage(secret_store::DesktopSecretStore::new())
         .manage(context_menu::NativeContextMenuManager::new())
         .manage(ssh::SshEnvironmentManager::new())
         .manage(ssh::SshPasswordPromptManager::new())
@@ -139,6 +143,9 @@ pub fn run() {
         bridge::desktop_bridge_compare_connection_catalog,
         bridge::desktop_bridge_compare_and_set_connection_catalog,
         bridge::desktop_bridge_clear_connection_catalog,
+        bridge::desktop_bridge_put_secret,
+        bridge::desktop_bridge_get_secret,
+        bridge::desktop_bridge_delete_secret,
         bridge::desktop_bridge_discover_ssh_hosts,
         bridge::desktop_bridge_ensure_ssh_environment,
         bridge::desktop_bridge_disconnect_ssh_environment,
@@ -245,6 +252,7 @@ mod config;
 mod context_menu;
 mod data_safety;
 mod preview;
+mod secret_store;
 mod security;
 mod shell_environment;
 pub mod ssh;

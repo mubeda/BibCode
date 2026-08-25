@@ -23,6 +23,9 @@ use crate::context_menu::{
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
 use crate::data_safety;
+use crate::secret_store::{
+    DesktopSecretInput, DesktopSecretStore, SecretStoreError, SecretStoreIpcError,
+};
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
@@ -1108,6 +1111,49 @@ pub fn desktop_bridge_clear_connection_catalog(
     catalogs
         .with_lock(|| clear_connection_catalog_document(&path))
         .map_err(|_| connection_catalog_command_error("clear"))
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_bridge_put_secret(
+    secrets: State<'_, DesktopSecretStore>,
+    input: DesktopSecretInput,
+) -> Result<String, SecretStoreIpcError> {
+    let store = secrets.inner().clone();
+    tokio::task::spawn_blocking(move || store.put(input.purpose, input.value.as_bytes()))
+        .await
+        .map_err(|_| SecretStoreIpcError::from(SecretStoreError::Failed))?
+        .map_err(SecretStoreIpcError::from)
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_bridge_get_secret(
+    secrets: State<'_, DesktopSecretStore>,
+    secret_ref: String,
+) -> Result<Option<String>, SecretStoreIpcError> {
+    let store = secrets.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        store.get(&secret_ref).and_then(|value| {
+            value
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|_| SecretStoreError::Failed)
+        })
+    })
+    .await
+    .map_err(|_| SecretStoreIpcError::from(SecretStoreError::Failed))?
+    .map_err(SecretStoreIpcError::from)
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_bridge_delete_secret(
+    secrets: State<'_, DesktopSecretStore>,
+    secret_ref: String,
+) -> Result<(), SecretStoreIpcError> {
+    let store = secrets.inner().clone();
+    tokio::task::spawn_blocking(move || store.delete(&secret_ref))
+        .await
+        .map_err(|_| SecretStoreIpcError::from(SecretStoreError::Failed))?
+        .map_err(SecretStoreIpcError::from)
 }
 
 #[tauri::command]
@@ -2804,6 +2850,7 @@ mod tests {
             .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
             .manage(ConnectionCatalogCoordinator::new())
+            .manage(DesktopSecretStore::new())
             .manage(NativeContextMenuManager::new())
             .manage(SshEnvironmentManager::new())
             .manage(SshPasswordPromptManager::new())
@@ -2826,6 +2873,9 @@ mod tests {
                 desktop_bridge_compare_connection_catalog,
                 desktop_bridge_compare_and_set_connection_catalog,
                 desktop_bridge_clear_connection_catalog,
+                desktop_bridge_put_secret,
+                desktop_bridge_get_secret,
+                desktop_bridge_delete_secret,
                 desktop_bridge_discover_ssh_hosts,
                 desktop_bridge_ensure_ssh_environment,
                 desktop_bridge_disconnect_ssh_environment,
@@ -2899,6 +2949,14 @@ mod tests {
         assert!(client_settings.is_null() || client_settings.is_object());
         let catalog = invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap();
         assert!(catalog.is_null() || catalog.is_string());
+        assert_eq!(
+            invoke(
+                "desktop_bridge_get_secret",
+                json!({"secretRef":"not-an-opaque-reference"}),
+            )
+            .expect_err("invalid secret references must fail before provider access"),
+            json!({"code":"invalid-reference"})
+        );
         assert_eq!(
             invoke(
                 "desktop_bridge_compare_connection_catalog",
