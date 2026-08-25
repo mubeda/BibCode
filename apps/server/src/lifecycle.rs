@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::{AuthService, SecretStore},
+    auth::{AuthService, SecretStore, build_pairing_url},
     config::{ServerConfig, ServerMode},
     data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
     diagnostics::{
@@ -359,10 +359,14 @@ impl ServerRuntime {
         let local_control = local_control::start(
             &config,
             &state_paths,
-            environment_id,
-            storage_instance_id,
-            update_maintenance.clone(),
-            shutdown.clone(),
+            local_control::LocalControlContext {
+                environment_id,
+                storage_instance_id,
+                auth: auth.clone(),
+                advertised_base_url: advertised_base_url.clone(),
+                update_maintenance: update_maintenance.clone(),
+                main_shutdown: shutdown.clone(),
+            },
         )
         .await
         .map_err(|error| ServerError::LocalControlInitialize(error.to_string()))?;
@@ -575,18 +579,13 @@ fn build_startup_access(
     advertised_base_url: &str,
     credential: String,
 ) -> Result<StartupAccess, ServerError> {
-    let mut pairing_url = url::Url::parse(advertised_base_url)
+    let advertised_url = url::Url::parse(advertised_base_url)
         .map_err(|error| ServerError::AuthInitialize(error.to_string()))?;
-    pairing_url.set_path("/pair");
-    pairing_url.set_query(None);
-    let fragment = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("token", &credential)
-        .finish();
-    pairing_url.set_fragment(Some(&fragment));
+    let pairing_url = build_pairing_url(&advertised_url, &credential);
     Ok(StartupAccess {
         connection_string: advertised_base_url.to_owned(),
         credential,
-        pairing_url: pairing_url.to_string(),
+        pairing_url,
     })
 }
 

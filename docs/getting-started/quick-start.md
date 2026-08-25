@@ -25,6 +25,9 @@ vp run dist:desktop:linux   # Linux
 
 # Native CLI help from this checkout
 cargo run -p bibcode-server -- --help
+
+# In another terminal, create a five-minute pairing for a running server
+cargo run -p bibcode-server -- auth pairing create --format human
 ```
 
 `vp run build` writes the web client to `apps/web/dist`. The server does not
@@ -39,6 +42,10 @@ build environment automatically.
 Node.js is required when developing the React frontend and running repository
 scripts. Packaged desktop applications and the native `bibcode` server do not
 ship or require Node.js.
+
+The pairing command uses the server's protected host-local socket or named pipe
+and never falls back to HTTP. If the server uses a non-default data root, pass
+the same absolute `--base-dir` used by `serve`. Treat its stdout as a secret.
 
 ## First run
 

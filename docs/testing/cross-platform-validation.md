@@ -190,6 +190,7 @@ server startup/shutdown, or state paths change, run:
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test local_control -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test server_runtime -- --nocapture
 ```
 
@@ -202,6 +203,13 @@ unlink; and secret-free debug/error output. A Windows-target type-check on
 another host is compatibility evidence only: named-pipe ACL, remote rejection,
 impersonation/revert, and administrator/service-account admission require a
 native Windows run.
+
+For pairing CLI changes, also record exact nested parsing, human and one-line
+JSON output, five-minute expiry, fixed non-Relay administrator scopes, wrong
+data root versus stopped server, inaccessible endpoint, invalid/expired reply,
+request/response identity matching, URL-fragment validation, and absence of the
+credential from stderr. Confirm the client never calls an HTTP pairing route as
+a fallback.
 
 ### VCS coordination gates
 

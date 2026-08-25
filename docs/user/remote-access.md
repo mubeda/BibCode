@@ -67,9 +67,11 @@ this shape:
 `httpBaseUrl` is the existing output key; its value uses `https://` for a TLS
 listener.
 
-The CLI does not print a QR code. It also has no `auth` or `project` subcommands,
-no positional working-directory argument, and no `--tailscale-serve` flags. Use
-`bibcode serve --help` for the implemented options.
+The CLI does not print a QR code. It has no `project` subcommand, positional
+working-directory argument, or `--tailscale-serve` flags. Its `auth` command is
+limited to host-local pairing issuance through the protected control endpoint;
+it is not a network administration API. Use `bibcode --help` for the
+implemented options.
 
 `--static-dir` is needed only when this server should deliver the web client.
 A separately hosted HTTPS web app can connect directly to an HTTPS/WSS backend
@@ -98,8 +100,28 @@ The hosted app saves the backend address, but it does not proxy traffic. The
 browser still connects directly to the backend, which must therefore be
 reachable over HTTPS/WSS from that browser.
 
-In the browser/hosted UI, create and revoke additional access from
-**Settings → Connections**. There is no current CLI access-management command.
+While the server is running, an authorized user on that server host can create
+another five-minute administrator pairing in a separate terminal:
+
+```bash
+bibcode auth pairing create \
+  --client-label "Administrator laptop" \
+  --format human \
+  --base-dir /absolute/path/to/bibcode-data
+```
+
+Omit `--base-dir` to use the same `BIBCODE_HOME`/default-root selection as
+`serve`; use `--format json` for one machine-readable document. The command
+reads the durable environment identity and uses only the protected Unix socket
+or Windows named pipe. It does not try the HTTP pairing endpoint when the
+server is stopped or the selected root is wrong. Human output prints the secret
+only inside the URL fragment. JSON includes the explicitly documented
+`credential` and `pairingUrl` fields, so treat the entire stdout document as a
+secret.
+
+The issued session is a full environment administrator for the current
+feature: permission levels are not user-selectable. In the browser/hosted UI,
+review and revoke access from **Settings → Connections**.
 
 ## Browser/hosted and future re-enabled desktop-managed SSH status
 
@@ -111,10 +133,10 @@ loopback, and create a local port forward. The remote host must provide:
 - `curl` or `wget` for the readiness probe; and
 - each provider CLI and its credentials.
 
-However, end-to-end setup of a new SSH environment is **currently unavailable**.
-The desktop pairing step invokes `bibcode auth pairing create`, while the native
-CLI currently implements only `start` and `serve`. Do not rely on the SSH **Add
-environment** flow until that CLI mismatch is resolved.
+The native pairing command now exists, but end-to-end setup of a new SSH
+environment remains unavailable until the desktop provisioning and
+loopback-forwarding work described in the current environment-management plan
+lands. Do not rely on the SSH **Add environment** flow yet.
 
 The launcher does not install Node.js, npm, npx, package-manager shims, or a
 BiBCode binary on the remote host.

@@ -207,6 +207,12 @@ requests, and releases the database/store guard only after both network and
 control tasks join. Service installation/uninstallation and remote data purge
 remain outside that command and are not implied by Forget.
 
+`bibcode auth pairing create` is the only current CLI client of this control
+channel. It resolves the same data root as the server, verifies the durable
+environment marker and response identity/expiry, and emits either a single JSON
+document or a human pairing URL. It has no HTTP fallback and grants one fixed
+environment-administrator scope set rather than exposing permission levels.
+
 ## Current limitations
 
 - OS-backed protection for the desktop connection catalog is implemented on

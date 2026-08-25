@@ -378,26 +378,19 @@ async fn administrative_inventory_is_closed_and_stop_replies_before_shutdown() {
     let root = tempfile::tempdir().expect("temporary data root");
     let handle = start(&root).await;
 
-    for body in [
-        ControlRequestBody::CreatePairing {
-            client_label: Some("Administrator laptop".to_owned()),
-        },
-        ControlRequestBody::ServicePrepareUpdate,
-    ] {
-        let mut stream = connect(&root).await;
-        let sent = request(body);
-        write_request(&mut stream, &sent)
-            .await
-            .expect("write known administrative request");
-        let response = read_response(&mut stream)
-            .await
-            .expect("read known administrative response");
-        assert_eq!(response.request_id, sent.request_id);
-        assert!(matches!(
-            response.body,
-            ControlResponseBody::Error { ref code, .. } if code == "command_unavailable"
-        ));
-    }
+    let mut stream = connect(&root).await;
+    let sent = request(ControlRequestBody::ServicePrepareUpdate);
+    write_request(&mut stream, &sent)
+        .await
+        .expect("write known administrative request");
+    let response = read_response(&mut stream)
+        .await
+        .expect("read known administrative response");
+    assert_eq!(response.request_id, sent.request_id);
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::Error { ref code, .. } if code == "command_unavailable"
+    ));
 
     let mut stream = connect(&root).await;
     let sent = request(ControlRequestBody::ServiceStop);
@@ -413,6 +406,90 @@ async fn administrative_inventory_is_closed_and_stop_replies_before_shutdown() {
         .await
         .expect("service stop cancels the server");
     handle.join().await.expect("join stopped server");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn create_pairing_issues_fixed_environment_administrator_access() {
+    let root = tempfile::tempdir().expect("temporary data root");
+    let handle = ServerRuntime::start(test_config(&root))
+        .await
+        .expect("start production server with local control");
+    let mut stream = connect(&root).await;
+    let sent = request(ControlRequestBody::CreatePairing {
+        client_label: Some("Administrator laptop".to_owned()),
+    });
+    write_request(&mut stream, &sent)
+        .await
+        .expect("write pairing request");
+    let response = read_response(&mut stream)
+        .await
+        .expect("read pairing response");
+    let ControlResponseBody::PairingCreated {
+        environment_id,
+        credential,
+        expires_at,
+        pairing_url,
+    } = response.body
+    else {
+        panic!("expected a pairing credential, got {response:?}");
+    };
+    assert_eq!(response.request_id, sent.request_id);
+    assert!(!credential.is_empty());
+    assert!(!expires_at.is_empty());
+    let expires =
+        time::OffsetDateTime::parse(&expires_at, &time::format_description::well_known::Rfc3339)
+            .expect("RFC 3339 pairing expiry");
+    let remaining_seconds = (expires - time::OffsetDateTime::now_utc()).whole_seconds();
+    assert!(
+        (285..=300).contains(&remaining_seconds),
+        "pairing TTL must remain five minutes, got {remaining_seconds} seconds"
+    );
+    let parsed_url = url::Url::parse(&pairing_url).expect("valid pairing URL");
+    assert_eq!(parsed_url.path(), "/pair");
+    assert!(parsed_url.query().is_none());
+    assert_eq!(
+        parsed_url
+            .fragment()
+            .and_then(|fragment| url::form_urlencoded::parse(fragment.as_bytes())
+                .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))),
+        Some(credential.clone())
+    );
+
+    let token = reqwest::Client::new()
+        .post(format!("{}/oauth/token", handle.advertised_base_url()))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", credential.as_str()),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            ("client_label", "Administrator laptop"),
+        ])
+        .send()
+        .await
+        .expect("exchange local-control pairing credential");
+    assert!(
+        token.status().is_success(),
+        "token exchange failed: {token:?}"
+    );
+    let token: serde_json::Value = token.json().await.expect("token response JSON");
+    assert_eq!(
+        token["scope"],
+        "orchestration:read orchestration:operate terminal:operate review:write access:read access:write"
+    );
+    assert_eq!(environment_id.to_string().len(), 36);
+
+    handle.shutdown();
+    handle.join().await.expect("join server");
 }
 
 #[cfg(any(unix, windows))]

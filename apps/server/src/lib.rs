@@ -42,10 +42,14 @@ pub mod worktree_catalog;
 pub(crate) mod test_support;
 
 use clap::Parser;
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 
-pub use config::{Cli, CliAction, ConfigError, ServerConfig, ServerMode, StorageCommand, TlsFiles};
+pub use config::{
+    AuthCommand, Cli, CliAction, ConfigError, PairingOutputFormat, ServerConfig, ServerMode,
+    StorageCommand, TlsFiles,
+};
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
 };
@@ -81,13 +85,59 @@ pub enum RunError {
     Recovery(#[from] persistence::RecoveryError),
     #[error("failed to encode storage command output")]
     StorageOutput(#[source] serde_json::Error),
+    #[error("{0}")]
+    LocalControl(String),
+    #[error("failed to encode pairing command output")]
+    PairingOutput(#[source] serde_json::Error),
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
     match Cli::try_parse()?.into_action()? {
         CliAction::Run(config) => run_server(*config).await,
         CliAction::Storage(command) => run_storage_command(command).await,
+        CliAction::Auth(command) => run_auth_command(command).await,
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingCommandOutput {
+    environment_id: persistence::EnvironmentId,
+    credential: String,
+    expires_at: String,
+    pairing_url: String,
+    control_protocol_version: u16,
+}
+
+async fn run_auth_command(command: AuthCommand) -> Result<(), RunError> {
+    let AuthCommand::CreatePairing {
+        root,
+        client_label,
+        format,
+    } = command;
+    let pairing = local_control::client::create_pairing(&root, client_label)
+        .await
+        .map_err(|error| RunError::LocalControl(error.to_string()))?;
+    match format {
+        PairingOutputFormat::Human => {
+            println!("Pairing URL: {}", pairing.pairing_url);
+            println!("Expires at: {}", pairing.expires_at);
+        }
+        PairingOutputFormat::Json => {
+            let output = PairingCommandOutput {
+                environment_id: pairing.environment_id,
+                credential: pairing.credential,
+                expires_at: pairing.expires_at,
+                pairing_url: pairing.pairing_url,
+                control_protocol_version: pairing.control_protocol_version,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&output).map_err(RunError::PairingOutput)?
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_server(config: ServerConfig) -> Result<(), RunError> {

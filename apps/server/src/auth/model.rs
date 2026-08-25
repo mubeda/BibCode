@@ -39,6 +39,15 @@ pub const ADMINISTRATIVE_SCOPES: &[&str] = &[
     SCOPE_RELAY_WRITE,
 ];
 
+pub const ENVIRONMENT_ADMINISTRATOR_SCOPES: &[&str] = &[
+    SCOPE_ORCHESTRATION_READ,
+    SCOPE_ORCHESTRATION_OPERATE,
+    SCOPE_TERMINAL_OPERATE,
+    SCOPE_REVIEW_WRITE,
+    SCOPE_ACCESS_READ,
+    SCOPE_ACCESS_WRITE,
+];
+
 pub const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub const BOOTSTRAP_TOKEN_TYPE: &str = "urn:bibcode:params:oauth:token-type:environment-bootstrap";

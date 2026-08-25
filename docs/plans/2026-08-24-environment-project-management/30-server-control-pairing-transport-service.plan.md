@@ -261,7 +261,7 @@ git commit -m "feat(server): add protected local control channel"
 - Modify: `apps/server/src/auth/model.rs`, `service.rs`
 - Test: `apps/server/tests/cli_smoke.rs`, `local_control.rs`
 
-- [ ] **Step 1: Add failing CLI parsing/output tests**
+- [x] **Step 1: Add failing CLI parsing/output tests**
 
 ```rust
 let action = Cli::try_parse_from([
@@ -272,7 +272,7 @@ assert_matches!(action, CliAction::Auth(AuthCommand::CreatePairing { .. }));
 
 Test human output, JSON output, server-not-running, wrong data root, inaccessible control endpoint, expired reply, and that stdout/stderr never duplicate the credential.
 
-- [ ] **Step 2: Add the exact CLI model**
+- [x] **Step 2: Add the exact CLI model**
 
 ```text
 bibcode auth pairing create [--client-label <label>] [--format human|json] [--base-dir <path>]
@@ -280,11 +280,11 @@ bibcode auth pairing create [--client-label <label>] [--format human|json] [--ba
 
 JSON output contains `environmentId`, `credential`, `expiresAt`, `pairingUrl`, and `controlProtocolVersion`. The URL puts the short-lived credential in the fragment, never the query or server logs.
 
-- [ ] **Step 3: Route CLI requests only through local control**
+- [x] **Step 3: Route CLI requests only through local control**
 
 Resolve the same data-root rules as `serve`, read the durable identity marker, find the endpoint, and send `CreatePairing`. Do not fall back to the HTTP pairing endpoint when control is absent.
 
-- [ ] **Step 4: Grant the fixed administrator scope set**
+- [x] **Step 4: Grant the fixed administrator scope set**
 
 ```rust
 pub const ENVIRONMENT_ADMINISTRATOR_SCOPES: &[&str] = &[
@@ -299,7 +299,12 @@ pub const ENVIRONMENT_ADMINISTRATOR_SCOPES: &[&str] = &[
 
 Ignore no caller-supplied scope list because none exists. Keep named scopes internally for future protocol evolution without presenting permission levels.
 
-- [ ] **Step 5: Run CLI/control tests and commit**
+- [x] **Step 5: Run CLI/control tests and commit**
+
+Progress: native macOS runs pass for CLI parsing/process output, protected
+control issuance, fixed non-Relay administrator scopes, lifecycle, formatting,
+lint, and Clippy. The Windows named-pipe client is implemented, but its native
+execution remains part of Task 3's open Windows validation gate.
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke -- --nocapture

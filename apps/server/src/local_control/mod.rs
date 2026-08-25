@@ -1,5 +1,7 @@
 pub mod protocol;
 
+pub(crate) mod client;
+
 #[cfg(unix)]
 pub mod unix;
 
@@ -17,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ServerConfig,
+    auth::{AuthService, build_pairing_url},
     maintenance::UpdateMaintenance,
     persistence::{EnvironmentId, StatePaths, StorageInstanceId},
 };
@@ -42,6 +45,8 @@ pub(crate) struct ControlDispatcher {
     environment_id: EnvironmentId,
     storage_instance_id: StorageInstanceId,
     server_version: String,
+    auth: AuthService,
+    advertised_base_url: url::Url,
     update_maintenance: Option<Arc<UpdateMaintenance>>,
     main_shutdown: CancellationToken,
 }
@@ -51,20 +56,30 @@ pub(crate) struct LocalControlHandle {
     task: Option<JoinHandle<Result<(), LocalControlError>>>,
 }
 
+pub(crate) struct LocalControlContext {
+    pub environment_id: EnvironmentId,
+    pub storage_instance_id: StorageInstanceId,
+    pub auth: AuthService,
+    pub advertised_base_url: String,
+    pub update_maintenance: Option<Arc<UpdateMaintenance>>,
+    pub main_shutdown: CancellationToken,
+}
+
 pub(crate) async fn start(
     config: &ServerConfig,
     _paths: &StatePaths,
-    environment_id: EnvironmentId,
-    storage_instance_id: StorageInstanceId,
-    update_maintenance: Option<Arc<UpdateMaintenance>>,
-    main_shutdown: CancellationToken,
+    context: LocalControlContext,
 ) -> Result<LocalControlHandle, LocalControlError> {
+    let advertised_base_url = url::Url::parse(&context.advertised_base_url)
+        .map_err(|error| LocalControlError::Prepare(error.to_string()))?;
     let dispatcher = ControlDispatcher {
-        environment_id,
-        storage_instance_id,
+        environment_id: context.environment_id,
+        storage_instance_id: context.storage_instance_id,
         server_version: config.server_version.clone(),
-        update_maintenance,
-        main_shutdown: main_shutdown.clone(),
+        auth: context.auth,
+        advertised_base_url,
+        update_maintenance: context.update_maintenance,
+        main_shutdown: context.main_shutdown.clone(),
     };
     let shutdown = CancellationToken::new();
 
@@ -73,14 +88,14 @@ pub(crate) async fn start(
         .map_err(|error| LocalControlError::Prepare(error.to_string()))?;
 
     #[cfg(windows)]
-    let endpoint = windows::WindowsControlEndpoint::bind(environment_id)
+    let endpoint = windows::WindowsControlEndpoint::bind(context.environment_id)
         .map_err(|error| LocalControlError::Prepare(error.to_string()))?;
 
     #[cfg(not(any(unix, windows)))]
     compile_error!("the BiBCode local control channel requires Unix or Windows");
 
     let task_shutdown = shutdown.clone();
-    let task_main_shutdown = main_shutdown;
+    let task_main_shutdown = context.main_shutdown;
     let task = tokio::spawn(async move {
         let result = endpoint
             .serve(dispatcher, task_shutdown, task_main_shutdown.clone())
@@ -152,10 +167,28 @@ impl ControlDispatcher {
                 storage_instance_id: self.storage_instance_id,
                 server_version: self.server_version.clone(),
             },
-            ControlRequestBody::CreatePairing { client_label: _ } => safe_error(
-                "command_unavailable",
-                "Pairing creation is not available in this server build.",
-            ),
+            ControlRequestBody::CreatePairing { client_label } => {
+                match self
+                    .auth
+                    .issue_environment_administrator_pairing(client_label)
+                    .await
+                {
+                    Ok(pairing) => {
+                        let pairing_url =
+                            build_pairing_url(&self.advertised_base_url, &pairing.credential);
+                        ControlResponseBody::PairingCreated {
+                            environment_id: self.environment_id,
+                            credential: pairing.credential,
+                            expires_at: pairing.expires_at,
+                            pairing_url,
+                        }
+                    }
+                    Err(_) => safe_error(
+                        "pairing_creation_failed",
+                        "The pairing credential could not be created safely.",
+                    ),
+                }
+            }
             ControlRequestBody::ServicePrepareUpdate => {
                 let Some(maintenance) = &self.update_maintenance else {
                     return (

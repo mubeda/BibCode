@@ -118,13 +118,32 @@ filesystem, account, firewall, or purge channel. Public failures contain only a
 stable code and safe message. Pairing values and pairing URLs are redacted from
 debug output.
 
-`Status` and `ServiceStop` are active. Update preparation is active only when
-the desktop maintenance owner exists. `CreatePairing` is reserved but currently
-returns `command_unavailable` until the five-minute, single-use CLI issuance
-flow is implemented. Server shutdown stops control admission, drains accepted
+`Status`, `CreatePairing`, and `ServiceStop` are active. Update preparation is
+active only when the desktop maintenance owner exists. `CreatePairing` issues a
+five-minute, single-use `environment-administrator` credential with the fixed
+orchestration read/operate, terminal operate, review write, and access
+read/write scopes. It has no caller-selected permission list and does not grant
+legacy Relay scopes. Server shutdown stops control admission, drains accepted
 requests, and removes a Unix socket only while its device/inode ownership still
 matches this process; the database and runtime lock remain live until that
 drain completes.
+
+Run the issuance command as an authorized host user while the server is
+running:
+
+```sh
+bibcode auth pairing create \
+  --client-label "Administrator laptop" \
+  --format human \
+  --base-dir /absolute/path/to/bibcode-data
+```
+
+`--format json` emits exactly one JSON document with `environmentId`,
+`credential`, `expiresAt`, `pairingUrl`, and `controlProtocolVersion`. Human
+mode prints the pairing URL and expiry without printing the raw credential a
+second time. The client resolves `--base-dir` with the same rules as `serve`,
+reads the durable environment marker, validates the expiry and URL fragment,
+and never falls back to an HTTP administration endpoint.
 
 ## Standards profile
 

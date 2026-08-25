@@ -246,6 +246,37 @@ enum CliCommand {
     Start,
     #[command(about = "Inspect or explicitly recover offline project data.")]
     Storage(StorageArgs),
+    #[command(about = "Manage environment authentication through local control.")]
+    Auth(AuthArgs),
+}
+
+#[derive(Debug, Args)]
+struct AuthArgs {
+    #[command(subcommand)]
+    command: AuthSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthSubcommand {
+    #[command(about = "Manage one-time pairing credentials.")]
+    Pairing(PairingArgs),
+}
+
+#[derive(Debug, Args)]
+struct PairingArgs {
+    #[command(subcommand)]
+    command: PairingSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairingSubcommand {
+    #[command(about = "Create a five-minute environment administrator pairing.")]
+    Create {
+        #[arg(long)]
+        client_label: Option<String>,
+        #[arg(long, value_enum, default_value_t)]
+        format: PairingOutputFormat,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +313,23 @@ enum StorageSubcommand {
 pub enum CliAction {
     Run(Box<ServerConfig>),
     Storage(StorageCommand),
+    Auth(AuthCommand),
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthCommand {
+    CreatePairing {
+        root: ResolvedDataRoot,
+        client_label: Option<String>,
+        format: PairingOutputFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum PairingOutputFormat {
+    #[default]
+    Human,
+    Json,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +396,8 @@ pub enum ConfigError {
     EmptyDesktopBootstrapToken,
     #[error("storage commands cannot be converted into a server configuration")]
     StorageCommandIsNotServer,
+    #[error("authentication commands cannot be converted into a server configuration")]
+    AuthCommandIsNotServer,
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -378,6 +428,7 @@ impl Cli {
         match self.into_action()? {
             CliAction::Run(config) => Ok(*config),
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
+            CliAction::Auth(_) => Err(ConfigError::AuthCommandIsNotServer),
         }
     }
 
@@ -388,14 +439,7 @@ impl Cli {
         } = self;
         let command = match command {
             Some(CliCommand::Storage(storage)) => {
-                let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
-                let request = select_data_root_request(
-                    args.base_dir,
-                    bibcode_env_var("BIBCODE_HOME"),
-                    None,
-                    home_dir,
-                );
-                let root = crate::data_root::resolve_data_root(request)?;
+                let root = resolve_command_data_root(args.base_dir)?;
                 return Ok(CliAction::Storage(match storage.command {
                     StorageSubcommand::Inspect { json } => StorageCommand::Inspect { root, json },
                     StorageSubcommand::Restore { backup_id, json } => StorageCommand::Restore {
@@ -406,6 +450,19 @@ impl Cli {
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }
                     }
+                }));
+            }
+            Some(CliCommand::Auth(auth)) => {
+                let root = resolve_command_data_root(args.base_dir)?;
+                let AuthSubcommand::Pairing(pairing) = auth.command;
+                let PairingSubcommand::Create {
+                    client_label,
+                    format,
+                } = pairing.command;
+                return Ok(CliAction::Auth(AuthCommand::CreatePairing {
+                    root,
+                    client_label,
+                    format,
                 }));
             }
             command => command,
@@ -472,6 +529,19 @@ impl Cli {
         config.desktop_bootstrap_token = desktop_bootstrap_token;
         Ok(CliAction::Run(Box::new(config)))
     }
+}
+
+fn resolve_command_data_root(
+    cli_base_dir: Option<PathBuf>,
+) -> Result<ResolvedDataRoot, ConfigError> {
+    let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+    let request = select_data_root_request(
+        cli_base_dir,
+        bibcode_env_var("BIBCODE_HOME"),
+        None,
+        home_dir,
+    );
+    Ok(crate::data_root::resolve_data_root(request)?)
 }
 
 fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {

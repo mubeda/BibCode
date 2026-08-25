@@ -4,8 +4,14 @@ use std::{
 };
 
 use bibcode_server::{
-    Cli, ServerConfig, ServerRuntime,
-    persistence::{BackupTrigger, StatePaths, create_verified_backup, prepare_store},
+    AuthCommand, Cli, CliAction, PairingOutputFormat, ServerConfig, ServerRuntime,
+    local_control::protocol::{
+        CONTROL_PROTOCOL_VERSION, ControlResponse, ControlResponseBody, read_request,
+        write_response,
+    },
+    persistence::{
+        BackupTrigger, EnvironmentId, StatePaths, create_verified_backup, prepare_store,
+    },
     resolve_data_root,
 };
 use clap::Parser;
@@ -36,6 +42,256 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }
+}
+
+#[test]
+fn pairing_create_cli_has_the_exact_nested_model_and_resolves_its_data_root() {
+    let root = TempDir::new().expect("temporary pairing root");
+    let action = Cli::try_parse_from([
+        "bibcode",
+        "auth",
+        "pairing",
+        "create",
+        "--client-label",
+        "Administrator laptop",
+        "--format",
+        "json",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ])
+    .expect("pairing arguments parse")
+    .into_action()
+    .expect("pairing action resolves");
+
+    let CliAction::Auth(AuthCommand::CreatePairing {
+        root: resolved,
+        client_label,
+        format,
+    }) = action
+    else {
+        panic!("unexpected CLI action: {action:?}");
+    };
+    assert_eq!(resolved.effective, root.path().canonicalize().unwrap());
+    assert_eq!(client_label.as_deref(), Some("Administrator laptop"));
+    assert_eq!(format, PairingOutputFormat::Json);
+}
+
+#[tokio::test]
+async fn pairing_create_prints_one_secret_bearing_document_only_on_stdout() {
+    let root = TempDir::new().expect("temporary pairing root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start pairing server");
+
+    let json_output = pairing_cli_output(&root, "json", Some("Administrator laptop")).await;
+    assert!(
+        json_output.status.success(),
+        "pairing CLI failed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&json_output.stdout)
+            .trim()
+            .lines()
+            .count(),
+        1,
+        "JSON mode must emit one document"
+    );
+    let json: Value = serde_json::from_slice(&json_output.stdout).expect("pairing JSON");
+    let credential = json["credential"].as_str().expect("pairing credential");
+    let pairing_url = json["pairingUrl"].as_str().expect("pairing URL");
+    assert_eq!(json["controlProtocolVersion"], CONTROL_PROTOCOL_VERSION);
+    let expected_environment_id =
+        std::fs::read_to_string(root.path().join("userdata").join("environment-id"))
+            .expect("environment identity marker");
+    assert_eq!(json["environmentId"], expected_environment_id.trim());
+    assert!(json["expiresAt"].as_str().is_some());
+    let parsed_url = url::Url::parse(pairing_url).expect("valid pairing URL");
+    assert!(parsed_url.query().is_none());
+    assert_eq!(
+        parsed_url
+            .fragment()
+            .and_then(|fragment| url::form_urlencoded::parse(fragment.as_bytes())
+                .find_map(|(key, value)| (key == "token").then(|| value.into_owned())))
+            .as_deref(),
+        Some(credential)
+    );
+    assert!(
+        !String::from_utf8_lossy(&json_output.stderr).contains(credential),
+        "the credential must never be duplicated to stderr"
+    );
+
+    let human_output = pairing_cli_output(&root, "human", None).await;
+    assert!(human_output.status.success());
+    let human = String::from_utf8(human_output.stdout).expect("human pairing output");
+    assert!(human.starts_with("Pairing URL: "));
+    assert!(human.contains("\nExpires at: "));
+    assert!(human_output.stderr.is_empty());
+    let human_url = human
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Pairing URL: "))
+        .expect("human pairing URL");
+    let human_url = url::Url::parse(human_url).expect("valid human pairing URL");
+    let human_credential = human_url
+        .fragment()
+        .and_then(|fragment| {
+            url::form_urlencoded::parse(fragment.as_bytes())
+                .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
+        })
+        .expect("human pairing credential fragment");
+    assert_eq!(human.matches(&human_credential).count(), 1);
+
+    handle.shutdown();
+    handle.join().await.expect("join pairing server");
+}
+
+#[tokio::test]
+async fn pairing_create_distinguishes_wrong_root_from_a_stopped_server() {
+    let wrong_root = TempDir::new().expect("wrong pairing root");
+    let wrong = pairing_cli_output(&wrong_root, "json", None).await;
+    assert!(!wrong.status.success());
+    assert!(wrong.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("does not contain a BiBCode environment")
+    );
+
+    let stopped_root = TempDir::new().expect("stopped pairing root");
+    let handle =
+        ServerRuntime::start(ServerConfig::new(stopped_root.path()).with_bind("127.0.0.1", 0))
+            .await
+            .expect("seed stopped environment");
+    handle.shutdown();
+    handle.join().await.expect("stop seeded environment");
+    let stopped = pairing_cli_output(&stopped_root, "human", None).await;
+    assert!(!stopped.status.success());
+    assert!(stopped.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stopped.stderr).contains("server is not running"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pairing_create_rejects_inaccessible_and_expired_control_replies_without_secret_leakage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let inaccessible_root = TempDir::new().expect("inaccessible pairing root");
+    let inaccessible_state = inaccessible_root.path().join("userdata");
+    let inaccessible_run = inaccessible_state.join("run");
+    std::fs::create_dir_all(&inaccessible_run).expect("create inaccessible state");
+    std::fs::set_permissions(&inaccessible_run, std::fs::Permissions::from_mode(0o700))
+        .expect("secure inaccessible run directory");
+    std::fs::write(
+        inaccessible_state.join("environment-id"),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .expect("write inaccessible marker");
+    std::fs::write(inaccessible_run.join("control.sock"), b"not a socket")
+        .expect("write inaccessible endpoint fixture");
+    let inaccessible = pairing_cli_output(&inaccessible_root, "json", None).await;
+    assert!(!inaccessible.status.success());
+    assert!(inaccessible.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&inaccessible.stderr)
+            .contains("control endpoint cannot be reached")
+    );
+
+    let http_only_root = TempDir::new().expect("HTTP-only pairing root");
+    let http_only_handle =
+        ServerRuntime::start(ServerConfig::new(http_only_root.path()).with_bind("127.0.0.1", 0))
+            .await
+            .expect("start server before hiding local control");
+    let control_socket = http_only_root
+        .path()
+        .join("userdata")
+        .join("run")
+        .join("control.sock");
+    std::fs::rename(
+        &control_socket,
+        control_socket.with_file_name("hidden-control.sock"),
+    )
+    .expect("hide control endpoint while HTTP remains active");
+    let http_only = pairing_cli_output(&http_only_root, "json", None).await;
+    assert!(
+        !http_only.status.success(),
+        "pairing CLI must not fall back to the live HTTP server"
+    );
+    assert!(http_only.stdout.is_empty());
+    assert!(
+        reqwest::get(format!(
+            "{}/.well-known/bibcode/environment",
+            http_only_handle.advertised_base_url()
+        ))
+        .await
+        .expect("HTTP server remains reachable")
+        .status()
+        .is_success()
+    );
+    http_only_handle.shutdown();
+    http_only_handle
+        .join()
+        .await
+        .expect("join HTTP-only server");
+
+    let expired_root = TempDir::new().expect("expired pairing root");
+    let expired_state = expired_root.path().join("userdata");
+    let expired_run = expired_state.join("run");
+    std::fs::create_dir_all(&expired_run).expect("create expired state");
+    std::fs::set_permissions(&expired_run, std::fs::Permissions::from_mode(0o700))
+        .expect("secure expired run directory");
+    let environment_id = EnvironmentId::from_uuid(uuid::Uuid::new_v4());
+    std::fs::write(
+        expired_state.join("environment-id"),
+        environment_id.to_string(),
+    )
+    .expect("write expired marker");
+    let socket = expired_run.join("control.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake control endpoint");
+    let secret = "PAIRINGSECRET".to_owned();
+    let server_secret = secret.clone();
+    let responder = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept pairing CLI");
+        let request = read_request(&mut stream)
+            .await
+            .expect("read pairing request");
+        write_response(
+            &mut stream,
+            &ControlResponse {
+                version: CONTROL_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                body: ControlResponseBody::PairingCreated {
+                    environment_id,
+                    credential: server_secret.clone(),
+                    expires_at: "2000-01-01T00:00:00Z".to_owned(),
+                    pairing_url: format!("https://environment.invalid/pair#token={server_secret}"),
+                },
+            },
+        )
+        .await
+        .expect("write expired response");
+    });
+    let expired = pairing_cli_output(&expired_root, "json", None).await;
+    responder.await.expect("fake control responder");
+    assert!(!expired.status.success());
+    assert!(expired.stdout.is_empty());
+    let error = String::from_utf8(expired.stderr).expect("expired CLI error");
+    assert!(error.contains("expired"), "{error}");
+    assert!(!error.contains(&secret));
+}
+
+async fn pairing_cli_output(
+    root: &TempDir,
+    format: &str,
+    client_label: Option<&str>,
+) -> std::process::Output {
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"));
+    command
+        .args(["auth", "pairing", "create", "--base-dir"])
+        .arg(root.path())
+        .args(["--format", format]);
+    if let Some(client_label) = client_label {
+        command.args(["--client-label", client_label]);
+    }
+    command.output().await.expect("run pairing CLI")
 }
 
 #[tokio::test]

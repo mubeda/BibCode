@@ -17,8 +17,8 @@ use super::{
     dpop::DpopVerifier,
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
-        ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView, Principal,
-        STANDARD_SCOPES,
+        ClientMetadata, ClientSessionView, ENVIRONMENT_ADMINISTRATOR_SCOPES,
+        PairingCredentialResult, PairingLinkView, Principal, STANDARD_SCOPES,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -533,6 +533,20 @@ impl AuthService {
             owned_scopes(ADMINISTRATIVE_SCOPES),
             None,
             "administrative-bootstrap",
+            None,
+            PAIRING_TTL_MS,
+        )
+        .await
+    }
+
+    pub(crate) async fn issue_environment_administrator_pairing(
+        &self,
+        label: Option<String>,
+    ) -> Result<PairingCredentialResult, AuthError> {
+        self.issue_pairing_for_subject(
+            owned_scopes(ENVIRONMENT_ADMINISTRATOR_SCOPES),
+            label,
+            "environment-administrator",
             None,
             PAIRING_TTL_MS,
         )
@@ -1117,6 +1131,17 @@ pub fn parse_scopes(value: &str) -> Result<Vec<String>, AuthError> {
 #[must_use]
 pub fn owned_scopes(scopes: &[&str]) -> Vec<String> {
     scopes.iter().map(|scope| (*scope).to_owned()).collect()
+}
+
+pub(crate) fn build_pairing_url(advertised_base_url: &url::Url, credential: &str) -> String {
+    let mut pairing_url = advertised_base_url.clone();
+    pairing_url.set_path("/pair");
+    pairing_url.set_query(None);
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("token", credential)
+        .finish();
+    pairing_url.set_fragment(Some(&fragment));
+    pairing_url.to_string()
 }
 
 #[must_use]
