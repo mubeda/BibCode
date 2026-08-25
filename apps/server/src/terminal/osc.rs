@@ -7,9 +7,12 @@
 //!   terminal's foreground/background/cursor color.
 //! - **DEC private mode 2031 + `DSR ? 996`** — the modern in-band dark/light
 //!   scheme protocol (contour/foot/ghostty). Enabling mode 2031
-//!   (`CSI ? 2031 h`) or querying with `CSI ? 996 n` must be answered with the
-//!   current scheme: `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light).
-//!   OpenCode uses this one, not OSC 11.
+//!   (`CSI ? 2031 h`) or querying with `CSI ? 996 n` is answered with
+//!   `CSI ? 997 ; 1 n` only when the configured background is dark. Light
+//!   schemes are left unanswered: reporting `997;2` forces Claude Code into a
+//!   light fullscreen Ink path that fails under BiBCode's xterm host. Codex
+//!   and similar agents detect light terminals via OSC 10/11 instead.
+//!   OpenCode still receives dark-scheme reports when the terminal is dark.
 //!
 //! xterm.js implements neither reliably in this embedded terminal — an OSC
 //! color reply would travel back through an async websocket + RPC path that
@@ -272,14 +275,14 @@ impl OscColorResponder {
                     }
                 }
                 ThemeQuery::ColorScheme => {
-                    if let Some(dark) = self.colors.prefers_dark() {
-                        // CSI ? 997 ; 1 n = dark, ; 2 n = light.
-                        let scheme = if dark {
-                            b"\x1b[?997;1n"
-                        } else {
-                            b"\x1b[?997;2n"
-                        };
-                        reply.extend_from_slice(scheme);
+                    // Only report dark schemes. A light `CSI ? 997 ; 2 n` reply
+                    // pushes Claude Code into its light fullscreen Ink path,
+                    // which repeatedly fails inside BiBCode's xterm host and
+                    // leaves a garbled fallback UI. Codex (and similar) detect
+                    // light/dark via OSC 10/11 instead, so leaving light
+                    // unanswered keeps both agents working.
+                    if self.colors.prefers_dark() == Some(true) {
+                        reply.extend_from_slice(b"\x1b[?997;1n");
                     }
                 }
             }
@@ -425,15 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn answers_color_scheme_mode_enable_for_light_background() {
+    fn leaves_color_scheme_unanswered_for_light_background() {
+        // Light `997;2` replies force Claude's fullscreen renderer into a path
+        // that fails under xterm.js; OSC 10/11 still answer for Codex.
         let mut responder = OscColorResponder::new(bg([255, 255, 255]));
-        assert_eq!(responder.process(b"\x1b[?2031h"), b"\x1b[?997;2n");
+        assert!(responder.process(b"\x1b[?2031h").is_empty());
+        assert!(responder.process(b"\x1b[?996n").is_empty());
     }
 
     #[test]
-    fn answers_color_scheme_query() {
-        let mut responder = OscColorResponder::new(bg([255, 255, 255]));
-        assert_eq!(responder.process(b"\x1b[?996n"), b"\x1b[?997;2n");
+    fn answers_color_scheme_query_for_dark_background() {
+        let mut responder = OscColorResponder::new(bg([14, 18, 24]));
+        assert_eq!(responder.process(b"\x1b[?996n"), b"\x1b[?997;1n");
     }
 
     #[test]

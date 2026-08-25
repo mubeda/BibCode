@@ -109,6 +109,19 @@ export function mergeTerminalSpawnEnv(input: {
   };
 }
 
+/** Codex snapshots OSC (and on Windows, ConPTY) colors at spawn; live xterm theme changes leave unreadable UI. */
+export function usesPersistentWindowsConsoleTheme(command: {
+  readonly executable: string;
+  readonly args: ReadonlyArray<string>;
+} | null | undefined): boolean {
+  if (!command) return false;
+  const executable = command.executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
+  return (
+    executable.includes("codex") ||
+    command.args.includes("--dangerously-bypass-approvals-and-sandbox")
+  );
+}
+
 export function retainTerminalLaunchTheme(
   previous: TerminalLaunchThemeState | null,
   input: {
