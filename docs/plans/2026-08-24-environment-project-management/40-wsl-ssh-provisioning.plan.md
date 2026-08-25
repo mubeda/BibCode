@@ -1,0 +1,494 @@
+# WSL And SSH Discovery, Provisioning, And Transport Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Present every running WSL distribution as an environment, retain accepted stopped distributions without starting them, and provide consent-based Linux, macOS, and Windows OpenSSH enrollment that can securely install, pair, and tunnel BiBCode Server.
+
+**Architecture:** The Tauri desktop remains the host authority. A generation-fenced WSL discovery service emits typed snapshots and reconciles platform bindings by proved server identity. WSL servers listen only on distro loopback and are reached through a desktop-owned loopback-to-`wsl.exe` byte forwarder. SSH enrollment is a staged state machine—trust, probe, consent, artifact transfer, atomic install, service start, tunnel, descriptor verification, pairing—implemented by constant OS-specific command adapters rather than client-authored scripts.
+
+**Tech Stack:** Rust 2024, Tokio process/I/O supervision, Tauri 2 commands/events, Windows `wsl.exe`, OpenSSH client tools, PowerShell, POSIX utilities, TypeScript 7, Effect 4, Effect Schema, IndexedDB platform bindings, release artifact manifest from Plan 70.
+
+**Spec:** [Connection, security, and lifecycle specification](./03-connection-security-and-lifecycle.spec.md) and [distribution specification](./05-distribution-docs-and-verification.spec.md)
+
+## Global Constraints
+
+- A WSL distro name or SSH target is a locator, never environment identity. Only a verified descriptor UUID binds it to a known environment.
+- Every Running WSL distro is visible by default. Previously accepted Stopped distros remain visible; unaccepted stopped distros appear only in Add Environment.
+- BiBCode never starts a stopped WSL distro automatically and never invokes `wsl --unregister`.
+- WSL enumeration is triggered by startup/focus/manual refresh/lifecycle events plus low-frequency bounded reconciliation; the renderer does not poll every three seconds.
+- WSL server HTTP/WS listens on WSL loopback. No WSL wildcard plaintext exception survives Plan 30.
+- A missing WSL server produces `Setup required`; installation requires explicit consent and does not change the distro's default/user/system settings silently.
+- SSH host-key changes block. Unknown keys follow native OpenSSH confirmation policy; BiBCode never inserts `StrictHostKeyChecking=no` or edits known_hosts behind the user.
+- Descriptor, storage identity, protocol, and transport trust are verified before a one-time pairing credential is consumed.
+- Provisioning never requires the remote host to access the internet; the desktop downloads and verifies bytes, then transfers them.
+- No arbitrary client-provided remote script is executed. OS adapters own fixed commands and pass user data only as validated argv/stdin values.
+- Every owned `wsl.exe`, `ssh`, `scp`/SFTP, and forwarding child has cancellation, output bounds, timeout, and terminate/reap ownership.
+- Current worktree path routing, WSL folder picking, Git discovery, adoption, removal plans, and process cleanup remain intact.
+
+---
+
+## File Structure
+
+- Modify: `packages/contracts/src/ipc.ts`, `ipc.test.ts` — WSL discovery, SSH probe/provision, progress, and cancellation contracts.
+- Create: `packages/contracts/src/serverArtifact.ts`, `serverArtifact.test.ts` — installer manifest selection schema shared with Plan 70.
+- Create: `apps/desktop/src-tauri/src/wsl.rs` — bounded discovery and structured WSL commands.
+- Create: `apps/desktop/src-tauri/src/wsl_transport.rs` — Windows-loopback to WSL-loopback forwarding.
+- Modify: `apps/desktop/src-tauri/src/backend.rs`, `bridge.rs`, `lib.rs` — multi-distro reconciliation and bridge ownership.
+- Modify: `apps/desktop/src-tauri/src/ssh.rs` — staged SSH manager and owned process cleanup.
+- Create: `apps/desktop/src-tauri/src/remote_host/mod.rs`, `model.rs`, `linux.rs`, `macos.rs`, `windows.rs` — structured probe/install/service adapters.
+- Modify: `apps/desktop/src-tauri/permissions/desktop-bridge.toml` — exact new commands/events.
+- Modify: `apps/web/src/tauriDesktopBridge.ts`, tests — bridge decoding and event subscription.
+- Modify: `apps/web/src/connection/platform.ts`, tests — descriptor-first enrollment and route persistence.
+- Modify: `apps/web/src/connection/useDesktopLocalBootstraps.ts` — event/focus refresh instead of constant polling.
+- Modify: `apps/web/src/state/desktopWslState.ts`, tests — generation-fenced discovery state.
+- Test: `apps/desktop/src-tauri/tests/bridge_public_contract.rs`, `ssh_public_contract.rs`.
+
+### Task 1: Define complete WSL discovery and staged provisioning contracts
+
+**Files:**
+
+- Modify: `packages/contracts/src/ipc.ts`, `ipc.test.ts`
+- Create: `packages/contracts/src/serverArtifact.ts`, `serverArtifact.test.ts`
+- Modify: `packages/contracts/src/index.ts`
+
+- [ ] **Step 1: Write failing schema fixtures**
+
+Cover Running/Stopped, default marker, WSL1/WSL2, partial valid rows, discovery unavailable/timeout/permission error, stale generations, SSH Linux/macOS/Windows probes, install consent, progress, cancellation, and manifest mismatch.
+
+- [ ] **Step 2: Replace the incomplete WSL row**
+
+```ts
+export const DesktopWslDistroSchema = Schema.Struct({
+  name: Schema.String,
+  isDefault: Schema.Boolean,
+  state: Schema.Literals(["running", "stopped"]),
+  version: Schema.Literals([1, 2]),
+});
+
+export const DesktopWslDiscoverySchema = Schema.Struct({
+  generation: Schema.Number,
+  observedAt: Schema.String,
+  health: Schema.Literals(["available", "disabled", "missing", "timedOut", "failed"]),
+  detail: Schema.NullOr(Schema.String),
+  distros: Schema.Array(DesktopWslDistroSchema),
+});
+```
+
+Keep the last good snapshot separate from current discovery health so a transient command failure cannot erase accepted rows.
+
+- [ ] **Step 3: Define a staged SSH/WSL setup model**
+
+```ts
+export const RemoteHostProbeSchema = Schema.Struct({
+  os: Schema.Literals(["linux", "macos", "windows"]),
+  architecture: Schema.Literals(["x86_64", "aarch64"]),
+  installedVersion: Schema.NullOr(Schema.String),
+  serviceMode: Schema.NullOr(Schema.Literals(["workstation", "headless"])),
+  serviceState: Schema.Literals(["notInstalled", "stopped", "running", "failed"]),
+  dataRoot: Schema.NullOr(Schema.String),
+  controlAvailable: Schema.Boolean,
+});
+```
+
+Add request IDs and stages `trust`, `probe`, `download`, `verify`, `transfer`, `install`, `start`, `tunnel`, `verifyIdentity`, `pair`; progress contains bounded counts, never credentials.
+
+- [ ] **Step 4: Define artifact selection without filename guessing**
+
+```ts
+export const ServerArtifactRecordSchema = Schema.Struct({
+  product: Schema.Literal("bibcode-server"),
+  version: Schema.String,
+  os: Schema.Literals(["linux", "macos", "windows"]),
+  architecture: Schema.Literals(["x86_64", "aarch64", "universal"]),
+  format: Schema.Literals(["zip", "tar.gz", "msi", "pkg", "deb", "rpm"]),
+  downloadName: Schema.String,
+  size: Schema.Number,
+  sha256: Schema.String,
+  signatureName: Schema.String,
+});
+```
+
+Plan 40 consumes fixture/remote manifests. Plan 70 builds and publishes the authoritative manifest and runs end-to-end artifact resolution.
+
+- [ ] **Step 5: Run schema tests and commit**
+
+```sh
+vp test packages/contracts/src/ipc.test.ts packages/contracts/src/serverArtifact.test.ts
+git add packages/contracts/src/ipc.ts packages/contracts/src/ipc.test.ts packages/contracts/src/serverArtifact.ts packages/contracts/src/serverArtifact.test.ts packages/contracts/src/index.ts
+git commit -m "feat(contracts): model WSL discovery and remote provisioning"
+```
+
+### Task 2: Extract bounded asynchronous WSL discovery from the bridge
+
+**Files:**
+
+- Create: `apps/desktop/src-tauri/src/wsl.rs`
+- Modify: `apps/desktop/src-tauri/src/bridge.rs`, `lib.rs`
+- Test: `apps/desktop/src-tauri/src/wsl.rs`
+- Test: `apps/desktop/src-tauri/tests/bridge_public_contract.rs`
+
+- [ ] **Step 1: Move current parser fixtures into failing state-aware tests**
+
+```rust
+assert_eq!(parse_wsl_verbose(utf16_fixture()).unwrap().distros, vec![
+    WslDistro { name: "Ubuntu".into(), is_default: true, state: Running, version: 2 },
+    WslDistro { name: "Debian".into(), is_default: false, state: Stopped, version: 2 },
+]);
+```
+
+Add BOM/no-BOM UTF-16LE, UTF-8, localized whitespace, names with spaces, malformed row isolation, empty output, missing executable, disabled feature, nonzero exit, output cap, and timeout.
+
+- [ ] **Step 2: Implement an owned discovery service**
+
+```rust
+pub struct WslDiscoveryService {
+    generation: AtomicU64,
+    refresh_gate: Mutex<()>,
+    last_good: RwLock<Option<WslDiscoverySnapshot>>,
+    cancellation: CancellationToken,
+}
+```
+
+Spawn `wsl.exe --list --verbose` with `CREATE_NO_WINDOW`, a 10-second deadline, a 1 MiB combined-output cap, and cancellation. A newer requested generation supersedes late output.
+
+- [ ] **Step 3: Emit one typed event**
+
+Add `desktop:wsl-discovery-changed`; emit after startup discovery, application focus, explicit refresh, accepted-binding changes, and backend lifecycle changes. Coalesce concurrent refreshes.
+
+- [ ] **Step 4: Add low-frequency reconciliation**
+
+While the desktop is active, reconcile no more frequently than once per minute, relax to five minutes after stable snapshots, and back off to fifteen minutes after repeated failures. Stop the timer when the app exits; this is a missed-event safety net, not UI polling.
+
+- [ ] **Step 5: Run native/parser tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl:: -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test bridge_public_contract -- --nocapture
+git add apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/tests/bridge_public_contract.rs
+git commit -m "feat(desktop): discover all WSL distributions safely"
+```
+
+### Task 3: Reconcile WSL platform bindings without locator identity
+
+**Files:**
+
+- Modify: `apps/desktop/src-tauri/src/backend.rs`, `bridge.rs`
+- Modify: `packages/contracts/src/ipc.ts`
+- Modify: `apps/web/src/state/desktopWslState.ts`, tests
+- Modify: `apps/web/src/connection/storage.ts`, tests
+
+- [ ] **Step 1: Write failing reconciliation tables**
+
+Cover new Running -> visible/setup required; new Stopped -> discovery only; accepted Stopped -> visible/stopped; Running with same descriptor after rename -> same environment; reused name with different UUID -> blocked identity conflict; missing snapshot -> retained unavailable; stale generation -> ignored; user Hide -> hidden but binding retained.
+
+- [ ] **Step 2: Persist a locator binding distinct from identity**
+
+```ts
+type WslPlatformBinding = {
+  bindingId: string;
+  distroName: string;
+  acceptedEnvironmentId: EnvironmentId | null;
+  acceptedStorageInstanceIds: readonly StorageInstanceId[];
+  acceptedAt: string | null;
+  lastDiscoveryGeneration: number;
+};
+```
+
+The binding can exist before setup with `acceptedEnvironmentId = null`. A proved descriptor atomically attaches it to the catalog environment from Plan 20.
+
+- [ ] **Step 3: Replace one-selected-distro backend planning**
+
+Plan one backend candidate per Running distro, not `wsl_backend_enabled + wsl_distro`. Keep legacy desktop settings only as a migration input that marks the prior distro accepted, then stop writing them.
+
+- [ ] **Step 4: Preserve worktree routing**
+
+Replace `wsl:<name>` as public identity with a binding lookup. Folder picker, open-in-editor, terminal, Git, worktree discovery/adoption/removal, and process ownership resolve `environmentId -> binding -> distroName`. No Git/worktree record stores the mutable distro name as identity.
+
+- [ ] **Step 5: Run state/storage/backend tests and commit**
+
+```sh
+vp test apps/web/src/state/desktopWslState.test.ts apps/web/src/connection/storage.test.ts
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop backend:: -- --nocapture
+git add apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts apps/web/src/state/desktopWslState.ts apps/web/src/state/desktopWslState.test.ts apps/web/src/connection/storage.ts apps/web/src/connection/storage.test.ts
+git commit -m "feat(environments): reconcile WSL bindings by server identity"
+```
+
+### Task 4: Replace WSL wildcard HTTP with a desktop-owned loopback forwarder
+
+**Files:**
+
+- Create: `apps/desktop/src-tauri/src/wsl_transport.rs`
+- Modify: `apps/desktop/src-tauri/src/backend.rs`, `lib.rs`
+- Modify: `apps/server/src/config.rs`, `lib.rs`
+- Test: `apps/desktop/src-tauri/src/wsl_transport.rs`
+- Test: `apps/server/tests/cli_smoke.rs`, `network_admission.rs`
+
+- [ ] **Step 1: Add failing transport security/lifecycle tests**
+
+Assert server argv uses `--host 127.0.0.1`, the Windows-facing listener binds only `127.0.0.1`/`::1`, byte streams preserve HTTP upgrade/WebSocket traffic, cancellation closes both halves, stalled copies time out only during setup, and all `wsl.exe` children are reaped.
+
+- [ ] **Step 2: Add a narrowly scoped internal forward command**
+
+```text
+bibcode transport stdio-forward --loopback-port <u16>
+```
+
+The command accepts no host, URL, path, or shell input. It connects only to `127.0.0.1:<port>`, copies stdin/stdout bidirectionally with bounded setup, and exits when either side closes.
+
+- [ ] **Step 3: Implement the Windows loopback proxy**
+
+For each accepted Windows-loopback connection, spawn:
+
+```text
+wsl.exe --distribution <validated-name> --exec <verified-bibcode-path> transport stdio-forward --loopback-port <port>
+```
+
+Pipe the socket to child stdin/stdout, bound stderr, associate the process with the desktop job/reaper, and generation-fence publication of the proxy URL.
+
+- [ ] **Step 4: Remove insecure WSL admission exceptions**
+
+Delete `WSL_BACKEND_BIND_HOST = "0.0.0.0"`, wildcard backend plans, and auth/service allowances keyed solely by `desktop_wsl_transport`. WSL ordinary traffic now arrives at the server on distro loopback and retains normal environment authentication.
+
+- [ ] **Step 5: Run transport/admission tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl_transport -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test network_admission -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke transport -- --nocapture
+git add apps/desktop/src-tauri/src/wsl_transport.rs apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/lib.rs apps/server/src/config.rs apps/server/src/lib.rs apps/server/tests/cli_smoke.rs apps/server/tests/network_admission.rs
+git commit -m "fix(wsl): forward loopback traffic without wildcard HTTP"
+```
+
+### Task 5: Add explicit WSL server setup and version reconciliation
+
+**Files:**
+
+- Modify: `apps/desktop/src-tauri/src/wsl.rs`, `bridge.rs`, `backend.rs`
+- Modify: `apps/desktop/src-tauri/src/updates.rs`
+- Modify: `packages/contracts/src/ipc.ts`
+- Test: `apps/desktop/src-tauri/src/wsl.rs`, `bridge.rs`
+
+- [ ] **Step 1: Write failing probe/install/cancel tests**
+
+Cover absent binary, compatible binary, incompatible protocol, wrong architecture, checksum/signature failure, no `tar`, disk full, cancellation mid-transfer, failed atomic rename, previous version preservation, stopped distro, and concurrent setup requests.
+
+- [ ] **Step 2: Probe without starting stopped distros**
+
+Only run commands for a distro in a fresh authoritative Running snapshot. Use structured `wsl.exe --distribution <name> --exec <program> <args...>` calls to read `uname -m`, locate the managed binary, and execute `bibcode storage inspect --json`/descriptor probe as available.
+
+- [ ] **Step 3: Present consent before mutation**
+
+Return exact version, architecture, verified source, download size, install destination under the distro user's home, data location, process/service behavior, and required commands. The bridge executes setup only with the matching one-time consent/probe generation.
+
+- [ ] **Step 4: Transfer and install atomically**
+
+Resolve the Linux portable artifact from the signed manifest, verify signature and SHA-256 on Windows, stream it with bounded memory to a distro temp file, verify SHA-256 again in WSL, extract into a versioned directory, then atomically switch the managed `current` link. Preserve the old version until descriptor verification succeeds.
+
+- [ ] **Step 5: Launch under current desktop ownership rules**
+
+Start the server only for Running distros, on distro loopback, with the existing data-root/process-group/log/restart policies and the Plan 4 transport. A setup failure leaves the row visible with actionable recovery and never fabricates an online environment.
+
+- [ ] **Step 6: Run WSL setup tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl::tests::setup -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop backend::tests::wsl -- --nocapture
+git add apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/src/backend.rs apps/desktop/src-tauri/src/updates.rs packages/contracts/src/ipc.ts
+git commit -m "feat(wsl): provision verified server runtimes with consent"
+```
+
+### Task 6: Split SSH trust/probe/tunnel/descriptor/pairing stages
+
+**Files:**
+
+- Modify: `apps/desktop/src-tauri/src/ssh.rs`, `bridge.rs`
+- Modify: `apps/web/src/connection/platform.ts`, tests
+- Modify: `packages/contracts/src/ipc.ts`
+- Test: `apps/desktop/src-tauri/tests/ssh_public_contract.rs`
+
+- [ ] **Step 1: Write a failing ordering test**
+
+Record operations and require:
+
+```text
+sshTrust -> probe -> ensureServer -> openTunnel -> fetchDescriptor
+-> verifyEnvironmentAndStorage -> createPairing -> redeemPairing -> persistRoute
+```
+
+Assert descriptor/storage/version/TLS failures never call pairing creation or redemption.
+
+- [ ] **Step 2: Replace `ensure_environment(issuePairingToken)` with staged methods**
+
+```rust
+pub async fn probe(&self, target: &SshEnvironmentTarget) -> Result<RemoteHostProbe, SshError>;
+pub async fn ensure_tunnel(&self, target: &SshEnvironmentTarget, port: u16) -> Result<SshTunnel, SshError>;
+pub async fn create_pairing(&self, target: &SshEnvironmentTarget) -> Result<SecretString, SshError>;
+```
+
+Remove `pairingToken` from `DesktopSshEnvironmentBootstrap`; a pairing credential is returned only from the explicit post-verification command and passed directly to secure redemption/storage.
+
+- [ ] **Step 3: Preserve native host-key policy**
+
+Use the user's OpenSSH config and known_hosts resolution, never suppress host checking, surface changed/unknown-key results distinctly, and record only a non-secret host-key fingerprint after successful trust.
+
+- [ ] **Step 4: Update the client platform flow**
+
+Delete the current `ensure -> pairing -> descriptor` ordering. Feed tunnel metadata into Plan 20 route verification, compare the descriptor to any accepted identities, then request/redeem pairing and immediately put resulting secret material in the OS secret provider.
+
+- [ ] **Step 5: Run SSH ordering and platform tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
+vp test apps/web/src/connection/platform.test.ts
+git add apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/tests/ssh_public_contract.rs apps/web/src/connection/platform.ts apps/web/src/connection/platform.test.ts packages/contracts/src/ipc.ts
+git commit -m "fix(ssh): verify remote identity before pairing"
+```
+
+### Task 7: Add Linux, macOS, and Windows remote adapters and consent-based install
+
+**Files:**
+
+- Create: `apps/desktop/src-tauri/src/remote_host/mod.rs`, `model.rs`, `linux.rs`, `macos.rs`, `windows.rs`
+- Modify: `apps/desktop/src-tauri/src/ssh.rs`, `lib.rs`, `bridge.rs`
+- Modify: `packages/contracts/src/ipc.ts`
+- Test: `apps/desktop/src-tauri/src/remote_host/*.rs`
+
+- [ ] **Step 1: Write command-generation and parser tests before adapters**
+
+Use hostile but valid host aliases/usernames/paths to prove no shell interpolation. Cover Linux GNU and minimal POSIX, macOS, Windows OpenSSH PowerShell, x86_64/ARM64, missing utilities, noninteractive privilege denial, service modes, and bounded noisy output.
+
+- [ ] **Step 2: Define a constant-command adapter boundary**
+
+```rust
+pub trait RemoteHostAdapter {
+    fn probe_commands(&self) -> Vec<RemoteCommand>;
+    fn stage_commands(&self, input: &VerifiedArtifact) -> Vec<RemoteCommand>;
+    fn install_commands(&self, input: &StagedArtifact) -> Vec<RemoteCommand>;
+    fn service_commands(&self, mode: ServiceMode) -> Vec<RemoteCommand>;
+}
+
+pub struct RemoteCommand {
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub stdin: RemoteStdin,
+    pub timeout: Duration,
+    pub max_output_bytes: usize,
+}
+```
+
+No field contains an opaque shell script. The PowerShell adapter uses repository-owned constant encoded commands with values passed as separately encoded arguments.
+
+- [ ] **Step 3: Implement platform probing**
+
+Probe OS/arch, installed binary/version, service status/mode, data root, local control availability, free space, and required install authority. Never read provider credentials, project lists, paths outside managed locations, or unrelated host inventory.
+
+- [ ] **Step 4: Implement verified transfer and atomic install**
+
+The desktop downloads the exact manifest record, streams while hashing, verifies detached signature/checksum, transfers to a random remote staging path, verifies again remotely, then invokes platform-native MSI/PKG/DEB/RPM or portable install with explicit mode. Keep the previous binary/service definition until health and identity verification succeeds.
+
+- [ ] **Step 5: Surface explicit partial-state recovery**
+
+Return a typed stage, mutation status, preserved version, cleanup outcome, and fixed recovery command. Never silently switch install target, mode, data root, or architecture.
+
+- [ ] **Step 6: Run adapter/provision tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop remote_host:: -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests::provision -- --nocapture
+git add apps/desktop/src-tauri/src/remote_host apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts
+git commit -m "feat(ssh): provision Linux macOS and Windows servers"
+```
+
+### Task 8: Fence cancellation, concurrency, and cleanup for remote operations
+
+**Files:**
+
+- Modify: `apps/desktop/src-tauri/src/ssh.rs`, `wsl.rs`, `wsl_transport.rs`, `bridge.rs`
+- Modify: `packages/contracts/src/ipc.ts`
+- Test: `apps/desktop/src-tauri/src/ssh.rs`, `wsl.rs`
+
+- [ ] **Step 1: Add race/failure tests**
+
+Cover duplicate ensure, cancel during password prompt/download/transfer/install/tunnel readiness, desktop shutdown, late completion after Forget, local-port race, SSH exit before publish, stuck stderr, reaper saturation, and stale progress after a newer generation.
+
+- [ ] **Step 2: Give each operation one owner**
+
+Use `operationId + environment/binding generation + CancellationToken`. Limit global provisioning, per-host mutation, active tunnels, WSL child forwards, and child reaper queues. Publish tunnel/binding changes only after readiness and generation checks.
+
+- [ ] **Step 3: Make Forget close admission first**
+
+Plan 20's removal lifecycle marks the environment closing, then this layer cancels setup, password prompts, downloads, transfers, tunnels, proxies, and backend children; waits/reaps; clears host auth material; and only then acknowledges host cleanup. Force remove records unknown remote outcome without pretending a remote stop/uninstall occurred.
+
+- [ ] **Step 4: Run stress/lifecycle tests and commit**
+
+```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests::manager -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl::tests::lifecycle -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl_transport::tests::shutdown -- --nocapture
+git add apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/wsl_transport.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts
+git commit -m "fix(desktop): own and reap remote environment operations"
+```
+
+### Task 9: Replace renderer polling with bridge events and route-aware state
+
+**Files:**
+
+- Modify: `apps/web/src/tauriDesktopBridge.ts`, tests
+- Modify: `apps/web/src/connection/useDesktopLocalBootstraps.ts`
+- Modify: `apps/web/src/connection/desktopLocal.ts`, tests
+- Modify: `apps/web/src/connection/platform.ts`, tests
+- Modify: `apps/web/src/state/desktopWslState.ts`, tests
+
+- [ ] **Step 1: Write fake-clock/event tests**
+
+Assert one initial read, coalesced focus/manual reads, event-driven updates, stale generation rejection, no three-second interval, low-frequency safety wakeup, cancellation at unmount, and no environment removal after discovery failure.
+
+- [ ] **Step 2: Subscribe through the typed bridge**
+
+Expose `onWslDiscoveryChanged`, `refreshWslDiscovery`, setup/provision progress, and cancellation. Decode every payload with contracts before state mutation and unsubscribe on layer teardown.
+
+- [ ] **Step 3: Feed bindings into the Plan 20 catalog**
+
+Create/update platform bindings and candidate routes, but let the environment supervisor perform identity verification and route activation. Discovery status can set `Stopped`/`Setup required`; it cannot overwrite a healthy verified environment with a stale locator result.
+
+- [ ] **Step 4: Run web bridge/platform tests and commit**
+
+```sh
+vp test apps/web/src/tauriDesktopBridge.test.ts apps/web/src/connection/desktopLocal.test.ts apps/web/src/connection/platform.test.ts apps/web/src/state/desktopWslState.test.ts
+git add apps/web/src/tauriDesktopBridge.ts apps/web/src/tauriDesktopBridge.test.ts apps/web/src/connection/useDesktopLocalBootstraps.ts apps/web/src/connection/desktopLocal.ts apps/web/src/connection/desktopLocal.test.ts apps/web/src/connection/platform.ts apps/web/src/connection/platform.test.ts apps/web/src/state/desktopWslState.ts apps/web/src/state/desktopWslState.test.ts
+git commit -m "feat(web): consume event-driven WSL and SSH state"
+```
+
+### Task 10: Update remote-environment and native testing documentation
+
+**Files:**
+
+- Modify: `docs/architecture/remote.md`, `connection-runtime.md`, `runtime-process-model.md`
+- Modify: `docs/user/remote-access.md`, `server-administration.md`
+- Modify: `docs/reference/workspace-layout.md`, `scripts.md`, `encyclopedia.md`
+- Modify: `docs/testing/windows-desktop.md`, `cross-platform-validation.md`
+- Create: `docs/testing/remote-environments.md`
+- Modify: `docs/testing/process-lifecycle.md`, `worktree-process-lifecycle.md`
+- Modify: `docs/testing/execution-report-template.md`
+
+- [ ] **Step 1: Document WSL visibility and safety exactly**
+
+State that every Running distro appears, accepted Stopped distros remain, unaccepted stopped distros stay in Add Environment, setup requires consent, no automatic distro start occurs, unregister is never invoked, and traffic uses the loopback forwarder.
+
+- [ ] **Step 2: Document Linux/macOS/Windows SSH flows**
+
+Include OpenSSH prerequisites, host-key handling, probe fields, consent screen, artifact verification/transfer, workstation/headless choices, pairing order, tunnel behavior, cancellation, partial-state recovery, and offline force removal consequences.
+
+- [ ] **Step 3: Add repeatable native evidence**
+
+Require real Windows WSL UTF/state enumeration, stopped retention, rename/identity reconcile, no wildcard listener, Linux/macOS/Windows OpenSSH enrollment, host-key change blocking, no-remote-internet provisioning, cancellation/reaping, current worktree flows, and environment-specific folder picking.
+
+- [ ] **Step 4: Verify docs and commit**
+
+```sh
+git diff --check
+rg -n "wsl --unregister|StrictHostKeyChecking=no|0\.0\.0\.0|Running|Stopped|Setup required|host key|PowerShell" docs/architecture docs/user docs/reference docs/testing apps/desktop/src-tauri/src
+node scripts/run-msvc-x64.mjs cargo clippy -p bibcode-desktop --all-targets -- -D warnings
+git add docs/architecture/remote.md docs/architecture/connection-runtime.md docs/architecture/runtime-process-model.md docs/user/remote-access.md docs/user/server-administration.md docs/reference/workspace-layout.md docs/reference/scripts.md docs/reference/encyclopedia.md docs/testing
+git commit -m "docs: describe safe WSL and SSH environment lifecycle"
+```
