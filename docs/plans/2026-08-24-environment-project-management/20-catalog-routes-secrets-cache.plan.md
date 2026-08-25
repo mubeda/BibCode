@@ -56,7 +56,7 @@
 
 - Produces: `KnownEnvironment`, `EnvironmentRoute`, `EnvironmentBinding`, `EnvironmentUiPreferences`, and actionable status types.
 
-- [ ] **Step 1: Write failing schema and collision tests**
+- [x] **Step 1: Write failing schema and collision tests**
 
 ```ts
 it("keeps two routes under one proved environment", () => {
@@ -69,13 +69,13 @@ it("keeps two routes under one proved environment", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 ```sh
 vp test run packages/client-runtime/src/connection/catalog.test.ts
 ```
 
-- [ ] **Step 3: Replace target classes with route classes**
+- [x] **Step 3: Replace target classes with route classes**
 
 ```ts
 const EnvironmentRouteBase = {
@@ -106,7 +106,9 @@ export class DirectHttpsRoute extends Schema.TaggedClass<DirectHttpsRoute>()("Di
 
 Add `DesktopLoopbackRoute` and `DesktopWslRoute`; model an unavailable WSL discovery result as a binding/condition rather than a connectable route.
 
-- [ ] **Step 4: Define the environment aggregate**
+Implementation sequencing: the canonical route contracts are now the v2 model. The legacy target classes remain temporarily as an input adapter for existing registry/storage consumers; Tasks 3-6 migrate those consumers, and Plan 60 deletes the final Relay/Connect-only variants instead of creating a compatibility alias.
+
+- [x] **Step 4: Define the environment aggregate**
 
 ```ts
 export interface KnownEnvironment {
@@ -120,7 +122,7 @@ export interface KnownEnvironment {
 }
 ```
 
-- [ ] **Step 5: Add explicit status/reason types**
+- [x] **Step 5: Add explicit status/reason types**
 
 ```ts
 export type EnvironmentPresentationStatus =
@@ -136,7 +138,7 @@ export type EnvironmentPresentationStatus =
 
 Extend blocked reasons with `environment-changed`, `certificate-changed`, `version-incompatible`, and `identity-conflict`; delete `relay-unavailable` from the new runtime type.
 
-- [ ] **Step 6: Run tests/typecheck and commit**
+- [x] **Step 6: Run tests/typecheck and commit**
 
 ```sh
 vp test run packages/client-runtime/src/connection/catalog.test.ts packages/client-runtime/src/connection/presentation.test.ts
