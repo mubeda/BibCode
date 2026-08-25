@@ -674,6 +674,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
     Migration::new(46, "ProjectRepositoryClaims", migration_046),
+    Migration::new(47, "OneActiveMainThread", migration_047),
 ];
 
 impl Migration {
@@ -2447,6 +2448,136 @@ fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_047(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists(transaction, "projection_projects")?
+        || !table_exists(transaction, "projection_threads")?
+    {
+        return Ok(());
+    }
+
+    let project_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT project_id FROM projection_projects WHERE deleted_at IS NULL \
+             UNION \
+             SELECT project_id FROM projection_threads WHERE deleted_at IS NULL \
+             ORDER BY project_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let format_ids = |ids: &[String]| {
+        if ids.is_empty() {
+            "<none>".to_owned()
+        } else {
+            ids.join(",")
+        }
+    };
+
+    for project_id in project_ids {
+        let active_threads = {
+            let mut statement = transaction.prepare(
+                "SELECT thread_id, kind FROM projection_threads \
+                 WHERE project_id = ? AND deleted_at IS NULL ORDER BY thread_id",
+            )?;
+            statement
+                .query_map([project_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let active_thread_ids = active_threads
+            .iter()
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        let current_default_ids = active_threads
+            .iter()
+            .filter(|(_, kind)| kind == "default")
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        let mut inferred_kinds = Vec::with_capacity(active_threads.len());
+        let mut unresolved_ids = Vec::new();
+
+        for (thread_id, _) in &active_threads {
+            let classifications = {
+                let mut statement = transaction.prepare(
+                    r#"
+                    SELECT DISTINCT CASE
+                      WHEN json_type(thread_event.payload_json, '$.kind') = 'text'
+                        THEN json_extract(thread_event.payload_json, '$.kind')
+                      WHEN json_type(thread_event.payload_json, '$.kind') IS NULL
+                        AND EXISTS (
+                          SELECT 1
+                          FROM orchestration_events AS project_event
+                          WHERE project_event.event_type = 'project.created'
+                            AND project_event.command_id = thread_event.command_id
+                            AND json_extract(project_event.payload_json, '$.projectId') = ?1
+                        )
+                        THEN 'default'
+                      WHEN json_type(thread_event.payload_json, '$.kind') IS NULL
+                        THEN 'workspace'
+                      ELSE NULL
+                    END AS inferred_kind
+                    FROM orchestration_events AS thread_event
+                    WHERE thread_event.event_type = 'thread.created'
+                      AND json_extract(thread_event.payload_json, '$.projectId') = ?1
+                      AND json_extract(thread_event.payload_json, '$.threadId') = ?2
+                    ORDER BY inferred_kind
+                    "#,
+                )?;
+                statement
+                    .query_map(rusqlite::params![project_id, thread_id], |row| {
+                        row.get::<_, Option<String>>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let inferred_kind = match classifications.as_slice() {
+                [Some(kind)] if matches!(kind.as_str(), "default" | "workspace" | "panel") => {
+                    Some(kind.clone())
+                }
+                _ => None,
+            };
+            if let Some(kind) = inferred_kind {
+                inferred_kinds.push((thread_id.clone(), kind));
+            } else {
+                unresolved_ids.push(thread_id.clone());
+            }
+        }
+
+        let canonical_main_ids = inferred_kinds
+            .iter()
+            .filter(|(_, kind)| kind == "default")
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        if !unresolved_ids.is_empty() || canonical_main_ids.len() != 1 {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "cannot establish permanent Main for project '{project_id}': active threads [{}], current default threads [{}], canonical Main candidates [{}], unresolved canonical kinds [{}]",
+                format_ids(&active_thread_ids),
+                format_ids(&current_default_ids),
+                format_ids(&canonical_main_ids),
+                format_ids(&unresolved_ids),
+            )));
+        }
+
+        for (thread_id, kind) in inferred_kinds {
+            transaction.execute(
+                "UPDATE projection_threads SET kind = ? \
+                 WHERE thread_id = ? AND project_id = ? AND deleted_at IS NULL",
+                rusqlite::params![kind, thread_id, project_id],
+            )?;
+        }
+    }
+
+    transaction.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX idx_projection_threads_one_active_default
+        ON projection_threads(project_id)
+        WHERE kind = 'default' AND deleted_at IS NULL;
+        "#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2967,7 +3098,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=46).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=47).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2985,6 +3116,7 @@ mod tests {
         assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
         assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
         assert_eq!(MIGRATIONS[45].name, "ProjectRepositoryClaims");
+        assert_eq!(MIGRATIONS[46].name, "OneActiveMainThread");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -3074,9 +3206,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 29);
+        assert_eq!(second.len(), 31);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[28].id, 45);
+        assert_eq!(second[30].id, 47);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3088,7 +3220,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 26);
+        assert_eq!(application_table_count, 27);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3176,14 +3308,14 @@ mod tests {
             [],
         )?;
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(46))?;
 
         assert_eq!(
             applied
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45]
+            [40, 41, 42, 43, 44, 45, 46]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3213,14 +3345,14 @@ mod tests {
             [],
         )?;
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(46))?;
 
         assert_eq!(
             applied
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45]
+            [41, 42, 43, 44, 45, 46]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3241,14 +3373,14 @@ mod tests {
             [],
         )?;
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(46))?;
 
         assert_eq!(
             applied
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45]
+            [42, 43, 44, 45, 46]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3302,6 +3434,129 @@ mod tests {
     }
 
     #[test]
+    fn migration_47_repairs_a_legacy_main_only_when_canonical_events_prove_it()
+    -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(46))?;
+        connection.execute_batch(
+            r#"
+            INSERT INTO projection_projects (
+              project_id, title, workspace_root, default_model_selection_json,
+              scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at
+            ) VALUES (
+              'legacy-project', 'Legacy', '/repo', NULL,
+              '[]', '{}', '2026-08-24T00:00:00Z', '2026-08-24T00:00:00Z', NULL
+            );
+            INSERT INTO projection_threads (
+              thread_id, project_id, title, created_at, updated_at, kind
+            ) VALUES
+              ('legacy-main', 'legacy-project', 'Legacy', '2026-08-24T00:00:00Z', '2026-08-24T00:00:00Z', 'default'),
+              ('legacy-workspace', 'legacy-project', 'Workspace', '2026-08-24T00:00:01Z', '2026-08-24T00:00:01Z', 'default');
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, command_id, actor_kind, payload_json, metadata_json
+            ) VALUES
+              ('legacy-project-created', 'project', 'legacy-project', 1, 'project.created',
+               '2026-08-24T00:00:00Z', 'legacy-create', 'client',
+               '{"projectId":"legacy-project"}', '{}'),
+              ('legacy-main-created', 'thread', 'legacy-main', 1, 'thread.created',
+               '2026-08-24T00:00:00Z', 'legacy-create', 'client',
+               '{"threadId":"legacy-main","projectId":"legacy-project"}', '{}'),
+              ('legacy-workspace-created', 'thread', 'legacy-workspace', 1, 'thread.created',
+               '2026-08-24T00:00:01Z', 'workspace-create', 'client',
+               '{"threadId":"legacy-workspace","projectId":"legacy-project"}', '{}');
+            "#,
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [47]
+        );
+        let kinds = connection
+            .prepare(
+                "SELECT thread_id, kind FROM projection_threads \
+                 WHERE project_id = 'legacy-project' ORDER BY thread_id",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            kinds,
+            [
+                ("legacy-main".to_owned(), "default".to_owned()),
+                ("legacy-workspace".to_owned(), "workspace".to_owned()),
+            ]
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO projection_threads (thread_id, project_id, title, created_at, updated_at, kind) \
+                     VALUES ('second-main', 'legacy-project', 'Second', '2026-08-24T00:00:02Z', '2026-08-24T00:00:02Z', 'default')",
+                    [],
+                )
+                .is_err(),
+            "the partial index must reject a second active Main"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_47_rejects_ambiguous_main_candidates_with_actionable_ids() -> rusqlite::Result<()>
+    {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(46))?;
+        connection.execute_batch(
+            r#"
+            INSERT INTO projection_projects (
+              project_id, title, workspace_root, default_model_selection_json,
+              scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at
+            ) VALUES (
+              'ambiguous-project', 'Ambiguous', '/repo', NULL,
+              '[]', '{}', '2026-08-24T00:00:00Z', '2026-08-24T00:00:00Z', NULL
+            );
+            INSERT INTO projection_threads (
+              thread_id, project_id, title, created_at, updated_at, kind
+            ) VALUES
+              ('main-a', 'ambiguous-project', 'A', '2026-08-24T00:00:00Z', '2026-08-24T00:00:00Z', 'default'),
+              ('main-b', 'ambiguous-project', 'B', '2026-08-24T00:00:01Z', '2026-08-24T00:00:01Z', 'default');
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, command_id, actor_kind, payload_json, metadata_json
+            ) VALUES
+              ('main-a-created', 'thread', 'main-a', 1, 'thread.created',
+               '2026-08-24T00:00:00Z', 'create-a', 'client',
+               '{"threadId":"main-a","projectId":"ambiguous-project","kind":"default"}', '{}'),
+              ('main-b-created', 'thread', 'main-b', 1, 'thread.created',
+               '2026-08-24T00:00:01Z', 'create-b', 'client',
+               '{"threadId":"main-b","projectId":"ambiguous-project","kind":"default"}', '{}');
+            "#,
+        )?;
+
+        let error = run_migrations(&mut connection, None)
+            .expect_err("ambiguous canonical Main candidates must stop migration");
+        let detail = error.to_string();
+        assert!(detail.contains("ambiguous-project"), "{detail}");
+        assert!(detail.contains("main-a"), "{detail}");
+        assert!(detail.contains("main-b"), "{detail}");
+        assert_eq!(
+            connection.query_row(
+                "SELECT MAX(migration_id) FROM effect_sql_migrations",
+                [],
+                |row| row.get::<_, u32>(0),
+            )?,
+            46,
+            "the migration body and ledger entry must roll back together"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn trusts_an_existing_current_effect_ledger_without_rebuilding_data() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         connection.execute_batch(
@@ -3317,19 +3572,13 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 12);
-        assert_eq!(applied[0].id, 34);
-        assert_eq!(applied[1].id, 35);
-        assert_eq!(applied[2].id, 36);
-        assert_eq!(applied[3].id, 37);
-        assert_eq!(applied[4].id, 38);
-        assert_eq!(applied[5].id, 39);
-        assert_eq!(applied[6].id, 40);
-        assert_eq!(applied[7].id, 41);
-        assert_eq!(applied[8].id, 42);
-        assert_eq!(applied[9].id, 43);
-        assert_eq!(applied[10].id, 44);
-        assert_eq!(applied[11].id, 45);
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            (34..=47).collect::<Vec<_>>()
+        );
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

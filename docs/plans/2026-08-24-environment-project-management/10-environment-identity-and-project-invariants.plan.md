@@ -422,7 +422,7 @@ git commit -m "feat(projects): report idempotent repository adds"
 
 - Produces: one active `kind = 'default'` row per project and rejects Main rename/archive/delete.
 
-- [ ] **Step 1: Write failing migration and mutation tests**
+- [x] **Step 1: Write failing migration and mutation tests**
 
 ```rust
 assert_rejected(main_command("thread.archive"), "Main cannot be archived").await;
@@ -430,17 +430,17 @@ assert_rejected(main_rename("Anything else"), "Main cannot be renamed").await;
 assert_rejected(second_default_create(), "already has a canonical Main").await;
 ```
 
-- [ ] **Step 2: Run engine tests and confirm the rename case is RED**
+- [x] **Step 2: Run engine tests and confirm the rename case is RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server orchestration::engine::tests::main -- --nocapture
 ```
 
-- [ ] **Step 3: Validate legacy state before adding the index**
+- [x] **Step 3: Validate legacy state before adding the index**
 
 Query active default counts grouped by project. Rebuild from canonical events when the answer is unique; abort with project/thread IDs when ambiguous.
 
-- [ ] **Step 4: Add the partial unique index**
+- [x] **Step 4: Add the partial unique index**
 
 ```sql
 CREATE UNIQUE INDEX idx_projection_threads_one_active_default
@@ -448,17 +448,24 @@ ON projection_threads(project_id)
 WHERE kind = 'default' AND deleted_at IS NULL;
 ```
 
-- [ ] **Step 5: Reject all independent Main mutations**
+- [x] **Step 5: Reject all independent Main mutations**
 
 Keep existing delete/archive guards and add title protection in `ThreadMetaUpdate`; only project-level operations may remove Main with the project.
 
-- [ ] **Step 6: Run migration, orchestration, and snapshot tests**
+- [x] **Step 6: Run migration, orchestration, and snapshot tests**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::migrations orchestration::engine -- --nocapture
 ```
 
 - [ ] **Step 7: Run plan-level verification and commit**
+
+Implementation note: the Task 6 migration, engine, integration, formatting,
+contract, `vp check`, direct server all-target check, and Clippy gates pass.
+The workspace typecheck remains open because the Connect-only `infra/relay`
+test fixtures have not adopted the strict descriptor protocol field; Plan 60
+deletes that package. Avoid compatibility edits to code scheduled for removal,
+then close this gate with the final post-removal workspace typecheck.
 
 ```sh
 vp run check:contracts

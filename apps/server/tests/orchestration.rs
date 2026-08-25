@@ -501,7 +501,7 @@ async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_thro
 }
 
 #[tokio::test]
-async fn default_thread_cannot_be_archived_or_deleted_directly() {
+async fn main_thread_cannot_be_renamed_archived_or_deleted_directly() {
     let repositories = migrated_repositories().await;
     let engine =
         OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
@@ -548,7 +548,22 @@ async fn default_thread_cannot_be_archived_or_deleted_directly() {
         })))
         .await
         .expect_err("second default thread is rejected");
-    assert!(duplicate_error.to_string().contains("default thread"));
+    assert!(
+        duplicate_error
+            .to_string()
+            .contains("canonical Main thread")
+    );
+
+    let rename_error = engine
+        .dispatch(decode(json!({
+            "type": "thread.meta.update",
+            "commandId": "rename-main",
+            "threadId": default_id,
+            "title": "Renamed Main",
+        })))
+        .await
+        .expect_err("Main title mutation is rejected");
+    assert!(rename_error.to_string().contains("cannot be renamed"));
 
     for (command_id, command_type) in [
         ("archive-default", "thread.archive"),
@@ -562,7 +577,7 @@ async fn default_thread_cannot_be_archived_or_deleted_directly() {
             })))
             .await
             .expect_err("default thread mutation is rejected");
-        assert!(error.to_string().contains("Default thread"));
+        assert!(error.to_string().contains("Main thread"));
     }
 
     let snapshot = load_snapshot(&engine.repositories())

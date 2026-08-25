@@ -3791,7 +3791,7 @@ async fn plan_command(
             {
                 return invariant(
                     command,
-                    format!("Project '{project_id}' already has a canonical default thread."),
+                    format!("Project '{project_id}' already has a canonical Main thread."),
                 );
             }
             if model.threads.contains_key(thread_id) {
@@ -3820,7 +3820,7 @@ async fn plan_command(
             if thread.kind == "default" {
                 return invariant(
                     command,
-                    format!("Default thread '{thread_id}' cannot be deleted directly."),
+                    format!("Main thread '{thread_id}' cannot be deleted directly."),
                 );
             }
             if thread.kind == "workspace" && thread.worktree_path.is_some() {
@@ -3849,7 +3849,7 @@ async fn plan_command(
             if thread.kind == "default" {
                 return invariant(
                     command,
-                    format!("Default thread '{thread_id}' cannot be archived directly."),
+                    format!("Main thread '{thread_id}' cannot be archived directly."),
                 );
             }
             if thread.archived_at.is_some() {
@@ -3895,6 +3895,12 @@ async fn plan_command(
             worktree_path,
         } => {
             let thread = require_thread(model, command, thread_id)?;
+            if thread.kind == "default" && title.is_some() {
+                return invariant(
+                    command,
+                    format!("Main thread '{thread_id}' cannot be renamed directly."),
+                );
+            }
             if thread.kind == "workspace"
                 && let OptionalNullable::Present(Some(_)) = worktree_path
             {
