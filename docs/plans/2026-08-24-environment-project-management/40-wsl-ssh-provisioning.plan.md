@@ -652,25 +652,53 @@ runbooks and are not claimed here.
 - Modify: `apps/web/src/connection/platform.ts`, tests
 - Modify: `apps/web/src/state/desktopWslState.ts`, tests
 
-- [ ] **Step 1: Write fake-clock/event tests**
+- [x] **Step 1: Write fake-clock/event tests**
 
 Assert one initial read, coalesced focus/manual reads, event-driven updates, stale generation rejection, no three-second interval, low-frequency safety wakeup, cancellation at unmount, and no environment removal after discovery failure.
 
-- [ ] **Step 2: Subscribe through the typed bridge**
+- [x] **Step 2: Subscribe through the typed bridge**
 
 Expose `onWslDiscoveryChanged`, `refreshWslDiscovery`, setup/provision progress, and cancellation. Decode every payload with contracts before state mutation and unsubscribe on layer teardown.
 
-- [ ] **Step 3: Feed bindings into the Plan 20 catalog**
+- [x] **Step 3: Feed bindings into the Plan 20 catalog**
 
 Create/update platform bindings and candidate routes, but let the environment supervisor perform identity verification and route activation. Discovery status can set `Stopped`/`Setup required`; it cannot overwrite a healthy verified environment with a stale locator result.
 
-- [ ] **Step 4: Run web bridge/platform tests and commit**
+- [x] **Step 4: Run web bridge/platform tests and commit**
 
 ```sh
 vp test apps/web/src/tauriDesktopBridge.test.ts apps/web/src/connection/desktopLocal.test.ts apps/web/src/connection/platform.test.ts apps/web/src/state/desktopWslState.test.ts
 git add apps/web/src/tauriDesktopBridge.ts apps/web/src/tauriDesktopBridge.test.ts apps/web/src/connection/useDesktopLocalBootstraps.ts apps/web/src/connection/desktopLocal.ts apps/web/src/connection/desktopLocal.test.ts apps/web/src/connection/platform.ts apps/web/src/connection/platform.test.ts apps/web/src/state/desktopWslState.ts apps/web/src/state/desktopWslState.test.ts
 git commit -m "feat(web): consume event-driven WSL and SSH state"
 ```
+
+Implemented one ref-counted renderer topology controller with typed native WSL
+and backend-ready events, one initial snapshot read, generation fencing,
+single-flight manual refresh, a five-minute missed-event safety wakeup, and
+teardown that ignores late completions. Native discovery remains the owner of
+focus-triggered enumeration, so renderer focus only coalesces a cached topology
+read and cannot launch a second `wsl.exe` probe. The platform source now
+reconciles discovery into the Plan 20 catalog using deterministic binding and
+route ids, preserves verified environments across failed or stale discovery,
+and represents accepted stopped/setup-required or identity-conflicted distros
+as unavailable without converting mutable distro locators into durable
+environment identity or auto-adopting a replacement server UUID.
+Initial WSL registrations are withheld until discovery state can attach stable
+binding/route metadata; the registry rejects undecorated bearer fallbacks and
+transactionally replaces any legacy volatile route. Non-authoritative topology
+failures retain accepted environments after bearer expiry, while two-stage
+renames compare-delete only the exact still-unproved locator row.
+
+Validation passed 266 affected contract/client/web tests, all 392 desktop
+library tests, and all 4 desktop bridge public-contract tests. `vp check`, the
+complete workspace typecheck graph, `cargo fmt --all --check`, and desktop
+all-target Clippy with warnings denied passed. `vp check` retains one
+pre-existing unused test-fixture warning in
+`apps/web/src/connection/storage.test.ts`. Native Windows WSL validation remains
+required by the testing runbook and is not claimed from this macOS worktree.
+Independent review found and drove three lifecycle fixes covering initial route
+pollution, failed-read removal after credential expiry, and transient rename
+ghosts; the read-only re-review found no remaining Critical or Important issue.
 
 ### Task 10: Update remote-environment and native testing documentation
 

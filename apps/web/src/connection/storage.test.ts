@@ -1888,6 +1888,38 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  it.effect("compare-deletes only the unchanged unproved WSL locator", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const catalog = yield* EnvironmentCatalogStore;
+      const current = decodeEnvironmentBinding({
+        _tag: "DesktopWslBinding",
+        bindingId: "binding-transient-rename",
+        distroName: "Ubuntu-Renamed",
+        acceptedEnvironmentId: null,
+        acceptedStorageInstanceIds: [],
+        acceptedAt: null,
+        lastDiscoveryGeneration: 8,
+        condition: "setup-required",
+        detail: "Install required.",
+      });
+      if (current._tag !== "DesktopWslBinding") throw new Error("Expected WSL binding fixture.");
+      yield* catalog.putBinding(current);
+
+      const stale = decodeEnvironmentBinding({ ...current, lastDiscoveryGeneration: 7 });
+      if (stale._tag !== "DesktopWslBinding") throw new Error("Expected WSL binding fixture.");
+      expect(yield* catalog.removeWslBindingIfUnchanged(stale)).toBe(false);
+      expect(yield* catalog.listBindings).toEqual([current]);
+
+      expect(yield* catalog.removeWslBindingIfUnchanged(current)).toBe(true);
+      expect(yield* catalog.listBindings).toEqual([]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("atomically proves a pre-setup WSL binding into its descriptor environment", () => {
     const factory = new IDBFactory();
     vi.stubGlobal("indexedDB", factory);

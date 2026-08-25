@@ -1812,6 +1812,16 @@ pub async fn desktop_bridge_get_wsl_state(
 ) -> Result<Value, String> {
     let settings = read_desktop_settings(&app)?;
     let discovery = app.state::<WslDiscoveryService>().inner().clone();
+    Ok(wsl_state(&settings, &backend, &discovery.snapshot()))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_refresh_wsl_discovery(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+) -> Result<Value, String> {
+    let settings = read_desktop_settings(&app)?;
+    let discovery = app.state::<WslDiscoveryService>().inner().clone();
     let snapshot = discovery
         .refresh_and_emit(&app, "manual refresh")
         .await
@@ -3895,6 +3905,7 @@ mod tests {
                 desktop_bridge_install_wsl_server,
                 desktop_bridge_cancel_wsl_setup,
                 desktop_bridge_get_wsl_state,
+                desktop_bridge_refresh_wsl_discovery,
                 desktop_bridge_set_wsl_backend_enabled,
                 desktop_bridge_set_wsl_distro,
                 desktop_bridge_set_wsl_only,
@@ -3990,6 +4001,10 @@ mod tests {
         );
         let _ = invoke("desktop_bridge_discover_ssh_hosts", json!({}));
         assert!(invoke("desktop_bridge_get_wsl_state", json!({})).unwrap()["enabled"].is_boolean());
+        assert!(
+            invoke("desktop_bridge_refresh_wsl_discovery", json!({})).unwrap()["enabled"]
+                .is_boolean()
+        );
         assert!(
             invoke("desktop_bridge_get_server_exposure_state", json!({}))
                 .unwrap()

@@ -19,6 +19,7 @@ import { CacheManifestEntry, CacheQuarantineEntry } from "../cache/envelope.ts";
 
 import type {
   ConnectionRegistration,
+  DesktopWslBinding,
   EnvironmentBinding,
   KnownEnvironment,
 } from "../connection/catalog.ts";
@@ -46,6 +47,7 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "update-environment-routes",
       "list-environment-bindings",
       "put-environment-binding",
+      "remove-wsl-binding",
       "forget-environment",
       "list-environment-cleanup-repairs",
       "save-environment-cleanup-repair",
@@ -107,6 +109,10 @@ export class EnvironmentCatalogStore extends Context.Service<
     readonly putBinding: (
       binding: EnvironmentBinding,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    /** Compare-and-delete for a still-unproved locator row. */
+    readonly removeWslBindingIfUnchanged: (
+      binding: DesktopWslBinding,
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/EnvironmentCatalogStore") {}
 

@@ -1,28 +1,34 @@
 import type { DesktopEnvironmentBootstrap } from "@bibcode/contracts";
 import { useEffect, useState } from "react";
 
-import { readDesktopSecondaryBootstraps } from "./desktopLocal";
+import { observeDesktopLocalTopology, readDesktopLocalTopologySnapshot } from "./desktopLocal";
 
-const DESKTOP_LOCAL_BOOTSTRAP_POLL_MS = 2_000;
+function bootstrapsFromCurrentTopology(): ReadonlyArray<DesktopEnvironmentBootstrap> {
+  const current = readDesktopLocalTopologySnapshot().secondaryBootstraps;
+  return current._tag === "Success" ? current.bootstraps : (current.retainedBootstraps ?? []);
+}
 
 /**
  * Reactively track the desktop's secondary local backends (e.g. a parallel WSL
- * backend). The bridge exposes no change event, so we re-read on an interval;
+ * backend). One shared controller consumes decoded native lifecycle events;
  * failed reads retain the latest successful snapshot, while a successful empty
- * read clears it. Use this instead of polling the bridge ad hoc so every
- * renderer consumer reads the same topology.
+ * read clears it.
  */
 export function useDesktopLocalBootstraps(): ReadonlyArray<DesktopEnvironmentBootstrap> {
   const [bootstraps, setBootstraps] = useState<ReadonlyArray<DesktopEnvironmentBootstrap>>(
-    readDesktopSecondaryBootstraps,
+    bootstrapsFromCurrentTopology,
   );
 
-  useEffect(() => {
-    const read = () => setBootstraps(readDesktopSecondaryBootstraps());
-    read();
-    const interval = setInterval(read, DESKTOP_LOCAL_BOOTSTRAP_POLL_MS);
-    return () => clearInterval(interval);
-  }, []);
+  useEffect(
+    () =>
+      observeDesktopLocalTopology((snapshot) => {
+        const current = snapshot.secondaryBootstraps;
+        setBootstraps(
+          current._tag === "Success" ? current.bootstraps : (current.retainedBootstraps ?? []),
+        );
+      }),
+    [],
+  );
 
   return bootstraps;
 }

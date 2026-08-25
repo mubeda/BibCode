@@ -38,6 +38,7 @@ import {
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
+  type DesktopWslBinding,
   EnvironmentBinding,
   EnvironmentRoute,
   ConnectionTransientError,
@@ -258,6 +259,7 @@ type NormalizedPersistenceOperation =
   | "update-environment-routes"
   | "list-environment-bindings"
   | "put-environment-binding"
+  | "remove-wsl-binding"
   | "forget-environment"
   | "list-environment-cleanup-repairs"
   | "save-environment-cleanup-repair"
@@ -483,6 +485,55 @@ function upsertEnvironmentBinding(database: IDBDatabase, binding: EnvironmentBin
       });
     }
   }).pipe(Effect.withSpan("web.connectionStorage.upsertEnvironmentBinding"));
+}
+
+function removeWslBindingIfUnchanged(database: IDBDatabase, binding: DesktopWslBinding) {
+  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(ENVIRONMENT_BINDINGS_STORE_NAME, "readwrite");
+    let removed = false;
+    transaction.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError("remove WSL binding", transaction.error ?? "Unknown IndexedDB error"),
+        ),
+      );
+    });
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(catalogError("remove WSL binding", transaction.error ?? "IndexedDB abort")),
+      );
+    });
+    transaction.addEventListener("complete", () => resume(Effect.succeed(removed)));
+
+    const store = transaction.objectStore(ENVIRONMENT_BINDINGS_STORE_NAME);
+    const request = store.get([binding._tag, binding.bindingId]);
+    request.addEventListener("success", () => {
+      const current = request.result as
+        | {
+            readonly _tag?: unknown;
+            readonly bindingId?: unknown;
+            readonly distroName?: unknown;
+            readonly acceptedEnvironmentId?: unknown;
+            readonly acceptedAt?: unknown;
+            readonly lastDiscoveryGeneration?: unknown;
+          }
+        | undefined;
+      if (
+        binding.acceptedEnvironmentId !== null ||
+        binding.acceptedAt !== null ||
+        current?._tag !== "DesktopWslBinding" ||
+        current.bindingId !== binding.bindingId ||
+        current.distroName !== binding.distroName ||
+        current.acceptedEnvironmentId !== null ||
+        current.acceptedAt !== null ||
+        current.lastDiscoveryGeneration !== binding.lastDiscoveryGeneration
+      ) {
+        return;
+      }
+      removed = true;
+      store.delete([binding._tag, binding.bindingId]);
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.removeWslBindingIfUnchanged"));
 }
 
 function compareAndSetDatabaseValue(
@@ -1894,6 +1945,10 @@ export const connectionStorageLayer = Layer.effectContext(
         decodeEnvironmentBinding(binding).pipe(
           Effect.flatMap((decoded) => upsertEnvironmentBinding(database, decoded)),
           Effect.mapError((cause) => normalizedPersistenceError("put-environment-binding", cause)),
+        ),
+      removeWslBindingIfUnchanged: (binding) =>
+        removeWslBindingIfUnchanged(database, binding).pipe(
+          Effect.mapError((cause) => normalizedPersistenceError("remove-wsl-binding", cause)),
         ),
     });
 

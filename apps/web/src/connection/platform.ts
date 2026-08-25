@@ -1,6 +1,7 @@
 import {
   ClientPresentation,
   CloudSession,
+  EnvironmentCatalogStore,
   EnvironmentOwnedDataCleanup,
   PlatformConnectionSource,
   PrimaryEnvironmentAuth,
@@ -21,6 +22,7 @@ import {
   UnavailableConnectionRegistration,
   UnavailableConnectionTarget,
   Wakeups,
+  type DesktopWslBinding,
 } from "@bibcode/client-runtime/connection";
 import { bootstrapRemoteBearerSession } from "@bibcode/client-runtime/authorization";
 import { fetchRemoteEnvironmentDescriptor } from "@bibcode/client-runtime/environment";
@@ -55,12 +57,26 @@ import { appAtomRegistry } from "../rpc/atomRegistry";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
   desktopLocalConnectionId,
-  readDesktopSecondaryBootstrapsResult,
+  observeDesktopLocalTopology,
+  readDesktopLocalTopologySnapshot,
+  reconcileDesktopWslBindings,
   type DesktopSecondaryBootstrapsRead,
 } from "./desktopLocal";
 import { connectionStorageLayer } from "./storage";
 
 let nextObservedRpcRequestId = 0;
+
+export function desktopWslBindingId(distroName: string): string {
+  return `desktop:wsl:${encodeURIComponent(distroName.trim().toLocaleLowerCase("en-US"))}`;
+}
+
+export function desktopWslRouteId(bindingId: string): string {
+  return `platform:wsl:${bindingId}`;
+}
+
+function desktopBootstrapDistro(bootstrap: DesktopEnvironmentBootstrap): string | null | undefined {
+  return bootstrap.runningDistro ?? bootstrap.configuredDistro;
+}
 
 function currentNetworkStatus(): "unknown" | "offline" | "online" {
   if (typeof navigator === "undefined") {
@@ -449,10 +465,6 @@ const loadSecondaryConnectionRegistration = Effect.fn(
   };
 });
 
-// Poll cadence for the desktop bootstrap topology. There is no change event on
-// the bridge, so the renderer polls; successful registrations are cached by a
-// signature of their endpoint + token until bearer credentials approach expiry.
-const PLATFORM_POLL_INTERVAL = "3 seconds";
 const SECONDARY_BEARER_REFRESH_SKEW_MS = 5_000;
 
 export function secondaryBearerExpiresAtEpochMs(
@@ -554,6 +566,259 @@ const platformConnectionSourceLayer = Layer.effect(
       });
     }
     const cacheRef = yield* Ref.make(new Map<string, CachedPlatformRegistration>());
+    const lastWslRegistrationsRef = yield* Ref.make<ReadonlyArray<PlatformConnectionRegistration>>(
+      [],
+    );
+    const environmentCatalog = yield* EnvironmentCatalogStore;
+
+    const reconcileWslRegistrations = Effect.fn("web.connectionPlatform.reconcileWslRegistrations")(
+      function* (
+        registrations: ReadonlyArray<PlatformConnectionRegistration>,
+        topologyRead: DesktopSecondaryBootstrapsRead,
+      ) {
+        const wslState = readDesktopLocalTopologySnapshot().wslState;
+        const catalogSnapshot = yield* Effect.all([
+          environmentCatalog.listBindings,
+          environmentCatalog.list,
+        ]).pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("Could not read the environment catalog for WSL reconciliation.", {
+              error,
+            }),
+          ),
+          Effect.option,
+        );
+        if (Option.isNone(catalogSnapshot)) {
+          const retained = yield* Ref.get(lastWslRegistrationsRef);
+          return [
+            ...registrations.filter(
+              (registration) => registration._tag === "PrimaryConnectionRegistration",
+            ),
+            ...retained,
+          ];
+        }
+        const [catalogBindings, environments] = catalogSnapshot.value;
+        const wslBindings = catalogBindings.filter(
+          (binding): binding is DesktopWslBinding => binding._tag === "DesktopWslBinding",
+        );
+        if (topologyRead._tag === "Failure") {
+          const representedBindingIds = new Set<string>();
+          const retained = registrations.flatMap(
+            (registration): ReadonlyArray<PlatformConnectionRegistration> => {
+              if (registration._tag === "PrimaryConnectionRegistration") return [registration];
+              const binding =
+                registration.wslBinding ??
+                wslBindings.find(
+                  (candidate) =>
+                    candidate.acceptedEnvironmentId === registration.target.environmentId,
+                );
+              if (binding === undefined || binding.acceptedEnvironmentId === null) return [];
+              representedBindingIds.add(binding.bindingId);
+              if (registration._tag === "BearerConnectionRegistration") {
+                return [
+                  new BearerConnectionRegistration({
+                    ...registration,
+                    wslBinding: binding,
+                    wslRouteId: desktopWslRouteId(binding.bindingId),
+                  }),
+                ];
+              }
+              return [registration];
+            },
+          );
+          for (const binding of wslBindings) {
+            if (
+              binding.acceptedEnvironmentId === null ||
+              representedBindingIds.has(binding.bindingId)
+            ) {
+              continue;
+            }
+            retained.push(
+              new UnavailableConnectionRegistration({
+                target: new UnavailableConnectionTarget({
+                  environmentId: binding.acceptedEnvironmentId,
+                  label: `WSL: ${binding.distroName}`,
+                  connectionId: desktopLocalConnectionId(`candidate:${binding.bindingId}`),
+                  configuredDistro: binding.distroName,
+                  detail: "Desktop WSL topology is temporarily unavailable.",
+                }),
+                wslBinding: binding,
+                wslRouteId: desktopWslRouteId(binding.bindingId),
+              }),
+            );
+          }
+          yield* Ref.set(
+            lastWslRegistrationsRef,
+            retained.filter(
+              (registration) => registration._tag !== "PrimaryConnectionRegistration",
+            ),
+          );
+          return retained;
+        }
+        if (wslState === null) {
+          const wslConnectionIds = new Set(
+            topologyRead.bootstraps
+              .filter((bootstrap) => desktopBootstrapDistro(bootstrap) != null)
+              .map((bootstrap) => desktopLocalConnectionId(bootstrap.id)),
+          );
+          return registrations.filter(
+            (registration) =>
+              registration._tag === "PrimaryConnectionRegistration" ||
+              !wslConnectionIds.has(registration.target.connectionId),
+          );
+        }
+        const bootstrapByConnectionId = new Map(
+          topologyRead.bootstraps.map((bootstrap) => [
+            desktopLocalConnectionId(bootstrap.id),
+            bootstrap,
+          ]),
+        );
+        const observations = topologyRead.bootstraps.flatMap((bootstrap) => {
+          const connectionId = desktopLocalConnectionId(bootstrap.id);
+          const registration = registrations.find(
+            (candidate) =>
+              candidate._tag !== "PrimaryConnectionRegistration" &&
+              candidate.target.connectionId === connectionId,
+          );
+          const distroName = desktopBootstrapDistro(bootstrap);
+          if (distroName === null || distroName === undefined) return [];
+          return [
+            {
+              distroName,
+              descriptor:
+                registration?._tag === "BearerConnectionRegistration"
+                  ? (registration.descriptor ?? null)
+                  : null,
+              detail:
+                registration?._tag === "UnavailableConnectionRegistration"
+                  ? registration.target.detail
+                  : null,
+            },
+          ];
+        });
+        const reconciled = reconcileDesktopWslBindings({
+          discovery: wslState.discovery,
+          observations,
+          bindings: wslBindings,
+          environments: environments.map((environment) => ({
+            environmentId: environment.environmentId,
+            hidden: environment.hidden,
+          })),
+          observedAt: wslState.discovery.observedAt,
+          createBindingId: desktopWslBindingId,
+          legacyAcceptedDistro: wslState.legacyAcceptedDistro,
+        });
+
+        yield* Effect.forEach(
+          reconciled.supersededBindings,
+          (binding) =>
+            environmentCatalog.removeWslBindingIfUnchanged(binding).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Could not remove a superseded WSL locator binding.", {
+                  error,
+                }),
+              ),
+            ),
+          { discard: true },
+        );
+
+        yield* Effect.forEach(
+          reconciled.bindings.filter((binding) => binding.acceptedEnvironmentId === null),
+          (binding) =>
+            environmentCatalog.putBinding(binding).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Could not persist an unproved WSL binding.", {
+                  error,
+                }),
+              ),
+            ),
+          { discard: true },
+        );
+
+        const representedBindingIds = new Set<string>();
+        const decorated = registrations.map((registration): PlatformConnectionRegistration => {
+          if (registration._tag === "PrimaryConnectionRegistration") return registration;
+          const bootstrap = bootstrapByConnectionId.get(registration.target.connectionId);
+          const distroName =
+            bootstrap === undefined ? undefined : desktopBootstrapDistro(bootstrap);
+          const binding = reconciled.bindings.find(
+            (candidate) =>
+              (registration._tag === "BearerConnectionRegistration" &&
+                candidate.acceptedEnvironmentId === registration.target.environmentId) ||
+              (distroName !== null &&
+                distroName !== undefined &&
+                candidate.distroName.localeCompare(distroName, "en-US", {
+                  sensitivity: "base",
+                }) === 0),
+          );
+          if (binding === undefined) return registration;
+          representedBindingIds.add(binding.bindingId);
+          const routeId = desktopWslRouteId(binding.bindingId);
+          if (registration._tag === "BearerConnectionRegistration") {
+            if (binding.condition !== "available") {
+              return new UnavailableConnectionRegistration({
+                target: new UnavailableConnectionTarget({
+                  environmentId: binding.acceptedEnvironmentId ?? registration.target.environmentId,
+                  label: `WSL: ${binding.distroName}`,
+                  connectionId: registration.target.connectionId,
+                  configuredDistro: binding.distroName,
+                  detail:
+                    binding.detail ??
+                    "This WSL locator did not prove the identity accepted for this environment.",
+                }),
+                wslBinding: binding,
+                wslRouteId: routeId,
+              });
+            }
+            return new BearerConnectionRegistration({
+              ...registration,
+              wslBinding: binding,
+              wslRouteId: routeId,
+            });
+          }
+          return new UnavailableConnectionRegistration({
+            ...registration,
+            target: new UnavailableConnectionTarget({
+              ...registration.target,
+              environmentId: binding.acceptedEnvironmentId ?? registration.target.environmentId,
+            }),
+            wslBinding: binding,
+            wslRouteId: routeId,
+          });
+        });
+
+        for (const binding of reconciled.bindings) {
+          if (representedBindingIds.has(binding.bindingId) || binding.condition === "available") {
+            continue;
+          }
+          const detail =
+            binding.detail ??
+            (binding.condition === "stopped"
+              ? "This WSL distribution is stopped."
+              : "BiBCode Server setup is required in this WSL distribution.");
+          decorated.push(
+            new UnavailableConnectionRegistration({
+              target: new UnavailableConnectionTarget({
+                environmentId:
+                  binding.acceptedEnvironmentId ??
+                  EnvironmentId.make(`wsl-candidate:${binding.bindingId}`),
+                label: `WSL: ${binding.distroName}`,
+                connectionId: desktopLocalConnectionId(`candidate:${binding.bindingId}`),
+                configuredDistro: binding.distroName,
+                detail,
+              }),
+              wslBinding: binding,
+              wslRouteId: desktopWslRouteId(binding.bindingId),
+            }),
+          );
+        }
+        yield* Ref.set(
+          lastWslRegistrationsRef,
+          decorated.filter((registration) => registration._tag !== "PrimaryConnectionRegistration"),
+        );
+        return decorated;
+      },
+    );
 
     // Resolve the full set of platform-managed environments the host currently
     // reports: the primary (same-origin cookie auth) plus any desktop-local
@@ -604,7 +869,7 @@ const platformConnectionSourceLayer = Layer.effect(
         }
       }
 
-      const topologyRead = readDesktopSecondaryBootstrapsResult();
+      const topologyRead = readDesktopLocalTopologySnapshot().secondaryBootstraps;
       for (const [id, cached] of secondaryRegistrationsToRetainAfterTopologyRead(
         previous,
         topologyRead,
@@ -619,7 +884,9 @@ const platformConnectionSourceLayer = Layer.effect(
           cause: topologyRead.cause,
         });
       } else {
+        const wslStateReady = readDesktopLocalTopologySnapshot().wslState !== null;
         for (const bootstrap of topologyRead.bootstraps) {
+          if (desktopBootstrapDistro(bootstrap) != null && !wslStateReady) continue;
           const signature = [
             bootstrap.httpBaseUrl,
             bootstrap.wsBaseUrl,
@@ -661,13 +928,21 @@ const platformConnectionSourceLayer = Layer.effect(
       }
 
       yield* Ref.set(cacheRef, next);
-      return registrations as ReadonlyArray<PlatformConnectionRegistration>;
+      return yield* reconcileWslRegistrations(registrations, topologyRead);
     }).pipe(Effect.provide(FetchHttpClient.layer));
 
-    return PlatformConnectionSource.of({
-      registrations: Stream.tick(PLATFORM_POLL_INTERVAL).pipe(
-        Stream.mapEffect(() => buildPlatformRegistrations),
+    const topologyChanges = Stream.callback<void>((queue) =>
+      Effect.acquireRelease(
+        Effect.sync(() =>
+          observeDesktopLocalTopology(() => {
+            Queue.offerUnsafe(queue, undefined);
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
       ),
+    );
+    return PlatformConnectionSource.of({
+      registrations: topologyChanges.pipe(Stream.mapEffect(() => buildPlatformRegistrations)),
     });
   }),
 );
@@ -697,25 +972,15 @@ const rpcRequestObserverLayer = Layer.succeed(
   }),
 );
 
-type ConnectionPlatformLayerSource =
-  | typeof connectionStorageLayer
-  | typeof connectivityLayer
-  | typeof wakeupsLayer
-  | typeof capabilitiesLayer
-  | typeof platformConnectionSourceLayer
-  | typeof environmentOwnedDataCleanupLayer
-  | typeof rpcRequestObserverLayer;
-
-export const connectionPlatformLayer: Layer.Layer<
-  Layer.Success<ConnectionPlatformLayerSource>,
-  Layer.Error<ConnectionPlatformLayerSource>,
-  Layer.Services<ConnectionPlatformLayerSource>
-> = Layer.mergeAll(
-  connectionStorageLayer,
+const connectionPlatformServicesLayer = Layer.mergeAll(
   connectivityLayer,
   wakeupsLayer,
   capabilitiesLayer,
   platformConnectionSourceLayer,
   environmentOwnedDataCleanupLayer,
   rpcRequestObserverLayer,
+);
+
+export const connectionPlatformLayer = connectionPlatformServicesLayer.pipe(
+  Layer.provideMerge(connectionStorageLayer),
 );

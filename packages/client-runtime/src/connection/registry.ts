@@ -302,31 +302,45 @@ function normalizedPlatformRegistration(
   if (registration._tag === "UnavailableConnectionRegistration") return null;
   const descriptor = registration.descriptor;
   if (descriptor === undefined) return null;
-  const route =
-    registration._tag === "PrimaryConnectionRegistration"
-      ? new DesktopLoopbackRoute({
-          routeId: "platform:primary",
-          environmentId: descriptor.environmentId,
-          label: registration.target.label,
-          priority: 0,
-          pinned: true,
-          autoconnect: true,
-          secretRef: null,
-          httpBaseUrl: registration.target.httpBaseUrl,
-          wsBaseUrl: registration.target.wsBaseUrl,
-        })
-      : new DesktopWslRoute({
-          routeId: registration.target.connectionId,
-          environmentId: descriptor.environmentId,
-          label: registration.target.label,
-          priority: 0,
-          pinned: true,
-          autoconnect: true,
-          secretRef: null,
-          bindingId: registration.target.connectionId,
-          httpBaseUrl: registration.profile.httpBaseUrl,
-          wsBaseUrl: registration.profile.wsBaseUrl,
-        });
+  if (registration._tag === "PrimaryConnectionRegistration") {
+    const route = new DesktopLoopbackRoute({
+      routeId: "platform:primary",
+      environmentId: descriptor.environmentId,
+      label: registration.target.label,
+      priority: 0,
+      pinned: true,
+      autoconnect: true,
+      secretRef: null,
+      httpBaseUrl: registration.target.httpBaseUrl,
+      wsBaseUrl: registration.target.wsBaseUrl,
+    });
+    return {
+      environment: {
+        environmentId: descriptor.environmentId,
+        acceptedStorageInstanceId: descriptor.storageInstanceId,
+        descriptor,
+        alias: registration.target.label,
+        hidden: false,
+        bindings: [],
+        routes: [route],
+      },
+    };
+  }
+  const wslBinding = registration.wslBinding;
+  const wslRouteId = registration.wslRouteId;
+  if (wslBinding === undefined || wslRouteId === undefined) return null;
+  const route = new DesktopWslRoute({
+    routeId: wslRouteId,
+    environmentId: descriptor.environmentId,
+    label: registration.target.label,
+    priority: 0,
+    pinned: true,
+    autoconnect: true,
+    secretRef: null,
+    bindingId: wslBinding.bindingId,
+    httpBaseUrl: registration.profile.httpBaseUrl,
+    wsBaseUrl: registration.profile.wsBaseUrl,
+  });
   return {
     environment: {
       environmentId: descriptor.environmentId,
@@ -334,17 +348,13 @@ function normalizedPlatformRegistration(
       descriptor,
       alias: registration.target.label,
       hidden: false,
-      bindings: [],
+      bindings: [wslBinding],
       routes: [route],
     },
-    ...(registration._tag === "BearerConnectionRegistration"
-      ? {
-          sessionSecret: {
-            routeId: registration.target.connectionId,
-            value: registration.credential.token,
-          },
-        }
-      : {}),
+    sessionSecret: {
+      routeId: wslRouteId,
+      value: registration.credential.token,
+    },
   };
 }
 
@@ -809,9 +819,29 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
       }
 
       const inputRouteIds = new Set(input.environment.routes.map((route) => route.routeId));
+      const inputBindingIds = new Set(
+        input.environment.bindings.map((binding) => binding.bindingId),
+      );
+      const replacesLegacyVolatileWslRoute = input.environment.routes.some(
+        (route) => route._tag === "DesktopWslRoute" && route.routeId !== route.bindingId,
+      );
+      const supersededRoutes =
+        current?.routes.filter(
+          (route) =>
+            replacesLegacyVolatileWslRoute &&
+            route._tag === "DesktopWslRoute" &&
+            route.routeId === route.bindingId,
+        ) ?? [];
+      const supersededRouteIds = new Set(supersededRoutes.map((route) => route.routeId));
       const mergedRoutes = [
-        ...(current?.routes.filter((route) => !inputRouteIds.has(route.routeId)) ?? []),
+        ...(current?.routes.filter(
+          (route) => !inputRouteIds.has(route.routeId) && !supersededRouteIds.has(route.routeId),
+        ) ?? []),
         ...input.environment.routes,
+      ];
+      const mergedBindings = [
+        ...(current?.bindings.filter((binding) => !inputBindingIds.has(binding.bindingId)) ?? []),
+        ...input.environment.bindings,
       ];
       let importedSecretRef: string | null = null;
       const previousSecretRef =
@@ -840,9 +870,7 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           alias: input.environment.alias ?? current?.alias ?? null,
           hidden: current?.hidden ?? input.environment.hidden,
           bindings:
-            input.environment.bindings.length === 0 && current !== undefined
-              ? current.bindings
-              : input.environment.bindings,
+            input.environment.bindings.length === 0 ? (current?.bindings ?? []) : mergedBindings,
           routes: mergedRoutes.map((route) =>
             input.sessionSecret !== undefined &&
             route.routeId === input.sessionSecret.routeId &&
@@ -870,6 +898,15 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           ),
         );
       }
+      yield* Effect.forEach(
+        supersededRoutes.flatMap((route) =>
+          route.secretRef === null || route.secretRef === importedSecretRef
+            ? []
+            : [route.secretRef],
+        ),
+        (secretRef) => environmentSecrets.delete(secretRef).pipe(Effect.ignore),
+        { discard: true },
+      );
     },
   );
 
@@ -941,6 +978,12 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
       ticket: EnvironmentAdmissionTicket | null,
     ) {
       if (ticket === null) return;
+      if (
+        registration._tag === "BearerConnectionRegistration" &&
+        (registration.wslBinding === undefined || registration.wslRouteId === undefined)
+      ) {
+        return;
+      }
       const entry = connectionRegistrationCatalogEntry(registration);
       const target = entry.target;
       yield* withLeaseLock(
@@ -958,6 +1001,36 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           if (normalized !== null) {
             yield* registerEnvironmentLocked(normalized);
             return;
+          }
+
+          if (
+            registration._tag === "UnavailableConnectionRegistration" &&
+            registration.wslBinding !== undefined
+          ) {
+            const binding = registration.wslBinding;
+            const acceptedEnvironmentId = binding.acceptedEnvironmentId;
+            if (acceptedEnvironmentId !== null && acceptedEnvironmentId !== target.environmentId) {
+              return yield* new Persistence.ConnectionPersistenceError({
+                operation: "put-environment-binding",
+                message: "The unavailable WSL binding belongs to another environment.",
+              });
+            }
+            const current = (yield* SubscriptionRef.get(environments)).get(target.environmentId);
+            if (acceptedEnvironmentId !== null && current !== undefined) {
+              const next: KnownEnvironment = {
+                ...current,
+                bindings: [
+                  ...current.bindings.filter(
+                    (currentBinding) => currentBinding.bindingId !== binding.bindingId,
+                  ),
+                  binding,
+                ],
+              };
+              yield* environmentCatalog.put(next);
+              yield* installEnvironmentLocked(next, entry);
+              return;
+            }
+            yield* environmentCatalog.putBinding(binding);
           }
 
           // Secondary desktop-local backends (e.g. a parallel WSL backend) live

@@ -10,7 +10,8 @@ import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { createDesktopWslStateAtom, reconcileDesktopWslBindings } from "./desktopWslState";
+import { reconcileDesktopWslBindings } from "../connection/desktopLocal";
+import { createDesktopWslStateAtom } from "./desktopWslState";
 
 const environmentId = EnvironmentId.make("018f1f52-0d78-7d73-8dc8-7bd50db6f001");
 const otherEnvironmentId = EnvironmentId.make("018f1f52-0d78-7d73-8dc8-7bd50db6f002");
@@ -225,6 +226,21 @@ describe("desktopWslState", () => {
         );
       },
     },
+    {
+      name: "does not downgrade a verified binding after discovery failure",
+      input: {
+        discovery: discovery(2, [distro("Ubuntu")], "failed"),
+        observations: [],
+        bindings: [binding()],
+        environments: [{ environmentId, hidden: false }],
+      },
+      assert: (result: ReturnType<typeof reconcileDesktopWslBindings>) => {
+        expect(result.bindings).toEqual([binding()]);
+        expect(result.presentations[0]).toEqual(
+          expect.objectContaining({ bindingId: "binding-ubuntu", visibility: "visible" }),
+        );
+      },
+    },
   ])("$name", ({ input, assert }) => {
     const result = reconcileDesktopWslBindings({
       ...input,
@@ -256,6 +272,46 @@ describe("desktopWslState", () => {
     ]);
     expect(result.presentations[0]?.visibility).toBe("visible");
     expect(result.discoveryOnlyDistros).toEqual([]);
+  });
+
+  it("merges a transient rename candidate after the original descriptor returns", () => {
+    const first = reconcileDesktopWslBindings({
+      discovery: discovery(2, [distro("Ubuntu-Renamed")]),
+      observations: [],
+      bindings: [binding()],
+      environments: [{ environmentId, hidden: false }],
+      observedAt,
+      createBindingId: (name) => `new:${name}`,
+      legacyAcceptedDistro: null,
+    });
+    const transient = first.bindings.find((candidate) => candidate.bindingId.startsWith("new:"));
+    expect(transient).toEqual(
+      expect.objectContaining({
+        distroName: "Ubuntu-Renamed",
+        acceptedEnvironmentId: null,
+        condition: "setup-required",
+      }),
+    );
+
+    const proved = reconcileDesktopWslBindings({
+      discovery: discovery(3, [distro("Ubuntu-Renamed")]),
+      observations: [{ distroName: "Ubuntu-Renamed", descriptor: descriptor() }],
+      bindings: first.bindings,
+      environments: [{ environmentId, hidden: false }],
+      observedAt,
+      createBindingId: (name) => `new:${name}`,
+      legacyAcceptedDistro: null,
+    });
+
+    expect(proved.bindings).toEqual([
+      expect.objectContaining({
+        bindingId: "binding-ubuntu",
+        distroName: "Ubuntu-Renamed",
+        acceptedEnvironmentId: environmentId,
+        condition: "available",
+      }),
+    ]);
+    expect(proved.supersededBindings).toEqual([transient]);
   });
 
   it("retains the loaded snapshot when the settings screen remounts", async () => {
@@ -332,5 +388,55 @@ describe("desktopWslState", () => {
     });
     expect(getWslState).toHaveBeenCalledTimes(2);
     registry.dispose();
+  });
+
+  it("applies decoded discovery events and ignores stale generations", async () => {
+    let listener: ((discovery: DesktopWslState["discovery"]) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const getWslState = vi.fn(async () => wslState);
+    const atom = createDesktopWslStateAtom(() => ({
+      getWslState,
+      onWslDiscoveryChanged: (next) => {
+        listener = next;
+        return unsubscribe;
+      },
+    }));
+    const registry = AtomRegistry.make();
+    registry.mount(atom);
+    await vi.waitFor(() => {
+      expect(AsyncResult.value(registry.get(atom))).toEqual(
+        expect.objectContaining({ _tag: "Some", value: wslState }),
+      );
+    });
+
+    const newer = {
+      ...wslState.discovery,
+      generation: wslState.discovery.generation + 1,
+      observedAt: "2026-08-25T00:00:02Z",
+      distros: [
+        { name: "Ubuntu", isDefault: true, state: "running" as const, version: 2 as const },
+        { name: "Debian", isDefault: false, state: "stopped" as const, version: 2 as const },
+      ],
+    };
+    listener?.(newer);
+    await vi.waitFor(() => {
+      expect(AsyncResult.value(registry.get(atom))).toEqual(
+        expect.objectContaining({
+          _tag: "Some",
+          value: expect.objectContaining({ discovery: newer, distros: newer.distros }),
+        }),
+      );
+    });
+
+    listener?.({ ...wslState.discovery, generation: newer.generation - 1 });
+    expect(AsyncResult.value(registry.get(atom))).toEqual(
+      expect.objectContaining({
+        _tag: "Some",
+        value: expect.objectContaining({ discovery: newer }),
+      }),
+    );
+    registry.dispose();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(getWslState).toHaveBeenCalledTimes(1);
   });
 });

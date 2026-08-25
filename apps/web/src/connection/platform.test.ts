@@ -11,7 +11,6 @@ import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -27,6 +26,7 @@ import {
   ConnectionBlockedError,
   ConnectionTransientError,
   Connectivity,
+  DesktopWslBinding,
   Wakeups,
 } from "@bibcode/client-runtime/connection";
 import { EnvironmentRpcRequestObserver } from "@bibcode/client-runtime/rpc";
@@ -49,6 +49,26 @@ function platformDescriptor() {
   } as const;
 }
 
+function platformWslState(generation: number, distroState: "running" | "stopped" = "running") {
+  const discovery = {
+    generation,
+    observedAt: "2026-08-25T00:00:00Z",
+    health: "available" as const,
+    detail: null,
+    distros: [{ name: "Ubuntu", isDefault: true, state: distroState, version: 2 as const }],
+  };
+  return {
+    enabled: distroState === "running",
+    distro: null,
+    legacyAcceptedDistro: null,
+    available: true,
+    wslOnly: false,
+    distros: discovery.distros,
+    discovery,
+    preflightError: null,
+  };
+}
+
 // ── Controllable mock state ──────────────────────────────────────────
 const pf = vi.hoisted(() => ({
   isHostedStatic: false,
@@ -63,6 +83,12 @@ const pf = vi.hoisted(() => ({
   clearCalls: [] as string[],
   trackCalls: [] as Array<{ requestId: string; tag: string }>,
   ackCalls: [] as string[],
+  topologyListeners: [] as Array<() => void>,
+  wslState: null as unknown,
+  catalogEnvironments: [] as unknown[],
+  catalogBindings: [] as unknown[],
+  putBindings: [] as unknown[],
+  removedBindings: [] as unknown[],
 }));
 
 vi.mock("../hostedPairing", () => ({
@@ -107,14 +133,78 @@ vi.mock("../environments/primary/target", () => ({
   },
 }));
 
-vi.mock("./desktopLocal", () => ({
-  desktopLocalConnectionId: (backendId: string) => `local:${backendId}`,
-  readDesktopSecondaryBootstrapsResult: () => pf.secondaryRead,
-}));
+vi.mock("./desktopLocal", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./desktopLocal")>();
+  return {
+    reconcileDesktopWslBindings: actual.reconcileDesktopWslBindings,
+    desktopLocalConnectionId: (backendId: string) => `local:${backendId}`,
+    readDesktopLocalTopologySnapshot: () => ({
+      secondaryBootstraps: pf.secondaryRead,
+      wslState: pf.wslState,
+    }),
+    observeDesktopLocalTopology: (listener: () => void) => {
+      pf.topologyListeners.push(listener);
+      listener();
+      return () => {
+        pf.topologyListeners = pf.topologyListeners.filter((current) => current !== listener);
+      };
+    },
+  };
+});
 
 vi.mock("./storage", async () => {
+  const Effect = await import("effect/Effect");
   const Layer = await import("effect/Layer");
-  return { connectionStorageLayer: Layer.empty };
+  const Option = await import("effect/Option");
+  const { EnvironmentCatalogStore } = await import("@bibcode/client-runtime/platform");
+  const store = EnvironmentCatalogStore.of({
+    list: Effect.sync(() => pf.catalogEnvironments as never[]),
+    load: (environmentId) =>
+      Effect.sync(() =>
+        Option.fromUndefinedOr(
+          pf.catalogEnvironments.find(
+            (environment) =>
+              (environment as { readonly environmentId?: unknown }).environmentId === environmentId,
+          ) as never,
+        ),
+      ),
+    put: (environment) =>
+      Effect.sync(() => {
+        pf.catalogEnvironments = [
+          ...pf.catalogEnvironments.filter(
+            (current) =>
+              (current as { readonly environmentId?: unknown }).environmentId !==
+              environment.environmentId,
+          ),
+          environment,
+        ];
+      }),
+    updateRoutes: () => Effect.void,
+    listBindings: Effect.sync(() => pf.catalogBindings as never[]),
+    putBinding: (binding) =>
+      Effect.sync(() => {
+        pf.putBindings.push(binding);
+        pf.catalogBindings = [
+          ...pf.catalogBindings.filter(
+            (current) =>
+              (current as { readonly bindingId?: unknown }).bindingId !== binding.bindingId,
+          ),
+          binding,
+        ];
+      }),
+    removeWslBindingIfUnchanged: (binding) =>
+      Effect.sync(() => {
+        pf.removedBindings.push(binding);
+        const present = pf.catalogBindings.includes(binding);
+        if (present) {
+          pf.catalogBindings = pf.catalogBindings.filter((current) => current !== binding);
+        }
+        return present;
+      }),
+  });
+  return {
+    connectionStorageLayer: Layer.succeed(EnvironmentCatalogStore, store),
+  };
 });
 
 vi.mock("@bibcode/client-runtime/relay", async () => {
@@ -349,6 +439,12 @@ function resetPf(): void {
   pf.clearCalls.length = 0;
   pf.trackCalls.length = 0;
   pf.ackCalls.length = 0;
+  pf.topologyListeners.length = 0;
+  pf.wslState = null;
+  pf.catalogEnvironments = [];
+  pf.catalogBindings = [];
+  pf.putBindings = [];
+  pf.removedBindings = [];
 }
 
 afterEach(() => {
@@ -830,7 +926,7 @@ describe("connectionPlatformLayer connection source", () => {
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
-  it.effect("polls the primary and desktop-local topology into registrations", () => {
+  it.effect("reads the primary and desktop-local topology on the initial event", () => {
     stubBrowser({ desktopBridge: makeBridge([]) });
     pf.isHostedStatic = false;
     pf.primaryTarget = {
@@ -865,18 +961,384 @@ describe("connectionPlatformLayer connection source", () => {
       const fiber = yield* Effect.forkChild(
         Stream.runHead(source.registrations.pipe(Stream.take(1))),
       );
-      yield* TestClock.adjust("3 seconds");
       const head = yield* Fiber.join(fiber);
       expect(Option.isSome(head)).toBe(true);
       const registrations = Option.getOrThrow(head);
       // Primary (same-origin) + secondary (desktop-local bearer) registrations.
       expect(registrations.length).toBeGreaterThanOrEqual(2);
-    }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("withholds a WSL runtime until the initial discovery state is available", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = null;
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "delayed-wsl-state",
+          label: "WSL: Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:3202/",
+          wsBaseUrl: "ws://127.0.0.1:3202/",
+          bootstrapToken: "bootstrap-token",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const fiber = yield* Effect.forkChild(
+        Stream.runCollect(source.registrations.pipe(Stream.take(2))),
+      );
+      yield* waitFor(() => pf.topologyListeners.length === 1);
+      yield* Effect.yieldNow;
+      expect(pf.descriptorCalls).toEqual([]);
+
+      pf.wslState = platformWslState(1);
+      for (const listener of pf.topologyListeners) listener();
+      const batches = Array.from(yield* Fiber.join(fiber));
+      expect(batches[0]).toEqual([]);
+      expect(batches[1]).toEqual([
+        expect.objectContaining({
+          _tag: "BearerConnectionRegistration",
+          wslRouteId: "platform:wsl:desktop:wsl:ubuntu",
+        }),
+      ]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("attaches a proved WSL binding and stable candidate route to a live runtime", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(7);
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "runtime-slot-1",
+          label: "WSL: Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:3202/",
+          wsBaseUrl: "ws://127.0.0.1:3202/",
+          bootstrapToken: "bootstrap-token",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(registrations).toContainEqual(
+        expect.objectContaining({
+          _tag: "BearerConnectionRegistration",
+          target: expect.objectContaining({ connectionId: "local:runtime-slot-1" }),
+          wslBinding: expect.objectContaining({
+            bindingId: "desktop:wsl:ubuntu",
+            distroName: "Ubuntu",
+            acceptedEnvironmentId: platformDescriptor().environmentId,
+            condition: "available",
+            lastDiscoveryGeneration: 7,
+          }),
+          wslRouteId: "platform:wsl:desktop:wsl:ubuntu",
+        }),
+      );
+      expect(pf.putBindings).toEqual([]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("retains accepted stopped environments as unavailable registrations", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(8, "stopped");
+    const acceptedBinding = new DesktopWslBinding({
+      bindingId: "desktop:wsl:ubuntu",
+      distroName: "Ubuntu",
+      acceptedEnvironmentId: EnvironmentId.make(platformDescriptor().environmentId),
+      acceptedStorageInstanceIds: [platformDescriptor().storageInstanceId],
+      acceptedAt: "2026-08-25T00:00:00Z",
+      lastDiscoveryGeneration: 7,
+      condition: "available",
+      detail: null,
+    });
+    pf.catalogBindings = [acceptedBinding];
+    pf.catalogEnvironments = [
+      {
+        environmentId: platformDescriptor().environmentId,
+        acceptedStorageInstanceId: platformDescriptor().storageInstanceId,
+        descriptor: platformDescriptor(),
+        alias: "WSL: Ubuntu",
+        hidden: false,
+        bindings: [acceptedBinding],
+        routes: [],
+      },
+    ];
+    pf.secondaryRead = { _tag: "Success", bootstraps: [] };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(registrations).toEqual([
+        expect.objectContaining({
+          _tag: "UnavailableConnectionRegistration",
+          target: expect.objectContaining({
+            environmentId: platformDescriptor().environmentId,
+            configuredDistro: "Ubuntu",
+          }),
+          wslBinding: expect.objectContaining({
+            bindingId: "desktop:wsl:ubuntu",
+            condition: "stopped",
+            lastDiscoveryGeneration: 8,
+          }),
+        }),
+      ]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("blocks a live WSL locator that reports a replacement server identity", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(9);
+    const acceptedBinding = new DesktopWslBinding({
+      bindingId: "desktop:wsl:ubuntu",
+      distroName: "Ubuntu",
+      acceptedEnvironmentId: EnvironmentId.make(platformDescriptor().environmentId),
+      acceptedStorageInstanceIds: [platformDescriptor().storageInstanceId],
+      acceptedAt: "2026-08-25T00:00:00Z",
+      lastDiscoveryGeneration: 8,
+      condition: "available",
+      detail: null,
+    });
+    pf.catalogBindings = [acceptedBinding];
+    pf.catalogEnvironments = [
+      {
+        environmentId: platformDescriptor().environmentId,
+        acceptedStorageInstanceId: platformDescriptor().storageInstanceId,
+        descriptor: platformDescriptor(),
+        alias: "WSL: Ubuntu",
+        hidden: false,
+        bindings: [acceptedBinding],
+        routes: [],
+      },
+    ];
+    pf.descriptor = {
+      ...platformDescriptor(),
+      environmentId: EnvironmentId.make("00000000-0000-4000-8000-000000000091"),
+      storageInstanceId: "00000000-0000-4000-8000-000000000092",
+    };
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "replacement-runtime-slot",
+          label: "WSL: Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:3209/",
+          wsBaseUrl: "ws://127.0.0.1:3209/",
+          bootstrapToken: "replacement-bootstrap-token",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(registrations).toEqual([
+        expect.objectContaining({
+          _tag: "UnavailableConnectionRegistration",
+          target: expect.objectContaining({
+            environmentId: platformDescriptor().environmentId,
+            connectionId: "local:replacement-runtime-slot",
+          }),
+          wslBinding: expect.objectContaining({
+            bindingId: "desktop:wsl:ubuntu",
+            acceptedEnvironmentId: platformDescriptor().environmentId,
+            condition: "identity-conflict",
+          }),
+        }),
+      ]);
+      expect(registrations).not.toContainEqual(
+        expect.objectContaining({ _tag: "BearerConnectionRegistration" }),
+      );
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("persists an unproved setup-required WSL candidate", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(5);
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "pending-ubuntu",
+          label: "WSL: Ubuntu",
+          configuredDistro: "Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: null,
+          wsBaseUrl: null,
+          preflightError: {
+            kind: "wsl-secondary-unavailable",
+            detail: "BiBCode Server setup is required.",
+          },
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(registrations).toEqual([
+        expect.objectContaining({
+          _tag: "UnavailableConnectionRegistration",
+          wslBinding: expect.objectContaining({
+            bindingId: "desktop:wsl:ubuntu",
+            acceptedEnvironmentId: null,
+            condition: "setup-required",
+            lastDiscoveryGeneration: 5,
+          }),
+        }),
+      ]);
+      expect(pf.putBindings).toEqual([
+        expect.objectContaining({
+          bindingId: "desktop:wsl:ubuntu",
+          condition: "setup-required",
+        }),
+      ]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("deletes a transient rename candidate after descriptor proof", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = {
+      ...platformWslState(3),
+      discovery: {
+        ...platformWslState(3).discovery,
+        distros: [
+          { name: "Ubuntu-Renamed", isDefault: true, state: "running", version: 2 as const },
+        ],
+      },
+      distros: [{ name: "Ubuntu-Renamed", isDefault: true, state: "running", version: 2 as const }],
+    };
+    const accepted = new DesktopWslBinding({
+      bindingId: "desktop:wsl:ubuntu",
+      distroName: "Ubuntu",
+      acceptedEnvironmentId: EnvironmentId.make(platformDescriptor().environmentId),
+      acceptedStorageInstanceIds: [platformDescriptor().storageInstanceId],
+      acceptedAt: "2026-08-25T00:00:00Z",
+      lastDiscoveryGeneration: 1,
+      condition: "available",
+      detail: null,
+    });
+    const transient = new DesktopWslBinding({
+      bindingId: "desktop:wsl:ubuntu-renamed",
+      distroName: "Ubuntu-Renamed",
+      acceptedEnvironmentId: null,
+      acceptedStorageInstanceIds: [],
+      acceptedAt: null,
+      lastDiscoveryGeneration: 2,
+      condition: "setup-required",
+      detail: "Setup required.",
+    });
+    pf.catalogBindings = [accepted, transient];
+    pf.catalogEnvironments = [
+      {
+        environmentId: platformDescriptor().environmentId,
+        acceptedStorageInstanceId: platformDescriptor().storageInstanceId,
+        descriptor: platformDescriptor(),
+        alias: "WSL: Ubuntu",
+        hidden: false,
+        bindings: [accepted],
+        routes: [],
+      },
+    ];
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "renamed-runtime-slot",
+          label: "WSL: Ubuntu-Renamed",
+          runningDistro: "Ubuntu-Renamed",
+          httpBaseUrl: "http://127.0.0.1:3210/",
+          wsBaseUrl: "ws://127.0.0.1:3210/",
+          bootstrapToken: "bootstrap-token",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(registrations).toHaveLength(1);
+      expect(registrations[0]).toEqual(
+        expect.objectContaining({
+          _tag: "BearerConnectionRegistration",
+          wslBinding: expect.objectContaining({
+            bindingId: accepted.bindingId,
+            distroName: "Ubuntu-Renamed",
+            condition: "available",
+          }),
+        }),
+      );
+      expect(pf.removedBindings).toEqual([transient]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("rebuilds registrations on topology events and unsubscribes on teardown", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(1);
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "wsl-first",
+          label: "WSL: Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:3201/",
+          wsBaseUrl: "ws://127.0.0.1:3201/",
+          bootstrapToken: "bootstrap-token-1",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const fiber = yield* Effect.forkChild(
+        Stream.runCollect(source.registrations.pipe(Stream.take(2))),
+      );
+      yield* waitFor(() => pf.topologyListeners.length === 1);
+      yield* waitFor(() => pf.descriptorCalls.length === 1);
+      pf.secondaryRead = {
+        _tag: "Success",
+        bootstraps: [
+          {
+            id: "wsl",
+            label: "WSL: Ubuntu",
+            runningDistro: "Ubuntu",
+            httpBaseUrl: "http://127.0.0.1:3202/",
+            wsBaseUrl: "ws://127.0.0.1:3202/",
+            bootstrapToken: "bootstrap-token",
+          },
+        ],
+      };
+      for (const listener of pf.topologyListeners) listener();
+      const batches = Array.from(yield* Fiber.join(fiber));
+
+      expect(batches).toHaveLength(2);
+      expect(batches[0]?.[0]).toEqual(
+        expect.objectContaining({
+          target: expect.objectContaining({ connectionId: "local:wsl-first" }),
+        }),
+      );
+      expect(batches[1]?.[0]).toEqual(
+        expect.objectContaining({
+          target: expect.objectContaining({ connectionId: "local:wsl" }),
+        }),
+      );
+      expect(pf.topologyListeners).toEqual([]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
   it.effect("retains a configured unavailable WSL secondary without fabricating a session", () => {
     stubBrowser({ desktopBridge: makeBridge([]) });
     pf.isHostedStatic = false;
+    pf.wslState = platformWslState(1);
     pf.primaryTarget = {
       source: "cli",
       target: {
@@ -906,7 +1368,6 @@ describe("connectionPlatformLayer connection source", () => {
       const fiber = yield* Effect.forkChild(
         Stream.runHead(source.registrations.pipe(Stream.take(1))),
       );
-      yield* TestClock.adjust("3 seconds");
       const registrations = Option.getOrThrow(yield* Fiber.join(fiber));
 
       expect(registrations).toContainEqual(
@@ -924,7 +1385,7 @@ describe("connectionPlatformLayer connection source", () => {
       );
       expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:3773/"]);
       expect(pf.bearerBootstrapCalls).toEqual([]);
-    }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
+    }).pipe(Effect.provide(connectionPlatformLayer));
   });
 
   it.effect("logs and yields an empty batch when both topology reads fail", () => {
@@ -937,11 +1398,76 @@ describe("connectionPlatformLayer connection source", () => {
       const fiber = yield* Effect.forkChild(
         Stream.runHead(source.registrations.pipe(Stream.take(1))),
       );
-      yield* TestClock.adjust("3 seconds");
       const head = yield* Fiber.join(fiber);
       expect(Option.isSome(head)).toBe(true);
       // No primary target and a failed secondary read yields an empty batch.
       expect(Option.getOrThrow(head)).toEqual([]);
-    }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("retains an accepted WSL environment after topology failure and token expiry", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.wslState = platformWslState(4);
+    pf.bearerAccess = { access_token: "short-lived", expires_in: 1 };
+    const accepted = new DesktopWslBinding({
+      bindingId: "desktop:wsl:ubuntu",
+      distroName: "Ubuntu",
+      acceptedEnvironmentId: EnvironmentId.make(platformDescriptor().environmentId),
+      acceptedStorageInstanceIds: [platformDescriptor().storageInstanceId],
+      acceptedAt: "2026-08-25T00:00:00Z",
+      lastDiscoveryGeneration: 3,
+      condition: "available",
+      detail: null,
+    });
+    pf.catalogBindings = [accepted];
+    pf.catalogEnvironments = [
+      {
+        environmentId: platformDescriptor().environmentId,
+        acceptedStorageInstanceId: platformDescriptor().storageInstanceId,
+        descriptor: platformDescriptor(),
+        alias: "WSL: Ubuntu",
+        hidden: false,
+        bindings: [accepted],
+        routes: [],
+      },
+    ];
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "expiring-runtime",
+          label: "WSL: Ubuntu",
+          runningDistro: "Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:3211/",
+          wsBaseUrl: "ws://127.0.0.1:3211/",
+          bootstrapToken: "bootstrap-token",
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const fiber = yield* Effect.forkChild(
+        Stream.runCollect(source.registrations.pipe(Stream.take(2))),
+      );
+      yield* waitFor(() => pf.topologyListeners.length === 1);
+      yield* waitFor(() => pf.descriptorCalls.length === 1);
+      yield* TestClock.adjust("2 seconds");
+      pf.secondaryRead = { _tag: "Failure", cause: new Error("IPC unavailable") };
+      for (const listener of pf.topologyListeners) listener();
+      const batches = Array.from(yield* Fiber.join(fiber));
+      expect(batches[0]?.[0]).toEqual(
+        expect.objectContaining({ _tag: "BearerConnectionRegistration" }),
+      );
+      expect(batches[1]).toEqual([
+        expect.objectContaining({
+          _tag: "UnavailableConnectionRegistration",
+          target: expect.objectContaining({
+            environmentId: platformDescriptor().environmentId,
+          }),
+          wslBinding: expect.objectContaining({ bindingId: accepted.bindingId }),
+        }),
+      ]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
   });
 });

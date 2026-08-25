@@ -27,6 +27,7 @@ import {
   BearerConnectionRegistration,
   type ConnectionRegistration,
   PrimaryConnectionRegistration,
+  DesktopWslBinding,
   RelayConnectionRegistration,
   SshConnectionProfile,
   type ConnectionCredential,
@@ -43,6 +44,7 @@ import {
   ConnectionTransientError,
   BearerConnectionTarget,
   DesktopLoopbackRoute,
+  DesktopWslRoute,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
@@ -363,6 +365,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       }),
     listBindings: Effect.succeed([]),
     putBinding: () => Effect.void,
+    removeWslBindingIfUnchanged: () => Effect.succeed(false),
   });
   const environmentSecretStore = Persistence.EnvironmentSecretStore.of({
     put: (_environmentId, _purpose, value) => {
@@ -1708,6 +1711,208 @@ describe("EnvironmentRegistry", () => {
           (yield* SubscriptionRef.get(registry.entries)).get(TARGET.environmentId)?.target,
         ).toEqual(TARGET);
       }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("persists a stable WSL binding and route while runtime slots rotate", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+      const environmentId = DurableEnvironmentId.make("00000000-0000-4000-8000-0000000000a1");
+      const descriptor = {
+        ...PREPARED.descriptor,
+        environmentId,
+        storageInstanceId: "00000000-0000-4000-8000-0000000000a2",
+      };
+      const binding = new DesktopWslBinding({
+        bindingId: "desktop:wsl:ubuntu",
+        distroName: "Ubuntu",
+        acceptedEnvironmentId: environmentId,
+        acceptedStorageInstanceIds: [descriptor.storageInstanceId],
+        acceptedAt: "2026-08-25T00:00:00Z",
+        lastDiscoveryGeneration: 8,
+        condition: "available",
+        detail: null,
+      });
+      const routeId = "platform:wsl:desktop:wsl:ubuntu";
+      const registration = new BearerConnectionRegistration({
+        target: new BearerConnectionTarget({
+          environmentId,
+          label: "WSL: Ubuntu",
+          connectionId: "local:runtime-slot-1",
+        }),
+        profile: new BearerConnectionProfile({
+          connectionId: "local:runtime-slot-1",
+          environmentId,
+          label: "WSL: Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:48293",
+          wsBaseUrl: "ws://127.0.0.1:48293",
+        }),
+        credential: new BearerConnectionCredential({ token: "runtime-token" }),
+        descriptor,
+        wslBinding: binding,
+        wslRouteId: routeId,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([registration]);
+        const stored = (yield* Ref.get(harness.storedEnvironments)).get(environmentId);
+        expect(stored?.bindings).toEqual([binding]);
+        expect(stored?.routes).toContainEqual(
+          expect.objectContaining({
+            _tag: "DesktopWslRoute",
+            routeId,
+            bindingId: binding.bindingId,
+          }),
+        );
+        expect(stored?.routes).not.toContainEqual(
+          expect.objectContaining({ routeId: "local:runtime-slot-1" }),
+        );
+
+        const stoppedBinding = new DesktopWslBinding({
+          ...binding,
+          lastDiscoveryGeneration: 9,
+          condition: "stopped",
+        });
+        yield* registry.reconcilePlatform([
+          new UnavailableConnectionRegistration({
+            target: new UnavailableConnectionTarget({
+              environmentId,
+              label: "WSL: Ubuntu",
+              connectionId: "local:runtime-slot-2",
+              configuredDistro: "Ubuntu",
+              detail: "This WSL distribution is stopped.",
+            }),
+            wslBinding: stoppedBinding,
+            wslRouteId: routeId,
+          }),
+        ]);
+
+        const stopped = (yield* Ref.get(harness.storedEnvironments)).get(environmentId);
+        expect(stopped?.bindings).toEqual([stoppedBinding]);
+        expect(stopped?.routes).toContainEqual(
+          expect.objectContaining({ _tag: "DesktopWslRoute", routeId }),
+        );
+        expect((yield* SubscriptionRef.get(registry.entries)).get(environmentId)?.target).toEqual(
+          expect.objectContaining({ _tag: "UnavailableConnectionTarget" }),
+        );
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("ignores a platform WSL bearer registration without stable binding metadata", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+      const environmentId = DurableEnvironmentId.make("00000000-0000-4000-8000-0000000000b1");
+      const descriptor = {
+        ...PREPARED.descriptor,
+        environmentId,
+        storageInstanceId: "00000000-0000-4000-8000-0000000000b2",
+      };
+      const registration = new BearerConnectionRegistration({
+        target: new BearerConnectionTarget({
+          environmentId,
+          label: "WSL: Ubuntu",
+          connectionId: "local:volatile-runtime-slot",
+        }),
+        profile: new BearerConnectionProfile({
+          connectionId: "local:volatile-runtime-slot",
+          environmentId,
+          label: "WSL: Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:48294",
+          wsBaseUrl: "ws://127.0.0.1:48294",
+        }),
+        credential: new BearerConnectionCredential({ token: "runtime-token" }),
+        descriptor,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([registration]);
+        expect((yield* Ref.get(harness.storedEnvironments)).has(environmentId)).toBe(false);
+        expect((yield* SubscriptionRef.get(registry.entries)).has(environmentId)).toBe(false);
+        expect((yield* Ref.get(harness.storedCredentials)).has("local:volatile-runtime-slot")).toBe(
+          false,
+        );
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("transactionally replaces a legacy volatile WSL route with the stable route", () =>
+    Effect.gen(function* () {
+      const environmentId = DurableEnvironmentId.make("00000000-0000-4000-8000-0000000000c1");
+      const descriptor = {
+        ...PREPARED.descriptor,
+        environmentId,
+        storageInstanceId: "00000000-0000-4000-8000-0000000000c2",
+      };
+      const volatileRoute = new DesktopWslRoute({
+        routeId: "local:volatile-runtime-slot",
+        environmentId,
+        label: "WSL: Ubuntu",
+        priority: 0,
+        pinned: true,
+        autoconnect: true,
+        secretRef: null,
+        bindingId: "local:volatile-runtime-slot",
+        httpBaseUrl: "http://127.0.0.1:48295",
+        wsBaseUrl: "ws://127.0.0.1:48295",
+      });
+      const legacyEnvironment: KnownEnvironment = {
+        environmentId,
+        acceptedStorageInstanceId: descriptor.storageInstanceId,
+        descriptor,
+        alias: "WSL: Ubuntu",
+        hidden: false,
+        bindings: [],
+        routes: [volatileRoute],
+      };
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [legacyEnvironment],
+      });
+      const binding = new DesktopWslBinding({
+        bindingId: "desktop:wsl:ubuntu",
+        distroName: "Ubuntu",
+        acceptedEnvironmentId: environmentId,
+        acceptedStorageInstanceIds: [descriptor.storageInstanceId],
+        acceptedAt: "2026-08-25T00:00:00Z",
+        lastDiscoveryGeneration: 8,
+        condition: "available",
+        detail: null,
+      });
+      const routeId = "platform:wsl:desktop:wsl:ubuntu";
+      const registration = new BearerConnectionRegistration({
+        target: new BearerConnectionTarget({
+          environmentId,
+          label: "WSL: Ubuntu",
+          connectionId: "local:current-runtime-slot",
+        }),
+        profile: new BearerConnectionProfile({
+          connectionId: "local:current-runtime-slot",
+          environmentId,
+          label: "WSL: Ubuntu",
+          httpBaseUrl: "http://127.0.0.1:48296",
+          wsBaseUrl: "ws://127.0.0.1:48296",
+        }),
+        credential: new BearerConnectionCredential({ token: "current-token" }),
+        descriptor,
+        wslBinding: binding,
+        wslRouteId: routeId,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([registration]);
+        const stored = (yield* Ref.get(harness.storedEnvironments)).get(environmentId);
+        expect(stored?.routes).toEqual([
+          expect.objectContaining({
+            _tag: "DesktopWslRoute",
+            routeId,
+            bindingId: binding.bindingId,
+          }),
+        ]);
+        expect(stored?.routes).not.toContainEqual(volatileRoute);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
 

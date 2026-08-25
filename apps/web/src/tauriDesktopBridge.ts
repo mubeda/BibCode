@@ -14,16 +14,24 @@ import type {
   DesktopUpdateCheckResult,
   DesktopUpdateInstallInput,
   DesktopUpdateState,
+  DesktopWslDiscovery,
   DesktopWslState,
+  RemoteSetupProgress,
 } from "@bibcode/contracts";
 import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  DesktopEnvironmentBootstrapSchema,
   DesktopSshServerProbeSchema,
   DesktopSshSetupResultSchema,
+  DesktopWslDiscoverySchema,
+  DesktopWslServerProbeSchema,
+  DesktopWslSetupResultSchema,
+  DesktopWslStateSchema,
   ExecutionEnvironmentDescriptor,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
+  RemoteSetupProgressSchema,
 } from "@bibcode/contracts";
 import { invoke as importedTauriInvoke, isTauri as isImportedTauri } from "@tauri-apps/api/core";
 import { listen as importedTauriListen } from "@tauri-apps/api/event";
@@ -41,14 +49,21 @@ const BACKEND_READY_EVENT = "desktop:backend-ready";
 const PROJECT_DATA_STATUS_CHANGED_EVENT = "desktop:project-data-status-changed";
 const MENU_ACTION_EVENT = "desktop:menu-action";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
+const REMOTE_SETUP_PROGRESS_EVENT = "desktop:remote-setup-progress";
 const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
 const UPDATE_STATE_EVENT = "desktop:update-state";
+const WSL_DISCOVERY_CHANGED_EVENT = "desktop:wsl-discovery-changed";
 const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
 const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
 const decodeSshEnvironmentDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
 const decodeSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
 const decodeSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
+const decodeRemoteSetupProgress = Schema.decodeUnknownSync(RemoteSetupProgressSchema);
+const decodeWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
+const decodeWslServerProbe = Schema.decodeUnknownSync(DesktopWslServerProbeSchema);
+const decodeWslSetupResult = Schema.decodeUnknownSync(DesktopWslSetupResultSchema);
+const decodeWslState = Schema.decodeUnknownSync(DesktopWslStateSchema);
 
 type ConnectionCatalogProtectionCapability = "protected" | "unprotected" | "unknown";
 
@@ -56,11 +71,16 @@ let cachedLocalEnvironmentBootstraps: readonly DesktopEnvironmentBootstrap[] = [
 let localEnvironmentBootstrapsRefresh: Promise<readonly DesktopEnvironmentBootstrap[]> | null =
   null;
 let localEnvironmentBearerToken: Promise<string> | null = null;
+const localEnvironmentBootstrapListeners = new Set<
+  (bootstraps: readonly DesktopEnvironmentBootstrap[]) => void
+>();
 
-interface TauriDesktopBackendReadyPayload {
-  readonly reason: "started" | "restarted";
-  readonly bootstraps: readonly DesktopEnvironmentBootstrap[];
-}
+const TauriDesktopBackendReadyPayloadSchema = Schema.Struct({
+  reason: Schema.Literals(["started", "restarted"]),
+  bootstraps: Schema.Array(DesktopEnvironmentBootstrapSchema),
+});
+type TauriDesktopBackendReadyPayload = typeof TauriDesktopBackendReadyPayloadSchema.Type;
+const decodeBackendReady = Schema.decodeUnknownSync(TauriDesktopBackendReadyPayloadSchema);
 
 interface TauriDesktopCapabilityUnsupportedPayload {
   readonly code: "tauri_capability_unsupported";
@@ -137,6 +157,21 @@ function tauriListen<T>(event: string, listener: (payload: T) => void): () => vo
     active = false;
     void unlisten.then((dispose) => dispose?.());
   };
+}
+
+function tauriListenDecoded<T>(
+  event: string,
+  decode: (input: unknown) => T,
+  listener: (payload: T) => void,
+): () => void {
+  return tauriListen<unknown>(event, (payload) => {
+    try {
+      listener(decode(payload));
+    } catch {
+      // Native events cross an untrusted serialization boundary. Invalid
+      // payloads are ignored without logging their potentially sensitive data.
+    }
+  });
 }
 
 async function tauriInvokeOr<T>(
@@ -224,6 +259,9 @@ function applyBackendReady(payload: TauriDesktopBackendReadyPayload): void {
   cachedLocalEnvironmentBootstraps = payload.bootstraps;
   localEnvironmentBootstrapsRefresh = null;
   localEnvironmentBearerToken = null;
+  for (const listener of localEnvironmentBootstrapListeners) {
+    listener(payload.bootstraps);
+  }
 }
 
 function primaryBootstrapFrom(
@@ -541,6 +579,10 @@ function createTauriDesktopBridge(
       tauriInvoke<DesktopBridgeHostMetadata>("desktop_bridge_get_bridge_metadata", undefined),
     getAppBranding: resolveTauriAppBranding,
     getLocalEnvironmentBootstraps: getCachedLocalEnvironmentBootstraps,
+    onLocalEnvironmentBootstrapsChanged: (listener) => {
+      localEnvironmentBootstrapListeners.add(listener);
+      return () => localEnvironmentBootstrapListeners.delete(listener);
+    },
     getLocalEnvironmentBearerToken,
     getClientSettings: () =>
       tauriInvokeOr<ClientSettings | null>("desktop_bridge_get_client_settings", undefined, () =>
@@ -616,7 +658,29 @@ function createTauriDesktopBridge(
     getAdvertisedEndpoints: () =>
       tauriInvokeOr("desktop_bridge_get_advertised_endpoints", undefined, () => []),
     getWslState: () =>
-      tauriInvokeOr<DesktopWslState>("desktop_bridge_get_wsl_state", undefined, defaultWslState),
+      tauriInvokeOr<unknown>("desktop_bridge_get_wsl_state", undefined, defaultWslState).then(
+        decodeWslState,
+      ),
+    refreshWslDiscovery: () =>
+      tauriInvokeOr<unknown>(
+        "desktop_bridge_refresh_wsl_discovery",
+        undefined,
+        defaultWslState,
+      ).then(decodeWslState),
+    onWslDiscoveryChanged: (listener: (discovery: DesktopWslDiscovery) => void) =>
+      tauriListenDecoded(WSL_DISCOVERY_CHANGED_EVENT, decodeWslDiscovery, listener),
+    prepareWslServer: (input) =>
+      tauriInvoke<unknown>("desktop_bridge_prepare_wsl_server", { input }).then(
+        decodeWslServerProbe,
+      ),
+    installWslServer: (decision) =>
+      tauriInvoke<unknown>("desktop_bridge_install_wsl_server", { input: decision }).then(
+        decodeWslSetupResult,
+      ),
+    cancelWslSetup: (input) =>
+      tauriInvokeDesktop<boolean>("desktop_bridge_cancel_wsl_setup", { input }),
+    onRemoteSetupProgress: (listener: (progress: RemoteSetupProgress) => void) =>
+      tauriListenDecoded(REMOTE_SETUP_PROGRESS_EVENT, decodeRemoteSetupProgress, listener),
     setWslBackendEnabled: (enabled) =>
       tauriInvokeOr<DesktopWslState>(
         "desktop_bridge_set_wsl_backend_enabled",
@@ -703,7 +767,7 @@ async function installTauriDesktopBridge(): Promise<void> {
   window.desktopBridge = bridge;
   const preview = bridge.preview;
   if (preview) startBrowserSurfaceSync(preview);
-  tauriListen<TauriDesktopBackendReadyPayload>(BACKEND_READY_EVENT, applyBackendReady);
+  tauriListenDecoded(BACKEND_READY_EVENT, decodeBackendReady, applyBackendReady);
 }
 
 export const tauriDesktopBridgeReady: Promise<void> = isTauriDesktopRuntime

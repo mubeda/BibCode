@@ -68,6 +68,25 @@ const defaultSshDescriptor = {
   transport: { mode: "loopback-http" },
 } as const;
 
+const defaultWslDiscovery = {
+  generation: 7,
+  observedAt: "2026-08-25T00:00:00Z",
+  health: "available",
+  detail: null,
+  distros: [{ name: "Ubuntu", isDefault: true, state: "running", version: 2 }],
+} as const;
+
+const defaultWslState = {
+  enabled: true,
+  distro: null,
+  legacyAcceptedDistro: null,
+  available: true,
+  wslOnly: false,
+  distros: defaultWslDiscovery.distros,
+  discovery: defaultWslDiscovery,
+  preflightError: null,
+} as const;
+
 function installTauriHarness(options?: {
   readonly previewSupported?: boolean;
   readonly protectedConnectionCatalog?: boolean;
@@ -219,6 +238,51 @@ function installTauriHarness(options?: {
           recoveryCommand: null,
           message: "SSH server installation was declined before mutation.",
         });
+      case "desktop_bridge_prepare_wsl_server":
+        return Promise.resolve({
+          requestId: "wsl-setup-1",
+          probeGeneration: 7,
+          discoveryGeneration: 7,
+          distro: "Ubuntu",
+          compatibility: "compatible",
+          probe: {
+            os: "linux",
+            architecture: "x86_64",
+            installedVersion: "0.4.2",
+            serviceMode: "workstation",
+            serviceState: "running",
+            dataRoot: "/home/dev/.bibcode",
+            controlAvailable: true,
+            freeBytes: 1_000_000,
+            installAuthority: "user",
+          },
+          installedBinaryPath: "/usr/bin/bibcode",
+          consent: null,
+          detail: null,
+        });
+      case "desktop_bridge_install_wsl_server":
+        return Promise.resolve({
+          requestId: "wsl-setup-1",
+          generation: 7,
+          distro: "Ubuntu",
+          status: "cancelled",
+          stage: "probe",
+          mutationStatus: "none",
+          cleanupStatus: "notRequired",
+          installedVersion: null,
+          previousVersion: "0.4.1",
+          managedBinaryPath: null,
+          dataRoot: "/home/dev/.bibcode",
+          descriptor: null,
+          message: "WSL server installation was declined before mutation.",
+        });
+      case "desktop_bridge_cancel_wsl_setup":
+        return Promise.resolve(true);
+      case "desktop_bridge_get_wsl_state":
+      case "desktop_bridge_refresh_wsl_discovery":
+        return options?.rejectFallbackCommands
+          ? Promise.reject(new Error(`unsupported fallback command: ${command}`))
+          : Promise.resolve(defaultWslState);
       case "desktop_bridge_show_context_menu":
         if ("rejectContextMenu" in (options ?? {})) {
           return Promise.reject(options?.rejectContextMenu);
@@ -1326,7 +1390,7 @@ describe("tauriDesktopBridge", () => {
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toBeNull();
     await expect(bridge.getAdvertisedEndpoints()).resolves.toBeNull();
-    await expect(bridge.getWslState()).resolves.toBeNull();
+    await expect(bridge.getWslState()).resolves.toEqual(defaultWslState);
     await expect(bridge.setWslBackendEnabled(true)).resolves.toBeNull();
     await expect(bridge.setWslDistro("Ubuntu")).resolves.toBeNull();
     await expect(bridge.setWslOnly(true)).resolves.toBeNull();
@@ -1377,6 +1441,78 @@ describe("tauriDesktopBridge", () => {
       path: "C:\\workspace\\demo\\src",
       isDirectory: true,
     });
+  });
+
+  it("decodes WSL discovery and setup events and exposes generation-fenced commands", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const discoveries: unknown[] = [];
+    const progress: unknown[] = [];
+
+    await expect(bridge.refreshWslDiscovery?.()).resolves.toEqual(defaultWslState);
+    await expect(
+      bridge.prepareWslServer?.({ distro: "Ubuntu", discoveryGeneration: 7 }),
+    ).resolves.toMatchObject({ distro: "Ubuntu", probeGeneration: 7 });
+    await expect(
+      bridge.installWslServer?.({ requestId: "wsl-setup-1", probeGeneration: 7, accepted: false }),
+    ).resolves.toMatchObject({ status: "cancelled", generation: 7 });
+    await expect(
+      bridge.cancelWslSetup?.({ requestId: "wsl-setup-1", generation: 7 }),
+    ).resolves.toBe(true);
+
+    const disposeDiscovery = bridge.onWslDiscoveryChanged?.((event) => discoveries.push(event));
+    const disposeProgress = bridge.onRemoteSetupProgress?.((event) => progress.push(event));
+    await Promise.resolve();
+
+    harness.listeners.get("desktop:wsl-discovery-changed")?.({
+      payload: defaultWslDiscovery,
+    });
+    harness.listeners.get("desktop:remote-setup-progress")?.({
+      payload: {
+        requestId: "wsl-setup-1",
+        generation: 7,
+        stage: "download",
+        status: "running",
+        completedBytes: 5,
+        totalBytes: 10,
+        message: null,
+      },
+    });
+    harness.listeners.get("desktop:wsl-discovery-changed")?.({
+      payload: { ...defaultWslDiscovery, generation: -1 },
+    });
+    harness.listeners.get("desktop:remote-setup-progress")?.({
+      payload: {
+        requestId: "wsl-setup-1",
+        generation: 7,
+        stage: "download",
+        status: "running",
+        completedBytes: 11,
+        totalBytes: 10,
+        message: null,
+      },
+    });
+
+    expect(discoveries).toEqual([defaultWslDiscovery]);
+    expect(progress).toEqual([
+      expect.objectContaining({ requestId: "wsl-setup-1", completedBytes: 5 }),
+    ]);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_refresh_wsl_discovery", undefined);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_prepare_wsl_server", {
+      input: { distro: "Ubuntu", discoveryGeneration: 7 },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_wsl_server", {
+      input: { requestId: "wsl-setup-1", probeGeneration: 7, accepted: false },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_cancel_wsl_setup", {
+      input: { requestId: "wsl-setup-1", generation: 7 },
+    });
+
+    disposeDiscovery?.();
+    disposeProgress?.();
+    await Promise.resolve();
+    expect(harness.unlisteners.get("desktop:wsl-discovery-changed")).toHaveBeenCalledTimes(1);
+    expect(harness.unlisteners.get("desktop:remote-setup-progress")).toHaveBeenCalledTimes(1);
   });
 
   it("wraps Tauri event listeners and tears them down", async () => {

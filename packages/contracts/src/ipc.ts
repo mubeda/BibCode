@@ -1503,6 +1503,9 @@ export interface DesktopBridge {
   // info (omits instances whose backend hasn't produced a config yet).
   // The primary backend is identified by id === PRIMARY_LOCAL_ENVIRONMENT_ID.
   getLocalEnvironmentBootstraps: () => readonly DesktopEnvironmentBootstrap[];
+  onLocalEnvironmentBootstrapsChanged?: (
+    listener: (bootstraps: readonly DesktopEnvironmentBootstrap[]) => void,
+  ) => () => void;
   getLocalEnvironmentBearerToken: () => Promise<string>;
   getClientSettings: () => Promise<ClientSettings | null>;
   setClientSettings: (settings: ClientSettings) => Promise<void>;
@@ -1565,6 +1568,12 @@ export interface DesktopBridge {
   }) => Promise<DesktopServerExposureState>;
   getAdvertisedEndpoints: () => Promise<readonly AdvertisedEndpoint[]>;
   getWslState: () => Promise<DesktopWslState>;
+  refreshWslDiscovery?: () => Promise<DesktopWslState>;
+  onWslDiscoveryChanged?: (listener: (discovery: DesktopWslDiscovery) => void) => () => void;
+  prepareWslServer?: (input: DesktopWslSetupProbeInput) => Promise<DesktopWslServerProbe>;
+  installWslServer?: (decision: RemoteSetupConsentDecision) => Promise<DesktopWslSetupResult>;
+  cancelWslSetup?: (input: RemoteSetupCancelInput) => Promise<boolean>;
+  onRemoteSetupProgress?: (listener: (progress: RemoteSetupProgress) => void) => () => void;
   /** @deprecated Compatibility refresh; Running distro discovery owns availability. */
   setWslBackendEnabled: (enabled: boolean) => Promise<DesktopWslState>;
   /** @deprecated Compatibility refresh; platform bindings own distro locators. */

@@ -218,6 +218,10 @@ export class BearerConnectionRegistration extends Schema.TaggedClass<BearerConne
     profile: BearerConnectionProfile,
     credential: BearerConnectionCredential,
     descriptor: Schema.optionalKey(ExecutionEnvironmentDescriptor),
+    /** Desktop-only normalized WSL locator metadata; never used as identity. */
+    wslBinding: Schema.optionalKey(DesktopWslBinding),
+    /** Stable route id kept separate from the process-lifetime runtime slot. */
+    wslRouteId: Schema.optionalKey(TrimmedNonEmptyString),
   },
 ) {}
 
@@ -233,6 +237,8 @@ export class UnavailableConnectionRegistration extends Schema.TaggedClass<Unavai
   "UnavailableConnectionRegistration",
   {
     target: UnavailableConnectionTarget,
+    wslBinding: Schema.optionalKey(DesktopWslBinding),
+    wslRouteId: Schema.optionalKey(TrimmedNonEmptyString),
   },
 ) {}
 
