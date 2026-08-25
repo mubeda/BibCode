@@ -5168,7 +5168,7 @@ exit /b 9
             .expect_err("malformed marker must fail desktop backend startup closed");
 
         assert!(
-            error.contains("storage instance marker") && error.contains("malformed"),
+            error.contains("identity marker") && error.contains("malformed"),
             "unexpected error: {error}",
         );
         assert!(supervisor.local_environment_bootstraps().is_empty());
@@ -6190,7 +6190,7 @@ $client.Dispose()
     }
 
     #[tokio::test]
-    async fn restarting_local_runtime_replaces_the_previous_in_process_server() {
+    async fn stopped_local_runtime_restarts_after_releasing_exclusive_ownership() {
         let temp = tempfile::tempdir().expect("tempdir should open");
         let first_port = portpicker::pick_unused_port().expect("first port should be available");
         let second_port = loop {
@@ -6218,6 +6218,13 @@ $client.Dispose()
             )
             .await
             .expect("first local runtime should start");
+
+        supervisor
+            .stop(BackendShutdownConfig {
+                timeout: Duration::from_secs(2),
+            })
+            .await
+            .expect("first local runtime should release its store and control endpoint");
 
         supervisor
             .start_with_options(
