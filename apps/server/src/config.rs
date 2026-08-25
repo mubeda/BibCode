@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::{EnvironmentId, StorageInstanceId};
+use crate::transport::TransportIdentity;
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -58,6 +59,7 @@ pub struct ServerConfig {
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    pub(crate) transport_identity: TransportIdentity,
     pub(crate) managed_service_launch: bool,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
@@ -87,6 +89,7 @@ impl ServerConfig {
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            transport_identity: TransportIdentity::LoopbackHttp,
             managed_service_launch: false,
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),

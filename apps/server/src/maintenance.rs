@@ -490,10 +490,9 @@ pub(crate) fn maintenance_routes_enabled(config: &ServerConfig) -> bool {
     if config.mode != ServerMode::Desktop || config.desktop_bootstrap_token.is_none() {
         return false;
     }
-    let local_bind = config
+    config
         .host
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| address.is_loopback())
-        || config.host.eq_ignore_ascii_case("localhost");
-    local_bind
+        || config.host.eq_ignore_ascii_case("localhost")
 }

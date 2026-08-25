@@ -288,6 +288,8 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
             .get("worktreeCatalogRefreshReason")
             .is_none()
     );
+    assert_eq!(descriptor["transport"]["mode"], "loopback-http");
+    assert!(descriptor["transport"].get("spkiSha256").is_none());
 
     handle.shutdown();
     timeout(Duration::from_secs(2), handle.join())
@@ -467,6 +469,10 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
         get_config["exit"]["value"]["environment"]["storageInstanceId"],
         storage_instance_id
     );
+    assert_eq!(
+        get_config["exit"]["value"]["environment"]["transport"],
+        well_known["transport"]
+    );
 
     send_rpc_request(&mut socket, "11", "subscribeServerConfig").await;
     let config_snapshot = next_rpc_wire(&mut socket, "server config snapshot").await;
@@ -476,6 +482,10 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
     assert_eq!(
         config_snapshot["values"][0]["config"]["environment"]["storageInstanceId"],
         storage_instance_id
+    );
+    assert_eq!(
+        config_snapshot["values"][0]["config"]["environment"]["transport"],
+        well_known["transport"]
     );
     acknowledge_rpc_chunk(&mut socket, "11").await;
 
@@ -488,6 +498,10 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
         assert_eq!(
             lifecycle["values"][0]["payload"]["environment"]["storageInstanceId"],
             storage_instance_id
+        );
+        assert_eq!(
+            lifecycle["values"][0]["payload"]["environment"]["transport"],
+            well_known["transport"]
         );
         acknowledge_rpc_chunk(&mut socket, "12").await;
     }

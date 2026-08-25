@@ -2160,6 +2160,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "vcsStatusSummary": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
         },
+        "transport": config.transport_identity.clone(),
     })
 }
 
@@ -2246,6 +2247,7 @@ mod tests {
 
     fn running_test_config(path: &Path) -> ServerConfig {
         let mut config = ServerConfig::new(path);
+        config.environment_id = Some(test_environment_id());
         config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
             TEST_STORAGE_INSTANCE_ID,
         ));
@@ -5015,6 +5017,8 @@ mod tests {
             true
         );
         assert_eq!(descriptor["capabilities"]["vcsStatusSummary"], true);
+        assert_eq!(descriptor["transport"]["mode"], "loopback-http");
+        assert!(descriptor["transport"].get("spkiSha256").is_none());
     }
 
     #[tokio::test]
@@ -5033,6 +5037,7 @@ mod tests {
             .await
             .expect("prepared test store");
         let expected = prepared.storage_instance_id.to_string();
+        config.environment_id = Some(prepared.environment_id);
         config.storage_instance_id = Some(prepared.storage_instance_id);
 
         let descriptor = environment_descriptor(&config, true);

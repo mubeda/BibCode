@@ -37,6 +37,7 @@ pub struct ServerRuntime;
 
 pub struct ServerHandle {
     local_addr: SocketAddr,
+    advertised_base_url: String,
     data_root: ResolvedDataRoot,
     startup_access: Option<StartupAccess>,
     database: Option<Database>,
@@ -139,11 +140,16 @@ impl ServerRuntime {
         process_tree_cleanup: ProcessTreeCleanup,
     ) -> Result<ServerHandle, ServerError> {
         let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
+        let shutdown = CancellationToken::new();
         let validated_listener = transport::validate_listener(&config).await?;
-        let listener = transport::bind(validated_listener).await?;
+        let listener = transport::bind(validated_listener, shutdown.clone()).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|source| TransportError::Bind { source })?;
+        let advertised_base_url = listener
+            .advertised_base_url()
+            .map_err(|source| TransportError::Bind { source })?;
+        config.transport_identity = listener.transport_identity();
         config.base_dir = resolved_data_root.effective.clone();
         config.resolved_data_root = Some(resolved_data_root.clone());
         tokio::fs::create_dir_all(&config.base_dir)
@@ -200,7 +206,10 @@ impl ServerRuntime {
                     .issue_startup_pairing()
                     .await
                     .map_err(|error| ServerError::AuthInitialize(format!("{error:?}")))?;
-                Some(build_startup_access(local_addr, issued.credential)?)
+                Some(build_startup_access(
+                    &advertised_base_url,
+                    issued.credential,
+                )?)
             } else {
                 None
             };
@@ -288,6 +297,7 @@ impl ServerRuntime {
                         "maximum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
                     },
                     "capabilities": { "repositoryIdentity": true },
+                    "transport": config.transport_identity.clone(),
                 });
                 let connect = Arc::new(
                     ConnectMcpService::open(
@@ -298,7 +308,7 @@ impl ServerRuntime {
                                 .expect("a running server has a prepared environment identity")
                                 .to_string(),
                             descriptor,
-                            mcp_endpoint: format!("http://{local_addr}/mcp"),
+                            mcp_endpoint: format!("{advertised_base_url}/mcp"),
                             now_epoch_seconds: Arc::new(|| {
                                 time::OffsetDateTime::now_utc().unix_timestamp()
                             }),
@@ -321,7 +331,6 @@ impl ServerRuntime {
                 )
             }
         };
-        let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
         let update_maintenance = if maintenance_routes_enabled(&config) {
             production_runtime.as_ref().map(|runtime| {
@@ -369,6 +378,7 @@ impl ServerRuntime {
 
         Ok(ServerHandle {
             local_addr,
+            advertised_base_url,
             data_root: resolved_data_root,
             startup_access,
             database: Some(database),
@@ -495,6 +505,11 @@ impl ServerHandle {
     }
 
     #[must_use]
+    pub fn advertised_base_url(&self) -> &str {
+        &self.advertised_base_url
+    }
+
+    #[must_use]
     pub fn data_root(&self) -> &ResolvedDataRoot {
         &self.data_root
     }
@@ -527,21 +542,10 @@ impl ServerHandle {
 }
 
 fn build_startup_access(
-    local_addr: SocketAddr,
+    advertised_base_url: &str,
     credential: String,
 ) -> Result<StartupAccess, ServerError> {
-    let host = if local_addr.ip().is_unspecified() {
-        "localhost".to_owned()
-    } else {
-        local_addr.ip().to_string()
-    };
-    let authority = if local_addr.is_ipv6() && !local_addr.ip().is_unspecified() {
-        format!("[{host}]:{}", local_addr.port())
-    } else {
-        format!("{host}:{}", local_addr.port())
-    };
-    let connection_string = format!("http://{authority}");
-    let mut pairing_url = url::Url::parse(&connection_string)
+    let mut pairing_url = url::Url::parse(advertised_base_url)
         .map_err(|error| ServerError::AuthInitialize(error.to_string()))?;
     pairing_url.set_path("/pair");
     pairing_url.set_query(None);
@@ -550,7 +554,7 @@ fn build_startup_access(
         .finish();
     pairing_url.set_fragment(Some(&fragment));
     Ok(StartupAccess {
-        connection_string,
+        connection_string: advertised_base_url.to_owned(),
         credential,
         pairing_url: pairing_url.to_string(),
     })
@@ -792,19 +796,13 @@ mod tests {
         fallback.shutdown();
         fallback.join().await.expect("fallback server should join");
 
-        let ipv4 = build_startup_access(
-            "0.0.0.0:3773".parse().expect("IPv4 socket address"),
-            "pairing credential".to_string(),
-        )
-        .expect("IPv4 startup access should build");
+        let ipv4 = build_startup_access("http://localhost:3773", "pairing credential".to_string())
+            .expect("IPv4 startup access should build");
         assert_eq!(ipv4.connection_string, "http://localhost:3773");
         assert!(ipv4.pairing_url.contains("token=pairing+credential"));
 
-        let ipv6 = build_startup_access(
-            "[::]:3774".parse().expect("IPv6 socket address"),
-            "credential".to_string(),
-        )
-        .expect("IPv6 startup access should build");
-        assert_eq!(ipv6.connection_string, "http://localhost:3774");
+        let ipv6 = build_startup_access("https://localhost:3774", "credential".to_string())
+            .expect("IPv6 startup access should build");
+        assert_eq!(ipv6.connection_string, "https://localhost:3774");
     }
 }

@@ -10,9 +10,12 @@ use bibcode_server::{
         validate_listener_with_resolved_addresses,
     },
 };
-use rcgen::{CertificateParams, KeyPair};
+use futures_util::SinkExt;
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use time::{Duration, OffsetDateTime};
+use x509_parser::parse_x509_certificate;
 
 struct TlsFixture {
     _directory: TempDir,
@@ -39,6 +42,8 @@ impl TlsFixture {
         .expect("certificate parameters");
         params.not_before = not_before;
         params.not_after = not_after;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let certificate = params
             .self_signed(&key_pair)
             .expect("self-signed certificate");
@@ -56,6 +61,28 @@ impl TlsFixture {
             certificate_chain: self.certificate_chain.clone(),
             private_key: self.private_key.clone(),
         }
+    }
+
+    fn certificate_pem(&self) -> Vec<u8> {
+        std::fs::read(&self.certificate_chain).expect("read certificate PEM")
+    }
+
+    fn certificate_der(&self) -> rustls::pki_types::CertificateDer<'static> {
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(self.certificate_pem()));
+        rustls_pemfile::certs(&mut reader)
+            .next()
+            .expect("certificate PEM entry")
+            .expect("certificate DER")
+    }
+
+    fn spki_sha256(&self) -> String {
+        let certificate = self.certificate_der();
+        let (_, certificate) =
+            parse_x509_certificate(certificate.as_ref()).expect("parse certificate");
+        Sha256::digest(certificate.public_key().raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -252,4 +279,170 @@ async fn rejected_listener_configuration_has_no_persistent_state_side_effects() 
         ServerError::Transport(TransportError::NonLoopbackPlaintext { .. })
     ));
     assert!(!state.exists());
+}
+
+#[tokio::test]
+async fn tls_listener_serves_https_metadata_and_never_downgrades_to_plaintext() {
+    let state = tempfile::tempdir().expect("state directory");
+    let tls = TlsFixture::valid();
+    let expected_fingerprint = tls.spki_sha256();
+    let handle = ServerRuntime::start_with_registry(
+        ServerConfig::new(state.path())
+            .with_bind("0.0.0.0", 0)
+            .with_tls_files(tls.files()),
+        bibcode_server::RpcRegistry::empty(),
+    )
+    .await
+    .expect("validated TLS server starts");
+    let port = handle.local_addr().port();
+    let startup_access = handle
+        .startup_access()
+        .expect("TLS web server issues startup access");
+    assert_eq!(
+        startup_access.connection_string,
+        format!("https://localhost:{port}")
+    );
+    assert!(startup_access.pairing_url.starts_with("https://localhost:"));
+
+    let root = reqwest::Certificate::from_pem(&tls.certificate_pem())
+        .expect("fixture certificate is a valid trust root");
+    let https = reqwest::Client::builder()
+        .add_root_certificate(root)
+        .https_only(true)
+        .no_proxy()
+        .build()
+        .expect("HTTPS client");
+    let descriptor = https
+        .get(format!(
+            "https://localhost:{port}/.well-known/bibcode/environment"
+        ))
+        .send()
+        .await
+        .expect("HTTPS descriptor response");
+    assert!(descriptor.status().is_success());
+    let descriptor = descriptor
+        .json::<serde_json::Value>()
+        .await
+        .expect("descriptor JSON");
+    assert_eq!(descriptor["transport"]["mode"], "https");
+    assert_eq!(descriptor["transport"]["spkiSha256"], expected_fingerprint);
+
+    let credential = startup_access.credential.clone();
+    let token = https
+        .post(format!("https://localhost:{port}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", credential.as_str()),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+        ])
+        .send()
+        .await
+        .expect("HTTPS token exchange")
+        .json::<serde_json::Value>()
+        .await
+        .expect("token JSON");
+    let ticket = https
+        .post(format!(
+            "https://localhost:{port}/api/auth/websocket-ticket"
+        ))
+        .bearer_auth(token["access_token"].as_str().expect("access token"))
+        .send()
+        .await
+        .expect("HTTPS WebSocket ticket")
+        .json::<serde_json::Value>()
+        .await
+        .expect("ticket JSON");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(tls.certificate_der())
+        .expect("add fixture trust root");
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("TLS WebSocket TCP connection");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("TLS server name")
+        .to_owned();
+    let tls_stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config))
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS WebSocket handshake");
+    let (mut websocket, _) = tokio_tungstenite::client_async(
+        format!(
+            "wss://localhost:{port}/ws?wsTicket={}",
+            ticket["ticket"].as_str().expect("WebSocket ticket")
+        ),
+        tls_stream,
+    )
+    .await
+    .expect("WSS upgrade");
+    websocket
+        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+        .await
+        .expect("close WSS connection");
+
+    let plaintext = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("plaintext client");
+    let plaintext_result = tokio::time::timeout(
+        Duration::seconds(2).unsigned_abs(),
+        plaintext
+            .get(format!(
+                "http://127.0.0.1:{port}/.well-known/bibcode/environment"
+            ))
+            .send(),
+    )
+    .await
+    .expect("plaintext attempt is rejected promptly");
+    assert!(plaintext_result.is_err());
+
+    handle.shutdown();
+    handle.join().await.expect("TLS server joins cleanly");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_the_bounded_set_of_stalled_tls_handshakes() {
+    let state = tempfile::tempdir().expect("state directory");
+    let tls = TlsFixture::valid();
+    let handle = ServerRuntime::start_with_registry(
+        ServerConfig::new(state.path())
+            .with_bind("0.0.0.0", 0)
+            .with_tls_files(tls.files()),
+        bibcode_server::RpcRegistry::empty(),
+    )
+    .await
+    .expect("validated TLS server starts");
+    let port = handle.local_addr().port();
+    let mut stalled = Vec::new();
+    for _ in 0..80 {
+        stalled.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("stalled TLS TCP connection"),
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    handle.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle.join())
+        .await
+        .expect("shutdown does not wait for the TLS handshake deadline")
+        .expect("TLS server joins after cancelling handshakes");
+    drop(stalled);
 }

@@ -51,6 +51,17 @@ export const ExecutionEnvironmentProtocol = Schema.Struct({
 );
 export type ExecutionEnvironmentProtocol = typeof ExecutionEnvironmentProtocol.Type;
 
+const EnvironmentSpkiSha256 = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u));
+
+export const EnvironmentTransportIdentity = Schema.Union([
+  Schema.Struct({ mode: Schema.Literal("loopback-http") }),
+  Schema.Struct({
+    mode: Schema.Literal("https"),
+    spkiSha256: EnvironmentSpkiSha256,
+  }),
+]);
+export type EnvironmentTransportIdentity = typeof EnvironmentTransportIdentity.Type;
+
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
   environmentId: DurableEnvironmentId,
   label: TrimmedNonEmptyString,
@@ -59,6 +70,7 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   storageInstanceId: Schema.String.check(Schema.isUUID()),
   protocol: ExecutionEnvironmentProtocol,
   capabilities: ExecutionEnvironmentCapabilities,
+  transport: Schema.optionalKey(EnvironmentTransportIdentity),
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;
 

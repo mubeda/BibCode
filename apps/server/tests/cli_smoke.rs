@@ -243,6 +243,41 @@ fn serve_flags_have_the_same_value_before_or_after_the_subcommand() {
 }
 
 #[test]
+fn tls_listener_files_are_an_atomic_cli_pair() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let base_dir = temp.path().to_string_lossy();
+    let config = Cli::try_parse_from([
+        "bibcode",
+        "serve",
+        "--base-dir",
+        base_dir.as_ref(),
+        "--tls-certificate-chain",
+        "certificate.pem",
+        "--tls-private-key",
+        "private-key.pem",
+    ])
+    .expect("paired TLS arguments parse")
+    .into_server_config()
+    .expect("paired TLS configuration builds");
+    let tls = config.tls.expect("TLS files");
+    assert_eq!(
+        tls.certificate_chain,
+        std::path::PathBuf::from("certificate.pem")
+    );
+    assert_eq!(tls.private_key, std::path::PathBuf::from("private-key.pem"));
+
+    for incomplete in [
+        ["--tls-certificate-chain", "certificate.pem"],
+        ["--tls-private-key", "private-key.pem"],
+    ] {
+        assert!(
+            Cli::try_parse_from(["bibcode", "serve", incomplete[0], incomplete[1]]).is_err(),
+            "incomplete TLS file pair must fail: {incomplete:?}"
+        );
+    }
+}
+
+#[test]
 fn start_opens_a_browser_unless_disabled_while_serve_is_always_headless() {
     let start = Cli::try_parse_from(["bibcode", "start"])
         .expect("start arguments")

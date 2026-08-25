@@ -92,14 +92,14 @@ pub async fn run_cli() -> Result<(), RunError> {
 async fn run_server(config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
     let handle = ServerRuntime::start_standalone(config).await?;
-    let http_base_url = format!("http://{}", handle.local_addr());
+    let http_base_url = handle.advertised_base_url();
     let browser_target = handle
         .startup_access()
         .map(|access| access.pairing_url.as_str())
-        .unwrap_or(http_base_url.as_str());
+        .unwrap_or(http_base_url);
     let mut startup_output = json!({
         "address": handle.local_addr().to_string(),
-        "httpBaseUrl": http_base_url.as_str(),
+        "httpBaseUrl": http_base_url,
     });
     if let Some(access) = handle.startup_access()
         && let Some(output) = startup_output.as_object_mut()

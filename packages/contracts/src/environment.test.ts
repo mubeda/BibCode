@@ -134,6 +134,32 @@ describe("execution environment contracts", () => {
     ).toEqual({ minimum: 1, maximum: 1 });
   });
 
+  it("decodes transport identity without treating descriptor metadata as a trust decision", () => {
+    const legacy = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+    expect(legacy.transport).toBeUndefined();
+
+    const spkiSha256 = "ab".repeat(32);
+    const https = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+      transport: { mode: "https", spkiSha256 },
+    });
+    expect(https.transport).toEqual({ mode: "https", spkiSha256 });
+
+    for (const transport of [{ mode: "https" }, { mode: "https", spkiSha256: "not-a-sha256" }]) {
+      expect(() =>
+        decodeExecutionEnvironmentDescriptor({
+          ...descriptor,
+          capabilities: { repositoryIdentity: true },
+          transport,
+        }),
+      ).toThrow();
+    }
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
@@ -179,8 +205,10 @@ describe("execution environment contracts", () => {
       },
     });
     const dispatchResponse = legacyClientDecoders["orchestration.dispatchCommand"]({
+      disposition: "created",
       sequence: 7,
       projectId: "project-1",
+      mainThreadId: "thread-main-1",
     });
     const conversationEvent = legacyClientDecoders["orchestration.subscribeThread"]({
       kind: "event",
@@ -213,7 +241,12 @@ describe("execution environment contracts", () => {
       "orchestration.subscribeThread",
     ]);
     expect(legacyDescriptor.capabilities).toEqual({ repositoryIdentity: true });
-    expect(dispatchResponse).toEqual({ sequence: 7, projectId: "project-1" });
+    expect(dispatchResponse).toEqual({
+      disposition: "created",
+      sequence: 7,
+      projectId: "project-1",
+      mainThreadId: "thread-main-1",
+    });
     expect(conversationEvent.kind).toBe("event");
     if (conversationEvent.kind === "event") {
       expect(conversationEvent.event.type).toBe("thread.message-sent");

@@ -267,6 +267,7 @@ struct EnvironmentDescriptor {
     storage_instance_id: String,
     protocol: ProtocolDescriptor,
     capabilities: EnvironmentCapabilities,
+    transport: crate::transport::TransportIdentity,
 }
 
 #[derive(Serialize)]
@@ -311,6 +312,7 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
         },
+        transport: config.transport_identity.clone(),
     })
 }
 
