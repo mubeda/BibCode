@@ -382,16 +382,10 @@ impl PortablePtyBackend {
             initialize_windows_console_theme(pair.slave.as_ref(), theme)?;
         }
 
-        // #region agent log
-        let debug_spawn_started = std::time::Instant::now();
-        // #endregion
         let child = match pair.slave.spawn_command(command) {
             Ok(child) => child,
             Err(error) => return Err(error.to_string()),
         };
-        // #region agent log
-        let debug_child_spawn_ms = debug_spawn_started.elapsed().as_millis();
-        // #endregion
         #[cfg(unix)]
         let mut child =
             SpawnedChildGuard::new_with_process_group(child, pair.master.process_group_leader());
@@ -429,44 +423,7 @@ impl PortablePtyBackend {
         // does not depend on the client's slower round-trip reply.
         let osc_responder = {
             let colors = colors_from_env(&input.env);
-            // #region agent log
-            {
-                use std::io::Write;
-                let payload = serde_json::json!({
-                    "sessionId": "c03592",
-                    "hypothesisId": "A",
-                    "location": "pty.rs:spawn_command",
-                    "message": "PTY spawn vs OSC responder readiness",
-                    "data": {
-                        "pid": pid,
-                        "childSpawnMs": debug_child_spawn_ms,
-                        "readerReadyMs": debug_spawn_started.elapsed().as_millis(),
-                        "hasOscColors": !colors.is_empty(),
-                        "oscBg": colors.background,
-                        "oscFg": colors.foreground,
-                        "bibcodeOscBgEnv": input.env.get("BIBCODE_OSC_BACKGROUND").cloned(),
-                    },
-                    "timestamp": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0),
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/Users/admin/projects/BibCode/.cursor/debug-c03592.log")
-                {
-                    let _ = writeln!(file, "{payload}");
-                }
-            }
-            // #endregion
-            (!colors.is_empty()).then(|| {
-                (
-                    OscColorResponder::new(colors),
-                    Arc::clone(&writer),
-                    debug_spawn_started,
-                )
-            })
+            (!colors.is_empty()).then(|| (OscColorResponder::new(colors), Arc::clone(&writer)))
         };
 
         let output_sender = output.clone();
@@ -663,6 +620,12 @@ fn build_pty_command_from_launch(
         command.raw_windows_args(raw_windows_args);
     }
     command.cwd(&input.cwd);
+    // Interactive agent TUIs inherit the host process environment. Cursor and
+    // other agent shells often export NO_COLOR=1 / FORCE_COLOR=0, which chalk
+    // and Claude Code honor by emitting no ANSI colours at all. Strip those
+    // and force colour support for PTY sessions unless the launch env
+    // explicitly opts out.
+    ensure_pty_color_environment(&mut command, &input.env);
     if !input.env.keys().any(|key| key.eq_ignore_ascii_case("TERM")) {
         command.env("TERM", DEFAULT_TERMINAL_TYPE);
     }
@@ -675,6 +638,35 @@ fn build_pty_command_from_launch(
         command.env(key, value);
     }
     command
+}
+
+/// Ensures PTY children can emit colours even when the BiBCode host was
+/// launched from a NO_COLOR / FORCE_COLOR=0 environment.
+fn ensure_pty_color_environment(
+    command: &mut CommandBuilder,
+    launch_env: &BTreeMap<String, String>,
+) {
+    let launch_disables_color = launch_env.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("NO_COLOR")
+            && !value.is_empty()
+            || key.eq_ignore_ascii_case("FORCE_COLOR") && value == "0"
+    });
+    if launch_disables_color {
+        return;
+    }
+    command.env_remove("NO_COLOR");
+    if !launch_env
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("FORCE_COLOR"))
+    {
+        command.env("FORCE_COLOR", "3");
+    }
+    if !launch_env
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("COLORTERM"))
+    {
+        command.env("COLORTERM", "truecolor");
+    }
 }
 
 fn is_reserved_pty_env_key_on(platform: Platform, key: &str) -> bool {
@@ -767,7 +759,7 @@ fn decode_pty_output(pending: &mut Vec<u8>, bytes: &[u8], end_of_stream: bool) -
 fn read_output(
     reader: &mut dyn Read,
     sender: &broadcast::Sender<String>,
-    mut osc_responder: Option<(OscColorResponder, SharedPtyWriter, std::time::Instant)>,
+    mut osc_responder: Option<(OscColorResponder, SharedPtyWriter)>,
 ) {
     let mut buffer = [0u8; 8 * 1024];
     let mut pending = Vec::with_capacity(4);
@@ -796,44 +788,16 @@ fn read_output(
 /// UTF-8 decoding; write failures are ignored because a lost reply only leaves
 /// the provider on its default theme.
 fn answer_osc_color_queries(
-    responder: Option<&mut (OscColorResponder, SharedPtyWriter, std::time::Instant)>,
+    responder: Option<&mut (OscColorResponder, SharedPtyWriter)>,
     bytes: &[u8],
 ) {
-    let Some((responder, writer, spawn_started)) = responder else {
+    let Some((responder, writer)) = responder else {
         return;
     };
     let reply = responder.process(bytes);
     if reply.is_empty() {
         return;
     }
-    // #region agent log
-    {
-        use std::io::Write;
-        let payload = serde_json::json!({
-            "sessionId": "c03592",
-            "hypothesisId": "A",
-            "location": "pty.rs:answer_osc_color_queries",
-            "message": "OSC theme query answered",
-            "data": {
-                "replyMsSinceSpawn": spawn_started.elapsed().as_millis(),
-                "replyLen": reply.len(),
-                "replyPreview": String::from_utf8_lossy(&reply).chars().take(120).collect::<String>(),
-                "inputHadOscQuery": bytes.windows(4).any(|w| w == b"]10;" || w == b"]11;" || w == b"]12;"),
-            },
-            "timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
-        });
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/Users/admin/projects/BibCode/.cursor/debug-c03592.log")
-        {
-            let _ = writeln!(file, "{payload}");
-        }
-    }
-    // #endregion
     if let Ok(mut writer) = writer.lock() {
         let _ = writer.write_all(&reply);
         let _ = writer.flush();
@@ -2024,6 +1988,47 @@ mod tests {
 
         let command = build_pty_command_on(Platform::Unix, &input).unwrap();
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("dumb")));
+    }
+
+    #[test]
+    fn prepared_command_clears_host_no_color_and_forces_truecolor() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let input = PtySpawnInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: executable
+                .parent()
+                .expect("test executable directory")
+                .to_path_buf(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::new(),
+        };
+
+        let command = build_pty_command_on(Platform::Unix, &input).unwrap();
+        assert_eq!(command.get_env("NO_COLOR"), None);
+        assert_eq!(command.get_env("FORCE_COLOR"), Some(OsStr::new("3")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+    }
+
+    #[test]
+    fn prepared_command_preserves_explicit_launch_no_color() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let input = PtySpawnInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: executable
+                .parent()
+                .expect("test executable directory")
+                .to_path_buf(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::from([("NO_COLOR".to_owned(), "1".to_owned())]),
+        };
+
+        let command = build_pty_command_on(Platform::Unix, &input).unwrap();
+        // ensure_pty_color_environment opts out; launch env then applies NO_COLOR.
+        assert_eq!(command.get_env("NO_COLOR"), Some(OsStr::new("1")));
     }
 
     #[test]

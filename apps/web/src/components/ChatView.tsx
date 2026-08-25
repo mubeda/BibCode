@@ -123,6 +123,12 @@ import {
   type TurnDiffSummary,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
+import {
+  mergeTerminalSpawnEnv,
+  resolveTerminalThemeMode,
+  usesPersistentWindowsConsoleTheme,
+  type TerminalThemeMode,
+} from "./terminalTheme";
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
@@ -4120,6 +4126,10 @@ function ChatViewContent(props: ChatViewProps) {
       const isOriginCurrent = () =>
         centerTerminalRouteBindingRef.current === originRouteBinding &&
         centerPanelWorkspaceRef.current === originWorkspace;
+      const terminalTheme = resolveTerminalThemeMode(
+        settings.terminalThemePreference,
+        (resolvedTheme === "dark" ? "dark" : "light") as TerminalThemeMode,
+      );
       const defaultLaunch: CenterTerminalLaunch | null = centerTerminalLaunchContext
         ? {
             cwd: centerTerminalLaunchContext.cwd,
@@ -4128,9 +4138,16 @@ function ChatViewContent(props: ChatViewProps) {
           }
         : null;
       const baseLaunch = launchOverride ?? defaultLaunch;
+      const launchCommand = options?.command ?? baseLaunch?.command;
       const launch = baseLaunch
         ? {
             ...baseLaunch,
+            env: mergeTerminalSpawnEnv({
+              runtimeEnv: baseLaunch.env,
+              commandEnv: launchCommand?.env,
+              resolvedTheme: terminalTheme,
+              windowsConsoleTheme: usesPersistentWindowsConsoleTheme(launchCommand),
+            }),
             ...(options?.label !== undefined ? { label: options.label } : {}),
             ...(options?.command !== undefined ? { command: options.command } : {}),
           }
@@ -4228,6 +4245,9 @@ function ChatViewContent(props: ChatViewProps) {
       closeTerminalMutation,
       openTerminal,
       reserveActiveTerminalId,
+      resolvedTheme,
+      serverConfig?.environment.platform.os,
+      settings.terminalThemePreference,
       workspaceUnavailable,
     ],
   );
@@ -4299,6 +4319,15 @@ function ChatViewContent(props: ChatViewProps) {
 
       let targetTerminalId: string;
       if (reusableTerminal) {
+        const scriptTerminalTheme = resolveTerminalThemeMode(
+          settings.terminalThemePreference,
+          (resolvedTheme === "dark" ? "dark" : "light") as TerminalThemeMode,
+        );
+        const scriptSpawnEnv = mergeTerminalSpawnEnv({
+          runtimeEnv,
+          resolvedTheme: scriptTerminalTheme,
+          windowsConsoleTheme: false,
+        });
         const openResult = await openTerminal({
           environmentId,
           input: {
@@ -4306,7 +4335,7 @@ function ChatViewContent(props: ChatViewProps) {
             terminalId: reusableTerminal.terminalId,
             cwd: targetCwd,
             worktreePath: targetWorktreePath,
-            env: runtimeEnv,
+            env: scriptSpawnEnv,
           },
         });
         if (openResult._tag === "Failure") {
@@ -4380,6 +4409,8 @@ function ChatViewContent(props: ChatViewProps) {
       runningTerminalIds,
       setLastInvokedScriptByProjectId,
       setThreadError,
+      resolvedTheme,
+      settings.terminalThemePreference,
       writeTerminal,
     ],
   );

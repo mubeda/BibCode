@@ -5,6 +5,7 @@ import {
   terminalExtendedAnsiPalette,
   retainTerminalLaunchTheme,
   terminalOscColorEnv,
+  usesPersistentWindowsConsoleTheme,
 } from "./terminalTheme";
 
 describe("terminal theme launch values", () => {
@@ -183,5 +184,17 @@ describe("terminal theme launch values", () => {
     expect(at(dark, 196)).toBe("#ff0000");
     expect(at(light, 196)).toBe("#ff0000");
     expect(dark.slice(0, 216)).toEqual(light.slice(0, 216));
+  });
+
+  it("detects Codex launches that pin the spawn theme until restart", () => {
+    expect(usesPersistentWindowsConsoleTheme({ executable: "codex", args: [] })).toBe(true);
+    expect(
+      usesPersistentWindowsConsoleTheme({
+        executable: "/usr/local/bin/codex",
+        args: ["--dangerously-bypass-approvals-and-sandbox"],
+      }),
+    ).toBe(true);
+    expect(usesPersistentWindowsConsoleTheme({ executable: "claude", args: [] })).toBe(false);
+    expect(usesPersistentWindowsConsoleTheme(undefined)).toBe(false);
   });
 });

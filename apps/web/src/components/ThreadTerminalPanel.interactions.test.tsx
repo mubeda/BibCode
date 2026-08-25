@@ -2143,7 +2143,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     }
   });
 
-  it("does not add the Windows console theme marker to Codex on a non-Windows host", async () => {
+  it("records the Codex console theme marker on a non-Windows host", async () => {
     testState.serverConfig = {
       availableEditors: ["vscode"],
       environment: { platform: { os: "darwin" } },
@@ -2161,7 +2161,9 @@ describe("TerminalViewport mounted lifecycle", () => {
     const spec = testState.attachedSessionInputs.at(-1) as {
       terminal: { env?: Record<string, string> };
     };
-    expect(spec.terminal.env).not.toHaveProperty("BIBCODE_WINDOWS_CONSOLE_THEME");
+    expect(spec.terminal.env).toMatchObject({
+      BIBCODE_WINDOWS_CONSOLE_THEME: "light",
+    });
   });
 
   it("waits for authoritative host config before attaching Codex", async () => {
@@ -3923,7 +3925,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(testState.restartCommand).not.toHaveBeenCalled();
   });
 
-  it("repaints Codex live on Darwin without re-keying the attachment or offering a restart", async () => {
+  it("keeps a running Codex launch palette on Darwin until an explicit theme restart", async () => {
     testState.serverConfig = {
       availableEditors: ["vscode"],
       environment: { platform: { os: "darwin" } },
@@ -3944,13 +3946,15 @@ describe("TerminalViewport mounted lifecycle", () => {
       terminal: { env?: Record<string, string> };
     };
     expect(attachmentAfterThemeChange.terminal).toEqual(initialAttachment.terminal);
-    expect(attachmentAfterThemeChange.terminal.env).not.toHaveProperty(
-      "BIBCODE_WINDOWS_CONSOLE_THEME",
-    );
+    expect(attachmentAfterThemeChange.terminal.env).toMatchObject({
+      BIBCODE_OSC_BACKGROUND: "14,18,24",
+      BIBCODE_WINDOWS_CONSOLE_THEME: "dark",
+    });
+    expect(xtermState.terminals).toHaveLength(1);
     expect(terminal.options.theme).toEqual(
-      expect.objectContaining({ background: "rgb(255, 255, 255)" }),
+      expect.objectContaining({ background: "rgb(14, 18, 24)" }),
     );
-    expect(document.querySelector('button[aria-label^="Restart Codex Terminal"]')).toBeNull();
+    expect(buttonByLabel("Restart Codex Terminal to apply Light theme").disabled).toBe(false);
     expect(testState.restartCommand).not.toHaveBeenCalled();
   });
 
