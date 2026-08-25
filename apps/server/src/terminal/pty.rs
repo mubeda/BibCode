@@ -647,8 +647,7 @@ fn ensure_pty_color_environment(
     launch_env: &BTreeMap<String, String>,
 ) {
     let launch_disables_color = launch_env.iter().any(|(key, value)| {
-        key.eq_ignore_ascii_case("NO_COLOR")
-            && !value.is_empty()
+        key.eq_ignore_ascii_case("NO_COLOR") && !value.is_empty()
             || key.eq_ignore_ascii_case("FORCE_COLOR") && value == "0"
     });
     if launch_disables_color {
