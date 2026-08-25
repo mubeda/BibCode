@@ -520,11 +520,11 @@ crosses into JavaScript.
 - Modify: `packages/contracts/src/ipc.ts`
 - Test: `apps/desktop/src-tauri/src/remote_host/*.rs`
 
-- [ ] **Step 1: Write command-generation and parser tests before adapters**
+- [x] **Step 1: Write command-generation and parser tests before adapters**
 
 Use hostile but valid host aliases/usernames/paths to prove no shell interpolation. Cover Linux GNU and minimal POSIX, macOS, Windows OpenSSH PowerShell, x86_64/ARM64, missing utilities, noninteractive privilege denial, service modes, and bounded noisy output.
 
-- [ ] **Step 2: Define a constant-command adapter boundary**
+- [x] **Step 2: Define a constant-command adapter boundary**
 
 ```rust
 pub trait RemoteHostAdapter {
@@ -545,19 +545,19 @@ pub struct RemoteCommand {
 
 No field contains an opaque shell script. The PowerShell adapter uses repository-owned constant encoded commands with values passed as separately encoded arguments.
 
-- [ ] **Step 3: Implement platform probing**
+- [x] **Step 3: Implement platform probing**
 
 Probe OS/arch, installed binary/version, service status/mode, data root, local control availability, free space, and required install authority. Never read provider credentials, project lists, paths outside managed locations, or unrelated host inventory.
 
-- [ ] **Step 4: Implement verified transfer and atomic install**
+- [x] **Step 4: Implement verified transfer and atomic install**
 
 The desktop downloads the exact manifest record, streams while hashing, verifies detached signature/checksum, transfers to a random remote staging path, verifies again remotely, then invokes platform-native MSI/PKG/DEB/RPM or portable install with explicit mode. Keep the previous binary/service definition until health and identity verification succeeds.
 
-- [ ] **Step 5: Surface explicit partial-state recovery**
+- [x] **Step 5: Surface explicit partial-state recovery**
 
 Return a typed stage, mutation status, preserved version, cleanup outcome, and fixed recovery command. Never silently switch install target, mode, data root, or architecture.
 
-- [ ] **Step 6: Run adapter/provision tests and commit**
+- [x] **Step 6: Run adapter/provision tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop remote_host:: -- --nocapture
@@ -565,6 +565,30 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests::provisio
 git add apps/desktop/src-tauri/src/remote_host apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/src/bridge.rs packages/contracts/src/ipc.ts
 git commit -m "feat(ssh): provision Linux macOS and Windows servers"
 ```
+
+Implementation note: SSH setup now probes Linux, macOS, and Windows x86-64/
+ARM64 hosts through bounded platform adapters, requires matching one-use consent,
+resolves the exact signed artifact tuple, verifies it before and after transfer,
+and re-probes the exact promoted binary before descriptor verification. Dynamic
+POSIX values are shell-quoted argv; Windows values cross as bounded JSON stdin
+to repository-owned UTF-16LE encoded PowerShell. Workstation installs support
+native or portable artifacts. Headless setup deliberately uses a portable
+artifact and administrator-owned system staging, re-verifies hash and size
+after the privileged copy, removes non-administrator write access, and promotes
+atomically while retaining the previous version until health succeeds. Typed
+failures report the stage, mutation and cleanup state, preserved version, and
+an exact quoted recovery command. Pairing material and unexpected descriptor
+fields never cross the renderer boundary.
+
+Validation passed 12 adapter tests, 10 provisioning tests, all 377 desktop
+library tests, and 82 affected contract/web tests. `cargo fmt --all --check`,
+desktop all-target `cargo check`, desktop all-target Clippy with warnings denied,
+`vp check`, and the complete workspace typecheck graph passed. `vp check`
+retains one pre-existing unused test-fixture warning in
+`apps/web/src/connection/storage.test.ts`. Independent review found no remaining
+Critical or Important findings. Host-independent fixtures do not replace the
+native Linux, macOS, and Windows OpenSSH runs required by the updated testing
+runbooks; those native executions are not claimed here.
 
 ### Task 8: Fence cancellation, concurrency, and cleanup for remote operations
 

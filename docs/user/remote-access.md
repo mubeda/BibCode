@@ -208,19 +208,34 @@ channel, and update `known_hosts` only after that verification. BiBCode offers
 no bypass. A saved route also rejects a fingerprint that differs from the one
 accepted during enrollment.
 
-Desktop **Add environment > SSH** is available when the remote host already
-exposes a compatible native `bibcode` CLI and the current Linux-like POSIX `sh`
-command surface through OpenSSH. Safe managed-port selection fails closed when
-neither `ss` nor readable Linux procfs is present, or when the installed `ss`
-cannot run the required filtered listener query. Automatic remote installation
-and the native macOS and Windows adapters are not available yet: an incompatible
-host produces guidance and BiBCode does not silently download or run
-Node.js/package-manager fallbacks. A pre-v3 SSH entry without a saved host-key
-pin can be removed locally, but BiBCode will not guess a pin or run a remote
-stop; re-enroll it before remote administration.
+Desktop **Add environment > SSH** supports Linux, macOS, and Windows OpenSSH
+targets on x86-64 and ARM64. After host-key verification, BiBCode probes only
+the OS, architecture, free space, supported installers, managed service state,
+and noninteractive install authority. If the exact server version and requested
+service mode are not already healthy, the UI must show a one-use consent screen
+with the target, signed artifact, destination, data root, service mode, and
+commands before any download or remote mutation.
 
-The launcher does not install Node.js, npm, npx, package-manager shims, or a
-BiBCode binary on the remote host.
+The desktop downloads the exact signed release artifact, verifies its signature
+and checksum locally, transfers it through SSH, and verifies checksum and byte
+count again on the host. Linux/macOS portable archives and Windows ZIP archives
+are extracted privately and promoted atomically. Headless setup requires
+noninteractive administrator authority and uses a portable artifact so a native
+package cannot silently create a workstation service. It installs beneath the
+platform system root (`/opt/bibcode/server`, `/Library/Application Support/BiBCode
+Server`, or `ProgramData\\BiBCode\\Server`) and rechecks the signed hash and byte
+count after copying into administrator-owned staging. Non-administrators cannot
+replace the promoted server files. No remote internet access, Node.js, npm, npx,
+or package-manager fallback is used. The installed server listens only on remote
+loopback and the desktop exposes it only through its own numeric-loopback SSH
+tunnel.
+
+If setup stops after mutation, BiBCode reports the exact stage, whether mutation
+was partial, whether cleanup completed, the preserved previous version, and a
+quoted service-status command bound to the relevant managed binary, service
+mode, port, and data root. A pre-v3 SSH entry without a saved host-key pin can
+be removed locally, but BiBCode will not guess a pin or run a remote stop;
+re-enroll it before remote administration.
 
 ## Windows Subsystem for Linux
 

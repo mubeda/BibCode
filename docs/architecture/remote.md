@@ -369,17 +369,29 @@ and [Runtime and process model](./runtime-process-model.md).
 - Desktop secret references resolve through the native keyring on macOS/Linux
   and DPAPI-protected per-user storage on Windows. Enrollment fails closed when
   that provider is unavailable or locked; renderer storage is not a fallback.
-- Desktop **Add environment > SSH** supports explicit enrollment when the
-  selected host already exposes a compatible native `bibcode` CLI and the
-  current Linux-like POSIX remote-command requirements through OpenSSH. Managed
-  port selection currently requires `ss` or readable Linux
-  `/proc/net/tcp{,6}` and fails closed when neither source exists or an
-  installed `ss` cannot execute the required filtered listener query; this
-  avoids treating an indeterminate/occupied port as free or accepting an
-  unrelated loopback listener. The macOS and Windows remote adapters and automatic cross-platform
-  remote installation are not implemented yet; an incompatible host fails with
-  guidance and does not fall back to Node.js or download executable bytes
-  implicitly.
+- Desktop **Add environment > SSH** probes Linux, macOS, and Windows OpenSSH
+  targets through fixed native command adapters. A compatible loopback service
+  can be enrolled directly. Otherwise the desktop resolves one exact signed
+  server artifact, shows a one-use consent summary, downloads and verifies it
+  locally, transfers it over the pinned SSH connection, verifies its hash and
+  size again remotely, and installs it with bounded commands and output. Dynamic
+  paths cross as quoted argv on POSIX or JSON stdin to a repository-owned
+  encoded PowerShell command on Windows; the renderer never supplies a shell
+  script or receives pairing credentials. Portable versions are promoted by an
+  atomic same-filesystem rename and the prior binary/service definition is kept
+  until service health and the canonical public descriptor are verified.
+- Headless SSH setup requires noninteractive administrator authority and a
+  portable artifact so a native package cannot create a transient workstation
+  service. Linux uses `/opt/bibcode/server`, macOS uses
+  `/Library/Application Support/BiBCode Server`, and Windows uses the host's
+  `ProgramData\\BiBCode\\Server` tree. The payload is copied into an
+  administrator-owned staging directory, its signed hash and byte count are
+  checked again there, and the promoted files remain administrator-owned with
+  non-administrator write access removed. All verified services bind remote
+  loopback and are reached only by a desktop-owned numeric-loopback SSH forward.
+  The older transient POSIX launch path still requires `ss` or readable Linux
+  `/proc/net/tcp{,6}` for safe port selection and fails closed when occupancy is
+  indeterminate.
 - Route-attempt cancellation does not yet interrupt an in-flight native SSH
   bridge command. The lifecycle-fencing task in the current plan owns prompt,
   setup, tunnel-publication, late-completion, and survivor cleanup races;

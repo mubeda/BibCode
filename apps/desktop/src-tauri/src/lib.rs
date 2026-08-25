@@ -24,6 +24,8 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_get_secret,
             desktop_bridge_delete_secret,
             desktop_bridge_discover_ssh_hosts,
+            desktop_bridge_prepare_ssh_server,
+            desktop_bridge_install_ssh_server,
             desktop_bridge_ensure_ssh_environment,
             desktop_bridge_disconnect_ssh_environment,
             desktop_bridge_fetch_environment_descriptor,
@@ -160,6 +162,8 @@ pub fn run() {
         bridge::desktop_bridge_get_secret,
         bridge::desktop_bridge_delete_secret,
         bridge::desktop_bridge_discover_ssh_hosts,
+        bridge::desktop_bridge_prepare_ssh_server,
+        bridge::desktop_bridge_install_ssh_server,
         bridge::desktop_bridge_ensure_ssh_environment,
         bridge::desktop_bridge_disconnect_ssh_environment,
         bridge::desktop_bridge_fetch_environment_descriptor,
@@ -279,6 +283,7 @@ mod config;
 mod context_menu;
 mod data_safety;
 mod preview;
+mod remote_host;
 mod secret_store;
 mod security;
 mod server_artifacts;

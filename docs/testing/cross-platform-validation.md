@@ -320,6 +320,7 @@ enrollment changes, run the desktop SSH owner, bridge contract, connection
 ordering, and onboarding tests together:
 
 ```sh
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop remote_host:: --lib -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop ssh::tests:: --lib -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test ssh_public_contract -- --nocapture
 vp test apps/web/src/connection/platform.test.ts apps/web/src/tauriDesktopBridge.test.ts packages/client-runtime/src/connection/resolver.test.ts packages/client-runtime/src/connection/onboarding.test.ts packages/contracts/src/ipc.test.ts
@@ -331,18 +332,22 @@ configuration source, host alias, port, and non-secret host-key fingerprint.
 Never record passwords, private keys, pairing credentials, access tokens, or
 raw command output that could contain them.
 
-Prove the visible order `OpenSSH trust -> probe -> ensure server -> numeric
-loopback tunnel -> bounded descriptor -> environment/storage/protocol
+Prove the visible order `OpenSSH trust -> bounded OS/architecture/service probe
+-> explicit one-use consent when setup is required -> exact signed artifact
+download and local verification -> bounded transfer -> remote hash and size
+verification -> atomic install -> requested loopback service -> numeric
+loopback tunnel -> bounded canonical descriptor -> environment/storage/protocol
 verification -> native pairing creation -> native redemption -> OS-secret
-persistence -> session`. An environment, storage, protocol, target, descriptor,
-or saved-host-fingerprint mismatch must stop before pairing. The native pairing
-operation must preconnect one TCP stream through the owned tunnel, refetch and
-require the exact verified descriptor on that stream, create the credential
-only afterward, and redeem it on that same stream. Close the forwarding
-listener after the descriptor response and prove redemption still uses the
-accepted connection; a replacement listener must receive no credential. No
-bridge payload, renderer state, log, error, or fixture snapshot may contain the
-raw pairing credential.
+persistence -> session`. Declined or stale consent, an environment, storage,
+protocol, platform, artifact, target, descriptor, or saved-host-fingerprint
+mismatch must stop before pairing. The native pairing operation must preconnect
+one TCP stream through the owned tunnel, refetch and require the exact verified
+descriptor on that stream, create the credential only afterward, and redeem it
+on that same stream. Close the forwarding listener after the descriptor
+response and prove redemption still uses the accepted connection; a replacement
+listener must receive no credential. No bridge payload, renderer state, log,
+error, or fixture snapshot may contain the raw pairing credential or unexpected
+descriptor fields.
 
 For probe, launch, stop, pairing, and tunnel setup, prove that bounded `ssh -G`
 runs before password-capable work and that the destination process invokes
@@ -379,7 +384,8 @@ Until the lifecycle-fencing task in the current plan lands, record route-attempt
 cancellation as unavailable rather than claiming that an in-flight native
 bridge command was interrupted. Host-independent parsers and command fixtures
 are compatibility evidence only; repeat Linux, macOS, and Windows OpenSSH
-behavior on the named native desktop once those product adapters are enabled.
+probe, consent, install, service, tunnel, descriptor, and recovery behavior on
+the named native desktop.
 
 ### VCS coordination gates
 

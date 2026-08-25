@@ -10,6 +10,9 @@ import {
   DesktopServerExposureStateSchema,
   DesktopSshEnvironmentBootstrapSchema,
   DesktopSshPairingInputSchema,
+  DesktopSshServerProbeSchema,
+  DesktopSshSetupProbeInputSchema,
+  DesktopSshSetupResultSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
   DesktopWslServerProbeSchema,
@@ -45,6 +48,9 @@ const decodeDesktopSshEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopSshEnvironmentBootstrapSchema,
 );
 const decodeDesktopSshPairingInput = Schema.decodeUnknownSync(DesktopSshPairingInputSchema);
+const decodeDesktopSshSetupProbeInput = Schema.decodeUnknownSync(DesktopSshSetupProbeInputSchema);
+const decodeDesktopSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
+const decodeDesktopSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
 const decodeDesktopWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
 const decodeDesktopWslSetupProbeInput = Schema.decodeUnknownSync(DesktopWslSetupProbeInputSchema);
 const decodeDesktopWslServerProbe = Schema.decodeUnknownSync(DesktopWslServerProbeSchema);
@@ -152,6 +158,8 @@ describe("Remote setup contracts", () => {
         serviceState: "running",
         dataRoot: "/managed/bibcode",
         controlAvailable: true,
+        freeBytes: 1_000_000,
+        installAuthority: "noninteractiveAdministrator",
       }),
     ).toMatchObject({ os, architecture, serviceState: "running" });
   });
@@ -262,6 +270,8 @@ describe("Desktop WSL server setup contracts", () => {
           serviceState: "stopped",
           dataRoot: "/home/dev/.bibcode",
           controlAvailable: false,
+          freeBytes: 1_000_000,
+          installAuthority: "user",
         },
         installedBinaryPath: "/home/dev/.local/share/bibcode/server/current/bin/bibcode",
         consent: null,
@@ -285,6 +295,8 @@ describe("Desktop WSL server setup contracts", () => {
         serviceState: "notInstalled",
         dataRoot: "/home/dev/.bibcode",
         controlAvailable: false,
+        freeBytes: 1_000_000,
+        installAuthority: "user",
       },
       installedBinaryPath: null,
       consent: {
@@ -420,6 +432,126 @@ describe("Desktop staged SSH contract", () => {
         descriptor,
       }).descriptor,
     ).toMatchObject(descriptor);
+  });
+
+  it("binds SSH setup to one host-key probe and an optional accepted identity pair", () => {
+    const input = decodeDesktopSshSetupProbeInput({
+      target: {
+        alias: "devbox",
+        hostname: "devbox.example",
+        username: "dev",
+        port: 22,
+      },
+      expectedHostKeyFingerprint: "SHA256:known-host-key",
+      managedBinaryPath: "/usr/bin/bibcode",
+      serviceMode: "workstation",
+      expectedEnvironmentId: descriptor.environmentId,
+      expectedStorageInstanceId: descriptor.storageInstanceId,
+    });
+    expect(input.serviceMode).toBe("workstation");
+    expect(() =>
+      decodeDesktopSshSetupProbeInput({
+        ...input,
+        expectedStorageInstanceId: null,
+      }),
+    ).toThrow();
+
+    const probe = decodeDesktopSshServerProbe({
+      requestId: "ssh-setup-1",
+      probeGeneration: 8,
+      target: input.target,
+      hostKeyFingerprint: "SHA256:known-host-key",
+      compatibility: "setupRequired",
+      probe: {
+        os: "linux",
+        architecture: "x86_64",
+        installedVersion: "0.4.1",
+        serviceMode: "workstation",
+        serviceState: "running",
+        dataRoot: "/home/dev/.bibcode",
+        controlAvailable: true,
+        freeBytes: 1_000_000,
+        installAuthority: "noninteractiveAdministrator",
+      },
+      installedBinaryPath: "/usr/bin/bibcode",
+      consent: {
+        requestId: "ssh-setup-1",
+        probeGeneration: 8,
+        transport: "ssh",
+        targetLabel: "devbox",
+        targetVersion: "0.4.2",
+        artifactSource: "https://releases.example/artifacts.json",
+        verification: {
+          manifestSignature: "verified",
+          artifactSignature: "pending",
+          checksum: "pending",
+        },
+        artifact: {
+          product: "bibcode-server",
+          version: "0.4.2",
+          os: "linux",
+          architecture: "x86_64",
+          format: "deb",
+          downloadName: "bibcode-server-linux-x86_64.deb",
+          size: 8192,
+          sha256: "c".repeat(64),
+          signatureName: "bibcode-server-linux-x86_64.deb.sig",
+        },
+        installDestination: "/usr",
+        dataRoot: "/home/dev/.bibcode",
+        serviceMode: "workstation",
+        requiredCommands: ["transfer verified artifact", "verify service identity"],
+        expiresAt: "2036-08-25T12:10:00.000Z",
+      },
+      detail: "BiBCode Server requires a verified update.",
+    });
+    expect(probe.consent?.transport).toBe("ssh");
+    expect(() =>
+      decodeDesktopSshServerProbe({
+        ...probe,
+        consent: { ...probe.consent, transport: "wsl" },
+      }),
+    ).toThrow();
+  });
+
+  it("requires a verified descriptor and retained tunnel for completed SSH setup", () => {
+    const completed = decodeDesktopSshSetupResult({
+      requestId: "ssh-setup-1",
+      generation: 8,
+      target: {
+        alias: "devbox",
+        hostname: "devbox.example",
+        username: "dev",
+        port: 22,
+      },
+      status: "completed",
+      stage: "verifyIdentity",
+      mutationStatus: "completed",
+      cleanupStatus: "completed",
+      installedVersion: "0.4.2",
+      previousVersion: "0.4.1",
+      managedBinaryPath: "/usr/bin/bibcode",
+      dataRoot: "/home/dev/.bibcode",
+      hostKeyFingerprint: "SHA256:known-host-key",
+      descriptor,
+      bootstrap: {
+        target: {
+          alias: "devbox",
+          hostname: "devbox.example",
+          username: "dev",
+          port: 22,
+        },
+        httpBaseUrl: "http://127.0.0.1:4100/",
+        wsBaseUrl: "ws://127.0.0.1:4100/",
+        hostKeyFingerprint: "SHA256:known-host-key",
+        remotePort: 3773,
+        remoteServerKind: "external",
+      },
+      recoveryCommand: null,
+      message: null,
+    });
+    expect(completed.status).toBe("completed");
+    expect(() => decodeDesktopSshSetupResult({ ...completed, bootstrap: null })).toThrow();
   });
 });
 

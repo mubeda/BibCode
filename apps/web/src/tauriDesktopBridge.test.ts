@@ -173,6 +173,52 @@ function installTauriHarness(options?: {
           remotePort: 3773,
           remoteServerKind: "managed",
         });
+      case "desktop_bridge_prepare_ssh_server":
+        return Promise.resolve({
+          requestId: "ssh-setup-1",
+          probeGeneration: 8,
+          target: (args?.input as { readonly target?: unknown } | undefined)?.target,
+          hostKeyFingerprint: "SHA256:known-host-key",
+          compatibility: "compatible",
+          probe: {
+            os: "linux",
+            architecture: "x86_64",
+            installedVersion: "0.4.2",
+            serviceMode: "workstation",
+            serviceState: "running",
+            dataRoot: "/home/dev/.bibcode",
+            controlAvailable: true,
+            freeBytes: 1_000_000,
+            installAuthority: "user",
+          },
+          installedBinaryPath: "/usr/bin/bibcode",
+          consent: null,
+          detail: null,
+        });
+      case "desktop_bridge_install_ssh_server":
+        return Promise.resolve({
+          requestId: "ssh-setup-1",
+          generation: 8,
+          target: {
+            alias: "host-1",
+            hostname: "example.test",
+            username: null,
+            port: null,
+          },
+          status: "cancelled",
+          stage: "probe",
+          mutationStatus: "none",
+          cleanupStatus: "notRequired",
+          installedVersion: null,
+          previousVersion: "0.4.1",
+          managedBinaryPath: null,
+          dataRoot: "/home/dev/.bibcode",
+          hostKeyFingerprint: "SHA256:known-host-key",
+          descriptor: null,
+          bootstrap: null,
+          recoveryCommand: null,
+          message: "SSH server installation was declined before mutation.",
+        });
       case "desktop_bridge_show_context_menu":
         if ("rejectContextMenu" in (options ?? {})) {
           return Promise.reject(options?.rejectContextMenu);
@@ -517,6 +563,44 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_issue_ssh_web_socket_ticket", {
       httpBaseUrl: "http://127.0.0.1:3773",
       bearerToken: "bearer-token",
+    });
+  });
+
+  it("routes typed SSH probe and one-use setup consent through native commands", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const target = {
+      alias: "host-1",
+      hostname: "example.test",
+      username: null,
+      port: null,
+    };
+
+    await expect(
+      bridge.prepareSshServer({
+        target,
+        expectedHostKeyFingerprint: "SHA256:known-host-key",
+        managedBinaryPath: "/usr/bin/bibcode",
+        serviceMode: "workstation",
+      }),
+    ).resolves.toMatchObject({
+      compatibility: "compatible",
+      probe: { os: "linux", freeBytes: 1_000_000 },
+    });
+    await expect(
+      bridge.installSshServer({ requestId: "ssh-setup-1", probeGeneration: 8, accepted: false }),
+    ).resolves.toMatchObject({ status: "cancelled", mutationStatus: "none" });
+
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_prepare_ssh_server", {
+      input: {
+        target,
+        expectedHostKeyFingerprint: "SHA256:known-host-key",
+        managedBinaryPath: "/usr/bin/bibcode",
+        serviceMode: "workstation",
+      },
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_ssh_server", {
+      decision: { requestId: "ssh-setup-1", probeGeneration: 8, accepted: false },
     });
   });
 

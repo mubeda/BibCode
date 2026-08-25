@@ -195,12 +195,14 @@ using any frame as evidence. At normal and minimum sizes verify:
 
 - Add Project has no Host selector or remote-device choice for the local Mac;
 - Settings > Connections exposes the desktop SSH enrollment card; with a
-  disposable Linux-like POSIX/OpenSSH host that already has a compatible native
-  `bibcode` plus `ss` or readable Linux procfs, verify host trust, loopback
-  tunnel, descriptor acceptance, native pairing, OS-secret persistence, and
-  safe disconnect. Record a native macOS remote target as unavailable until its
-  port/service adapter lands; unknown/changed keys and identity mismatches must
-  stop before pairing, and no raw pairing value is rendered;
+  disposable native macOS/OpenSSH host, exercise compatible-service enrollment
+  and explicit signed-artifact setup. Verify x86-64/ARM64 normalization as
+  applicable, local and remote checksum/size checks, private extraction plus
+  atomic promotion, requested workstation/headless service mode, loopback
+  tunnel, canonical descriptor, native pairing, OS-secret persistence, and safe
+  disconnect. Unknown/changed keys, declined consent, checksum failure, and
+  identity mismatch must stop before pairing, and no raw pairing value is
+  rendered;
 - WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
   from the ordinary macOS presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode

@@ -727,6 +727,8 @@ pub(crate) struct RemoteHostProbeWire {
     service_state: &'static str,
     data_root: Option<String>,
     control_available: bool,
+    free_bytes: u64,
+    install_authority: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1504,6 +1506,8 @@ fn remote_host_probe_wire(probe: &WslHostProbe, architecture: &str) -> RemoteHos
         },
         data_root: Some(probe.data_root.clone()),
         control_available: probe.control_available,
+        free_bytes: probe.free_bytes,
+        install_authority: "user",
     }
 }
 

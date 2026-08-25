@@ -65,9 +65,10 @@ Select focused tests from affected source and verify at least:
   Administrator token, and reverts impersonation before any await;
 - local Windows and WSL presentation follows current environment capability;
 - Settings > Connections mounts the SSH enrollment card, while Tailscale,
-  relay, and generic remote-device actions remain absent. Treat native Windows
-  OpenSSH/PowerShell provisioning as unavailable until its adapter lands; do
-  not substitute a POSIX shell and call it a Windows pass; and
+  relay, and generic remote-device actions remain absent. Exercise the native
+  Windows OpenSSH adapter with its fixed UTF-16LE encoded PowerShell commands;
+  prove every dynamic path crosses through bounded JSON stdin and do not
+  substitute a POSIX shell or host-independent fixture for the native pass; and
 - Claude, Codex, Cursor, and OpenCode are visible while Grok is absent.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
@@ -278,8 +279,9 @@ When WSL is unavailable:
 
 Do not install a distribution or change system WSL configuration without
 permission. The Connections SSH card remains visible in both WSL branches;
-Tailscale, relay, and generic remote-device targets remain absent. Record the
-native Windows OpenSSH/PowerShell adapter as unavailable until implemented.
+Tailscale, relay, and generic remote-device targets remain absent. Validate the
+native Windows OpenSSH/PowerShell setup independently of whether WSL is
+available.
 
 ## Native tests and static gates
 
@@ -353,9 +355,11 @@ Windows DPI states. Verify:
 - Add Project shows **This device** and usable WSL locations only;
 - Local Environment is visible and never empty;
 - Settings > Connections shows SSH enrollment without rendering raw pairing
-  credentials; native Windows OpenSSH/PowerShell setup is explicitly
-  unavailable until its adapter lands, while Tailscale, relay, exposure, and
-  generic remote-retry UI remains absent;
+  credentials; on a disposable Windows OpenSSH target, verify explicit setup
+  consent, signed artifact transfer and remote checksum/size validation,
+  private ZIP extraction plus atomic directory promotion, the requested service
+  mode, loopback tunnel, canonical descriptor, and safe disconnect. Tailscale,
+  relay, exposure, and generic remote-retry UI remains absent;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt

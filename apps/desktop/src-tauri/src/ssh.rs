@@ -1,4 +1,20 @@
+use crate::remote_host::{
+    linux::LinuxRemoteHostAdapter,
+    macos::MacOsRemoteHostAdapter,
+    model::{
+        ArtifactFormat, CleanupStatus, MutationStatus, RemoteCommand, RemoteCommandOutput,
+        RemoteCommandPurpose, RemoteHostAdapter, RemoteHostArchitecture, RemoteHostOs,
+        RemoteHostProbe, RemoteInstallAuthority, RemoteInstallFailure, RemoteInstallStage,
+        RemoteServiceMode, RemoteServiceState, RemoteStdin, StagedArtifact, VerifiedArtifact,
+    },
+    render_posix_remote_command,
+    windows::WindowsRemoteHostAdapter,
+};
+use crate::server_artifacts::{
+    ResolvedServerArtifact, ServerArtifactRecord, ServerArtifactRequest, ServerArtifactSource,
+};
 use bibcode_server::process::configure_background_command;
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -52,6 +68,9 @@ const REMOTE_PORT_SCAN_WINDOW: u16 = 200;
 const REMOTE_READY_TIMEOUT_MS: u64 = 15_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS: u64 = 2_000;
 const SSH_TRUST_PROBE_MARKER: &str = "bibcode-ssh-trust-ok";
+const SSH_SETUP_CONSENT_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const SSH_SETUP_REQUIRED_SPACE_MULTIPLIER: u64 = 3;
+const SSH_SETUP_DESCRIPTOR_LIMIT: usize = 256 * 1024;
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -269,6 +288,145 @@ pub struct SshEnvironmentTarget {
 #[serde(rename_all = "camelCase")]
 pub struct SshEnvironmentEnsureOptions {
     pub expected_host_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SshServerProbeInput {
+    pub target: SshEnvironmentTarget,
+    pub expected_host_key_fingerprint: Option<String>,
+    pub managed_binary_path: Option<String>,
+    #[serde(default)]
+    pub service_mode: RemoteServiceMode,
+    pub expected_environment_id: Option<String>,
+    pub expected_storage_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SshSetupConsentDecision {
+    pub request_id: String,
+    pub probe_generation: u64,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SshSetupCompatibility {
+    Compatible,
+    SetupRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshSetupVerification {
+    manifest_signature: &'static str,
+    artifact_signature: &'static str,
+    checksum: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshSetupConsent {
+    pub request_id: String,
+    pub probe_generation: u64,
+    transport: &'static str,
+    target_label: String,
+    target_version: String,
+    artifact_source: String,
+    verification: SshSetupVerification,
+    artifact: ServerArtifactRecord,
+    install_destination: String,
+    data_root: String,
+    service_mode: RemoteServiceMode,
+    required_commands: Vec<String>,
+    expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshServerProbe {
+    pub request_id: String,
+    pub probe_generation: u64,
+    pub target: SshEnvironmentTarget,
+    pub host_key_fingerprint: String,
+    pub compatibility: SshSetupCompatibility,
+    pub probe: RemoteHostProbe,
+    pub installed_binary_path: Option<String>,
+    pub consent: Option<SshSetupConsent>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SshSetupStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshSetupResult {
+    pub request_id: String,
+    pub generation: u64,
+    pub target: SshEnvironmentTarget,
+    pub status: SshSetupStatus,
+    pub stage: RemoteInstallStage,
+    pub mutation_status: MutationStatus,
+    pub cleanup_status: CleanupStatus,
+    pub installed_version: Option<String>,
+    pub previous_version: Option<String>,
+    pub managed_binary_path: Option<String>,
+    pub data_root: String,
+    pub host_key_fingerprint: String,
+    pub descriptor: Option<Value>,
+    pub bootstrap: Option<SshEnvironmentBootstrap>,
+    pub recovery_command: Option<String>,
+    pub message: Option<String>,
+}
+
+struct SshSetupOutcome {
+    status: SshSetupStatus,
+    stage: RemoteInstallStage,
+    mutation_status: MutationStatus,
+    cleanup_status: CleanupStatus,
+    installed_version: Option<String>,
+    descriptor: Option<Value>,
+    bootstrap: Option<SshEnvironmentBootstrap>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SshInstallPaths {
+    remote_artifact: String,
+    install_root: String,
+    installed_binary: String,
+    data_root: String,
+    remote_port: u16,
+}
+
+#[derive(Clone)]
+struct PreparedSshSetup {
+    request_id: String,
+    probe_generation: u64,
+    target: SshEnvironmentTarget,
+    host_key_fingerprint: String,
+    probe: RemoteHostProbe,
+    target_version: String,
+    service_mode: RemoteServiceMode,
+    expected_environment_id: Option<String>,
+    expected_storage_instance_id: Option<String>,
+    resolved: ResolvedServerArtifact,
+    format: ArtifactFormat,
+    paths: SshInstallPaths,
+    expires_at: OffsetDateTime,
+}
+
+#[derive(Default)]
+struct SshSetupState {
+    generation: u64,
+    prepared: HashMap<String, PreparedSshSetup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -527,6 +685,8 @@ pub struct SshEnvironmentManager {
     askpass_temporary_base: PathBuf,
     askpass_launcher: Mutex<Weak<SshAskpassLauncherInner>>,
     child_reaper: SshChildReaper,
+    setup_state: Mutex<SshSetupState>,
+    artifact_source: Result<ServerArtifactSource, String>,
 }
 
 impl Default for SshEnvironmentManager {
@@ -547,6 +707,8 @@ impl SshEnvironmentManager {
             askpass_temporary_base,
             askpass_launcher: Mutex::new(Weak::new()),
             child_reaper: SshChildReaper::new(),
+            setup_state: Mutex::new(SshSetupState::default()),
+            artifact_source: ServerArtifactSource::production(),
         }
     }
 
@@ -782,6 +944,838 @@ impl SshEnvironmentManager {
             return Err(error);
         }
         Ok(bootstrap)
+    }
+
+    async fn ensure_external_tunnel<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        probe: SshHostProbe,
+        remote_port: u16,
+    ) -> Result<SshEnvironmentBootstrap, String> {
+        if remote_port == 0 {
+            return Err("The SSH service reported an invalid loopback port.".to_string());
+        }
+        let target = normalize_ssh_environment_target(probe.target)?;
+        let key = target_connection_key(&target);
+        if let Some(existing) = self.take_existing_bootstrap_if_running(&key)? {
+            validate_expected_host_key_fingerprint(
+                Some(&probe.host_key_fingerprint),
+                &existing.host_key_fingerprint,
+            )?;
+            if existing.remote_port != remote_port {
+                return Err(
+                    "An existing SSH tunnel targets a different remote port; disconnect it before installing the service."
+                        .to_string(),
+                );
+            }
+            return Ok(existing);
+        }
+        let local_port = portpicker::pick_unused_port()
+            .ok_or_else(|| "Could not find an available local SSH tunnel port.".to_string())?;
+        let askpass_launcher = self.askpass_launcher()?;
+        let expected_host_key_fingerprint = probe.host_key_fingerprint.clone();
+        let remote = RemoteLaunchResult {
+            remote_port,
+            server_kind: "external".to_string(),
+        };
+        let tunnel_result = self
+            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+                let target = target.clone();
+                let askpass_launcher = askpass_launcher.clone();
+                let remote = remote.clone();
+                let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+                async move {
+                    let plan = SshEnvironmentLaunchPlan::forward_with_auth(
+                        target, local_port, remote, &auth,
+                    )?;
+                    let child = start_ssh_tunnel(
+                        &plan,
+                        &auth,
+                        askpass_launcher,
+                        &expected_host_key_fingerprint,
+                    )
+                    .await?;
+                    Ok((plan, child))
+                }
+            })
+            .await;
+        let (plan, child) = tunnel_result?;
+        let bootstrap = SshEnvironmentBootstrap::new(
+            target,
+            plan.remote_port,
+            plan.http_base_url,
+            plan.ws_base_url,
+            expected_host_key_fingerprint,
+            "external",
+        );
+        if let Err((error, mut child)) = self.publish_tunnel(key, child, bootstrap.clone()) {
+            child.terminate_and_reap().await;
+            return Err(error);
+        }
+        Ok(bootstrap)
+    }
+
+    pub(crate) async fn inspect_remote_host<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        probe: SshHostProbe,
+    ) -> Result<RemoteHostProbe, String> {
+        self.inspect_remote_host_at_binary(app, prompts, probe, None)
+            .await
+    }
+
+    async fn inspect_remote_host_at_binary<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        probe: SshHostProbe,
+        managed_binary_path: Option<String>,
+    ) -> Result<RemoteHostProbe, String> {
+        let target = normalize_ssh_environment_target(probe.target)?;
+        validate_expected_host_key_fingerprint(
+            Some(&probe.host_key_fingerprint),
+            &probe.host_key_fingerprint,
+        )?;
+        let key = target_connection_key(&target);
+        let askpass_launcher = self.askpass_launcher()?;
+        let expected_host_key_fingerprint = probe.host_key_fingerprint;
+        self.run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+            let target = target.clone();
+            let askpass_launcher = askpass_launcher.clone();
+            let expected_host_key_fingerprint = expected_host_key_fingerprint.clone();
+            let managed_binary_path = managed_binary_path.clone();
+            async move {
+                probe_remote_host(
+                    &target,
+                    &auth,
+                    askpass_launcher,
+                    &expected_host_key_fingerprint,
+                    managed_binary_path.as_deref(),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn prepare_server<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        input: SshServerProbeInput,
+        target_version: &str,
+    ) -> Result<SshServerProbe, String> {
+        validate_expected_setup_identity(
+            input.expected_environment_id.as_deref(),
+            input.expected_storage_instance_id.as_deref(),
+        )?;
+        let target = normalize_ssh_environment_target(input.target)?;
+        let trust = self
+            .probe_with_expected(
+                app,
+                prompts,
+                target.clone(),
+                input.expected_host_key_fingerprint.as_deref(),
+            )
+            .await?;
+        let mut host = self
+            .inspect_remote_host(app, prompts, trust.clone())
+            .await?;
+        if let Some(managed_binary_path) = input.managed_binary_path.as_deref() {
+            validate_managed_binary_path(&host, managed_binary_path)?;
+            host = self
+                .inspect_remote_host_at_binary(
+                    app,
+                    prompts,
+                    trust.clone(),
+                    Some(managed_binary_path.to_string()),
+                )
+                .await?;
+        }
+        let request_id = Uuid::new_v4().to_string();
+        let probe_generation = self.next_setup_generation()?;
+        let compatible_service = host.installed_version.as_deref() == Some(target_version)
+            && host.service_mode == Some(input.service_mode)
+            && host.service_state == RemoteServiceState::Running
+            && host.control_available
+            && host.bind_port.is_some();
+        let compatible_transient = host.installed_version.as_deref() == Some(target_version)
+            && input.service_mode == RemoteServiceMode::Workstation
+            && input.managed_binary_path.is_none()
+            && matches!(host.os, RemoteHostOs::Linux | RemoteHostOs::MacOs);
+        if compatible_service || compatible_transient {
+            return Ok(SshServerProbe {
+                request_id,
+                probe_generation,
+                target,
+                host_key_fingerprint: trust.host_key_fingerprint,
+                compatibility: SshSetupCompatibility::Compatible,
+                installed_binary_path: host.binary_path.clone(),
+                probe: host,
+                consent: None,
+                detail: None,
+            });
+        }
+        if input.service_mode == RemoteServiceMode::Headless
+            && host.install_authority != RemoteInstallAuthority::NoninteractiveAdministrator
+        {
+            return Err(
+                "The selected SSH session lacks noninteractive administrator authority required for headless installation."
+                    .to_string(),
+            );
+        }
+        let adapter = remote_host_adapter(host.os);
+        let preferred_formats =
+            ssh_setup_preferred_formats(adapter.as_ref(), &host, input.service_mode);
+        let Some(format) = preferred_formats.first().copied() else {
+            return Err(
+                "The remote host lacks a supported verified package installer or portable extractor."
+                    .to_string(),
+            );
+        };
+        let source = self
+            .artifact_source
+            .as_ref()
+            .map_err(|error| error.clone())?;
+        let manifest_architecture =
+            if host.os == RemoteHostOs::MacOs && format == ArtifactFormat::Pkg {
+                "universal"
+            } else {
+                host.architecture.as_manifest_value()
+            };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let resolved = source
+            .resolve(
+                &ServerArtifactRequest {
+                    version: target_version.to_string(),
+                    os: host.os.as_manifest_value().to_string(),
+                    architecture: manifest_architecture.to_string(),
+                    preferred_formats: vec![format.as_str().to_string()],
+                },
+                &cancellation,
+            )
+            .await?;
+        if artifact_format(&resolved.record.format)? != format {
+            return Err("The signed server artifact format changed after selection.".to_string());
+        }
+        let required_space = resolved
+            .record
+            .size
+            .saturating_mul(SSH_SETUP_REQUIRED_SPACE_MULTIPLIER);
+        if host.free_bytes < required_space {
+            return Err(
+                "The remote host does not have enough free space for verified staging and rollback."
+                    .to_string(),
+            );
+        }
+        let paths = ssh_install_paths(
+            &host,
+            &resolved.record,
+            format,
+            target_version,
+            &request_id,
+            input.service_mode,
+        )?;
+        let expires_at = OffsetDateTime::now_utc()
+            + time::Duration::seconds(SSH_SETUP_CONSENT_LIFETIME.as_secs() as i64);
+        let consent = SshSetupConsent {
+            request_id: request_id.clone(),
+            probe_generation,
+            transport: "ssh",
+            target_label: target.alias.clone(),
+            target_version: target_version.to_string(),
+            artifact_source: resolved.manifest_url.to_string(),
+            verification: SshSetupVerification {
+                manifest_signature: "verified",
+                artifact_signature: "pending",
+                checksum: "pending",
+            },
+            artifact: resolved.record.clone(),
+            install_destination: paths.install_root.clone(),
+            data_root: paths.data_root.clone(),
+            service_mode: input.service_mode,
+            required_commands: setup_command_summaries(host.os, format, input.service_mode),
+            expires_at: expires_at
+                .format(&Rfc3339)
+                .map_err(|error| format!("Could not format SSH setup consent expiry: {error}"))?,
+        };
+        self.store_prepared_setup(PreparedSshSetup {
+            request_id: request_id.clone(),
+            probe_generation,
+            target: target.clone(),
+            host_key_fingerprint: trust.host_key_fingerprint.clone(),
+            probe: host.clone(),
+            target_version: target_version.to_string(),
+            service_mode: input.service_mode,
+            expected_environment_id: input.expected_environment_id,
+            expected_storage_instance_id: input.expected_storage_instance_id,
+            resolved,
+            format,
+            paths,
+            expires_at,
+        })?;
+        Ok(SshServerProbe {
+            request_id,
+            probe_generation,
+            target,
+            host_key_fingerprint: trust.host_key_fingerprint,
+            compatibility: SshSetupCompatibility::SetupRequired,
+            installed_binary_path: host.binary_path.clone(),
+            probe: host.clone(),
+            consent: Some(consent),
+            detail: Some(match host.installed_version {
+                Some(version) => format!(
+                    "BiBCode Server {version} is not compatible with required version {target_version} or the requested service mode is not running."
+                ),
+                None => "BiBCode Server is not installed on the SSH host.".to_string(),
+            }),
+        })
+    }
+
+    fn next_setup_generation(&self) -> Result<u64, String> {
+        let mut state = self
+            .setup_state
+            .lock()
+            .map_err(|error| format!("Could not access SSH setup state: {error}"))?;
+        state.generation = state.generation.saturating_add(1);
+        Ok(state.generation)
+    }
+
+    fn store_prepared_setup(&self, prepared: PreparedSshSetup) -> Result<(), String> {
+        let mut state = self
+            .setup_state
+            .lock()
+            .map_err(|error| format!("Could not access SSH setup state: {error}"))?;
+        state.prepared.retain(|_, candidate| {
+            candidate.expires_at >= OffsetDateTime::now_utc() && candidate.target != prepared.target
+        });
+        state.prepared.insert(prepared.request_id.clone(), prepared);
+        Ok(())
+    }
+
+    fn take_prepared_setup(
+        &self,
+        decision: &SshSetupConsentDecision,
+    ) -> Result<PreparedSshSetup, String> {
+        let mut state = self
+            .setup_state
+            .lock()
+            .map_err(|error| format!("Could not access SSH setup state: {error}"))?;
+        let prepared = state.prepared.remove(&decision.request_id).ok_or_else(|| {
+            "The SSH setup consent is missing, expired, or already used.".to_string()
+        })?;
+        if prepared.probe_generation != decision.probe_generation {
+            return Err("The SSH setup consent generation does not match the probe.".to_string());
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) async fn install_server<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        decision: SshSetupConsentDecision,
+        staging_root: &Path,
+    ) -> Result<SshSetupResult, String> {
+        let prepared = self.take_prepared_setup(&decision)?;
+        if OffsetDateTime::now_utc() > prepared.expires_at {
+            return Err(
+                "The SSH setup consent expired; probe again before installing.".to_string(),
+            );
+        }
+        if !decision.accepted {
+            return Ok(ssh_setup_result(
+                &prepared,
+                SshSetupOutcome {
+                    status: SshSetupStatus::Cancelled,
+                    stage: RemoteInstallStage::Probe,
+                    mutation_status: MutationStatus::None,
+                    cleanup_status: CleanupStatus::NotRequired,
+                    installed_version: None,
+                    descriptor: None,
+                    bootstrap: None,
+                    message: Some(
+                        "SSH server installation was declined before mutation.".to_string(),
+                    ),
+                },
+            ));
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let source = self
+            .artifact_source
+            .as_ref()
+            .map_err(|error| error.clone())?;
+        let artifact = match source
+            .download(
+                prepared.resolved.clone(),
+                staging_root,
+                &cancellation,
+                Arc::new(|_, _| {}),
+            )
+            .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return Ok(ssh_setup_result(
+                    &prepared,
+                    SshSetupOutcome {
+                        status: SshSetupStatus::Failed,
+                        stage: RemoteInstallStage::Download,
+                        mutation_status: MutationStatus::None,
+                        cleanup_status: CleanupStatus::NotRequired,
+                        installed_version: None,
+                        descriptor: None,
+                        bootstrap: None,
+                        message: Some(error),
+                    },
+                ));
+            }
+        };
+        let verified = VerifiedArtifact {
+            local_path: artifact.path.clone(),
+            version: prepared.target_version.clone(),
+            os: prepared.probe.os,
+            architecture: prepared.probe.architecture,
+            format: prepared.format,
+            size: artifact.resolved.record.size,
+            sha256: artifact.resolved.record.sha256.clone(),
+            remote_path: prepared.paths.remote_artifact.clone(),
+            install_root: prepared.paths.install_root.clone(),
+            data_root: prepared.paths.data_root.clone(),
+            service_mode: prepared.service_mode,
+            remote_port: prepared.paths.remote_port,
+        };
+        let staged = StagedArtifact::from_verified(
+            verified.clone(),
+            prepared.paths.installed_binary.clone(),
+            prepared.probe.install_authority,
+        )
+        .with_service_update(prepared.probe.service_mode.is_some());
+        let adapter = remote_host_adapter(prepared.probe.os);
+        let stage_commands = adapter.stage_commands(&verified)?;
+        for command in stage_commands {
+            let output = match self
+                .execute_setup_command(app, prompts, &prepared, &command)
+                .await
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let cleanup = self
+                        .cleanup_setup(app, prompts, &prepared, &verified, false)
+                        .await;
+                    return Ok(ssh_setup_failure(
+                        &prepared,
+                        RemoteInstallStage::Transfer,
+                        MutationStatus::Partial,
+                        cleanup,
+                        error,
+                    ));
+                }
+            };
+            if !output.succeeded() {
+                let cleanup = self
+                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Transfer,
+                    MutationStatus::Partial,
+                    cleanup,
+                    format!("Remote staging command {:?} failed.", command.purpose),
+                ));
+            }
+            if matches!(
+                command.purpose,
+                RemoteCommandPurpose::VerifyTransfer | RemoteCommandPurpose::VerifyTransferSize
+            ) && let Err(error) =
+                validate_remote_artifact_verification(prepared.probe.os, &output, &verified)
+            {
+                let cleanup = self
+                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Verify,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        }
+        for command in adapter.install_commands(&staged)? {
+            let promotion_outcome_is_unknown = matches!(prepared.format, ArtifactFormat::TarGz)
+                && (command.program == "mv"
+                    || command.program == "sudo"
+                        && command
+                            .arguments
+                            .get(1)
+                            .is_some_and(|program| program == "mv"))
+                || matches!(prepared.format, ArtifactFormat::Zip);
+            let output = match self
+                .execute_setup_command(app, prompts, &prepared, &command)
+                .await
+            {
+                Ok(output) if output.succeeded() => output,
+                Ok(_) => {
+                    let cleanup = self
+                        .cleanup_setup(app, prompts, &prepared, &verified, false)
+                        .await;
+                    return Ok(ssh_setup_failure(
+                        &prepared,
+                        RemoteInstallStage::Install,
+                        MutationStatus::Partial,
+                        cleanup,
+                        "The fixed remote installer command failed.".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let cleanup = self
+                        .cleanup_setup(
+                            app,
+                            prompts,
+                            &prepared,
+                            &verified,
+                            promotion_outcome_is_unknown,
+                        )
+                        .await;
+                    return Ok(ssh_setup_failure(
+                        &prepared,
+                        RemoteInstallStage::Install,
+                        MutationStatus::Partial,
+                        cleanup,
+                        error,
+                    ));
+                }
+            };
+            if matches!(
+                command.purpose,
+                RemoteCommandPurpose::VerifyTransfer | RemoteCommandPurpose::VerifyTransferSize
+            ) && let Err(error) =
+                validate_remote_artifact_verification(prepared.probe.os, &output, &verified)
+            {
+                let cleanup = self
+                    .cleanup_setup(app, prompts, &prepared, &verified, false)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Verify,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+            drop(output);
+        }
+        for command in adapter.service_commands(&staged)? {
+            match self
+                .execute_setup_command(app, prompts, &prepared, &command)
+                .await
+            {
+                Ok(output) if output.succeeded() => {}
+                Ok(_) => {
+                    let cleanup = self
+                        .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                        .await;
+                    return Ok(ssh_setup_failure(
+                        &prepared,
+                        RemoteInstallStage::Start,
+                        MutationStatus::Partial,
+                        cleanup,
+                        "The installed BiBCode service did not start successfully.".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let cleanup = self
+                        .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                        .await;
+                    return Ok(ssh_setup_failure(
+                        &prepared,
+                        RemoteInstallStage::Start,
+                        MutationStatus::Partial,
+                        cleanup,
+                        error,
+                    ));
+                }
+            }
+        }
+        let installed_probe = match self
+            .inspect_remote_host_at_binary(
+                app,
+                prompts,
+                SshHostProbe {
+                    target: prepared.target.clone(),
+                    host_key_fingerprint: prepared.host_key_fingerprint.clone(),
+                },
+                Some(prepared.paths.installed_binary.clone()),
+            )
+            .await
+        {
+            Ok(probe) => probe,
+            Err(error) => {
+                let cleanup = self
+                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Start,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        };
+        let service_port = match validate_installed_service(&prepared, &installed_probe) {
+            Ok(port) => port,
+            Err(error) => {
+                let cleanup = self
+                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Start,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        };
+        let bootstrap = match self
+            .ensure_external_tunnel(
+                app,
+                prompts,
+                SshHostProbe {
+                    target: prepared.target.clone(),
+                    host_key_fingerprint: prepared.host_key_fingerprint.clone(),
+                },
+                service_port,
+            )
+            .await
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                let cleanup = self
+                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::Start,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        };
+        let descriptor = match fetch_ssh_setup_descriptor(&bootstrap.http_base_url).await {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                let cleanup = self
+                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::VerifyIdentity,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        };
+        let descriptor = match validate_ssh_setup_descriptor(&prepared, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                let cleanup = self
+                    .recover_setup_after_service_mutation(app, prompts, &prepared, &verified)
+                    .await;
+                return Ok(ssh_setup_failure(
+                    &prepared,
+                    RemoteInstallStage::VerifyIdentity,
+                    MutationStatus::Partial,
+                    cleanup,
+                    error,
+                ));
+            }
+        };
+        let cleanup_status = self
+            .cleanup_setup(app, prompts, &prepared, &verified, false)
+            .await;
+        Ok(ssh_setup_result(
+            &prepared,
+            SshSetupOutcome {
+                status: SshSetupStatus::Completed,
+                stage: RemoteInstallStage::VerifyIdentity,
+                mutation_status: MutationStatus::Completed,
+                cleanup_status,
+                installed_version: Some(prepared.target_version.clone()),
+                descriptor: Some(descriptor),
+                bootstrap: Some(bootstrap),
+                message: (cleanup_status == CleanupStatus::Failed).then_some(
+                    "The server is verified, but the remote staging artifact could not be removed."
+                        .to_string(),
+                ),
+            },
+        ))
+    }
+
+    async fn execute_setup_command<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshSetup,
+        command: &RemoteCommand,
+    ) -> Result<RemoteCommandOutput, String> {
+        let key = target_connection_key(&prepared.target);
+        let askpass_launcher = self.askpass_launcher()?;
+        self.run_with_ssh_auth(app, prompts, &key, &prepared.target, |auth| {
+            let target = prepared.target.clone();
+            let askpass_launcher = askpass_launcher.clone();
+            let fingerprint = prepared.host_key_fingerprint.clone();
+            let command = command.clone();
+            let os = prepared.probe.os;
+            async move {
+                run_remote_command(&target, os, &command, &auth, askpass_launcher, &fingerprint)
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn cleanup_setup<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshSetup,
+        verified: &VerifiedArtifact,
+        remove_install_root: bool,
+    ) -> CleanupStatus {
+        let adapter = remote_host_adapter(prepared.probe.os);
+        let Ok(commands) = adapter.cleanup_commands(verified, remove_install_root) else {
+            return CleanupStatus::Failed;
+        };
+        for command in commands {
+            match self
+                .execute_setup_command(app, prompts, prepared, &command)
+                .await
+            {
+                Ok(output) if output.succeeded() => {}
+                _ => return CleanupStatus::Failed,
+            }
+        }
+        CleanupStatus::Completed
+    }
+
+    async fn recover_setup_after_service_mutation<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshSetup,
+        verified: &VerifiedArtifact,
+    ) -> CleanupStatus {
+        let tunnel_closed = self.close_setup_tunnel(&prepared.target).await;
+        let restored = self
+            .restore_previous_service(app, prompts, prepared, verified)
+            .await;
+        let cleaned = self
+            .cleanup_setup(app, prompts, prepared, verified, false)
+            .await;
+        if tunnel_closed == CleanupStatus::Completed
+            && restored == CleanupStatus::Completed
+            && cleaned == CleanupStatus::Completed
+        {
+            CleanupStatus::Completed
+        } else {
+            CleanupStatus::Failed
+        }
+    }
+
+    async fn close_setup_tunnel(&self, target: &SshEnvironmentTarget) -> CleanupStatus {
+        let key = target_connection_key(target);
+        let tunnel = match self.tunnels.lock() {
+            Ok(mut tunnels) => tunnels.remove(&key),
+            Err(_) => return CleanupStatus::Failed,
+        };
+        if let Some(mut tunnel) = tunnel {
+            tunnel.child.terminate_and_reap().await;
+        }
+        CleanupStatus::Completed
+    }
+
+    async fn restore_previous_service<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshSetup,
+        verified: &VerifiedArtifact,
+    ) -> CleanupStatus {
+        let (
+            Some(previous_version),
+            Some(previous_mode),
+            Some(previous_binary),
+            Some(previous_data_root),
+            Some(previous_port),
+        ) = (
+            prepared.probe.installed_version.clone(),
+            prepared.probe.service_mode,
+            prepared.probe.binary_path.clone(),
+            prepared.probe.data_root.clone(),
+            prepared.probe.bind_port,
+        )
+        else {
+            return CleanupStatus::Failed;
+        };
+        if validate_managed_binary_path(&prepared.probe, &previous_binary).is_err() {
+            return CleanupStatus::Failed;
+        }
+        let mut previous_artifact = verified.clone();
+        previous_artifact.version = previous_version.clone();
+        previous_artifact.data_root = previous_data_root.clone();
+        previous_artifact.service_mode = previous_mode;
+        previous_artifact.remote_port = previous_port;
+        let previous = StagedArtifact::from_verified(
+            previous_artifact,
+            previous_binary.clone(),
+            prepared.probe.install_authority,
+        )
+        .with_service_update(true);
+        let adapter = remote_host_adapter(prepared.probe.os);
+        let Ok(commands) = adapter.service_commands(&previous) else {
+            return CleanupStatus::Failed;
+        };
+        for command in commands {
+            match self
+                .execute_setup_command(app, prompts, prepared, &command)
+                .await
+            {
+                Ok(output) if output.succeeded() => {}
+                _ => return CleanupStatus::Failed,
+            }
+        }
+        let Ok(restored_probe) = self
+            .inspect_remote_host_at_binary(
+                app,
+                prompts,
+                SshHostProbe {
+                    target: prepared.target.clone(),
+                    host_key_fingerprint: prepared.host_key_fingerprint.clone(),
+                },
+                Some(previous_binary.clone()),
+            )
+            .await
+        else {
+            return CleanupStatus::Failed;
+        };
+        let mut expected = prepared.clone();
+        expected.target_version = previous_version;
+        expected.service_mode = previous_mode;
+        expected.paths.installed_binary = previous_binary;
+        expected.paths.data_root = previous_data_root;
+        expected.paths.remote_port = previous_port;
+        if validate_installed_service(&expected, &restored_probe).is_ok() {
+            CleanupStatus::Completed
+        } else {
+            CleanupStatus::Failed
+        }
     }
 
     pub fn active_bootstrap(
@@ -1067,6 +2061,298 @@ fn normalize_ssh_environment_target(
     Ok(target)
 }
 
+fn remote_host_adapter(os: RemoteHostOs) -> Box<dyn RemoteHostAdapter> {
+    match os {
+        RemoteHostOs::Linux => Box::new(LinuxRemoteHostAdapter),
+        RemoteHostOs::MacOs => Box::new(MacOsRemoteHostAdapter),
+        RemoteHostOs::Windows => Box::new(WindowsRemoteHostAdapter),
+    }
+}
+
+fn ssh_setup_preferred_formats(
+    adapter: &dyn RemoteHostAdapter,
+    host: &RemoteHostProbe,
+    service_mode: RemoteServiceMode,
+) -> Vec<ArtifactFormat> {
+    if service_mode != RemoteServiceMode::Headless {
+        return adapter.preferred_formats(host);
+    }
+    if !host.capabilities.portable_extractor {
+        return Vec::new();
+    }
+    vec![match host.os {
+        RemoteHostOs::Linux | RemoteHostOs::MacOs => ArtifactFormat::TarGz,
+        RemoteHostOs::Windows => ArtifactFormat::Zip,
+    }]
+}
+
+fn artifact_format(value: &str) -> Result<ArtifactFormat, String> {
+    match value {
+        "zip" => Ok(ArtifactFormat::Zip),
+        "tar.gz" => Ok(ArtifactFormat::TarGz),
+        "msi" => Ok(ArtifactFormat::Msi),
+        "pkg" => Ok(ArtifactFormat::Pkg),
+        "deb" => Ok(ArtifactFormat::Deb),
+        "rpm" => Ok(ArtifactFormat::Rpm),
+        _ => Err("The signed server artifact format is unsupported by SSH setup.".to_string()),
+    }
+}
+
+fn validate_expected_setup_identity(
+    environment_id: Option<&str>,
+    storage_instance_id: Option<&str>,
+) -> Result<(), String> {
+    match (environment_id, storage_instance_id) {
+        (None, None) => Ok(()),
+        (Some(environment_id), Some(storage_instance_id)) => {
+            Uuid::parse_str(environment_id)
+                .map_err(|_| "The expected SSH environment identity is invalid.".to_string())?;
+            Uuid::parse_str(storage_instance_id)
+                .map_err(|_| "The expected SSH storage identity is invalid.".to_string())?;
+            Ok(())
+        }
+        _ => Err(
+            "Expected SSH environment and storage identities must be supplied together."
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_managed_binary_path(host: &RemoteHostProbe, binary_path: &str) -> Result<(), String> {
+    let valid = match host.os {
+        RemoteHostOs::Linux | RemoteHostOs::MacOs => {
+            crate::remote_host::model::validate_posix_path(binary_path, "managed binary")?;
+            if binary_path
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
+            {
+                false
+            } else {
+                let native = match host.os {
+                    RemoteHostOs::Linux => "/usr/bin/bibcode",
+                    RemoteHostOs::MacOs => "/usr/local/bin/bibcode",
+                    RemoteHostOs::Windows => unreachable!(),
+                };
+                let under_version_root = |base: &str| {
+                    let prefix = format!("{}/versions/", base.trim_end_matches('/'));
+                    binary_path.strip_prefix(&prefix).is_some_and(|relative| {
+                        relative.split_once('/').is_some_and(|(version, suffix)| {
+                            !version.is_empty() && suffix == "bibcode-server/bin/bibcode"
+                        })
+                    })
+                };
+                let portable = under_version_root(&host.install_base)
+                    || under_version_root(&host.system_install_base);
+                binary_path == native || portable
+            }
+        }
+        RemoteHostOs::Windows => {
+            crate::remote_host::model::validate_windows_path(binary_path, "managed binary")?;
+            let normalized = binary_path.replace('/', "\\").to_ascii_lowercase();
+            if normalized
+                .split('\\')
+                .any(|component| matches!(component, "." | ".."))
+            {
+                false
+            } else {
+                let base = host
+                    .install_base
+                    .trim_end_matches(['\\', '/'])
+                    .replace('/', "\\")
+                    .to_ascii_lowercase();
+                let native = format!(r"{base}\programs\bibcode server\bin\bibcode.exe");
+                let system_base = host
+                    .system_install_base
+                    .trim_end_matches(['\\', '/'])
+                    .replace('/', "\\")
+                    .to_ascii_lowercase();
+                let under_version_root = |prefix: String| {
+                    normalized.strip_prefix(&prefix).is_some_and(|relative| {
+                        relative.split_once('\\').is_some_and(|(version, suffix)| {
+                            !version.is_empty() && suffix == r"bibcode-server\bin\bibcode.exe"
+                        })
+                    })
+                };
+                let portable = under_version_root(format!(r"{base}\bibcode\server\versions\"))
+                    || under_version_root(format!(r"{system_base}\versions\"));
+                normalized == native || portable
+            }
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "The saved SSH managed binary path is outside BiBCode-owned installation roots."
+                .to_string(),
+        )
+    }
+}
+
+fn ssh_install_paths(
+    host: &RemoteHostProbe,
+    record: &ServerArtifactRecord,
+    format: ArtifactFormat,
+    target_version: &str,
+    request_id: &str,
+    service_mode: RemoteServiceMode,
+) -> Result<SshInstallPaths, String> {
+    if Uuid::parse_str(request_id).is_err() {
+        return Err("The SSH setup request identifier is invalid.".to_string());
+    }
+    let digest = Sha256::digest(target_version.as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut encoded, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+            encoded
+        },
+    );
+    let suffix = match format {
+        ArtifactFormat::Zip => "zip",
+        ArtifactFormat::TarGz => "tar.gz",
+        ArtifactFormat::Msi => "msi",
+        ArtifactFormat::Pkg => "pkg",
+        ArtifactFormat::Deb => "deb",
+        ArtifactFormat::Rpm => "rpm",
+    };
+    let data_root = if service_mode == RemoteServiceMode::Headless {
+        host.headless_data_root.clone()
+    } else {
+        host.data_root
+            .clone()
+            .ok_or_else(|| "The SSH workstation data root is unavailable.".to_string())?
+    };
+    let remote_port = host.bind_port.unwrap_or(DEFAULT_REMOTE_PORT);
+    let (remote_artifact, install_root, installed_binary) = match host.os {
+        RemoteHostOs::Linux => {
+            let remote_artifact = format!(
+                "{}/staging/{request_id}.{suffix}",
+                host.install_base.trim_end_matches('/')
+            );
+            match format {
+                ArtifactFormat::Deb | ArtifactFormat::Rpm => (
+                    remote_artifact,
+                    "/usr".to_string(),
+                    "/usr/bin/bibcode".to_string(),
+                ),
+                ArtifactFormat::TarGz => {
+                    let install_base = if service_mode == RemoteServiceMode::Headless {
+                        &host.system_install_base
+                    } else {
+                        &host.install_base
+                    };
+                    let root = format!(
+                        "{}/versions/version-{digest}-{request_id}",
+                        install_base.trim_end_matches('/')
+                    );
+                    let binary = format!("{root}/bibcode-server/bin/bibcode");
+                    (remote_artifact, root, binary)
+                }
+                _ => {
+                    return Err(
+                        "The selected artifact format is not valid for Linux SSH setup."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        RemoteHostOs::MacOs => {
+            let remote_artifact = format!(
+                "{}/staging/{request_id}.{suffix}",
+                host.install_base.trim_end_matches('/')
+            );
+            match format {
+                ArtifactFormat::Pkg => (
+                    remote_artifact,
+                    "/Applications/BiBCode Server".to_string(),
+                    "/usr/local/bin/bibcode".to_string(),
+                ),
+                ArtifactFormat::TarGz => {
+                    let install_base = if service_mode == RemoteServiceMode::Headless {
+                        &host.system_install_base
+                    } else {
+                        &host.install_base
+                    };
+                    let root = format!(
+                        "{}/versions/version-{digest}-{request_id}",
+                        install_base.trim_end_matches('/')
+                    );
+                    let binary = format!("{root}/bibcode-server/bin/bibcode");
+                    (remote_artifact, root, binary)
+                }
+                _ => {
+                    return Err(
+                        "The selected artifact format is not valid for macOS SSH setup."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        RemoteHostOs::Windows => {
+            let base = host.install_base.trim_end_matches(['\\', '/']);
+            let remote_artifact = format!(r"{base}\BiBCode\Server\staging\{request_id}.{suffix}");
+            match format {
+                ArtifactFormat::Msi => {
+                    let root = format!(r"{base}\Programs\BiBCode Server");
+                    let binary = format!(r"{root}\bin\bibcode.exe");
+                    (remote_artifact, root, binary)
+                }
+                ArtifactFormat::Zip => {
+                    let install_base = if service_mode == RemoteServiceMode::Headless {
+                        host.system_install_base
+                            .trim_end_matches(['\\', '/'])
+                            .to_string()
+                    } else {
+                        format!(r"{base}\BiBCode\Server")
+                    };
+                    let root = format!(r"{install_base}\versions\version-{digest}-{request_id}");
+                    let binary = format!(r"{root}\bibcode-server\bin\bibcode.exe");
+                    (remote_artifact, root, binary)
+                }
+                _ => {
+                    return Err(
+                        "The selected artifact format is not valid for Windows SSH setup."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    };
+    if record.size == 0 || record.sha256.len() != 64 {
+        return Err("The selected signed server artifact metadata is invalid.".to_string());
+    }
+    Ok(SshInstallPaths {
+        remote_artifact,
+        install_root,
+        installed_binary,
+        data_root,
+        remote_port,
+    })
+}
+
+fn setup_command_summaries(
+    os: RemoteHostOs,
+    format: ArtifactFormat,
+    service_mode: RemoteServiceMode,
+) -> Vec<String> {
+    vec![
+        "Create one private BiBCode Server staging location on the selected host.".to_string(),
+        "Transfer the exact desktop-verified release artifact over the pinned SSH session."
+            .to_string(),
+        "Verify the signed-manifest SHA-256 again on the remote host.".to_string(),
+        format!(
+            "Install the {} artifact through the fixed {} adapter.",
+            format.as_str(),
+            os.as_manifest_value()
+        ),
+        format!(
+            "Install and start the loopback-only {} service definition, then verify identity.",
+            service_mode.as_str()
+        ),
+    ]
+}
+
 fn validate_expected_host_key_fingerprint(
     expected: Option<&str>,
     observed: &str,
@@ -1084,6 +2370,537 @@ fn validate_expected_host_key_fingerprint(
         );
     }
     Ok(())
+}
+
+fn ssh_setup_result(prepared: &PreparedSshSetup, outcome: SshSetupOutcome) -> SshSetupResult {
+    SshSetupResult {
+        request_id: prepared.request_id.clone(),
+        generation: prepared.probe_generation,
+        target: prepared.target.clone(),
+        status: outcome.status,
+        stage: outcome.stage,
+        mutation_status: outcome.mutation_status,
+        cleanup_status: outcome.cleanup_status,
+        installed_version: outcome.installed_version,
+        previous_version: prepared.probe.installed_version.clone(),
+        managed_binary_path: (outcome.mutation_status != MutationStatus::None)
+            .then(|| prepared.paths.installed_binary.clone()),
+        data_root: prepared.paths.data_root.clone(),
+        host_key_fingerprint: prepared.host_key_fingerprint.clone(),
+        descriptor: outcome.descriptor,
+        bootstrap: outcome.bootstrap,
+        recovery_command: None,
+        message: outcome.message,
+    }
+}
+
+fn ssh_setup_failure(
+    prepared: &PreparedSshSetup,
+    stage: RemoteInstallStage,
+    mutation_status: MutationStatus,
+    cleanup_status: CleanupStatus,
+    message: String,
+) -> SshSetupResult {
+    let recovery_command = ssh_setup_recovery_command(prepared);
+    let failure = RemoteInstallFailure::new(
+        stage,
+        mutation_status,
+        cleanup_status,
+        prepared.probe.installed_version.clone(),
+        message,
+        recovery_command,
+    );
+    let mut result = ssh_setup_result(
+        prepared,
+        SshSetupOutcome {
+            status: SshSetupStatus::Failed,
+            stage: failure.stage,
+            mutation_status: failure.mutation_status,
+            cleanup_status: failure.cleanup_status,
+            installed_version: None,
+            descriptor: None,
+            bootstrap: None,
+            message: Some(failure.message),
+        },
+    );
+    result.previous_version = failure.previous_version;
+    result.recovery_command = Some(failure.recovery_command);
+    result
+}
+
+fn ssh_setup_recovery_command(prepared: &PreparedSshSetup) -> String {
+    let previous = (
+        prepared.probe.binary_path.as_deref(),
+        prepared.probe.service_mode,
+        prepared.probe.data_root.as_deref(),
+        prepared.probe.bind_port,
+    );
+    let (binary_path, service_mode, data_root, port) = match previous {
+        (Some(binary_path), Some(service_mode), Some(data_root), Some(port))
+            if validate_managed_binary_path(&prepared.probe, binary_path).is_ok() =>
+        {
+            (binary_path, service_mode, data_root, port)
+        }
+        _ => (
+            prepared.paths.installed_binary.as_str(),
+            prepared.service_mode,
+            prepared.paths.data_root.as_str(),
+            prepared.paths.remote_port,
+        ),
+    };
+    render_ssh_recovery_command(
+        prepared.probe.os,
+        binary_path,
+        service_mode,
+        data_root,
+        port,
+    )
+    .unwrap_or_else(|_| {
+        "BiBCode could not construct a safe remote service inspection command.".to_string()
+    })
+}
+
+fn render_ssh_recovery_command(
+    os: RemoteHostOs,
+    binary_path: &str,
+    service_mode: RemoteServiceMode,
+    data_root: &str,
+    port: u16,
+) -> Result<String, String> {
+    let arguments = [
+        "service".to_string(),
+        "status".to_string(),
+        "--mode".to_string(),
+        service_mode.as_str().to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--base-dir".to_string(),
+        data_root.to_string(),
+    ];
+    match os {
+        RemoteHostOs::Linux | RemoteHostOs::MacOs => {
+            crate::remote_host::model::validate_posix_path(binary_path, "managed binary")?;
+            crate::remote_host::model::validate_posix_path(data_root, "data root")?;
+            let command = if service_mode == RemoteServiceMode::Headless {
+                let mut elevated = vec!["-n".to_string(), binary_path.to_string()];
+                elevated.extend(arguments);
+                RemoteCommand::standard(RemoteCommandPurpose::Service, "sudo", elevated)?
+            } else {
+                RemoteCommand::standard(RemoteCommandPurpose::Service, binary_path, arguments)?
+            };
+            render_posix_remote_command(&command)
+        }
+        RemoteHostOs::Windows => {
+            crate::remote_host::model::validate_windows_path(binary_path, "managed binary")?;
+            crate::remote_host::model::validate_windows_path(data_root, "data root")?;
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+            Ok(format!(
+                "& {} service status --mode {} --format json --host 127.0.0.1 --port {port} --base-dir {}",
+                quote(binary_path),
+                service_mode.as_str(),
+                quote(data_root),
+            ))
+        }
+    }
+}
+
+fn validate_remote_artifact_verification(
+    os: RemoteHostOs,
+    output: &RemoteCommandOutput,
+    verified: &VerifiedArtifact,
+) -> Result<(), String> {
+    if !output.succeeded() {
+        return Err("The remote artifact verification command failed.".to_string());
+    }
+    match (os, output.purpose) {
+        (RemoteHostOs::Windows, RemoteCommandPurpose::VerifyTransfer) => {
+            let document: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+                "Windows remote artifact verification returned invalid JSON.".to_string()
+            })?;
+            let observed_hash =
+                document
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "Windows remote artifact verification omitted SHA-256.".to_string()
+                    })?;
+            let observed_size = document
+                .get("size")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    "Windows remote artifact verification omitted the byte count.".to_string()
+                })?;
+            if !observed_hash.eq_ignore_ascii_case(&verified.sha256)
+                || observed_size != verified.size
+            {
+                return Err(
+                    "The transferred server artifact does not match its signed manifest record."
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        (RemoteHostOs::Linux | RemoteHostOs::MacOs, RemoteCommandPurpose::VerifyTransfer) => {
+            let observed_hash = output
+                .stdout_text()?
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| "The remote artifact verification omitted SHA-256.".to_string())?;
+            if !observed_hash.eq_ignore_ascii_case(&verified.sha256) {
+                return Err(
+                    "The transferred server artifact SHA-256 does not match its signed manifest record."
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        (RemoteHostOs::Linux | RemoteHostOs::MacOs, RemoteCommandPurpose::VerifyTransferSize) => {
+            let observed_size = output
+                .stdout_text()?
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    "The remote artifact verification returned an invalid byte count.".to_string()
+                })?;
+            if observed_size != verified.size {
+                return Err(
+                    "The transferred server artifact byte count does not match its signed manifest record."
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err(
+            "The remote artifact verification result did not match the host adapter.".to_string(),
+        ),
+    }
+}
+
+fn validate_installed_service(
+    prepared: &PreparedSshSetup,
+    installed: &RemoteHostProbe,
+) -> Result<u16, String> {
+    if installed.os != prepared.probe.os || installed.architecture != prepared.probe.architecture {
+        return Err("The installed BiBCode service host identity changed after setup.".to_string());
+    }
+    if installed.installed_version.as_deref() != Some(prepared.target_version.as_str()) {
+        return Err(
+            "The installed BiBCode service version does not match the consented artifact."
+                .to_string(),
+        );
+    }
+    if installed.service_mode != Some(prepared.service_mode)
+        || installed.service_state != RemoteServiceState::Running
+        || !installed.control_available
+    {
+        return Err(
+            "The installed BiBCode service is not running in the consented service mode."
+                .to_string(),
+        );
+    }
+    if installed.data_root.as_deref() != Some(prepared.paths.data_root.as_str()) {
+        return Err("The installed BiBCode service uses an unexpected data root.".to_string());
+    }
+    let observed_binary = installed.binary_path.as_deref().ok_or_else(|| {
+        "The installed BiBCode service did not report its managed binary path.".to_string()
+    })?;
+    let expected_binary = prepared.paths.installed_binary.as_str();
+    let binary_matches = match installed.os {
+        RemoteHostOs::Windows => observed_binary
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&expected_binary.replace('/', "\\")),
+        RemoteHostOs::Linux | RemoteHostOs::MacOs => observed_binary == expected_binary,
+    };
+    if !binary_matches {
+        return Err("The installed BiBCode service uses an unexpected binary path.".to_string());
+    }
+    let port = installed.bind_port.ok_or_else(|| {
+        "The installed BiBCode service did not report a loopback port.".to_string()
+    })?;
+    if port != prepared.paths.remote_port {
+        return Err("The installed BiBCode service uses an unexpected loopback port.".to_string());
+    }
+    Ok(port)
+}
+
+async fn fetch_ssh_setup_descriptor(http_base_url: &str) -> Result<Value, String> {
+    let mut url = url::Url::parse(http_base_url)
+        .map_err(|error| format!("Could not parse the SSH setup tunnel URL: {error}"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(_)) | None => false,
+    };
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(
+            "SSH setup identity verification requires a credential-free loopback HTTP tunnel."
+                .to_string(),
+        );
+    }
+    url.set_path(SSH_READY_PATH);
+    url.set_query(None);
+    url.set_fragment(None);
+    let response = build_ssh_readiness_client(reqwest::Client::builder())?
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach the installed BiBCode service: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The installed BiBCode service identity endpoint returned HTTP {}.",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > SSH_SETUP_DESCRIPTOR_LIMIT as u64)
+    {
+        return Err("The installed BiBCode service identity descriptor is too large.".to_string());
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            format!("Could not read the installed BiBCode service identity: {error}")
+        })?;
+        if bytes.len().saturating_add(chunk.len()) > SSH_SETUP_DESCRIPTOR_LIMIT {
+            return Err(
+                "The installed BiBCode service identity descriptor is too large.".to_string(),
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!("Could not decode the installed BiBCode service identity: {error}")
+    })
+}
+
+pub(crate) fn canonicalize_ssh_environment_descriptor(descriptor: &Value) -> Result<Value, String> {
+    let descriptor = descriptor
+        .as_object()
+        .ok_or_else(|| "The verified SSH descriptor is not an object.".to_string())?;
+    let environment_id = descriptor
+        .get("environmentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no environment identity.".to_string())?;
+    let label = descriptor
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .ok_or_else(|| "The verified SSH descriptor has no valid label.".to_string())?;
+    let platform = descriptor
+        .get("platform")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid platform.".to_string())?;
+    let platform_os = platform
+        .get("os")
+        .and_then(Value::as_str)
+        .filter(|os| matches!(*os, "darwin" | "linux" | "windows" | "unknown"))
+        .ok_or_else(|| "The verified SSH descriptor has an invalid platform OS.".to_string())?;
+    let platform_arch = platform
+        .get("arch")
+        .and_then(Value::as_str)
+        .filter(|arch| matches!(*arch, "arm64" | "x64" | "other"))
+        .ok_or_else(|| {
+            "The verified SSH descriptor has an invalid platform architecture.".to_string()
+        })?;
+    let storage_id = descriptor
+        .get("storageInstanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no storage identity.".to_string())?;
+    let environment_id = Uuid::parse_str(environment_id)
+        .map_err(|_| "The verified SSH environment identity is invalid.".to_string())?;
+    let storage_id = Uuid::parse_str(storage_id)
+        .map_err(|_| "The verified SSH storage identity is invalid.".to_string())?;
+    let server_version = descriptor
+        .get("serverVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| "The verified SSH server version is invalid.".to_string())?;
+    let protocol = descriptor
+        .get("protocol")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid protocol range.".to_string())?;
+    let minimum = protocol
+        .get("minimum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The verified SSH protocol minimum is invalid.".to_string())?;
+    let maximum = protocol
+        .get("maximum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The verified SSH protocol maximum is invalid.".to_string())?;
+    if minimum == 0 || maximum == 0 || minimum > maximum {
+        return Err("The verified SSH protocol range is invalid.".to_string());
+    }
+    let supported = u64::from(bibcode_server::ENVIRONMENT_PROTOCOL_VERSION);
+    if minimum > supported || maximum < supported {
+        return Err(
+            "The verified SSH server protocol is incompatible with this desktop.".to_string(),
+        );
+    }
+    let capabilities = descriptor
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "The verified SSH descriptor has no valid capabilities.".to_string())?;
+    let capability = |name: &str| -> Result<bool, String> {
+        capabilities
+            .get(name)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    format!("The verified SSH descriptor has an invalid {name} capability.")
+                })
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let repository_identity = capability("repositoryIdentity")?;
+    let worktree_catalog = capability("worktreeCatalog")?;
+    let worktree_catalog_refresh_reason = capability("worktreeCatalogRefreshReason")?;
+    let vcs_status_summary = capability("vcsStatusSummary")?;
+    let activity_protocol_version = match capabilities.get("activityProtocolVersion") {
+        None | Some(Value::Null) => Value::Null,
+        Some(value) if value.as_u64() == Some(2) => json!(2),
+        Some(_) => {
+            return Err(
+                "The verified SSH descriptor has an invalid activity protocol capability."
+                    .to_string(),
+            );
+        }
+    };
+    let transport = descriptor
+        .get("transport")
+        .and_then(Value::as_object)
+        .and_then(|transport| transport.get("mode"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The verified SSH descriptor has no transport identity.".to_string())?;
+    if transport != "loopback-http" {
+        return Err(
+            "The verified SSH descriptor does not identify a loopback HTTP transport.".to_string(),
+        );
+    }
+    Ok(json!({
+        "environmentId": environment_id.to_string(),
+        "label": label,
+        "platform": {
+            "os": platform_os,
+            "arch": platform_arch,
+        },
+        "serverVersion": server_version,
+        "storageInstanceId": storage_id.to_string(),
+        "protocol": {
+            "minimum": minimum,
+            "maximum": maximum,
+        },
+        "capabilities": {
+            "repositoryIdentity": repository_identity,
+            "worktreeCatalog": worktree_catalog,
+            "worktreeCatalogRefreshReason": worktree_catalog_refresh_reason,
+            "vcsStatusSummary": vcs_status_summary,
+            "activityProtocolVersion": activity_protocol_version,
+        },
+        "transport": {
+            "mode": "loopback-http",
+        },
+    }))
+}
+
+fn validate_ssh_setup_descriptor(
+    prepared: &PreparedSshSetup,
+    descriptor: &Value,
+) -> Result<Value, String> {
+    let descriptor = canonicalize_ssh_environment_descriptor(descriptor)?;
+    let environment_id = descriptor
+        .get("environmentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The SSH environment descriptor has no environment identity.".to_string())?;
+    let storage_instance_id = descriptor
+        .get("storageInstanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The SSH environment descriptor has no storage identity.".to_string())?;
+    Uuid::parse_str(environment_id)
+        .map_err(|_| "The SSH environment descriptor identity is invalid.".to_string())?;
+    Uuid::parse_str(storage_instance_id)
+        .map_err(|_| "The SSH storage descriptor identity is invalid.".to_string())?;
+    if prepared
+        .expected_environment_id
+        .as_deref()
+        .is_some_and(|expected| expected != environment_id)
+        || prepared
+            .expected_storage_instance_id
+            .as_deref()
+            .is_some_and(|expected| expected != storage_instance_id)
+    {
+        return Err(
+            "The installed BiBCode service identity changed during remote setup.".to_string(),
+        );
+    }
+    if descriptor.get("serverVersion").and_then(Value::as_str)
+        != Some(prepared.target_version.as_str())
+    {
+        return Err(
+            "The SSH environment descriptor version does not match the consented artifact."
+                .to_string(),
+        );
+    }
+    let expected_os = match prepared.probe.os {
+        RemoteHostOs::Linux => "linux",
+        RemoteHostOs::MacOs => "darwin",
+        RemoteHostOs::Windows => "windows",
+    };
+    let expected_arch = match prepared.probe.architecture {
+        RemoteHostArchitecture::X86_64 => "x64",
+        RemoteHostArchitecture::Aarch64 => "arm64",
+    };
+    if descriptor.pointer("/platform/os").and_then(Value::as_str) != Some(expected_os)
+        || descriptor.pointer("/platform/arch").and_then(Value::as_str) != Some(expected_arch)
+    {
+        return Err(
+            "The SSH environment descriptor platform does not match the probed host.".to_string(),
+        );
+    }
+    let minimum = descriptor
+        .pointer("/protocol/minimum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The SSH environment descriptor protocol minimum is invalid.".to_string())?;
+    let maximum = descriptor
+        .pointer("/protocol/maximum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "The SSH environment descriptor protocol maximum is invalid.".to_string())?;
+    let supported = u64::from(bibcode_server::ENVIRONMENT_PROTOCOL_VERSION);
+    if minimum > supported || maximum < supported {
+        return Err("The installed BiBCode service protocol is incompatible.".to_string());
+    }
+    if descriptor
+        .pointer("/transport/mode")
+        .and_then(Value::as_str)
+        != Some("loopback-http")
+    {
+        return Err("The installed BiBCode service is not loopback-only.".to_string());
+    }
+    if descriptor
+        .get("label")
+        .and_then(Value::as_str)
+        .is_none_or(|label| label.trim().is_empty())
+        || descriptor
+            .pointer("/capabilities/repositoryIdentity")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("The SSH environment descriptor is missing required fields.".to_string());
+    }
+    Ok(descriptor)
 }
 
 #[cfg(test)]
@@ -1743,6 +3560,7 @@ where
 
 async fn drain_ssh_command_stderr<R>(
     mut reader: R,
+    command_marker: String,
     verification_sender: oneshot::Sender<Result<(), String>>,
     output_sender: oneshot::Sender<io::Result<Vec<u8>>>,
 ) where
@@ -1773,9 +3591,7 @@ async fn drain_ssh_command_stderr<R>(
                     "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
                         .to_string(),
                 ));
-            } else if verification_sender.is_some()
-                && diagnostics.contains(SSH_REMOTE_SCRIPT_COMMAND_MARKER)
-            {
+            } else if verification_sender.is_some() && diagnostics.contains(&command_marker) {
                 let sender = verification_sender
                     .take()
                     .expect("verification sender remains present");
@@ -1975,9 +3791,23 @@ impl ManagedSshChild {
         stdout: Option<tokio::process::ChildStdout>,
         stderr_receiver: oneshot::Receiver<io::Result<Vec<u8>>>,
     ) -> io::Result<std::process::Output> {
+        self.wait_with_streamed_stderr_output_limit(
+            stdout,
+            stderr_receiver,
+            SSH_COMMAND_OUTPUT_LIMIT,
+        )
+        .await
+    }
+
+    async fn wait_with_streamed_stderr_output_limit(
+        &mut self,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr_receiver: oneshot::Receiver<io::Result<Vec<u8>>>,
+        stdout_limit: usize,
+    ) -> io::Result<std::process::Output> {
         let stdout_task = async move {
             match stdout {
-                Some(stdout) => read_bounded_ssh_output(stdout, SSH_COMMAND_OUTPUT_LIMIT).await,
+                Some(stdout) => read_bounded_ssh_output(stdout, stdout_limit).await,
                 None => Ok(Vec::new()),
             }
         };
@@ -2270,6 +4100,7 @@ async fn run_remote_ssh_script(
     let (stderr_sender, stderr_receiver) = oneshot::channel();
     let stderr_drain = tokio::spawn(drain_ssh_command_stderr(
         stderr,
+        SSH_REMOTE_SCRIPT_COMMAND_MARKER.to_string(),
         verification_sender,
         stderr_sender,
     ));
@@ -2319,6 +4150,323 @@ fn build_remote_script_ssh_args(
     args.extend(["sh".to_string(), "-s".to_string(), "--".to_string()]);
     args.extend(script_args.iter().cloned());
     Ok(args)
+}
+
+fn build_remote_command_ssh_args(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+    remote_os: RemoteHostOs,
+    command: &RemoteCommand,
+) -> Result<(Vec<String>, String), String> {
+    let host_spec = build_ssh_host_spec(target)?;
+    let rendered = match remote_os {
+        RemoteHostOs::Linux | RemoteHostOs::MacOs => render_posix_remote_command(command)?,
+        RemoteHostOs::Windows => command.render_for_windows_openssh()?,
+    };
+    let mut args = base_ssh_args_with_auth(target, auth);
+    args.extend([
+        "-o".to_string(),
+        "LogLevel=DEBUG".to_string(),
+        "-o".to_string(),
+        "FingerprintHash=sha256".to_string(),
+        "--".to_string(),
+        host_spec,
+        rendered.clone(),
+    ]);
+    Ok((args, format!("Sending command: {rendered}")))
+}
+
+async fn await_remote_command_verification(
+    verification_receiver: oneshot::Receiver<Result<(), String>>,
+    shutdown: &mut watch::Receiver<bool>,
+    operation: &str,
+) -> Result<(), String> {
+    tokio::select! {
+        result = tokio::time::timeout(SSH_READY_TIMEOUT, verification_receiver) => result
+            .map_err(|_| format!("SSH {operation} command timed out before confirming its pinned destination host key."))?
+            .map_err(|_| format!("SSH {operation} command verification diagnostics ended unexpectedly."))??,
+        _ = wait_for_ssh_shutdown(shutdown) => {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn write_remote_command_input_after_host_key<W>(
+    mut stdin: W,
+    input: &RemoteStdin,
+    remote_os: RemoteHostOs,
+    verification_receiver: oneshot::Receiver<Result<(), String>>,
+    mut shutdown: watch::Receiver<bool>,
+    operation: &str,
+) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    await_remote_command_verification(verification_receiver, &mut shutdown, operation).await?;
+    match input {
+        RemoteStdin::None => {}
+        RemoteStdin::Json(bytes) => {
+            tokio::select! {
+                result = stdin.write_all(bytes) => result
+                    .map_err(|error| format!("Failed to write SSH {operation} JSON input: {error}"))?,
+                _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                    return Err("SSH process owner is shutting down.".to_string());
+                }
+            }
+        }
+        RemoteStdin::Artifact {
+            local_path,
+            metadata,
+            expected_size,
+        } => {
+            let actual_size = tokio::fs::metadata(local_path)
+                .await
+                .map_err(|error| format!("Could not inspect the verified SSH artifact: {error}"))?
+                .len();
+            if actual_size != *expected_size {
+                return Err(
+                    "The verified SSH artifact size changed before remote transfer.".to_string(),
+                );
+            }
+            if remote_os == RemoteHostOs::Windows {
+                let metadata_size = u32::try_from(metadata.len())
+                    .map_err(|_| "The Windows artifact metadata is too large.".to_string())?;
+                let header = metadata_size.to_le_bytes();
+                tokio::select! {
+                    result = async {
+                        stdin.write_all(&header).await?;
+                        stdin.write_all(metadata).await
+                    } => result.map_err(|error| format!("Failed to write SSH {operation} artifact metadata: {error}"))?,
+                    _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                        return Err("SSH process owner is shutting down.".to_string());
+                    }
+                }
+            }
+            let mut artifact = tokio::fs::File::open(local_path)
+                .await
+                .map_err(|error| format!("Could not open the verified SSH artifact: {error}"))?;
+            let copied = tokio::select! {
+                result = tokio::io::copy(&mut artifact, &mut stdin) => result
+                    .map_err(|error| format!("Failed to transfer the verified SSH artifact: {error}"))?,
+                _ = wait_for_ssh_shutdown(&mut shutdown) => {
+                    return Err("SSH process owner is shutting down.".to_string());
+                }
+            };
+            if copied != *expected_size {
+                return Err(
+                    "The verified SSH artifact transfer ended at an unexpected size.".to_string(),
+                );
+            }
+        }
+    }
+    tokio::select! {
+        result = stdin.shutdown() => result
+            .map_err(|error| format!("Failed to close SSH {operation} command input: {error}"))?,
+        _ = wait_for_ssh_shutdown(&mut shutdown) => {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn within_remote_command_deadline<T, F>(
+    timeout: Duration,
+    operation: &str,
+    future: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| format!("SSH {operation} command timed out."))?
+}
+
+async fn run_remote_command(
+    target: &SshEnvironmentTarget,
+    remote_os: RemoteHostOs,
+    command_spec: &RemoteCommand,
+    auth: &SshAuthOptions,
+    askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
+) -> Result<RemoteCommandOutput, String> {
+    validate_effective_ssh_security_policy(target, askpass_launcher.clone(), auth.interactive_auth)
+        .await?;
+    let (mut args, command_marker) =
+        build_remote_command_ssh_args(target, auth, remote_os, command_spec)?;
+    insert_ssh_host_key_pin_args(&mut args);
+    let environment = build_verified_ssh_child_environment(
+        auth,
+        askpass_launcher.path(),
+        askpass_launcher.host_key_pin_verifier_path(),
+        Some(expected_host_key_fingerprint),
+        None,
+    )?;
+    let mut command = Command::new(ssh_command());
+    configure_background_command(&mut command);
+    apply_verified_ssh_child_environment(&mut command, environment);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let operation = format!("remote {:?}", command_spec.purpose);
+    let mut child = spawn_managed_ssh_child(
+        command,
+        askpass_launcher,
+        &format!("run SSH {operation} command"),
+    )?;
+    let stdin = child
+        .child_mut()
+        .stdin
+        .take()
+        .ok_or_else(|| format!("SSH {operation} command did not expose stdin."))?;
+    let stdout = child.child_mut().stdout.take();
+    let stderr =
+        child.child_mut().stderr.take().ok_or_else(|| {
+            format!("SSH {operation} command did not expose host-key diagnostics.")
+        })?;
+    let (verification_sender, verification_receiver) = oneshot::channel();
+    let (stderr_sender, stderr_receiver) = oneshot::channel();
+    let stderr_drain = tokio::spawn(drain_ssh_command_stderr(
+        stderr,
+        command_marker,
+        verification_sender,
+        stderr_sender,
+    ));
+    child.retain_stderr_drain(stderr_drain);
+    let command_result = within_remote_command_deadline(command_spec.timeout, &operation, async {
+        write_remote_command_input_after_host_key(
+            stdin,
+            &command_spec.stdin,
+            remote_os,
+            verification_receiver,
+            child.shutdown_receiver(),
+            &operation,
+        )
+        .await?;
+        child
+            .wait_with_streamed_stderr_output_limit(
+                stdout,
+                stderr_receiver,
+                command_spec.max_output_bytes,
+            )
+            .await
+            .map_err(|error| format!("Failed to wait for SSH {operation} command: {error}"))
+    })
+    .await;
+    let output = match command_result {
+        Ok(output) => output,
+        Err(error) => {
+            child.terminate_and_reap().await;
+            return Err(error);
+        }
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_ssh_host_key_pin_failure(&stderr) {
+        return Err(
+            "SSH host-key fingerprint changed. Connection is blocked until the saved route is explicitly re-enrolled."
+                .to_string(),
+        );
+    }
+    if is_ssh_auth_failure(&stderr) {
+        return Err(format!("SSH authentication failed during {operation}."));
+    }
+    if output.status.code() == Some(255) {
+        return Err(format!("SSH {operation} transport failed."));
+    }
+    RemoteCommandOutput::new(
+        command_spec.purpose,
+        output.status.code().unwrap_or(-1),
+        output.stdout,
+        output.stderr,
+        false,
+        command_spec.max_output_bytes,
+    )
+}
+
+async fn probe_remote_host(
+    target: &SshEnvironmentTarget,
+    auth: &SshAuthOptions,
+    askpass_launcher: SshAskpassLauncher,
+    expected_host_key_fingerprint: &str,
+    managed_binary_path: Option<&str>,
+) -> Result<RemoteHostProbe, String> {
+    let kernel_command = RemoteCommand::standard(RemoteCommandPurpose::Kernel, "uname", ["-s"])?;
+    let kernel = run_remote_command(
+        target,
+        RemoteHostOs::Linux,
+        &kernel_command,
+        auth,
+        askpass_launcher.clone(),
+        expected_host_key_fingerprint,
+    )
+    .await?;
+    let kernel_name = kernel.stdout_text().unwrap_or_default().trim();
+    let adapter: Box<dyn RemoteHostAdapter> = match kernel_name {
+        "Linux" => Box::new(LinuxRemoteHostAdapter),
+        "Darwin" => Box::new(MacOsRemoteHostAdapter),
+        _ => Box::new(WindowsRemoteHostAdapter),
+    };
+    let mut commands = adapter.probe_commands();
+    if let Some(managed_binary_path) = managed_binary_path {
+        configure_managed_binary_probe(adapter.os(), &mut commands, managed_binary_path)?;
+    }
+    let mut outputs = Vec::new();
+    for command in commands {
+        if command.purpose == RemoteCommandPurpose::Kernel && adapter.os() != RemoteHostOs::Windows
+        {
+            outputs.push(kernel.clone());
+            continue;
+        }
+        outputs.push(
+            run_remote_command(
+                target,
+                adapter.os(),
+                &command,
+                auth,
+                askpass_launcher.clone(),
+                expected_host_key_fingerprint,
+            )
+            .await?,
+        );
+    }
+    adapter.parse_probe(&outputs)
+}
+
+fn configure_managed_binary_probe(
+    os: RemoteHostOs,
+    commands: &mut [RemoteCommand],
+    managed_binary_path: &str,
+) -> Result<(), String> {
+    for command in commands {
+        match os {
+            RemoteHostOs::Windows if command.purpose == RemoteCommandPurpose::WindowsProbe => {
+                command.stdin = RemoteStdin::Json(
+                    serde_json::to_vec(&json!({
+                        "managedBinaryPath": managed_binary_path,
+                    }))
+                    .map_err(|error| {
+                        format!("Could not encode the managed SSH binary probe: {error}")
+                    })?,
+                );
+            }
+            RemoteHostOs::Linux | RemoteHostOs::MacOs
+                if matches!(
+                    command.purpose,
+                    RemoteCommandPurpose::InstalledVersion
+                        | RemoteCommandPurpose::WorkstationService
+                        | RemoteCommandPurpose::HeadlessService
+                ) =>
+            {
+                command.program = managed_binary_path.to_string();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn ssh_remote_script_failure_message(operation: &str, status: &str, stderr: &str) -> String {
@@ -3261,6 +5409,382 @@ pub fn discover_ssh_hosts(home_dir: Option<PathBuf>) -> Result<Vec<DiscoveredSsh
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn provision_verified_artifact(os: RemoteHostOs) -> VerifiedArtifact {
+        VerifiedArtifact {
+            local_path: PathBuf::from("fixture-server-artifact"),
+            version: "0.4.2".to_string(),
+            os,
+            architecture: RemoteHostArchitecture::X86_64,
+            format: match os {
+                RemoteHostOs::Linux => ArtifactFormat::TarGz,
+                RemoteHostOs::MacOs => ArtifactFormat::TarGz,
+                RemoteHostOs::Windows => ArtifactFormat::Zip,
+            },
+            size: 4096,
+            sha256: "a".repeat(64),
+            remote_path: match os {
+                RemoteHostOs::Windows => r"C:\Users\dev\server.zip".to_string(),
+                RemoteHostOs::Linux | RemoteHostOs::MacOs => "/home/dev/server.tar.gz".to_string(),
+            },
+            install_root: match os {
+                RemoteHostOs::Windows => r"C:\Users\dev\BiBCode\Server".to_string(),
+                RemoteHostOs::Linux | RemoteHostOs::MacOs => {
+                    "/home/dev/.local/share/bibcode/server".to_string()
+                }
+            },
+            data_root: match os {
+                RemoteHostOs::Windows => r"C:\Users\dev\.bibcode".to_string(),
+                RemoteHostOs::Linux | RemoteHostOs::MacOs => "/home/dev/.bibcode".to_string(),
+            },
+            service_mode: RemoteServiceMode::Workstation,
+            remote_port: 3773,
+        }
+    }
+
+    fn provision_managed_path_probe(os: RemoteHostOs, install_base: &str) -> RemoteHostProbe {
+        RemoteHostProbe {
+            os,
+            architecture: RemoteHostArchitecture::X86_64,
+            installed_version: Some("0.4.2".to_string()),
+            service_mode: Some(RemoteServiceMode::Workstation),
+            service_state: RemoteServiceState::Running,
+            data_root: Some(match os {
+                RemoteHostOs::Windows => r"C:\Users\dev\.bibcode".to_string(),
+                RemoteHostOs::Linux | RemoteHostOs::MacOs => "/home/dev/.bibcode".to_string(),
+            }),
+            control_available: true,
+            free_bytes: 1_000_000,
+            install_authority: RemoteInstallAuthority::User,
+            home: match os {
+                RemoteHostOs::Windows => r"C:\Users\dev".to_string(),
+                RemoteHostOs::Linux | RemoteHostOs::MacOs => "/home/dev".to_string(),
+            },
+            install_base: install_base.to_string(),
+            system_install_base: match os {
+                RemoteHostOs::Linux => "/opt/bibcode/server".to_string(),
+                RemoteHostOs::MacOs => "/Library/Application Support/BiBCode Server".to_string(),
+                RemoteHostOs::Windows => r"C:\ProgramData\BiBCode\Server".to_string(),
+            },
+            headless_data_root: match os {
+                RemoteHostOs::Windows => r"C:\ProgramData\BiBCode".to_string(),
+                RemoteHostOs::Linux => "/var/lib/bibcode".to_string(),
+                RemoteHostOs::MacOs => "/Library/Application Support/BiBCode".to_string(),
+            },
+            binary_path: None,
+            bind_port: Some(3773),
+            capabilities: crate::remote_host::model::RemoteHostCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn provision_managed_binary_paths_are_confined_to_owned_roots() {
+        let linux = provision_managed_path_probe(
+            RemoteHostOs::Linux,
+            "/home/dev/.local/share/bibcode/server",
+        );
+        assert!(validate_managed_binary_path(&linux, "/usr/bin/bibcode").is_ok());
+        assert!(
+            validate_managed_binary_path(
+                &linux,
+                "/home/dev/.local/share/bibcode/server/versions/version-1/bibcode-server/bin/bibcode",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_binary_path(
+                &linux,
+                "/opt/bibcode/server/versions/version-1/bibcode-server/bin/bibcode",
+            )
+            .is_ok()
+        );
+        assert!(validate_managed_binary_path(&linux, "/tmp/bibcode").is_err());
+        assert!(
+            validate_managed_binary_path(
+                &linux,
+                "/home/dev/.local/share/bibcode/server/versions/../bibcode-server/bin/bibcode",
+            )
+            .is_err()
+        );
+
+        let macos = provision_managed_path_probe(
+            RemoteHostOs::MacOs,
+            "/Users/dev/Library/Application Support/BiBCode Server",
+        );
+        assert!(validate_managed_binary_path(&macos, "/usr/local/bin/bibcode").is_ok());
+        assert!(
+            validate_managed_binary_path(
+                &macos,
+                "/Users/dev/Library/Application Support/BiBCode Server/versions/version-1/bibcode-server/bin/bibcode",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_binary_path(
+                &macos,
+                "/Library/Application Support/BiBCode Server/versions/version-1/bibcode-server/bin/bibcode",
+            )
+            .is_ok()
+        );
+
+        let windows =
+            provision_managed_path_probe(RemoteHostOs::Windows, r"C:\Users\dev\AppData\Local");
+        assert!(
+            validate_managed_binary_path(
+                &windows,
+                r"C:\Users\dev\AppData\Local\Programs\BiBCode Server\bin\bibcode.exe",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_binary_path(
+                &windows,
+                r"C:\Users\dev\AppData\Local\BiBCode\Server\versions\version-1\bibcode-server\bin\bibcode.exe",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_binary_path(
+                &windows,
+                r"C:\ProgramData\BiBCode\Server\versions\version-1\bibcode-server\bin\bibcode.exe",
+            )
+            .is_ok()
+        );
+        assert!(validate_managed_binary_path(&windows, r"C:\Temp\bibcode.exe").is_err());
+    }
+
+    #[test]
+    fn provision_managed_binary_probe_keeps_dynamic_paths_out_of_shell_program_text() {
+        let posix_path = "/home/dev/.local/share/bibcode/server/versions/version ' ; $(touch nope)/bibcode-server/bin/bibcode";
+        let linux = provision_managed_path_probe(
+            RemoteHostOs::Linux,
+            "/home/dev/.local/share/bibcode/server",
+        );
+        validate_managed_binary_path(&linux, posix_path).expect("owned POSIX managed path");
+        let mut linux_commands = LinuxRemoteHostAdapter.probe_commands();
+        configure_managed_binary_probe(RemoteHostOs::Linux, &mut linux_commands, posix_path)
+            .expect("configure POSIX managed probe");
+        let version = linux_commands
+            .iter()
+            .find(|command| command.purpose == RemoteCommandPurpose::InstalledVersion)
+            .expect("managed version probe");
+        assert_eq!(version.program, posix_path);
+        assert_eq!(
+            render_posix_remote_command(version).expect("render managed version probe"),
+            format!("'{}' '--version'", posix_path.replace('\'', "'\"'\"'"))
+        );
+
+        let windows_path = r"C:\Users\dev\AppData\Local\BiBCode\Server\versions\version & calc\bibcode-server\bin\bibcode.exe";
+        let windows =
+            provision_managed_path_probe(RemoteHostOs::Windows, r"C:\Users\dev\AppData\Local");
+        validate_managed_binary_path(&windows, windows_path).expect("owned Windows managed path");
+        let mut windows_commands = WindowsRemoteHostAdapter.probe_commands();
+        configure_managed_binary_probe(RemoteHostOs::Windows, &mut windows_commands, windows_path)
+            .expect("configure Windows managed probe");
+        let probe = windows_commands
+            .iter()
+            .find(|command| command.purpose == RemoteCommandPurpose::WindowsProbe)
+            .expect("Windows managed probe");
+        assert!(
+            !probe.program.contains(windows_path)
+                && probe
+                    .arguments
+                    .iter()
+                    .all(|argument| !argument.contains(windows_path))
+        );
+        assert!(
+            !crate::remote_host::windows::decode_powershell_command(probe)
+                .expect("decode fixed Windows probe")
+                .contains(windows_path)
+        );
+        let RemoteStdin::Json(bytes) = &probe.stdin else {
+            panic!("Windows managed path must cross only typed JSON stdin");
+        };
+        let document: Value = serde_json::from_slice(bytes).expect("managed probe JSON");
+        assert_eq!(
+            document.get("managedBinaryPath").and_then(Value::as_str),
+            Some(windows_path)
+        );
+    }
+
+    #[test]
+    fn provision_headless_setup_selects_portable_artifacts_without_package_side_effects() {
+        for (os, adapter, expected) in [
+            (
+                RemoteHostOs::Linux,
+                Box::new(LinuxRemoteHostAdapter) as Box<dyn RemoteHostAdapter>,
+                ArtifactFormat::TarGz,
+            ),
+            (
+                RemoteHostOs::MacOs,
+                Box::new(MacOsRemoteHostAdapter) as Box<dyn RemoteHostAdapter>,
+                ArtifactFormat::TarGz,
+            ),
+            (
+                RemoteHostOs::Windows,
+                Box::new(WindowsRemoteHostAdapter) as Box<dyn RemoteHostAdapter>,
+                ArtifactFormat::Zip,
+            ),
+        ] {
+            let install_base = match os {
+                RemoteHostOs::Windows => r"C:\Users\dev\AppData\Local",
+                RemoteHostOs::Linux => "/home/dev/.local/share/bibcode/server",
+                RemoteHostOs::MacOs => "/Users/dev/Library/Application Support/BiBCode Server",
+            };
+            let mut probe = provision_managed_path_probe(os, install_base);
+            probe.installed_version = None;
+            probe.install_authority = RemoteInstallAuthority::NoninteractiveAdministrator;
+            probe.capabilities.portable_extractor = true;
+            probe.capabilities.deb_installer = os == RemoteHostOs::Linux;
+            probe.capabilities.package_installer = os == RemoteHostOs::MacOs;
+            probe.capabilities.msi_installer = os == RemoteHostOs::Windows;
+
+            assert_eq!(
+                ssh_setup_preferred_formats(adapter.as_ref(), &probe, RemoteServiceMode::Headless,),
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn provision_recovery_command_binds_exact_binary_mode_and_data_root() {
+        let posix = render_ssh_recovery_command(
+            RemoteHostOs::Linux,
+            "/home/dev/version ' one/bibcode",
+            RemoteServiceMode::Headless,
+            "/var/lib/bibcode data",
+            4773,
+        )
+        .expect("POSIX recovery command");
+        assert_eq!(
+            posix,
+            "'sudo' '-n' '/home/dev/version '\"'\"' one/bibcode' 'service' 'status' '--mode' 'headless' '--format' 'json' '--host' '127.0.0.1' '--port' '4773' '--base-dir' '/var/lib/bibcode data'"
+        );
+
+        let windows = render_ssh_recovery_command(
+            RemoteHostOs::Windows,
+            r"C:\Users\dev\BiBCode's Server\bibcode.exe",
+            RemoteServiceMode::Workstation,
+            r"C:\Users\dev\BiBCode's Data",
+            3773,
+        )
+        .expect("Windows recovery command");
+        assert_eq!(
+            windows,
+            "& 'C:\\Users\\dev\\BiBCode''s Server\\bibcode.exe' service status --mode workstation --format json --host 127.0.0.1 --port 3773 --base-dir 'C:\\Users\\dev\\BiBCode''s Data'"
+        );
+    }
+
+    #[test]
+    fn provision_descriptor_canonicalization_strips_unexpected_secret_fields() {
+        let protocol = u64::from(bibcode_server::ENVIRONMENT_PROTOCOL_VERSION);
+        let descriptor = json!({
+            "environmentId": "123e4567-e89b-12d3-a456-426614174000",
+            "label": "Remote host",
+            "platform": { "os": "linux", "arch": "x64", "secret": "drop-me" },
+            "serverVersion": "0.4.2",
+            "storageInstanceId": "123e4567-e89b-12d3-a456-426614174001",
+            "protocol": { "minimum": protocol, "maximum": protocol },
+            "capabilities": {
+                "repositoryIdentity": true,
+                "secret": "drop-me",
+            },
+            "transport": { "mode": "loopback-http", "credential": "drop-me" },
+            "credential": "must-never-cross-the-desktop-bridge",
+        });
+        let canonical = canonicalize_ssh_environment_descriptor(&descriptor)
+            .expect("canonical public descriptor");
+
+        assert!(canonical.get("credential").is_none());
+        assert!(canonical.pointer("/platform/secret").is_none());
+        assert!(canonical.pointer("/capabilities/secret").is_none());
+        assert!(canonical.pointer("/transport/credential").is_none());
+        assert_eq!(
+            canonical.pointer("/capabilities/repositoryIdentity"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn provision_verifies_posix_hash_and_size_as_separate_bounded_results() {
+        let verified = provision_verified_artifact(RemoteHostOs::Linux);
+        let hash = RemoteCommandOutput::success(
+            RemoteCommandPurpose::VerifyTransfer,
+            format!("{}  {}\n", verified.sha256, verified.remote_path).into_bytes(),
+        );
+        let size = RemoteCommandOutput::success(
+            RemoteCommandPurpose::VerifyTransferSize,
+            format!("{} {}\n", verified.size, verified.remote_path).into_bytes(),
+        );
+        validate_remote_artifact_verification(RemoteHostOs::Linux, &hash, &verified)
+            .expect("matching hash");
+        validate_remote_artifact_verification(RemoteHostOs::Linux, &size, &verified)
+            .expect("matching byte count");
+
+        let wrong_size = RemoteCommandOutput::success(
+            RemoteCommandPurpose::VerifyTransferSize,
+            b"4095 /home/dev/server.tar.gz\n".to_vec(),
+        );
+        assert!(
+            validate_remote_artifact_verification(RemoteHostOs::Linux, &wrong_size, &verified,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provision_rejects_a_mismatched_privileged_headless_artifact_copy() {
+        let mut verified = provision_verified_artifact(RemoteHostOs::Linux);
+        verified.service_mode = RemoteServiceMode::Headless;
+        verified.install_root = "/opt/bibcode/server/versions/version-1".to_string();
+        let wrong_hash = RemoteCommandOutput::success(
+            RemoteCommandPurpose::VerifyTransfer,
+            format!(
+                "{}  {}/artifact.tar.gz\n",
+                "b".repeat(64),
+                verified.install_root
+            )
+            .into_bytes(),
+        );
+
+        assert!(
+            validate_remote_artifact_verification(RemoteHostOs::Linux, &wrong_hash, &verified)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provision_verifies_windows_hash_and_size_in_one_owned_json_result() {
+        let verified = provision_verified_artifact(RemoteHostOs::Windows);
+        let output = RemoteCommandOutput::success(
+            RemoteCommandPurpose::VerifyTransfer,
+            serde_json::to_vec(&json!({
+                "sha256": verified.sha256,
+                "size": verified.size,
+            }))
+            .expect("verification fixture"),
+        );
+        validate_remote_artifact_verification(RemoteHostOs::Windows, &output, &verified)
+            .expect("matching Windows verification");
+    }
+
+    #[tokio::test]
+    async fn provision_descriptor_fetch_rejects_non_loopback_and_credentialed_urls() {
+        assert!(
+            fetch_ssh_setup_descriptor("http://192.0.2.10:3773/")
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_ssh_setup_descriptor("http://user:password@127.0.0.1:3773/")
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_ssh_setup_descriptor("https://127.0.0.1:3773/")
+                .await
+                .is_err()
+        );
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -4870,6 +7394,7 @@ mod tests {
         let (output_sender, output_receiver) = oneshot::channel();
         let drain = tokio::spawn(drain_ssh_command_stderr(
             reader,
+            SSH_REMOTE_SCRIPT_COMMAND_MARKER.to_string(),
             fingerprint_sender,
             output_sender,
         ));
@@ -4972,6 +7497,41 @@ mod tests {
             .expect("accepted gate should join")
             .expect("matching host key should release the script");
         assert_eq!(accepted, script);
+    }
+
+    #[tokio::test]
+    async fn provision_remote_command_deadline_covers_a_stalled_artifact_writer() {
+        let artifact = tempfile::NamedTempFile::new().expect("stalled artifact fixture");
+        let bytes = vec![b'x'; 64 * 1024];
+        fs::write(artifact.path(), &bytes).expect("write stalled artifact fixture");
+        let (stdin, _stalled_remote_reader) = tokio::io::duplex(8);
+        let (verification_sender, verification_receiver) = oneshot::channel();
+        verification_sender
+            .send(Ok(()))
+            .expect("verification gate should remain live");
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let input = RemoteStdin::Artifact {
+            local_path: artifact.path().to_path_buf(),
+            metadata: Vec::new(),
+            expected_size: bytes.len() as u64,
+        };
+
+        let error = within_remote_command_deadline(
+            Duration::from_millis(25),
+            "remote Transfer",
+            write_remote_command_input_after_host_key(
+                stdin,
+                &input,
+                RemoteHostOs::Linux,
+                verification_receiver,
+                shutdown,
+                "remote Transfer",
+            ),
+        )
+        .await
+        .expect_err("stalled artifact streaming must hit the command deadline");
+
+        assert_eq!(error, "SSH remote Transfer command timed out.");
     }
 
     #[tokio::test]

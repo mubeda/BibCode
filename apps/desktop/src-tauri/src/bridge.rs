@@ -42,7 +42,8 @@ use crate::security::{
 use crate::ssh::{
     SshEnvironmentBootstrap, SshEnvironmentDisconnectOptions, SshEnvironmentEnsureOptions,
     SshEnvironmentManager, SshEnvironmentTarget, SshPasswordPromptManager,
-    SshPasswordPromptResolution, default_home_dir, discover_ssh_hosts,
+    SshPasswordPromptResolution, SshServerProbeInput, SshSetupConsentDecision,
+    canonicalize_ssh_environment_descriptor, default_home_dir, discover_ssh_hosts,
 };
 use crate::tailscale::{
     TailscaleStatus, build_tailscale_https_base_url, probe_tailscale_https_endpoint,
@@ -1345,137 +1346,6 @@ fn validate_ssh_pairing_descriptor(observed: &Value, expected: &Value) -> Result
     Ok(())
 }
 
-fn canonicalize_ssh_environment_descriptor(descriptor: &Value) -> Result<Value, String> {
-    let descriptor = descriptor
-        .as_object()
-        .ok_or_else(|| "The verified SSH descriptor is not an object.".to_string())?;
-    let environment_id = descriptor
-        .get("environmentId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "The verified SSH descriptor has no environment identity.".to_string())?;
-    let label = descriptor
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .ok_or_else(|| "The verified SSH descriptor has no valid label.".to_string())?;
-    let platform = descriptor
-        .get("platform")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "The verified SSH descriptor has no valid platform.".to_string())?;
-    let platform_os = platform
-        .get("os")
-        .and_then(Value::as_str)
-        .filter(|os| matches!(*os, "darwin" | "linux" | "windows" | "unknown"))
-        .ok_or_else(|| "The verified SSH descriptor has an invalid platform OS.".to_string())?;
-    let platform_arch = platform
-        .get("arch")
-        .and_then(Value::as_str)
-        .filter(|arch| matches!(*arch, "arm64" | "x64" | "other"))
-        .ok_or_else(|| {
-            "The verified SSH descriptor has an invalid platform architecture.".to_string()
-        })?;
-    let storage_id = descriptor
-        .get("storageInstanceId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "The verified SSH descriptor has no storage identity.".to_string())?;
-    let environment_id = uuid::Uuid::parse_str(environment_id)
-        .map_err(|_| "The verified SSH environment identity is invalid.".to_string())?;
-    let storage_id = uuid::Uuid::parse_str(storage_id)
-        .map_err(|_| "The verified SSH storage identity is invalid.".to_string())?;
-    let server_version = descriptor
-        .get("serverVersion")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| "The verified SSH server version is invalid.".to_string())?;
-    let protocol = descriptor
-        .get("protocol")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "The verified SSH descriptor has no valid protocol range.".to_string())?;
-    let minimum = protocol
-        .get("minimum")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "The verified SSH protocol minimum is invalid.".to_string())?;
-    let maximum = protocol
-        .get("maximum")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "The verified SSH protocol maximum is invalid.".to_string())?;
-    if minimum == 0 || maximum == 0 || minimum > maximum {
-        return Err("The verified SSH protocol range is invalid.".to_string());
-    }
-    let supported = u64::from(bibcode_server::ENVIRONMENT_PROTOCOL_VERSION);
-    if minimum > supported || maximum < supported {
-        return Err(
-            "The verified SSH server protocol is incompatible with this desktop.".to_string(),
-        );
-    }
-    let capabilities = descriptor
-        .get("capabilities")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "The verified SSH descriptor has no valid capabilities.".to_string())?;
-    let capability = |name: &str| -> Result<bool, String> {
-        capabilities
-            .get(name)
-            .map(|value| {
-                value.as_bool().ok_or_else(|| {
-                    format!("The verified SSH descriptor has an invalid {name} capability.")
-                })
-            })
-            .transpose()
-            .map(Option::unwrap_or_default)
-    };
-    let repository_identity = capability("repositoryIdentity")?;
-    let worktree_catalog = capability("worktreeCatalog")?;
-    let worktree_catalog_refresh_reason = capability("worktreeCatalogRefreshReason")?;
-    let vcs_status_summary = capability("vcsStatusSummary")?;
-    let activity_protocol_version = match capabilities.get("activityProtocolVersion") {
-        None | Some(Value::Null) => Value::Null,
-        Some(value) if value.as_u64() == Some(2) => json!(2),
-        Some(_) => {
-            return Err(
-                "The verified SSH descriptor has an invalid activity protocol capability."
-                    .to_string(),
-            );
-        }
-    };
-    let transport = descriptor
-        .get("transport")
-        .and_then(Value::as_object)
-        .and_then(|transport| transport.get("mode"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "The verified SSH descriptor has no transport identity.".to_string())?;
-    if transport != "loopback-http" {
-        return Err(
-            "The verified SSH descriptor does not identify a loopback HTTP transport.".to_string(),
-        );
-    }
-    Ok(json!({
-        "environmentId": environment_id.to_string(),
-        "label": label,
-        "platform": {
-            "os": platform_os,
-            "arch": platform_arch,
-        },
-        "serverVersion": server_version,
-        "storageInstanceId": storage_id.to_string(),
-        "protocol": {
-            "minimum": minimum,
-            "maximum": maximum,
-        },
-        "capabilities": {
-            "repositoryIdentity": repository_identity,
-            "worktreeCatalog": worktree_catalog,
-            "worktreeCatalogRefreshReason": worktree_catalog_refresh_reason,
-            "vcsStatusSummary": vcs_status_summary,
-            "activityProtocolVersion": activity_protocol_version,
-        },
-        "transport": {
-            "mode": "loopback-http",
-        },
-    }))
-}
-
 #[derive(Deserialize, Serialize)]
 struct SshAccessTokenResult {
     access_token: String,
@@ -2063,6 +1933,39 @@ pub async fn desktop_bridge_ensure_ssh_environment(
         .await?;
     serde_json::to_value(bootstrap)
         .map_err(|error| bridge_error("Could not encode SSH environment bootstrap", error))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_prepare_ssh_server(
+    app: AppHandle<DesktopRuntime>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    input: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<SshServerProbeInput>(input)
+        .map_err(|error| bridge_error("Could not decode the SSH server probe", error))?;
+    let probe = ssh
+        .prepare_server(&app, &prompts, input, &app_version(&app))
+        .await?;
+    serde_json::to_value(probe)
+        .map_err(|error| bridge_error("Could not encode the SSH server probe", error))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_install_ssh_server(
+    app: AppHandle<DesktopRuntime>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    decision: Value,
+) -> Result<Value, String> {
+    let decision = serde_json::from_value::<SshSetupConsentDecision>(decision)
+        .map_err(|error| bridge_error("Could not decode the SSH setup consent", error))?;
+    let staging_root = state_dir(&app)?.join("runtime").join("server-artifacts");
+    let result = ssh
+        .install_server(&app, &prompts, decision, &staging_root)
+        .await?;
+    serde_json::to_value(result)
+        .map_err(|error| bridge_error("Could not encode the SSH server setup result", error))
 }
 
 #[tauri::command]
@@ -3844,6 +3747,8 @@ mod tests {
                 desktop_bridge_get_secret,
                 desktop_bridge_delete_secret,
                 desktop_bridge_discover_ssh_hosts,
+                desktop_bridge_prepare_ssh_server,
+                desktop_bridge_install_ssh_server,
                 desktop_bridge_ensure_ssh_environment,
                 desktop_bridge_disconnect_ssh_environment,
                 desktop_bridge_fetch_environment_descriptor,

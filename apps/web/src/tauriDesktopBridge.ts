@@ -20,6 +20,8 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  DesktopSshServerProbeSchema,
+  DesktopSshSetupResultSchema,
   ExecutionEnvironmentDescriptor,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@bibcode/contracts";
@@ -45,6 +47,8 @@ const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
 const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
 const decodeSshEnvironmentDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+const decodeSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
+const decodeSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
 
 type ConnectionCatalogProtectionCapability = "protected" | "unprotected" | "unknown";
 
@@ -565,6 +569,14 @@ function createTauriDesktopBridge(
     exportProjectDataDiagnostics: (environmentId) =>
       tauriInvokeDesktop("desktop_bridge_export_project_data_diagnostics", { environmentId }),
     discoverSshHosts: () => tauriInvokeOr("desktop_bridge_discover_ssh_hosts", undefined, () => []),
+    prepareSshServer: (input) =>
+      tauriInvoke<unknown>("desktop_bridge_prepare_ssh_server", { input }).then(
+        decodeSshServerProbe,
+      ),
+    installSshServer: (decision) =>
+      tauriInvoke<unknown>("desktop_bridge_install_ssh_server", { decision }).then(
+        decodeSshSetupResult,
+      ),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),
     disconnectSshEnvironment: (target, options) =>

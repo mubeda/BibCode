@@ -157,11 +157,13 @@ environment in the report. At normal and minimum sizes verify:
 - Add Project has no Host selector or remote-device choice when only the local
   Linux environment is supported;
 - Settings > Connections exposes the desktop SSH enrollment card; with a
-  disposable Linux-like POSIX/OpenSSH host that already has a compatible native
-  `bibcode` plus `ss` or readable Linux procfs, verify host trust, loopback
-  tunnel, descriptor acceptance, native pairing, OS-secret persistence, and
-  safe disconnect. Unknown/changed keys and identity mismatches must stop before
-  pairing, and no raw pairing value is rendered;
+  disposable Linux/OpenSSH host, exercise both compatible-service enrollment
+  and explicit setup consent. Verify the exact signed artifact, local and remote
+  checksum/size checks, private extraction plus atomic promotion for portable
+  installs, requested service mode, loopback tunnel, canonical descriptor,
+  native pairing, OS-secret persistence, and safe disconnect. Unknown/changed
+  keys, declined consent, checksum failure, and identity mismatch must stop
+  before pairing, and no raw pairing value is rendered;
 - WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
   from the ordinary Linux presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode

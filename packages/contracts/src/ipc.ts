@@ -96,7 +96,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId, IsoDateTime, NonNegativeInt } from "./baseSchemas.ts";
+import { DurableEnvironmentId, EnvironmentId, IsoDateTime, NonNegativeInt } from "./baseSchemas.ts";
 import { ServerArtifactRecordSchema } from "./serverArtifact.ts";
 import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
@@ -718,6 +718,13 @@ export const RemoteHostServiceStateSchema = Schema.Literals([
 ]);
 export type RemoteHostServiceState = typeof RemoteHostServiceStateSchema.Type;
 
+export const RemoteHostInstallAuthoritySchema = Schema.Literals([
+  "user",
+  "noninteractiveAdministrator",
+  "administratorRequired",
+]);
+export type RemoteHostInstallAuthority = typeof RemoteHostInstallAuthoritySchema.Type;
+
 export const RemoteHostProbeSchema = Schema.Struct({
   os: RemoteHostOsSchema,
   architecture: RemoteHostArchitectureSchema,
@@ -726,6 +733,8 @@ export const RemoteHostProbeSchema = Schema.Struct({
   serviceState: RemoteHostServiceStateSchema,
   dataRoot: Schema.NullOr(Schema.String),
   controlAvailable: Schema.Boolean,
+  freeBytes: NonNegativeInt,
+  installAuthority: RemoteHostInstallAuthoritySchema,
 });
 export type RemoteHostProbe = typeof RemoteHostProbeSchema.Type;
 
@@ -864,6 +873,74 @@ export const DesktopWslSetupResultSchema = Schema.Struct({
   ),
 );
 export type DesktopWslSetupResult = typeof DesktopWslSetupResultSchema.Type;
+
+export const DesktopSshSetupProbeInputSchema = Schema.Struct({
+  target: DesktopSshEnvironmentTargetSchema,
+  expectedHostKeyFingerprint: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  managedBinaryPath: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  serviceMode: Schema.optionalKey(RemoteHostServiceModeSchema),
+  expectedEnvironmentId: Schema.optionalKey(Schema.NullOr(DurableEnvironmentId)),
+  expectedStorageInstanceId: Schema.optionalKey(
+    Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  ),
+}).check(
+  Schema.makeFilter(
+    ({ expectedEnvironmentId, expectedStorageInstanceId }) =>
+      (expectedEnvironmentId == null) === (expectedStorageInstanceId == null) ||
+      "Expected SSH environment and storage identities must be supplied together.",
+  ),
+);
+export type DesktopSshSetupProbeInput = typeof DesktopSshSetupProbeInputSchema.Type;
+
+export const DesktopSshServerProbeSchema = Schema.Struct({
+  requestId: Schema.String,
+  probeGeneration: NonNegativeInt,
+  target: DesktopSshEnvironmentTargetSchema,
+  hostKeyFingerprint: Schema.String,
+  compatibility: DesktopWslSetupCompatibilitySchema,
+  probe: RemoteHostProbeSchema,
+  installedBinaryPath: Schema.NullOr(Schema.String),
+  consent: Schema.NullOr(RemoteSetupConsentSchema),
+  detail: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(({ compatibility, consent }) => {
+    if (compatibility === "compatible") {
+      return consent === null || "A compatible SSH server must not fabricate install consent.";
+    }
+    return (
+      (consent !== null && consent.transport === "ssh") ||
+      "A setup-required SSH server must include SSH install consent."
+    );
+  }),
+);
+export type DesktopSshServerProbe = typeof DesktopSshServerProbeSchema.Type;
+
+export const DesktopSshSetupResultSchema = Schema.Struct({
+  requestId: Schema.String,
+  generation: NonNegativeInt,
+  target: DesktopSshEnvironmentTargetSchema,
+  status: Schema.Literals(["completed", "failed", "cancelled"]),
+  stage: RemoteSetupStageSchema,
+  mutationStatus: Schema.Literals(["none", "partial", "completed"]),
+  cleanupStatus: Schema.Literals(["notRequired", "completed", "failed"]),
+  installedVersion: Schema.NullOr(Schema.String),
+  previousVersion: Schema.NullOr(Schema.String),
+  managedBinaryPath: Schema.NullOr(Schema.String),
+  dataRoot: Schema.String,
+  hostKeyFingerprint: Schema.String,
+  descriptor: Schema.NullOr(ExecutionEnvironmentDescriptor),
+  bootstrap: Schema.NullOr(DesktopSshEnvironmentBootstrapSchema),
+  recoveryCommand: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+  message: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(
+    ({ status, descriptor, bootstrap }) =>
+      status !== "completed" ||
+      (descriptor !== null && bootstrap !== null) ||
+      "Completed SSH setup requires a verified descriptor and retained tunnel.",
+  ),
+);
+export type DesktopSshSetupResult = typeof DesktopSshSetupResultSchema.Type;
 
 export interface DesktopWslState {
   // True when authoritative discovery contains at least one Running distro.
@@ -1414,6 +1491,8 @@ export interface DesktopBridge {
   openProjectDataPath?: (environmentId: string) => Promise<void>;
   exportProjectDataDiagnostics?: (environmentId: string) => Promise<string | null>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
+  prepareSshServer: (input: DesktopSshSetupProbeInput) => Promise<DesktopSshServerProbe>;
+  installSshServer: (decision: RemoteSetupConsentDecision) => Promise<DesktopSshSetupResult>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
     options?: { expectedHostKeyFingerprint?: string | null },
