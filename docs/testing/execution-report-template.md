@@ -55,6 +55,26 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Ambiguous legacy migration diagnostic IDs:
 - Existing worktree suite result and unchanged-behavior evidence:
 
+## Environment catalog, routes, secrets, cache, and cleanup
+
+- v1 direct migration route/result and receipt count:
+- v1 Relay-only discarded counts and negative secret/metadata evidence:
+- Corrupt input quarantine/recovery result:
+- Secret provider used and unavailable/locked fail-closed result:
+- Renderer/IndexedDB credential negative evidence:
+- Cache persistence mode: Durable | Session-only | Unavailable
+- Cache ciphertext/AAD scope, tamper, stale-revision, and eviction result:
+- Cross-environment duplicate route/binding rejection:
+- Route order, first-route outcome, active route, and active session count:
+- Offline cancellation/cache presentation result:
+- Stale environment/route/admission generation result:
+- Hide/restore runtime-retention result:
+- Single-route removal and retained-environment result:
+- Forget ordered lifecycle result:
+- Injected secret/transaction failure and redacted repair receipt result:
+- Restart with pending repair and successful retry result:
+- Remote server/projects/worktrees/data retained after local Forget:
+
 ## VCS observation evidence
 
 - Execution host and route: Native | WSL direct | SSH/server | Unavailable

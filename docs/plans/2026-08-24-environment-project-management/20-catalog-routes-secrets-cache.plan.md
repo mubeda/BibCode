@@ -657,15 +657,15 @@ git commit -m "feat(environments): add safe hide and forget lifecycle"
 - Modify: `docs/testing/cross-platform-validation.md`
 - Modify: `docs/testing/execution-report-template.md`
 
-- [ ] **Step 1: Document state ownership and the route state machine**
+- [x] **Step 1: Document state ownership and the route state machine**
 
 Include `KnownEnvironment -> routes -> one active session`, exact status vocabulary, identity verification order, secret-reference rule, cache envelope, and Forget ordering.
 
-- [ ] **Step 2: Add repeatable migration/offline evidence**
+- [x] **Step 2: Add repeatable migration/offline evidence**
 
 The runbook must exercise v1 direct, v1 Relay-only, corrupt, secret-provider unavailable, tampered cache, duplicate IDs across environments, failover, stale generation, and Forget cleanup.
 
-- [ ] **Step 3: Verify docs and commit**
+- [x] **Step 3: Verify docs and commit**
 
 ```sh
 git diff --check

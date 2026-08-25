@@ -123,6 +123,66 @@ Project/thread/cache/navigation assertions must always include the accepted
 environment identity. Do not use host label, distro, SSH target, path, remote
 URL, or project count as identity or availability evidence.
 
+### Environment catalog, route, secret, cache, and cleanup evidence
+
+When normalized connection persistence, route selection, protected secrets,
+offline cache, or environment removal changes, run the current owners together:
+
+```sh
+vp test run apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/storage.test.ts packages/client-runtime/src/connection/catalog.test.ts packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop secret_store -- --nocapture
+```
+
+On a non-Windows native host, use direct Cargo for the Rust filter. Record the
+test names and totals, not only the file result. The fixtures and native scenario
+must prove each of these cases:
+
+1. **v1 direct:** a legacy HTTPS entry with an accepted storage UUID becomes one
+   normalized environment and route. Its bearer value stays outside metadata,
+   an OS-secret reference is created before publication, and exactly one
+   migration receipt survives retry after an injected abort. A loopback HTTP
+   entry may become a loopback route; non-loopback HTTP is quarantined.
+2. **v1 Relay-only:** the migration produces no environment, route, credential,
+   or DPoP row; it records only discarded counts and a receipt. Assert that no
+   token or endpoint secret appears in metadata or diagnostics.
+3. **Corrupt input:** invalid catalog or row data remains isolated, cannot become
+   an empty authoritative project catalog, and yields only a bounded fingerprint
+   and stable code. Recovery requires an explicit reset or valid retry.
+4. **Secret provider unavailable or locked:** enrollment/migration fails closed
+   before normalized publication. No credential falls back to IndexedDB, no
+   receipt claims success, and error output contains no value or native path.
+5. **Private cache:** a durable snapshot is ciphertext; a valid envelope cannot
+   be read under another environment, storage UUID, entity kind, or entity ID.
+   Tampered ciphertext is quarantined, stale revisions are rejected, and an
+   unavailable durable key selects documented `session-only` behavior or purges
+   now-unreadable rows.
+6. **Duplicate IDs across environments:** an existing globally keyed route ID
+   or proved binding cannot be published for a second environment. The first
+   aggregate remains byte-for-byte authoritative and no partial second row is
+   visible.
+7. **Failover:** with two eligible routes, a transient first-route failure tries
+   the second route in the same cycle and publishes exactly one active session.
+   A blocked route is skipped until explicit retry or credentials change.
+8. **Offline and stale generations:** going offline cancels in-flight work,
+   retains encrypted cache as non-authoritative presentation data, and starts no
+   new transport. Success, failure, progress, or reconciliation from an older
+   environment/route/admission generation cannot replace current state or
+   resurrect forgotten metadata.
+9. **Forget:** verify the visible order `close admission -> cancel supervisor ->
+await scope -> delete secrets -> clear cache/UI -> delete routes/bindings ->
+delete environment`. Inject a secret failure and a transaction abort; the
+   redacted repair receipt must keep restart admission closed, all rows must
+   survive an abort, and one retry must remove every environment-owned row and
+   the receipt.
+
+For a packaged native run, exercise Hide/restore without a reconnect, remove one
+route while retaining the other route and projects, then Forget using only a
+disposable remote. Inspect the OS credential provider through platform-approved
+metadata or test APIs only; never reveal or copy secret values into evidence.
+After restart, confirm a pending cleanup receipt prevents connection attempts
+until retry. After successful Forget, confirm that the remote server and its
+projects/worktrees/data still exist because local Forget is not host purge.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

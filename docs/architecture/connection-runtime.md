@@ -1,18 +1,21 @@
 # Connection runtime
 
-`@bibcode/client-runtime` gives browser and desktop clients one supervised
-connection model for local, manually paired, relay, and SSH environments. The
-public package has no root export; callers use focused subpaths such as
-`connection`, `authorization`, `rpc`, `relay`, and `state/<domain>`.
+`@bibcode/client-runtime` gives browser and desktop clients one normalized,
+supervised connection model for local, WSL, manually paired HTTPS, and
+desktop-managed SSH environments. The public package has no root export;
+callers use focused subpaths such as `connection`, `cache`, `authorization`,
+`rpc`, and `state/<domain>`. Pre-v3 connection targets and BiBCode Connect
+remain bounded migration/compatibility inputs until their dedicated removal;
+they are not a second environment model.
 
 ## Ownership
 
-- `ConnectionResolver` converts a catalog entry into a `PreparedConnection`.
-  It recovers profiles and credentials and performs bearer, DPoP, relay, or SSH
-  preparation as required by the target. Every prepared connection retains the
+- `ConnectionResolver` converts one selected environment route into a
+  `PreparedConnection`. It resolves only the opaque secret reference and host
+  capability required by that route. Every prepared connection retains the
   complete current `ExecutionEnvironmentDescriptor`; an unauthenticated primary
-  fetches the public descriptor, and bearer plus fresh or cached DPoP attempts
-  fetch it during every preparation rather than inferring it from a saved token.
+  fetches the public descriptor, and authenticated attempts fetch it during
+  every preparation rather than inferring it from saved metadata or a token.
 - Environment bootstrap decodes and retains the complete environment
   descriptor on `KnownEnvironment`, including its nullable
   `storageInstanceId`, rather than reducing it to a label and logical ID.
@@ -23,21 +26,81 @@ public package has no root export; callers use focused subpaths such as
   then does it report `synchronizing` and return a live lease. A prepared
   mismatch cannot open a socket, and a backend restart between HTTP preparation
   and WebSocket configuration cannot publish synchronization or a live lease.
-- `EnvironmentSupervisor` owns desired state, connectivity, retries, the
-  prepared connection, and the live RPC session for one environment.
-- `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
-  reconciles platform-provided registrations and exposes environment-scoped
-  execution to domain state.
+- `EnvironmentSupervisor` owns desired state, connectivity, deterministic
+  sequential route selection, retries, the prepared connection, and at most one
+  live RPC session for one environment.
+- `EnvironmentRegistry` owns normalized environment aggregates and their scoped
+  supervisors. It reconciles platform-provided registrations, fences stale
+  generations, and exposes environment-scoped execution to domain state.
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
 The composition root is
 [`connection/layer.ts`](../../packages/client-runtime/src/connection/layer.ts).
 
-## Targets
+## Normalized environment aggregate
 
-Canonical targets are defined in
+`KnownEnvironment` is the client source of truth for one accepted server
+identity. Its shape is deliberately aggregate-first:
+
+```text
+KnownEnvironment
+├── environmentId + acceptedStorageInstanceId
+├── last verified descriptor
+├── client-local alias + hidden flag
+├── discovery bindings[]
+└── connection routes[]
+    └── activeRouteId -> one supervised RpcSession
+```
+
+The following invariants are decoded before publication:
+
+- route IDs and binding IDs are unique within the environment;
+- persisted route IDs are collision-free across environments; a cross-
+  environment collision aborts publication of the second aggregate;
+- every route carries the containing `environmentId`;
+- every proved binding points to that same accepted identity;
+- at most one route is pinned; and
+- a retained descriptor must match both the accepted environment and storage
+  UUIDs.
+
+Bindings are mutable locators such as the desktop primary slot or a WSL distro
+name. Routes are access methods. Neither is durable identity, and neither owns
+projects, threads, provider processes, or cached state. Those remain scoped by
+the accepted environment.
+
+## Routes and failover
+
+Normalized route schemas are defined in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
+
+| Route                  | Trust and preparation                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| `DesktopLoopbackRoute` | Loopback HTTP/WebSocket supplied by the desktop host.                               |
+| `DesktopWslRoute`      | WSL binding reached through a desktop-owned loopback forwarder.                     |
+| `SshTunnelRoute`       | SSH locator prepared by the desktop host; the resulting transport is loopback-only. |
+| `DirectHttpsRoute`     | Direct `https://` endpoint using system trust or an explicit pinned SPKI hash.      |
+
+Plain non-loopback HTTP is not representable. Route URLs cannot contain
+credentials, query parameters, or fragments. Authentication material is held
+outside route rows and addressed only by opaque `secretRef` values.
+
+Eligible routes are attempted sequentially: the pinned route first, then the
+last active route, then ascending numeric priority, with route ID as a stable
+tie-breaker. A route must be autoconnect-enabled unless it is pinned. A blocked
+route is skipped until an explicit retry or credential-change wakeup; a
+transient failure falls through to the next eligible route in the same cycle.
+Only one route may publish the live lease. Route results retain environment and
+route generations so late success, failure, or progress from an older attempt
+cannot replace current state.
+
+## Pre-v3 target compatibility
+
+Legacy target adapters are defined in
+[`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
+They remain current executable evidence while v1 catalogs and BiBCode Connect
+still exist, but normalized persistence and supervision use `KnownEnvironment`
+routes rather than one target per environment.
 
 | Target                        | Preparation                                                                                                                                                     |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -47,11 +110,40 @@ Canonical targets are defined in
 | `SshConnectionTarget`         | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.                     |
 | `UnavailableConnectionTarget` | Retains a platform-owned desired environment and its cached projections without an endpoint or credential; preparation fails transiently before transport work. |
 
-Bearer, relay, and SSH targets may be persisted in the connection catalog.
+Bearer, relay, and SSH targets may still appear in the v1 connection catalog.
 Unavailable targets are reconciled only from host topology and are never
-persisted as saved connections.
-Profiles and credentials remain separate so catalog metadata can be listed
-without exposing secrets.
+persisted as saved connections. Profiles and credentials remain separate so
+legacy metadata can be listed without exposing secrets. After the v1-to-v3
+migration receipt exists, registry startup reads normalized environment rows
+exclusively.
+
+## Normalized persistence and migration
+
+The web persistence owner stores environment records, routes, bindings, UI
+state, cache manifests, encrypted shell snapshots, encrypted thread snapshots,
+and migration receipts separately. Dependent route, binding, and thread-cache
+stores have an `environmentId` index. Publication occurs only after an
+environment aggregate has been decoded from committed rows; no store is a
+second in-memory source of truth.
+
+The one-time `catalog-v1-to-v3` migration is deterministic and bounded:
+
+- a legacy direct bearer or SSH target is accepted only with its matching
+  profile and an accepted storage UUID;
+- non-loopback direct routes must decode as HTTPS, while safe loopback URLs may
+  become a desktop loopback route;
+- bearer values stay in a memory-only staging list until the desktop OS secret
+  provider returns opaque references;
+- Relay-only targets and legacy remote DPoP tokens are counted and discarded,
+  not copied into normalized rows;
+- corrupt, incomplete, conflicting, or unsafe entries produce only a bounded
+  SHA-256 fingerprint and stable reason code; and
+- normalized rows and the receipt commit together. An aborted commit deletes
+  newly staged secret references and is safe to retry.
+
+Startup never mixes the two models. Without a receipt the migration owner runs;
+with a receipt the registry ignores v1 targets. A secret-provider failure
+publishes neither normalized rows nor a receipt.
 
 ## Accepted storage identity
 
@@ -213,6 +305,69 @@ supervisor. Disconnect and scope closure interrupt in-flight work.
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
 
+The supervisor vocabulary is exactly `available`, `offline`, `connecting`,
+`backoff`, `connected`, and `blocked`; the optional connection stage is
+`preparing`, `opening`, or `synchronizing`. UI presentation maps those internal
+states to `online`, `connecting`, `reconnecting`, `offline`,
+`authentication-required`, `version-incompatible`, `updating`, or `stopped` as
+appropriate. Binding discovery uses `available`, `unavailable`, `stopped`,
+`setup-required`, or `identity-conflict`. New status strings require a contract
+and presentation change together; callers must not infer a new state from a
+free-form detail message.
+
+## Secret and offline-cache boundary
+
+Normalized environment rows never contain a credential, DPoP private key, or
+cache key. They contain an opaque secret reference whose value can be resolved
+only through `EnvironmentSecretStore`. Desktop implementations route that
+capability across the typed `DesktopBridge` to the OS credential store. A
+missing or locked provider is a typed, redacted failure; renderer storage is
+not a credential fallback.
+
+Shell and thread snapshots use AES-256-GCM envelopes. The authenticated
+additional data is the exact tuple
+`{schemaVersion, environmentId, storageInstanceId, entityKind, entityId}`.
+This prevents a valid ciphertext from being replayed under another environment,
+server store, entity kind, or entity ID. Desktop durable cache keys are random
+material held behind an opaque OS secret reference. A secure browser may keep a
+non-exportable Web Crypto key through structured-clone persistence; if durable
+key persistence is unavailable, both key and cache remain session-only.
+
+The cache manifest and encrypted write commit in one transaction. Stale server
+revisions cannot overwrite a newer entry. Age and total-byte limits evict the
+least recently accessed unselected entries, while the current selection is
+protected. Authentication failure, payload mismatch, or storage/scope mismatch
+quarantines and removes the affected envelope instead of rendering it.
+Legacy plaintext cache is migrated once only when a secure durable key is
+available; otherwise it is deleted and the server must resynchronize it.
+
+## Hide, route removal, and Forget
+
+Hide and restore update only the client-local `hidden` field. They retain
+routes, bindings, secrets, cache, settings, and the current supervisor.
+Removing one route deletes that route's secret and reconstructs the supervised
+aggregate while retaining the environment, including when no usable route
+remains.
+
+Forget is a cancellation boundary, not a display mutation:
+
+1. increment the environment admission generation and persist a redacted
+   `pending` cleanup receipt;
+2. cancel and await the supervisor scope so no route attempt owns work;
+3. resolve the cache manifest and idempotently delete every route and cache-key
+   secret reference;
+4. clear client-only ephemeral state; and
+5. in one IndexedDB transaction remove route rows, binding rows, UI selection
+   and ordering, cache manifest and encrypted/plaintext snapshots, the
+   environment row, and the cleanup receipt.
+
+Registrations and platform reconciliations capture admission tickets before
+their work and must still match both phase and generation at publication. A
+late completion after Forget is ignored. A secret or metadata failure leaves a
+redacted `secret-deletion-failed` or `metadata-deletion-failed` repair state;
+restart remains closed until Forget is retried. After a successful commit, a
+new explicit authoritative registration may recreate the environment.
+
 ## Worktree catalog subscriptions
 
 The worktree catalog is capability gated through one exported policy selector.
@@ -296,15 +451,16 @@ nothing.
 
 ## Data boundary
 
-A session becomes ready only after the socket connects and the initial
+A session becomes ready only after the selected route connects and the initial
 `server.getConfig` call succeeds. Current servers publish the same prepared
 `storageInstanceId` through that configuration, the initial configuration
 subscription snapshot, and lifecycle welcome and ready events as through the
 well-known descriptor. Domain requests resolve the current scoped session
 through the registry; they fail or wait according to the domain API instead of
-retaining a global client. Removing a saved environment also removes its
-registration, profile, credential, supervisor scope, and environment-keyed
-client state.
+retaining a global client. Forget removes this client's supervisor, protected
+secret references, routes, bindings, UI state, and environment-keyed cache. It
+does not claim to stop a remote server or remove remote projects, worktrees, or
+data.
 
 `environmentId` remains the logical routing identity. `storageInstanceId` is
 the persistent-store UUID supplied by a current server on its initial

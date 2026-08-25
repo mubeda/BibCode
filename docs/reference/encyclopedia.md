@@ -3,6 +3,69 @@
 This is a living glossary for BiBCode. It explains common terms used in the
 codebase and UI.
 
+## Environments And Connections
+
+### Environment
+
+One accepted BiBCode server identity and its host-scoped projects, threads,
+terminals, provider runtimes, and diagnostics. Selecting another environment
+changes the machine on which those operations run; it never merges local and
+remote process, filesystem, or project state.
+
+### Known Environment
+
+The client aggregate for an accepted environment. It contains the durable
+environment ID, accepted storage-instance ID, last verified descriptor,
+client-local alias/hidden fields, discovery bindings, and connection routes.
+The runtime creates one scoped supervisor and at most one active RPC session for
+the aggregate.
+
+### Storage Instance
+
+The UUID of the server's persistent database/store. `environmentId` answers
+which logical server this is; `storageInstanceId` proves which durable project
+store that server currently exposes. A changed non-null storage identity blocks
+synchronization until the user explicitly adopts it.
+
+### Binding
+
+A mutable platform locator, such as the desktop primary slot or a WSL distro
+name. A binding may remain visible while unavailable, stopped, or awaiting
+setup. It is not identity, a route, or authorization.
+
+### Route
+
+One way to reach an environment: desktop loopback, desktop-managed WSL,
+desktop-managed SSH tunnel, or direct HTTPS. Routes have stable IDs, priority,
+autoconnect/pin metadata, and an optional opaque secret reference. The
+supervisor attempts eligible routes sequentially and permits only one to own the
+active session.
+
+### Secret Reference
+
+An opaque identifier for a credential or key held by the operating-system
+secret provider. Catalog and route rows store the reference, never the secret
+value. Renderer storage is not a credential fallback.
+
+### Cache Envelope
+
+An AES-GCM encrypted shell or thread snapshot authenticated to its environment,
+storage instance, entity kind, and entity ID. A cache envelope is an offline
+rendering aid, never authoritative server state.
+
+### Hide
+
+A reversible client presentation change. It retains the environment's routes,
+bindings, credentials, cache, settings, and server-side data.
+
+### Forget
+
+Cancellation-safe removal of one client's environment data. It closes route
+admission, cancels and awaits the scoped runtime, deletes protected secret
+references, and atomically removes local routes, bindings, UI state, cache, and
+environment metadata. It does not imply that a remote server was stopped or
+that remote projects/worktrees/data were deleted.
+
 ## Project And Workspace
 
 ### Project
@@ -158,13 +221,6 @@ and `full-access` (Full access).
 ### Interaction Mode
 
 The agent interaction style for a session, such as default or plan mode.
-
-### Environment
-
-A local or remote server connection and its host-scoped projects, threads,
-terminals, provider runtimes, and diagnostics. Selecting a remote environment
-changes the host on which those operations run; it does not merge remote and
-local process or resource state.
 
 ### Activity Actor
 
