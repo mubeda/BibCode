@@ -1,11 +1,9 @@
-use bibcode_server::process::configure_background_std_command;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::Duration,
 };
@@ -39,6 +37,7 @@ use crate::tailscale::{
     read_tailscale_status,
 };
 use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
+use crate::wsl::{WslDiscoveryHealth, WslDiscoveryService, WslDiscoverySnapshot, WslDistro};
 
 #[cfg(test)]
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
@@ -143,14 +142,6 @@ impl ConnectionCatalogCoordinator {
 
 fn connection_catalog_command_error(operation: &str) -> String {
     format!("Could not {operation} the protected connection catalog.")
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WslDistro {
-    name: String,
-    is_default: bool,
-    version: u8,
 }
 
 fn bridge_error(context: &str, error: impl std::fmt::Display) -> String {
@@ -649,77 +640,6 @@ async fn tailscale_advertised_endpoints_for_config(
     tailscale_endpoints_for_status(config, &status, magic_dns_reachable)
 }
 
-fn decode_command_output(bytes: &[u8]) -> String {
-    let has_utf16_bom = bytes.starts_with(&[0xff, 0xfe]);
-    let likely_utf16_le = has_utf16_bom
-        || bytes
-            .iter()
-            .take(80)
-            .enumerate()
-            .filter(|(index, byte)| index % 2 == 1 && **byte == 0)
-            .count()
-            > 10;
-
-    if likely_utf16_le {
-        let (chunks, _) = bytes.as_chunks::<2>();
-        let code_units = chunks
-            .iter()
-            .map(|chunk| u16::from_le_bytes(*chunk))
-            .collect::<Vec<_>>();
-        String::from_utf16_lossy(&code_units)
-            .trim_start_matches('\u{feff}')
-            .to_string()
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
-    }
-}
-
-fn parse_wsl_distro_list(stdout: &[u8]) -> Vec<WslDistro> {
-    decode_command_output(stdout)
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let raw = line.trim_end();
-            if raw.trim().is_empty() {
-                return None;
-            }
-            let is_default = raw.trim_start().starts_with('*');
-            let cleaned = raw.trim_start().trim_start_matches('*').trim();
-            let fields = cleaned.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 3 {
-                return None;
-            }
-            let version = match fields.last().copied() {
-                Some("1") => 1,
-                Some("2") => 2,
-                _ => return None,
-            };
-            let name = fields[..fields.len() - 2].join(" ");
-            if name.is_empty() {
-                return None;
-            }
-            Some(WslDistro {
-                name,
-                is_default,
-                version,
-            })
-        })
-        .collect()
-}
-
-fn read_wsl_environment() -> (bool, Vec<WslDistro>) {
-    if !cfg!(target_os = "windows") {
-        return (false, Vec::new());
-    }
-
-    let mut command = Command::new("wsl.exe");
-    configure_background_std_command(&mut command);
-    match command.args(["-l", "-v"]).output() {
-        Ok(output) if output.status.success() => (true, parse_wsl_distro_list(&output.stdout)),
-        _ => (false, Vec::new()),
-    }
-}
-
 fn extract_wsl_distro_from_environment_id(environment_id: &str) -> Option<String> {
     let suffix = environment_id.strip_prefix(WSL_INSTANCE_ID_PREFIX)?;
     if suffix.is_empty() || suffix == "default" {
@@ -839,12 +759,15 @@ fn resolve_pick_folder_dialog_default_path<R: Runtime>(
         .and_then(Value::as_str)
         .and_then(extract_wsl_distro_from_environment_id)
         .or_else(|| settings.wsl_distro.clone());
-    let (_, distros) = read_wsl_environment();
+    let distros = app.state::<WslDiscoveryService>().last_good_distros();
     resolve_wsl_pick_folder_default_path(raw_options, target_distro.as_deref(), &distros, None)
 }
 
-fn wsl_state(settings: &DesktopSettings, backend: &BackendSupervisor) -> Value {
-    let (available, distros) = read_wsl_environment();
+fn wsl_state(
+    settings: &DesktopSettings,
+    backend: &BackendSupervisor,
+    discovery: &WslDiscoverySnapshot,
+) -> Value {
     let preflight_error = match backend.primary_plan_error() {
         Some(BackendPlanError::WslPrimaryUnavailable { detail }) => Some(json!({
             "kind": "wsl-primary-unavailable",
@@ -863,9 +786,9 @@ fn wsl_state(settings: &DesktopSettings, backend: &BackendSupervisor) -> Value {
     json!({
         "enabled": settings.wsl_backend_enabled,
         "distro": &settings.wsl_distro,
-        "available": available,
+        "available": discovery.health == WslDiscoveryHealth::Available,
         "wslOnly": settings.wsl_only,
-        "distros": distros,
+        "distros": &discovery.distros,
         "preflightError": preflight_error,
     })
 }
@@ -1229,11 +1152,17 @@ pub async fn desktop_bridge_set_tailscale_serve_enabled(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_get_wsl_state(
+pub async fn desktop_bridge_get_wsl_state(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
 ) -> Result<Value, String> {
-    read_desktop_settings(&app).map(|settings| wsl_state(&settings, &backend))
+    let settings = read_desktop_settings(&app)?;
+    let discovery = app.state::<WslDiscoveryService>().inner().clone();
+    let snapshot = discovery
+        .refresh_and_emit(&app, "manual refresh")
+        .await
+        .unwrap_or_else(|| discovery.snapshot());
+    Ok(wsl_state(&settings, &backend, &snapshot))
 }
 
 #[tauri::command]
@@ -1249,7 +1178,12 @@ pub async fn desktop_bridge_set_wsl_backend_enabled(
         }
     })?;
     backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    let discovery = app.state::<WslDiscoveryService>().inner().clone();
+    let snapshot = discovery
+        .refresh_and_emit(&app, "backend lifecycle")
+        .await
+        .unwrap_or_else(|| discovery.snapshot());
+    Ok(wsl_state(&settings, &backend, &snapshot))
 }
 
 #[tauri::command]
@@ -1262,7 +1196,12 @@ pub async fn desktop_bridge_set_wsl_distro(
         settings.wsl_distro = normalize_wsl_distro(distro);
     })?;
     backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    let discovery = app.state::<WslDiscoveryService>().inner().clone();
+    let snapshot = discovery
+        .refresh_and_emit(&app, "accepted binding change")
+        .await
+        .unwrap_or_else(|| discovery.snapshot());
+    Ok(wsl_state(&settings, &backend, &snapshot))
 }
 
 #[tauri::command]
@@ -1275,7 +1214,12 @@ pub async fn desktop_bridge_set_wsl_only(
         settings.wsl_only = enabled;
     })?;
     backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    let discovery = app.state::<WslDiscoveryService>().inner().clone();
+    let snapshot = discovery
+        .refresh_and_emit(&app, "backend lifecycle")
+        .await
+        .unwrap_or_else(|| discovery.snapshot());
+    Ok(wsl_state(&settings, &backend, &snapshot))
 }
 
 #[tauri::command]
@@ -1552,6 +1496,7 @@ pub async fn desktop_bridge_install_update(
 mod tests {
     use super::*;
     use crate::backend::BackendUnavailableEnvironment;
+    use crate::wsl::WslDistroState;
     use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1681,6 +1626,16 @@ mod tests {
             advertised_host: None,
             tailscale_serve_enabled: false,
             tailscale_serve_port: 443,
+        }
+    }
+
+    fn unavailable_wsl_discovery() -> WslDiscoverySnapshot {
+        WslDiscoverySnapshot {
+            generation: 1,
+            observed_at: "2026-08-25T00:00:00Z".to_string(),
+            health: WslDiscoveryHealth::Missing,
+            detail: Some("wsl.exe was not found on this computer.".to_string()),
+            distros: Vec::new(),
         }
     }
 
@@ -2015,7 +1970,11 @@ mod tests {
     #[tokio::test]
     async fn platform_state_helpers_cover_non_wsl_and_disabled_tailscale_paths() {
         let settings = default_desktop_settings();
-        let state = wsl_state(&settings, &BackendSupervisor::new());
+        let state = wsl_state(
+            &settings,
+            &BackendSupervisor::new(),
+            &unavailable_wsl_discovery(),
+        );
         if !cfg!(target_os = "windows") {
             assert_eq!(state["available"], false);
             assert_eq!(state["distros"], json!([]));
@@ -2045,7 +2004,7 @@ mod tests {
             detail: "the selected distribution could not start".to_string(),
         });
 
-        let state = wsl_state(&settings, &backend);
+        let state = wsl_state(&settings, &backend, &unavailable_wsl_discovery());
 
         assert_eq!(
             state["preflightError"],
@@ -2073,7 +2032,7 @@ mod tests {
             detail: "the selected distribution could not start".to_string(),
         });
 
-        let state = wsl_state(&settings, &backend);
+        let state = wsl_state(&settings, &backend, &unavailable_wsl_discovery());
 
         assert_eq!(
             state["preflightError"],
@@ -2321,62 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_utf8_wsl_distro_list() {
-        let output = b"  NAME                   STATE           VERSION\r\n* Ubuntu-24.04           Running         2\r\n  Debian Test            Stopped         1\r\n";
-
-        assert_eq!(
-            parse_wsl_distro_list(output),
-            vec![
-                WslDistro {
-                    name: "Ubuntu-24.04".to_string(),
-                    is_default: true,
-                    version: 2,
-                },
-                WslDistro {
-                    name: "Debian Test".to_string(),
-                    is_default: false,
-                    version: 1,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_utf16_wsl_distro_list() {
-        let text =
-            "  NAME            STATE           VERSION\r\n* Ubuntu          Running         2\r\n";
-        let mut bytes = vec![0xff, 0xfe];
-        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-
-        assert_eq!(
-            parse_wsl_distro_list(&bytes),
-            vec![WslDistro {
-                name: "Ubuntu".to_string(),
-                is_default: true,
-                version: 2,
-            }]
-        );
-    }
-
-    #[test]
-    fn wsl_parsers_ignore_malformed_rows_and_validate_distro_names() {
-        let output =
-            b"NAME STATE VERSION\n\nUbuntu Running 3\nMissingFields 2\nValid_Name Stopped 1\n";
-        assert_eq!(
-            parse_wsl_distro_list(output),
-            vec![WslDistro {
-                name: "Valid_Name".to_string(),
-                is_default: false,
-                version: 1,
-            }]
-        );
-
-        let utf16_without_bom = "NAME STATE VERSION\nUbuntu Running 2\n"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        assert_eq!(parse_wsl_distro_list(&utf16_without_bom)[0].name, "Ubuntu");
-
+    fn validates_wsl_distro_names_and_environment_locators() {
         assert!(is_valid_distro_name("Ubuntu 24.04-LTS"));
         assert!(!is_valid_distro_name(""));
         assert!(!is_valid_distro_name("-Ubuntu"));
@@ -2390,6 +2294,7 @@ mod tests {
         let distros = vec![WslDistro {
             name: "Debian".to_string(),
             is_default: true,
+            state: WslDistroState::Running,
             version: 2,
         }];
 
@@ -2435,6 +2340,7 @@ mod tests {
         let distros = vec![WslDistro {
             name: "Debian".to_string(),
             is_default: true,
+            state: WslDistroState::Stopped,
             version: 2,
         }];
 
@@ -2791,6 +2697,7 @@ mod tests {
         let app = mock_builder()
             .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
+            .manage(WslDiscoveryService::new())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(DesktopSecretStore::new())
             .manage(NativeContextMenuManager::new())

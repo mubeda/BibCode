@@ -86,6 +86,7 @@ pub fn run() {
     let shell_path_hydration = shell_environment::hydrate_process_path();
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
         .manage(backend::BackendSupervisor::new())
+        .manage(wsl::WslDiscoveryService::new())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(secret_store::DesktopSecretStore::new())
         .manage(context_menu::NativeContextMenuManager::new())
@@ -109,11 +110,15 @@ pub fn run() {
         let update_app = app.handle().clone();
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
+        wsl::request_refresh(app.handle().clone(), "startup");
+        wsl::start_reconciliation(app.handle().clone());
+
         let app_handle = app.handle().clone();
         let backend = app.state::<backend::BackendSupervisor>().inner().clone();
         #[cfg(unix)]
         backend::install_termination_signal_handler(app_handle.clone(), backend.clone());
         tauri::async_runtime::spawn(async move {
+            let discovery_app = app_handle.clone();
             match backend.start_default(app_handle).await {
                 Ok(_config) => {}
                 Err(error) => {
@@ -121,6 +126,7 @@ pub fn run() {
                     backend.record_error(error);
                 }
             }
+            wsl::request_refresh(discovery_app, "backend lifecycle");
         });
         Ok(())
     });
@@ -190,19 +196,27 @@ pub fn run() {
     builder
         .build(desktop_context())
         .expect("error while building BiBCode Tauri application")
-        .run(|app_handle, event| {
-            if matches!(event, tauri::RunEvent::ExitRequested { .. })
-                && let Err(error) =
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Focused(true),
+                ..
+            } => wsl::request_refresh(app_handle.clone(), "application focus"),
+            tauri::RunEvent::ExitRequested { .. } => {
+                if let Err(error) =
                     tauri::async_runtime::block_on(prepare_desktop_runtime_for_exit(app_handle))
-            {
-                tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
+                {
+                    tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
+                }
             }
+            tauri::RunEvent::Exit => app_handle.state::<wsl::WslDiscoveryService>().shutdown(),
+            _ => {}
         });
 }
 
 async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
+    app_handle.state::<wsl::WslDiscoveryService>().shutdown();
     if let Err(error) = window::persist_main_window_state(app_handle) {
         tracing::warn!("failed to persist Tauri main window state during exit: {error}");
     }
@@ -259,11 +273,16 @@ mod tailscale;
 mod test_support;
 mod updates;
 mod window;
+mod wsl;
 
 pub use bridge::{
     desktop_bridge_bootstrap_ssh_bearer_session, desktop_bridge_fetch_environment_descriptor,
     desktop_bridge_fetch_ssh_session_state, desktop_bridge_get_bridge_metadata,
     desktop_bridge_issue_ssh_web_socket_ticket,
+};
+pub use wsl::{
+    WSL_DISCOVERY_CHANGED_EVENT, WslDiscoveryHealth, WslDiscoverySnapshot, WslDistro,
+    WslDistroState,
 };
 
 #[cfg(test)]

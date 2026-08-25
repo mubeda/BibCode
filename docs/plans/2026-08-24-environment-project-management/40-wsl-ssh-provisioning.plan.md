@@ -148,7 +148,7 @@ hides an incomplete native row.
 - Test: `apps/desktop/src-tauri/src/wsl.rs`
 - Test: `apps/desktop/src-tauri/tests/bridge_public_contract.rs`
 
-- [ ] **Step 1: Move current parser fixtures into failing state-aware tests**
+- [x] **Step 1: Move current parser fixtures into failing state-aware tests**
 
 ```rust
 assert_eq!(parse_wsl_verbose(utf16_fixture()).unwrap().distros, vec![
@@ -159,7 +159,7 @@ assert_eq!(parse_wsl_verbose(utf16_fixture()).unwrap().distros, vec![
 
 Add BOM/no-BOM UTF-16LE, UTF-8, localized whitespace, names with spaces, malformed row isolation, empty output, missing executable, disabled feature, nonzero exit, output cap, and timeout.
 
-- [ ] **Step 2: Implement an owned discovery service**
+- [x] **Step 2: Implement an owned discovery service**
 
 ```rust
 pub struct WslDiscoveryService {
@@ -172,15 +172,15 @@ pub struct WslDiscoveryService {
 
 Spawn `wsl.exe --list --verbose` with `CREATE_NO_WINDOW`, a 10-second deadline, a 1 MiB combined-output cap, and cancellation. A newer requested generation supersedes late output.
 
-- [ ] **Step 3: Emit one typed event**
+- [x] **Step 3: Emit one typed event**
 
 Add `desktop:wsl-discovery-changed`; emit after startup discovery, application focus, explicit refresh, accepted-binding changes, and backend lifecycle changes. Coalesce concurrent refreshes.
 
-- [ ] **Step 4: Add low-frequency reconciliation**
+- [x] **Step 4: Add low-frequency reconciliation**
 
 While the desktop is active, reconcile no more frequently than once per minute, relax to five minutes after stable snapshots, and back off to fifteen minutes after repeated failures. Stop the timer when the app exits; this is a missed-event safety net, not UI polling.
 
-- [ ] **Step 5: Run native/parser tests and commit**
+- [x] **Step 5: Run native/parser tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop wsl:: -- --nocapture
@@ -188,6 +188,32 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop --test bridge_public
 git add apps/desktop/src-tauri/src/wsl.rs apps/desktop/src-tauri/src/bridge.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/tests/bridge_public_contract.rs
 git commit -m "feat(desktop): discover all WSL distributions safely"
 ```
+
+Implementation note: `WslDiscoveryService` is the native owner of monotonic
+generations, coalesced refresh admission, current health, last-good rows, and
+shutdown cancellation. Its `wsl.exe --list --verbose` child uses the existing
+Windows `CREATE_NO_WINDOW` configuration, piped stdin/stdout/stderr, a
+10-second deadline, a 1 MiB combined-output ceiling, kill-on-drop, and explicit
+terminate/reap plus reader-task joins on timeout, cancellation, output overflow,
+or wait failure. The state-aware parser accepts UTF-8 and UTF-16LE with or
+without a BOM, Unicode whitespace and names containing spaces, while isolating
+malformed rows.
+
+The desktop emits only `desktop:wsl-discovery-changed`, with the schema-shaped
+generation/health/detail/distro payload, after startup, focus, manual refresh,
+accepted-distro changes, and backend lifecycle changes. Concurrent requests
+publish only the latest generation. A cancelled reconciliation owner stops on
+desktop exit; its missed-event schedule starts at one minute, relaxes to five
+minutes after a stable available snapshot, and backs off to fifteen minutes
+after repeated failures. A failed observation retains last-good distro rows
+instead of erasing them.
+
+The exact plan commands passed on macOS as parser/process compatibility tests:
+9 focused WSL tests and 3 bridge public-contract tests. The complete desktop
+suite passed 308 unit tests plus 7 public SSH/bridge integration tests, desktop
+Clippy passed for all targets with warnings denied, and Rust formatting and
+diff checks passed. Native Windows execution remains part of the Windows
+runbook/CI evidence rather than being claimed from the macOS host.
 
 ### Task 3: Reconcile WSL platform bindings without locator identity
 

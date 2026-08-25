@@ -6,10 +6,45 @@ use std::{
 };
 
 use bibcode_desktop_lib::{
-    desktop_bridge_bootstrap_ssh_bearer_session, desktop_bridge_fetch_environment_descriptor,
-    desktop_bridge_fetch_ssh_session_state, desktop_bridge_issue_ssh_web_socket_ticket,
+    WSL_DISCOVERY_CHANGED_EVENT, WslDiscoveryHealth, WslDiscoverySnapshot, WslDistro,
+    WslDistroState, desktop_bridge_bootstrap_ssh_bearer_session,
+    desktop_bridge_fetch_environment_descriptor, desktop_bridge_fetch_ssh_session_state,
+    desktop_bridge_issue_ssh_web_socket_ticket,
 };
 use serde_json::json;
+
+#[test]
+fn public_wsl_discovery_event_has_a_stable_typed_payload() {
+    assert_eq!(WSL_DISCOVERY_CHANGED_EVENT, "desktop:wsl-discovery-changed");
+    let snapshot = WslDiscoverySnapshot {
+        generation: 7,
+        observed_at: "2026-08-25T12:00:00Z".to_string(),
+        health: WslDiscoveryHealth::Available,
+        detail: None,
+        distros: vec![WslDistro {
+            name: "Ubuntu 24.04".to_string(),
+            is_default: true,
+            state: WslDistroState::Running,
+            version: 2,
+        }],
+    };
+
+    assert_eq!(
+        serde_json::to_value(snapshot).expect("WSL discovery event should serialize"),
+        json!({
+            "generation": 7,
+            "observedAt": "2026-08-25T12:00:00Z",
+            "health": "available",
+            "detail": null,
+            "distros": [{
+                "name": "Ubuntu 24.04",
+                "isDefault": true,
+                "state": "running",
+                "version": 2,
+            }],
+        })
+    );
+}
 
 #[test]
 fn public_secret_bridge_exposes_only_put_get_and_delete() {
