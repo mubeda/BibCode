@@ -9,11 +9,13 @@
  */
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { parseScopedThreadKey } from "@bibcode/client-runtime/environment";
+import type { EnvironmentId } from "@bibcode/contracts";
 
 import { resolveStorage } from "./lib/storage";
 
-const SIDEBAR_WORKSPACE_META_STORAGE_KEY = "bibcode:sidebar-workspace-meta:v1";
-const SIDEBAR_WORKSPACE_META_STORAGE_VERSION = 1;
+export const SIDEBAR_WORKSPACE_META_STORAGE_KEY = "bibcode:sidebar-workspace-meta:v1";
+const SIDEBAR_WORKSPACE_META_STORAGE_VERSION = 2;
 
 export interface SidebarWorkspaceMetaState {
   pinnedThreadKeys: string[];
@@ -21,6 +23,7 @@ export interface SidebarWorkspaceMetaState {
   togglePinned: (key: string) => void;
   markUnread: (key: string) => void;
   markRead: (key: string) => void;
+  clearEnvironment: (environmentId: EnvironmentId) => void;
 }
 
 function withToggled(keys: readonly string[], key: string): string[] {
@@ -46,13 +49,31 @@ export function migratePersistedSidebarWorkspaceMetaState(persistedState: unknow
     pinnedThreadKeys?: unknown;
     unreadThreadKeys?: unknown;
   };
-  const pinnedThreadKeys = Array.isArray(state.pinnedThreadKeys)
-    ? state.pinnedThreadKeys.filter((key): key is string => typeof key === "string")
-    : [];
-  const unreadThreadKeys = Array.isArray(state.unreadThreadKeys)
-    ? state.unreadThreadKeys.filter((key): key is string => typeof key === "string")
-    : [];
+  const sanitizeKeys = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? [
+          ...new Set(
+            value.filter(
+              (key): key is string => typeof key === "string" && parseScopedThreadKey(key) !== null,
+            ),
+          ),
+        ]
+      : [];
+  const pinnedThreadKeys = sanitizeKeys(state.pinnedThreadKeys);
+  const unreadThreadKeys = sanitizeKeys(state.unreadThreadKeys);
   return { pinnedThreadKeys, unreadThreadKeys };
+}
+
+export function clearEnvironmentWorkspaceMeta(
+  state: Pick<SidebarWorkspaceMetaState, "pinnedThreadKeys" | "unreadThreadKeys">,
+  environmentId: EnvironmentId | string,
+): Pick<SidebarWorkspaceMetaState, "pinnedThreadKeys" | "unreadThreadKeys"> {
+  const keepOtherEnvironment = (key: string): boolean =>
+    parseScopedThreadKey(key)?.environmentId !== environmentId;
+  return {
+    pinnedThreadKeys: state.pinnedThreadKeys.filter(keepOtherEnvironment),
+    unreadThreadKeys: state.unreadThreadKeys.filter(keepOtherEnvironment),
+  };
 }
 
 export const useSidebarWorkspaceMetaStore = create<SidebarWorkspaceMetaState>()(
@@ -66,6 +87,8 @@ export const useSidebarWorkspaceMetaStore = create<SidebarWorkspaceMetaState>()(
         set((state) => ({ unreadThreadKeys: withAdded(state.unreadThreadKeys, key) })),
       markRead: (key) =>
         set((state) => ({ unreadThreadKeys: withRemoved(state.unreadThreadKeys, key) })),
+      clearEnvironment: (environmentId) =>
+        set((state) => clearEnvironmentWorkspaceMeta(state, environmentId)),
     }),
     {
       name: SIDEBAR_WORKSPACE_META_STORAGE_KEY,

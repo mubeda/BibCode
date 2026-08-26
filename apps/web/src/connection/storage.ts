@@ -24,6 +24,7 @@ import {
   EnvironmentCatalogStore,
   EnvironmentCleanupRepairReceipt,
   EnvironmentCleanupStore,
+  EnvironmentClientCleanupRepairReceipt,
   EnvironmentMigrationReceipt,
   EnvironmentMigrationStore,
   EnvironmentSecretStore,
@@ -94,6 +95,7 @@ const ENCRYPTED_SHELL_CACHE_STORE_NAME = "shellCache";
 const ENCRYPTED_THREAD_CACHE_STORE_NAME = "threadCache";
 const MIGRATION_STATE_STORE_NAME = "migrationState";
 const CLEANUP_REPAIR_KEY_PREFIX = "cleanup-repair:";
+const CLIENT_CLEANUP_REPAIR_KEY_PREFIX = "client-cleanup-repair:";
 export const NORMALIZED_STORE_NAMES = [
   ENVIRONMENTS_STORE_NAME,
   ENVIRONMENT_ROUTES_STORE_NAME,
@@ -151,6 +153,12 @@ const decodeEnvironmentCleanupRepairReceipt = Schema.decodeUnknownEffect(
 );
 const decodeEnvironmentCleanupRepairReceipts = Schema.decodeUnknownEffect(
   Schema.Array(EnvironmentCleanupRepairReceipt),
+);
+const decodeEnvironmentClientCleanupRepairReceipt = Schema.decodeUnknownEffect(
+  EnvironmentClientCleanupRepairReceipt,
+);
+const decodeEnvironmentClientCleanupRepairReceipts = Schema.decodeUnknownEffect(
+  Schema.Array(EnvironmentClientCleanupRepairReceipt),
 );
 const decodeEnvironmentUiStateDocumentSync = Schema.decodeUnknownSync(EnvironmentUiStateDocument);
 
@@ -263,6 +271,9 @@ type NormalizedPersistenceOperation =
   | "forget-environment"
   | "list-environment-cleanup-repairs"
   | "save-environment-cleanup-repair"
+  | "list-environment-client-cleanup-repairs"
+  | "save-environment-client-cleanup-repair"
+  | "delete-environment-client-cleanup-repair"
   | "load-environment-ui-state"
   | "save-environment-ui-state"
   | "clear-environment-ui-state"
@@ -1071,6 +1082,10 @@ function cleanupRepairKey(environmentId: EnvironmentId): string {
   return `${CLEANUP_REPAIR_KEY_PREFIX}${environmentId}`;
 }
 
+function clientCleanupRepairKey(environmentId: EnvironmentId): string {
+  return `${CLIENT_CLEANUP_REPAIR_KEY_PREFIX}${environmentId}`;
+}
+
 function withoutEnvironmentUiState(
   state: EnvironmentUiStateDocument,
   environmentId: EnvironmentId,
@@ -1081,6 +1096,15 @@ function withoutEnvironmentUiState(
     expandedEnvironmentIds: state.expandedEnvironmentIds.filter(
       (candidate) => candidate !== environmentId,
     ),
+    expandedProjectKeys: state.expandedProjectKeys.filter(
+      (candidate) => !candidate.startsWith(`${environmentId}:`),
+    ),
+    manuallyToggledKeys: state.manuallyToggledKeys.filter(
+      (candidate) =>
+        candidate !== `environment:${environmentId}` &&
+        !candidate.startsWith(`project:${environmentId}:`) &&
+        !candidate.startsWith(`thread:${environmentId}:`),
+    ),
     environmentOrder: state.environmentOrder.filter((candidate) => candidate !== environmentId),
     pinnedEnvironmentIds: state.pinnedEnvironmentIds.filter(
       (candidate) => candidate !== environmentId,
@@ -1089,6 +1113,82 @@ function withoutEnvironmentUiState(
       Object.entries(state.projectOrderByEnvironment).filter(([key]) => key !== environmentId),
     ),
   };
+}
+
+export interface EnvironmentUiStateMigrationCommitOptions {
+  /** Test-only fault seam proving that state and receipt share one transaction. */
+  readonly injectAbortBeforeReceipt?: boolean;
+}
+
+export function commitEnvironmentUiStateMigration(
+  database: IDBDatabase,
+  state: EnvironmentUiStateDocument,
+  receipt: EnvironmentMigrationReceipt,
+  options: EnvironmentUiStateMigrationCommitOptions = {},
+) {
+  return Effect.callback<"applied" | "already-applied", ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(
+      [ENVIRONMENT_UI_STATE_STORE_NAME, MIGRATION_STATE_STORE_NAME],
+      "readwrite",
+    );
+    let settled = false;
+    let abortCause: unknown;
+    let outcome: "applied" | "already-applied" = "applied";
+    const settleFailure = (cause: unknown) => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.fail(catalogError("commit environment UI-state migration", cause)));
+    };
+    const failAndAbort = (cause: unknown) => {
+      abortCause ??= cause;
+      try {
+        transaction.abort();
+      } catch (abortError) {
+        settleFailure(abortError);
+      }
+    };
+    transaction.addEventListener("error", () => {
+      abortCause ??= transaction.error ?? "Unknown IndexedDB navigation migration error";
+    });
+    transaction.addEventListener("abort", () =>
+      settleFailure(
+        abortCause ?? transaction.error ?? "IndexedDB navigation migration transaction aborted",
+      ),
+    );
+    transaction.addEventListener("complete", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.succeed(outcome));
+    });
+
+    try {
+      const migrationStore = transaction.objectStore(MIGRATION_STATE_STORE_NAME);
+      const receiptRequest = migrationStore.get(receipt.id);
+      receiptRequest.addEventListener("error", () =>
+        failAndAbort(receiptRequest.error ?? "Unknown migration-receipt read error"),
+      );
+      receiptRequest.addEventListener("success", () => {
+        if (receiptRequest.result !== undefined) {
+          outcome = "already-applied";
+          return;
+        }
+        try {
+          transaction
+            .objectStore(ENVIRONMENT_UI_STATE_STORE_NAME)
+            .put(state, ENVIRONMENT_UI_STATE_KEY);
+          if (options.injectAbortBeforeReceipt === true) {
+            failAndAbort(new DOMException("Quota exceeded", "QuotaExceededError"));
+            return;
+          }
+          migrationStore.add(receipt);
+        } catch (cause) {
+          failAndAbort(cause);
+        }
+      });
+    } catch (cause) {
+      failAndAbort(cause);
+    }
+  }).pipe(Effect.withSpan("web.connectionStorage.commitEnvironmentUiStateMigration"));
 }
 
 function readEnvironmentCleanupRepairs(database: IDBDatabase) {
@@ -1111,6 +1211,33 @@ function readEnvironmentCleanupRepairs(database: IDBDatabase) {
       resume(Effect.succeed(request.result));
     });
   }).pipe(Effect.withSpan("web.connectionStorage.readEnvironmentCleanupRepairs"));
+}
+
+function readEnvironmentClientCleanupRepairs(database: IDBDatabase) {
+  return Effect.callback<ReadonlyArray<unknown>, ConnectionTransientError>((resume) => {
+    const request = database
+      .transaction(ENVIRONMENT_UI_STATE_STORE_NAME, "readonly")
+      .objectStore(ENVIRONMENT_UI_STATE_STORE_NAME)
+      .getAll(
+        IDBKeyRange.bound(
+          CLIENT_CLEANUP_REPAIR_KEY_PREFIX,
+          `${CLIENT_CLEANUP_REPAIR_KEY_PREFIX}\uffff`,
+        ),
+      );
+    request.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError(
+            "list environment client cleanup repairs",
+            request.error ?? "Unknown IndexedDB client repair read error",
+          ),
+        ),
+      );
+    });
+    request.addEventListener("success", () => {
+      resume(Effect.succeed(request.result));
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.readEnvironmentClientCleanupRepairs"));
 }
 
 /** Atomically removes every non-secret row owned by one environment. */
@@ -1990,6 +2117,18 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
           Effect.mapError((cause) =>
             normalizedPersistenceError("clear-environment-ui-state", cause),
+          ),
+        ),
+      migrateLegacy: (state, receipt) =>
+        Effect.all({
+          state: decodeEnvironmentUiStateDocument(state),
+          receipt: decodeEnvironmentMigrationReceipt(receipt),
+        }).pipe(
+          Effect.flatMap((decoded) =>
+            commitEnvironmentUiStateMigration(database, decoded.state, decoded.receipt),
+          ),
+          Effect.mapError((cause) =>
+            normalizedPersistenceError("save-environment-ui-state", cause),
           ),
         ),
     });
@@ -3008,6 +3147,36 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
           Effect.mapError((cause) =>
             normalizedPersistenceError("save-environment-cleanup-repair", cause),
+          ),
+        ),
+      clientRepairs: readEnvironmentClientCleanupRepairs(database).pipe(
+        Effect.flatMap(decodeEnvironmentClientCleanupRepairReceipts),
+        Effect.mapError((cause) =>
+          normalizedPersistenceError("list-environment-client-cleanup-repairs", cause),
+        ),
+      ),
+      saveClientRepair: (receipt) =>
+        decodeEnvironmentClientCleanupRepairReceipt(receipt).pipe(
+          Effect.flatMap((decoded) =>
+            writeDatabaseValue(
+              database,
+              ENVIRONMENT_UI_STATE_STORE_NAME,
+              clientCleanupRepairKey(decoded.environmentId),
+              decoded,
+            ),
+          ),
+          Effect.mapError((cause) =>
+            normalizedPersistenceError("save-environment-client-cleanup-repair", cause),
+          ),
+        ),
+      removeClientRepair: (environmentId) =>
+        removeDatabaseValue(
+          database,
+          ENVIRONMENT_UI_STATE_STORE_NAME,
+          clientCleanupRepairKey(environmentId),
+        ).pipe(
+          Effect.mapError((cause) =>
+            normalizedPersistenceError("delete-environment-client-cleanup-repair", cause),
           ),
         ),
       commitForget: (environmentId) =>

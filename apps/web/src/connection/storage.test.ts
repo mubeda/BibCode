@@ -54,6 +54,7 @@ import {
   type CatalogBackend,
   activateCatalogV1ToV3Migration,
   commitCatalogMigrationMetadata,
+  commitEnvironmentUiStateMigration,
   connectionStorageLayer,
   makeCatalogBackend,
   makeCatalogStore,
@@ -373,7 +374,7 @@ function writeIndexedDbRecord(
 // ── Domain fixtures ──────────────────────────────────────────────────
 
 const environmentId = EnvironmentId.make("environment-1");
-const otherEnvironmentId = EnvironmentId.make("environment-2");
+const otherEnvironmentId = EnvironmentId.make("018f1f52-0d78-7d73-8dc8-7bd50db6f002");
 const threadId = ThreadId.make("thread-1");
 const projectId = ProjectId.make("project-1");
 const connectionId = "connection-1";
@@ -1674,6 +1675,49 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  it.effect("keeps per-environment client cleanup repairs across authoritative Forget", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    const firstEnvironmentId = EnvironmentId.make(durableEnvironmentId);
+
+    return Effect.gen(function* () {
+      const cleanup = yield* EnvironmentCleanupStore;
+      yield* Effect.all(
+        [
+          cleanup.saveClientRepair({
+            schemaVersion: 1,
+            environmentId: firstEnvironmentId,
+            phase: "prepared",
+          }),
+          cleanup.saveClientRepair({
+            schemaVersion: 1,
+            environmentId: otherEnvironmentId,
+            phase: "confirmed",
+          }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      );
+
+      expect((yield* cleanup.clientRepairs).map((receipt) => receipt.environmentId).sort()).toEqual(
+        [firstEnvironmentId, otherEnvironmentId].sort(),
+      );
+      yield* cleanup.commitForget(firstEnvironmentId);
+      expect((yield* cleanup.clientRepairs).map((receipt) => receipt.environmentId).sort()).toEqual(
+        [firstEnvironmentId, otherEnvironmentId].sort(),
+      );
+      yield* cleanup.removeClientRepair(firstEnvironmentId);
+      expect(yield* cleanup.clientRepairs).toEqual([
+        {
+          schemaVersion: 1,
+          environmentId: otherEnvironmentId,
+          phase: "confirmed",
+        },
+      ]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("rolls back an interrupted migration and commits one receipt on retry", () => {
     const factory = new IDBFactory();
     vi.stubGlobal("indexedDB", factory);
@@ -1976,11 +2020,22 @@ describe("connectionStorageLayer", () => {
         schemaVersion: 2,
         selected: { environmentId: environment.environmentId, projectId: null, threadId: null },
         expandedEnvironmentIds: [environment.environmentId],
-        expandedProjectKeys: [],
-        manuallyToggledKeys: [],
-        environmentOrder: [environment.environmentId],
-        pinnedEnvironmentIds: [],
-        projectOrderByEnvironment: {},
+        expandedProjectKeys: [
+          `${environment.environmentId}:${projectId}`,
+          `${otherEnvironmentId}:${projectId}`,
+        ],
+        manuallyToggledKeys: [
+          `environment:${environment.environmentId}`,
+          `project:${environment.environmentId}:${projectId}`,
+          `thread:${environment.environmentId}:${threadId}`,
+          `project:${otherEnvironmentId}:${projectId}`,
+        ],
+        environmentOrder: [environment.environmentId, otherEnvironmentId],
+        pinnedEnvironmentIds: [environment.environmentId, otherEnvironmentId],
+        projectOrderByEnvironment: {
+          [environment.environmentId]: [projectId],
+          [otherEnvironmentId]: [projectId],
+        },
       } as const;
       const manifest = {
         schemaVersion: 1,
@@ -2006,9 +2061,71 @@ describe("connectionStorageLayer", () => {
 
       yield* ui.clearEnvironment(manifest.environmentId);
       yield* manifests.remove(manifest.environmentId);
-      expect((yield* ui.load).pipe(Option.getOrThrow).selected).toBeNull();
+      expect((yield* ui.load).pipe(Option.getOrThrow)).toMatchObject({
+        selected: null,
+        expandedEnvironmentIds: [],
+        expandedProjectKeys: [`${otherEnvironmentId}:${projectId}`],
+        manuallyToggledKeys: [`project:${otherEnvironmentId}:${projectId}`],
+        environmentOrder: [otherEnvironmentId],
+        pinnedEnvironmentIds: [otherEnvironmentId],
+        projectOrderByEnvironment: { [otherEnvironmentId]: [projectId] },
+      });
       expect(yield* manifests.load(manifest.environmentId)).toEqual(Option.none());
     }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("atomically commits environment UI state and its one-time migration receipt", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    const state = {
+      schemaVersion: 2,
+      selected: { environmentId, projectId, threadId },
+      expandedEnvironmentIds: [environmentId],
+      expandedProjectKeys: [`${environmentId}:${projectId}`],
+      manuallyToggledKeys: [],
+      environmentOrder: [environmentId],
+      pinnedEnvironmentIds: [],
+      projectOrderByEnvironment: { [environmentId]: [projectId] },
+    } as const;
+    const receipt = {
+      id: "environment-navigation-v1-to-v2",
+      completedAt: now,
+    } as const;
+
+    return Effect.gen(function* () {
+      const database = yield* openConnectionDatabase();
+      yield* commitEnvironmentUiStateMigration(database, state, receipt, {
+        injectAbortBeforeReceipt: true,
+      }).pipe(Effect.flip);
+      database.close();
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "environmentUiState", "client")),
+      ).toBeUndefined();
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "migrationState", receipt.id)),
+      ).toBeUndefined();
+
+      const retryDatabase = yield* openConnectionDatabase();
+      expect(yield* commitEnvironmentUiStateMigration(retryDatabase, state, receipt)).toBe(
+        "applied",
+      );
+      expect(
+        yield* commitEnvironmentUiStateMigration(
+          retryDatabase,
+          { ...state, selected: null },
+          receipt,
+        ),
+      ).toBe("already-applied");
+      retryDatabase.close();
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "environmentUiState", "client")),
+      ).toEqual(state);
+      expect(
+        yield* Effect.promise(() => readIndexedDbValue(factory, "migrationState", receipt.id)),
+      ).toEqual(receipt);
+    });
   });
 
   it.effect(

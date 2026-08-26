@@ -401,6 +401,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
             : Effect.void,
         ),
       ),
+    clientRepairs: Effect.succeed([]),
+    saveClientRepair: () => Effect.void,
+    removeClientRepair: () => Effect.void,
     commitForget: (environmentId) =>
       Effect.gen(function* () {
         yield* Ref.update(lifecycleEvents, (current) => [...current, "clear-cache"]);
@@ -438,6 +441,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     load: Effect.succeed(Option.none()),
     save: () => Effect.void,
     clearEnvironment: () => Effect.void,
+    migrateLegacy: () => Effect.succeed("applied" as const),
   });
   const environmentMigrationStore = Persistence.EnvironmentMigrationStore.of({
     load: () =>

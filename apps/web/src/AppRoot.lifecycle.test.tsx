@@ -64,6 +64,10 @@ vi.mock("./components/preview/PreviewAutomationHosts", () => ({
 
 vi.mock("./components/preview/previewBridge", () => ({ previewBridge: null }));
 
+vi.mock("./ForgottenEnvironmentClientCleanupCoordinator", () => ({
+  ForgottenEnvironmentClientCleanupCoordinator: () => null,
+}));
+
 vi.mock("./previewRuntimeCapabilities", () => ({
   supportsPreviewRuntimeCapability: () => false,
 }));
@@ -71,6 +75,7 @@ vi.mock("./previewRuntimeCapabilities", () => ({
 vi.mock("./state/environments", () => ({
   useEnvironments: () => ({
     isReady: true,
+    catalogEnvironmentIds: h.environmentIds,
     networkStatus: "online",
     environments: h.environmentIds.map((environmentId) => ({
       environmentId,

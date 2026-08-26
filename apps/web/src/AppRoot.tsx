@@ -14,6 +14,7 @@ import { environmentAvailabilityCommands, useEnvironmentShellSummary } from "./s
 import { useAtomCommand } from "./state/use-atom-command";
 import { useEnvironments } from "./state/environments";
 import { isDesktopLocalConnectionTarget } from "./connection/desktopLocal";
+import { ForgottenEnvironmentClientCleanupCoordinator } from "./ForgottenEnvironmentClientCleanupCoordinator";
 
 export function ProjectDataRecoveryCoordinator() {
   const summary = useEnvironmentShellSummary();
@@ -143,6 +144,7 @@ export function ProjectDataRecoveryCoordinator() {
 export function AppRoot({ router }: { readonly router: AppRouter }) {
   return (
     <AppAtomRegistryProvider>
+      <ForgottenEnvironmentClientCleanupCoordinator />
       <ThreadLifecycleReconciler />
       <ProjectDataRecoveryCoordinator />
       <RouterProvider router={router} />

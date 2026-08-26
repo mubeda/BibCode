@@ -1,4 +1,5 @@
 import { Debouncer } from "@tanstack/react-pacer";
+import { parseScopedProjectKey, parseScopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { EnvironmentId } from "@bibcode/contracts";
 import { create } from "zustand";
 import { normalizeProjectPathForComparison } from "./lib/projectPaths";
@@ -25,6 +26,12 @@ export interface PersistedUiState {
 export interface UiProjectState {
   projectExpandedById: Record<string, boolean>;
   projectOrder: string[];
+}
+
+/** Bounded v1 input retained only for the one-time environment-tree migration. */
+export interface LegacyProjectNavigationPreferences {
+  readonly projectExpandedById: Record<string, boolean>;
+  readonly projectOrder: string[];
 }
 
 export interface UiThreadState {
@@ -158,6 +165,14 @@ function readPersistedState(): UiState {
   } catch {
     return initialState;
   }
+}
+
+export function readLegacyProjectNavigationPreferences(): LegacyProjectNavigationPreferences {
+  const persisted = readPersistedState();
+  return {
+    projectExpandedById: persisted.projectExpandedById,
+    projectOrder: persisted.projectOrder,
+  };
 }
 
 function sanitizePersistedThreadChangedFilesExpanded(
@@ -448,6 +463,26 @@ export function migrateProjectOrderPreferences(
   return changed ? { ...state, projectOrder } : state;
 }
 
+export function clearEnvironmentUiState(state: UiState, environmentId: EnvironmentId): UiState {
+  const keepOtherProject = (key: string): boolean =>
+    parseScopedProjectKey(key)?.environmentId !== environmentId;
+  const keepOtherThread = (key: string): boolean =>
+    parseScopedThreadKey(key)?.environmentId !== environmentId;
+  return {
+    ...state,
+    projectExpandedById: Object.fromEntries(
+      Object.entries(state.projectExpandedById).filter(([key]) => keepOtherProject(key)),
+    ),
+    projectOrder: state.projectOrder.filter(keepOtherProject),
+    threadLastVisitedAtById: Object.fromEntries(
+      Object.entries(state.threadLastVisitedAtById).filter(([key]) => keepOtherThread(key)),
+    ),
+    threadChangedFilesExpandedById: Object.fromEntries(
+      Object.entries(state.threadChangedFilesExpandedById).filter(([key]) => keepOtherThread(key)),
+    ),
+  };
+}
+
 interface UiStateStore extends UiState {
   markThreadVisited: (threadId: string, visitedAt: string) => void;
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
@@ -460,6 +495,7 @@ interface UiStateStore extends UiState {
     targetProjectIds: readonly string[],
   ) => void;
   migrateProjectOrderPreferences: (projects: readonly ProjectOrderPreferenceMigration[]) => void;
+  clearEnvironment: (environmentId: EnvironmentId) => void;
 }
 
 export const useUiStateStore = create<UiStateStore>((set) => ({
@@ -480,6 +516,13 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
     ),
   migrateProjectOrderPreferences: (projects) =>
     set((state) => migrateProjectOrderPreferences(state, projects)),
+  clearEnvironment: (environmentId) =>
+    set((state) => {
+      const nextState = clearEnvironmentUiState(state, environmentId);
+      debouncedPersistState.cancel();
+      persistState(nextState);
+      return nextState;
+    }),
 }));
 
 useUiStateStore.subscribe((state) => debouncedPersistState.maybeExecute(state));

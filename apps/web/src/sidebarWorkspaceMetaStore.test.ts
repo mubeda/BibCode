@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  clearEnvironmentWorkspaceMeta,
   migratePersistedSidebarWorkspaceMetaState,
   selectIsPinned,
   selectIsUnread,
@@ -77,5 +78,58 @@ describe("sidebarWorkspaceMetaStore", () => {
         unreadThreadKeys: ["env-1:thread-B"],
       });
     });
+
+    it("keeps only unique environment-scoped thread keys", () => {
+      expect(
+        migratePersistedSidebarWorkspaceMetaState({
+          pinnedThreadKeys: ["env-1:thread-A", "env-1:thread-A", "unscoped", ""],
+          unreadThreadKeys: ["env-2:thread-B", "env-2:thread-B", ":missing-environment"],
+        }),
+      ).toEqual({
+        pinnedThreadKeys: ["env-1:thread-A"],
+        unreadThreadKeys: ["env-2:thread-B"],
+      });
+    });
+  });
+
+  it("prunes only the forgotten environment's scoped metadata", () => {
+    const next = clearEnvironmentWorkspaceMeta(
+      {
+        pinnedThreadKeys: ["env-1:thread-A", "env-2:thread-A"],
+        unreadThreadKeys: ["env-1:thread-B", "env-2:thread-B"],
+      },
+      "env-1",
+    );
+
+    expect(next).toEqual({
+      pinnedThreadKeys: ["env-2:thread-A"],
+      unreadThreadKeys: ["env-2:thread-B"],
+    });
+  });
+
+  it("sanitizes an existing v1 persistence envelope during real hydration", async () => {
+    const originalStorage = useSidebarWorkspaceMetaStore.persist.getOptions().storage;
+    const storage = {
+      getItem: vi.fn(() => ({
+        state: {
+          pinnedThreadKeys: ["env-1:thread-A", "env-1:thread-A", "unscoped"],
+          unreadThreadKeys: ["env-2:thread-B", ":invalid"],
+        },
+        version: 1,
+      })),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+    };
+    useSidebarWorkspaceMetaStore.persist.setOptions({ storage: storage as never });
+
+    try {
+      await useSidebarWorkspaceMetaStore.persist.rehydrate();
+      expect(useSidebarWorkspaceMetaStore.getState()).toMatchObject({
+        pinnedThreadKeys: ["env-1:thread-A"],
+        unreadThreadKeys: ["env-2:thread-B"],
+      });
+    } finally {
+      useSidebarWorkspaceMetaStore.persist.setOptions({ storage: originalStorage });
+    }
   });
 });

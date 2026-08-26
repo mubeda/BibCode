@@ -51,6 +51,9 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "forget-environment",
       "list-environment-cleanup-repairs",
       "save-environment-cleanup-repair",
+      "list-environment-client-cleanup-repairs",
+      "save-environment-client-cleanup-repair",
+      "delete-environment-client-cleanup-repair",
       "load-environment-ui-state",
       "save-environment-ui-state",
       "clear-environment-ui-state",
@@ -133,6 +136,14 @@ export const EnvironmentCleanupRepairReceipt = Schema.Struct({
 });
 export type EnvironmentCleanupRepairReceipt = typeof EnvironmentCleanupRepairReceipt.Type;
 
+export const EnvironmentClientCleanupRepairReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  environmentId: DurableEnvironmentId,
+  phase: Schema.Literals(["prepared", "confirmed"]),
+});
+export type EnvironmentClientCleanupRepairReceipt =
+  typeof EnvironmentClientCleanupRepairReceipt.Type;
+
 /**
  * Two-phase boundary for cancellation-safe local cleanup. Secret deletion happens
  * between `saveRepair` and `commitForget`; the final commit removes every
@@ -147,6 +158,16 @@ export class EnvironmentCleanupStore extends Context.Service<
     >;
     readonly saveRepair: (
       receipt: EnvironmentCleanupRepairReceipt,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly clientRepairs: Effect.Effect<
+      ReadonlyArray<EnvironmentClientCleanupRepairReceipt>,
+      ConnectionPersistenceError
+    >;
+    readonly saveClientRepair: (
+      receipt: EnvironmentClientCleanupRepairReceipt,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly removeClientRepair: (
+      environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly commitForget: (
       environmentId: EnvironmentId,
@@ -185,6 +206,11 @@ export class EnvironmentUiStateStore extends Context.Service<
     readonly clearEnvironment: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    /** Atomically publishes migrated v2 UI state and its idempotence receipt. */
+    readonly migrateLegacy: (
+      state: EnvironmentUiStateDocument,
+      receipt: EnvironmentMigrationReceipt,
+    ) => Effect.Effect<"applied" | "already-applied", ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/EnvironmentUiStateStore") {}
 

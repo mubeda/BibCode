@@ -269,6 +269,14 @@ vi.mock("~/state/auth", () => ({
 }));
 
 vi.mock("~/connection/catalog", () => ({
+  ForgottenEnvironmentClientCleanupError: class ForgottenEnvironmentClientCleanupError extends Error {
+    constructor(
+      message: string,
+      readonly authoritativeForgetSucceeded: boolean,
+    ) {
+      super(message);
+    }
+  },
   environmentCatalog: {
     register: h.atoms.catalogRegister,
     remove: h.atoms.catalogRemove,
@@ -548,6 +556,7 @@ vi.mock("../AnimatedHeight", () => ({
   AnimatedHeight: (props: AnyProps) => <div data-animated>{props.children as ReactNode}</div>,
 }));
 
+import { ForgottenEnvironmentClientCleanupError } from "~/connection/catalog";
 import { ConnectionsSettings, connectionsSettingsInternals } from "./ConnectionsSettings";
 
 const PRIMARY_ID = EnvironmentId.make("environment-primary");
@@ -1287,6 +1296,23 @@ describe("ConnectionsSettings", () => {
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not remove backend" }),
+    );
+
+    h.commands.remove.mockResolvedValueOnce(
+      failure(
+        new ForgottenEnvironmentClientCleanupError(
+          "The environment was forgotten, but cleanup is pending.",
+          true,
+        ),
+      ),
+    );
+    invoke(control("button", "Disconnect"), "onClick");
+    await flush();
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "warning",
+        title: "Backend removed; cleanup pending",
+      }),
     );
   });
 

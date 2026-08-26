@@ -145,6 +145,17 @@ Startup never mixes the two models. Without a receipt the migration owner runs;
 with a receipt the registry ignores v1 targets. A secret-provider failure
 publishes neither normalized rows nor a receipt.
 
+Environment navigation has its own one-time
+`environment-navigation-v1-to-v2` boundary. Selected ownership paths,
+environment/project disclosure, manual-toggle intent, and per-environment order
+are one decoded v2 document in IndexedDB. The document and its receipt commit in
+one transaction; a receipt without the document is treated as an integrity
+failure rather than an empty preference set. Before that receipt exists, the
+web client reads only bounded v1 project preferences and migrates a CWD or old
+group key only when the current project catalog resolves it to exactly one
+`environmentId + projectId`. After the receipt exists, v1 localStorage is never
+consulted for navigation.
+
 ### Desktop topology reconciliation
 
 The renderer owns one reference-counted desktop topology controller. Native
@@ -396,6 +407,19 @@ late completion after Forget is ignored. A secret or metadata failure leaves a
 redacted `secret-deletion-failed` or `metadata-deletion-failed` repair state;
 restart remains closed until Forget is retried. After a successful commit, a
 new explicit authoritative registration may recreate the environment.
+
+Browser-local pin, unread, visit, and legacy disclosure metadata cannot share
+the authoritative Forget transaction. The web client therefore writes one
+independently keyed IndexedDB client-repair receipt before starting Forget,
+confirms it after server success, clears and verifies both in-memory and
+persisted scoped metadata, and removes the receipt only after verification.
+Per-environment keys prevent concurrent tabs from overwriting another
+environment's receipt. On restart, a prepared receipt remains dormant while
+the authoritative catalog still contains the environment; a confirmed receipt,
+or a prepared receipt for an absent environment, is repaired idempotently.
+Failure to make the receipt durable prevents Forget from starting, while
+incomplete post-success cleanup is reported explicitly and remains retryable
+rather than being presented as a clean removal.
 
 ## Worktree catalog subscriptions
 

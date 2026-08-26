@@ -58,9 +58,11 @@ export function useEnvironments() {
       ),
     [presentationById],
   );
+  const catalogEnvironmentIds = useMemo(() => [...catalog.entries.keys()], [catalog.entries]);
 
   return {
     isReady: catalog.isReady,
+    catalogEnvironmentIds,
     networkStatus,
     environments,
     presentationById,

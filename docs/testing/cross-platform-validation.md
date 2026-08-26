@@ -132,7 +132,7 @@ When normalized connection persistence, route selection, protected secrets,
 offline cache, or environment removal changes, run the current owners together:
 
 ```sh
-vp test run apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/storage.test.ts packages/client-runtime/src/connection/catalog.test.ts packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts
+vp test apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/catalog.test.ts apps/web/src/connection/storage.test.ts apps/web/src/environmentNavigationStore.test.ts apps/web/src/ForgottenEnvironmentClientCleanupCoordinator.test.tsx apps/web/src/uiStateStore.test.ts apps/web/src/sidebarWorkspaceMetaStore.test.ts packages/client-runtime/src/connection/catalog.test.ts packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts --run
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop secret_store -- --nocapture
 ```
 
@@ -183,6 +183,19 @@ clear cache/UI -> delete routes/bindings -> delete environment`. Inject native
    and leaves the remote service/data untouched.
    Also reject a changed saved pin while retaining the live tunnel and prove a
    same-generation route attempt remains admissible after that rejected cleanup.
+   In the browser client, assert the pre-Forget local repair receipt is durable
+   before the authoritative command starts. A failed or interrupted
+   authoritative Forget must retain pin/unread/visit/disclosure metadata and
+   keep the prepared receipt until the catalog proves whether removal committed.
+   A successful Forget must remove only the forgotten environment's scoped
+   navigation and workspace metadata. Inject localStorage failure after server
+   success and assert the UI reports cleanup pending, the receipt survives, and
+   restart repairs it when the authoritative catalog proves the environment is
+   absent. If restart still finds the environment for an unconfirmed receipt,
+   leave the receipt dormant without deleting metadata. Race two tabs forgetting
+   different environments and prove independently keyed receipts both survive.
+   Reload once more to prove repair is durable and does not touch another
+   environment.
 
 For a packaged native run, exercise Hide/restore without a reconnect, remove one
 route while retaining the other route and projects, then Forget using only a

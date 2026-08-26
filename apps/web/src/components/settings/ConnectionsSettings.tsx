@@ -99,7 +99,7 @@ import {
   unlinkPrimaryEnvironment as unlinkPrimaryEnvironmentAtom,
 } from "~/cloud/linkEnvironmentAtoms";
 import { authEnvironment } from "~/state/auth";
-import { environmentCatalog } from "~/connection/catalog";
+import { environmentCatalog, ForgottenEnvironmentClientCleanupError } from "~/connection/catalog";
 import {
   connectPairing as connectPairingAtom,
   connectSshEnvironment as connectSshEnvironmentAtom,
@@ -1907,8 +1907,16 @@ function FullConnectionsSettings() {
         setSavedBackendError(message);
         toastManager.add(
           stackedThreadToast({
-            type: "error",
-            title: "Could not remove backend",
+            type:
+              error instanceof ForgottenEnvironmentClientCleanupError &&
+              error.authoritativeForgetSucceeded
+                ? "warning"
+                : "error",
+            title:
+              error instanceof ForgottenEnvironmentClientCleanupError &&
+              error.authoritativeForgetSucceeded
+                ? "Backend removed; cleanup pending"
+                : "Could not remove backend",
             description: message,
           }),
         );

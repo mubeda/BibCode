@@ -213,12 +213,18 @@ both regressions were added and the re-review found no remaining P0-P2 issue.
 - Modify: `apps/web/src/uiStateStore.ts`, test
 - Modify: `apps/web/src/sidebarWorkspaceMetaStore.ts`, test
 - Modify: `apps/web/src/connection/storage.ts`, test
+- Modify: `packages/client-runtime/src/platform/persistence.ts`
+- Modify: `apps/web/src/connection/catalog.ts`, test
+- Create: `apps/web/src/ForgottenEnvironmentClientCleanupCoordinator.tsx`, test
+- Modify: `apps/web/src/AppRoot.tsx`, test
+- Modify: `apps/web/src/state/environments.ts`
+- Modify: `apps/web/src/components/settings/ConnectionsSettings.tsx`, test
 
-- [ ] **Step 1: Write migration/restart tests**
+- [x] **Step 1: Write migration/restart tests**
 
 Cover clean start, old project CWD keys, old grouped physical keys, scoped thread pin/unread, corrupt records, removed IDs, hidden selected environment, cached offline selection, quota failure, and reload after manual collapse.
 
-- [ ] **Step 2: Define the v2 document stored through Plan 20**
+- [x] **Step 2: Define the v2 document stored through Plan 20**
 
 ```ts
 export type EnvironmentNavigationStateV2 = {
@@ -235,25 +241,52 @@ export type EnvironmentNavigationStateV2 = {
 
 Aliases and `hidden` remain on `KnownEnvironment`; thread pins/unread remain in the scoped workspace metadata store.
 
-- [ ] **Step 3: Implement first-use versus explicit disclosure**
+- [x] **Step 3: Implement first-use versus explicit disclosure**
 
 With no `manuallyToggledKeys`, synthesize expansion for the selected ancestor path and persist it. Once a row is manually toggled, restore that exact value on startup; route hydration does not silently reopen it.
 
-- [ ] **Step 4: Migrate only unambiguous v1 state**
+- [x] **Step 4: Migrate only unambiguous v1 state**
 
 Map a legacy project key only when current cached/live data resolves it to one scoped project. Preserve scoped thread keys. Drop ambiguous repository-group order entries rather than applying them to both environments. Write one migration receipt and stop reading localStorage v1 after success.
 
-- [ ] **Step 5: Implement authoritative fallback**
+- [x] **Step 5: Implement authoritative fallback**
 
 Do not change selection for offline/missing-from-stale-discovery. After explicit Forget/delete or an authoritative online snapshot proves removal, fall back to parent, next project's Main, environment overview, then primary environment.
 
-- [ ] **Step 6: Run persistence tests and commit**
+- [x] **Step 6: Run persistence tests and commit**
 
 ```sh
 vp test apps/web/src/environmentNavigationStore.test.ts apps/web/src/uiStateStore.test.ts apps/web/src/sidebarWorkspaceMetaStore.test.ts apps/web/src/connection/storage.test.ts
 git add apps/web/src/environmentNavigationStore.ts apps/web/src/environmentNavigationStore.test.ts apps/web/src/uiStateStore.ts apps/web/src/uiStateStore.test.ts apps/web/src/sidebarWorkspaceMetaStore.ts apps/web/src/sidebarWorkspaceMetaStore.test.ts apps/web/src/connection/storage.ts apps/web/src/connection/storage.test.ts
 git commit -m "feat(web): persist exact environment tree state"
 ```
+
+Implemented the decoded v2 navigation document through the Plan 20 IndexedDB
+owner, including exact selected ownership paths, disclosure/manual-toggle
+intent, stable environment and per-environment project order, and scoped
+cleanup on Forget. The first-use synthesizer opens only the untoggled ancestors
+of the selected path; later manual collapse survives restart. Migration accepts
+only aliases that resolve to one current scoped project, atomically commits the
+v2 document with its receipt, and treats receipt-without-document as an
+integrity failure. Authoritative fallback preserves offline/stale selections
+and moves only after explicit removal or a current online snapshot proves an ID
+gone.
+
+The existing scoped pin/unread and legacy UI stores now sanitize persisted
+keys, migrate their actual v1 envelopes, and remove only metadata owned by the
+forgotten environment. Independent review found crash, interruption, and
+multi-tab gaps in an initial best-effort cleanup callback. The final boundary
+writes one independently keyed IndexedDB client-repair receipt before Forget,
+retains it on failure/interruption, confirms it on success, verifies local
+metadata deletion, and reconciles prepared/confirmed repairs after catalog
+startup. Unavailable localStorage is reported as cleanup pending, and the
+settings UI distinguishes this partial post-success state from a failed
+authoritative removal. Re-review found no remaining P0-P2 issue.
+
+The focused gate passed 172 tests across navigation, browser cleanup,
+persistence, startup, and registry owners. `vp check`, the complete workspace
+typecheck graph, and the full suite passed; the full run reported 591 test files
+passed, one skipped, 8,448 tests passed, and 29 skipped.
 
 ### Task 4: Render a virtualized accessible navigation-only tree
 

@@ -2,6 +2,7 @@ import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  clearEnvironmentUiState,
   legacyProjectCwdPreferenceKey,
   legacyPhysicalProjectPreferenceKey,
   markThreadUnread,
@@ -9,6 +10,7 @@ import {
   migrateProjectOrderPreferences,
   parsePersistedState,
   PERSISTED_STATE_KEY,
+  readLegacyProjectNavigationPreferences,
   type PersistedUiState,
   persistState,
   reorderProjects,
@@ -31,6 +33,41 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
 }
 
 describe("uiStateStore pure functions", () => {
+  it("prunes every environment-scoped v1 project and thread preference on Forget", () => {
+    const initial = makeUiState({
+      projectExpandedById: {
+        "env-1:project-a": false,
+        "env-2:project-a": true,
+        [legacyProjectCwdPreferenceKey("/shared")]: false,
+      },
+      projectOrder: ["env-1:project-a", "env-2:project-a"],
+      threadLastVisitedAtById: {
+        "env-1:thread-a": "2026-02-25T12:30:00.000Z",
+        "env-2:thread-a": "2026-02-25T12:30:00.000Z",
+      },
+      threadChangedFilesExpandedById: {
+        "env-1:thread-a": { turn: false },
+        "env-2:thread-a": { turn: false },
+      },
+    });
+
+    expect(clearEnvironmentUiState(initial, EnvironmentId.make("env-1"))).toEqual(
+      makeUiState({
+        projectExpandedById: {
+          "env-2:project-a": true,
+          [legacyProjectCwdPreferenceKey("/shared")]: false,
+        },
+        projectOrder: ["env-2:project-a"],
+        threadLastVisitedAtById: {
+          "env-2:thread-a": "2026-02-25T12:30:00.000Z",
+        },
+        threadChangedFilesExpandedById: {
+          "env-2:thread-a": { turn: false },
+        },
+      }),
+    );
+  });
+
   it("stores server timestamps without moving visit state backwards", () => {
     const threadId = ThreadId.make("thread-1");
     const initialState = makeUiState();
@@ -362,5 +399,27 @@ describe("uiStateStore persistence", () => {
 
     vi.unstubAllGlobals();
     expect(() => persistState(makeUiState())).not.toThrow();
+  });
+
+  it("reads a bounded project-only migration view and tolerates corrupt JSON", () => {
+    localStorageStub.setItem(
+      PERSISTED_STATE_KEY,
+      JSON.stringify({
+        projectExpandedById: { "env:project": false, invalid: "no" },
+        projectOrder: ["env:project", "env:project", 7],
+        defaultAdvertisedEndpointKey: "must-not-leak-into-navigation",
+      }),
+    );
+
+    expect(readLegacyProjectNavigationPreferences()).toEqual({
+      projectExpandedById: { "env:project": false },
+      projectOrder: ["env:project"],
+    });
+
+    localStorageStub.setItem(PERSISTED_STATE_KEY, "{not-json");
+    expect(readLegacyProjectNavigationPreferences()).toEqual({
+      projectExpandedById: {},
+      projectOrder: [],
+    });
   });
 });
