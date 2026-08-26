@@ -58,12 +58,13 @@ bibcode-server/
 ├── bin/bibcode[.exe]
 ├── share/bibcode/web/index.html
 ├── share/bibcode/web/assets/**
+├── share/bibcode/web-assets.json
 ├── share/bibcode/install-layout.json
 ├── share/bibcode/LICENSE
 └── share/bibcode/THIRD-PARTY-NOTICES.md
 ```
 
-- [ ] **Step 1: Write failing path, integrity, and runtime tests**
+- [x] **Step 1: Write failing path, integrity, and runtime tests**
 
 Cover a valid relocated layout, Windows/POSIX separators, executable symlink, missing `index.html`, escaped/static-root symlink, asset manifest mismatch, read-only installation, hostile current working directory, portable foreground invocation, service invocation, and development `--static-dir` override.
 
@@ -72,26 +73,26 @@ assert_eq!(resolve_installed_web_root(&exe)?, root.join("share/bibcode/web"));
 assert!(resolve_installed_web_root(&escaped_exe).is_err());
 ```
 
-- [ ] **Step 2: Run the focused server tests and confirm RED**
+- [x] **Step 2: Run the focused server tests and confirm RED**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test install_layout -- --nocapture
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test server_runtime static -- --nocapture
 ```
 
-- [ ] **Step 3: Resolve assets from signed package metadata, not CWD**
+- [x] **Step 3: Resolve assets from signed package metadata, not CWD**
 
 `install-layout.json` contains schema version, product, binary-relative web path, web asset manifest path, and package version. Canonicalize the executable/layout/root, reject path escape, then feed the verified root into the existing static handler. `--static-dir` remains an explicit development/admin override and is recorded in diagnostics.
 
-- [ ] **Step 4: Fail packaged startup when required assets are absent or altered**
+- [x] **Step 4: Fail packaged startup when required assets are absent or altered**
 
 In installed/service mode, do not silently start an API-only server if the packaged UI is missing. Return a redacted repair error naming the installation root and reinstall command. Portable `serve --no-browser` can opt into API-only behavior only with an explicit `--without-web-ui`; service definitions never set it.
 
-- [ ] **Step 5: Keep same-origin browser behavior and CSP**
+- [x] **Step 5: Keep same-origin browser behavior and CSP**
 
 Serve compiled assets and API/WebSocket from the same loopback origin, preserve traversal/symlink defenses and cache policy, and verify no external runtime CDN/font/script is required. Opening the browser is explicit/interactive; service startup never launches one.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test install_layout -- --nocapture

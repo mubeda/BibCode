@@ -41,6 +41,7 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
         "--base-dir",
         "--bootstrap-fd",
         "--no-browser",
+        "--without-web-ui",
         "--no-startup-pairing",
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
@@ -797,6 +798,33 @@ fn start_opens_a_browser_unless_disabled_while_serve_is_always_headless() {
     assert!(!start.no_browser);
     assert!(disabled.no_browser);
     assert!(serve.no_browser);
+}
+
+#[test]
+fn portable_api_only_mode_is_explicit_and_forbidden_for_managed_services() {
+    let portable = Cli::try_parse_from(["bibcode", "serve", "--without-web-ui"])
+        .expect("portable API-only arguments")
+        .into_server_config()
+        .expect("portable API-only configuration");
+    assert!(portable.without_web_ui);
+    assert!(portable.static_dir.is_none());
+    assert!(portable.installed_layout.is_none());
+
+    let error = Cli::try_parse_from([
+        "bibcode",
+        "serve",
+        "--without-web-ui",
+        "--managed-service-mode",
+        "workstation",
+    ])
+    .expect("managed API-only syntax")
+    .into_server_config()
+    .expect_err("managed services require the packaged UI");
+    assert!(
+        error
+            .to_string()
+            .contains("require the verified packaged web UI")
+    );
 }
 
 #[tokio::test]

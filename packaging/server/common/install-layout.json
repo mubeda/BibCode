@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "product": "bibcode-server",
+  "packageVersion": "0.4.1",
+  "binaryRelativeWebPath": "../share/bibcode/web",
+  "binaryRelativeAssetManifestPath": "../share/bibcode/web-assets.json"
+}

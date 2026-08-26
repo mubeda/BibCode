@@ -12,6 +12,7 @@ pub mod diagnostics;
 mod environment_identity;
 pub mod git;
 mod http;
+pub mod install_layout;
 mod lifecycle;
 pub mod local_control;
 pub mod logging;

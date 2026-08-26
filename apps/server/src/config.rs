@@ -15,6 +15,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
+use crate::install_layout::{
+    InstallLayoutError, VerifiedInstallLayout, resolve_installed_web_root,
+};
 use crate::persistence::{EnvironmentId, StorageInstanceId};
 use crate::service::ServiceMode;
 use crate::transport::TransportIdentity;
@@ -53,8 +56,10 @@ pub struct ServerConfig {
     pub resolved_data_root: Option<ResolvedDataRoot>,
     pub tls: Option<TlsFiles>,
     pub static_dir: Option<PathBuf>,
+    pub installed_layout: Option<VerifiedInstallLayout>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
+    pub without_web_ui: bool,
     pub startup_pairing_enabled: bool,
     pub desktop_bootstrap_token: Option<String>,
     pub unsafe_no_auth: bool,
@@ -86,8 +91,10 @@ impl ServerConfig {
             base_dir,
             tls: None,
             static_dir: None,
+            installed_layout: None,
             dev_url: None,
             no_browser: false,
+            without_web_ui: false,
             startup_pairing_enabled: true,
             desktop_bootstrap_token: None,
             unsafe_no_auth: false,
@@ -125,7 +132,24 @@ impl ServerConfig {
     #[must_use]
     pub fn with_static_dir(mut self, static_dir: impl AsRef<Path>) -> Self {
         self.static_dir = Some(static_dir.as_ref().to_path_buf());
+        self.installed_layout = None;
         self
+    }
+
+    /// Uses a verified packaged web root unless an explicit development or
+    /// administrator override already owns static asset resolution.
+    pub fn with_installed_layout_from_executable(
+        mut self,
+        executable: impl AsRef<Path>,
+    ) -> Result<Self, ConfigError> {
+        if self.static_dir.is_some() || self.dev_url.is_some() || self.mode == ServerMode::Desktop {
+            return Ok(self);
+        }
+        if let Some(layout) = resolve_installed_web_root(executable.as_ref())? {
+            self.static_dir = Some(layout.web_root().to_path_buf());
+            self.installed_layout = Some(layout);
+        }
+        Ok(self)
     }
 
     #[must_use]
@@ -517,6 +541,14 @@ struct ServerArgs {
     #[arg(long, env = "BIBCODE_NO_BROWSER", global = true)]
     no_browser: bool,
 
+    /// Run a portable foreground server without serving the browser UI.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["static_dir", "dev_url"]
+    )]
+    without_web_ui: bool,
+
     /// Keep authentication enabled but do not mint or print a startup pairing credential.
     #[arg(long, env = "BIBCODE_NO_STARTUP_PAIRING", global = true)]
     no_startup_pairing: bool,
@@ -560,6 +592,12 @@ pub enum ConfigError {
     },
     #[error("managed services require a numeric loopback host, not {0:?}")]
     InvalidServiceHost(String),
+    #[error("managed services require the verified packaged web UI")]
+    ManagedServiceRequiresWebUi,
+    #[error("failed to resolve the current server executable")]
+    CurrentExecutable(#[source] io::Error),
+    #[error(transparent)]
+    InstallLayout(#[from] InstallLayoutError),
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -719,6 +757,18 @@ impl Cli {
             },
         );
         config.dev_url = args.dev_url;
+        config.without_web_ui = args.without_web_ui;
+        if managed_service_mode.is_some() && config.without_web_ui {
+            return Err(ConfigError::ManagedServiceRequiresWebUi);
+        }
+        if config.static_dir.is_none()
+            && config.dev_url.is_none()
+            && config.mode == ServerMode::Web
+            && !config.without_web_ui
+        {
+            let executable = std::env::current_exe().map_err(ConfigError::CurrentExecutable)?;
+            config = config.with_installed_layout_from_executable(executable)?;
+        }
         config.no_browser = headless
             || args.no_browser
             || bootstrap.as_ref().is_some_and(|value| value.no_browser)
@@ -751,6 +801,7 @@ impl ServerArgs {
             || self.tls_private_key.is_some()
             || self.dev_url.is_some()
             || self.no_browser
+            || self.without_web_ui
             || self.no_startup_pairing
             || self.bootstrap_fd.is_some()
             || self.managed_service_mode.is_some()

@@ -592,7 +592,7 @@ async fn hides_the_desktop_shutdown_route_outside_desktop_mode() {
 }
 
 #[tokio::test]
-async fn native_mcp_routes_are_live_and_enforce_authentication() {
+async fn removed_connect_mcp_http_routes_are_not_mounted() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = ServerRuntime::start(test_config(&temp))
         .await
@@ -604,8 +604,8 @@ async fn native_mcp_routes_are_live_and_enforce_authentication() {
         client.delete(endpoint(handle.local_addr(), "/mcp")),
     ] {
         let response = request.send().await.expect("MCP response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.text().await.unwrap(), "Not Found");
     }
 
     handle.shutdown();
@@ -687,12 +687,9 @@ async fn custom_registry_uses_exact_fallback_http_responses() {
         client.post(endpoint(handle.local_addr(), "/mcp")),
         client.delete(endpoint(handle.local_addr(), "/mcp")),
     ] {
-        assert_json_wire(
-            request.send().await.expect("fallback MCP response"),
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"_tag":"McpUnavailableError"}"#,
-        )
-        .await;
+        let response = request.send().await.expect("removed MCP response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.text().await.unwrap(), "Not Found");
     }
 
     handle.shutdown();

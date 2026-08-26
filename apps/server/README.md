@@ -48,6 +48,14 @@ cargo run -p bibcode-server -- serve
 startup URL unless `--no-browser` is present. A direct network listener must
 provide both TLS files:
 
+Installed and portable server packages resolve their compiled browser UI from
+the verified `share/bibcode/install-layout.json` beside `bin/bibcode`; they do
+not depend on the current working directory. Missing, escaped, symlinked, or
+hash-mismatched web assets fail packaged startup with a reinstall error. An
+explicit `--static-dir` remains available for development and administration.
+Portable foreground use may deliberately omit the UI with
+`--without-web-ui`; managed services reject that flag.
+
 ```sh
 cargo run -p bibcode-server -- serve \
   --host 0.0.0.0 \
