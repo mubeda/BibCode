@@ -17,6 +17,7 @@ import {
   BearerConnectionProfile,
   type ConnectionCatalogEntry,
   type ConnectionRegistration,
+  DesktopPrimaryBinding,
   type KnownEnvironment,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
@@ -322,7 +323,15 @@ function normalizedPlatformRegistration(
         descriptor,
         alias: registration.target.label,
         hidden: false,
-        bindings: [],
+        bindings: [
+          new DesktopPrimaryBinding({
+            bindingId: "platform:primary",
+            acceptedEnvironmentId: descriptor.environmentId,
+            acceptedStorageInstanceIds: [descriptor.storageInstanceId],
+            condition: "available",
+            detail: null,
+          }),
+        ],
         routes: [route],
       },
     };

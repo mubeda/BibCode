@@ -1146,6 +1146,16 @@ describe("EnvironmentRegistry", () => {
         const stored = (yield* Ref.get(harness.storedEnvironments)).get(NORMALIZED_ENVIRONMENT_ID);
         expect(stored).toMatchObject({
           acceptedStorageInstanceId: NORMALIZED_ENVIRONMENT.acceptedStorageInstanceId,
+          bindings: [
+            {
+              _tag: "DesktopPrimaryBinding",
+              bindingId: "platform:primary",
+              acceptedEnvironmentId: NORMALIZED_ENVIRONMENT_ID,
+              acceptedStorageInstanceIds: [NORMALIZED_ENVIRONMENT.acceptedStorageInstanceId],
+              condition: "available",
+              detail: null,
+            },
+          ],
           routes: [{ _tag: "DesktopLoopbackRoute", routeId: "platform:primary" }],
         });
         expect(
