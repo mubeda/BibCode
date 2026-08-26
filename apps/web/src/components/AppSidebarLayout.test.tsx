@@ -6,6 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 const navigate = vi.fn();
 let menuListener: ((action: string) => void) | undefined;
+const layoutCapture = vi.hoisted(() => ({
+  sidebarProps: null as Record<string, unknown> | null,
+  threadSidebarRenders: 0,
+}));
 
 vi.mock("@effect/atom-react", () => ({
   useAtomValue: () => [],
@@ -16,11 +20,17 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  default: () => null,
+  default: () => {
+    layoutCapture.threadSidebarRenders += 1;
+    return <nav data-testid="environment-tree-sidebar" />;
+  },
 }));
 
 vi.mock("./ui/sidebar", () => ({
-  Sidebar: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  Sidebar: (props: Record<string, unknown>) => {
+    layoutCapture.sidebarProps = props;
+    return <aside>{props.children as ReactNode}</aside>;
+  },
   SidebarProvider: ({ children }: { children?: ReactNode }) => <>{children}</>,
   SidebarRail: () => null,
   SidebarTrigger: () => null,
@@ -44,10 +54,35 @@ afterEach(async () => {
   });
   navigate.mockReset();
   menuListener = undefined;
+  layoutCapture.sidebarProps = null;
+  layoutCapture.threadSidebarRenders = 0;
   delete (window as { desktopBridge?: unknown }).desktopBridge;
 });
 
 describe("AppSidebarLayout", () => {
+  it("mounts one navigation-only left sidebar and keeps workspace content central", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(
+        <AppSidebarLayout>
+          <article data-testid="workspace">Workspace</article>
+        </AppSidebarLayout>,
+      );
+    });
+
+    expect(layoutCapture.threadSidebarRenders).toBe(1);
+    expect(layoutCapture.sidebarProps).toMatchObject({
+      "aria-label": "Environment navigation",
+      side: "left",
+      collapsible: "offcanvas",
+    });
+    expect(container.querySelectorAll('[data-testid="environment-tree-sidebar"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-testid="workspace"]')).toHaveLength(1);
+  });
+
   it("routes supported desktop menu actions independently", async () => {
     const checkForUpdate = vi.fn(() => Promise.resolve({ checked: true }));
     Object.assign(window, {

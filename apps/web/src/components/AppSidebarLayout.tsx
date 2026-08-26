@@ -77,6 +77,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   return (
     <SidebarProvider className="h-dvh! min-h-0!" defaultOpen>
       <Sidebar
+        aria-label="Environment navigation"
         side="left"
         collapsible="offcanvas"
         className="border-r border-border bg-card text-foreground"

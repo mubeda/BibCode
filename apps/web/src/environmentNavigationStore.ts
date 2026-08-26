@@ -15,6 +15,10 @@ import type {
   ProjectId as ProjectIdType,
   ThreadId as ThreadIdType,
 } from "@bibcode/contracts";
+import {
+  createAtomCommandScheduler,
+  createRuntimeCommand,
+} from "@bibcode/client-runtime/state/runtime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -24,6 +28,7 @@ import {
   readLegacyProjectNavigationPreferences,
   type LegacyProjectNavigationPreferences,
 } from "./uiStateStore";
+import { connectionAtomRuntime } from "./connection/runtime";
 
 export const ENVIRONMENT_NAVIGATION_V1_MIGRATION_ID = "environment-navigation-v1-to-v2";
 
@@ -388,3 +393,21 @@ export const loadEnvironmentNavigationState = Effect.fn(
     onSome: Effect.succeed,
   });
 });
+
+const environmentNavigationScheduler = createAtomCommandScheduler();
+
+export const environmentNavigationCommands = {
+  load: createRuntimeCommand(connectionAtomRuntime, {
+    label: "environment-navigation:load",
+    scheduler: environmentNavigationScheduler,
+    concurrency: { mode: "serial", key: () => "environment-navigation" },
+    execute: loadEnvironmentNavigationState,
+  }),
+  save: createRuntimeCommand(connectionAtomRuntime, {
+    label: "environment-navigation:save",
+    scheduler: environmentNavigationScheduler,
+    concurrency: { mode: "serial", key: () => "environment-navigation" },
+    execute: (state: EnvironmentNavigationStateV2) =>
+      EnvironmentUiStateStore.pipe(Effect.flatMap((store) => store.save(state))),
+  }),
+} as const;

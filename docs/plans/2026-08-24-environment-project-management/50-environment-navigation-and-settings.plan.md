@@ -299,33 +299,53 @@ passed, one skipped, 8,448 tests passed, and 29 skipped.
 - Refactor: `apps/web/src/components/Sidebar.tsx`, `Sidebar.test.tsx`
 - Modify: `apps/web/src/components/AppSidebarLayout.tsx`, test
 
-- [ ] **Step 1: Write semantic and interaction tests**
+- [x] **Step 1: Write semantic and interaction tests**
 
 Assert one `role=tree`, visible `treeitem` rows, exact levels/set positions, separate caret/name actions, `aria-expanded`, `aria-selected`, status text, environment/project/thread accessible names, context-menu keyboard access, and no center-only panel/thread in the DOM.
 
-- [ ] **Step 2: Create small memoized row components**
+- [x] **Step 2: Create small memoized row components**
 
 `EnvironmentRow` owns caret, status, alias, condition badge, and kebab. `ProjectRow` owns project selection and project actions. `ThreadRow` owns Main/ordinary/worktree icon/adornments and current pin/unread/activity behavior. None reads global network/Git state independently.
 
-- [ ] **Step 3: Render the flat projection with existing `LegendList`**
+- [x] **Step 3: Render the flat projection with existing `LegendList`**
 
 Use stable row keys and an estimated fixed row height with measured exceptions. Maintain key-to-index mapping so keyboard focus scrolls the target into the rendered window before moving focus. Populate ARIA sibling metadata from the projection, not DOM siblings.
 
-- [ ] **Step 4: Implement WAI-ARIA Tree View keys**
+- [x] **Step 4: Implement WAI-ARIA Tree View keys**
 
 Up/Down moves visible focus; Right expands or moves to first child; Left collapses or moves to parent; Home/End, character type-ahead, Enter/Space activation, Escape search clear, and Shift+F10 context menu are deterministic. Selection and focus remain visually distinct.
 
-- [ ] **Step 5: Remove left-panel informational surfaces**
+- [x] **Step 5: Remove left-panel informational surfaces**
 
 Delete project environment badges, grouped-member menus, project grouping controls, aggregate availability panels, and settings/detail content from the left. Keep compact row statuses and bottom navigation actions only.
 
-- [ ] **Step 6: Run component tests and commit**
+- [x] **Step 6: Run component tests and commit**
 
 ```sh
 vp test apps/web/src/components/sidebar apps/web/src/components/Sidebar.test.tsx apps/web/src/components/AppSidebarLayout.test.tsx
 git add apps/web/src/components/sidebar apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/AppSidebarLayout.tsx apps/web/src/components/AppSidebarLayout.test.tsx
 git commit -m "feat(web): render the environment project thread tree"
 ```
+
+Implementation evidence: the sidebar now renders one flattened, virtualized
+`Environment -> Project -> Main/threads` tree from the pure projection and the
+durable v2 navigation controller. Memoized rows expose exact projected ARIA
+metadata, distinct disclosure/name/action controls, deterministic Tree View
+keys, type-ahead, virtual focus scrolling, and focus recovery when filtering or
+reconciliation removes the active row. The left panel no longer renders
+grouping, aggregate availability, settings, discovery, or detail panels;
+worktree lifecycle surfaces remain scheduled for the center **Projects &
+Storage** workspace in Task 7, while destructive row removal continues to
+re-fetch the server-authoritative removal plan.
+
+Review found and fixed two P2 lifecycle seams: an unmounted hydration instance
+can no longer publish or persist stale state, and reconciliation restores DOM
+focus to the selected surviving row. The focused gate passed 156 tests before
+review and the two review regressions passed seven tests. `vp check`, the full
+workspace typecheck graph, the web production build, and the full suite passed;
+the full run reported 596 test files passed, one skipped, 8,354 tests passed,
+and 29 skipped. The first sandboxed full run could not bind loopback test ports
+(`EPERM`); the unchanged command passed outside the sandbox.
 
 ### Task 5: Make project selection open Main and handle duplicate repository adds
 
