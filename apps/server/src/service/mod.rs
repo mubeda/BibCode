@@ -383,6 +383,7 @@ where
         if before.state != ServiceState::NotInstalled && !update {
             return Err(ServiceError::DefinitionMismatch);
         }
+        let replacing_definition = before.state != ServiceState::NotInstalled;
         self.ensure_authority(adapter).await?;
         let mut account_created = false;
         if let Some(probe) = adapter.account_probe() {
@@ -394,7 +395,9 @@ where
                 account_created = true;
             }
         }
-        let install_result = self.execute_steps(&adapter.install_steps(update)).await;
+        let install_result = self
+            .execute_steps(&adapter.install_steps(replacing_definition))
+            .await;
         if install_result.is_err()
             && account_created
             && let Some(step) = adapter.account_create_step()
@@ -421,7 +424,7 @@ where
                 return Err(error);
             }
         };
-        self.execute_steps(&adapter.finalize_install_steps(update))
+        self.execute_steps(&adapter.finalize_install_steps(replacing_definition))
             .await?;
         Ok(ServiceInstallResult {
             status: after,

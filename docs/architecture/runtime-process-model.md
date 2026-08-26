@@ -116,10 +116,52 @@ version. A match becomes `succeeded`; an interrupted handoff, identity change,
 or version mismatch becomes `recoveryRequired`.
 
 Replacement package bytes and restoration of the prior service definition are
-one signed distribution transaction owned by the server installer/updater.
-They must not be duplicated inside the runtime maintenance module. Until that
-distribution transaction is available, update preparation is not a standalone
-server package installer.
+one distribution transaction owned by the native package manager and
+`package_lifecycle`, not by runtime maintenance. The credential-free receipt
+advances through `Prepared`, `ServiceStopped`, `FilesCommitted`,
+`ServiceStarted`, `Verified`, or `RolledBack` under the same per-root operation
+lock used by store maintenance. It binds the opaque installer nonce,
+source/target versions, environment/storage identities, canonical root, prior
+binary path/SHA-256, service mode/owner, verified backup ID/schema, and update
+operation ID.
+
+After file commit, the replacement binary installs or updates the native
+definition and must prove matching environment/storage identities and target
+version, the current local-control protocol, verified packaged web assets, a
+loopback bind, and an exact service definition. Failed verification stops the
+new service before the package manager restores its exact saved bytes. The
+restored binary may start only when its path and SHA-256 match the receipt and
+the live schema still equals the backup schema. A committed migration therefore
+fails closed: the rollback command stops and removes the managed registration
+so old bytes cannot auto-start, while PKG/DEB/RPM hooks restore the failed new
+bytes and all platforms retain the verified backup/recovery evidence. Rollback
+never applies old schema bytes to a newer database.
+
+Package hooks retain their private transaction directory and opaque nonce until
+a terminal result. A repeated pre-install resumes a matching clean install or
+identity-bound stopped update; it never overwrites mismatched recovery state.
+Likewise, purge persists authorization before shutdown so a CLI interrupted
+after the acknowledgement can resume offline with the same plan and exact
+typed name. Package command output reports only phase/state/version—not the
+receipt's user, root, binary path, hash, backup, or identities.
+
+The safe pre-install command is available only in packages that include this
+protocol. An upgrade from an older package without it aborts before file
+mutation and requires a documented preserve-data reinstall path; hooks never
+guess that an uncoordinated upgrade is safe.
+
+## Uninstall and explicit purge
+
+Service and package uninstall stop/remove only package-owned registration and
+files and preserve the exact server data root and backups. Purge is a separate
+two-command local-control transaction. Its short-lived plan binds the
+environment/storage identities, canonical root, exact user-facing name, and
+current project/worktree/process/client counts. Authorization requires exact
+name typing and zero project, worktree, and owned-process guards. After the
+server acknowledges shutdown, the CLI waits for the runtime lock, acquires the
+store-operation lock, rechecks identity markers and database guards, and
+removes only that canonical root. There is no MSI, PKG, DEB, RPM, or
+`service uninstall` purge flag.
 
 ## Network-visible service state
 

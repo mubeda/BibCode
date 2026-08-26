@@ -168,6 +168,11 @@ export function renderMacDistribution(template: string, version: string): string
   return assertNoPlaceholder(template.replaceAll("@VERSION@", version));
 }
 
+export function renderPackageHook(template: string, version: string): string {
+  assertVersion(version);
+  return assertNoPlaceholder(template.replaceAll("@PACKAGE_VERSION@", version));
+}
+
 export function validateMacPackagePayloadListing(contents: string): ReadonlyArray<string> {
   const paths = contents.split(/\r?\n/u).filter(Boolean);
   const pathSet = new Set(paths);
@@ -257,6 +262,7 @@ export interface RenderRpmMetadataInput {
   readonly payloadRoot: string;
   readonly payload: ReadonlyArray<InstallerPayloadRecord>;
   readonly scripts: {
+    readonly preInstall: string;
     readonly postInstall: string;
     readonly preUninstall: string;
     readonly postUninstall: string;
@@ -314,6 +320,7 @@ export function renderRpmMetadata(input: RenderRpmMetadataInput): string {
   return assertNoPlaceholder(
     input.template
       .replace("  # @ASSETS@", assets)
+      .replaceAll("@PRE_INSTALL_SCRIPT@", NodePath.resolve(input.scripts.preInstall))
       .replaceAll("@POST_INSTALL_SCRIPT@", NodePath.resolve(input.scripts.postInstall))
       .replaceAll("@PRE_UNINSTALL_SCRIPT@", NodePath.resolve(input.scripts.preUninstall))
       .replaceAll("@POST_UNINSTALL_SCRIPT@", NodePath.resolve(input.scripts.postUninstall)),

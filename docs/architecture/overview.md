@@ -206,10 +206,13 @@ Native packaging consumes that same verified stage without introducing another
 runtime or service-definition source. WiX owns only the per-user Windows file,
 PATH, and transaction hooks; Apple package scripts select the eligible console
 user or explicitly fall back to files-only; DEB/RPM hooks require an explicit
-non-root workstation owner or remain files-only. All three call the Rust
-`bibcode service` operations, which remain the sole Task Scheduler, launchd,
-and systemd definition owners. Native package removal preserves the server data
-root, and no native package opens a firewall or enables non-loopback HTTP.
+non-root workstation owner or remain files-only. The hooks pin that owner's
+resolved home/data root and use the Rust package lifecycle to drain, back up,
+stop, replace, restart, and identity-verify one update. Rust service adapters
+remain the sole Task Scheduler, launchd, and systemd definition owners. Native
+package removal preserves the server data root; purge is a separate online
+plan plus exact confirmation, and no package opens a firewall or enables
+non-loopback HTTP.
 
 The artifact builder resolves Cargo and rustc from the exact checked-in Rustup
 channel and sets `RUSTC` explicitly, preventing a system/Homebrew compiler from

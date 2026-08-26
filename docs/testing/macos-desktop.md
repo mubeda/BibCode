@@ -155,6 +155,17 @@ install, upgrade, and uninstall evidence belongs on the approved disposable
 runner and must record the LaunchAgent owner/state plus the preserved data
 root. Remove only the exact inspection directory during cleanup.
 
+On that runner, inspect `/var/db/bibcode-server-package` permissions and prove
+the transaction contains no credential. Exercise files-only fallback, clean
+console-user install, a prepared upgrade, activation failure with exact
+install-root restoration, and seeded schema advancement that refuses
+old-binary restart while retaining recovery artifacts. The console user's
+recorded home/data root must match the LaunchAgent definition even when the
+installer process starts with root's `HOME`. An older-package fixture without
+`package prepare` must stop before payload replacement. Package removal/manual
+service uninstall preserves data; explicit purge uses a fresh exact-name plan
+and leaves a same-parent sentinel untouched.
+
 ## Application and DMG build inspection
 
 Build the host-native artifact:

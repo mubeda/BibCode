@@ -331,11 +331,11 @@ Implementation evidence (2026-08-26):
 - Test: `apps/server/tests/package_lifecycle.rs`, `service_lifecycle.rs`, `cli_smoke.rs`
 - Modify: all platform package scripts/templates from Task 4
 
-- [ ] **Step 1: Write state-machine tests before installer hooks**
+- [x] **Step 1: Write state-machine tests before installer hooks**
 
 Cover clean install, service already installed, one-process/data-root lock, active mutation drain, backup success/failure, stop timeout, binary replacement, service definition replacement, identity-preserving restart, health failure/rollback, irreversible DB migration, uninstall with data, reinstall adoption, explicit purge, and crash/retry at every durable boundary.
 
-- [ ] **Step 2: Add a versioned package lifecycle receipt**
+- [x] **Step 2: Add a versioned package lifecycle receipt**
 
 ```rust
 pub enum PackageLifecyclePhase {
@@ -350,23 +350,23 @@ pub enum PackageLifecyclePhase {
 
 The receipt binds package version, environment/storage IDs, data-root identity, prior binary hash/path, service mode/owner, backup ID, and phase. It contains no credential. Package scripts pass an opaque nonce and cannot select a different data root after preparation.
 
-- [ ] **Step 3: Prepare upgrade through local control**
+- [x] **Step 3: Prepare upgrade through local control**
 
 Close mutation admission, drain bounded active work, cancel/reap owned provider/terminal/SSH children, checkpoint WAL, create/verify the pre-update backup, then stop the service. Abort before file mutation when any required preparation fails.
 
-- [ ] **Step 4: Verify identity and roll back bytes, never schema**
+- [x] **Step 4: Verify identity and roll back bytes, never schema**
 
 After replacement, start and check descriptor health, environment UUID, storage UUID, version, protocol, control channel, web assets, and loopback bind. If the new binary cannot start before an irreversible migration, restore the previous package bytes/service definition and verify once. If an irreversible migration committed, leave the verified backup and recovery instructions; never run the older binary against the newer database.
 
-- [ ] **Step 5: Separate uninstall and purge**
+- [x] **Step 5: Separate uninstall and purge**
 
 `bibcode service uninstall` and native uninstaller remove the service/task and package-owned files, preserve the verified data root/backups, and print their exact retained path. `bibcode storage purge` requires an online removal plan, full administrator session/local authority, exact typed environment name, resolved-root containment, and existing project/worktree removal guards. There is no MSI/PKG/DEB/RPM purge flag.
 
-- [ ] **Step 6: Test headless account ownership and rollback**
+- [x] **Step 6: Test headless account ownership and rollback**
 
 Require explicit elevation, create/use the dedicated `bibcode` account without adopting a conflicting pre-existing account, set minimal ACLs, use no interactive provider secrets, and report account removal separately. Rollback never deletes a pre-existing user/account.
 
-- [ ] **Step 7: Run lifecycle tests and commit**
+- [x] **Step 7: Run lifecycle tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test package_lifecycle -- --nocapture
@@ -375,6 +375,50 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test cli_smoke pack
 git add apps/server/src/service apps/server/src/package_lifecycle.rs apps/server/src/config.rs apps/server/src/lib.rs apps/server/src/local_control apps/server/tests/package_lifecycle.rs apps/server/tests/service_lifecycle.rs apps/server/tests/cli_smoke.rs packaging/server
 git commit -m "feat(server): make package lifecycle identity safe"
 ```
+
+Implementation evidence (2026-08-26):
+
+- `package_lifecycle` persists one credential-free, nonce-hashed receipt with
+  the six planned durable phases and the package, environment, storage, root,
+  old-binary, service-owner, backup, schema, and operation bindings. The
+  per-root store-operation lock serializes concurrent installers; retries may
+  resume only a matching committed handoff.
+- Protected local control now prepares and commits an update, returns the
+  verified backup schema, exposes bounded loopback/assets status, and owns the
+  fresh purge plan/authorization. Purge closes admission, rechecks project,
+  worktree, process, paired-client, identity, runtime-lock, and operation-lock
+  evidence, supports a durable post-shutdown retry, and removes only the exact
+  canonical root. Service/package uninstall remains preserve-data and no
+  package format exposes purge.
+- New package activation explicitly starts an idempotently matching stopped
+  definition, verifies environment/storage/version/protocol/assets/loopback/
+  definition, and stops failed activations before byte restoration. Old-binary
+  rollback first proves exact path/SHA-256 and unchanged schema. Any unsafe
+  rollback removes the managed registration so an old binary cannot
+  auto-start; PKG/DEB/RPM then restore the failed new bytes for recovery.
+- WiX, PKG, DEB, and RPM hooks use the package transaction. macOS/Linux pin the
+  selected workstation user's home and exact `--base-dir`, retain private
+  crash-retry state, reject mismatched state, preserve prior byte snapshots,
+  and keep uninstall distinct from purge. Upgrade from a package that lacks
+  `package prepare` aborts before file mutation and uses the documented
+  preserve-data reinstall path.
+- Focused validation passes 76 integration tests across package lifecycle,
+  service lifecycle, CLI, local control, and production maintenance, plus the
+  receipt-redaction unit test and 28 server-packaging/build tests. Shell syntax,
+  `cargo fmt --all --check`, server all-target Clippy with warnings denied,
+  `vp check`, and the serial workspace typecheck pass. The maintenance PID
+  fixture now waits through the observable empty-file creation race uncovered
+  by the combined run.
+- A final real macOS build produced
+  `/private/tmp/bibcode-server-task5-native-v2`: portable SHA-256
+  `321bc427a481006b5d7ce1b069fedd4e81110e1fe675cd6e06a68d74a7bc0e40`
+  and universal PKG SHA-256
+  `889c6d6c075b679efc1242956b3f4218a08d69e340613d831640301c15aff105`.
+  Expanded evidence proves exactly `x86_64 arm64`, valid strict ad-hoc binary
+  signing, no materialized AppleDouble files, shell-valid and byte-identical
+  rendered hooks, and intentionally no PKG signature. Windows/Linux native
+  install execution remains owned by Tasks 7 and 8; template/contract results
+  are not mislabeled as native execution.
 
 ### Task 6: Sign, checksum, inventory, and attest final artifact bytes
 

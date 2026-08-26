@@ -116,6 +116,26 @@ required. Restart success requires the expected version and the same
 environment/storage identities; package-byte rollback belongs to the signed
 distribution transaction.
 
+### Package Lifecycle Receipt
+
+A versioned, credential-free installer receipt under the selected server data
+root. Its durable phases are `Prepared`, `ServiceStopped`, `FilesCommitted`,
+`ServiceStarted`, `Verified`, and `RolledBack`. It binds the hashed opaque
+installer nonce, source/target versions, environment/storage identities,
+canonical root, prior binary path/SHA-256, service mode/owner, verified backup,
+backup schema version, and operation ID. One data-root operation lock
+serializes retries and competing installers.
+
+### Storage Purge Plan
+
+A five-minute host-local authorization that records the exact environment and
+storage identities, canonical data root, user-facing environment alias, and
+project/worktree/process/paired-client counts. Exact alias typing authorizes
+only that plan. Execution waits for the runtime to be offline, reacquires the
+store-operation lock, revalidates identity markers and removal guards, and
+deletes only the planned root. Uninstall, Forget, and package removal are not
+purge aliases.
+
 ### Managed WSL Runtime
 
 The native Linux server package installed per WSL user under

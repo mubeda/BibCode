@@ -1,0 +1,105 @@
+#!/bin/sh
+set -eu
+
+package_version="@PACKAGE_VERSION@"
+state_root="/var/lib/bibcode-server-package"
+owner_file="$state_root/workstation-user"
+transaction="$state_root/transaction"
+rollback_root="$state_root/rollback"
+
+mode="${BIBCODE_PACKAGE_MODE:-files-only}"
+package_user="${BIBCODE_PACKAGE_USER:-}"
+if [ -f "$owner_file" ]; then
+  mode="workstation"
+  package_user=$(/bin/sed -n '1p' "$owner_file")
+fi
+case "$mode" in
+  files-only)
+    echo "BiBCode Server: files-only installation; no service transaction was prepared."
+    exit 0
+    ;;
+  workstation) ;;
+  *)
+    echo "BiBCode Server: BIBCODE_PACKAGE_MODE must be files-only or workstation." >&2
+    exit 1
+    ;;
+esac
+case "$package_user" in
+  ""|root|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server: workstation mode requires a valid non-root BIBCODE_PACKAGE_USER." >&2
+    exit 1
+    ;;
+esac
+/usr/bin/getent passwd "$package_user" >/dev/null
+package_home=$(/usr/bin/getent passwd "$package_user" | /usr/bin/cut -d: -f6)
+case "$package_home" in
+  /*) ;;
+  *)
+    echo "BiBCode Server: workstation package user has no absolute home directory." >&2
+    exit 1
+    ;;
+esac
+data_root="$package_home/.bibcode"
+
+/usr/bin/install -d -m 0700 "$state_root"
+if [ -d "$transaction" ]; then
+  prior_user=$(/bin/sed -n '1p' "$transaction/user" 2>/dev/null || true)
+  prior_nonce=$(/bin/sed -n '1p' "$transaction/nonce" 2>/dev/null || true)
+  prior_version=$(/bin/sed -n '1p' "$transaction/target-version" 2>/dev/null || true)
+  prior_root=$(/bin/sed -n '1p' "$transaction/data-root" 2>/dev/null || true)
+  case "$prior_nonce" in
+    ""|*[!A-Za-z0-9._-]*) prior_nonce="" ;;
+  esac
+  if [ "$prior_user" = "$package_user" ] && [ -n "$prior_nonce" ] && \
+    [ "$prior_version" = "$package_version" ] && [ "$prior_root" = "$data_root" ]
+  then
+    if [ -f "$transaction/clean-install" ]; then
+      echo "BiBCode Server: resuming the prepared clean install."
+      exit 0
+    fi
+    if [ -x "$rollback_root/bibcode" ] && [ -d "$rollback_root/share-bibcode" ]; then
+      if [ ! -f "$transaction/upgrade" ]; then
+        if ! /usr/sbin/runuser -u "$package_user" -- \
+          /usr/bin/env HOME="$package_home" USER="$package_user" LOGNAME="$package_user" \
+          /usr/bin/bibcode package prepare --mode workstation --host 127.0.0.1 --format json \
+          --base-dir "$data_root" --nonce "$prior_nonce" --target-version "$package_version"
+        then
+          echo "BiBCode Server: prepared upgrade retry could not resume safely." >&2
+          exit 1
+        fi
+        /usr/bin/touch "$transaction/upgrade"
+      fi
+      echo "BiBCode Server: resuming the identity-bound upgrade."
+      exit 0
+    fi
+  fi
+  echo "BiBCode Server: an incomplete or mismatched package transaction requires recovery." >&2
+  exit 1
+fi
+/bin/rm -R -f -- "$rollback_root"
+/usr/bin/install -d -m 0700 "$transaction"
+nonce=$(/bin/sed -n '1p' /proc/sys/kernel/random/uuid)
+umask 077
+/usr/bin/printf '%s\n' "$package_user" > "$transaction/user"
+/usr/bin/printf '%s\n' "$nonce" > "$transaction/nonce"
+/usr/bin/printf '%s\n' "$package_version" > "$transaction/target-version"
+/usr/bin/printf '%s\n' "$data_root" > "$transaction/data-root"
+
+if [ ! -x /usr/bin/bibcode ]; then
+  /usr/bin/touch "$transaction/clean-install"
+  exit 0
+fi
+
+/usr/bin/install -d -m 0700 "$rollback_root"
+/bin/cp --preserve=all -- /usr/bin/bibcode "$rollback_root/bibcode"
+/bin/cp -a -- /usr/share/bibcode "$rollback_root/share-bibcode"
+if ! /usr/sbin/runuser -u "$package_user" -- \
+  /usr/bin/env HOME="$package_home" USER="$package_user" LOGNAME="$package_user" \
+  /usr/bin/bibcode package prepare --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  /bin/rm -R -f -- "$transaction" "$rollback_root"
+  echo "BiBCode Server: safe update preparation failed before package mutation." >&2
+  exit 1
+fi
+/usr/bin/touch "$transaction/upgrade"

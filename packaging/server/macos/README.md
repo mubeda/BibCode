@@ -5,13 +5,25 @@ combined `x86_64` and `arm64` Rust executable plus the verified server-only
 layout. It installs under `/usr/local/libexec/bibcode-server` and owns the
 relative `/usr/local/bin/bibcode` link.
 
-`postinstall` detects a valid non-root console user and invokes the installed
-binary's `service install --mode workstation --host 127.0.0.1 --update`
-operation in that user's launchd domain. Without an eligible console user or
-on a non-root target volume, installation is explicitly files-only. The Rust
-service adapter remains the only LaunchAgent definition owner. No script opens
-a listener beyond loopback, enables remote access, receives a secret, or
-deletes the data root.
+`preinstall` detects a valid non-root console user, resolves and records that
+user's exact home/data root, snapshots the prior install root, and asks the old
+binary to drain, back up, and stop through the package lifecycle. `postinstall`
+runs the new binary's activation in that user's launchd domain. On failure it
+restores the exact prior install tree and permits the old binary to start only
+after receipt hash/path and schema checks. If rollback is unsafe, the new bytes,
+failed-byte snapshot, and verified backup remain for recovery. Without an
+eligible console user or on a non-root target volume, installation is
+explicitly files-only. The Rust service adapter remains the only LaunchAgent
+definition owner. No script opens a listener beyond loopback, enables remote
+access, receives a secret, purges, or deletes the data root.
+
+The private transaction survives interruption and a repeated pre-install
+resumes only the same user, root, target version, nonce, and snapshot. Any
+mismatch fails closed without deleting the recovery material.
+
+Safe upgrade requires the installed package to expose `package prepare`. An
+older PKG without it aborts before replacement; preserve the data root, remove
+only package/service files, and use a clean install to adopt that root.
 
 On either native Mac, install both repository-pinned Rust targets first, then
 build:

@@ -648,20 +648,115 @@ async fn production_local_control_prepares_update_without_exposing_network_maint
         .await
         .expect("read update preparation response");
     assert_eq!(response.request_id, sent.request_id);
-    assert!(matches!(
-        response.body,
+    let operation_id = match response.body {
         ControlResponseBody::UpdatePrepared {
             ref operation_id,
             ref backup_id,
+            backup_schema_version,
+            ref current_version,
             ..
-        } if !operation_id.is_empty() && !backup_id.is_empty()
-    ));
+        } if !operation_id.is_empty()
+            && !backup_id.is_empty()
+            && backup_schema_version >= 0
+            && current_version == env!("CARGO_PKG_VERSION") =>
+        {
+            operation_id.clone()
+        }
+        other => panic!("unexpected update preparation response: {other:?}"),
+    };
 
-    handle.shutdown();
+    let mut stream = connect(&root).await;
+    let committed = request(ControlRequestBody::ServiceCommitUpdate { operation_id });
+    write_request(&mut stream, &committed)
+        .await
+        .expect("write update commit request");
+    let response = read_response(&mut stream)
+        .await
+        .expect("commit acknowledgement precedes shutdown");
+    assert_eq!(response.request_id, committed.request_id);
+    assert!(
+        matches!(response.body, ControlResponseBody::UpdateCommitted),
+        "unexpected update commit response: {:?}",
+        response.body
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+        .await
+        .expect("committed update cancels the server after its acknowledgement");
+
     handle
         .join()
         .await
         .expect("join prepared production server");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn purge_requires_a_fresh_online_plan_exact_typed_name_and_shutdown_acknowledgement() {
+    let root = tempfile::tempdir().expect("temporary data root");
+    let handle = ServerRuntime::start(test_config(&root))
+        .await
+        .expect("start production server for purge planning");
+
+    let mut stream = connect(&root).await;
+    let request_plan = request(ControlRequestBody::StoragePlanPurge {
+        environment_name: "Disposable environment".to_owned(),
+    });
+    write_request(&mut stream, &request_plan)
+        .await
+        .expect("write purge plan request");
+    let response = read_response(&mut stream)
+        .await
+        .expect("read purge plan response");
+    let plan = match response.body {
+        ControlResponseBody::PurgePlanned { plan } => plan,
+        other => panic!("unexpected purge plan response: {other:?}"),
+    };
+    assert_eq!(plan.environment_name, "Disposable environment");
+    assert_eq!(plan.project_count, 0);
+    assert_eq!(plan.worktree_count, 0);
+    assert_eq!(plan.process_count, 0);
+    assert_eq!(
+        plan.data_root,
+        root.path().canonicalize().expect("canonical purge root")
+    );
+
+    let mut stream = connect(&root).await;
+    let wrong_confirmation = request(ControlRequestBody::StorageAuthorizePurge {
+        operation_id: plan.plan_id.to_string(),
+        typed_environment_name: "disposable environment".to_owned(),
+    });
+    write_request(&mut stream, &wrong_confirmation)
+        .await
+        .expect("write wrong confirmation");
+    let response = read_response(&mut stream)
+        .await
+        .expect("read rejected confirmation");
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::Error { ref code, .. } if code == "purge_confirmation_failed"
+    ));
+
+    let mut stream = connect(&root).await;
+    let authorize = request(ControlRequestBody::StorageAuthorizePurge {
+        operation_id: plan.plan_id.to_string(),
+        typed_environment_name: "Disposable environment".to_owned(),
+    });
+    write_request(&mut stream, &authorize)
+        .await
+        .expect("write exact purge confirmation");
+    let response = read_response(&mut stream)
+        .await
+        .expect("purge authorization precedes shutdown");
+    assert!(matches!(
+        response.body,
+        ControlResponseBody::PurgeAuthorized { ref authorization }
+            if authorization.plan_id == plan.plan_id
+    ));
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown())
+        .await
+        .expect("authorized purge shuts down the server");
+    handle.join().await.expect("join purge-authorized server");
 }
 
 #[test]

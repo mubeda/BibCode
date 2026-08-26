@@ -1,10 +1,16 @@
 #!/bin/sh
 set -eu
 
+package_version="@PACKAGE_VERSION@"
 binary="/usr/local/libexec/bibcode-server/bin/bibcode"
+install_root="/usr/local/libexec/bibcode-server"
+state_root="/var/db/bibcode-server-package"
+transaction="$state_root/transaction"
+rollback_root="$state_root/rollback"
 target_root="${3:-/}"
 
-if [ "$target_root" != "/" ] || [ ! -x "$binary" ]; then
+if [ "$target_root" != "/" ]; then
+  echo "BiBCode Server preinstall: files-only on a non-root target volume."
   exit 0
 fi
 
@@ -15,12 +21,81 @@ case "$console_user" in
     exit 0
     ;;
 esac
-
 console_uid=$(/usr/bin/id -u "$console_user")
 if [ "$console_uid" -eq 0 ]; then
   echo "BiBCode Server preinstall: files-only; refusing the root account."
   exit 0
 fi
+console_home=$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory)
+console_home=${console_home#NFSHomeDirectory: }
+case "$console_home" in
+  /*) ;;
+  *)
+    echo "BiBCode Server preinstall: files-only; the console user has no absolute home directory."
+    exit 0
+    ;;
+esac
+data_root="$console_home/.bibcode"
 
-/bin/launchctl asuser "$console_uid" /usr/bin/sudo -u "$console_user" -- \
-  "$binary" service stop --mode workstation --format json
+/usr/bin/install -d -m 0700 "$state_root"
+if [ -d "$transaction" ]; then
+  prior_user=$(/bin/sed -n '1p' "$transaction/user" 2>/dev/null || true)
+  prior_nonce=$(/bin/sed -n '1p' "$transaction/nonce" 2>/dev/null || true)
+  prior_version=$(/bin/sed -n '1p' "$transaction/target-version" 2>/dev/null || true)
+  prior_root=$(/bin/sed -n '1p' "$transaction/data-root" 2>/dev/null || true)
+  case "$prior_nonce" in
+    ""|*[!A-Za-z0-9._-]*) prior_nonce="" ;;
+  esac
+  if [ "$prior_user" = "$console_user" ] && [ -n "$prior_nonce" ] && \
+    [ "$prior_version" = "$package_version" ] && [ "$prior_root" = "$data_root" ]
+  then
+    if [ -f "$transaction/clean-install" ]; then
+      echo "BiBCode Server preinstall: resuming the prepared clean install."
+      exit 0
+    fi
+    if [ -x "$rollback_root/install-root/bin/bibcode" ]; then
+      if [ ! -f "$transaction/upgrade" ]; then
+        if ! /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "$console_user" -- \
+          "$binary" package prepare --mode workstation --host 127.0.0.1 --format json \
+          --base-dir "$data_root" --nonce "$prior_nonce" --target-version "$package_version"
+        then
+          echo "BiBCode Server preinstall: prepared upgrade retry could not resume safely." >&2
+          exit 1
+        fi
+        /usr/bin/touch "$transaction/upgrade"
+      fi
+      echo "BiBCode Server preinstall: resuming the identity-bound upgrade."
+      exit 0
+    fi
+  fi
+  echo "BiBCode Server preinstall: an incomplete or mismatched package transaction requires recovery." >&2
+  exit 1
+fi
+/bin/rm -R -f -- "$rollback_root"
+/usr/bin/install -d -m 0700 "$transaction"
+nonce=$(/usr/bin/uuidgen)
+umask 077
+/usr/bin/printf '%s\n' "$console_user" > "$transaction/user"
+/usr/bin/printf '%s\n' "$nonce" > "$transaction/nonce"
+/usr/bin/printf '%s\n' "$package_version" > "$transaction/target-version"
+/usr/bin/printf '%s\n' "$data_root" > "$transaction/data-root"
+
+if [ ! -x "$binary" ]; then
+  /usr/bin/touch "$transaction/clean-install"
+  exit 0
+fi
+
+/usr/bin/install -d -m 0700 "$rollback_root"
+/usr/bin/ditto "$install_root" "$rollback_root/install-root"
+if [ -L /usr/local/bin/bibcode ]; then
+  /usr/bin/readlink /usr/local/bin/bibcode > "$rollback_root/link-target"
+fi
+if ! /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "$console_user" -- \
+  "$binary" package prepare --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  /bin/rm -R -f -- "$transaction" "$rollback_root"
+  echo "BiBCode Server preinstall: safe update preparation failed before package mutation." >&2
+  exit 1
+fi
+/usr/bin/touch "$transaction/upgrade"

@@ -166,6 +166,10 @@ impl ServerTerminalServices {
         }
     }
 
+    pub(crate) fn active_owned_process_count(&self) -> usize {
+        self.process_attribution.active_registration_count()
+    }
+
     pub(crate) async fn shutdown_with_process_ownership(&self, ownership: RuntimeProcessOwnership) {
         self.terminal.shutdown().await;
         match self

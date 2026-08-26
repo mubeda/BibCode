@@ -360,11 +360,22 @@ uninstall custom-action order. Reject secrets, shell interpolation, firewall or
 non-loopback HTTP actions, purge/data-root deletion, and any service definition
 not delegated to `bibcode.exe service`.
 
+Decompile the execute sequence and prove the old binary's `package prepare`
+runs before `RemoveExistingProducts`, the new binary's activation runs after
+`InstallFiles`, MSI rollback restores prior bytes before the receipt-bound
+rollback action, and actual uninstall—but not major upgrade—removes the user
+task while preserving data. Seed an activation health failure and a schema
+advance as separate cases. The first must restore and verify the old version;
+the second must retain the new bytes and backup without starting the old
+binary. A fixture MSI lacking `package prepare` must fail before removal.
+
 An unsigned MSI is expected only for `--unsigned-test`. Stable evidence later
 requires successful Authenticode verification for both the contained executable
 and MSI. Install/remove only on an approved disposable native runner; record the
 installing SID, scheduled-task identity/state, version, loopback health, and
-preserved data root.
+preserved data root. Run the two-step `storage purge` only after uninstall and
+project/worktree/process cleanup; record exact typed-name and same-parent
+sentinel evidence.
 
 ## NSIS package build and inspection
 

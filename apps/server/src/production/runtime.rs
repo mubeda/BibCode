@@ -555,6 +555,10 @@ impl ProductionRuntime {
         }
     }
 
+    pub(crate) fn active_owned_process_count(&self) -> usize {
+        self.terminal_services.active_owned_process_count()
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.quiesce_for_update().await;
     }

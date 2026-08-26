@@ -93,6 +93,31 @@ Uninstall removes registration but preserves the data root; there is no purge
 flag. See [Server administration](../../docs/user/server-administration.md) for
 platform mechanisms, exact commands, pairing, recovery, and safety notes.
 
+Native installers coordinate replacement through the internal
+`package prepare|activate|rollback` surface. The old binary drains through
+protected local control, creates a verified backup, stops, and writes an
+identity-bound receipt before the package manager may replace files. The new
+binary must verify the same environment/storage identities, expected version,
+local-control protocol, loopback listener, web assets, and service definition.
+Rollback starts an older binary only after its path and SHA-256 match the
+receipt and the database schema still matches the pre-update backup.
+
+Destructive storage removal is deliberately separate and two-step:
+
+```sh
+bibcode storage purge plan --environment-name "Build Mac" --json
+bibcode storage purge execute \
+  --plan-id <uuid> \
+  --confirm-environment-name "Build Mac" \
+  --json
+```
+
+Both commands use the same `--base-dir` when it is not the default. Planning
+requires the running server's protected local-control endpoint. Execution
+requires the exact name, fresh plan, environment/storage markers, an offline
+runtime, and no project, worktree, or owned-process guard. It removes only the
+canonical selected data root; no package or service command has a purge flag.
+
 ## Validation
 
 Run focused owners from the repository root:
@@ -104,6 +129,7 @@ cargo test -p bibcode-server --test local_control -- --nocapture
 cargo test -p bibcode-server --test service_lifecycle -- --nocapture
 cargo test -p bibcode-server --test production_control -- --nocapture
 cargo test -p bibcode-server --test production_maintenance -- --nocapture
+cargo test -p bibcode-server --test package_lifecycle -- --nocapture
 ```
 
 On native Windows, use `node scripts/run-msvc-x64.mjs cargo ...`. Follow the

@@ -13,6 +13,7 @@ import {
   generateWixFilesFragment,
   renderDebCargoManifest,
   renderMacDistribution,
+  renderPackageHook,
   renderRpmMetadata,
   resolveLinuxNativePackageCommands,
   resolveNativeInstallerDescriptor,
@@ -89,6 +90,15 @@ describe("server installer source contract", () => {
     NodeFS.writeFileSync(NodePath.join(root, "share/bibcode/LICENSE"), "license");
     const payload = await collectInstallerPayload(root, "bibcode");
     const mac = renderMacDistribution(read("packaging/server/macos/Distribution.xml"), "0.4.1");
+    const macPreinstall = renderPackageHook(
+      read("packaging/server/macos/scripts/preinstall"),
+      "0.4.1",
+    );
+    const debPreinstall = renderPackageHook(read("packaging/server/linux/deb/preinst"), "0.4.1");
+    const rpmPreinstall = renderPackageHook(
+      read("packaging/server/linux/rpm/pre_install"),
+      "0.4.1",
+    );
     const deb = renderDebCargoManifest({
       payloadRoot: root,
       payload,
@@ -100,6 +110,7 @@ describe("server installer source contract", () => {
       payloadRoot: root,
       payload,
       scripts: {
+        preInstall: NodePath.join(repoRoot, "packaging/server/linux/rpm/pre_install"),
         postInstall: NodePath.join(repoRoot, "packaging/server/linux/rpm/post_install"),
         preUninstall: NodePath.join(repoRoot, "packaging/server/linux/rpm/pre_uninstall"),
         postUninstall: NodePath.join(repoRoot, "packaging/server/linux/rpm/post_uninstall"),
@@ -112,7 +123,9 @@ describe("server installer source contract", () => {
     expect(rpm).toContain('dest = "/usr/bin/bibcode"');
     expect(rpm).toContain('dest = "/usr/share/bibcode/LICENSE"');
     expect(rpm).not.toContain("auto-req");
-    expect(`${mac}\n${deb}\n${rpm}`).not.toMatch(/@[A-Z][A-Z_]+@/u);
+    expect(
+      `${mac}\n${macPreinstall}\n${debPreinstall}\n${rpmPreinstall}\n${deb}\n${rpm}`,
+    ).not.toMatch(/@[A-Z][A-Z_]+@/u);
   });
 
   it("uses each Linux package tool's supported manifest and architecture arguments", () => {
@@ -160,7 +173,11 @@ describe("server installer source contract", () => {
     expect(product).toContain('System="no"');
     expect(product).toContain('Permanent="no"');
     expect(product).toContain('FileRef="BibcodeExecutable"');
-    expect(product).toMatch(/service install[^"\n]*--mode workstation/iu);
+    expect(product).toMatch(/package prepare[^"\n]*--mode workstation/iu);
+    expect(product).toMatch(/package activate[^"\n]*--mode workstation/iu);
+    expect(product).toMatch(/package rollback[^"\n]*--mode workstation/iu);
+    expect(product).toContain("[ProductCode]");
+    expect(product).toContain("[ProductVersion]");
     expect(product).toMatch(/service uninstall[^"\n]*--mode workstation/iu);
     expect(product).toContain('Execute="rollback"');
     expect(product).toContain('Impersonate="yes"');
@@ -179,10 +196,19 @@ describe("server installer source contract", () => {
     expect(distribution).toContain("com.bibcode.server");
     expect(distribution).toContain("arm64,x86_64");
     expect(preinstall).toContain("/usr/local/libexec/bibcode-server/bin/bibcode");
-    expect(preinstall).toMatch(/service stop[^\n]*--mode workstation/iu);
-    expect(postinstall).toContain("/dev/console");
+    expect(preinstall).toContain("@PACKAGE_VERSION@");
+    expect(preinstall).toMatch(/package prepare[^\n]*--mode workstation/iu);
+    expect(preinstall).toContain("/var/db/bibcode-server-package");
+    expect(preinstall).toContain("/usr/local/libexec/bibcode-server");
+    expect(preinstall).toContain("/dev/console");
     expect(postinstall).toContain("launchctl asuser");
-    expect(postinstall).toMatch(/service install[^\n]*--mode workstation[^\n]*--update/iu);
+    expect(postinstall).toMatch(/package activate[^\n]*--mode workstation/iu);
+    expect(postinstall).toMatch(/package rollback[^\n]*--mode workstation/iu);
+    expect(combined).toContain("sudo -H -u");
+    expect(combined).toContain('--base-dir "$data_root"');
+    expect(combined).toContain("NFSHomeDirectory");
+    expect(combined).toContain("resuming the identity-bound upgrade");
+    expect(combined).toContain("incomplete or mismatched package transaction requires recovery");
     expect(postinstall).toMatch(/files-only/iu);
     expect(postinstall).not.toMatch(/enable.*linger/iu);
     expectNoUnsafeInstallerPolicy(combined);
@@ -231,9 +257,11 @@ describe("server installer source contract", () => {
   it("makes DEB/RPM package hooks files-only by default and preserves data on removal", () => {
     const files = [
       "packaging/server/linux/deb/postinst",
+      "packaging/server/linux/deb/preinst",
       "packaging/server/linux/deb/prerm",
       "packaging/server/linux/deb/postrm",
       "packaging/server/linux/rpm/metadata.toml",
+      "packaging/server/linux/rpm/pre_install",
       "packaging/server/linux/rpm/post_install",
       "packaging/server/linux/rpm/pre_uninstall",
       "packaging/server/linux/rpm/post_uninstall",
@@ -245,9 +273,17 @@ describe("server installer source contract", () => {
     expect(combined).toContain("workstation");
     expect(combined).toContain("BIBCODE_PACKAGE_USER");
     expect(combined).toContain("package.metadata.generate-rpm");
+    expect(combined).toContain("@PACKAGE_VERSION@");
     expect(combined).not.toContain("auto-req");
-    expect(combined).toMatch(/service install[^\n]*--mode workstation/iu);
+    expect(combined).toMatch(/package prepare[^\n]*--mode workstation/iu);
+    expect(combined).toMatch(/package activate[^\n]*--mode workstation/iu);
+    expect(combined).toMatch(/package rollback[^\n]*--mode workstation/iu);
     expect(combined).toMatch(/service uninstall[^\n]*--mode workstation/iu);
+    expect(combined).toContain('--base-dir "$data_root"');
+    expect(combined).toContain("workstation-root");
+    expect(combined).toContain('HOME="$package_home"');
+    expect(combined).toContain("resuming the identity-bound upgrade");
+    expect(combined).toContain("incomplete or mismatched package transaction requires recovery");
     expect(combined).toContain("data root is preserved");
     expect(combined).not.toMatch(/loginctl\s+enable-linger/iu);
     expectNoUnsafeInstallerPolicy(combined);

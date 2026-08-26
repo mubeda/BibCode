@@ -1,27 +1,85 @@
 #!/bin/sh
 set -eu
 
+package_version="@PACKAGE_VERSION@"
 binary="/usr/local/libexec/bibcode-server/bin/bibcode"
+install_root="/usr/local/libexec/bibcode-server"
+state_root="/var/db/bibcode-server-package"
+transaction="$state_root/transaction"
+rollback_root="$state_root/rollback"
+failed_root="$state_root/failed-new"
 target_root="${3:-/}"
 
-if [ "$target_root" != "/" ]; then
-  echo "BiBCode Server postinstall: files-only on a non-root target volume."
+if [ "$target_root" != "/" ] || [ ! -d "$transaction" ]; then
+  echo "BiBCode Server postinstall: files-only; no package service transaction was prepared."
   exit 0
 fi
 
-console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
+console_user=$(/bin/sed -n '1p' "$transaction/user")
+nonce=$(/bin/sed -n '1p' "$transaction/nonce")
+target_version=$(/bin/sed -n '1p' "$transaction/target-version")
+data_root=$(/bin/sed -n '1p' "$transaction/data-root")
 case "$console_user" in
   ""|root|loginwindow|*[!A-Za-z0-9._-]*)
-    echo "BiBCode Server postinstall: files-only; run 'bibcode service install --mode workstation' as the intended user."
-    exit 0
+    echo "BiBCode Server postinstall: invalid transaction user." >&2
+    exit 1
     ;;
 esac
-
+case "$nonce" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server postinstall: invalid transaction nonce." >&2
+    exit 1
+    ;;
+esac
+if [ "$target_version" != "$package_version" ]; then
+  echo "BiBCode Server postinstall: transaction version mismatch." >&2
+  exit 1
+fi
+case "$data_root" in
+  /*) ;;
+  *)
+    echo "BiBCode Server postinstall: invalid transaction data root." >&2
+    exit 1
+    ;;
+esac
 console_uid=$(/usr/bin/id -u "$console_user")
-if [ "$console_uid" -eq 0 ]; then
-  echo "BiBCode Server postinstall: files-only; refusing the root account."
+
+if /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "$console_user" -- \
+  "$binary" package activate --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  /bin/rm -R -f -- "$transaction" "$rollback_root" "$failed_root"
   exit 0
 fi
 
-/bin/launchctl asuser "$console_uid" /usr/bin/sudo -u "$console_user" -- \
-  "$binary" service install --mode workstation --host 127.0.0.1 --format json --update
+if [ ! -f "$transaction/upgrade" ] || [ ! -x "$rollback_root/install-root/bin/bibcode" ]; then
+  echo "BiBCode Server postinstall: clean activation failed; package files remain for diagnosis and project data is preserved." >&2
+  exit 1
+fi
+
+/bin/rm -R -f -- "$failed_root"
+/bin/mv "$install_root" "$failed_root"
+/usr/bin/ditto "$rollback_root/install-root" "$install_root"
+/bin/rm -f -- /usr/local/bin/bibcode
+if [ -f "$rollback_root/link-target" ]; then
+  old_link=$(/bin/sed -n '1p' "$rollback_root/link-target")
+  /bin/ln -s "$old_link" /usr/local/bin/bibcode
+else
+  /bin/ln -s ../libexec/bibcode-server/bin/bibcode /usr/local/bin/bibcode
+fi
+
+if /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "$console_user" -- \
+  "$install_root/bin/bibcode" package rollback --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  /bin/rm -R -f -- "$transaction" "$rollback_root" "$failed_root"
+  echo "BiBCode Server postinstall: activation failed; previous package bytes and service were restored." >&2
+  exit 1
+fi
+
+/bin/rm -R -f -- "$install_root"
+/bin/mv "$failed_root" "$install_root"
+/bin/rm -f -- /usr/local/bin/bibcode
+/bin/ln -s ../libexec/bibcode-server/bin/bibcode /usr/local/bin/bibcode
+echo "BiBCode Server postinstall: rollback was forbidden or failed; new bytes and the verified backup were preserved for recovery." >&2
+exit 1

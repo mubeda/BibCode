@@ -7,6 +7,7 @@ vendor = "BiBCode"
 assets = [
   # @ASSETS@
 ]
+pre_install_script = "@PRE_INSTALL_SCRIPT@"
 post_install_script = "@POST_INSTALL_SCRIPT@"
 pre_uninstall_script = "@PRE_UNINSTALL_SCRIPT@"
 post_uninstall_script = "@POST_UNINSTALL_SCRIPT@"

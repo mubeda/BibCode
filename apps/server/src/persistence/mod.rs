@@ -9,8 +9,9 @@ mod store;
 pub use backup::{
     BackupError, BackupInventory, BackupInventoryIssue, BackupManifest, BackupTrigger,
     RecoveryAction, RecoveryError, RecoveryResult, StoreInspection, StoreInspectionStatus,
-    StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup, create_verified_backup, inspect_store,
-    inventory_verified_backups, preserve_and_start_empty, restore_backup,
+    StoreOfflineGuard, StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup,
+    create_verified_backup, inspect_store, inventory_verified_backups, preserve_and_start_empty,
+    restore_backup,
 };
 pub(crate) use database::{CommitFence, CommitPermit};
 pub use database::{Database, PersistenceError, Result};

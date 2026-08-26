@@ -14,6 +14,8 @@ control channel, or an explicit SSH/local shell on the server host.
   there are no permission levels yet.
 - `service uninstall` preserves projects, repositories, worktrees, credentials,
   and the selected data root. It has no purge option.
+- Native package removal also preserves the data root. Purge is a separate
+  online plan and exact-confirmation command, never an installer checkbox.
 - Never delete a data root, service account, socket, pipe, or process merely
   because its label looks familiar. Verify the exact service and environment
   identity first.
@@ -226,6 +228,46 @@ It does not delete the data root and exposes no `--purge` flag. Deleting server
 data is a separate destructive decision and is not part of service uninstall,
 client Forget, or route removal.
 
+### Explicit storage purge
+
+First remove every project through the normal environment UI so existing Git
+worktree and process guards run. With the server still online, create a
+short-lived plan from a shell authorized to use its protected local-control
+endpoint:
+
+```sh
+bibcode storage purge plan \
+  --environment-name "Build Mac" \
+  --base-dir /absolute/path/to/bibcode-data \
+  --json
+```
+
+Read the returned environment ID, storage ID, canonical root, expiry, and
+project, worktree, process, and paired-client counts. Other paired clients are
+a warning; any project, worktree, or owned process blocks authorization. If the
+identity, root, or counts are unexpected, stop and investigate.
+
+Execute only the same fresh plan and type the displayed alias exactly:
+
+```sh
+bibcode storage purge execute \
+  --plan-id <uuid-from-plan> \
+  --confirm-environment-name "Build Mac" \
+  --base-dir /absolute/path/to/bibcode-data \
+  --json
+```
+
+Authorization closes mutation admission and asks the server to shut down. The
+CLI then waits for the runtime lock, takes the store-operation lock, rechecks
+the environment/storage markers and database guards, and deletes only that
+canonical root. A stale plan, wrong case in the name, different root, running
+server, new project/worktree, or identity mismatch fails closed. This action is
+irreversible; backups inside the selected root are removed with it.
+
+If the CLI is interrupted after the server acknowledges authorization, rerun
+the same execute command. The durable authorization permits only the same plan
+and exact typed name; it does not reopen planning while the server is offline.
+
 For a desktop-managed SSH environment, **Disconnect** and **Forget** do not run
 these service commands remotely. They close and reap local tunnels and remove
 only that client's routes, secrets, bindings, caches, and presentation state.
@@ -260,10 +302,33 @@ backup, and persists its operation, identities, versions, and bounded state.
 After restart, a matching environment/storage identity and target version
 becomes `succeeded`; interruption or mismatch becomes `recoveryRequired`.
 
-Standalone signed server-package replacement and automatic restoration of the
-previous package/service definition are not yet an administrator command.
-Until that transaction is available, do not treat update preparation or
-`service install --update` as proof that binary bytes were safely replaced.
+Native package hooks drive the internal `package prepare`, `activate`, and
+`rollback` transaction. Before file mutation, the old binary must persist the
+verified backup and an identity-bound, nonce-hashed receipt, commit its update
+handoff, and stop. Activation verifies the same environment/storage IDs,
+target version, local-control protocol, loopback listener, web assets, and
+native definition. If activation fails before a schema migration, the package
+manager restores its exact byte snapshot and the old binary verifies its own
+path/SHA-256 and the unchanged schema before starting. If the schema advanced,
+old-binary rollback is forbidden. The rollback command removes the managed
+registration so old bytes cannot auto-start. PKG/DEB/RPM restore the failed new
+bytes; MSI may leave restored old package files but no runnable registration.
+The verified backup/recovery state remains. On Windows, first retry the same
+MSI so its bound transaction can finish; after verification a newer upgrade is
+allowed. PKG/DEB/RPM reuse their retained private transaction on retry.
+
+An interrupted package-manager retry reuses only a matching private
+transaction, target version, owner, root, and opaque nonce. Mismatched or
+incomplete recovery state fails closed instead of being overwritten. Internal
+package command output is redacted to phase, service state, and version.
+
+Do not invoke `package` commands manually or treat `service install --update`
+as a binary updater. Safe in-place upgrade requires the already installed
+package to contain this pre-install protocol. An older package without it
+causes upgrade to abort before mutation. Preserve the existing data root,
+uninstall only package/service files, install the new package, and let its
+clean-install path adopt the existing root; verify identity before resuming
+work.
 
 ## Troubleshooting checklist
 
@@ -276,8 +341,9 @@ Until that transaction is available, do not treat update preparation or
    trust or the exact pin. Never use plaintext as a diagnostic shortcut.
 6. For pairing, check the selected data root, server state, five-minute expiry,
    client clock, and DPoP URL/method.
-7. For `recoveryRequired`, preserve the update status and backup evidence, then
-   restore through the owning signed distribution workflow when available.
+7. For `recoveryRequired`, preserve the package transaction directory, update
+   status, failed/new bytes, and verified backup; do not start an older binary
+   if the schema version differs from the receipt.
 8. Verify no server-owned child process remains after stop before force-removing
    an exact native registration.
 

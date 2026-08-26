@@ -273,6 +273,12 @@ impl ServerRuntime {
             local_control::LocalControlContext {
                 environment_id,
                 storage_instance_id,
+                environment_name: config.environment_label.clone(),
+                bind: local_addr,
+                web_assets_verified: config.installed_layout.is_some(),
+                data_root: config.base_dir.clone(),
+                database: database.clone(),
+                production_runtime: production_runtime.clone(),
                 auth: auth.clone(),
                 advertised_base_url: advertised_base_url.clone(),
                 update_maintenance: update_maintenance.clone(),

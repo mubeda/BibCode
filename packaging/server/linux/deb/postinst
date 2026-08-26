@@ -1,31 +1,84 @@
 #!/bin/sh
 set -eu
 
-mode="${BIBCODE_PACKAGE_MODE:-files-only}"
-case "$mode" in
-  files-only)
-    echo "BiBCode Server: files-only installation; no service was changed."
-    exit 0
-    ;;
-  workstation) ;;
-  *)
-    echo "BiBCode Server: BIBCODE_PACKAGE_MODE must be files-only or workstation." >&2
-    exit 1
-    ;;
-esac
+package_version="@PACKAGE_VERSION@"
+state_root="/var/lib/bibcode-server-package"
+owner_file="$state_root/workstation-user"
+root_file="$state_root/workstation-root"
+transaction="$state_root/transaction"
+rollback_root="$state_root/rollback"
+failed_root="$state_root/failed-new"
 
-package_user="${BIBCODE_PACKAGE_USER:-}"
+if [ ! -d "$transaction" ]; then
+  echo "BiBCode Server: files-only installation; no service was changed."
+  exit 0
+fi
+package_user=$(/bin/sed -n '1p' "$transaction/user")
+nonce=$(/bin/sed -n '1p' "$transaction/nonce")
+target_version=$(/bin/sed -n '1p' "$transaction/target-version")
+data_root=$(/bin/sed -n '1p' "$transaction/data-root")
 case "$package_user" in
   ""|root|*[!A-Za-z0-9._-]*)
-    echo "BiBCode Server: workstation mode requires a non-root BIBCODE_PACKAGE_USER." >&2
+    echo "BiBCode Server: invalid package transaction user." >&2
     exit 1
     ;;
 esac
+case "$nonce" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server: invalid package transaction nonce." >&2
+    exit 1
+    ;;
+esac
+if [ "$target_version" != "$package_version" ]; then
+  echo "BiBCode Server: package transaction version mismatch." >&2
+  exit 1
+fi
 /usr/bin/getent passwd "$package_user" >/dev/null
+package_home=$(/usr/bin/getent passwd "$package_user" | /usr/bin/cut -d: -f6)
+case "$package_home:$data_root" in
+  /*:/*) ;;
+  *)
+    echo "BiBCode Server: invalid package transaction home or data root." >&2
+    exit 1
+    ;;
+esac
 
-/usr/sbin/runuser -u "$package_user" -- \
-  /usr/bin/bibcode service install --mode workstation --host 127.0.0.1 --format json --update
+if /usr/sbin/runuser -u "$package_user" -- \
+  /usr/bin/env HOME="$package_home" USER="$package_user" LOGNAME="$package_user" \
+  /usr/bin/bibcode package activate --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  umask 077
+  /usr/bin/printf '%s\n' "$package_user" > "$owner_file"
+  /usr/bin/printf '%s\n' "$data_root" > "$root_file"
+  /bin/rm -R -f -- "$transaction" "$rollback_root" "$failed_root"
+  exit 0
+fi
 
-/usr/bin/install -d -m 0700 /var/lib/bibcode-server-package
-umask 077
-/usr/bin/printf '%s\n' "$package_user" > /var/lib/bibcode-server-package/workstation-user
+if [ ! -f "$transaction/upgrade" ] || [ ! -x "$rollback_root/bibcode" ]; then
+  echo "BiBCode Server: clean activation failed; package files remain for diagnosis and project data is preserved." >&2
+  exit 1
+fi
+
+/bin/rm -R -f -- "$failed_root"
+/usr/bin/install -d -m 0700 "$failed_root"
+/bin/mv /usr/bin/bibcode "$failed_root/bibcode"
+/bin/mv /usr/share/bibcode "$failed_root/share-bibcode"
+/bin/cp --preserve=all -- "$rollback_root/bibcode" /usr/bin/bibcode
+/bin/cp -a -- "$rollback_root/share-bibcode" /usr/share/bibcode
+if /usr/sbin/runuser -u "$package_user" -- \
+  /usr/bin/env HOME="$package_home" USER="$package_user" LOGNAME="$package_user" \
+  /usr/bin/bibcode package rollback --mode workstation --host 127.0.0.1 --format json \
+  --base-dir "$data_root" --nonce "$nonce" --target-version "$package_version"
+then
+  /bin/rm -R -f -- "$transaction" "$rollback_root" "$failed_root"
+  echo "BiBCode Server: activation failed; previous package bytes and service were restored." >&2
+  exit 1
+fi
+
+/bin/rm -f -- /usr/bin/bibcode
+/bin/rm -R -f -- /usr/share/bibcode
+/bin/mv "$failed_root/bibcode" /usr/bin/bibcode
+/bin/mv "$failed_root/share-bibcode" /usr/share/bibcode
+echo "BiBCode Server: rollback was forbidden or failed; new bytes and the verified backup were preserved for recovery." >&2
+exit 1

@@ -23,6 +23,24 @@ linger, create a headless account, open a firewall, or delete the data root.
 Headless setup remains a separate elevated `bibcode service install --mode
 headless` operation after package installation.
 
+The package records the validated workstation account and resolved data root
+under root-only `/var/lib/bibcode-server-package`. On upgrade, the pre-install
+hook snapshots `/usr/bin/bibcode` and `/usr/share/bibcode`, then the old binary
+drains, backs up, records its identity-bound receipt, and stops. Post-install
+activates and verifies the new binary. A failure restores the byte snapshot and
+starts the old service only if binary path/SHA-256 and database schema still
+match; otherwise it restores the new failed bytes and retains recovery
+artifacts. DEB/RPM removal deletes package files and service registration but
+preserves the user data root. Neither format has a purge flag.
+
+The private transaction survives interruption and a repeated pre-install
+resumes only the same user, root, target version, nonce, and snapshot. Any
+mismatch fails closed without deleting the recovery material.
+
+Safe upgrade requires the installed package to expose `package prepare`. An
+older DEB/RPM without it aborts before replacement; preserve the data root,
+remove only package/service files, then clean-install and verify root adoption.
+
 Build on the matching native architecture after installing the pinned package
 tools:
 

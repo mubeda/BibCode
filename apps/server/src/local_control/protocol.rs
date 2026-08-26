@@ -9,6 +9,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::package_lifecycle::{PurgeAuthorizationReceipt, PurgePlan};
 use crate::persistence::{EnvironmentId, StorageInstanceId};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
@@ -26,6 +27,16 @@ pub enum ControlRequestBody {
     ServicePrepareUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_version: Option<String>,
+    },
+    ServiceCommitUpdate {
+        operation_id: String,
+    },
+    StoragePlanPurge {
+        environment_name: String,
+    },
+    StorageAuthorizePurge {
+        operation_id: String,
+        typed_environment_name: String,
     },
     ServiceStop,
 }
@@ -66,6 +77,9 @@ pub enum ControlResponseBody {
         environment_id: EnvironmentId,
         storage_instance_id: StorageInstanceId,
         server_version: String,
+        environment_name: String,
+        bind: String,
+        web_assets_verified: bool,
     },
     PairingCreated {
         environment_id: EnvironmentId,
@@ -75,9 +89,20 @@ pub enum ControlResponseBody {
     },
     UpdatePrepared {
         operation_id: String,
+        environment_id: EnvironmentId,
+        storage_instance_id: StorageInstanceId,
+        current_version: String,
         backup_id: String,
+        backup_schema_version: i64,
         drained_operations: u64,
         expires_at: String,
+    },
+    UpdateCommitted,
+    PurgePlanned {
+        plan: PurgePlan,
+    },
+    PurgeAuthorized {
+        authorization: PurgeAuthorizationReceipt,
     },
     StopAccepted {
         #[serde(default)]
@@ -96,11 +121,17 @@ impl fmt::Debug for ControlResponseBody {
                 environment_id,
                 storage_instance_id,
                 server_version,
+                environment_name,
+                bind,
+                web_assets_verified,
             } => formatter
                 .debug_struct("Status")
                 .field("environment_id", environment_id)
                 .field("storage_instance_id", storage_instance_id)
                 .field("server_version", server_version)
+                .field("environment_name", environment_name)
+                .field("bind", bind)
+                .field("web_assets_verified", web_assets_verified)
                 .finish(),
             Self::PairingCreated {
                 environment_id,
@@ -116,15 +147,32 @@ impl fmt::Debug for ControlResponseBody {
                 .finish(),
             Self::UpdatePrepared {
                 operation_id,
+                environment_id,
+                storage_instance_id,
+                current_version,
                 backup_id,
+                backup_schema_version,
                 drained_operations,
                 expires_at,
             } => formatter
                 .debug_struct("UpdatePrepared")
                 .field("operation_id", operation_id)
+                .field("environment_id", environment_id)
+                .field("storage_instance_id", storage_instance_id)
+                .field("current_version", current_version)
                 .field("backup_id", backup_id)
+                .field("backup_schema_version", backup_schema_version)
                 .field("drained_operations", drained_operations)
                 .field("expires_at", expires_at)
+                .finish(),
+            Self::UpdateCommitted => formatter.write_str("UpdateCommitted"),
+            Self::PurgePlanned { plan } => formatter
+                .debug_struct("PurgePlanned")
+                .field("plan", plan)
+                .finish(),
+            Self::PurgeAuthorized { authorization } => formatter
+                .debug_struct("PurgeAuthorized")
+                .field("authorization", authorization)
                 .finish(),
             Self::StopAccepted { drained_operations } => formatter
                 .debug_struct("StopAccepted")
@@ -242,7 +290,15 @@ fn decode_request(bytes: &[u8]) -> Result<ControlRequest, ProtocolError> {
     }
     if !matches!(
         command,
-        Some("status" | "createPairing" | "servicePrepareUpdate" | "serviceStop")
+        Some(
+            "status"
+                | "createPairing"
+                | "servicePrepareUpdate"
+                | "serviceCommitUpdate"
+                | "storagePlanPurge"
+                | "storageAuthorizePurge"
+                | "serviceStop"
+        )
     ) {
         return Err(ProtocolError {
             code: "unknown_command",

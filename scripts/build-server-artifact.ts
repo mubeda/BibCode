@@ -22,6 +22,7 @@ import {
   isPlainExecutable,
   renderDebCargoManifest,
   renderMacDistribution,
+  renderPackageHook,
   renderRpmMetadata,
   resolveLinuxNativePackageCommands,
   resolveNativeInstallerDescriptor,
@@ -870,12 +871,46 @@ const buildLinuxNativeInstallers = async (
   const workspace = NodePath.join(context.temporary, "native", "linux");
   await NodeFSP.mkdir(NodePath.join(workspace, "src"), { recursive: true });
   await NodeFSP.writeFile(NodePath.join(workspace, "src", "main.rs"), "fn main() {}\n");
+  const renderedHooks = NodePath.join(workspace, "hooks");
+  const debHooks = NodePath.join(renderedHooks, "deb");
+  const rpmHooks = NodePath.join(renderedHooks, "rpm");
+  await Promise.all([
+    NodeFSP.mkdir(debHooks, { recursive: true }),
+    NodeFSP.mkdir(rpmHooks, { recursive: true }),
+  ]);
+  for (const script of ["preinst", "postinst", "prerm", "postrm"] as const) {
+    const template = await NodeFSP.readFile(
+      NodePath.join(context.repoRoot, "packaging/server/linux/deb", script),
+      "utf8",
+    );
+    await NodeFSP.writeFile(
+      NodePath.join(debHooks, script),
+      renderPackageHook(template, context.version),
+      { mode: 0o755 },
+    );
+  }
+  for (const script of [
+    "pre_install",
+    "post_install",
+    "pre_uninstall",
+    "post_uninstall",
+  ] as const) {
+    const template = await NodeFSP.readFile(
+      NodePath.join(context.repoRoot, "packaging/server/linux/rpm", script),
+      "utf8",
+    );
+    await NodeFSP.writeFile(
+      NodePath.join(rpmHooks, script),
+      renderPackageHook(template, context.version),
+      { mode: 0o755 },
+    );
+  }
   const payload = await collectInstallerPayload(context.stagedRoot, "bibcode");
   const debManifest = renderDebCargoManifest({
     payloadRoot: context.stagedRoot,
     payload,
     version: context.version,
-    maintainerScripts: NodePath.join(context.repoRoot, "packaging/server/linux/deb"),
+    maintainerScripts: debHooks,
   });
   const rpmMetadata = renderRpmMetadata({
     template: NodeFS.readFileSync(
@@ -885,9 +920,10 @@ const buildLinuxNativeInstallers = async (
     payloadRoot: context.stagedRoot,
     payload,
     scripts: {
-      postInstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/post_install"),
-      preUninstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/pre_uninstall"),
-      postUninstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/post_uninstall"),
+      preInstall: NodePath.join(rpmHooks, "pre_install"),
+      postInstall: NodePath.join(rpmHooks, "post_install"),
+      preUninstall: NodePath.join(rpmHooks, "pre_uninstall"),
+      postUninstall: NodePath.join(rpmHooks, "post_uninstall"),
     },
   });
   const manifestPath = NodePath.join(workspace, "Cargo.toml");
@@ -1051,10 +1087,17 @@ const buildMacNativeInstaller = async (
     context.limits,
   );
 
-  const scripts = NodePath.join(context.repoRoot, "packaging/server/macos/scripts");
+  const scripts = NodePath.join(workspace, "scripts");
+  await NodeFSP.mkdir(scripts, { recursive: true });
   for (const script of ["preinstall", "postinstall"] as const) {
+    const source = NodePath.join(context.repoRoot, "packaging/server/macos/scripts", script);
+    if (!isPlainExecutable(source))
+      return fail(`macOS package script must be executable: ${source}.`);
+    const template = await NodeFSP.readFile(source, "utf8");
     const path = NodePath.join(scripts, script);
-    if (!isPlainExecutable(path)) return fail(`macOS package script must be executable: ${path}.`);
+    await NodeFSP.writeFile(path, renderPackageHook(template, context.version), {
+      mode: 0o755,
+    });
   }
   const componentPath = NodePath.join(workspace, "BiBCodeServer-component.pkg");
   const packageEnv = { ...context.rust.env, COPYFILE_DISABLE: "1" };
@@ -1166,10 +1209,12 @@ export async function buildServerArtifact(
       case "linux":
         requiredInputRelatives.push(
           "packaging/server/linux/deb/postinst",
+          "packaging/server/linux/deb/preinst",
           "packaging/server/linux/deb/prerm",
           "packaging/server/linux/deb/postrm",
           "packaging/server/linux/rpm/metadata.toml",
           "packaging/server/linux/rpm/post_install",
+          "packaging/server/linux/rpm/pre_install",
           "packaging/server/linux/rpm/pre_uninstall",
           "packaging/server/linux/rpm/post_uninstall",
         );

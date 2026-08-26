@@ -381,6 +381,48 @@ async fn matching_install_is_idempotent_and_mismatch_requires_explicit_update() 
 }
 
 #[tokio::test]
+async fn update_requested_for_a_missing_service_uses_the_clean_install_path() {
+    let adapter = ServiceAdapter::linux(linux_workstation_target()).expect("Linux adapter");
+    let definition = adapter.rendered_definition();
+    let mut outcomes = Vec::from([
+        Ok(CommandOutput {
+            exit_code: 4,
+            stdout:
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=disabled\n"
+                    .to_owned(),
+            stderr: "Unit bibcode.service could not be found".to_owned(),
+        }),
+        exit(1, "No such file"),
+        success("no\n"),
+    ]);
+    outcomes.extend((0..6).map(|_| success("")));
+    outcomes.extend([
+        success("LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\n"),
+        success(definition),
+        success("no\n"),
+    ]);
+    let runner = FakeCommandRunner::with_outcomes(outcomes);
+
+    let result = ServiceManager::new(runner.clone())
+        .install_report(&adapter, true)
+        .await
+        .expect("missing service follows clean install semantics");
+
+    assert!(result.changed);
+    assert_eq!(result.status.state, ServiceState::Running);
+    let commands = runner.commands();
+    assert!(commands.iter().all(|command| command.program != "cp"));
+    assert!(commands.iter().any(|command| {
+        command.program == "systemctl"
+            && command.args == ["--user", "enable", "--now", "bibcode.service"]
+    }));
+    assert!(commands.iter().all(|command| {
+        !(command.program == "systemctl"
+            && command.args == ["--user", "restart", "bibcode.service"])
+    }));
+}
+
+#[tokio::test]
 async fn partial_install_rolls_back_created_metadata_but_never_the_data_root() {
     let target = linux_workstation_target();
     let adapter = ServiceAdapter::linux(target.clone()).expect("Linux adapter");

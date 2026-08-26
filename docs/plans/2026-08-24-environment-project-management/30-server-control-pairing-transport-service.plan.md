@@ -494,7 +494,7 @@ Network clients may read service mode/state/version/update state but host mutati
 
 Expose startup mechanism, state, version, bind posture, account kind, update state, and whether the current route has host-control authority. Avoid raw control socket paths, service credentials, environment variables, and full sensitive filesystem paths unless already authorized by the existing server settings policy.
 
-- [ ] **Step 3: Integrate update admission with service restart**
+- [x] **Step 3: Integrate update admission with service restart**
 
 Prepare rejects new mutations, drains admitted work, persists update status, closes transports, performs the platform restart through the authorized host path, verifies the same environment/storage identity and compatible version, then commits. On failure restore the previous binary and report a bounded recovery state.
 
@@ -526,11 +526,12 @@ updater supplies the exact downloaded target version. Direct HTTPS DPoP
 validation also now derives the request scheme from the TLS listener while
 preserving the existing trusted loopback reverse-proxy behavior.
 
-Step 3 intentionally remains open for Plan 70 Task 5: restoring replacement
-package bytes and the prior platform service definition belongs to the signed
-server-distribution transaction. This task implements the server-side
-admission, drain, durable handoff, identity/version verification, and bounded
-recovery state without creating a second package rollback owner.
+Plan 70 Task 5 now completes Step 3. The native package transaction owns
+replacement/restoration bytes and service-definition rollback, while this
+plan's maintenance runtime remains the sole owner of admission, drain, backup,
+durable handoff, identity/version reconciliation, and bounded recovery state.
+The package receipt cross-binds those owners without duplicating either source
+of truth.
 
 Validation passed 34 contract tests, 21 production-control tests, nine
 production-maintenance tests (including a real server-owned child reaping

@@ -43,7 +43,7 @@
     </Feature>
 
     <CustomAction
-      Id="RollbackWorkstationService"
+      Id="RollbackCleanWorkstationService"
       FileRef="BibcodeExecutable"
       ExeCommand="service uninstall --mode workstation --format json"
       Execute="rollback"
@@ -51,25 +51,33 @@
       HideTarget="yes"
       Return="ignore" />
     <CustomAction
-      Id="InstallWorkstationService"
+      Id="ActivateCleanWorkstationPackage"
       FileRef="BibcodeExecutable"
-      ExeCommand="service install --mode workstation --host 127.0.0.1 --format json"
+      ExeCommand="package activate --mode workstation --host 127.0.0.1 --format json --nonce &quot;[ProductCode]&quot; --target-version &quot;[ProductVersion]&quot;"
       Execute="deferred"
       Impersonate="yes"
       HideTarget="yes"
       Return="check" />
     <CustomAction
-      Id="StopWorkstationServiceForUpgrade"
+      Id="RollbackWorkstationPackageUpgrade"
       FileRef="BibcodeExecutable"
-      ExeCommand="service stop --mode workstation --format json"
+      ExeCommand="package rollback --mode workstation --host 127.0.0.1 --format json --nonce &quot;[ProductCode]&quot; --target-version &quot;[ProductVersion]&quot;"
+      Execute="rollback"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="ignore" />
+    <CustomAction
+      Id="PrepareWorkstationPackageUpgrade"
+      FileRef="BibcodeExecutable"
+      ExeCommand="package prepare --mode workstation --host 127.0.0.1 --format json --nonce &quot;[ProductCode]&quot; --target-version &quot;[ProductVersion]&quot;"
       Execute="deferred"
       Impersonate="yes"
       HideTarget="yes"
       Return="check" />
     <CustomAction
-      Id="UpdateWorkstationService"
+      Id="ActivateWorkstationPackageUpgrade"
       FileRef="BibcodeExecutable"
-      ExeCommand="service install --mode workstation --host 127.0.0.1 --format json --update"
+      ExeCommand="package activate --mode workstation --host 127.0.0.1 --format json --nonce &quot;[ProductCode]&quot; --target-version &quot;[ProductVersion]&quot;"
       Execute="deferred"
       Impersonate="yes"
       HideTarget="yes"
@@ -85,20 +93,24 @@
 
     <InstallExecuteSequence>
       <Custom
-        Action="RollbackWorkstationService"
-        Before="InstallWorkstationService"
+        Action="RollbackCleanWorkstationService"
+        Before="ActivateCleanWorkstationPackage"
         Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
       <Custom
-        Action="InstallWorkstationService"
+        Action="ActivateCleanWorkstationPackage"
         After="InstallFiles"
         Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
       <Custom
-        Action="StopWorkstationServiceForUpgrade"
+        Action="RollbackWorkstationPackageUpgrade"
+        Before="PrepareWorkstationPackageUpgrade"
+        Condition="WIX_UPGRADE_DETECTED" />
+      <Custom
+        Action="PrepareWorkstationPackageUpgrade"
         Before="RemoveExistingProducts"
         Condition="WIX_UPGRADE_DETECTED" />
       <Custom
-        Action="UpdateWorkstationService"
-        After="InstallWorkstationService"
+        Action="ActivateWorkstationPackageUpgrade"
+        After="InstallFiles"
         Condition="WIX_UPGRADE_DETECTED" />
       <Custom
         Action="UninstallWorkstationService"

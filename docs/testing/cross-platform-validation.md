@@ -175,6 +175,33 @@ scenarios only on an approved disposable runner with an isolated BiBCode data
 root. Format inspection on another OS or architecture is compatibility evidence
 only; it is not native installation evidence.
 
+Before native execution, run the shared lifecycle owners:
+
+```sh
+cargo test -p bibcode-server --test package_lifecycle -- --nocapture
+cargo test -p bibcode-server --test service_lifecycle -- --nocapture
+cargo test -p bibcode-server --test local_control -- --nocapture
+cargo test -p bibcode-server --test production_maintenance -- --nocapture
+cargo test -p bibcode-server --test cli_smoke package -- --nocapture
+```
+
+On each native package runner, record clean install, idempotent install,
+prepared upgrade, service stop, file commit, identity-preserving restart,
+version/protocol/assets/loopback/definition verification, activation failure,
+safe byte+definition rollback, rollback rejection after a seeded schema
+advance, and retry at every durable receipt phase. Prove competing package
+operations serialize on one root. Remove the package and prove the exact data
+root and backup remain, then reinstall and verify identity adoption. Finally
+use a fresh online purge plan: wrong-case confirmation, stale plan, active
+project/worktree/process, and changed-root attempts must fail; exact
+confirmation after guards clear must remove only the selected root and leave a
+same-parent sentinel untouched.
+
+Also test upgrade from a fixture package without the package-lifecycle CLI. It
+must fail before file mutation. Record the preserve-data uninstall and clean
+reinstall recovery path; do not classify an uncoordinated in-place replacement
+as a pass.
+
 ### Environment, project, and Main invariant evidence
 
 When environment identity, project admission, project navigation, or thread

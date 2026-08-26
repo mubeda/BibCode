@@ -155,6 +155,16 @@ Install/remove only on an approved disposable runner. Exercise files-only and
 explicit workstation modes separately, record package-manager output and the
 user-unit owner/state, and prove removal preserves the exact data root.
 
+For both DEB and RPM, inspect the root-only workstation owner/root receipt and
+prove `runuser` receives the selected account's exact `HOME` and `--base-dir`.
+Exercise a prepared upgrade, activation failure with exact binary/share-tree
+restoration, and seeded schema advancement that refuses old-binary restart and
+retains recovery artifacts. Upgrade removal hooks must not stop or uninstall
+the replacement service. An older-package fixture without `package prepare`
+must fail before payload mutation. After normal removal, run the two-step purge
+only with zero project/worktree/process guards and prove a same-parent sentinel
+survives.
+
 ## AppImage build and inspection
 
 Build the supported artifact:

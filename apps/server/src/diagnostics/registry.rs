@@ -138,6 +138,10 @@ impl ProcessAttributionRegistry {
             .collect()
     }
 
+    pub(crate) fn active_registration_count(&self) -> usize {
+        lock_state(&self.inner).entries.len()
+    }
+
     #[must_use]
     pub fn bind_and_snapshot(
         &self,

@@ -1,4 +1,4 @@
-use std::{fmt, io};
+use std::{fmt, io, net::SocketAddr};
 
 #[cfg(windows)]
 use std::time::Duration;
@@ -41,6 +41,24 @@ pub(crate) enum ControlClientError {
     ServiceStopRejected,
     #[error("the protected local control response was not a valid service stop acknowledgement")]
     InvalidServiceStopResponse,
+    #[error("the protected local control response was not a valid status document")]
+    InvalidStatusResponse,
+    #[error("the server rejected package update preparation")]
+    UpdatePrepareRejected,
+    #[error("the protected local control response was not a valid prepared update")]
+    InvalidUpdatePrepareResponse,
+    #[error("the server rejected the prepared package update commit")]
+    UpdateCommitRejected,
+    #[error("the protected local control response was not a valid update commit acknowledgement")]
+    InvalidUpdateCommitResponse,
+    #[error("the server rejected storage purge planning")]
+    PurgePlanRejected,
+    #[error("the protected local control response was not a valid purge plan")]
+    InvalidPurgePlanResponse,
+    #[error("the server rejected storage purge authorization")]
+    PurgeAuthorizationRejected,
+    #[error("the protected local control response was not a valid purge authorization")]
+    InvalidPurgeAuthorizationResponse,
 }
 
 pub(crate) struct CreatedPairing {
@@ -49,6 +67,29 @@ pub(crate) struct CreatedPairing {
     pub expires_at: String,
     pub pairing_url: String,
     pub control_protocol_version: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControlStatus {
+    pub environment_id: EnvironmentId,
+    pub storage_instance_id: crate::persistence::StorageInstanceId,
+    pub server_version: String,
+    pub environment_name: String,
+    pub bind: SocketAddr,
+    pub web_assets_verified: bool,
+    pub control_protocol_version: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedUpdate {
+    pub operation_id: Uuid,
+    pub environment_id: EnvironmentId,
+    pub storage_instance_id: crate::persistence::StorageInstanceId,
+    pub current_version: String,
+    pub backup_id: Uuid,
+    pub backup_schema_version: i64,
+    pub drained_operations: u64,
+    pub expires_at: String,
 }
 
 impl fmt::Debug for CreatedPairing {
@@ -131,6 +172,197 @@ pub(crate) async fn stop_service(root: &ResolvedDataRoot) -> Result<u64, Control
         ControlResponseBody::Error { .. } => Err(ControlClientError::ServiceStopRejected),
         _ => Err(ControlClientError::InvalidServiceStopResponse),
     }
+}
+
+pub(crate) async fn status(root: &ResolvedDataRoot) -> Result<ControlStatus, ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::Status,
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    let response_version = response.version;
+    let ControlResponseBody::Status {
+        environment_id: response_environment_id,
+        storage_instance_id,
+        server_version,
+        environment_name,
+        bind,
+        web_assets_verified,
+    } = response.body
+    else {
+        return Err(ControlClientError::InvalidStatusResponse);
+    };
+    let bind = bind
+        .parse::<SocketAddr>()
+        .map_err(|_| ControlClientError::InvalidStatusResponse)?;
+    if response_environment_id != environment_id
+        || server_version.trim().is_empty()
+        || environment_name.trim().is_empty()
+        || !bind.ip().is_loopback()
+    {
+        return Err(ControlClientError::InvalidStatusResponse);
+    }
+    Ok(ControlStatus {
+        environment_id,
+        storage_instance_id,
+        server_version,
+        environment_name,
+        bind,
+        web_assets_verified,
+        control_protocol_version: response_version,
+    })
+}
+
+pub(crate) async fn prepare_update(
+    root: &ResolvedDataRoot,
+    target_version: String,
+) -> Result<PreparedUpdate, ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::ServicePrepareUpdate {
+            target_version: Some(target_version),
+        },
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    let ControlResponseBody::UpdatePrepared {
+        operation_id,
+        environment_id: response_environment_id,
+        storage_instance_id,
+        current_version,
+        backup_id,
+        backup_schema_version,
+        drained_operations,
+        expires_at,
+    } = response.body
+    else {
+        return if matches!(response.body, ControlResponseBody::Error { .. }) {
+            Err(ControlClientError::UpdatePrepareRejected)
+        } else {
+            Err(ControlClientError::InvalidUpdatePrepareResponse)
+        };
+    };
+    let operation_id = Uuid::parse_str(&operation_id)
+        .map_err(|_| ControlClientError::InvalidUpdatePrepareResponse)?;
+    let backup_id = Uuid::parse_str(&backup_id)
+        .map_err(|_| ControlClientError::InvalidUpdatePrepareResponse)?;
+    let expires = OffsetDateTime::parse(&expires_at, &Rfc3339)
+        .map_err(|_| ControlClientError::InvalidUpdatePrepareResponse)?;
+    if response_environment_id != environment_id
+        || current_version.trim().is_empty()
+        || backup_schema_version < 0
+        || expires <= OffsetDateTime::now_utc()
+    {
+        return Err(ControlClientError::InvalidUpdatePrepareResponse);
+    }
+    Ok(PreparedUpdate {
+        operation_id,
+        environment_id,
+        storage_instance_id,
+        current_version,
+        backup_id,
+        backup_schema_version,
+        drained_operations,
+        expires_at,
+    })
+}
+
+pub(crate) async fn commit_update(
+    root: &ResolvedDataRoot,
+    operation_id: Uuid,
+) -> Result<(), ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::ServiceCommitUpdate {
+            operation_id: operation_id.to_string(),
+        },
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    match response.body {
+        ControlResponseBody::UpdateCommitted => Ok(()),
+        ControlResponseBody::Error { .. } => Err(ControlClientError::UpdateCommitRejected),
+        _ => Err(ControlClientError::InvalidUpdateCommitResponse),
+    }
+}
+
+pub(crate) async fn plan_purge(
+    root: &ResolvedDataRoot,
+    environment_name: String,
+) -> Result<crate::package_lifecycle::PurgePlan, ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::StoragePlanPurge { environment_name },
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    let ControlResponseBody::PurgePlanned { plan } = response.body else {
+        return if matches!(response.body, ControlResponseBody::Error { .. }) {
+            Err(ControlClientError::PurgePlanRejected)
+        } else {
+            Err(ControlClientError::InvalidPurgePlanResponse)
+        };
+    };
+    if plan.environment_id != environment_id || plan.data_root != root.effective {
+        return Err(ControlClientError::InvalidPurgePlanResponse);
+    }
+    Ok(plan)
+}
+
+pub(crate) async fn authorize_purge(
+    root: &ResolvedDataRoot,
+    plan_id: Uuid,
+    typed_environment_name: String,
+) -> Result<crate::package_lifecycle::PurgeAuthorizationReceipt, ControlClientError> {
+    let paths = StatePaths::from_config(&ServerConfig::new(&root.effective));
+    let environment_id = read_environment_id(&paths).await?;
+    let request = ControlRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: Uuid::new_v4(),
+        body: ControlRequestBody::StorageAuthorizePurge {
+            operation_id: plan_id.to_string(),
+            typed_environment_name,
+        },
+    };
+    let response = exchange(&paths, environment_id, &request).await?;
+    if response.request_id != request.request_id {
+        return Err(ControlClientError::ResponseMismatch);
+    }
+    let ControlResponseBody::PurgeAuthorized { authorization } = response.body else {
+        return if matches!(response.body, ControlResponseBody::Error { .. }) {
+            Err(ControlClientError::PurgeAuthorizationRejected)
+        } else {
+            Err(ControlClientError::InvalidPurgeAuthorizationResponse)
+        };
+    };
+    if authorization.plan_id != plan_id
+        || authorization.environment_id != environment_id
+        || authorization.data_root != root.effective
+    {
+        return Err(ControlClientError::InvalidPurgeAuthorizationResponse);
+    }
+    Ok(authorization)
 }
 
 async fn read_environment_id(paths: &StatePaths) -> Result<EnvironmentId, ControlClientError> {

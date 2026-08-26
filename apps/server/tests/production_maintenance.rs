@@ -244,11 +244,13 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         let pid_deadline = Instant::now() + Duration::from_secs(2);
         let server_owned_pid = loop {
             match std::fs::read_to_string(&pid_file) {
-                Ok(pid) => {
-                    break pid
-                        .trim()
-                        .parse::<u32>()
-                        .expect("server-owned terminal PID");
+                Ok(pid) if let Ok(pid) = pid.trim().parse::<u32>() => break pid,
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < pid_deadline,
+                        "server-owned terminal published an invalid PID"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     assert!(

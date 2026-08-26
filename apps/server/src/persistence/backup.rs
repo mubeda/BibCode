@@ -403,12 +403,12 @@ impl Drop for StoreRuntimeGuard {
     }
 }
 
-struct OfflineRecoveryGuard {
+pub struct StoreOfflineGuard {
     lock_file: File,
 }
 
-impl OfflineRecoveryGuard {
-    fn acquire(paths: &StatePaths) -> Result<Self, RecoveryError> {
+impl StoreOfflineGuard {
+    pub fn acquire(paths: &StatePaths) -> Result<Self, RecoveryError> {
         let path = paths.runtime_lock();
         let lock_file = open_private_lock_file(&path)?;
         match lock_file.try_lock() {
@@ -421,7 +421,7 @@ impl OfflineRecoveryGuard {
     }
 }
 
-impl Drop for OfflineRecoveryGuard {
+impl Drop for StoreOfflineGuard {
     fn drop(&mut self) {
         let _ = self.lock_file.unlock();
     }
@@ -956,7 +956,7 @@ async fn restore_backup_inner(
     config.base_dir.clone_from(&current.effective);
     config.resolved_data_root = Some(current.clone());
     let paths = StatePaths::from_config(&config);
-    let _offline = OfflineRecoveryGuard::acquire(&paths)?;
+    let _offline = StoreOfflineGuard::acquire(&paths)?;
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let _guard =
@@ -1165,7 +1165,7 @@ pub async fn preserve_and_start_empty(
     config.base_dir.clone_from(&current.effective);
     config.resolved_data_root = Some(current.clone());
     let paths = StatePaths::from_config(&config);
-    let _offline = OfflineRecoveryGuard::acquire(&paths)?;
+    let _offline = StoreOfflineGuard::acquire(&paths)?;
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let _guard =

@@ -4,8 +4,9 @@ use std::{
 };
 
 use bibcode_server::{
-    AuthCommand, Cli, CliAction, PairingOutputFormat, ServerConfig, ServerRuntime,
-    ServiceCliCommand, ServiceOperation, ServiceOutputFormat, TransportCommand,
+    AuthCommand, Cli, CliAction, PackageCliCommand, PackageOperation, PairingOutputFormat,
+    ServerConfig, ServerRuntime, ServiceCliCommand, ServiceOperation, ServiceOutputFormat,
+    StorageCommand, TransportCommand,
     local_control::protocol::{
         CONTROL_PROTOCOL_VERSION, ControlResponse, ControlResponseBody, read_request,
         write_response,
@@ -25,6 +26,7 @@ use tokio::{
     process::Command as TokioCommand,
     time::timeout,
 };
+use uuid::Uuid;
 
 #[test]
 fn headless_binary_exposes_the_compatible_serve_flags() {
@@ -289,6 +291,211 @@ fn service_cli_rejects_non_loopback_bind_before_any_host_mutation() {
     .expect_err("managed service must remain loopback-only");
 
     assert!(error.to_string().contains("loopback"));
+}
+
+#[test]
+fn package_cli_binds_an_opaque_nonce_target_version_mode_root_and_loopback() {
+    let root = TempDir::new().expect("temporary package root");
+    let action = Cli::try_parse_from([
+        "bibcode",
+        "package",
+        "prepare",
+        "--nonce",
+        "installer-operation-1",
+        "--target-version",
+        "0.5.0",
+        "--mode",
+        "workstation",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+        "--format",
+        "json",
+    ])
+    .expect("package arguments parse")
+    .into_action()
+    .expect("package action resolves");
+
+    let CliAction::Package(PackageCliCommand {
+        operation,
+        nonce,
+        target_version,
+        mode,
+        root: resolved,
+        bind,
+        format,
+    }) = action
+    else {
+        panic!("unexpected CLI action: {action:?}");
+    };
+    assert_eq!(operation, PackageOperation::Prepare);
+    assert_eq!(nonce, "installer-operation-1");
+    assert_eq!(target_version, "0.5.0");
+    assert_eq!(mode, ServiceMode::Workstation);
+    assert_eq!(resolved.effective, root.path().canonicalize().unwrap());
+    assert!(bind.ip().is_loopback());
+    assert_eq!(format, ServiceOutputFormat::Json);
+}
+
+#[test]
+fn package_cli_rejects_non_loopback_bind_and_has_no_purge_action() {
+    let root = TempDir::new().expect("temporary package root");
+    let invalid_host = Cli::try_parse_from([
+        "bibcode",
+        "package",
+        "activate",
+        "--nonce",
+        "installer-operation-1",
+        "--target-version",
+        "0.5.0",
+        "--host",
+        "0.0.0.0",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+    ])
+    .expect("package syntax parses")
+    .into_action()
+    .expect_err("package service activation must remain loopback-only");
+    assert!(invalid_host.to_string().contains("loopback"));
+
+    assert!(
+        Cli::try_parse_from([
+            "bibcode",
+            "package",
+            "purge",
+            "--nonce",
+            "installer-operation-1",
+            "--target-version",
+            "0.5.0",
+        ])
+        .is_err(),
+        "native package transactions must never expose purge"
+    );
+}
+
+#[test]
+fn storage_purge_is_an_explicit_two_step_plan_and_exact_confirmation() {
+    let root = TempDir::new().expect("temporary purge root");
+    let plan = Cli::try_parse_from([
+        "bibcode",
+        "storage",
+        "purge",
+        "plan",
+        "--environment-name",
+        "Build host",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+        "--json",
+    ])
+    .expect("purge plan syntax parses")
+    .into_action()
+    .expect("purge plan resolves");
+    let CliAction::Storage(StorageCommand::PlanPurge {
+        environment_name,
+        json,
+        ..
+    }) = plan
+    else {
+        panic!("unexpected purge plan action: {plan:?}");
+    };
+    assert_eq!(environment_name, "Build host");
+    assert!(json);
+
+    let plan_id = Uuid::new_v4();
+    let execute = Cli::try_parse_from([
+        "bibcode",
+        "storage",
+        "purge",
+        "execute",
+        "--plan-id",
+        &plan_id.to_string(),
+        "--confirm-environment-name",
+        "Build host",
+        "--base-dir",
+        root.path().to_string_lossy().as_ref(),
+        "--json",
+    ])
+    .expect("purge execute syntax parses")
+    .into_action()
+    .expect("purge execute resolves");
+    let CliAction::Storage(StorageCommand::ExecutePurge {
+        plan_id: parsed_id,
+        confirm_environment_name,
+        json,
+        ..
+    }) = execute
+    else {
+        panic!("unexpected purge execute action: {execute:?}");
+    };
+    assert_eq!(parsed_id, plan_id);
+    assert_eq!(confirm_environment_name, "Build host");
+    assert!(json);
+}
+
+#[tokio::test]
+async fn storage_purge_cli_plans_online_then_waits_for_shutdown_and_removes_exact_root() {
+    let root = TempDir::new().expect("temporary online purge root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start purge target server");
+    let plan_output = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args([
+            "storage",
+            "purge",
+            "plan",
+            "--environment-name",
+            "Disposable environment",
+            "--base-dir",
+        ])
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .await
+        .expect("run online purge plan CLI");
+    assert!(
+        plan_output.status.success(),
+        "purge plan failed: {}",
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_output.stdout).expect("purge plan JSON");
+    let plan_id = plan["planId"].as_str().expect("purge plan ID");
+    assert_eq!(plan["environmentName"], "Disposable environment");
+    assert_eq!(plan["projectCount"], 0);
+
+    let join = tokio::spawn(async move {
+        handle.wait_for_shutdown().await;
+        handle.join().await
+    });
+    let execute_output = timeout(
+        Duration::from_secs(25),
+        TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
+            .args([
+                "storage",
+                "purge",
+                "execute",
+                "--plan-id",
+                plan_id,
+                "--confirm-environment-name",
+                "Disposable environment",
+                "--base-dir",
+            ])
+            .arg(root.path())
+            .arg("--json")
+            .output(),
+    )
+    .await
+    .expect("purge execution remains bounded")
+    .expect("run purge execute CLI");
+    assert!(
+        execute_output.status.success(),
+        "purge execute failed: {}",
+        String::from_utf8_lossy(&execute_output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&execute_output.stdout).expect("purge result JSON");
+    assert_eq!(result["removed"], true);
+    join.await
+        .expect("purge server join task")
+        .expect("purge server shuts down cleanly");
+    assert!(!root.path().exists());
 }
 
 #[test]

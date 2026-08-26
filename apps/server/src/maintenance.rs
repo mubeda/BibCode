@@ -254,6 +254,7 @@ pub struct PrepareForUpdateResult {
     pub environment_id: EnvironmentId,
     pub storage_instance_id: StorageInstanceId,
     pub backup_id: String,
+    pub backup_schema_version: i64,
     pub drained_operations: u64,
     pub expires_at: String,
     pub current_version: String,
@@ -417,6 +418,22 @@ pub(crate) async fn reconcile_update_status(
             .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
     }
     Ok(())
+}
+
+pub(crate) async fn committed_update_handoff_matches(
+    state_directory: &Path,
+    operation_id: Uuid,
+    target_version: &str,
+) -> Result<bool, MaintenanceError> {
+    let status = read_json::<PersistedUpdateStatus>(update_status_path(state_directory))
+        .await
+        .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
+    Ok(status.is_some_and(|status| {
+        status.schema_version == UPDATE_STATUS_SCHEMA_VERSION
+            && status.phase == PersistedUpdatePhase::Restarting
+            && status.operation_id == operation_id.to_string()
+            && status.target_version.as_deref() == Some(target_version)
+    }))
 }
 
 pub(crate) async fn update_view(state_directory: &Path, current_version: &str) -> Value {
@@ -688,6 +705,7 @@ impl UpdateMaintenance {
             environment_id: self.environment_id,
             storage_instance_id: self.storage_instance_id,
             backup_id: backup.manifest.backup_id.to_string(),
+            backup_schema_version: backup.manifest.schema_version,
             drained_operations,
             expires_at,
             current_version: self.app_version.clone(),

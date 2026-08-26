@@ -47,6 +47,18 @@ state kind.
   control.
 - `bibcode service uninstall --mode <workstation|headless>`: remove native
   registration while preserving the selected data root. No purge flag exists.
+- `bibcode package prepare|activate|rollback --nonce <opaque> --target-version
+<version>`: internal native-installer transaction commands. They bind one
+  resolved root and package operation to a redacted durable receipt; they are
+  not a manual binary-update shortcut.
+- `bibcode storage purge plan --environment-name <alias> --json`: obtain a
+  five-minute online plan through protected local control. The result includes
+  exact environment/storage/root identity and current project, worktree,
+  process, and paired-client counts.
+- `bibcode storage purge execute --plan-id <uuid>
+--confirm-environment-name <exact-alias> --json`: authorize shutdown,
+  revalidate the offline store and removal guards, and remove only the planned
+  canonical data root.
 
 Add the same explicit `--base-dir` to every command when the service does not
 use its mode's default root. Managed services reject non-loopback `--host`
@@ -179,8 +191,10 @@ credential-free binary, and keeps package signing/notarization distinct. Linux
 requires exactly `cargo-deb` 3.7.0 and `cargo-generate-rpm` 0.21.0 and emits
 both DEB and RPM. Every native package delegates service definitions to the
 Rust `bibcode service` adapter, binds workstation service configuration to
-loopback, and preserves data on uninstall. Package templates contain no
-credential.
+loopback, and preserves data on uninstall. Upgrade hooks use the protected
+package lifecycle receipt, preserve an exact prior-byte snapshot, and invoke
+rollback only when the restored executable hash/path and store schema are
+safe. Package templates contain no credential and expose no purge action.
 
 CI may supply an already built immutable web directory together with its
 sorted `web-assets.json`; both options are required together and every path,

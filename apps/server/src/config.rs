@@ -327,6 +327,8 @@ enum CliCommand {
     Auth(AuthArgs),
     #[command(about = "Manage the workstation or headless server service.")]
     Service(ServiceArgs),
+    #[command(about = "Coordinate one signed native package transaction.")]
+    Package(PackageArgs),
     #[command(about = "Run narrowly scoped internal byte transports.")]
     Transport(TransportArgs),
 }
@@ -356,6 +358,33 @@ struct ServiceArgs {
 
     #[command(subcommand)]
     command: ServiceSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct PackageArgs {
+    #[arg(long, value_enum, default_value_t, global = true)]
+    format: ServiceOutputFormat,
+
+    #[command(subcommand)]
+    command: PackageSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PackageSubcommand {
+    #[command(about = "Drain, back up, and stop the installed service before replacement.")]
+    Prepare(PackageTransactionArgs),
+    #[command(about = "Install, start, and verify the newly committed package bytes.")]
+    Activate(PackageTransactionArgs),
+    #[command(about = "Verify schema safety before restoring the previous service.")]
+    Rollback(PackageTransactionArgs),
+}
+
+#[derive(Debug, Args)]
+struct PackageTransactionArgs {
+    #[arg(long)]
+    nonce: String,
+    #[arg(long)]
+    target_version: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -437,6 +466,34 @@ enum StorageSubcommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Plan or execute explicit online-authorized data removal.")]
+    Purge(PurgeArgs),
+}
+
+#[derive(Debug, Args)]
+struct PurgeArgs {
+    #[command(subcommand)]
+    command: PurgeSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PurgeSubcommand {
+    #[command(about = "Create a five-minute online removal plan without deleting data.")]
+    Plan {
+        #[arg(long)]
+        environment_name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Authorize, stop, revalidate, and remove the exact planned data root.")]
+    Execute {
+        #[arg(long)]
+        plan_id: uuid::Uuid,
+        #[arg(long)]
+        confirm_environment_name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -445,7 +502,26 @@ pub enum CliAction {
     Storage(StorageCommand),
     Auth(AuthCommand),
     Service(ServiceCliCommand),
+    Package(PackageCliCommand),
     Transport(TransportCommand),
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageCliCommand {
+    pub operation: PackageOperation,
+    pub nonce: String,
+    pub target_version: String,
+    pub mode: ServiceMode,
+    pub root: ResolvedDataRoot,
+    pub bind: SocketAddr,
+    pub format: ServiceOutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageOperation {
+    Prepare,
+    Activate,
+    Rollback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,6 +584,17 @@ pub enum StorageCommand {
     },
     StartEmpty {
         root: ResolvedDataRoot,
+        json: bool,
+    },
+    PlanPurge {
+        root: ResolvedDataRoot,
+        environment_name: String,
+        json: bool,
+    },
+    ExecutePurge {
+        root: ResolvedDataRoot,
+        plan_id: uuid::Uuid,
+        confirm_environment_name: String,
         json: bool,
     },
 }
@@ -630,6 +717,7 @@ impl Cli {
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
             CliAction::Auth(_) => Err(ConfigError::AuthCommandIsNotServer),
             CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
+            CliAction::Package(_) => Err(ConfigError::ServiceCommandIsNotServer),
             CliAction::Transport(_) => Err(ConfigError::TransportCommandIsNotServer),
         }
     }
@@ -652,6 +740,26 @@ impl Cli {
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }
                     }
+                    StorageSubcommand::Purge(purge) => match purge.command {
+                        PurgeSubcommand::Plan {
+                            environment_name,
+                            json,
+                        } => StorageCommand::PlanPurge {
+                            root,
+                            environment_name,
+                            json,
+                        },
+                        PurgeSubcommand::Execute {
+                            plan_id,
+                            confirm_environment_name,
+                            json,
+                        } => StorageCommand::ExecutePurge {
+                            root,
+                            plan_id,
+                            confirm_environment_name,
+                            json,
+                        },
+                    },
                 }));
             }
             Some(CliCommand::Auth(auth)) => {
@@ -691,6 +799,31 @@ impl Cli {
                     root,
                     bind: SocketAddr::new(ip, args.port.unwrap_or(DEFAULT_PORT)),
                     format: service.format,
+                }));
+            }
+            Some(CliCommand::Package(package)) => {
+                let mode = parse_service_mode(args.mode.as_deref())?;
+                let root = resolve_service_data_root(args.base_dir, mode)?;
+                let host = args.host.unwrap_or_else(|| "127.0.0.1".to_owned());
+                let ip = host
+                    .parse::<IpAddr>()
+                    .map_err(|_| ConfigError::InvalidServiceHost(host.clone()))?;
+                if !ip.is_loopback() {
+                    return Err(ConfigError::InvalidServiceHost(host));
+                }
+                let (operation, transaction) = match package.command {
+                    PackageSubcommand::Prepare(args) => (PackageOperation::Prepare, args),
+                    PackageSubcommand::Activate(args) => (PackageOperation::Activate, args),
+                    PackageSubcommand::Rollback(args) => (PackageOperation::Rollback, args),
+                };
+                return Ok(CliAction::Package(PackageCliCommand {
+                    operation,
+                    nonce: transaction.nonce,
+                    target_version: transaction.target_version,
+                    mode,
+                    root,
+                    bind: SocketAddr::new(ip, args.port.unwrap_or(DEFAULT_PORT)),
+                    format: package.format,
                 }));
             }
             Some(CliCommand::Transport(transport)) => {
