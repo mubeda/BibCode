@@ -132,11 +132,11 @@ environment ownership.
 - Consumes: known environments, per-environment cached/live projects/threads, WSL bindings, activity metadata, and client preferences.
 - Produces: flat `EnvironmentTreeRow[]` plus key/index/parent maps; it performs no I/O and starts no subscriptions.
 
-- [ ] **Step 1: Write table tests for the approved hierarchy**
+- [x] **Step 1: Write table tests for the approved hierarchy**
 
 Cover primary, several remote environments, same repo in two environments, Main first, ordinary before worktree, panel excluded, collapsed parents, selected path first-use expansion, exact later collapse, stopped/offline cached descendants, and status-stable order.
 
-- [ ] **Step 2: Define explicit row types**
+- [x] **Step 2: Define explicit row types**
 
 ```ts
 type EnvironmentTreeRow =
@@ -161,25 +161,49 @@ type EnvironmentTreeRow =
 
 Each row also carries `parentKey`, `isExpanded`, `isSelected`, `ariaPosInSet`, `ariaSetSize`, cached/stale flags, and compact presentation values prepared outside React components.
 
-- [ ] **Step 3: Implement one-time environment placement**
+- [x] **Step 3: Implement one-time environment placement**
 
 When a new environment lacks an order record, insert it by: manual/pinned position, primary, currently Running WSL, connected remote, offline/stopped. Persist the resulting key array immediately. Subsequent status changes retain the stored order.
 
-- [ ] **Step 4: Implement project/thread ordering**
+- [x] **Step 4: Implement project/thread ordering**
 
 Project order is scoped to the environment. Threads are stable-partitioned as Main, pinned ordinary, ordinary, pinned worktree, worktree while preserving the existing configured thread sort within each partition. Panel threads are filtered before count/ARIA metadata.
 
-- [ ] **Step 5: Prove linear derivation and referential reuse**
+- [x] **Step 5: Prove linear derivation and referential reuse**
 
 Build each environment subtree independently, memoize by environment shell revision + preference revision, and reuse unchanged row objects. Add a 100-environment/1,000-visible-row benchmark with a fixed upper budget recorded in the test rather than an unmeasured claim.
 
-- [ ] **Step 6: Run tree tests and commit**
+- [x] **Step 6: Run tree tests and commit**
 
 ```sh
 vp test apps/web/src/environmentTree.test.ts apps/web/src/components/Sidebar.logic.test.ts
 git add apps/web/src/environmentTree.ts apps/web/src/environmentTree.test.ts apps/web/src/components/Sidebar.logic.ts apps/web/src/components/Sidebar.logic.test.ts
 git commit -m "feat(web): derive a stable environment navigation tree"
 ```
+
+Implemented a pure, environment-scoped flat-tree projector with explicit
+environment/project/thread row unions, visible-row key/index/parent maps,
+search ancestry, exact disclosure behavior, independent cached/stale flags,
+and compact status/path/activity presentation values. The projector reports a
+repaired one-time environment order for its caller to persist, preserves stored
+peer order across status changes, scopes manual project order per environment,
+retains configured non-manual sorting, and stable-partitions Main, ordinary,
+and worktree rows while excluding panel and archived threads before ARIA counts.
+Existing sidebar ordering helpers now re-export from this shared pure boundary.
+
+Per-environment memoization reuses unchanged row objects, limits selection
+rebuilds to affected subtrees, prunes forgotten environments, and repairs
+duplicate migrated order/input IDs by first occurrence. A cold benchmark covers
+100 environments and 1,100 visible rows with a recorded 250 ms upper budget.
+The initial RED run failed because the projector module did not exist; targeted
+RED runs then exposed search-result ARIA counts, persisted-order insertion,
+configured project-sort precedence, cached/stale separation, unrelated
+selection invalidation, system Main search, cache eviction, and duplicate-order
+handling before each fix. The final focused gate passed 111 tests across the
+new projector and existing sidebar logic. `vp check` passed with the one
+pre-existing unused fixture warning, and the complete workspace typecheck graph
+passed. Independent review found the cache-eviction and duplicate-order P2s;
+both regressions were added and the re-review found no remaining P0-P2 issue.
 
 ### Task 3: Persist exact scoped navigation state and migrate v1 preferences
 

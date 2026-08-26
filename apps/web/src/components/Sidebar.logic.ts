@@ -1,18 +1,22 @@
 import * as React from "react";
-import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@bibcode/contracts/settings";
+import type { SidebarThreadSortOrder } from "@bibcode/contracts/settings";
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
 import type { ConnectionCatalogHealth } from "@bibcode/client-runtime/platform";
 import type { EnvironmentId } from "@bibcode/contracts";
-import {
-  getThreadSortTimestamp,
-  sortThreads,
-  toSortableTimestamp,
-  type ThreadSortInput,
-} from "../lib/threadSort";
+import { sortThreads, type ThreadSortInput } from "../lib/threadSort";
 import type { SidebarThreadSummary, Thread } from "../types";
 import { cn } from "../lib/utils";
 import { isLatestTurnSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
+
+export {
+  findDefaultThread,
+  getProjectSortTimestamp,
+  orderRowsWithPins,
+  sortProjectsForSidebar,
+  splitPrimaryAndWorkspaceThreads,
+  type WorkspaceRowThreadInput,
+} from "../environmentTree";
 
 export const THREAD_SELECTION_SAFE_SELECTOR = "[data-thread-item], [data-thread-selection-safe]";
 export const THREAD_JUMP_HINT_SHOW_DELAY_MS = 100;
@@ -101,13 +105,6 @@ export function resolveSidebarProjectAvailability(input: {
     hasCachedProjects: input.projectCount > 0,
   };
 }
-type SidebarProject = {
-  id: string;
-  title: string;
-  createdAt?: string | undefined;
-  updatedAt?: string | undefined;
-};
-
 export type ThreadTraversalDirection = "previous" | "next";
 
 export interface ThreadStatusPill {
@@ -601,73 +598,7 @@ export function getFallbackThreadIdAfterDelete<
     )[0]?.id ?? null
   );
 }
-export function getProjectSortTimestamp(
-  project: SidebarProject,
-  projectThreads: readonly ThreadSortInput[],
-  sortOrder: Exclude<SidebarProjectSortOrder, "manual">,
-): number {
-  if (projectThreads.length > 0) {
-    return projectThreads.reduce(
-      (latest, thread) => Math.max(latest, getThreadSortTimestamp(thread, sortOrder)),
-      Number.NEGATIVE_INFINITY,
-    );
-  }
-
-  if (sortOrder === "created_at") {
-    return toSortableTimestamp(project.createdAt) ?? Number.NEGATIVE_INFINITY;
-  }
-  return toSortableTimestamp(project.updatedAt ?? project.createdAt) ?? Number.NEGATIVE_INFINITY;
-}
-
 // --- Orca-parity workspace-row helpers (primary row + pin ordering + duration) ---
-
-export interface WorkspaceRowThreadInput {
-  readonly kind?: "default" | "workspace" | "panel" | undefined;
-}
-
-/** Finds the project's default (primary-row) thread, if the server has backfilled one. */
-export function findDefaultThread<T extends WorkspaceRowThreadInput>(
-  threads: readonly T[],
-): T | null {
-  return threads.find((thread) => thread.kind === "default") ?? null;
-}
-
-/**
- * Splits a project's threads into the primary-row thread (`kind: "default"`)
- * and the remaining workspace rows (worktree/ad-hoc threads). `kind: "panel"`
- * threads are center-panel siblings of a host thread and never appear as
- * sidebar rows, so they are excluded from `workspaceThreads` entirely. `null`
- * primary means the server hasn't backfilled a default thread yet for this
- * project; callers fall back to creating one on click.
- */
-export function splitPrimaryAndWorkspaceThreads<T extends WorkspaceRowThreadInput>(
-  threads: readonly T[],
-): { primaryThread: T | null; workspaceThreads: T[] } {
-  const primaryThread = findDefaultThread(threads);
-  const workspaceThreads = threads.filter(
-    (thread) => thread !== primaryThread && thread.kind !== "panel",
-  );
-  return { primaryThread, workspaceThreads };
-}
-
-/**
- * Stable-partitions `items` so pinned entries (per `sidebarWorkspaceMetaStore`)
- * come first, preserving the caller's existing relative order (typically
- * already sorted via `sortThreads`) within each partition.
- */
-export function orderRowsWithPins<T>(
-  items: readonly T[],
-  pinnedKeys: ReadonlySet<string> | readonly string[],
-  getKey: (item: T) => string,
-): T[] {
-  const pinned = pinnedKeys instanceof Set ? pinnedKeys : new Set(pinnedKeys);
-  const pinnedItems: T[] = [];
-  const restItems: T[] = [];
-  for (const item of items) {
-    (pinned.has(getKey(item)) ? pinnedItems : restItems).push(item);
-  }
-  return [...pinnedItems, ...restItems];
-}
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -694,41 +625,4 @@ export function formatSessionDuration(input: {
   if (elapsedMs < HOUR_MS) return `${Math.floor(elapsedMs / MINUTE_MS)}m`;
   if (elapsedMs < DAY_MS) return `${Math.floor(elapsedMs / HOUR_MS)}h`;
   return `${Math.floor(elapsedMs / DAY_MS)}d`;
-}
-
-export function sortProjectsForSidebar<
-  TProject extends SidebarProject,
-  TThread extends Pick<Thread, "projectId" | "createdAt" | "updatedAt"> & ThreadSortInput,
->(
-  projects: readonly TProject[],
-  threads: readonly TThread[],
-  sortOrder: SidebarProjectSortOrder,
-): TProject[] {
-  if (sortOrder === "manual") {
-    return [...projects];
-  }
-
-  const threadsByProjectId = new Map<string, TThread[]>();
-  for (const thread of threads) {
-    const existing = threadsByProjectId.get(thread.projectId) ?? [];
-    existing.push(thread);
-    threadsByProjectId.set(thread.projectId, existing);
-  }
-
-  return [...projects].toSorted((left, right) => {
-    const rightTimestamp = getProjectSortTimestamp(
-      right,
-      threadsByProjectId.get(right.id) ?? [],
-      sortOrder,
-    );
-    const leftTimestamp = getProjectSortTimestamp(
-      left,
-      threadsByProjectId.get(left.id) ?? [],
-      sortOrder,
-    );
-    const byTimestamp =
-      rightTimestamp === leftTimestamp ? 0 : rightTimestamp > leftTimestamp ? 1 : -1;
-    if (byTimestamp !== 0) return byTimestamp;
-    return left.title.localeCompare(right.title) || left.id.localeCompare(right.id);
-  });
 }
