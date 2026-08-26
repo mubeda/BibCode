@@ -26,9 +26,36 @@ pub async fn exchange_pairing(
     credential: &str,
     signing_seed: u8,
 ) -> DpopSession {
+    let response = send_pairing_exchange(client, token_url, credential, signing_seed).await;
+    let status = response.status();
+    let body = response.text().await.expect("DPoP pairing exchange body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "DPoP pairing exchange failed: {body}"
+    );
+    let access_token =
+        serde_json::from_str::<Value>(&body).expect("DPoP pairing exchange JSON")["access_token"]
+            .as_str()
+            .expect("DPoP access token")
+            .to_owned();
     let signing_key = SigningKey::from_bytes((&[signing_seed; 32]).into())
         .expect("valid deterministic DPoP signing key");
-    let response = client
+    DpopSession {
+        access_token,
+        signing_key,
+    }
+}
+
+pub async fn send_pairing_exchange(
+    client: &Client,
+    token_url: &str,
+    credential: &str,
+    signing_seed: u8,
+) -> reqwest::Response {
+    let signing_key = SigningKey::from_bytes((&[signing_seed; 32]).into())
+        .expect("valid deterministic DPoP signing key");
+    client
         .post(token_url)
         .header("dpop", dpop_proof(&signing_key, "POST", token_url, None))
         .form(&[
@@ -48,23 +75,7 @@ pub async fn exchange_pairing(
         ])
         .send()
         .await
-        .expect("DPoP pairing exchange response");
-    let status = response.status();
-    let body = response.text().await.expect("DPoP pairing exchange body");
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "DPoP pairing exchange failed: {body}"
-    );
-    let access_token =
-        serde_json::from_str::<Value>(&body).expect("DPoP pairing exchange JSON")["access_token"]
-            .as_str()
-            .expect("DPoP access token")
-            .to_owned();
-    DpopSession {
-        access_token,
-        signing_key,
-    }
+        .expect("DPoP pairing exchange response")
 }
 
 fn dpop_proof(

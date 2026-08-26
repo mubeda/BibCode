@@ -251,6 +251,13 @@ impl PackageLifecycleReceiptStore {
         Ok(receipt)
     }
 
+    pub async fn load_active(&self) -> Result<Option<PackageLifecycleReceipt>> {
+        Ok(self
+            .load()
+            .await?
+            .filter(|receipt| !receipt.phase.is_terminal()))
+    }
+
     pub async fn prepare(&self, input: PackagePrepareInput) -> Result<PackageLifecycleReceipt> {
         let _guard = acquire_lifecycle_lock(&self.data_root).await?;
         if input.data_root != self.data_root {

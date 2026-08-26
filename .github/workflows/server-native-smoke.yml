@@ -34,7 +34,7 @@ jobs:
   build:
     name: Server ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -42,27 +42,39 @@ jobs:
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             platform: windows
+            architecture: x86_64
             formats: native,portable
+            smoke_formats: msi zip
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             platform: windows
+            architecture: aarch64
             formats: native,portable
+            smoke_formats: msi zip
           - runner: macos-26-intel
             target: x86_64-apple-darwin
             platform: macos
+            architecture: x86_64
             formats: portable
+            smoke_formats: tar.gz
           - runner: macos-26
             target: aarch64-apple-darwin
             platform: macos
+            architecture: aarch64
             formats: portable
+            smoke_formats: tar.gz
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux
+            architecture: x86_64
             formats: native,portable
+            smoke_formats: deb rpm tar.gz
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux
+            architecture: aarch64
             formats: native,portable
+            smoke_formats: deb rpm tar.gz
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,6 +107,23 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Install pinned Windows MSI inspector
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $archive = Join-Path $env:RUNNER_TEMP 'lessmsi-v2.12.9.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'lessmsi-v2.12.9'
+          Invoke-WebRequest -Uri 'https://github.com/activescott/lessmsi/releases/download/v2.12.9/lessmsi-v2.12.9.zip' -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '5b4e187e74b184ad3a63ccf06c3d17dae2b8c4b6c298a996dbd51a9f6db29d21'
+          if ($actual -ne $expected) { throw 'The pinned lessmsi archive checksum is invalid.' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $tool = @(Get-ChildItem -LiteralPath $destination -Filter lessmsi.exe -Recurse)
+          if ($tool.Count -ne 1) { throw 'The pinned lessmsi archive layout is invalid.' }
+          $tool[0].DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Download frozen server web assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -112,6 +141,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          elevate=sudo
+          "$elevate" apt-get update
+          "$elevate" apt-get install -y rpm
           cargo install cargo-deb --version 3.7.0 --locked
           cargo install cargo-generate-rpm --version 0.21.0 --locked
 
@@ -186,6 +218,49 @@ jobs:
           fi
           "${args[@]}"
 
+      - name: Inspect Windows MSI before execution
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packages = @(Get-ChildItem release/server-candidate -Filter *.msi)
+          if ($packages.Count -ne 1) { throw 'Expected exactly one Windows MSI.' }
+          $inspection = Join-Path $env:RUNNER_TEMP 'bibcode-msi-inspection'
+          New-Item -ItemType Directory -Path $inspection | Out-Null
+          lessmsi.exe l -t File $packages[0].FullName |
+            Out-File -FilePath (Join-Path $inspection 'File.csv') -Encoding utf8
+          lessmsi.exe l -t Directory $packages[0].FullName |
+            Out-File -FilePath (Join-Path $inspection 'Directory.csv') -Encoding utf8
+          lessmsi.exe l -t CustomAction $packages[0].FullName |
+            Out-File -FilePath (Join-Path $inspection 'CustomAction.csv') -Encoding utf8
+          $payload = Join-Path $inspection 'payload'
+          New-Item -ItemType Directory -Path $payload | Out-Null
+          lessmsi.exe x $packages[0].FullName ($payload + [IO.Path]::DirectorySeparatorChar)
+          if ($LASTEXITCODE -ne 0) { throw 'lessmsi payload extraction failed.' }
+          $binaries = @(Get-ChildItem -LiteralPath $payload -Filter bibcode.exe -Recurse)
+          $layouts = @(Get-ChildItem -LiteralPath $payload -Filter server-layout.json -Recurse)
+          if ($binaries.Count -ne 1 -or $layouts.Count -ne 1) {
+            throw 'The MSI payload does not match the server layout allowlist.'
+          }
+
+      - name: Inspect Linux packages before execution
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          deb_paths=(release/server-candidate/*.deb)
+          rpm_paths=(release/server-candidate/*.rpm)
+          if (( ${#deb_paths[@]} != 1 || ${#rpm_paths[@]} != 1 )); then
+            echo 'Expected exactly one DEB and one RPM.' >&2
+            exit 1
+          fi
+          mkdir -p release/server-package-inspection/deb-control
+          dpkg-deb --contents "${deb_paths[0]}" > release/server-package-inspection/deb-contents.txt
+          dpkg-deb --control "${deb_paths[0]}" release/server-package-inspection/deb-control
+          rpm -qpl --scripts "${rpm_paths[0]}" > release/server-package-inspection/rpm-contents-and-scripts.txt
+
       - name: Remove ephemeral Windows signing certificate
         if: always() && matrix.platform == 'windows' && inputs.channel != 'unsigned-test'
         shell: pwsh
@@ -196,6 +271,45 @@ jobs:
           if ($thumbprint -match '^[A-Fa-f0-9]{40}$') {
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Create byte-verified native smoke set
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/create-server-install-smoke-set.ts \
+            --artifact-root "$PWD/release/server-candidate" \
+            --output-dir "$PWD/release/server-smoke-set" \
+            --source-date-epoch "${{ inputs.source-date-epoch }}"
+
+      - name: Run native server installer lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/server-smoke-evidence
+          for format in ${{ matrix.smoke_formats }}; do
+            format_slug="${format//./-}"
+            work_root="$PWD/release/server-smoke-work-$format_slug"
+            node scripts/server-install-smoke.ts \
+              --manifest "$PWD/release/server-smoke-set/artifacts.json" \
+              --artifact-root "$PWD/release/server-smoke-set" \
+              --os "${{ matrix.platform }}" \
+              --architecture "${{ matrix.architecture }}" \
+              --format "$format" \
+              --work-root "$work_root" \
+              --stage-timeout-ms 1800000 \
+              --command-timeout-ms 180000 \
+              --allow-unsigned-test \
+              --allow-system-mutation
+            cp "$work_root/evidence.json" "release/server-smoke-evidence/$format_slug.json"
+          done
+
+      - name: Upload native server smoke evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-smoke-${{ inputs.source-sha }}-${{ matrix.target }}
+          path: release/server-smoke-evidence/*.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload source-bound server candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -209,7 +323,7 @@ jobs:
     name: Server universal-apple-darwin
     needs: [build]
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -274,6 +388,59 @@ jobs:
             args+=(--unsigned-test)
           fi
           "${args[@]}"
+
+      - name: Inspect universal macOS package before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_path="$PWD/release/server-candidate/bibcode-server-${{ inputs.version }}-macos-universal.pkg"
+          inspection_root="$PWD/release/server-package-inspection"
+          pkgutil --expand-full "$package_path" "$inspection_root"
+          binaries=()
+          while IFS= read -r binary; do
+            binaries+=("$binary")
+          done < <(find "$inspection_root" -type f -path '*/usr/local/libexec/bibcode-server/bin/bibcode')
+          if (( ${#binaries[@]} != 1 )); then
+            echo 'Expected exactly one expanded universal server binary.' >&2
+            exit 1
+          fi
+          codesign --verify --strict --verbose=4 "${binaries[0]}"
+
+      - name: Create byte-verified native smoke set
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/create-server-install-smoke-set.ts \
+            --artifact-root "$PWD/release/server-candidate" \
+            --output-dir "$PWD/release/server-smoke-set" \
+            --source-date-epoch "${{ inputs.source-date-epoch }}"
+
+      - name: Run native server installer lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_root="$PWD/release/server-smoke-work-pkg"
+          node scripts/server-install-smoke.ts \
+            --manifest "$PWD/release/server-smoke-set/artifacts.json" \
+            --artifact-root "$PWD/release/server-smoke-set" \
+            --os macos \
+            --architecture universal \
+            --format pkg \
+            --work-root "$work_root" \
+            --stage-timeout-ms 1800000 \
+            --command-timeout-ms 180000 \
+            --allow-unsigned-test \
+            --allow-system-mutation
+          mkdir -p release/server-smoke-evidence
+          cp "$work_root/evidence.json" release/server-smoke-evidence/pkg.json
+
+      - name: Upload native server smoke evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-smoke-${{ inputs.source-sha }}-universal-apple-darwin
+          path: release/server-smoke-evidence/*.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload source-bound universal candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

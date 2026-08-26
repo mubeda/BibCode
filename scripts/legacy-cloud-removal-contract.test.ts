@@ -105,4 +105,16 @@ describe("legacy cloud removal contract", () => {
       ].sort(),
     );
   });
+
+  it("keeps native installer validation inside the active-source scan", () => {
+    for (const path of [
+      ".github/workflows/server-native-smoke.yml",
+      "apps/server/tests/packaged_server_smoke.rs",
+      "scripts/create-server-install-smoke-set.ts",
+      "scripts/lib/server-install-smoke-driver.ts",
+      "scripts/server-install-smoke.ts",
+    ]) {
+      expect(isAllowedPath(path), path).toBe(false);
+    }
+  });
 });

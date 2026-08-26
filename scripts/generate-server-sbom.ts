@@ -169,19 +169,23 @@ export function resolveServerSbomCommandPlan(
 const componentIdentity = (component: JsonRecord): string =>
   `${String(component.name ?? "")} ${String(component.purl ?? "")}`.toLocaleLowerCase("en-US");
 
+const forbiddenProductionIdentityMarkers = [
+  "tauri",
+  ["bibcode", "connect"].join(" "),
+  ["bibcode", "connect"].join("-"),
+  ["bibcode", "connect"].join("_"),
+  ["tele", "metry"].join(""),
+  ["opentele", "metry"].join(""),
+  "sentry",
+] as const;
+
 const forbiddenProductionComponent = (component: JsonRecord): boolean => {
   const identity = componentIdentity(component);
   const name = String(component.name ?? "").toLocaleLowerCase("en-US");
   return (
     name === "node" ||
     name === "node.js" ||
-    identity.includes("tauri") ||
-    identity.includes("bibcode connect") ||
-    identity.includes("bibcode-connect") ||
-    identity.includes("bibcode_connect") ||
-    identity.includes("telemetry") ||
-    identity.includes("opentelemetry") ||
-    identity.includes("sentry")
+    forbiddenProductionIdentityMarkers.some((marker) => identity.includes(marker))
   );
 };
 

@@ -269,6 +269,70 @@ describe("reusable native server workflow contract", () => {
     expect(universalCommands).toContain("--macos-other-slice");
     expect(universalCommands).toContain("x86_64-apple-darwin.tar.gz.build.json");
   });
+
+  it("runs the verified installer lifecycle for every native server package and portable file", () => {
+    const { workflow } = readWorkflow(SERVER_NATIVE_WORKFLOW_PATH);
+    const build = requireJob(workflow, "build");
+    const matrix = build.strategy?.matrix?.include ?? [];
+    const buildCommands = allStepCommands(build);
+    const universalCommands = allStepCommands(requireJob(workflow, "mac_universal"));
+
+    expect(matrix).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: "x86_64-pc-windows-msvc",
+          architecture: "x86_64",
+          smoke_formats: "msi zip",
+        }),
+        expect.objectContaining({
+          target: "aarch64-pc-windows-msvc",
+          architecture: "aarch64",
+          smoke_formats: "msi zip",
+        }),
+        expect.objectContaining({
+          target: "x86_64-apple-darwin",
+          architecture: "x86_64",
+          smoke_formats: "tar.gz",
+        }),
+        expect.objectContaining({
+          target: "aarch64-apple-darwin",
+          architecture: "aarch64",
+          smoke_formats: "tar.gz",
+        }),
+        expect.objectContaining({
+          target: "x86_64-unknown-linux-gnu",
+          architecture: "x86_64",
+          smoke_formats: "deb rpm tar.gz",
+        }),
+        expect.objectContaining({
+          target: "aarch64-unknown-linux-gnu",
+          architecture: "aarch64",
+          smoke_formats: "deb rpm tar.gz",
+        }),
+      ]),
+    );
+    for (const commands of [buildCommands, universalCommands]) {
+      expect(commands).toContain("create-server-install-smoke-set.ts");
+      expect(commands).toContain("server-install-smoke.ts");
+      expect(commands).toContain("--allow-unsigned-test");
+      expect(commands).toContain("--allow-system-mutation");
+      expect(commands).toContain("evidence.json");
+      expect(commands).toContain("Upload native server smoke evidence");
+    }
+    expect(buildCommands).toContain("lessmsi-v2.12.9.zip");
+    expect(buildCommands).toContain(
+      "5b4e187e74b184ad3a63ccf06c3d17dae2b8c4b6c298a996dbd51a9f6db29d21",
+    );
+    expect(buildCommands).toContain("lessmsi.exe");
+    expect(buildCommands).toContain("$PSNativeCommandUseErrorActionPreference = $true");
+    expect(buildCommands).toContain("dpkg-deb --contents");
+    expect(buildCommands).toContain("dpkg-deb --control");
+    expect(buildCommands).toContain("rpm -qpl --scripts");
+    expect(universalCommands).toContain("pkgutil --expand-full");
+    expect(universalCommands).toContain("codesign --verify --strict --verbose=4");
+    expect(buildCommands).not.toContain("cargo install cargo-cyclonedx");
+    expect(buildCommands).toContain("apt-get install -y rpm");
+  });
 });
 
 describe("cross-platform release contract", () => {

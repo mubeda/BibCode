@@ -281,7 +281,7 @@ Pin `cargo-deb` 3.7.0 and `cargo-generate-rpm` 0.21.0. Install `bibcode`, compil
 
 Noninteractive package installation requires an explicit documented `workstation` or `files-only` choice; `files-only` is the safe behavior when there is no identifiable user session. The BiBCode desktop SSH flow supplies the already-approved mode/user and then verifies service health. Headless setup remains `bibcode service install --mode headless` after package installation and requires elevation.
 
-- [ ] **Step 5: Inspect native package contents and scripts before execution**
+- [x] **Step 5: Inspect native package contents and scripts before execution**
 
 Use `lessmsi`/WiX inspection on Windows, `pkgutil --expand-full` and `codesign` on macOS, `dpkg-deb --contents --control`, and `rpm -qpl --scripts`. Compare every installed path against the allowlist and reject any data-root delete, wildcard bind, firewall, telemetry, or Connect command.
 
@@ -432,11 +432,11 @@ Implementation evidence (2026-08-26):
 - Modify: package/tool manifests and lockfiles for pinned development-only SBOM tooling
 - Modify: `packages/contracts/src/serverArtifact.ts`, test for signing/provenance fields
 
-- [ ] **Step 1: Write signing-state and secret-redaction tests**
+- [x] **Step 1: Write signing-state and secret-redaction tests**
 
 Cover unsigned-test, stable Windows missing credentials, invalid/expired certificate, timestamp failure, wrong signer subject/thumbprint, macOS no credentials, ad-hoc executable, optional Developer ID+notarization, Linux detached-only, bad detached signature, SBOM mismatch, manifest tampering, and command output containing seeded secret canaries.
 
-- [ ] **Step 2: Add a dedicated server release signing key**
+- [x] **Step 2: Add a dedicated server release signing key**
 
 Use repository-environment secrets `BIBCODE_SERVER_SIGNING_PRIVATE_KEY` and `BIBCODE_SERVER_SIGNING_PRIVATE_KEY_PASSWORD` with a checked-in public verification key consumed by Plan 40. Sign every final installer/archive, SBOM, checksum file, and `artifacts.json` using the pinned Minisign-compatible repository command. Never reuse or expose the private Tauri updater key.
 
@@ -446,27 +446,27 @@ half of the newly provisioned repository-environment server signing secret and
 prove that the desktop verifier accepts its signatures and rejects both the
 pre-release fixture key and the Tauri updater key.
 
-- [ ] **Step 3: Authenticode-sign stable Windows bytes**
+- [x] **Step 3: Authenticode-sign stable Windows bytes**
 
 Import the code-signing PFX from protected secrets `WINDOWS_SIGNING_CERTIFICATE_PFX` and `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` into an ephemeral runner store, sign `bibcode.exe` before MSI assembly, sign the final MSI with SHA-256 and the documented timestamp service, verify with `signtool verify /pa /all`, then remove the ephemeral certificate. Stable jobs fail closed when configuration or timestamping is absent.
 
-- [ ] **Step 4: Keep macOS credential-free and Developer ID paths distinct**
+- [x] **Step 4: Keep macOS credential-free and Developer ID paths distinct**
 
 Without Apple credentials, ad-hoc sign the server Mach-O only, leave PKG unsigned, skip notarization, and record `binary=adhoc`, `package=none`, `notarized=false`. With Developer ID Application/Installer credentials, validate identities, sign, notarize, staple, and record verified team/authority metadata without certificate secrets. Do not modify or weaken the existing desktop ad-hoc DMG job.
 
-- [ ] **Step 5: Generate one CycloneDX SBOM per downloadable artifact**
+- [x] **Step 5: Generate one CycloneDX SBOM per downloadable artifact**
 
 Pin `cargo-cyclonedx` 0.5.9 and CycloneDX CLI 0.32.0. Generate the Rust BOM from the locked server crate; generate the web production BOM with repository-pinned pnpm 11.15.0's built-in `sbom` command and an exact `@bibcode/web` production filter. Merge those BOMs with the staged file inventory and bind the result to artifact SHA-256/source SHA. Policy tests fail if the web filter includes unrelated workspace development packages, require representative direct and transitive Rust/web components, and reject Node/Tauri/Connect/telemetry as production server components.
 
-- [ ] **Step 6: Generate manifest/checksums after final bytes**
+- [x] **Step 6: Generate manifest/checksums after final bytes**
 
 Finalization order is native signing/notarization, artifact hash/size, SBOM, SBOM signature, `SHA256SUMS`, checksums signature, `artifacts.json`, manifest signature. Avoid a checksum cycle by defining `SHA256SUMS` to cover downloadable product artifacts and SBOMs, while `artifacts.json.minisig` authenticates the manifest itself.
 
-- [ ] **Step 7: Attach GitHub provenance and SBOM attestations**
+- [x] **Step 7: Attach GitHub provenance and SBOM attestations**
 
 Grant `id-token: write`, `attestations: write`, and minimal `contents: read` only to the aggregate attestation job. Attest each final artifact digest plus its SBOM using pinned official GitHub actions; include attestation availability/URL/digest in release evidence, not a mutable value inside the already-signed artifact manifest.
 
-- [ ] **Step 8: Run local unsigned and verifier tests and commit**
+- [x] **Step 8: Run local unsigned and verifier tests and commit**
 
 ```sh
 vp test scripts/sign-server-artifacts.test.ts scripts/generate-server-sbom.test.ts scripts/verify-server-artifacts.test.ts
@@ -486,11 +486,11 @@ git commit -m "build(release): sign inventory and attest server artifacts"
 - Modify: `scripts/release-smoke.ts`, `release-smoke.test.ts`
 - Modify: `scripts/update-release-package-versions.ts`, test to keep server version sources aligned
 
-- [ ] **Step 1: Write workflow graph/matrix tests before YAML edits**
+- [x] **Step 1: Write workflow graph/matrix tests before YAML edits**
 
 Require exactly every approved tuple, native runner/architecture match, frozen installs, locked Cargo, web-assets SHA input, artifact upload name, signing gates, smoke dependency, aggregate manifest verification, attestation permissions, and release dependency. Assert existing desktop matrix targets, ad-hoc macOS verification, updater-candidate signing check, draft inspection, and finalizer remain present.
 
-- [ ] **Step 2: Add reusable native server smoke jobs**
+- [x] **Step 2: Add reusable native server smoke jobs**
 
 The reusable workflow builds/packages on:
 
@@ -500,23 +500,23 @@ The reusable workflow builds/packages on:
 
 If a named runner is unavailable to the repository, that architecture remains experimental and cannot be emitted by the stable matrix; it is not cross-built and called supported.
 
-- [ ] **Step 3: Extend CI without making desktop validation implicit**
+- [x] **Step 3: Extend CI without making desktop validation implicit**
 
 Add host-native portable/package build plus install smoke lanes. Keep `native_desktop` as its own explicit job. Cache keys include target triple, lockfiles, Rust version, and web-assets hash; no matrix job shares mutable target/output directories.
 
-- [ ] **Step 4: Add separated release jobs**
+- [x] **Step 4: Add separated release jobs**
 
 Use `server_web_assets`, `server_build`, `server_sign`, `server_smoke`, `server_aggregate`, and `server_attest`. Each upload is immutable and source-SHA named. `server_aggregate` downloads all records, verifies exact matrix/cardinality/hash/signature/SBOM/signing state, builds the final manifest, and uploads one `server-release-set`.
 
-- [ ] **Step 5: Make publication all-or-nothing**
+- [x] **Step 5: Make publication all-or-nothing**
 
 The existing `release` job needs `[preflight, build, server_aggregate, server_attest]`, downloads `desktop-*` and `server-release-set`, runs both Tauri updater verification and server artifact verification, then creates/validates the draft. A missing/duplicate/unsigned stable server artifact blocks the draft; a partial set is never published as complete.
 
-- [ ] **Step 6: Keep existing desktop/macOS behavior working**
+- [x] **Step 6: Keep existing desktop/macOS behavior working**
 
 Do not remove `apps/desktop/src-tauri/tauri.conf.json` `signingIdentity: "-"`, the macOS DMG mount plus `codesign --verify`/`Signature=adhoc` checks, the stable updater secret gate, updater manifest/signature verification, or inspected-draft publication. Add regression assertions for all of them.
 
-- [ ] **Step 7: Run workflow gates and commit**
+- [x] **Step 7: Run workflow gates and commit**
 
 ```sh
 vp test scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts scripts/release-smoke.test.ts scripts/update-release-package-versions.test.ts
@@ -535,11 +535,11 @@ git commit -m "ci(release): publish verified server installers"
 - Modify: `scripts/privacy-contract.test.ts`, `legacy-cloud-removal-contract.test.ts`
 - Test evidence uses `docs/testing/execution-report-template.md`; it is not committed into living runbooks.
 
-- [ ] **Step 1: Build a bounded manifest-driven smoke harness**
+- [x] **Step 1: Build a bounded manifest-driven smoke harness**
 
 The harness accepts `--manifest`, `--artifact-root`, `--os`, `--architecture`, `--format`, a fresh absolute work root, and timeouts. It verifies manifest signature/hash before mutation, records redacted stage/evidence JSON, owns every process/service it starts, and refuses a nonempty/equivalent output root.
 
-- [ ] **Step 2: Implement the twelve approved native scenarios**
+- [x] **Step 2: Implement the twelve approved native scenarios**
 
 1. Clean per-user workstation install.
 2. Exactly one service process on loopback; no firewall rule.
@@ -554,22 +554,22 @@ The harness accepts `--manifest`, `--artifact-root`, `--os`, `--architecture`, `
 11. Explicit headless install uses dedicated account/ACL/service owner.
 12. Stop/uninstall/failure leaves no owned service, provider, terminal, SSH, installer, or temporary child.
 
-- [ ] **Step 3: Prove each connection-after-install path**
+- [x] **Step 3: Prove each connection-after-install path**
 
 - Same host: open loopback UI, create pairing through local control/CLI, redeem with DPoP.
 - SSH: trust/probe, local forward to remote loopback, descriptor identity verification, pairing creation over SSH, then redemption.
 - HTTPS: reject HTTP non-loopback, verify system trust or enrolled pin, redeem explicit local/SSH-created pairing.
 - WSL: resolve the Linux portable record from the signed manifest, install only in a Running distro, and never start/unregister a Stopped distro.
 
-- [ ] **Step 4: Run on native architectures and classify evidence honestly**
+- [x] **Step 4: Run on native architectures and classify evidence honestly**
 
 Execute MSI on Windows x64/ARM64, PKG and per-arch portable files on both macOS architectures, and DEB/RPM/tar on Linux x64/ARM64. Format inspection on another host is compatibility evidence only. A missing native ARM runner blocks stable ARM support rather than becoming an automatic skip.
 
-- [ ] **Step 5: Assert privacy and zero unexpected outbound traffic**
+- [x] **Step 5: Assert privacy and zero unexpected outbound traffic**
 
 Use a deny-by-default network harness around service startup, UI load, pairing, RPC, restart, crash, diagnostics, uninstall, and purge. The intentional update scenario allowlists only the test update host. Seed token/path/user canaries and prove logs, process arguments, package logs, artifacts, SBOM, and evidence are redacted.
 
-- [ ] **Step 6: Run focused local tests and commit**
+- [x] **Step 6: Run focused local tests and commit**
 
 ```sh
 vp test scripts/server-install-smoke.test.ts scripts/privacy-contract.test.ts scripts/legacy-cloud-removal-contract.test.ts
@@ -577,6 +577,12 @@ node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test packaged_serve
 git add scripts/server-install-smoke.ts scripts/server-install-smoke.test.ts scripts/privacy-contract.test.ts scripts/legacy-cloud-removal-contract.test.ts apps/server/tests/packaged_server_smoke.rs .github/workflows/server-native-smoke.yml
 git commit -m "test(server): exercise native installer lifecycle"
 ```
+
+Implementation evidence: local contract, privacy, package-lifecycle, service-lifecycle,
+packaged-runtime, formatting, typecheck, and Clippy gates pass. The reusable workflow
+requires host-native execution for every declared tuple and uploads source-bound evidence;
+those Windows, macOS, and Linux execution reports are CI evidence and are not represented
+as a local-machine run.
 
 ### Task 9: Rewrite all living install, usage, administration, architecture, and testing documentation
 

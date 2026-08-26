@@ -238,4 +238,19 @@ describe("zero-telemetry privacy contract", () => {
     expect(releaseSmoke).toContain("assertNoLegacyCloudArtifacts");
     expect(releaseSmoke).toContain('"--release"');
   });
+
+  it("keeps native installer evidence bounded, redacted, and behind the outbound deny proxy", () => {
+    const harness = read("scripts/server-install-smoke.ts");
+    const packagedSmoke = read("apps/server/tests/packaged_server_smoke.rs");
+
+    expect(harness).toContain("SAFE_EVIDENCE_CODE");
+    expect(harness).toContain("cleanup was attempted");
+    expect(harness).not.toContain("JSON.stringify(error)");
+    for (const proxyVariable of ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) {
+      expect(packagedSmoke).toContain(proxyVariable);
+    }
+    expect(packagedSmoke).toContain("proxy.attempts()");
+    expect(packagedSmoke).toContain("!logs.contains(&credential)");
+    expect(packagedSmoke).toContain("!replay");
+  });
 });

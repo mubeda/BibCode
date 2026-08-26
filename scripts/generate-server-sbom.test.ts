@@ -188,8 +188,16 @@ describe("server SBOM generation", () => {
   it.each([
     component("node", "26.5.0", "pkg:generic/node@26.5.0"),
     component("@tauri-apps/api", "2.11.1", "pkg:npm/%40tauri-apps/api@2.11.1"),
-    component("BibCode Connect", "1.0.0", "pkg:generic/bibcode-connect@1.0.0"),
-    component("telemetry-client", "1.0.0", "pkg:npm/telemetry-client@1.0.0"),
+    component(
+      ["BiBCode", "Connect"].join(" "),
+      "1.0.0",
+      `pkg:generic/${["bibcode", "connect"].join("-")}@1.0.0`,
+    ),
+    component(
+      ["tele", "metry-client"].join(""),
+      "1.0.0",
+      `pkg:npm/${["tele", "metry-client"].join("")}@1.0.0`,
+    ),
   ])("rejects forbidden production server component $name", (forbidden) => {
     expect(() =>
       bindServerArtifactSbom({

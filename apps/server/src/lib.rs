@@ -406,7 +406,7 @@ async fn run_package_command(command: PackageCliCommand) -> Result<(), RunError>
         }
         PackageOperation::Activate => {
             require_running_package_version(&command.target_version)?;
-            let existing = store.load().await?;
+            let existing = store.load_active().await?;
             let clean_install = existing.is_none();
             let mut receipt = existing;
             if let Some(current) = &receipt {

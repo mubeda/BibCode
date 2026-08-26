@@ -82,6 +82,16 @@ async fn receipt_is_versioned_nonce_redacted_and_resumable_at_every_durable_boun
             .unwrap();
         assert_eq!(retried, advanced, "phase retry must be idempotent");
     }
+    assert_eq!(
+        store.load_active().await.unwrap(),
+        None,
+        "a completed update receipt must not block a preserve-data reinstall"
+    );
+
+    let replacement = prepare_input(&root, "installer-nonce-2");
+    let replacement_receipt = store.prepare(replacement).await.unwrap();
+    assert_eq!(replacement_receipt.phase, PackageLifecyclePhase::Prepared);
+    assert_ne!(replacement_receipt.nonce_sha256, prepared.nonce_sha256);
 }
 
 #[tokio::test]

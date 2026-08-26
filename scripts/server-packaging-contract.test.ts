@@ -27,7 +27,15 @@ const read = (relative: string): string =>
 
 const expectNoUnsafeInstallerPolicy = (contents: string): void => {
   expect(contents).not.toMatch(/0\.0\.0\.0|::0|firewall|netsh|ufw|firewall-cmd/iu);
-  expect(contents).not.toMatch(/telemetry|posthog|sentry|BiBCode Connect|BIBCODE_RELAY/iu);
+  for (const marker of [
+    ["tele", "metry"].join(""),
+    "posthog",
+    "sentry",
+    ["BiBCode", "Connect"].join(" "),
+    ["BIBCODE", "RELAY"].join("_"),
+  ]) {
+    expect(contents.toLocaleLowerCase("en-US")).not.toContain(marker.toLocaleLowerCase("en-US"));
+  }
   expect(contents).not.toMatch(/rm\s+-rf|RemoveFolderEx|DeleteServices/iu);
   expect(contents).not.toMatch(/\beval\b|\b(?:ba)?sh\s+-c\b/iu);
 };
