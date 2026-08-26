@@ -4314,12 +4314,11 @@ describe("ChatView", () => {
       const draftId = newDraftId();
       useComposerDraftStore
         .getState()
-        .setLogicalProjectDraftThreadId(
-          "logical-project-1",
-          scopeProjectRef(environmentId, projectId),
-          draftId,
-          { threadId, createdAt: now, envMode: "local" },
-        );
+        .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+          threadId,
+          createdAt: now,
+          envMode: "local",
+        });
       publishSeededStoreState(useComposerDraftStore);
 
       const markup = renderToStaticMarkup(
@@ -4365,17 +4364,12 @@ describe("ChatView", () => {
       const draftId = newDraftId();
       useComposerDraftStore
         .getState()
-        .setLogicalProjectDraftThreadId(
-          "logical-project-1",
-          scopeProjectRef(environmentId, projectId),
-          draftId,
-          {
-            threadId,
-            createdAt: now,
-            envMode: draftContext.envMode,
-            worktreePath: draftContext.worktreePath,
-          },
-        );
+        .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+          threadId,
+          createdAt: now,
+          envMode: draftContext.envMode,
+          worktreePath: draftContext.worktreePath,
+        });
       useRightPanelStore.getState().open(threadRef, "plan");
       publishSeededStoreState(useComposerDraftStore);
       publishSeededStoreState(useRightPanelStore);
@@ -5164,12 +5158,11 @@ describe("ChatView handlers (captured from mocked children)", () => {
     const draftId = newDraftId();
     useComposerDraftStore
       .getState()
-      .setLogicalProjectDraftThreadId(
-        "logical-project-1",
-        scopeProjectRef(environmentId, projectId),
-        draftId,
-        { threadId, createdAt: now, envMode: "local" },
-      );
+      .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+        threadId,
+        createdAt: now,
+        envMode: "local",
+      });
     publishSeededStoreState(useComposerDraftStore);
 
     renderToStaticMarkup(

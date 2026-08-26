@@ -426,9 +426,9 @@ the final subscription or unary operation releases it.
 The RPC stream is latest-value state. Client state accepts only a current
 authoritative generation as new catalog content. If a later scan is degraded,
 it retains the last authoritative candidate and adopted-workspace arrays while
-publishing the new health status. Environment and project grouping in React is
-presentation only; it does not merge the scoped catalog sources or grant the
-browser authority over paths.
+publishing the new health status. React projects remain strictly scoped to their
+owning environment; repository metadata never merges catalog sources or grants
+the browser authority over paths.
 
 One client-runtime presentation selector governs workspace-action availability.
 A cold/no-status row, `present`, and retained `verification-unavailable` remain

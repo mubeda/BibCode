@@ -32,7 +32,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { newCommandId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
-import type { SidebarProjectGroupMember, SidebarProjectSnapshot } from "../sidebarProjectGrouping";
+import type { Project } from "../types";
 import { useEnvironmentQuery } from "../state/query";
 import { useAtomCommand } from "../state/use-atom-command";
 import { useWorktreeCatalogFocusRefresh, worktreeEnvironment } from "../state/worktrees";
@@ -48,7 +48,8 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 export interface WorktreeDiscoverySectionProps {
-  readonly project: SidebarProjectSnapshot;
+  readonly project: Project;
+  readonly environmentLabel?: string | null;
   readonly serverConfigs: ReadonlyMap<EnvironmentId, ServerConfig>;
   readonly primaryEnvironmentId?: EnvironmentId | null;
   readonly onNavigateToThread: (threadRef: ScopedThreadRef) => void;
@@ -59,18 +60,8 @@ type AtomCommandFailureResult = Extract<
   { readonly _tag: "Failure" }
 >;
 
-export function getSupportedWorktreeDiscoveryMembers(
-  members: ReadonlyArray<SidebarProjectGroupMember>,
-  serverConfigs: ReadonlyMap<EnvironmentId, ServerConfig>,
-): SidebarProjectGroupMember[] {
-  return members.filter((member) => {
-    const descriptor = serverConfigs.get(member.environmentId)?.environment;
-    return descriptor !== undefined && isWorktreeCatalogSupported(descriptor);
-  });
-}
-
 function adoptionThreadDefaults(
-  member: SidebarProjectGroupMember,
+  member: Project,
   serverConfig: ServerConfig | undefined,
 ): WorktreeAdoptInput["threadDefaults"] {
   const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
@@ -93,7 +84,7 @@ function adoptionThreadDefaults(
 }
 
 function candidateInput(input: {
-  readonly member: SidebarProjectGroupMember;
+  readonly member: Project;
   readonly candidate: VcsWorktreeDescriptor;
   readonly generation: number;
   readonly serverConfig: ServerConfig | undefined;
@@ -209,13 +200,15 @@ function CandidateParentGroup(props: {
   );
 }
 
-function PhysicalWorktreeDiscoverySection(props: {
-  readonly member: SidebarProjectGroupMember;
+function ScopedWorktreeDiscoverySection(props: {
+  readonly member: Project;
+  readonly environmentLabel: string;
   readonly serverConfig: ServerConfig;
   readonly primaryEnvironmentId: EnvironmentId | null;
   readonly onNavigateToThread: (threadRef: ScopedThreadRef) => void;
 }) {
-  const { member, serverConfig, primaryEnvironmentId, onNavigateToThread } = props;
+  const { member, environmentLabel, serverConfig, primaryEnvironmentId, onNavigateToThread } =
+    props;
   const catalog = useEnvironmentQuery(
     worktreeEnvironment.catalog({
       environmentId: member.environmentId,
@@ -274,7 +267,6 @@ function PhysicalWorktreeDiscoverySection(props: {
     (discovery?.showCollapsedHiddenLine === true ||
       locallyAcknowledgedGeneration === snapshot?.generation);
   const shownCandidates = discovery?.shownCandidates ?? [];
-  const environmentLabel = member.environmentLabel ?? member.environmentId;
   const accessiblePhysicalScope = `${environmentLabel} (environment ${member.environmentId}, project ${member.id})`;
   const isRemote = primaryEnvironmentId !== null && member.environmentId !== primaryEnvironmentId;
 
@@ -553,36 +545,33 @@ function PhysicalWorktreeDiscoverySection(props: {
 }
 
 export function WorktreeDiscoverySection(props: WorktreeDiscoverySectionProps) {
-  const { project, serverConfigs, primaryEnvironmentId = null, onNavigateToThread } = props;
-  const supportedMembers = useMemo(
-    () => getSupportedWorktreeDiscoveryMembers(project.memberProjects, serverConfigs),
-    [project.memberProjects, serverConfigs],
-  );
+  const {
+    project,
+    environmentLabel = "This device",
+    serverConfigs,
+    primaryEnvironmentId = null,
+    onNavigateToThread,
+  } = props;
+  const serverConfig = serverConfigs.get(project.environmentId);
+  const supported =
+    serverConfig !== undefined && isWorktreeCatalogSupported(serverConfig.environment);
   const subscribedProjects = useMemo(
-    () =>
-      supportedMembers.map((member) => ({
-        environmentId: member.environmentId,
-        projectId: member.id,
-      })),
-    [supportedMembers],
+    () => (supported ? [{ environmentId: project.environmentId, projectId: project.id }] : []),
+    [project.environmentId, project.id, supported],
   );
   useWorktreeCatalogFocusRefresh(subscribedProjects);
 
-  if (supportedMembers.length === 0) {
+  if (!supported || !serverConfig) {
     return null;
   }
 
   return (
-    <>
-      {supportedMembers.map((member) => (
-        <PhysicalWorktreeDiscoverySection
-          key={member.physicalProjectKey}
-          member={member}
-          serverConfig={serverConfigs.get(member.environmentId)!}
-          primaryEnvironmentId={primaryEnvironmentId}
-          onNavigateToThread={onNavigateToThread}
-        />
-      ))}
-    </>
+    <ScopedWorktreeDiscoverySection
+      member={project}
+      environmentLabel={environmentLabel ?? project.environmentId}
+      serverConfig={serverConfig}
+      primaryEnvironmentId={primaryEnvironmentId}
+      onNavigateToThread={onNavigateToThread}
+    />
   );
 }

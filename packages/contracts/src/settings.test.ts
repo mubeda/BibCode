@@ -225,6 +225,31 @@ describe("ClientSettings terminal font", () => {
   });
 });
 
+describe("ClientSettings project ownership", () => {
+  it("does not expose retired cross-environment project grouping controls", () => {
+    expect(DEFAULT_CLIENT_SETTINGS).not.toHaveProperty("sidebarProjectGroupingMode");
+    expect(DEFAULT_CLIENT_SETTINGS).not.toHaveProperty("sidebarProjectGroupingOverrides");
+    expect(
+      decodeClientSettings({
+        sidebarProjectGroupingMode: "repository",
+        sidebarProjectGroupingOverrides: { legacy: "separate" },
+      }),
+    ).not.toMatchObject({
+      sidebarProjectGroupingMode: expect.anything(),
+      sidebarProjectGroupingOverrides: expect.anything(),
+    });
+    expect(
+      decodeClientSettingsPatch({
+        sidebarProjectGroupingMode: "repository",
+        sidebarProjectGroupingOverrides: { legacy: "separate" },
+      }),
+    ).not.toMatchObject({
+      sidebarProjectGroupingMode: expect.anything(),
+      sidebarProjectGroupingOverrides: expect.anything(),
+    });
+  });
+});
+
 describe("ClientSettings word wrap", () => {
   it("defaults word wrap on", () => {
     expect(decodeClientSettings({}).wordWrap).toBe(true);

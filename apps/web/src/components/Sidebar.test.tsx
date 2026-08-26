@@ -26,12 +26,12 @@ import {
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { createModelSelection } from "@bibcode/shared/model";
 import {
+  scopedProjectKey,
   scopedThreadKey,
   scopeProjectRef,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
 import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
-import { derivePhysicalProjectKey } from "../logicalProject";
 import type {
   EnvironmentProject,
   EnvironmentThreadShell,
@@ -40,6 +40,10 @@ import type {
 const browserRuntime =
   typeof document !== "undefined" && typeof document.createElement === "function";
 const staticDescribe = browserRuntime ? describe.skip : describe;
+
+function projectKey(project: { environmentId: EnvironmentId; id: ProjectId }): string {
+  return scopedProjectKey(scopeProjectRef(project.environmentId, project.id));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hoisted harness state shared with every vi.mock factory.
@@ -980,7 +984,7 @@ function baseScenario() {
   };
 }
 
-const groupedRepoIdentity = {
+const sharedRepoIdentity = {
   canonicalKey: "github.com/acme/repo-a",
   locator: {
     source: "git-remote" as const,
@@ -992,13 +996,13 @@ const groupedRepoIdentity = {
   name: "repo-a",
 };
 
-function groupedScenario() {
+function sharedRepositoryScenario() {
   const localMember = makeProject("project-a", {
-    repositoryIdentity: groupedRepoIdentity,
+    repositoryIdentity: sharedRepoIdentity,
   });
   const remoteMember = makeProject("project-a-remote", {
     workspaceRoot: "C:/remote/repo-a",
-    repositoryIdentity: { ...groupedRepoIdentity, rootPath: "C:/remote/repo-a" },
+    repositoryIdentity: { ...sharedRepoIdentity, rootPath: "C:/remote/repo-a" },
     environmentId: ENV_REMOTE,
   });
   const remoteThread = makeThread("thread-remote", {
@@ -1578,7 +1582,7 @@ staticDescribe("Sidebar full render", () => {
   it("collapses a project but keeps the active thread row visible", () => {
     baseScenario();
     h.uiStore.setState({
-      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+      projectExpandedById: { [projectKey(projectA)]: false },
     });
     const markup = render(<Sidebar />);
     // Active thread peeks through even while collapsed.
@@ -1925,17 +1929,13 @@ staticDescribe("Sidebar sort menu", () => {
     render(<Sidebar />);
 
     const radioGroups = captured("MenuRadioGroup");
-    expect(radioGroups.length).toBe(3);
+    expect(radioGroups.length).toBe(2);
 
     (radioGroups[0]!.props["onValueChange"] as (value: string) => void)("created_at");
     expect(h.spies.updateSettings).toHaveBeenCalledWith({ sidebarProjectSortOrder: "created_at" });
 
     (radioGroups[1]!.props["onValueChange"] as (value: string) => void)("created_at");
     expect(h.spies.updateSettings).toHaveBeenCalledWith({ sidebarThreadSortOrder: "created_at" });
-
-    (radioGroups[2]!.props["onValueChange"] as (value: string) => void)("separate");
-    expect(h.spies.updateSettings).toHaveBeenCalledWith({ sidebarProjectGroupingMode: "separate" });
-    (radioGroups[2]!.props["onValueChange"] as (value: string) => void)("bogus");
 
     const numberField = captured("NumberField")[0]!;
     const onValueChange = numberField.props["onValueChange"] as (value: number | null) => void;
@@ -1965,8 +1965,8 @@ staticDescribe("Sidebar manual project sorting", () => {
 
   it("renders inside a DndContext and reorders on drag end", () => {
     const { projectB } = manualScenario();
-    const keyA = derivePhysicalProjectKey(projectA);
-    const keyB = derivePhysicalProjectKey(projectB);
+    const keyA = projectKey(projectA);
+    const keyB = projectKey(projectB);
     render(<Sidebar />);
 
     const dnd = captured("DndContext")[0]!;
@@ -2002,7 +2002,7 @@ staticDescribe("Sidebar manual project sorting", () => {
 
   it("suppresses project header clicks around drags and context menus", () => {
     manualScenario();
-    const keyA = derivePhysicalProjectKey(projectA);
+    const keyA = projectKey(projectA);
     render(<Sidebar />);
 
     const dnd = captured("DndContext")[0]!;
@@ -2175,7 +2175,7 @@ staticDescribe("project header context menu", () => {
     });
   });
 
-  it("opens the rename and grouping dialogs from the menu", async () => {
+  it("opens the rename dialog from the project menu", async () => {
     const header = projectHeaderProps();
     fakeLocalApi();
     h.spies.contextMenuShow.mockImplementationOnce(async (items: Array<{ id: string }>) => {
@@ -2184,12 +2184,7 @@ staticDescribe("project header context menu", () => {
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
 
-    h.spies.contextMenuShow.mockImplementationOnce(async (items: Array<{ id: string }>) => {
-      return items.find((item) => item.id.startsWith("grouping:"))!.id;
-    });
-    invoke(header, "onContextMenu", mouseEvent());
-    await flush();
-    expect(h.spies.contextMenuShow).toHaveBeenCalledTimes(2);
+    expect(h.spies.contextMenuShow).toHaveBeenCalledTimes(1);
   });
 
   it("removes an empty project after confirmation", async () => {
@@ -2324,7 +2319,7 @@ staticDescribe("worktree discovery integration", () => {
       discoveredCatalog("C:/worktrees/discovered", "feature/discovered"),
     );
     h.uiStore.setState({
-      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+      projectExpandedById: { [projectKey(projectA)]: false },
     });
 
     const collapsedMarkup = render(<Sidebar />);
@@ -2336,7 +2331,7 @@ staticDescribe("worktree discovery integration", () => {
     h.state.discoveryCatalogSubscriptions = [];
     h.state.discoveryFocusRefreshCalls = [];
     h.uiStore.setState({
-      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: true },
+      projectExpandedById: { [projectKey(projectA)]: true },
     });
     const expandedMarkup = render(<Sidebar />);
     const discoveryIndex = expandedMarkup.indexOf("Discovered worktrees");
@@ -2360,7 +2355,7 @@ staticDescribe("worktree discovery integration", () => {
     h.state.discoveryCatalogSubscriptions = [];
     h.state.discoveryFocusRefreshCalls = [];
     h.uiStore.setState({
-      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+      projectExpandedById: { [projectKey(projectA)]: false },
     });
     const recollapsedMarkup = render(<Sidebar />);
     expect(recollapsedMarkup).not.toContain("Discovered worktrees");
@@ -2368,8 +2363,8 @@ staticDescribe("worktree discovery integration", () => {
     expect(h.state.discoveryFocusRefreshCalls).toEqual([]);
   });
 
-  it("keeps grouped mixed-capability discovery at the supported physical boundary", () => {
-    groupedScenario();
+  it("keeps mixed-capability discovery scoped to the supported environment-owned project", () => {
+    sharedRepositoryScenario();
     h.state.routeParams = {};
     const remoteProjectId = ProjectId.make("project-a-remote");
     h.state.serverConfigs = new Map([
@@ -2850,7 +2845,7 @@ staticDescribe("thread context menu", () => {
   });
 
   it("omits File Explorer for a remote row", async () => {
-    const { remoteThread } = groupedScenario();
+    const { remoteThread } = sharedRepositoryScenario();
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -3453,103 +3448,34 @@ staticDescribe("new thread entry points", () => {
   });
 });
 
-staticDescribe("grouped and remote projects", () => {
-  it("groups projects by repository and renders remote thread markers", () => {
-    groupedScenario();
+staticDescribe("environment-owned remote projects", () => {
+  it("keeps the same repository as separate projects in separate environments", () => {
+    sharedRepositoryScenario();
     const markup = render(<Sidebar />);
-    expect(markup).toContain("2 projects");
+    expect(captured("ProjectFavicon")).toHaveLength(2);
+    expect(markup).not.toContain("2 projects");
     expect(markup).toContain("thread-row-thread-remote");
     expect(markup).toContain("Remote Box");
   });
 
-  it("uses a member picker when creating a main-branch chat in a grouped project", async () => {
-    groupedScenario();
+  it("starts a thread directly in the selected environment-owned project", async () => {
+    sharedRepositoryScenario();
     render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockImplementation(
-      async (items: Array<{ id: string }>) => items[1]!.id,
-    );
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
+    const newThreadButtons = captured("TooltipTrigger").flatMap((entry) => {
+      const rendered = entry.props["render"];
+      return React.isValidElement(rendered) &&
+        (rendered.props as Record<string, unknown>)["data-testid"] === "new-main-chat-button"
+        ? [rendered.props as Record<string, unknown>]
+        : [];
+    });
+    expect(newThreadButtons).toHaveLength(2);
+    const newThread = newThreadButtons[1]!;
     invoke(newThread, "onClick", mouseEvent());
     await flush();
-    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
     expect(h.spies.newThreadHandler).toHaveBeenCalledWith(
       expect.objectContaining({ environmentId: ENV_REMOTE }),
       { branch: null, worktreePath: null, envMode: "local" },
-    );
-  });
-
-  it("uses the chosen grouped-project member for worktree creation", async () => {
-    groupedScenario();
-    render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockImplementation(
-      async (items: Array<{ id: string }>) => items[1]!.id,
-    );
-
-    const worktree = mustFindProps(byTestId("new-worktree-button"), "new worktree button");
-    invoke(worktree, "onClick", mouseEvent());
-    await flush();
-
-    expect(h.spies.contextMenuShow).toHaveBeenCalled();
-  });
-
-  it("does not create a grouped-project chat when its picker is unavailable or cancelled", async () => {
-    groupedScenario();
-    render(<Sidebar />);
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.newThreadHandler).not.toHaveBeenCalled();
-
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockResolvedValue(null);
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    h.spies.contextMenuShow.mockResolvedValue("missing-member");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.newThreadHandler).not.toHaveBeenCalled();
-  });
-
-  it("uses workspace paths when grouped members have no environment label", async () => {
-    groupedScenario();
-    h.state.environments = [];
-    render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockImplementation(async (items: Array<{ label: string }>) => {
-      expect(items.every((item) => item.label.includes("C:/"))).toBe(true);
-      return null;
-    });
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.contextMenuShow).toHaveBeenCalled();
-  });
-
-  it("uses a generic message for opaque member-picker failures", async () => {
-    groupedScenario();
-    render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockRejectedValue("opaque picker failure");
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ description: "An error occurred." }),
-    );
-  });
-
-  it("toasts when the environment picker fails", async () => {
-    groupedScenario();
-    render(<Sidebar />);
-    fakeLocalApi();
-    h.spies.contextMenuShow.mockRejectedValue(new Error("picker broke"));
-    const newThread = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
-    invoke(newThread, "onClick", mouseEvent());
-    await flush();
-    expect(h.spies.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not choose environment" }),
     );
   });
 
@@ -3856,13 +3782,13 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
   });
 });
 
-staticDescribe("project rename and grouping dialogs", () => {
+staticDescribe("project rename dialog", () => {
   it("wires the rename dialog inputs and guards empty submits", async () => {
     baseScenario();
     render(<Sidebar />);
 
     const dialogs = captured("Dialog");
-    expect(dialogs.length).toBeGreaterThanOrEqual(2);
+    expect(dialogs.length).toBeGreaterThanOrEqual(1);
     for (const dialog of dialogs) {
       const onOpenChange = dialog.props["onOpenChange"] as (open: boolean) => void;
       onOpenChange(false);
@@ -3888,35 +3814,6 @@ staticDescribe("project rename and grouping dialogs", () => {
       invoke(cancel.props, "onClick", mouseEvent());
     }
     await flush();
-  });
-
-  it("validates the grouping selection values", () => {
-    baseScenario();
-    render(<Sidebar />);
-    const select = captured("Select")[0]!;
-    const onValueChange = select.props["onValueChange"] as (value: string) => void;
-    onValueChange("repository");
-    onValueChange("repository_path");
-    onValueChange("separate");
-    onValueChange("inherit");
-    onValueChange("bogus");
-  });
-
-  it("describes each grouping mode", () => {
-    baseScenario();
-    h.state.clientSettings = {
-      ...DEFAULT_CLIENT_SETTINGS,
-      sidebarProjectGroupingMode: "repository_path",
-    };
-    let markup = render(<Sidebar />);
-    expect(markup).toContain("repo-relative path");
-
-    h.state.clientSettings = {
-      ...DEFAULT_CLIENT_SETTINGS,
-      sidebarProjectGroupingMode: "separate",
-    };
-    markup = render(<Sidebar />);
-    expect(markup).toContain("own sidebar row");
   });
 });
 
@@ -4033,23 +3930,21 @@ if (browserRuntime) {
       await unmount(root, container);
     });
 
-    it("opens the dialog for the remote member chosen from a grouped worktree row", async () => {
-      groupedScenario();
+    it("opens the dialog directly for the selected remote environment-owned project", async () => {
+      sharedRepositoryScenario();
       fakeLocalApi();
-      h.spies.contextMenuShow.mockImplementation(
-        async (items: Array<{ id: string }>) => items[1]!.id,
-      );
       const { container, root } = await mount(<Sidebar />);
 
       h.state.captures.length = 0;
-      const worktree = requiredElement<HTMLButtonElement>(
-        container,
+      const worktrees = container.querySelectorAll<HTMLButtonElement>(
         "[data-testid='new-worktree-button']",
       );
+      expect(worktrees).toHaveLength(2);
+      const worktree = worktrees[1]!;
       await dispatch(worktree, new MouseEvent("click", { bubbles: true, cancelable: true }));
       await React.act(async () => flush());
 
-      expect(h.spies.contextMenuShow).toHaveBeenCalled();
+      expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
       expect(captured("CreateWorktreeDialog").at(-1)?.props["defaultProjectRef"]).toEqual(
         scopeProjectRef(ENV_REMOTE, ProjectId.make("project-a-remote")),
       );

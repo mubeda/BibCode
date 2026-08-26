@@ -41,13 +41,6 @@ export const SidebarThreadSortOrder = Schema.Literals(["updated_at", "created_at
 export type SidebarThreadSortOrder = typeof SidebarThreadSortOrder.Type;
 export const DEFAULT_SIDEBAR_THREAD_SORT_ORDER: SidebarThreadSortOrder = "updated_at";
 
-export const SidebarProjectGroupingMode = Schema.Literals([
-  "repository",
-  "repository_path",
-  "separate",
-]);
-export type SidebarProjectGroupingMode = typeof SidebarProjectGroupingMode.Type;
-export const DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE: SidebarProjectGroupingMode = "repository";
 export const MIN_SIDEBAR_THREAD_PREVIEW_COUNT = 1;
 export const MAX_SIDEBAR_THREAD_PREVIEW_COUNT = 15;
 export const SidebarThreadPreviewCount = Schema.Int.check(
@@ -138,13 +131,6 @@ export const ClientSettingsSchema = Schema.Struct({
       ),
       modelOrder: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
     }),
-  ).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
-    Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
-  ),
-  sidebarProjectGroupingOverrides: Schema.Record(
-    TrimmedNonEmptyString,
-    SidebarProjectGroupingMode,
   ).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   sidebarProjectSortOrder: SidebarProjectSortOrder.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_SORT_ORDER)),
@@ -696,10 +682,6 @@ export const ClientSettingsPatch = Schema.Struct({
         ),
       }),
     ),
-  ),
-  sidebarProjectGroupingMode: Schema.optionalKey(SidebarProjectGroupingMode),
-  sidebarProjectGroupingOverrides: Schema.optionalKey(
-    Schema.Record(TrimmedNonEmptyString, SidebarProjectGroupingMode),
   ),
   sidebarProjectSortOrder: Schema.optionalKey(SidebarProjectSortOrder),
   sidebarThreadSortOrder: Schema.optionalKey(SidebarThreadSortOrder),

@@ -1,10 +1,6 @@
 // @vitest-environment happy-dom
 
-import {
-  scopedProjectKey,
-  scopeProjectRef,
-  scopeThreadRef,
-} from "@bibcode/client-runtime/environment";
+import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
@@ -38,7 +34,6 @@ const testState = vi.hoisted(() => ({
   activeThread: null as Record<string, unknown> | null,
   shellExists: false,
   projectOrder: [] as string[],
-  logicalProjectKey: "logical:project",
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -59,13 +54,6 @@ vi.mock("../state/entities", () => ({
     ),
   useThread: (threadRef: unknown) => (threadRef ? testState.activeThread : null),
   readThreadShell: () => (testState.shellExists ? { status: "ready" } : null),
-}));
-
-vi.mock("../logicalProject", () => ({
-  deriveLogicalProjectKeyFromSettings: () => testState.logicalProjectKey,
-  getProjectOrderKey: (project: { environmentId: string; id: string }) =>
-    `${project.environmentId}:${project.id}`,
-  selectProjectGroupingSettings: (settings: unknown) => settings,
 }));
 
 vi.mock("../uiStateStore", () => ({
@@ -313,7 +301,6 @@ beforeEach(() => {
   testState.activeThread = null;
   testState.shellExists = false;
   testState.projectOrder = [];
-  testState.logicalProjectKey = "logical:project";
   vi.spyOn(console, "warn").mockImplementation(() => {});
   setRoute({});
 });
@@ -776,11 +763,9 @@ describe("useNewThreadHandler", () => {
         },
       },
     });
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: ThreadId.make("thread-with-selection"),
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: ThreadId.make("thread-with-selection"),
+    });
     useComposerDraftStore.getState().setModelSelection(draftId, currentSelection);
     setRoute({ draftId });
 
@@ -871,9 +856,7 @@ describe("useNewThreadHandler", () => {
     );
     await clickNewThread();
 
-    const draft = useComposerDraftStore
-      .getState()
-      .getDraftSessionByLogicalProjectKey(testState.logicalProjectKey);
+    const draft = useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef);
     expect(draft).toMatchObject({
       branch: "feature/coverage",
       worktreePath: "X:\\worktrees\\coverage",
@@ -884,13 +867,11 @@ describe("useNewThreadHandler", () => {
 
   it("reuses a stored draft in place and updates only supplied context", async () => {
     const draftId = "draft-stored" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: ThreadId.make("thread-stored"),
-        branch: "main",
-        envMode: "local",
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: ThreadId.make("thread-stored"),
+      branch: "main",
+      envMode: "local",
+    });
     setRoute({ draftId });
     await mount(
       <NewThreadHarness
@@ -918,34 +899,28 @@ describe("useNewThreadHandler", () => {
     ["nullable worktree only", { worktreePath: null } satisfies NewThreadOptions],
   ])("reuses a stored draft with %s", async (_label, options) => {
     const draftId = "draft-stored-partial" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: ThreadId.make("thread-stored-partial"),
-        branch: "main",
-        worktreePath: "X:\\worktrees\\previous",
-        envMode: "local",
-        startFromOrigin: true,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: ThreadId.make("thread-stored-partial"),
+      branch: "main",
+      worktreePath: "X:\\worktrees\\previous",
+      envMode: "local",
+      startFromOrigin: true,
+    });
     setRoute({ draftId });
     await mount(<NewThreadHarness {...(options === undefined ? {} : { options })} />);
     await clickNewThread();
 
     expect(testState.router.navigate).not.toHaveBeenCalled();
-    expect(
-      useComposerDraftStore
-        .getState()
-        .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef))?.draftId,
-    ).toBe(draftId);
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)?.draftId).toBe(
+      draftId,
+    );
   });
 
   it("navigates back to a reusable stored draft from another route", async () => {
     const storedDraftId = "draft-stored" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, storedDraftId, {
-        threadId: ThreadId.make("thread-stored"),
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, storedDraftId, {
+      threadId: ThreadId.make("thread-stored"),
+    });
     setRoute({ draftId: "draft-other" });
     await mount(<NewThreadHarness />);
     await clickNewThread();
@@ -958,14 +933,12 @@ describe("useNewThreadHandler", () => {
 
   it("reuses the active draft when its logical-project pointer is temporarily absent", async () => {
     const draftId = "draft-active" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: ThreadId.make("thread-active"),
-        envMode: "local",
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: ThreadId.make("thread-active"),
+      envMode: "local",
+    });
     useComposerDraftStore.setState({
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
     });
     setRoute({ draftId });
     await mount(
@@ -987,11 +960,9 @@ describe("useNewThreadHandler", () => {
       envMode: "worktree",
       startFromOrigin: false,
     });
-    expect(
-      useComposerDraftStore
-        .getState()
-        .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef))?.draftId,
-    ).toBe(draftId);
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)?.draftId).toBe(
+      draftId,
+    );
   });
 
   it.each([
@@ -1000,45 +971,37 @@ describe("useNewThreadHandler", () => {
     ["with only a nullable worktree", { worktreePath: null } satisfies NewThreadOptions],
   ])("reuses a detached active draft %s", async (_label, options) => {
     const draftId = "draft-active-partial" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: ThreadId.make("thread-active-partial"),
-        branch: "main",
-        worktreePath: "X:\\worktrees\\previous",
-        envMode: "local",
-        startFromOrigin: true,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: ThreadId.make("thread-active-partial"),
+      branch: "main",
+      worktreePath: "X:\\worktrees\\previous",
+      envMode: "local",
+      startFromOrigin: true,
+    });
     useComposerDraftStore.setState({
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
     });
     setRoute({ draftId });
     await mount(<NewThreadHarness {...(options === undefined ? {} : { options })} />);
     await clickNewThread();
 
     expect(testState.router.navigate).not.toHaveBeenCalled();
-    expect(
-      useComposerDraftStore
-        .getState()
-        .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef))?.draftId,
-    ).toBe(draftId);
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)?.draftId).toBe(
+      draftId,
+    );
   });
 
   it("marks a server-backed stored draft promoted before creating a replacement", async () => {
     const storedDraftId = "draft-promoted" as never;
     const storedThreadId = ThreadId.make("thread-promoted");
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, storedDraftId, {
-        threadId: storedThreadId,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, storedDraftId, {
+      threadId: storedThreadId,
+    });
     testState.shellExists = true;
     await mount(<NewThreadHarness />);
     await clickNewThread();
 
-    const replacement = useComposerDraftStore
-      .getState()
-      .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef));
+    const replacement = useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef);
     expect(replacement?.draftId).not.toBe(storedDraftId);
     expect(useComposerDraftStore.getState().getDraftSession(storedDraftId)?.promotedTo).toEqual(
       scopeThreadRef(environmentId, storedThreadId),
@@ -1051,21 +1014,17 @@ describe("useNewThreadHandler", () => {
   it("creates a fresh draft when the matching active draft is reached through a server route", async () => {
     const activeDraftId = "draft-from-server" as never;
     const activeThreadId = ThreadId.make("thread-from-server");
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, activeDraftId, {
-        threadId: activeThreadId,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, activeDraftId, {
+      threadId: activeThreadId,
+    });
     useComposerDraftStore.setState({
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
     });
     setRoute({ environmentId, threadId: activeThreadId });
     await mount(<NewThreadHarness />);
     await clickNewThread();
 
-    const replacement = useComposerDraftStore
-      .getState()
-      .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef));
+    const replacement = useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef);
     expect(replacement?.draftId).not.toBe(activeDraftId);
     expect(testState.router.navigate).toHaveBeenCalledWith(
       expect.objectContaining({ params: { draftId: replacement!.draftId } }),
@@ -1102,11 +1061,9 @@ describe("useHandleNewThread", () => {
     const routeThreadId = ThreadId.make("route-thread");
     const routeRef = scopeThreadRef(environmentId, routeThreadId);
     const draftId = "draft-server-route" as never;
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: routeThreadId,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: routeThreadId,
+    });
     testState.activeThread = { id: routeThreadId };
     setRoute({ environmentId, threadId: routeThreadId });
     await mount(<HandleSummary />);
@@ -1120,11 +1077,9 @@ describe("useHandleNewThread", () => {
   it("reports draft route state without a server thread", async () => {
     const draftId = "draft-route" as never;
     const draftThreadId = ThreadId.make("draft-route-thread");
-    useComposerDraftStore
-      .getState()
-      .setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
-        threadId: draftThreadId,
-      });
+    useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, draftId, {
+      threadId: draftThreadId,
+    });
     setRoute({ draftId });
     await mount(<HandleSummary />);
 

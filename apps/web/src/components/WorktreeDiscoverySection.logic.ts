@@ -4,7 +4,16 @@ import type {
   VcsWorktreeDescriptor,
   WorktreeDiscoveryVisibility,
 } from "@bibcode/contracts";
-import { compareSidebarDisplayText } from "../sidebarProjectGrouping";
+
+function compareSidebarDisplayText(left: string, right: string): number {
+  const foldedLeft = left.toLowerCase();
+  const foldedRight = right.toLowerCase();
+  if (foldedLeft < foldedRight) return -1;
+  if (foldedLeft > foldedRight) return 1;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
 
 export interface WorktreeDiscoverySource {
   readonly environmentId: EnvironmentId;

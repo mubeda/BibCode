@@ -1,10 +1,12 @@
-import { ProjectId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   legacyProjectCwdPreferenceKey,
+  legacyPhysicalProjectPreferenceKey,
   markThreadUnread,
   markThreadVisited,
+  migrateProjectOrderPreferences,
   parsePersistedState,
   PERSISTED_STATE_KEY,
   type PersistedUiState,
@@ -55,33 +57,24 @@ describe("uiStateStore pure functions", () => {
     expect(markThreadUnread(next, threadId, "2026-02-25T12:30:00.000Z")).toBe(next);
   });
 
-  it("resolves project expansion from logical, physical, and legacy preference keys", () => {
-    const physicalKey = "environment:/repo/project";
+  it("resolves project expansion from scoped and legacy preference keys", () => {
+    const scopedKey = "environment:project";
     const legacyKey = legacyProjectCwdPreferenceKey("/repo/project");
 
-    expect(resolveProjectExpanded({ logical: false, [physicalKey]: true }, ["logical"])).toBe(
-      false,
-    );
-    expect(resolveProjectExpanded({ [physicalKey]: false }, ["new-logical", physicalKey])).toBe(
-      false,
-    );
-    expect(resolveProjectExpanded({ [legacyKey]: false }, ["new-logical", legacyKey])).toBe(false);
-    expect(resolveProjectExpanded({}, ["new-logical"])).toBe(true);
+    expect(resolveProjectExpanded({ [scopedKey]: false }, [scopedKey])).toBe(false);
+    expect(resolveProjectExpanded({ [legacyKey]: false }, [scopedKey, legacyKey])).toBe(false);
+    expect(resolveProjectExpanded({}, [scopedKey])).toBe(true);
   });
 
-  it("sets expansion for every stable key belonging to a logical project", () => {
+  it("sets expansion for one environment-scoped project key", () => {
     const initialState = makeUiState();
-    const keys = ["logical", "environment-a:/repo", "environment-b:/repo"];
+    const key = "environment-a:project-a";
 
-    const next = setProjectExpanded(initialState, keys, false);
+    const next = setProjectExpanded(initialState, key, false);
 
-    expect(next.projectExpandedById).toEqual({
-      logical: false,
-      "environment-a:/repo": false,
-      "environment-b:/repo": false,
-    });
-    expect(setProjectExpanded(next, keys, false)).toBe(next);
-    expect(setProjectExpanded(next, "logical", true).projectExpandedById.logical).toBe(true);
+    expect(next.projectExpandedById).toEqual({ [key]: false });
+    expect(setProjectExpanded(next, key, false)).toBe(next);
+    expect(setProjectExpanded(next, key, true).projectExpandedById[key]).toBe(true);
   });
 
   it("reorders from the current atom-derived project order", () => {
@@ -95,16 +88,39 @@ describe("uiStateStore pure functions", () => {
     expect(next.projectOrder).toEqual([project2, project3, project1]);
   });
 
-  it("moves grouped project members together", () => {
+  it("reorders same-repository projects independently across environments", () => {
     const keyALocal = "env-local:proj-a";
     const keyARemote = "env-remote:proj-a";
     const keyB = "env-local:proj-b";
     const keyC = "env-local:proj-c";
     const currentOrder = [keyALocal, keyARemote, keyB, keyC];
 
-    const next = reorderProjects(makeUiState(), currentOrder, [keyALocal, keyARemote], [keyC]);
+    const next = reorderProjects(makeUiState(), currentOrder, [keyALocal], [keyC]);
 
-    expect(next.projectOrder).toEqual([keyB, keyC, keyALocal, keyARemote]);
+    expect(next.projectOrder).toEqual([keyARemote, keyB, keyC, keyALocal]);
+  });
+
+  it("rewrites pre-change physical project order keys to scoped ownership keys", () => {
+    const environmentId = EnvironmentId.make("environment-a");
+    const scopedKey = "environment-a:project-a";
+    const legacyPhysicalKey = legacyPhysicalProjectPreferenceKey(environmentId, "/repo/project-a");
+    const hydrated = parsePersistedState({
+      projectOrder: [legacyPhysicalKey, "stale-project-key"],
+    });
+
+    const migrated = migrateProjectOrderPreferences(hydrated, [
+      {
+        projectKey: scopedKey,
+        legacyPreferenceKeys: [legacyPhysicalKey],
+      },
+    ]);
+
+    expect(migrated.projectOrder).toEqual([scopedKey, "stale-project-key"]);
+    expect(
+      migrateProjectOrderPreferences(migrated, [
+        { projectKey: scopedKey, legacyPreferenceKeys: [legacyPhysicalKey] },
+      ]),
+    ).toBe(migrated);
   });
 
   it("does not reorder missing or identical groups", () => {

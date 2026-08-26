@@ -27,8 +27,6 @@ const s = vi.hoisted(() => ({
   activeEnvironmentId: null as string | null,
   setActiveCalls: [] as string[],
   settings: {} as Record<string, unknown>,
-  logicalKey: null as string | null,
-  physicalKey: null as string | null,
   syncThemeCalls: 0,
   toasts: [] as unknown[],
   setProjectExpandedCalls: [] as Array<{ key: string; expanded: boolean }>,
@@ -174,12 +172,6 @@ vi.mock("../connection/currentEnvironmentPresentation", () => ({
   }),
 }));
 
-vi.mock("../logicalProject", () => ({
-  deriveLogicalProjectKeyFromSettings: () => s.logicalKey,
-  derivePhysicalProjectKeyFromPath: () => s.physicalKey,
-  selectProjectGroupingSettings: (settings: unknown) => settings,
-}));
-
 vi.mock("../editorPreferences", () => ({
   resolveAndPersistPreferredEditor: () => s.preferredEditor,
 }));
@@ -298,8 +290,6 @@ beforeEach(() => {
   s.activeEnvironmentId = null;
   s.setActiveCalls.length = 0;
   s.settings = {};
-  s.logicalKey = null;
-  s.physicalKey = null;
   s.syncThemeCalls = 0;
   s.toasts.length = 0;
   s.setProjectExpandedCalls.length = 0;
@@ -564,7 +554,6 @@ describe("EventRouter", () => {
   it("handles a welcome payload by expanding the project and navigating", async () => {
     s.pathname = "/";
     s.project = { id: "proj-1" };
-    s.logicalKey = "logical-project-key";
     s.atomValues.set("config", seedServerConfig());
     s.atomValues.set("welcome", {
       environment: { environmentId: "env-1" },
@@ -578,16 +567,15 @@ describe("EventRouter", () => {
 
     expect(s.setActiveCalls).toContain("env-1");
     expect(s.setProjectExpandedCalls).toContainEqual({
-      key: "logical-project-key",
+      key: "scoped-project-key",
       expanded: true,
     });
     expect(s.navigateCalls.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("derives the project key from the server cwd when the project is unknown", async () => {
+  it("uses the scoped project key while the project catalog is still loading", async () => {
     s.pathname = "/other";
     s.project = null;
-    s.physicalKey = "physical-key";
     s.atomValues.set("config", seedServerConfig());
     s.atomValues.set("welcome", {
       environment: { environmentId: "env-1" },
@@ -600,7 +588,7 @@ describe("EventRouter", () => {
     await flush();
 
     // A non-root pathname short-circuits before navigating.
-    expect(s.setProjectExpandedCalls).toContainEqual({ key: "physical-key", expanded: true });
+    expect(s.setProjectExpandedCalls).toContainEqual({ key: "scoped-project-key", expanded: true });
     expect(s.navigateCalls.length).toBe(0);
   });
 

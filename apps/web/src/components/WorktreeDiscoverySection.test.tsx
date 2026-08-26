@@ -18,7 +18,7 @@ import { act, cloneElement, type ReactElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { SidebarProjectSnapshot } from "../sidebarProjectGrouping";
+import type { Project } from "../types";
 
 const testState = vi.hoisted(() => ({
   catalogs: new Map<string, unknown>(),
@@ -89,10 +89,7 @@ import { WorktreeDiscoverySection } from "./WorktreeDiscoverySection";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-main");
 const PROJECT_ID = ProjectId.make("project-main");
-const REMOTE_ENVIRONMENT_ID = EnvironmentId.make("environment-remote");
-const REMOTE_PROJECT_ID = ProjectId.make("project-remote");
 const LOCAL_ACCESSIBLE_SCOPE = `This device (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID})`;
-const REMOTE_ACCESSIBLE_SCOPE = `Remote Box (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID})`;
 
 function candidate(path: string, branch: string): VcsWorktreeDescriptor {
   return {
@@ -129,8 +126,8 @@ function project(
   visibility: "hidden" | "shown" = "hidden",
   initialPromptDismissedAt: string | null = null,
   baselinePaths: ReadonlyArray<string> = [],
-): SidebarProjectSnapshot {
-  const member = {
+): Project {
+  return {
     id: PROJECT_ID,
     title: "Repo",
     workspaceRoot: "/repo",
@@ -141,20 +138,7 @@ function project(
     createdAt: "2026-08-09T00:00:00.000Z",
     updatedAt: "2026-08-09T00:00:00.000Z",
     environmentId: ENVIRONMENT_ID,
-    physicalProjectKey: "environment-main:/repo",
-    environmentLabel: "This device",
-  } as const;
-  return {
-    ...member,
-    projectKey: "repository-main",
-    displayName: "Repo",
-    groupedProjectCount: 1,
-    environmentPresence: "local-only",
-    allRemoteMembersAreDesktopLocal: false,
-    memberProjects: [member],
-    memberProjectRefs: [{ environmentId: ENVIRONMENT_ID, projectId: PROJECT_ID }],
-    remoteEnvironmentLabels: [],
-  } as SidebarProjectSnapshot;
+  } as Project;
 }
 
 function serverConfigs(supported: boolean): ReadonlyMap<EnvironmentId, ServerConfig> {
@@ -167,49 +151,6 @@ function serverConfigs(supported: boolean): ReadonlyMap<EnvironmentId, ServerCon
         providers: [],
       } as unknown as ServerConfig,
     ],
-  ]);
-}
-
-function groupedProject(
-  localVisibility: "hidden" | "shown",
-  remoteVisibility: "hidden" | "shown",
-): SidebarProjectSnapshot {
-  const localProject = project(localVisibility);
-  const localMember = localProject.memberProjects[0]!;
-  const remoteMember = {
-    ...localMember,
-    id: REMOTE_PROJECT_ID,
-    workspaceRoot: "R:\\repo",
-    worktreeDiscovery: {
-      ...localMember.worktreeDiscovery,
-      visibility: remoteVisibility,
-    },
-    environmentId: REMOTE_ENVIRONMENT_ID,
-    physicalProjectKey: "environment-remote:R:\\repo",
-    environmentLabel: "Remote Box",
-  };
-  return {
-    ...localProject,
-    groupedProjectCount: 2,
-    environmentPresence: "mixed",
-    memberProjects: [localMember, remoteMember],
-    memberProjectRefs: [
-      { environmentId: ENVIRONMENT_ID, projectId: PROJECT_ID },
-      { environmentId: REMOTE_ENVIRONMENT_ID, projectId: REMOTE_PROJECT_ID },
-    ],
-    remoteEnvironmentLabels: ["Remote Box"],
-  };
-}
-
-function groupedServerConfigs(): ReadonlyMap<EnvironmentId, ServerConfig> {
-  const config = {
-    environment: { capabilities: { worktreeCatalog: true } },
-    settings: DEFAULT_SERVER_SETTINGS,
-    providers: [],
-  } as unknown as ServerConfig;
-  return new Map([
-    [ENVIRONMENT_ID, config],
-    [REMOTE_ENVIRONMENT_ID, config],
   ]);
 }
 
@@ -265,7 +206,7 @@ afterEach(async () => {
 });
 
 describe("WorktreeDiscoverySection", () => {
-  it("keeps identical labels, candidate names, and host paths unique by physical scope", async () => {
+  it("subscribes to and renders exactly one environment-scoped project", async () => {
     const sharedEnvironmentLabel = "Shared host";
     const sharedPath = "/worktrees/shared";
     const sharedBranch = "feature/shared";
@@ -273,23 +214,11 @@ describe("WorktreeDiscoverySection", () => {
       `${ENVIRONMENT_ID}:${PROJECT_ID}`,
       snapshot([candidate(sharedPath, sharedBranch)]),
     );
-    testState.catalogs.set(
-      `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
-      snapshot([candidate(sharedPath, sharedBranch)]),
-    );
-    const withSharedLabels = (snapshot: SidebarProjectSnapshot): SidebarProjectSnapshot => ({
-      ...snapshot,
-      memberProjects: snapshot.memberProjects.map((member) => ({
-        ...member,
-        environmentLabel: sharedEnvironmentLabel,
-      })),
-      remoteEnvironmentLabels: [sharedEnvironmentLabel],
-    });
-
     await mount(
       <WorktreeDiscoverySection
-        project={withSharedLabels(groupedProject("hidden", "hidden"))}
-        serverConfigs={groupedServerConfigs()}
+        project={project("hidden")}
+        environmentLabel={sharedEnvironmentLabel}
+        serverConfigs={serverConfigs(true)}
         onNavigateToThread={testState.navigate}
       />,
     );
@@ -299,65 +228,37 @@ describe("WorktreeDiscoverySection", () => {
       .filter((name): name is string => name?.startsWith("Add feature/shared from") === true);
     expect(addNames).toEqual([
       `Add feature/shared from Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}) at ${sharedPath} to BiBCode`,
-      `Add feature/shared from Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}) at ${sharedPath} to BiBCode`,
     ]);
-    expect(new Set(addNames).size).toBe(2);
+    expect(testState.focusRefreshProjects).toEqual([
+      { environmentId: ENVIRONMENT_ID, projectId: PROJECT_ID },
+    ]);
 
     const pathTriggerNames = Array.from(document.querySelectorAll<HTMLElement>("[aria-label]"))
       .map((element) => element.getAttribute("aria-label"))
       .filter((name): name is string => name?.startsWith("Full worktree path for") === true);
     expect(pathTriggerNames).toEqual([
       `Full worktree path for feature/shared in Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}): ${sharedPath}`,
-      `Full worktree path for feature/shared in Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}): ${sharedPath}`,
     ]);
-    expect(new Set(pathTriggerNames).size).toBe(2);
     expect(document.body.textContent).toContain(sharedEnvironmentLabel);
     expect(document.body.textContent).not.toContain(ENVIRONMENT_ID);
-    expect(document.body.textContent).not.toContain(REMOTE_ENVIRONMENT_ID);
     expect(
       Array.from(document.querySelectorAll<HTMLElement>("[data-mock='tooltip-popup']")).filter(
         (element) => element.textContent === sharedPath,
       ),
-    ).toHaveLength(2);
-
-    await unmountLastMountedTree();
-    await mount(
-      <WorktreeDiscoverySection
-        project={withSharedLabels(groupedProject("shown", "shown"))}
-        serverConfigs={groupedServerConfigs()}
-        onNavigateToThread={testState.navigate}
-      />,
-    );
-
-    const shownNames = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
-      .map((element) => element.getAttribute("aria-label"))
-      .filter(
-        (name): name is string =>
-          name?.startsWith("Add discovered worktree feature/shared") === true,
-      );
-    expect(shownNames).toEqual([
-      `Add discovered worktree feature/shared from Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}) at ${sharedPath} to BiBCode`,
-      `Add discovered worktree feature/shared from Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}) at ${sharedPath} to BiBCode`,
-    ]);
-    expect(new Set(shownNames).size).toBe(2);
+    ).toHaveLength(1);
   });
 
-  it("uniquely names same-branch actions and discloses exact paths on focus and hover", async () => {
+  it("discloses the exact scoped path without rendering path markup", async () => {
     const localPath = '/worktrees/<script>alert("x")</script>/same';
-    const remotePath = "R:\\worktrees\\same";
     testState.catalogs.set(
       `${ENVIRONMENT_ID}:${PROJECT_ID}`,
       snapshot([candidate(localPath, "feature/shared")]),
     );
-    testState.catalogs.set(
-      `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
-      snapshot([candidate(remotePath, "feature/shared")]),
-    );
-
     await mount(
       <WorktreeDiscoverySection
-        project={groupedProject("hidden", "shown")}
-        serverConfigs={groupedServerConfigs()}
+        project={project("hidden")}
+        environmentLabel="This device"
+        serverConfigs={serverConfigs(true)}
         onNavigateToThread={testState.navigate}
       />,
     );
@@ -365,12 +266,6 @@ describe("WorktreeDiscoverySection", () => {
     expect(
       button(`Add feature/shared from ${LOCAL_ACCESSIBLE_SCOPE} at ${localPath} to BiBCode`),
     ).toBeDefined();
-    expect(
-      button(
-        `Add discovered worktree feature/shared from ${REMOTE_ACCESSIBLE_SCOPE} at ${remotePath} to BiBCode`,
-      ),
-    ).toBeDefined();
-
     const localPathTrigger = Array.from(
       document.querySelectorAll<HTMLElement>("[aria-label]"),
     ).find(
@@ -384,7 +279,6 @@ describe("WorktreeDiscoverySection", () => {
       document.querySelectorAll<HTMLElement>("[data-mock='tooltip-popup']"),
     ).map((element) => element.textContent);
     expect(tooltips).toContain(localPath);
-    expect(tooltips).toContain(remotePath);
     expect(document.querySelector("script")).toBeNull();
   });
 

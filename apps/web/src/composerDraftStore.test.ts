@@ -161,7 +161,7 @@ function resetComposerDraftStore() {
   useComposerDraftStore.setState({
     draftsByThreadKey: {},
     draftThreadsByThreadKey: {},
-    logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+    projectDraftThreadKeyByProjectKey: {},
     stickyModelSelectionByProvider: {},
     stickyActiveProvider: null,
   });
@@ -412,7 +412,7 @@ describe("composerDraftStore syncPersistedAttachments", () => {
     useComposerDraftStore.setState({
       draftsByThreadKey: {},
       draftThreadsByThreadKey: {},
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
       stickyModelSelectionByProvider: {},
       stickyActiveProvider: null,
     });
@@ -468,7 +468,7 @@ describe("composerDraftStore terminal contexts", () => {
     useComposerDraftStore.setState({
       draftsByThreadKey: {},
       draftThreadsByThreadKey: {},
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
       stickyModelSelectionByProvider: {},
       stickyActiveProvider: null,
     });
@@ -634,7 +634,7 @@ describe("composerDraftStore terminal contexts", () => {
 
     expect(mergedState.draftsByThreadKey[threadKeyFor(threadId)]).toBeUndefined();
     expect(mergedState.draftThreadsByThreadKey).toEqual({});
-    expect(mergedState.logicalProjectDraftThreadKeyByLogicalProjectKey).toEqual({});
+    expect(mergedState.projectDraftThreadKeyByProjectKey).toEqual({});
   });
 });
 
@@ -864,7 +864,7 @@ describe("composerDraftStore project draft thread mapping", () => {
       threadId,
       environmentId: TEST_ENVIRONMENT_ID,
       projectId,
-      logicalProjectKey: scopedProjectKey(projectRef),
+      projectKey: scopedProjectKey(projectRef),
       branch: "feature/test",
       worktreePath: "/tmp/worktree-test",
       envMode: "worktree",
@@ -875,7 +875,7 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toMatchObject({
       environmentId: TEST_ENVIRONMENT_ID,
       projectId,
-      logicalProjectKey: scopedProjectKey(projectRef),
+      projectKey: scopedProjectKey(projectRef),
       branch: "feature/test",
       worktreePath: "/tmp/worktree-test",
       envMode: "worktree",
@@ -1233,7 +1233,7 @@ describe("composerDraftStore project draft thread mapping", () => {
       envMode: "worktree",
     });
 
-    store.setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), remoteProjectRef, draftId, {
+    store.setProjectDraftThreadId(remoteProjectRef, draftId, {
       threadId,
     });
 
@@ -1244,6 +1244,10 @@ describe("composerDraftStore project draft thread mapping", () => {
       worktreePath: null,
       envMode: "local",
     });
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)).toBeNull();
+    expect(
+      useComposerDraftStore.getState().getDraftSessionByProjectRef(remoteProjectRef)?.draftId,
+    ).toBe(draftId);
   });
 
   it("clears branch and worktree context when changing a draft thread project ref", () => {
@@ -1266,6 +1270,27 @@ describe("composerDraftStore project draft thread mapping", () => {
       worktreePath: null,
       envMode: "local",
     });
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)).toBeNull();
+    expect(
+      useComposerDraftStore.getState().getDraftSessionByProjectRef(remoteProjectRef)?.draftId,
+    ).toBe(draftId);
+  });
+
+  it("cleans up a displaced draft when retargeting onto an occupied project", () => {
+    const store = useComposerDraftStore.getState();
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+    store.setProjectDraftThreadId(remoteProjectRef, otherDraftId, {
+      threadId: otherThreadId,
+    });
+    store.setPrompt(otherDraftId, "displaced unsent content");
+
+    store.setDraftThreadContext(draftId, { projectRef: remoteProjectRef });
+
+    const next = useComposerDraftStore.getState();
+    expect(next.getDraftSessionByProjectRef(projectRef)).toBeNull();
+    expect(next.getDraftSessionByProjectRef(remoteProjectRef)?.draftId).toBe(draftId);
+    expect(next.getDraftThread(otherDraftId)).toBeNull();
+    expect(next.getComposerDraft(otherDraftId)).toBeNull();
   });
 });
 
@@ -2085,7 +2110,7 @@ interface MigratedStateForTest {
     }
   >;
   draftThreadsByThreadKey: Record<string, Record<string, unknown>>;
-  logicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string>;
+  projectDraftThreadKeyByProjectKey: Record<string, string>;
   stickyModelSelectionByProvider?: Record<
     string,
     { model: string; options?: ReadonlyArray<{ id: string; value: string | boolean }> }
@@ -2105,7 +2130,7 @@ describe("composerDraftStore legacy storage migration", () => {
       expect(migrate(payload, 2)).toEqual({
         draftsByThreadKey: {},
         draftThreadsByThreadKey: {},
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
         stickyModelSelectionByProvider: {},
         stickyActiveProvider: null,
       });
@@ -2188,9 +2213,7 @@ describe("composerDraftStore legacy storage migration", () => {
         threadId: "thread-legacy-promoted",
       },
     });
-    expect(migrated.logicalProjectDraftThreadKeyByLogicalProjectKey[legacyProjectKey]).toBe(
-      rawThreadId,
-    );
+    expect(migrated.projectDraftThreadKeyByProjectKey[legacyProjectKey]).toBe(rawThreadId);
 
     expect(migrated.stickyModelSelectionByProvider?.codex).toMatchObject({
       model: "gpt-5.4",
@@ -2327,7 +2350,7 @@ describe("composerDraftStore legacy storage migration", () => {
           activeProvider?: string;
         }
       >;
-      draftThreadsByThreadKey: Record<string, { logicalProjectKey?: string }>;
+      draftThreadsByThreadKey: Record<string, { projectKey?: string }>;
     };
 
     expect(migrated.draftsByThreadKey.edge!.modelSelectionByProvider.codex!.options).toEqual([
@@ -2351,7 +2374,11 @@ describe("composerDraftStore legacy storage migration", () => {
     ]);
     expect(migrated.draftsByThreadKey.custom!.activeProvider).toBe("custom_instance");
     expect(migrated.draftsByThreadKey.invalidModel!.activeProvider).toBeUndefined();
-    expect(migrated.draftThreadsByThreadKey.edge!.logicalProjectKey).toBe("logical-edge");
+    expect(migrated.draftThreadsByThreadKey.edge!.projectKey).toBe(
+      scopedProjectKey(
+        scopeProjectRef(EnvironmentId.make("environment-edge"), ProjectId.make("project-edge")),
+      ),
+    );
   });
 
   it("reconciles project mappings against missing and conflicting draft threads", () => {
@@ -2394,23 +2421,25 @@ describe("composerDraftStore legacy storage migration", () => {
       threadId: "thread-mapped",
       environmentId: mappedEnvironmentId,
       projectId: "project-mapped",
-      logicalProjectKey: mappedProjectKey,
+      projectKey: mappedProjectKey,
       envMode: "local",
       branch: null,
       worktreePath: null,
       promotedTo: null,
     });
-    // A mapping that disagrees with the stored draft thread wins.
+    // A mapping cannot overwrite the draft's own physical ownership.
     expect(migrated.draftThreadsByThreadKey["thread-conflict"]).toMatchObject({
-      environmentId: "environment-new",
-      projectId: "project-new",
-      logicalProjectKey: conflictingProjectKey,
+      environmentId: "environment-old",
+      projectId: "project-old",
+      projectKey: scopedProjectKey(
+        scopeProjectRef(EnvironmentId.make("environment-old"), ProjectId.make("project-old")),
+      ),
     });
     // Entries without a project or environment identity are dropped.
     expect(migrated.draftThreadsByThreadKey["thread-dropped"]).toBeUndefined();
-    expect(
-      migrated.logicalProjectDraftThreadKeyByLogicalProjectKey["not-a-project-key-loose"],
-    ).toBe("thread-orphan");
+    expect(migrated.projectDraftThreadKeyByProjectKey).not.toHaveProperty(
+      "not-a-project-key-loose",
+    );
   });
 });
 
@@ -2466,7 +2495,7 @@ describe("composerDraftStore v3 hydration via merge", () => {
           },
         },
         draftThreadsByThreadKey: {},
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
       },
       useComposerDraftStore.getInitialState(),
     );
@@ -2520,7 +2549,7 @@ describe("composerDraftStore v3 hydration via merge", () => {
           },
         },
         draftThreadsByThreadKey: {},
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
       },
       useComposerDraftStore.getInitialState(),
     );
@@ -2571,7 +2600,7 @@ describe("composerDraftStore v3 hydration via merge", () => {
           },
         },
         draftThreadsByThreadKey: {},
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
       },
       useComposerDraftStore.getInitialState(),
     );
@@ -2690,7 +2719,7 @@ describe("composerDraftStore v3 hydration via merge", () => {
             },
           },
         },
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
         stickyModelSelectionByProvider: {
           codex: createModelSelection(CODEX_INSTANCE, "gpt-5.4"),
         },
@@ -2760,7 +2789,7 @@ describe("composerDraftStore v3 hydration via merge", () => {
             startFromOrigin: false,
           },
         },
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
       },
       useComposerDraftStore.getInitialState(),
     );
@@ -3200,7 +3229,7 @@ describe("composerDraftStore persisted attachment lifecycle", () => {
             [threadKey]: { prompt: "", attachments: [attachment] },
           },
           draftThreadsByThreadKey: {},
-          logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+          projectDraftThreadKeyByProjectKey: {},
         },
       },
       Schema.Unknown,
@@ -3306,27 +3335,37 @@ describe("composerDraftStore draft session getters", () => {
     resetComposerDraftStore();
   });
 
-  it("looks up draft sessions by logical project key", () => {
+  it("looks up draft sessions by environment-scoped project reference", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, { threadId });
 
-    const session = store.getDraftThreadByLogicalProjectKey(scopedProjectKey(projectRef));
+    const session = store.getDraftSessionByProjectRef(projectRef);
     expect(session).toMatchObject({ draftId, threadId, projectId });
-
-    expect(store.getDraftSessionByLogicalProjectKey("   ")).toBeNull();
-    expect(store.getDraftSessionByLogicalProjectKey("missing-key")).toBeNull();
   });
 
-  it("hides promoting draft sessions from logical project lookups", () => {
+  it("keeps the same project id isolated between environments", () => {
+    const otherProjectRef = scopeProjectRef(OTHER_TEST_ENVIRONMENT_ID, projectId);
+    const otherDraftId = DraftId.make("draft-getters-other-environment");
+    const otherThreadId = ThreadId.make("thread-getters-other-environment");
+    const store = useComposerDraftStore.getState();
+
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+    store.setProjectDraftThreadId(otherProjectRef, otherDraftId, { threadId: otherThreadId });
+
+    expect(store.getDraftSessionByProjectRef(projectRef)?.draftId).toBe(draftId);
+    expect(store.getDraftSessionByProjectRef(otherProjectRef)?.draftId).toBe(otherDraftId);
+    expect(useComposerDraftStore.getState().projectDraftThreadKeyByProjectKey).toEqual({
+      [scopedProjectKey(projectRef)]: draftId,
+      [scopedProjectKey(otherProjectRef)]: otherDraftId,
+    });
+  });
+
+  it("hides promoting draft sessions from scoped project lookups", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, { threadId });
     markPromotedDraftThread(threadId);
 
-    expect(
-      useComposerDraftStore
-        .getState()
-        .getDraftThreadByLogicalProjectKey(scopedProjectKey(projectRef)),
-    ).toBeNull();
+    expect(useComposerDraftStore.getState().getDraftSessionByProjectRef(projectRef)).toBeNull();
   });
 
   it("lists scoped draft thread keys and reports environment membership", () => {
@@ -3650,7 +3689,7 @@ describe("composerDraftStore invalid draft targets", () => {
     expect(useComposerDraftStore.getState()).toMatchObject({
       draftsByThreadKey: {},
       draftThreadsByThreadKey: {},
-      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      projectDraftThreadKeyByProjectKey: {},
       stickyModelSelectionByProvider: {},
       stickyActiveProvider: null,
     });

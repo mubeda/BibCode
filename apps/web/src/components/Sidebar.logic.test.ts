@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { scopedProjectKey, scopeProjectRef } from "@bibcode/client-runtime/environment";
 import {
   createThreadJumpHintVisibilityController,
   findDefaultThread,
@@ -489,12 +490,11 @@ describe("orderItemsByPreferredIds", () => {
     ]);
   });
 
-  it("honors projectOrder physical keys via getProjectOrderKey", async () => {
+  it("honors projectOrder environment-scoped project keys", () => {
     // Regression guard for #1904 / the regression introduced by #2055:
     // `projectOrder` is populated with physical keys (envId + cwd-derived)
     // by the store and by drag-end handlers. Readers must identify projects
     // with the same key format, or manual sort silently snaps back.
-    const { getProjectOrderKey } = await import("../logicalProject");
     const projects = [
       {
         environmentId: EnvironmentId.make("environment-local"),
@@ -512,6 +512,8 @@ describe("orderItemsByPreferredIds", () => {
         workspaceRoot: "/work/gamma",
       },
     ];
+    const getProjectOrderKey = (project: (typeof projects)[number]) =>
+      scopedProjectKey(scopeProjectRef(project.environmentId, project.id));
     const ordered = orderItemsByPreferredIds({
       items: projects,
       preferredIds: [getProjectOrderKey(projects[2]!), getProjectOrderKey(projects[0]!)],

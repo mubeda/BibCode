@@ -56,7 +56,7 @@
 - Test: corresponding `.test.ts`/`.test.tsx` files
 - Delete after callers migrate: `apps/web/src/logicalProject.ts`, `sidebarProjectGrouping.ts`, `environmentGrouping.test.ts`, `sidebarProjectGrouping.test.ts`
 
-- [ ] **Step 1: Rewrite tests to assert physical ownership**
+- [x] **Step 1: Rewrite tests to assert physical ownership**
 
 ```ts
 expect(projectTreeKey(primaryProject)).toBe(
@@ -70,31 +70,55 @@ expect(projectTreeKey(remoteSameRepository)).not.toBe(projectTreeKey(primaryProj
 
 Assert same remote URL in two environments yields two project rows, a project never has `memberProjects`, and Worktree Discovery receives one scoped project.
 
-- [ ] **Step 2: Run grouping/draft tests and confirm RED**
+- [x] **Step 2: Run grouping/draft tests and confirm RED**
 
 ```sh
 vp test apps/web/src/environmentGrouping.test.ts apps/web/src/sidebarProjectGrouping.test.ts apps/web/src/composerDraftStore.test.ts apps/web/src/hooks/useHandleNewThread.test.tsx
 ```
 
-- [ ] **Step 3: Replace logical keys with `scopedProjectKey`**
+- [x] **Step 3: Replace logical keys with `scopedProjectKey`**
 
 Use `{ environmentId, projectId }` for draft lookup, active-project highlighting, project ordering, discovery, and new-thread seed context. Repository identity remains useful server metadata but never a UI ownership key.
 
-- [ ] **Step 4: Migrate legacy drafts without merging them**
+- [x] **Step 4: Migrate legacy drafts without merging them**
 
 Rekey each persisted draft from its own stored project/environment reference. If a legacy logical mapping points to several physical drafts, publish each under its scoped key. Quarantine a mapping with no recoverable project reference; never choose an environment by array order.
 
-- [ ] **Step 5: Remove project-grouping preferences from active settings**
+- [x] **Step 5: Remove project-grouping preferences from active settings**
 
 Delete `sidebarProjectGroupingMode` and overrides from UI and active contract/defaults. The persisted settings decoder may ignore the old fields for one migration version, but runtime and RPC never write or expose a compatibility alias.
 
-- [ ] **Step 6: Delete grouping modules and run focused tests**
+- [x] **Step 6: Delete grouping modules and run focused tests**
 
 ```sh
 vp test apps/web/src/composerDraftStore.test.ts apps/web/src/hooks/useHandleNewThread.test.tsx apps/web/src/components/ChatView.hooks.test.tsx apps/web/src/components/WorktreeDiscoverySection.test.tsx packages/contracts/src/settings.test.ts
 git add -A apps/web/src/logicalProject.ts apps/web/src/sidebarProjectGrouping.ts apps/web/src/environmentGrouping.test.ts apps/web/src/sidebarProjectGrouping.test.ts apps/web/src/composerDraftStore.ts apps/web/src/composerDraftStore.test.ts apps/web/src/hooks apps/web/src/components/ChatView.tsx apps/web/src/components/WorktreeDiscoverySection.tsx packages/contracts/src/settings.ts packages/contracts/src/settings.test.ts apps/server/src/server_settings/mod.rs
 git commit -m "refactor(web): make projects strictly environment owned"
 ```
+
+Implemented environment-scoped project identity throughout draft lookup,
+ordering, active highlighting, new-thread seeding, sidebar rows, and worktree
+discovery. Legacy draft mappings are rebuilt only from recoverable stored
+environment/project ownership; ambiguous repository-derived mappings never
+enter active state. Retired grouping settings decode as ignored unknown input,
+and the grouping modules and public client-runtime export were deleted.
+Migration-only aliases preserve and rewrite the former physical project order
+keys, while draft remapping removes both stale source keys and deliberately
+displaced destination state instead of leaving unreachable composer content.
+
+The initial RED run failed on the new scoped draft-map assertion and the still
+active grouping defaults. The final focused gate passed 856 tests across 14
+contract, client-runtime, store, hook, route, sidebar, chat, discovery, and UI
+state files; `vp check` passed with the one pre-existing unused fixture warning,
+and the complete workspace typecheck graph passed. A repository-wide run outside
+the sandbox passed 8,387 tests and exposed eight earlier-plan fixture/ledger
+failures (five relay UUID fixtures, one remote-auth UUID fixture, one stale
+desktop-bridge mock, and one dependency ledger); those are tracked for a
+separate repair commit before Task 2. Independent review found and verified the
+two migration/remap fixes above, with no remaining P0-P2 finding. The remote
+environment and worktree lifecycle runbooks were reviewed and remain accurate;
+the active connection architecture wording was updated to match strict
+environment ownership.
 
 ### Task 2: Build a pure stable environment-tree projection
 

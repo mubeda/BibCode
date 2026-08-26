@@ -27,12 +27,6 @@ import {
   toastManager,
 } from "../components/ui/toast";
 import { resolveAndPersistPreferredEditor } from "../editorPreferences";
-import { useClientSettings } from "../hooks/useSettings";
-import {
-  deriveLogicalProjectKeyFromSettings,
-  derivePhysicalProjectKeyFromPath,
-  selectProjectGroupingSettings,
-} from "../logicalProject";
 import { useUiStateStore } from "../uiStateStore";
 import { syncBrowserChromeTheme } from "../hooks/useTheme";
 import { resolveInitialServerAuthGateState } from "../environments/primary";
@@ -46,7 +40,7 @@ import {
   primaryServerConfigEventAtom,
   primaryServerWelcomeAtom,
 } from "../state/server";
-import { readProject, setActiveEnvironmentId, useActiveEnvironmentId } from "../state/entities";
+import { setActiveEnvironmentId, useActiveEnvironmentId } from "../state/entities";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import {
   createKeybindingsUpdateToastController,
@@ -279,7 +273,6 @@ function errorDetails(error: unknown): string {
 function EventRouter() {
   const navigate = useNavigate();
   const pathname = useLocation({ select: (loc) => loc.pathname });
-  const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
   const primaryEnvironment = usePrimaryEnvironment();
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
@@ -302,19 +295,9 @@ function EventRouter() {
       if (!payload.bootstrapProjectId || !payload.bootstrapThreadId) {
         return;
       }
-      const bootstrapProject = readProject(
+      const bootstrapProjectKey = scopedProjectKey(
         scopeProjectRef(payload.environment.environmentId, payload.bootstrapProjectId),
       );
-      const bootstrapProjectKey =
-        (bootstrapProject
-          ? deriveLogicalProjectKeyFromSettings(bootstrapProject, projectGroupingSettings)
-          : null) ??
-        (serverConfig?.cwd
-          ? derivePhysicalProjectKeyFromPath(payload.environment.environmentId, serverConfig.cwd)
-          : null) ??
-        scopedProjectKey(
-          scopeProjectRef(payload.environment.environmentId, payload.bootstrapProjectId),
-        );
       useUiStateStore.getState().setProjectExpanded(bootstrapProjectKey, true);
 
       if (readPathname() !== "/") {

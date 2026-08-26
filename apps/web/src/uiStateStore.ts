@@ -1,4 +1,5 @@
 import { Debouncer } from "@tanstack/react-pacer";
+import type { EnvironmentId } from "@bibcode/contracts";
 import { create } from "zustand";
 import { normalizeProjectPathForComparison } from "./lib/projectPaths";
 
@@ -51,6 +52,14 @@ let legacyKeysCleanedUp = false;
 
 export function legacyProjectCwdPreferenceKey(cwd: string): string {
   return `${LEGACY_PROJECT_CWD_PREFERENCE_PREFIX}${normalizeProjectPathForComparison(cwd)}`;
+}
+
+/** Migration-only alias for project-order and expansion keys written before environment ownership. */
+export function legacyPhysicalProjectPreferenceKey(
+  environmentId: EnvironmentId,
+  cwd: string,
+): string {
+  return `${environmentId}:${normalizeProjectPathForComparison(cwd)}`;
 }
 
 function sanitizeStringArray(value: unknown): string[] {
@@ -405,6 +414,40 @@ export function reorderProjects(
   };
 }
 
+export interface ProjectOrderPreferenceMigration {
+  readonly projectKey: string;
+  readonly legacyPreferenceKeys: readonly string[];
+}
+
+export function migrateProjectOrderPreferences(
+  state: UiState,
+  projects: readonly ProjectOrderPreferenceMigration[],
+): UiState {
+  const projectKeyByLegacyPreference = new Map<string, string>();
+  for (const project of projects) {
+    for (const legacyPreferenceKey of project.legacyPreferenceKeys) {
+      projectKeyByLegacyPreference.set(legacyPreferenceKey, project.projectKey);
+    }
+  }
+
+  let changed = false;
+  const seen = new Set<string>();
+  const projectOrder: string[] = [];
+  for (const persistedKey of state.projectOrder) {
+    const projectKey = projectKeyByLegacyPreference.get(persistedKey) ?? persistedKey;
+    if (projectKey !== persistedKey || seen.has(projectKey)) {
+      changed = true;
+    }
+    if (seen.has(projectKey)) {
+      continue;
+    }
+    seen.add(projectKey);
+    projectOrder.push(projectKey);
+  }
+
+  return changed ? { ...state, projectOrder } : state;
+}
+
 interface UiStateStore extends UiState {
   markThreadVisited: (threadId: string, visitedAt: string) => void;
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
@@ -416,6 +459,7 @@ interface UiStateStore extends UiState {
     draggedProjectIds: readonly string[],
     targetProjectIds: readonly string[],
   ) => void;
+  migrateProjectOrderPreferences: (projects: readonly ProjectOrderPreferenceMigration[]) => void;
 }
 
 export const useUiStateStore = create<UiStateStore>((set) => ({
@@ -434,6 +478,8 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
     set((state) =>
       reorderProjects(state, currentProjectOrder, draggedProjectIds, targetProjectIds),
     ),
+  migrateProjectOrderPreferences: (projects) =>
+    set((state) => migrateProjectOrderPreferences(state, projects)),
 }));
 
 useUiStateStore.subscribe((state) => debouncedPersistState.maybeExecute(state));

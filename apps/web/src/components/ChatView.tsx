@@ -208,10 +208,6 @@ import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { resolveThreadProviderBinding } from "../threadProviderBinding";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { DesktopPreviewTabHosts } from "../browser/DesktopPreviewTabHosts";
-import {
-  deriveLogicalProjectKeyFromSettings,
-  selectProjectGroupingSettings,
-} from "../logicalProject";
 import { buildDraftThreadRouteParams } from "../threadRoutes";
 import {
   type ComposerAttachment,
@@ -1455,13 +1451,11 @@ function ChatViewContent(props: ChatViewProps) {
     (store) => store.discardComposerContent,
   );
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
-  const getDraftSessionByLogicalProjectKey = useComposerDraftStore(
-    (store) => store.getDraftSessionByLogicalProjectKey,
+  const getDraftSessionByProjectRef = useComposerDraftStore(
+    (store) => store.getDraftSessionByProjectRef,
   );
   const getDraftSession = useComposerDraftStore((store) => store.getDraftSession);
-  const setLogicalProjectDraftThreadId = useComposerDraftStore(
-    (store) => store.setLogicalProjectDraftThreadId,
-  );
+  const setProjectDraftThreadId = useComposerDraftStore((store) => store.setProjectDraftThreadId);
   const draftThread = useComposerDraftStore((store) =>
     routeKind === "server"
       ? store.getDraftSessionByRef(routeThreadRef)
@@ -2091,8 +2085,6 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [retryEnvironment],
   );
-  const projectGroupingSettings = selectProjectGroupingSettings(settings);
-
   const closePullRequestDialog = useCallback(() => {
     setPullRequestDialogState(null);
   }, []);
@@ -2103,22 +2095,14 @@ function ChatViewContent(props: ChatViewProps) {
         throw new Error("No active project is available for this pull request.");
       }
       const activeProjectRef = scopeProjectRef(activeProject.environmentId, activeProject.id);
-      const logicalProjectKey = deriveLogicalProjectKeyFromSettings(
-        activeProject,
-        projectGroupingSettings,
-      );
-      const storedDraftSession = getDraftSessionByLogicalProjectKey(logicalProjectKey);
+      const projectKey = scopedProjectKey(activeProjectRef);
+      const storedDraftSession = getDraftSessionByProjectRef(activeProjectRef);
       if (storedDraftSession) {
         setDraftThreadContext(storedDraftSession.draftId, input);
-        setLogicalProjectDraftThreadId(
-          logicalProjectKey,
-          activeProjectRef,
-          storedDraftSession.draftId,
-          {
-            threadId: storedDraftSession.threadId,
-            ...input,
-          },
-        );
+        setProjectDraftThreadId(activeProjectRef, storedDraftSession.draftId, {
+          threadId: storedDraftSession.threadId,
+          ...input,
+        });
         if (routeKind !== "draft" || draftId !== storedDraftSession.draftId) {
           await navigate({
             to: "/draft/$draftId",
@@ -2129,13 +2113,9 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       const activeDraftSession = routeKind === "draft" && draftId ? getDraftSession(draftId) : null;
-      if (
-        !isServerThread &&
-        activeDraftSession?.logicalProjectKey === logicalProjectKey &&
-        draftId
-      ) {
+      if (!isServerThread && activeDraftSession?.projectKey === projectKey && draftId) {
         setDraftThreadContext(draftId, input);
-        setLogicalProjectDraftThreadId(logicalProjectKey, activeProjectRef, draftId, {
+        setProjectDraftThreadId(activeProjectRef, draftId, {
           threadId: activeDraftSession.threadId,
           createdAt: activeDraftSession.createdAt,
           runtimeMode: activeDraftSession.runtimeMode,
@@ -2157,7 +2137,7 @@ function ChatViewContent(props: ChatViewProps) {
         settings,
         projectSelection: activeProject.defaultModelSelection,
       });
-      setLogicalProjectDraftThreadId(logicalProjectKey, activeProjectRef, nextDraftId, {
+      setProjectDraftThreadId(activeProjectRef, nextDraftId, {
         threadId: nextThreadId,
         createdAt: new Date().toISOString(),
         runtimeMode: DEFAULT_RUNTIME_MODE,
@@ -2179,14 +2159,13 @@ function ChatViewContent(props: ChatViewProps) {
       activeEnvironment?.serverConfig?.providers,
       draftId,
       getDraftSession,
-      getDraftSessionByLogicalProjectKey,
+      getDraftSessionByProjectRef,
       isServerThread,
       navigate,
-      projectGroupingSettings,
       routeKind,
       setComposerDraftModelSelection,
       setDraftThreadContext,
-      setLogicalProjectDraftThreadId,
+      setProjectDraftThreadId,
       settings.providerInstances,
       settings.providerSessionDefaults,
     ],

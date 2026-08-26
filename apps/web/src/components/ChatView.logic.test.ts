@@ -304,7 +304,7 @@ describe("local draft and attachment helpers", () => {
         threadId,
         environmentId,
         projectId,
-        logicalProjectKey: "local:project-1",
+        projectKey: "local:project-1",
         createdAt: now,
         runtimeMode: "approval-required",
         interactionMode: "plan",

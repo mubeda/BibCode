@@ -538,7 +538,7 @@ describe("worktree catalog atoms", () => {
     }),
   );
 
-  it.effect("keeps the same grouped project id isolated by environment", () =>
+  it.effect("keeps the same project id isolated by environment", () =>
     Effect.gen(function* () {
       const first = snapshot({
         repositoryKey: "repository-1",

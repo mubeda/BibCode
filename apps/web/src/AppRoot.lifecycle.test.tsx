@@ -1,7 +1,6 @@
 // @vitest-environment happy-dom
 
 import {
-  scopedProjectKey,
   scopedThreadKey,
   scopeProjectRef,
   scopeThreadRef,
@@ -197,7 +196,7 @@ beforeEach(() => {
   useComposerDraftStore.setState({
     draftsByThreadKey: {},
     draftThreadsByThreadKey: {},
-    logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+    projectDraftThreadKeyByProjectKey: {},
   });
   container = document.createElement("div");
   document.body.append(container);
@@ -427,12 +426,9 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     });
     useComposerDraftStore
       .getState()
-      .setLogicalProjectDraftThreadId(
-        scopedProjectKey(PROJECT_REF),
-        PROJECT_REF,
-        DraftId.make("draft-lifecycle"),
-        { threadId: DRAFT_THREAD_ID },
-      );
+      .setProjectDraftThreadId(PROJECT_REF, DraftId.make("draft-lifecycle"), {
+        threadId: DRAFT_THREAD_ID,
+      });
     useCenterPanelStore.getState().openChatPanel(HOST_REF, DRAFT_THREAD_ID, "Draft");
     useCenterPanelStore.getState().openTerminalPanel(DELETED_REF, "term-deleted");
     useCenterPanelStore.getState().openTerminalPanel(ARCHIVED_REF, "term-archived");

@@ -646,10 +646,6 @@ import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
 import { newDraftId } from "../lib/utils";
-import {
-  deriveLogicalProjectKeyFromSettings,
-  selectProjectGroupingSettings,
-} from "../logicalProject";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import type { ProviderInstanceEntry } from "../providerInstances";
@@ -1121,7 +1117,7 @@ function sendContextWithOwnedComposerContexts(
 }
 
 function seedFreshLocalDraft(
-  logicalProjectKey: string,
+  _projectKey: string,
   modelSelection: ModelSelection,
 ): ReturnType<typeof newDraftId> {
   const draftId = newDraftId();
@@ -1130,12 +1126,11 @@ function seedFreshLocalDraft(
   seedGitStatus(true);
   useComposerDraftStore
     .getState()
-    .setLogicalProjectDraftThreadId(
-      logicalProjectKey,
-      scopeProjectRef(environmentId, projectId),
-      draftId,
-      { threadId, createdAt: now, envMode: "local" },
-    );
+    .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+      threadId,
+      createdAt: now,
+      envMode: "local",
+    });
   useComposerDraftStore.getState().setModelSelection(draftId, modelSelection);
   publishSeededStoreState(useComposerDraftStore);
   return draftId;
@@ -3461,12 +3456,11 @@ describe("ChatView send flows", () => {
     };
     useComposerDraftStore
       .getState()
-      .setLogicalProjectDraftThreadId(
-        "legacy-draft",
-        scopeProjectRef(environmentId, projectId),
-        draftId,
-        { threadId, createdAt: now, envMode: "local" },
-      );
+      .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+        threadId,
+        createdAt: now,
+        envMode: "local",
+      });
     publishSeededStoreState(useComposerDraftStore);
 
     renderDraftRoute(draftId);
@@ -3500,12 +3494,11 @@ describe("ChatView send flows", () => {
       };
       useComposerDraftStore
         .getState()
-        .setLogicalProjectDraftThreadId(
-          "legacy-draft-fallback",
-          scopeProjectRef(environmentId, projectId),
-          draftId,
-          { threadId, createdAt: now, envMode: "local" },
-        );
+        .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+          threadId,
+          createdAt: now,
+          envMode: "local",
+        });
       publishSeededStoreState(useComposerDraftStore);
 
       if (route === "draft") {
@@ -4051,12 +4044,11 @@ describe("ChatView send flows", () => {
     const draftId = newDraftId();
     useComposerDraftStore
       .getState()
-      .setLogicalProjectDraftThreadId(
-        "logical-project-1",
-        scopeProjectRef(environmentId, projectId),
-        draftId,
-        { threadId, createdAt: now, envMode: "worktree" },
-      );
+      .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+        threadId,
+        createdAt: now,
+        envMode: "worktree",
+      });
     publishSeededStoreState(useComposerDraftStore);
 
     renderDraftRoute(draftId);
@@ -5597,21 +5589,15 @@ describe("ChatView banners and dialogs", () => {
 
   it("reuses a stored draft session for pull request checkout when one exists", async () => {
     seedConnectedServerThread();
-    const project = makeProject();
-    const logicalKey = deriveLogicalProjectKeyFromSettings(
-      project,
-      selectProjectGroupingSettings(h.settings as never),
-    );
     const draftId = newDraftId();
     const draftThreadId = ThreadId.make("thread-draft-9");
     useComposerDraftStore
       .getState()
-      .setLogicalProjectDraftThreadId(
-        logicalKey,
-        scopeProjectRef(environmentId, projectId),
-        draftId,
-        { threadId: draftThreadId, createdAt: now, envMode: "local" },
-      );
+      .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, {
+        threadId: draftThreadId,
+        createdAt: now,
+        envMode: "local",
+      });
     publishSeededStoreState(useComposerDraftStore);
     seedHostState("pullRequestDialogState", { initialReference: null, key: 3 });
 

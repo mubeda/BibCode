@@ -219,7 +219,7 @@ const PersistedDraftThreadState = Schema.Struct({
   threadId: ThreadId,
   environmentId: Schema.String,
   projectId: ProjectId,
-  logicalProjectKey: Schema.optionalKey(Schema.String),
+  projectKey: Schema.optionalKey(Schema.String),
   createdAt: Schema.String,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -241,7 +241,7 @@ type PersistedDraftThreadState = typeof PersistedDraftThreadState.Type;
 const PersistedComposerDraftStoreState = Schema.Struct({
   draftsByThreadKey: Schema.Record(Schema.String, PersistedComposerThreadDraftState),
   draftThreadsByThreadKey: Schema.Record(Schema.String, PersistedDraftThreadState),
-  logicalProjectDraftThreadKeyByLogicalProjectKey: Schema.Record(Schema.String, Schema.String),
+  projectDraftThreadKeyByProjectKey: Schema.Record(Schema.String, Schema.String),
   stickyModelSelectionByProvider: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, ModelSelection),
   ),
@@ -298,7 +298,7 @@ export interface DraftSessionState {
   threadId: ThreadId;
   environmentId: EnvironmentId;
   projectId: ProjectId;
-  logicalProjectKey: string;
+  projectKey: string;
   createdAt: string;
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
@@ -338,14 +338,11 @@ type ComposerThreadTarget = ScopedThreadRef | DraftId;
 interface ComposerDraftStoreState {
   draftsByThreadKey: Record<string, ComposerThreadDraftState>;
   draftThreadsByThreadKey: Record<string, DraftThreadState>;
-  logicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string>;
+  projectDraftThreadKeyByProjectKey: Record<string, string>;
   stickyModelSelectionByProvider: Partial<Record<ProviderInstanceId, ModelSelection>>;
   stickyActiveProvider: ProviderInstanceId | null;
   /** Returns the editable composer content for a draft session or server thread. */
   getComposerDraft: (target: ComposerThreadTarget) => ComposerThreadDraftState | null;
-  /** Looks up the active draft session for a logical project identity. */
-  getDraftThreadByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
-  getDraftSessionByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
   getDraftThreadByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   getDraftSessionByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   /** Reads mutable draft-session metadata by `DraftId`. */
@@ -356,22 +353,6 @@ interface ComposerDraftStoreState {
   getDraftThread: (threadRef: ComposerThreadTarget) => DraftThreadState | null;
   listDraftThreadKeys: () => string[];
   hasDraftThreadsInEnvironment: (environmentId: EnvironmentId) => boolean;
-  /** Creates or updates the draft session tracked for a logical project. */
-  setLogicalProjectDraftThreadId: (
-    logicalProjectKey: string,
-    projectRef: ScopedProjectRef,
-    draftId: DraftId,
-    options?: {
-      threadId?: ThreadId;
-      branch?: string | null;
-      worktreePath?: string | null;
-      createdAt?: string;
-      envMode?: DraftThreadEnvMode;
-      startFromOrigin?: boolean;
-      runtimeMode?: RuntimeMode;
-      interactionMode?: ProviderInteractionMode;
-    },
-  ) => void;
   /** Creates or updates the draft session tracked for a concrete project ref. */
   setProjectDraftThreadId: (
     projectRef: ScopedProjectRef,
@@ -574,7 +555,7 @@ function compactModelSelectionByProvider(
 const EMPTY_PERSISTED_DRAFT_STORE_STATE = Object.freeze<PersistedComposerDraftStoreState>({
   draftsByThreadKey: {},
   draftThreadsByThreadKey: {},
-  logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+  projectDraftThreadKeyByProjectKey: {},
   stickyModelSelectionByProvider: {},
   stickyActiveProvider: null,
 });
@@ -1229,10 +1210,6 @@ function projectDraftKey(projectRef: ScopedProjectRef): string {
   return scopedProjectKey(projectRef);
 }
 
-function logicalProjectDraftKey(logicalProjectKey: string): string {
-  return logicalProjectKey.trim();
-}
-
 /**
  * Runtime composer storage key for app-facing identities only.
  *
@@ -1356,7 +1333,6 @@ function toProjectDraftSession(
 function createDraftThreadState(
   projectRef: ScopedProjectRef,
   threadId: ThreadId,
-  logicalProjectKey: string,
   existingThread: DraftThreadState | undefined,
   options?: {
     threadId?: ThreadId;
@@ -1395,7 +1371,7 @@ function createDraftThreadState(
     threadId,
     environmentId: projectRef.environmentId,
     projectId: projectRef.projectId,
-    logicalProjectKey,
+    projectKey: projectDraftKey(projectRef),
     createdAt: options?.createdAt ?? existingThread?.createdAt ?? new Date().toISOString(),
     runtimeMode: options?.runtimeMode ?? existingThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
     interactionMode:
@@ -1434,7 +1410,7 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
     left.threadId === right.threadId &&
     left.environmentId === right.environmentId &&
     left.projectId === right.projectId &&
-    left.logicalProjectKey === right.logicalProjectKey &&
+    left.projectKey === right.projectKey &&
     left.createdAt === right.createdAt &&
     left.runtimeMode === right.runtimeMode &&
     left.interactionMode === right.interactionMode &&
@@ -1449,19 +1425,15 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
 function removeDraftThreadReferences(
   state: Pick<
     ComposerDraftStoreState,
-    | "draftThreadsByThreadKey"
-    | "draftsByThreadKey"
-    | "logicalProjectDraftThreadKeyByLogicalProjectKey"
+    "draftThreadsByThreadKey" | "draftsByThreadKey" | "projectDraftThreadKeyByProjectKey"
   >,
   threadKey: string,
 ): Pick<
   ComposerDraftStoreState,
-  | "draftThreadsByThreadKey"
-  | "draftsByThreadKey"
-  | "logicalProjectDraftThreadKeyByLogicalProjectKey"
+  "draftThreadsByThreadKey" | "draftsByThreadKey" | "projectDraftThreadKeyByProjectKey"
 > {
-  const nextLogicalMappings = Object.fromEntries(
-    Object.entries(state.logicalProjectDraftThreadKeyByLogicalProjectKey).filter(
+  const nextProjectMappings = Object.fromEntries(
+    Object.entries(state.projectDraftThreadKeyByProjectKey).filter(
       ([, draftThreadKey]) => draftThreadKey !== threadKey,
     ),
   ) as Record<string, string>;
@@ -1472,7 +1444,7 @@ function removeDraftThreadReferences(
   return {
     draftsByThreadKey: restDraftsByThreadKey,
     draftThreadsByThreadKey: restDraftThreadsByThreadKey,
-    logicalProjectDraftThreadKeyByLogicalProjectKey: nextLogicalMappings,
+    projectDraftThreadKeyByProjectKey: nextProjectMappings,
   };
 }
 
@@ -1481,7 +1453,7 @@ function normalizePersistedDraftThreads(
   rawProjectDraftThreadIdByProjectKey: unknown,
 ): Pick<
   PersistedComposerDraftStoreState,
-  "draftThreadsByThreadKey" | "logicalProjectDraftThreadKeyByLogicalProjectKey"
+  "draftThreadsByThreadKey" | "projectDraftThreadKeyByProjectKey"
 > {
   const draftThreadsByThreadKey: Record<string, PersistedDraftThreadState> = {};
   const environmentIdByThreadId = new Map<ThreadId, EnvironmentId>();
@@ -1558,17 +1530,12 @@ function normalizePersistedDraftThreads(
         continue;
       }
       const normalizedEnvironmentId = environmentId as EnvironmentId;
+      const projectRef = scopeProjectRef(normalizedEnvironmentId, projectId as ProjectId);
       draftThreadsByThreadKey[threadKey] = {
         threadId,
         environmentId: normalizedEnvironmentId,
         projectId: projectId as ProjectId,
-        logicalProjectKey:
-          typeof candidateDraftThread.logicalProjectKey === "string" &&
-          candidateDraftThread.logicalProjectKey.length > 0
-            ? candidateDraftThread.logicalProjectKey
-            : parsedThreadRef
-              ? projectDraftKey(scopeProjectRef(normalizedEnvironmentId, projectId as ProjectId))
-              : threadKeyOrId,
+        projectKey: projectDraftKey(projectRef),
         createdAt:
           typeof createdAt === "string" && createdAt.length > 0
             ? createdAt
@@ -1590,32 +1557,29 @@ function normalizePersistedDraftThreads(
     }
   }
 
-  const logicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string> = {};
+  // Legacy grouping indexes are migration input only. Rebuild the active index
+  // from each draft's own environment/project reference so two environments
+  // can never collapse into one draft merely because they share a repository.
   if (
     rawProjectDraftThreadIdByProjectKey &&
     typeof rawProjectDraftThreadIdByProjectKey === "object"
   ) {
-    for (const [logicalProjectKey, threadKeyOrId] of Object.entries(
+    for (const [legacyProjectKey, threadKeyOrId] of Object.entries(
       rawProjectDraftThreadIdByProjectKey as Record<string, unknown>,
     )) {
       if (typeof threadKeyOrId !== "string" || threadKeyOrId.length === 0) {
         continue;
       }
-      const projectRef = parseScopedProjectKey(logicalProjectKey);
+      const projectRef = parseScopedProjectKey(legacyProjectKey);
       const parsedThreadRef = parseScopedThreadKey(threadKeyOrId);
       const threadKey = normalizeLegacyComposerStorageKey(threadKeyOrId);
-      logicalProjectDraftThreadKeyByLogicalProjectKey[logicalProjectKey] = threadKey;
       if (parsedThreadRef) {
         environmentIdByThreadId.set(parsedThreadRef.threadId, parsedThreadRef.environmentId);
       }
       if (!projectRef) {
-        const existingDraftThread = draftThreadsByThreadKey[threadKey];
-        if (existingDraftThread && !existingDraftThread.logicalProjectKey) {
-          draftThreadsByThreadKey[threadKey] = {
-            ...existingDraftThread,
-            logicalProjectKey,
-          };
-        }
+        // A repository-derived legacy key cannot establish physical ownership.
+        // Keep any independently recoverable draft metadata, but never expose
+        // the ambiguous mapping to active runtime state.
         continue;
       }
       if (!draftThreadsByThreadKey[threadKey]) {
@@ -1623,7 +1587,7 @@ function normalizePersistedDraftThreads(
           threadId: parsedThreadRef?.threadId ?? (threadKey as ThreadId),
           environmentId: projectRef.environmentId,
           projectId: projectRef.projectId,
-          logicalProjectKey,
+          projectKey: projectDraftKey(projectRef),
           createdAt: new Date().toISOString(),
           runtimeMode: DEFAULT_RUNTIME_MODE,
           interactionMode: DEFAULT_INTERACTION_MODE,
@@ -1633,22 +1597,22 @@ function normalizePersistedDraftThreads(
           startFromOrigin: false,
           promotedTo: null,
         };
-      } else if (
-        draftThreadsByThreadKey[threadKey]?.projectId !== projectRef.projectId ||
-        draftThreadsByThreadKey[threadKey]?.environmentId !== projectRef.environmentId
-      ) {
-        draftThreadsByThreadKey[threadKey] = {
-          ...draftThreadsByThreadKey[threadKey]!,
-          threadId: draftThreadsByThreadKey[threadKey]!.threadId,
-          environmentId: projectRef.environmentId,
-          projectId: projectRef.projectId,
-          logicalProjectKey,
-        };
       }
     }
   }
 
-  return { draftThreadsByThreadKey, logicalProjectDraftThreadKeyByLogicalProjectKey };
+  const projectDraftThreadKeyByProjectKey: Record<string, string> = {};
+  for (const [threadKey, draftThread] of Object.entries(draftThreadsByThreadKey).sort(
+    ([, left], [, right]) => left.createdAt.localeCompare(right.createdAt),
+  )) {
+    projectDraftThreadKeyByProjectKey[
+      projectDraftKey(
+        scopeProjectRef(draftThread.environmentId as EnvironmentId, draftThread.projectId),
+      )
+    ] = threadKey;
+  }
+
+  return { draftThreadsByThreadKey, projectDraftThreadKeyByProjectKey };
 }
 
 function normalizePersistedDraftsByThreadId(
@@ -1819,8 +1783,8 @@ function migratePersistedComposerDraftStoreState(
   const rawDraftThreadsByThreadId =
     candidate.draftThreadsByThreadKey ?? candidate.draftThreadsByThreadId;
   const rawProjectDraftThreadIdByProjectKey =
-    candidate.logicalProjectDraftThreadKeyByLogicalProjectKey ??
     candidate.projectDraftThreadKeyByProjectKey ??
+    candidate.logicalProjectDraftThreadKeyByLogicalProjectKey ??
     candidate.projectDraftThreadIdByProjectKey ??
     candidate.projectDraftThreadIdByProjectId;
 
@@ -1845,7 +1809,7 @@ function migratePersistedComposerDraftStoreState(
   );
   const stickyActiveProvider = normalizeProviderInstanceId(candidate.stickyProvider) ?? null;
 
-  const { draftThreadsByThreadKey, logicalProjectDraftThreadKeyByLogicalProjectKey } =
+  const { draftThreadsByThreadKey, projectDraftThreadKeyByProjectKey } =
     normalizePersistedDraftThreads(rawDraftThreadsByThreadId, rawProjectDraftThreadIdByProjectKey);
   const draftsByThreadKey = normalizePersistedDraftsByThreadId(
     rawDraftMap,
@@ -1854,7 +1818,7 @@ function migratePersistedComposerDraftStoreState(
   return {
     draftsByThreadKey,
     draftThreadsByThreadKey,
-    logicalProjectDraftThreadKeyByLogicalProjectKey,
+    projectDraftThreadKeyByProjectKey,
     stickyModelSelectionByProvider: compactModelSelectionByProvider(stickyModelSelectionByProvider),
     stickyActiveProvider,
   };
@@ -1946,8 +1910,7 @@ function partializeComposerDraftStoreState(
   return {
     draftsByThreadKey: persistedDraftsByThreadKey,
     draftThreadsByThreadKey: state.draftThreadsByThreadKey,
-    logicalProjectDraftThreadKeyByLogicalProjectKey:
-      state.logicalProjectDraftThreadKeyByLogicalProjectKey,
+    projectDraftThreadKeyByProjectKey: state.projectDraftThreadKeyByProjectKey,
     stickyModelSelectionByProvider: compactModelSelectionByProvider(
       state.stickyModelSelectionByProvider,
     ),
@@ -1962,12 +1925,12 @@ function normalizeCurrentPersistedComposerDraftStoreState(
     return EMPTY_PERSISTED_DRAFT_STORE_STATE;
   }
   const normalizedPersistedState = persistedState as LegacyPersistedComposerDraftStoreState;
-  const { draftThreadsByThreadKey, logicalProjectDraftThreadKeyByLogicalProjectKey } =
+  const { draftThreadsByThreadKey, projectDraftThreadKeyByProjectKey } =
     normalizePersistedDraftThreads(
       normalizedPersistedState.draftThreadsByThreadKey ??
         normalizedPersistedState.draftThreadsByThreadId,
-      normalizedPersistedState.logicalProjectDraftThreadKeyByLogicalProjectKey ??
-        normalizedPersistedState.projectDraftThreadKeyByProjectKey ??
+      normalizedPersistedState.projectDraftThreadKeyByProjectKey ??
+        normalizedPersistedState.logicalProjectDraftThreadKeyByLogicalProjectKey ??
         normalizedPersistedState.projectDraftThreadIdByProjectKey ??
         normalizedPersistedState.projectDraftThreadIdByProjectId,
     );
@@ -2019,7 +1982,7 @@ function normalizeCurrentPersistedComposerDraftStoreState(
       draftThreadsByThreadKey,
     ),
     draftThreadsByThreadKey,
-    logicalProjectDraftThreadKeyByLogicalProjectKey,
+    projectDraftThreadKeyByProjectKey,
     stickyModelSelectionByProvider: compactModelSelectionByProvider(stickyModelSelectionByProvider),
     stickyActiveProvider,
   };
@@ -2196,14 +2159,12 @@ function toHydratedDraftThreadState(
     threadId: persistedDraftThread.threadId,
     environmentId: persistedDraftThread.environmentId as EnvironmentId,
     projectId: persistedDraftThread.projectId,
-    logicalProjectKey:
-      persistedDraftThread.logicalProjectKey ??
-      projectDraftKey(
-        scopeProjectRef(
-          persistedDraftThread.environmentId as EnvironmentId,
-          persistedDraftThread.projectId,
-        ),
+    projectKey: projectDraftKey(
+      scopeProjectRef(
+        persistedDraftThread.environmentId as EnvironmentId,
+        persistedDraftThread.projectId,
       ),
+    ),
     createdAt: persistedDraftThread.createdAt,
     runtimeMode: persistedDraftThread.runtimeMode,
     interactionMode: persistedDraftThread.interactionMode,
@@ -2249,45 +2210,22 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
       return {
         draftsByThreadKey: {},
         draftThreadsByThreadKey: {},
-        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+        projectDraftThreadKeyByProjectKey: {},
         stickyModelSelectionByProvider: {},
         stickyActiveProvider: null,
         getComposerDraft: (target) => getComposerDraftState(get(), target),
-        getDraftThreadByLogicalProjectKey: (logicalProjectKey) => {
-          return get().getDraftSessionByLogicalProjectKey(logicalProjectKey);
-        },
-        getDraftSessionByLogicalProjectKey: (logicalProjectKey) => {
-          const normalizedLogicalProjectKey = logicalProjectDraftKey(logicalProjectKey);
-          if (normalizedLogicalProjectKey.length === 0) {
-            return null;
-          }
-          const draftId =
-            get().logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
-          if (!draftId) {
-            return null;
-          }
-          const draftThread = get().draftThreadsByThreadKey[draftId];
-          if (!draftThread || isDraftThreadPromoting(draftThread)) {
-            return null;
-          }
-          return toProjectDraftSession(DraftId.make(draftId), draftThread);
-        },
         getDraftThreadByProjectRef: (projectRef) => {
           return get().getDraftSessionByProjectRef(projectRef);
         },
         getDraftSessionByProjectRef: (projectRef) => {
-          for (const [draftId, draftThread] of Object.entries(get().draftThreadsByThreadKey)) {
-            if (isDraftThreadPromoting(draftThread)) {
-              continue;
-            }
-            if (
-              draftThread.projectId === projectRef.projectId &&
-              draftThread.environmentId === projectRef.environmentId
-            ) {
-              return toProjectDraftSession(DraftId.make(draftId), draftThread);
-            }
+          const draftId = get().projectDraftThreadKeyByProjectKey[projectDraftKey(projectRef)];
+          if (!draftId) {
+            return null;
           }
-          return null;
+          const draftThread = get().draftThreadsByThreadKey[draftId];
+          return !draftThread || isDraftThreadPromoting(draftThread)
+            ? null
+            : toProjectDraftSession(DraftId.make(draftId), draftThread);
         },
         getDraftSession: (draftId) => get().draftThreadsByThreadKey[draftId] ?? null,
         getDraftSessionByRef: (threadRef) => {
@@ -2318,69 +2256,65 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           Object.values(get().draftThreadsByThreadKey).some(
             (draftThread) => draftThread.environmentId === environmentId,
           ),
-        setLogicalProjectDraftThreadId: (logicalProjectKey, projectRef, draftId, options) => {
-          const normalizedLogicalProjectKey = logicalProjectDraftKey(logicalProjectKey);
-          if (normalizedLogicalProjectKey.length === 0 || draftId.length === 0) {
+        setProjectDraftThreadId: (projectRef, draftId, options) => {
+          const scopedKey = projectDraftKey(projectRef);
+          if (scopedKey.length === 0 || draftId.length === 0) {
             return;
           }
           set((state) => {
             const existingThread = state.draftThreadsByThreadKey[draftId];
-            const previousThreadKeyForLogicalProject =
-              state.logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
+            const previousThreadKeyForProject = state.projectDraftThreadKeyByProjectKey[scopedKey];
             const nextDraftThread = createDraftThreadState(
               projectRef,
               options?.threadId ?? existingThread?.threadId ?? ThreadId.make(draftId),
-              normalizedLogicalProjectKey,
               existingThread,
               options,
             );
-            const hasSameLogicalMapping = previousThreadKeyForLogicalProject === draftId;
-            if (hasSameLogicalMapping && draftThreadsEqual(existingThread, nextDraftThread)) {
+            const hasSameProjectMapping = previousThreadKeyForProject === draftId;
+            if (hasSameProjectMapping && draftThreadsEqual(existingThread, nextDraftThread)) {
               return state;
             }
-            const nextLogicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string> = {
-              ...state.logicalProjectDraftThreadKeyByLogicalProjectKey,
-              [normalizedLogicalProjectKey]: draftId,
+            const nextProjectDraftThreadKeyByProjectKey: Record<string, string> = {
+              ...state.projectDraftThreadKeyByProjectKey,
             };
+            if (
+              existingThread?.projectKey !== scopedKey &&
+              existingThread?.projectKey !== undefined &&
+              nextProjectDraftThreadKeyByProjectKey[existingThread.projectKey] === draftId
+            ) {
+              delete nextProjectDraftThreadKeyByProjectKey[existingThread.projectKey];
+            }
+            nextProjectDraftThreadKeyByProjectKey[scopedKey] = draftId;
             const nextDraftThreadsByThreadKey: Record<string, DraftThreadState> = {
               ...state.draftThreadsByThreadKey,
               [draftId]: nextDraftThread,
             };
             let nextDraftsByThreadKey = state.draftsByThreadKey;
             const previousDraftThread =
-              previousThreadKeyForLogicalProject === undefined
+              previousThreadKeyForProject === undefined
                 ? undefined
-                : nextDraftThreadsByThreadKey[previousThreadKeyForLogicalProject];
+                : nextDraftThreadsByThreadKey[previousThreadKeyForProject];
             if (
-              previousThreadKeyForLogicalProject &&
-              previousThreadKeyForLogicalProject !== draftId &&
+              previousThreadKeyForProject &&
+              previousThreadKeyForProject !== draftId &&
               !isComposerThreadKeyInUse(
-                nextLogicalProjectDraftThreadKeyByLogicalProjectKey,
-                previousThreadKeyForLogicalProject,
+                nextProjectDraftThreadKeyByProjectKey,
+                previousThreadKeyForProject,
               ) &&
               !isDraftThreadPromoting(previousDraftThread)
             ) {
-              delete nextDraftThreadsByThreadKey[previousThreadKeyForLogicalProject];
-              if (state.draftsByThreadKey[previousThreadKeyForLogicalProject] !== undefined) {
+              delete nextDraftThreadsByThreadKey[previousThreadKeyForProject];
+              if (state.draftsByThreadKey[previousThreadKeyForProject] !== undefined) {
                 nextDraftsByThreadKey = { ...state.draftsByThreadKey };
-                delete nextDraftsByThreadKey[previousThreadKeyForLogicalProject];
+                delete nextDraftsByThreadKey[previousThreadKeyForProject];
               }
             }
             return {
               draftsByThreadKey: nextDraftsByThreadKey,
               draftThreadsByThreadKey: nextDraftThreadsByThreadKey,
-              logicalProjectDraftThreadKeyByLogicalProjectKey:
-                nextLogicalProjectDraftThreadKeyByLogicalProjectKey,
+              projectDraftThreadKeyByProjectKey: nextProjectDraftThreadKeyByProjectKey,
             };
           });
-        },
-        setProjectDraftThreadId: (projectRef, draftId, options) => {
-          get().setLogicalProjectDraftThreadId(
-            projectDraftKey(projectRef),
-            projectRef,
-            draftId,
-            options,
-          );
         },
         setDraftThreadContext: (threadRef, options) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
@@ -2427,7 +2361,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               threadId: existing.threadId,
               environmentId: nextProjectRef.environmentId,
               projectId: nextProjectRef.projectId,
-              logicalProjectKey: existing.logicalProjectKey,
+              projectKey: projectDraftKey(nextProjectRef),
               createdAt:
                 options.createdAt === undefined
                   ? existing.createdAt
@@ -2449,7 +2383,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const isUnchanged =
               nextDraftThread.environmentId === existing.environmentId &&
               nextDraftThread.projectId === existing.projectId &&
-              nextDraftThread.logicalProjectKey === existing.logicalProjectKey &&
+              nextDraftThread.projectKey === existing.projectKey &&
               nextDraftThread.createdAt === existing.createdAt &&
               nextDraftThread.runtimeMode === existing.runtimeMode &&
               nextDraftThread.interactionMode === existing.interactionMode &&
@@ -2461,11 +2395,37 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             if (isUnchanged) {
               return state;
             }
+            const nextProjectMappings = { ...state.projectDraftThreadKeyByProjectKey };
+            const displacedThreadKey = projectChanged
+              ? nextProjectMappings[nextDraftThread.projectKey]
+              : undefined;
+            if (projectChanged) {
+              if (nextProjectMappings[existing.projectKey] === threadKey) {
+                delete nextProjectMappings[existing.projectKey];
+              }
+              nextProjectMappings[nextDraftThread.projectKey] = threadKey;
+            }
+            const nextDraftThreadsByThreadKey = {
+              ...state.draftThreadsByThreadKey,
+              [threadKey]: nextDraftThread,
+            };
+            let nextDraftsByThreadKey = state.draftsByThreadKey;
+            if (
+              displacedThreadKey !== undefined &&
+              displacedThreadKey !== threadKey &&
+              !isComposerThreadKeyInUse(nextProjectMappings, displacedThreadKey) &&
+              !isDraftThreadPromoting(nextDraftThreadsByThreadKey[displacedThreadKey])
+            ) {
+              delete nextDraftThreadsByThreadKey[displacedThreadKey];
+              if (state.draftsByThreadKey[displacedThreadKey] !== undefined) {
+                nextDraftsByThreadKey = { ...state.draftsByThreadKey };
+                delete nextDraftsByThreadKey[displacedThreadKey];
+              }
+            }
             return {
-              draftThreadsByThreadKey: {
-                ...state.draftThreadsByThreadKey,
-                [threadKey]: nextDraftThread,
-              },
+              draftsByThreadKey: nextDraftsByThreadKey,
+              draftThreadsByThreadKey: nextDraftThreadsByThreadKey,
+              projectDraftThreadKeyByProjectKey: nextProjectMappings,
             };
           });
         },
@@ -2545,11 +2505,11 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           }
           set((state) => {
             const hasDraftThread = state.draftThreadsByThreadKey[threadKey] !== undefined;
-            const hasLogicalProjectMapping = Object.values(
-              state.logicalProjectDraftThreadKeyByLogicalProjectKey,
+            const hasProjectMapping = Object.values(
+              state.projectDraftThreadKeyByProjectKey,
             ).includes(threadKey);
             const hasComposerDraft = state.draftsByThreadKey[threadKey] !== undefined;
-            if (!hasDraftThread && !hasLogicalProjectMapping && !hasComposerDraft) {
+            if (!hasDraftThread && !hasProjectMapping && !hasComposerDraft) {
               return state;
             }
             return removeDraftThreadReferences(state, threadKey);
@@ -3452,8 +3412,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           ...currentState,
           draftsByThreadKey,
           draftThreadsByThreadKey,
-          logicalProjectDraftThreadKeyByLogicalProjectKey:
-            normalizedPersisted.logicalProjectDraftThreadKeyByLogicalProjectKey,
+          projectDraftThreadKeyByProjectKey: normalizedPersisted.projectDraftThreadKeyByProjectKey,
           stickyModelSelectionByProvider: normalizedPersisted.stickyModelSelectionByProvider ?? {},
           stickyActiveProvider: normalizedPersisted.stickyActiveProvider ?? null,
         };
@@ -3478,18 +3437,16 @@ export function clearComposerDraftsEnvironment(environmentId: EnvironmentId): vo
         removedThreadKeys.add(threadKey);
       }
     }
-    for (const [logicalProjectKey, threadKey] of Object.entries(
-      state.logicalProjectDraftThreadKeyByLogicalProjectKey,
-    )) {
-      if (parseScopedProjectKey(logicalProjectKey)?.environmentId === environmentId) {
+    for (const [projectKey, threadKey] of Object.entries(state.projectDraftThreadKeyByProjectKey)) {
+      if (parseScopedProjectKey(projectKey)?.environmentId === environmentId) {
         removedThreadKeys.add(threadKey);
       }
     }
 
-    const nextLogicalMappings = Object.fromEntries(
-      Object.entries(state.logicalProjectDraftThreadKeyByLogicalProjectKey).filter(
-        ([logicalProjectKey, threadKey]) =>
-          parseScopedProjectKey(logicalProjectKey)?.environmentId !== environmentId &&
+    const nextProjectMappings = Object.fromEntries(
+      Object.entries(state.projectDraftThreadKeyByProjectKey).filter(
+        ([projectKey, threadKey]) =>
+          parseScopedProjectKey(projectKey)?.environmentId !== environmentId &&
           !removedThreadKeys.has(threadKey),
       ),
     ) as Record<string, string>;
@@ -3512,7 +3469,7 @@ export function clearComposerDraftsEnvironment(environmentId: EnvironmentId): vo
     return {
       draftsByThreadKey: nextDrafts,
       draftThreadsByThreadKey: nextDraftThreads,
-      logicalProjectDraftThreadKeyByLogicalProjectKey: nextLogicalMappings,
+      projectDraftThreadKeyByProjectKey: nextProjectMappings,
     };
   });
   composerDebouncedStorage.flush();
