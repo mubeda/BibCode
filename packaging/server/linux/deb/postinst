@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+mode="${BIBCODE_PACKAGE_MODE:-files-only}"
+case "$mode" in
+  files-only)
+    echo "BiBCode Server: files-only installation; no service was changed."
+    exit 0
+    ;;
+  workstation) ;;
+  *)
+    echo "BiBCode Server: BIBCODE_PACKAGE_MODE must be files-only or workstation." >&2
+    exit 1
+    ;;
+esac
+
+package_user="${BIBCODE_PACKAGE_USER:-}"
+case "$package_user" in
+  ""|root|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server: workstation mode requires a non-root BIBCODE_PACKAGE_USER." >&2
+    exit 1
+    ;;
+esac
+/usr/bin/getent passwd "$package_user" >/dev/null
+
+/usr/sbin/runuser -u "$package_user" -- \
+  /usr/bin/bibcode service install --mode workstation --host 127.0.0.1 --format json --update
+
+/usr/bin/install -d -m 0700 /var/lib/bibcode-server-package
+umask 077
+/usr/bin/printf '%s\n' "$package_user" > /var/lib/bibcode-server-package/workstation-user

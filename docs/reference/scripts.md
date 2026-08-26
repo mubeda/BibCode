@@ -145,7 +145,7 @@ under `release/desktop/<platform>-<arch>` unless an output directory is supplied
 The desktop artifact contains the Tauri host, in-process Rust server, and built
 web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.
 
-## Portable Server Artifacts
+## Server Artifacts
 
 - `vp run dist:server:artifact -- --target <native-target> --formats portable
 --output-dir <new-directory>`: build the native `bibcode` executable, the
@@ -154,22 +154,41 @@ web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.
 - `vp run dist:server:artifact -- --target <native-target> --formats portable
 --output-dir <new-directory> --unsigned-test`: label a local validation build
   as `unsigned-test`; this does not make the artifact a signed release.
+- `vp run dist:server:artifact -- --target <native-target> --formats native
+--output-dir <new-directory> --unsigned-test`: build the matching native MSI,
+  universal PKG, or DEB and RPM outputs.
+- `--formats native,portable`: publish both requested format classes from one
+  verified web/staging input. Unknown, empty, or duplicate format selections
+  fail before publication.
 
 The target must match the native host architecture. Supported target triples
 are Windows x64/ARM64, macOS x64/ARM64, and Linux x64/ARM64. The output
-directory must not already exist. The builder uses frozen Cargo and pnpm
-inputs, consumes Cargo's exact compiler-artifact record, and refuses links,
+directory must not already exist. The builder resolves Cargo and rustc through
+the exact channel in `rust-toolchain.toml`, sets the selected compiler
+explicitly, uses frozen Cargo and pnpm inputs, consumes Cargo's exact
+compiler-artifact record, and refuses links,
 source maps, secrets, logs, databases, `node_modules`, Node executables, Tauri
 runtime bytes, and legacy Connect/telemetry content. The archive contains only
 the native CLI/server, a browser-only static application, install-layout
 metadata, build metadata, license, notices, and a README; extraction performs
 no service, login-item, PATH, firewall, or data-root mutation.
 
+Windows MSI uses pinned WiX 7 and a per-user install root. macOS PKG combines
+both Rust slices, verifies exact universal membership, ad-hoc signs the local
+credential-free binary, and keeps package signing/notarization distinct. Linux
+requires exactly `cargo-deb` 3.7.0 and `cargo-generate-rpm` 0.21.0 and emits
+both DEB and RPM. Every native package delegates service definitions to the
+Rust `bibcode service` adapter, binds workstation service configuration to
+loopback, and preserves data on uninstall. Package templates contain no
+credential.
+
 CI may supply an already built immutable web directory together with its
 sorted `web-assets.json`; both options are required together and every path,
-size, and SHA-256 is revalidated before staging. Native installers and signed
-release manifests are separate later release steps and must not treat an
-unsigned portable archive as publishable evidence.
+size, and SHA-256 is revalidated before staging. Adjacent `.build.json` files
+record the target/compiler/binary digest; universal PKG metadata additionally
+records both slice digests. Signing, SBOM, manifest, and stable-release gates
+are later finalization steps and must not treat `unsigned-test` output as
+publishable evidence.
 
 ## Repository Maintenance
 

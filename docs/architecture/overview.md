@@ -202,6 +202,23 @@ links and normalizes archive paths, modes, order, and timestamps. The resulting
 server artifact has no production Node/TypeScript runtime, Tauri shell,
 WebView, privileged helper, Connect component, or telemetry uploader.
 
+Native packaging consumes that same verified stage without introducing another
+runtime or service-definition source. WiX owns only the per-user Windows file,
+PATH, and transaction hooks; Apple package scripts select the eligible console
+user or explicitly fall back to files-only; DEB/RPM hooks require an explicit
+non-root workstation owner or remain files-only. All three call the Rust
+`bibcode service` operations, which remain the sole Task Scheduler, launchd,
+and systemd definition owners. Native package removal preserves the server data
+root, and no native package opens a firewall or enables non-loopback HTTP.
+
+The artifact builder resolves Cargo and rustc from the exact checked-in Rustup
+channel and sets `RUSTC` explicitly, preventing a system/Homebrew compiler from
+silently shadowing one target slice. A universal macOS package binds the hash
+of each native slice and the ad-hoc-signed combined executable in embedded and
+adjacent build metadata. Certificate signing, notarization, SBOMs, detached
+signatures, and the aggregate stable manifest remain later release-finalization
+boundaries.
+
 ## Project-data ownership and identity
 
 The Rust server is the source of truth for the requested and effective data

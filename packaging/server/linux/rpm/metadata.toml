@@ -1,0 +1,12 @@
+[package.metadata.generate-rpm]
+name = "bibcode-server"
+release = "1"
+license = "Apache-2.0"
+summary = "Private native BiBCode coding-agent server"
+vendor = "BiBCode"
+assets = [
+  # @ASSETS@
+]
+post_install_script = "@POST_INSTALL_SCRIPT@"
+pre_uninstall_script = "@PRE_UNINSTALL_SCRIPT@"
+post_uninstall_script = "@POST_UNINSTALL_SCRIPT@"

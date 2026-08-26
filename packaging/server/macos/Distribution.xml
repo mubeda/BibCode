@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+  <title>BiBCode Server</title>
+  <organization>com.bibcode</organization>
+  <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true" />
+  <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64,x86_64" />
+  <choices-outline>
+    <line choice="com.bibcode.server.choice" />
+  </choices-outline>
+  <choice id="com.bibcode.server.choice" visible="false">
+    <pkg-ref id="com.bibcode.server" />
+  </choice>
+  <pkg-ref id="com.bibcode.server" version="@VERSION@" onConclusion="none">BiBCodeServer-component.pkg</pkg-ref>
+</installer-gui-script>

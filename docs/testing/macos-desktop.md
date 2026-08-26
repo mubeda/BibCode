@@ -112,6 +112,49 @@ linker, compact-unwind, process-signal, WebKit, signing, and DMG diagnostics
 with their affected test or artifact. Do not suppress a warning without
 classifying it.
 
+## Server PKG build and inspection
+
+Install both repository-pinned macOS Rust targets, then build into a new output
+directory:
+
+```sh
+toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+rustup target add --toolchain "$toolchain" aarch64-apple-darwin x86_64-apple-darwin
+target=$(rustup run "$toolchain" rustc -vV | sed -n 's/^host: //p')
+node scripts/build-server-artifact.ts --target "$target" --formats native,portable --output-dir release/server-native-local --unsigned-test
+```
+
+The builder must report one host-architecture tar file, one universal PKG, and
+adjacent metadata for both. Inspect without installing:
+
+```sh
+pkg=$(find release/server-native-local -maxdepth 1 -type f -name '*-macos-universal.pkg' -print -quit)
+test -n "$pkg"
+inspect_parent=$(mktemp -d /private/tmp/bibcode-server-pkg.XXXXXX)
+expanded="$inspect_parent/expanded"
+pkgutil --expand-full "$pkg" "$expanded"
+pkgutil --payload-files "$pkg"
+test -z "$(find "$expanded" -name '._*' -print -quit)"
+binary="$expanded/BiBCodeServer-component.pkg/Payload/usr/local/libexec/bibcode-server/bin/bibcode"
+lipo -archs "$binary"
+codesign --verify --strict --verbose=2 "$binary"
+codesign -dv --verbose=4 "$binary"
+pkgutil --check-signature "$pkg" || true
+```
+
+Require exactly `x86_64 arm64`, `Signature=adhoc`, an unsigned package for
+credential-free evidence, package ID `com.bibcode.server`, version parity, the
+relative `/usr/local/bin/bibcode` link, byte-identical checked-in scripts, and
+byte-identical embedded/adjacent universal metadata. Run both slices with
+`arch -x86_64` and `arch -arm64` and require the same `bibcode --version`.
+AppleDouble records shown by `pkgutil --payload-files` must have an allowlisted
+sibling and must not become separate files after `--expand-full`.
+
+Do not run `installer` on a workstation used for ordinary development. Native
+install, upgrade, and uninstall evidence belongs on the approved disposable
+runner and must record the LaunchAgent owner/state plus the preserved data
+root. Remove only the exact inspection directory during cleanup.
+
 ## Application and DMG build inspection
 
 Build the host-native artifact:

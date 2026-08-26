@@ -329,6 +329,43 @@ Keep `vp run test`, `vp check`, `vp run typecheck`, `cargo fmt --all --check`,
 and `git diff --check` in the recorded gate set. Do not run separate broad
 Cargo commands concurrently.
 
+## Server MSI build and inspection
+
+On matching native Windows x64 or ARM64, build the server artifacts into a new
+directory. The target must match `rustc -vV` from the repository-pinned Rustup
+toolchain:
+
+```powershell
+$Toolchain = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$').Matches.Groups[1].Value
+$Target = ((rustup run $Toolchain rustc -vV) | Select-String '^host: ').Line.Substring(6)
+node scripts/build-server-artifact.ts --target $Target --formats native,portable --output-dir release/server-native-local --unsigned-test
+```
+
+Discover the MSI and inspect it before execution:
+
+```powershell
+$Msi = (Get-ChildItem release/server-native-local -Filter '*.msi' | Select-Object -First 1).FullName
+if (-not $Msi) { throw 'Server MSI was not produced.' }
+Get-FileHash -Algorithm SHA256 $Msi
+Get-AuthenticodeSignature -FilePath $Msi |
+  Select-Object Status, StatusMessage, SignerCertificate
+lessmsi l $Msi
+```
+
+Use `lessmsi x` or WiX decompilation in a disposable inspection directory to
+verify the per-user `%LOCALAPPDATA%\Programs\BiBCode Server` root, owned user
+`PATH` component, one `bibcode.exe`, browser assets, notices, build metadata,
+fixed UpgradeCode, architecture-specific package, and install/rollback/upgrade/
+uninstall custom-action order. Reject secrets, shell interpolation, firewall or
+non-loopback HTTP actions, purge/data-root deletion, and any service definition
+not delegated to `bibcode.exe service`.
+
+An unsigned MSI is expected only for `--unsigned-test`. Stable evidence later
+requires successful Authenticode verification for both the contained executable
+and MSI. Install/remove only on an approved disposable native runner; record the
+installing SID, scheduled-task identity/state, version, loopback health, and
+preserved data root.
+
 ## NSIS package build and inspection
 
 Build the supported artifact:

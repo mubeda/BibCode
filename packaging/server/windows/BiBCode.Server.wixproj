@@ -1,0 +1,8 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <InstallerPlatform Condition="'$(InstallerPlatform)' == ''">x64</InstallerPlatform>
+    <OutputName>bibcode-server-$(ProductVersion)-windows-$(InstallerPlatform)</OutputName>
+    <OutputType>Package</OutputType>
+    <DefineConstants>ProductVersion=$(ProductVersion);StageRoot=$(StageRoot)</DefineConstants>
+  </PropertyGroup>
+</Project>

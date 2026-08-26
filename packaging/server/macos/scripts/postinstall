@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+binary="/usr/local/libexec/bibcode-server/bin/bibcode"
+target_root="${3:-/}"
+
+if [ "$target_root" != "/" ]; then
+  echo "BiBCode Server postinstall: files-only on a non-root target volume."
+  exit 0
+fi
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
+case "$console_user" in
+  ""|root|loginwindow|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server postinstall: files-only; run 'bibcode service install --mode workstation' as the intended user."
+    exit 0
+    ;;
+esac
+
+console_uid=$(/usr/bin/id -u "$console_user")
+if [ "$console_uid" -eq 0 ]; then
+  echo "BiBCode Server postinstall: files-only; refusing the root account."
+  exit 0
+fi
+
+/bin/launchctl asuser "$console_uid" /usr/bin/sudo -u "$console_user" -- \
+  "$binary" service install --mode workstation --host 127.0.0.1 --format json --update

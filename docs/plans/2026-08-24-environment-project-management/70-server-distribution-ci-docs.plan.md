@@ -254,30 +254,30 @@ Implementation evidence (2026-08-26):
 
 - Create: `packaging/server/windows/BiBCode.Server.wixproj`, `Product.wxs`, `variables.wxi`, `README.md`
 - Create: `packaging/server/macos/Distribution.xml`, `scripts/preinstall`, `scripts/postinstall`, `README.md`
-- Create: `packaging/server/linux/bibcode.service`, `deb/**`, `rpm/bibcode-server.spec`, `README.md`
+- Create: `packaging/server/linux/deb/**`, `rpm/metadata.toml`, RPM scriptlets, `README.md`
 - Modify: `scripts/build-server-artifact.ts`, test
 - Modify: `apps/server/Cargo.toml` package metadata only where consumed by pinned native tools
 - Test: package source/template policy in `scripts/server-packaging-contract.test.ts`
 
-- [ ] **Step 1: Write package-template and dry-run tests**
+- [x] **Step 1: Write package-template and dry-run tests**
 
 Assert product/version/architecture/install root, loopback defaults, workstation mode, service owner, CLI path, data preservation, no firewall rule, no purge custom action, upgrade codes/package IDs, rollback actions, uninstall order, and no shell interpolation of user-provided paths.
 
-- [ ] **Step 2: Implement Windows x64/ARM64 MSI with WiX 7**
+- [x] **Step 2: Implement Windows x64/ARM64 MSI with WiX 7**
 
 Pin `WixToolset.Sdk/7.0.0` in `BiBCode.Server.wixproj`. Build a per-user MSI that installs the staged layout under `%LOCALAPPDATA%\Programs\BiBCode Server`, adds `bin` through an installer-owned user PATH entry, and calls the same versioned Plan 30 service operation used by CLI to create one logon-triggered task for the installing SID. Deferred actions receive no raw secret and have explicit rollback/uninstall counterparts.
 
 Use one stable UpgradeCode across architectures and architecture-specific package identity/components. Major upgrade stops the owned task, preserves the data root, replaces files transactionally, recreates/starts the task, and verifies loopback health. Stable release output fails unless both `bibcode.exe` and MSI signature verification pass.
 
-- [ ] **Step 3: Implement a universal macOS PKG plus per-arch tar files**
+- [x] **Step 3: Implement a universal macOS PKG plus per-arch tar files**
 
 Build both native Mach-O slices, verify each reports the same version/protocol, then combine only the server executable with `lipo -create`. Verify `lipo -archs` returns exactly `x86_64 arm64`. The PKG installs the universal staged layout and CLI link, creates the installing user's LaunchAgent through Plan 30's service command, binds loopback, and preserves user data on uninstall.
 
 Credential-free CI ad-hoc signs the universal executable with `codesign --sign -` and leaves the PKG unsigned/unnotarized; the manifest records those two facts separately. Optional Developer ID mode signs both slices/universal binary, signs the PKG with `productsign`, notarizes/staples, and verifies with `spctl`/`pkgutil`/`stapler`.
 
-- [ ] **Step 4: Implement Linux x64/ARM64 DEB and RPM packages**
+- [x] **Step 4: Implement Linux x64/ARM64 DEB and RPM packages**
 
-Pin `cargo-deb` 3.7.0 and `cargo-generate-rpm` 0.21.0. Install `bibcode`, compiled web assets, notices, and a systemd user-unit template under distro-standard locations. Package scripts reload user-unit metadata only for the invoking/explicit installation user, call the Plan 30 workstation service operation, and never enable linger, create a system account, open a firewall, or delete data.
+Pin `cargo-deb` 3.7.0 and `cargo-generate-rpm` 0.21.0. Install `bibcode`, compiled web assets, and notices. Do not package a second systemd unit: the Plan 30 Rust service adapter remains the sole definition owner and writes the exact per-user unit during the explicit workstation operation. Package scripts mutate service state only for the invoking/explicit installation user and never enable linger, create a system account, open a firewall, or delete data. `cargo-generate-rpm` consumes its metadata/scriptlets directly and does not consume a dead `.spec` file.
 
 Noninteractive package installation requires an explicit documented `workstation` or `files-only` choice; `files-only` is the safe behavior when there is no identifiable user session. The BiBCode desktop SSH flow supplies the already-approved mode/user and then verifies service health. Headless setup remains `bibcode service install --mode headless` after package installation and requires elevation.
 
@@ -285,15 +285,41 @@ Noninteractive package installation requires an explicit documented `workstation
 
 Use `lessmsi`/WiX inspection on Windows, `pkgutil --expand-full` and `codesign` on macOS, `dpkg-deb --contents --control`, and `rpm -qpl --scripts`. Compare every installed path against the allowlist and reject any data-root delete, wildcard bind, firewall, telemetry, or Connect command.
 
-- [ ] **Step 6: Build the host-native formats and commit**
+- [x] **Step 6: Build the host-native formats and commit**
 
 ```sh
 vp test scripts/build-server-artifact.test.ts scripts/server-packaging-contract.test.ts
-node scripts/build-server-artifact.ts --target "$(rustc -vV | sed -n 's/^host: //p')" --formats native,portable --output-dir release/server-local --unsigned-test
-node scripts/verify-server-artifacts.ts --directory release/server-local --allow-unsigned-test
-git add packaging/server scripts/build-server-artifact.ts scripts/build-server-artifact.test.ts scripts/server-packaging-contract.test.ts apps/server/Cargo.toml Cargo.lock
+toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+target=$(rustup run "$toolchain" rustc -vV | sed -n 's/^host: //p')
+node scripts/build-server-artifact.ts --target "$target" --formats native,portable --output-dir release/server-local --unsigned-test
+git add packaging/server scripts/build-server-artifact.ts scripts/build-server-artifact.test.ts scripts/lib/server-native-packaging.ts scripts/server-packaging-contract.test.ts docs
 git commit -m "build(server): package native server installers"
 ```
+
+Task 4 validates build metadata and native package contents directly. Aggregate
+manifest, SBOM, and signature verification is introduced by Task 6 and must not
+be invoked without its required `--manifest` input.
+
+Implementation evidence (2026-08-26):
+
+- `vp test scripts/build-server-artifact.test.ts scripts/server-packaging-contract.test.ts`
+  passes 28 focused tests. `vp check`, `vp run typecheck`, shell syntax checks
+  for every maintainer script/scriptlet, XML parsing, and `git diff --check`
+  pass.
+- The builder resolves the exact `rust-toolchain.toml` Cargo/rustc pair and
+  produced one deterministic host tar plus one universal PKG in
+  `/private/tmp/bibcode-server-task4-native-v5`. Their SHA-256 values are
+  `4dd31c2bff62f37897f4f194c266b0d27b73a9daa85dca2e74794303c9c13029`
+  and `9eacd2ec59f1a7e7871839f9a7ca3a573639932410c1db1df7477e62ca4374af`.
+- Expanded PKG evidence proves exactly `x86_64 arm64`, version `0.4.1` from
+  both slices, valid strict ad-hoc executable signing, intentionally no PKG
+  signature, the relative CLI link, byte-identical checked-in scripts and
+  embedded/adjacent metadata, and no materialized AppleDouble file.
+- Windows and Linux template/render/command policy is compatibility evidence,
+  not native execution evidence. Step 5 remains open until Tasks 7 and 8 run
+  `lessmsi`, `dpkg-deb`, and `rpm` inspection on their corresponding native
+  runners. `apps/server/Cargo.toml` and `Cargo.lock` remain unchanged because
+  the pinned Linux tools consume the generated isolated manifest.
 
 ### Task 5: Integrate service-safe install, upgrade, uninstall, and explicit purge
 

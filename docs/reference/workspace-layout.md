@@ -61,6 +61,13 @@ the native `bibcode` executable and verified browser assets. Node.js,
 TypeScript, and Tauri remain build-time or desktop-product dependencies and are
 not server-package runtime dependencies.
 
+`packaging/server/common` owns the installed-layout contract and notice input.
+`packaging/server/windows`, `macos`, and `linux` own native package templates
+and transaction hooks, while `scripts/build-server-artifact.ts` consumes them
+from an unpublished temporary root. Platform package definitions do not own or
+duplicate Task Scheduler, launchd, or systemd definitions; those remain in the
+server's Rust service adapters.
+
 Native discovery and host mutation stay separate. The desktop emits WSL
 topology and setup events and owns SSH processes; the client runtime reconciles
 those events into stable environment catalog rows; the web application renders

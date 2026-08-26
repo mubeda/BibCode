@@ -118,6 +118,43 @@ WebKitGTK, X11, or Wayland diagnostic.
 Do not run `vp run test` and a separate broad Cargo command concurrently. Do
 not replace the normal Rust test harness with a serial harness.
 
+## Server DEB and RPM build and inspection
+
+On a matching native Linux runner, first verify that `cargo-deb 3.7.0` and
+`cargo-generate-rpm 0.21.0` are installed. Installation of missing global tools
+requires approval. Build into a new output directory:
+
+```sh
+cargo deb --version
+cargo generate-rpm --version
+toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+target=$(rustup run "$toolchain" rustc -vV | sed -n 's/^host: //p')
+node scripts/build-server-artifact.ts --target "$target" --formats native,portable --output-dir release/server-native-local --unsigned-test
+```
+
+Inspect before installation:
+
+```sh
+deb=$(find release/server-native-local -maxdepth 1 -type f -name '*.deb' -print -quit)
+rpm=$(find release/server-native-local -maxdepth 1 -type f -name '*.rpm' -print -quit)
+test -n "$deb" && test -n "$rpm"
+dpkg-deb --contents "$deb"
+control_root=$(mktemp -d "${TMPDIR:-/tmp}/bibcode-deb-control.XXXXXX")
+dpkg-deb --control "$deb" "$control_root"
+rpm -qpl --scripts "$rpm"
+```
+
+Require `/usr/bin/bibcode`, the `/usr/share/bibcode` layout, notices, and build
+metadata; reject another systemd unit or paths under a data root. Inspect every
+maintainer script/scriptlet. Files-only must be the default;
+`BIBCODE_PACKAGE_MODE=workstation` must also require one validated existing
+non-root `BIBCODE_PACKAGE_USER`. No hook may enable linger, create a headless
+account, open a firewall, accept a secret, purge storage, or remove data.
+
+Install/remove only on an approved disposable runner. Exercise files-only and
+explicit workstation modes separately, record package-manager output and the
+user-unit owner/state, and prove removal preserves the exact data root.
+
 ## AppImage build and inspection
 
 Build the supported artifact:

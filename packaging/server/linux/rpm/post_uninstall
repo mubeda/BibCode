@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" -eq 0 ]; then
+  echo "BiBCode Server: package files removed; the data root is preserved."
+fi

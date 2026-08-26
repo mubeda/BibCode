@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+owner_file="/var/lib/bibcode-server-package/workstation-user"
+if [ ! -f "$owner_file" ]; then
+  exit 0
+fi
+
+package_user=$(/bin/sed -n '1p' "$owner_file")
+case "$package_user" in
+  ""|root|*[!A-Za-z0-9._-]*)
+    echo "BiBCode Server: invalid package service owner receipt; refusing service mutation." >&2
+    exit 1
+    ;;
+esac
+/usr/bin/getent passwd "$package_user" >/dev/null
+
+case "${1:-}" in
+  upgrade)
+    /usr/sbin/runuser -u "$package_user" -- \
+      /usr/bin/bibcode service stop --mode workstation --format json
+    ;;
+  remove|deconfigure)
+    /usr/sbin/runuser -u "$package_user" -- \
+      /usr/bin/bibcode service uninstall --mode workstation --format json
+    /bin/rm -f "$owner_file"
+    echo "BiBCode Server: service registration removed; the data root is preserved."
+    ;;
+esac

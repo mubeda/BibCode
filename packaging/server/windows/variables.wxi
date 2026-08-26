@@ -1,0 +1,5 @@
+<Include xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?define ProductName = "BiBCode Server" ?>
+  <?define Manufacturer = "BiBCode" ?>
+  <?define UpgradeCode = "{42B72C90-DAEF-48D7-85F3-411784524876}" ?>
+</Include>

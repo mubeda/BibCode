@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+  remove|purge)
+    echo "BiBCode Server: package files removed; the data root is preserved."
+    ;;
+esac

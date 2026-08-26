@@ -16,6 +16,17 @@ import {
   generateThirdPartyNoticesMarkdown,
   parseCargoNoticePackages,
 } from "./lib/server-notices.ts";
+import {
+  collectInstallerPayload,
+  generateWixFilesFragment,
+  isPlainExecutable,
+  renderDebCargoManifest,
+  renderMacDistribution,
+  renderRpmMetadata,
+  resolveLinuxNativePackageCommands,
+  resolveNativeInstallerDescriptor,
+  validateMacPackagePayloadListing,
+} from "./lib/server-native-packaging.ts";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -67,6 +78,7 @@ export const SERVER_PORTABLE_TARGETS = {
 } as const satisfies Readonly<Record<string, PortableTarget>>;
 
 export type ServerTargetTriple = keyof typeof SERVER_PORTABLE_TARGETS;
+export type ServerArtifactFormatSelection = "native" | "portable";
 
 export interface ServerArtifactBuildInput {
   readonly target: string;
@@ -87,6 +99,7 @@ export interface ServerArtifactBuildHost {
 
 export interface ServerArtifactBuildPlan {
   readonly target: ServerTargetTriple;
+  readonly formats: ReadonlyArray<ServerArtifactFormatSelection>;
   readonly portableFormat: "zip" | "tar.gz";
   readonly executableName: "bibcode" | "bibcode.exe";
   readonly outputDir: string;
@@ -106,6 +119,14 @@ export interface ServerArtifactCommandPlan {
 export interface ServerArtifactCommandResult {
   readonly stdout: string;
   readonly stderr: string;
+}
+
+export function parsePinnedRustToolchainChannel(contents: string): string {
+  const channel = contents.match(/^\s*channel\s*=\s*"([^"]+)"\s*$/mu)?.[1];
+  if (channel === undefined || !/^[0-9]+\.[0-9]+\.[0-9]+$/u.test(channel)) {
+    return fail("rust-toolchain.toml must pin an exact stable Rust channel.");
+  }
+  return channel;
 }
 
 interface ServerArtifactCommandOptions {
@@ -214,7 +235,11 @@ export function resolveServerArtifactBuildPlan(
     return fail(`Unsupported server target '${input.target}'.`);
   }
   const formats = input.formats ?? ["portable"];
-  if (formats.length !== 1 || formats[0] !== "portable") {
+  if (
+    formats.length === 0 ||
+    new Set(formats).size !== formats.length ||
+    formats.some((format) => format !== "native" && format !== "portable")
+  ) {
     return fail(`Unsupported server artifact format selection: ${formats.join(",") || "<empty>"}.`);
   }
   const target = SERVER_PORTABLE_TARGETS[input.target];
@@ -228,6 +253,7 @@ export function resolveServerArtifactBuildPlan(
   const cargoTargetDirectory = NodePath.join(repoRoot, "target", input.target, "release");
   return {
     target: input.target,
+    formats: formats as ReadonlyArray<ServerArtifactFormatSelection>,
     portableFormat: target.portableFormat,
     executableName: target.executableName,
     outputDir,
@@ -477,6 +503,51 @@ const assertPlainFile = (path: string, label: string): void => {
   }
 };
 
+const resolveRustToolchainRuntime = async (
+  channel: string,
+  baseEnv: NodeJS.ProcessEnv,
+  repoRoot: string,
+  commandRunner: ServerArtifactCommandRunner,
+  limits: ServerArtifactCommandOptions,
+): Promise<RustToolchainRuntime> => {
+  const [cargoResult, rustcResult] = await Promise.all([
+    commandRunner(
+      {
+        command: "rustup",
+        args: ["which", "--toolchain", channel, "cargo"],
+        cwd: repoRoot,
+      },
+      limits,
+    ),
+    commandRunner(
+      {
+        command: "rustup",
+        args: ["which", "--toolchain", channel, "rustc"],
+        cwd: repoRoot,
+      },
+      limits,
+    ),
+  ]);
+  const cargo = NodePath.resolve(cargoResult.stdout.trim());
+  const rustc = NodePath.resolve(rustcResult.stdout.trim());
+  if (
+    !NodePath.isAbsolute(cargoResult.stdout.trim()) ||
+    !NodePath.isAbsolute(rustcResult.stdout.trim())
+  ) {
+    return fail("rustup returned a non-absolute pinned toolchain path.");
+  }
+  assertPlainFile(cargo, "Pinned Cargo executable");
+  assertPlainFile(rustc, "Pinned rustc executable");
+  if (NodePath.dirname(cargo) !== NodePath.dirname(rustc)) {
+    return fail("Pinned Cargo and rustc must come from the same Rust toolchain directory.");
+  }
+  return {
+    cargo,
+    rustc,
+    env: { ...baseEnv, RUSTC: rustc, RUSTUP_TOOLCHAIN: channel },
+  };
+};
+
 const copyPlainTree = async (source: string, destination: string): Promise<void> => {
   const manifest = await collectWebAssetManifest(source);
   await NodeFSP.mkdir(destination, { recursive: true });
@@ -519,8 +590,34 @@ export interface BuildServerArtifactOptions {
 }
 
 export interface BuiltServerArtifact {
-  readonly archivePath: string;
-  readonly metadataPath: string;
+  readonly artifactPaths: ReadonlyArray<string>;
+  readonly metadataPaths: ReadonlyArray<string>;
+  readonly archivePath?: string;
+  readonly metadataPath?: string;
+}
+
+interface ServerBuildMetadata {
+  readonly schemaVersion: 1;
+  readonly product: "bibcode-server";
+  readonly buildMode: "signing-candidate" | "unsigned-test";
+  readonly version: string;
+  readonly sourceSha: string;
+  readonly targetTriple: string;
+  readonly sourceDateEpoch: number;
+  readonly rustc: string;
+  readonly binarySha256: string;
+  readonly sliceSha256?: Readonly<Record<string, string>>;
+}
+
+interface PublishedServerArtifact {
+  readonly fileName: string;
+  readonly metadataName: string;
+}
+
+interface RustToolchainRuntime {
+  readonly cargo: string;
+  readonly rustc: string;
+  readonly env: NodeJS.ProcessEnv;
 }
 
 const portableReadme = (version: string): string => `# BiBCode Server ${version}
@@ -540,6 +637,494 @@ Register an explicit per-user workstation service:
 \`\`\`
 `;
 
+const cargoArgsForTarget = (target: ServerTargetTriple): ReadonlyArray<string> => [
+  "build",
+  "--locked",
+  "--release",
+  "-p",
+  "bibcode-server",
+  "--bin",
+  "bibcode",
+  "--target",
+  target,
+  "--message-format=json-render-diagnostics",
+];
+
+const writeBuildMetadata = async (path: string, metadata: ServerBuildMetadata): Promise<void> => {
+  await NodeFSP.writeFile(path, `${JSON.stringify(metadata, null, 2)}\n`);
+};
+
+interface StageServerLayoutInput {
+  readonly repoRoot: string;
+  readonly rust: RustToolchainRuntime;
+  readonly executable: string;
+  readonly webRoot: string;
+  readonly webManifestPath: string;
+  readonly noticesPath: string;
+  readonly readmePath: string;
+  readonly metadataPath: string;
+  readonly output: string;
+}
+
+const stageServerLayout = async (
+  input: StageServerLayoutInput,
+  commandRunner: ServerArtifactCommandRunner,
+  limits: ServerArtifactCommandOptions,
+): Promise<void> => {
+  await commandRunner(
+    {
+      command: input.rust.cargo,
+      args: [
+        "run",
+        "--locked",
+        "-p",
+        "bibcode-server-packager",
+        "--",
+        "stage",
+        "--binary",
+        input.executable,
+        "--web-root",
+        input.webRoot,
+        "--web-asset-manifest",
+        input.webManifestPath,
+        "--install-layout",
+        NodePath.join(input.repoRoot, "packaging/server/common/install-layout.json"),
+        "--license",
+        NodePath.join(input.repoRoot, "LICENSE"),
+        "--notices",
+        input.noticesPath,
+        "--portable-readme",
+        input.readmePath,
+        "--build-metadata",
+        input.metadataPath,
+        "--output",
+        input.output,
+      ],
+      cwd: input.repoRoot,
+      env: input.rust.env,
+    },
+    limits,
+  );
+};
+
+const findPlainFiles = async (root: string, extension: string): Promise<ReadonlyArray<string>> => {
+  const pending = [NodePath.resolve(root)];
+  const matches: string[] = [];
+  while (pending.length > 0) {
+    const directory = pending.pop() ?? fail("Native installer output traversal failed.");
+    for (const entry of await NodeFSP.readdir(directory, { withFileTypes: true })) {
+      const path = NodePath.join(directory, entry.name);
+      const metadata = await NodeFSP.lstat(path);
+      if (metadata.isSymbolicLink()) {
+        return fail(`Native installer output contains a symbolic link: ${path}.`);
+      }
+      if (metadata.isDirectory()) {
+        pending.push(path);
+      } else if (metadata.isFile() && entry.name.endsWith(extension)) {
+        matches.push(path);
+      }
+    }
+  }
+  return matches.sort((left, right) => byteOrder(left, right));
+};
+
+const requireExactlyOneOutput = async (
+  root: string,
+  extension: string,
+  label: string,
+): Promise<string> => {
+  const matches = await findPlainFiles(root, extension);
+  if (matches.length !== 1) {
+    return fail(`${label} must produce exactly one ${extension} file; observed ${matches.length}.`);
+  }
+  return matches[0] ?? fail(`${label} output discovery failed.`);
+};
+
+const assertToolVersion = (output: string, tool: string, expected: string): void => {
+  const tokens = output.trim().split(/\s+/u);
+  if (!output.toLocaleLowerCase("en-US").includes(tool) || !tokens.includes(expected)) {
+    fail(`${tool} ${expected} is required; observed ${output.trim() || "no version output"}.`);
+  }
+};
+
+const copyInstallerPayload = async (
+  payload: ReadonlyArray<Awaited<ReturnType<typeof collectInstallerPayload>>[number]>,
+  destinationRoot: string,
+): Promise<void> => {
+  for (const record of payload) {
+    const destination = NodePath.join(destinationRoot, ...record.path.split("/"));
+    await NodeFSP.mkdir(NodePath.dirname(destination), { recursive: true });
+    await NodeFSP.copyFile(record.sourcePath, destination);
+    await NodeFSP.chmod(destination, Number.parseInt(record.mode, 8));
+  }
+};
+
+interface NativeBuildContext {
+  readonly repoRoot: string;
+  readonly rust: RustToolchainRuntime;
+  readonly temporary: string;
+  readonly publish: string;
+  readonly plan: ServerArtifactBuildPlan;
+  readonly version: string;
+  readonly executable: string;
+  readonly stagedRoot: string;
+  readonly metadata: ServerBuildMetadata;
+  readonly metadataPath: string;
+  readonly webRoot: string;
+  readonly webManifestPath: string;
+  readonly noticesPath: string;
+  readonly readmePath: string;
+  readonly commandRunner: ServerArtifactCommandRunner;
+  readonly limits: ServerArtifactCommandOptions;
+}
+
+const publishMetadataFor = async (
+  publish: string,
+  artifactName: string,
+  metadataSource: string,
+): Promise<PublishedServerArtifact> => {
+  const metadataName = `${artifactName}.build.json`;
+  await NodeFSP.copyFile(metadataSource, NodePath.join(publish, metadataName));
+  return { fileName: artifactName, metadataName };
+};
+
+const buildWindowsNativeInstaller = async (
+  context: NativeBuildContext,
+): Promise<ReadonlyArray<PublishedServerArtifact>> => {
+  const descriptor = resolveNativeInstallerDescriptor(context.plan.target);
+  const installerPlatform = descriptor.packageArchitectures.msi;
+  if (installerPlatform === undefined) return fail("The Windows target has no MSI architecture.");
+  const workspace = NodePath.join(context.temporary, "native", "windows");
+  const output = NodePath.join(workspace, "output");
+  const intermediate = NodePath.join(workspace, "obj");
+  await NodeFSP.mkdir(output, { recursive: true });
+  await NodeFSP.mkdir(intermediate, { recursive: true });
+  for (const file of ["BiBCode.Server.wixproj", "Product.wxs", "variables.wxi"] as const) {
+    await NodeFSP.copyFile(
+      NodePath.join(context.repoRoot, "packaging", "server", "windows", file),
+      NodePath.join(workspace, file),
+    );
+  }
+  const payload = await collectInstallerPayload(context.stagedRoot, "bibcode.exe");
+  await NodeFSP.writeFile(
+    NodePath.join(workspace, "ServerFiles.wxs"),
+    generateWixFilesFragment(context.stagedRoot, payload),
+  );
+  await context.commandRunner(
+    {
+      command: "dotnet",
+      args: [
+        "build",
+        NodePath.join(workspace, "BiBCode.Server.wixproj"),
+        "--configuration",
+        "Release",
+        "--nologo",
+        `-p:ProductVersion=${context.version}`,
+        `-p:StageRoot=${context.stagedRoot}`,
+        `-p:InstallerPlatform=${installerPlatform}`,
+        `-p:OutputPath=${output}${NodePath.sep}`,
+        `-p:IntermediateOutputPath=${intermediate}${NodePath.sep}`,
+      ],
+      cwd: workspace,
+    },
+    context.limits,
+  );
+  const built = await requireExactlyOneOutput(output, ".msi", "WiX");
+  const artifactName = `bibcode-server-${context.version}-windows-${descriptor.manifestArchitecture}.msi`;
+  await NodeFSP.copyFile(built, NodePath.join(context.publish, artifactName));
+  return [await publishMetadataFor(context.publish, artifactName, context.metadataPath)];
+};
+
+const buildLinuxNativeInstallers = async (
+  context: NativeBuildContext,
+): Promise<ReadonlyArray<PublishedServerArtifact>> => {
+  const descriptor = resolveNativeInstallerDescriptor(context.plan.target);
+  const debArchitecture = descriptor.packageArchitectures.deb;
+  const rpmArchitecture = descriptor.packageArchitectures.rpm;
+  if (debArchitecture === undefined || rpmArchitecture === undefined) {
+    return fail("The Linux target is missing a native package architecture.");
+  }
+  const [debVersion, rpmVersion] = await Promise.all([
+    context.commandRunner(
+      {
+        command: context.rust.cargo,
+        args: ["deb", "--version"],
+        cwd: context.repoRoot,
+        env: context.rust.env,
+      },
+      context.limits,
+    ),
+    context.commandRunner(
+      {
+        command: context.rust.cargo,
+        args: ["generate-rpm", "--version"],
+        cwd: context.repoRoot,
+        env: context.rust.env,
+      },
+      context.limits,
+    ),
+  ]);
+  assertToolVersion(`${debVersion.stdout}\n${debVersion.stderr}`, "cargo-deb", "3.7.0");
+  assertToolVersion(`${rpmVersion.stdout}\n${rpmVersion.stderr}`, "cargo-generate-rpm", "0.21.0");
+
+  const workspace = NodePath.join(context.temporary, "native", "linux");
+  await NodeFSP.mkdir(NodePath.join(workspace, "src"), { recursive: true });
+  await NodeFSP.writeFile(NodePath.join(workspace, "src", "main.rs"), "fn main() {}\n");
+  const payload = await collectInstallerPayload(context.stagedRoot, "bibcode");
+  const debManifest = renderDebCargoManifest({
+    payloadRoot: context.stagedRoot,
+    payload,
+    version: context.version,
+    maintainerScripts: NodePath.join(context.repoRoot, "packaging/server/linux/deb"),
+  });
+  const rpmMetadata = renderRpmMetadata({
+    template: NodeFS.readFileSync(
+      NodePath.join(context.repoRoot, "packaging/server/linux/rpm/metadata.toml"),
+      "utf8",
+    ),
+    payloadRoot: context.stagedRoot,
+    payload,
+    scripts: {
+      postInstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/post_install"),
+      preUninstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/pre_uninstall"),
+      postUninstall: NodePath.join(context.repoRoot, "packaging/server/linux/rpm/post_uninstall"),
+    },
+  });
+  const manifestPath = NodePath.join(workspace, "Cargo.toml");
+  await NodeFSP.writeFile(manifestPath, `${debManifest}\n${rpmMetadata}`);
+
+  const debName = `bibcode-server-${context.version}-linux-${descriptor.manifestArchitecture}.deb`;
+  const rpmName = `bibcode-server-${context.version}-linux-${descriptor.manifestArchitecture}.rpm`;
+  const debPath = NodePath.join(context.publish, debName);
+  const rpmPath = NodePath.join(context.publish, rpmName);
+  const packageCommands = resolveLinuxNativePackageCommands({
+    manifestPath,
+    target: context.plan.target,
+    debOutputPath: debPath,
+    rpmOutputPath: rpmPath,
+    rpmArchitecture,
+  });
+  await context.commandRunner(
+    {
+      command: context.rust.cargo,
+      args: packageCommands.debArgs,
+      cwd: workspace,
+      env: context.rust.env,
+    },
+    context.limits,
+  );
+  await context.commandRunner(
+    {
+      command: context.rust.cargo,
+      args: packageCommands.rpmArgs,
+      cwd: workspace,
+      env: context.rust.env,
+    },
+    context.limits,
+  );
+  assertPlainFile(debPath, `DEB ${debArchitecture} installer`);
+  assertPlainFile(rpmPath, `RPM ${rpmArchitecture} installer`);
+  return Promise.all([
+    publishMetadataFor(context.publish, debName, context.metadataPath),
+    publishMetadataFor(context.publish, rpmName, context.metadataPath),
+  ]);
+};
+
+const buildMacNativeInstaller = async (
+  context: NativeBuildContext,
+): Promise<ReadonlyArray<PublishedServerArtifact>> => {
+  const otherTarget: ServerTargetTriple =
+    context.plan.target === "aarch64-apple-darwin" ? "x86_64-apple-darwin" : "aarch64-apple-darwin";
+  const otherBuild = await context.commandRunner(
+    {
+      command: context.rust.cargo,
+      args: cargoArgsForTarget(otherTarget),
+      cwd: context.repoRoot,
+      env: context.rust.env,
+    },
+    context.limits,
+  );
+  const otherExecutable = parseCargoServerExecutable(otherBuild.stdout, {
+    cargoTargetDirectory: NodePath.join(context.repoRoot, "target", otherTarget, "release"),
+    executableName: "bibcode",
+  });
+  assertPlainFile(otherExecutable, `Cargo ${otherTarget} server executable`);
+  const otherVersion = await context.commandRunner(
+    { command: otherExecutable, args: ["--version"], cwd: context.repoRoot },
+    context.limits,
+  );
+  if (!otherVersion.stdout.split(/\s+/u).includes(context.version)) {
+    return fail(`The ${otherTarget} server executable does not report version ${context.version}.`);
+  }
+
+  const workspace = NodePath.join(context.temporary, "native", "macos");
+  await NodeFSP.mkdir(workspace, { recursive: true });
+  const universalExecutable = NodePath.join(workspace, "bibcode");
+  const binaries = new Map<ServerTargetTriple, string>([
+    [context.plan.target, context.executable],
+    [otherTarget, otherExecutable],
+  ]);
+  await context.commandRunner(
+    {
+      command: "lipo",
+      args: [
+        "-create",
+        binaries.get("x86_64-apple-darwin") ?? fail("The x86_64 macOS slice is missing."),
+        binaries.get("aarch64-apple-darwin") ?? fail("The arm64 macOS slice is missing."),
+        "-output",
+        universalExecutable,
+      ],
+      cwd: workspace,
+    },
+    context.limits,
+  );
+  await NodeFSP.chmod(universalExecutable, 0o755);
+  const archs = await context.commandRunner(
+    { command: "lipo", args: ["-archs", universalExecutable], cwd: workspace },
+    context.limits,
+  );
+  const observedArchs = new Set(archs.stdout.trim().split(/\s+/u).filter(Boolean));
+  if (observedArchs.size !== 2 || !observedArchs.has("x86_64") || !observedArchs.has("arm64")) {
+    return fail(`The universal macOS executable has invalid slices: ${archs.stdout.trim()}.`);
+  }
+  await context.commandRunner(
+    {
+      command: "codesign",
+      args: ["--force", "--sign", "-", "--timestamp=none", universalExecutable],
+      cwd: workspace,
+    },
+    context.limits,
+  );
+  await context.commandRunner(
+    {
+      command: "codesign",
+      args: ["--verify", "--strict", "--verbose=2", universalExecutable],
+      cwd: workspace,
+    },
+    context.limits,
+  );
+
+  const universalMetadata: ServerBuildMetadata = {
+    ...context.metadata,
+    targetTriple: "universal-apple-darwin",
+    binarySha256: await sha256File(universalExecutable),
+    sliceSha256: {
+      "x86_64-apple-darwin": await sha256File(
+        binaries.get("x86_64-apple-darwin") ?? fail("The x86_64 slice hash input is missing."),
+      ),
+      "aarch64-apple-darwin": await sha256File(
+        binaries.get("aarch64-apple-darwin") ?? fail("The arm64 slice hash input is missing."),
+      ),
+    },
+  };
+  const universalMetadataPath = NodePath.join(workspace, "build-metadata.json");
+  await writeBuildMetadata(universalMetadataPath, universalMetadata);
+  const universalStage = NodePath.join(workspace, "stage", "bibcode-server");
+  await stageServerLayout(
+    {
+      repoRoot: context.repoRoot,
+      rust: context.rust,
+      executable: universalExecutable,
+      webRoot: context.webRoot,
+      webManifestPath: context.webManifestPath,
+      noticesPath: context.noticesPath,
+      readmePath: context.readmePath,
+      metadataPath: universalMetadataPath,
+      output: universalStage,
+    },
+    context.commandRunner,
+    context.limits,
+  );
+
+  const packageRoot = NodePath.join(workspace, "root");
+  const installRoot = NodePath.join(packageRoot, "usr/local/libexec/bibcode-server");
+  const payload = await collectInstallerPayload(universalStage, "bibcode");
+  await copyInstallerPayload(payload, installRoot);
+  const linkDirectory = NodePath.join(packageRoot, "usr/local/bin");
+  await NodeFSP.mkdir(linkDirectory, { recursive: true });
+  await NodeFSP.symlink(
+    "../libexec/bibcode-server/bin/bibcode",
+    NodePath.join(linkDirectory, "bibcode"),
+  );
+  await context.commandRunner(
+    { command: "xattr", args: ["-cr", packageRoot], cwd: workspace },
+    context.limits,
+  );
+
+  const scripts = NodePath.join(context.repoRoot, "packaging/server/macos/scripts");
+  for (const script of ["preinstall", "postinstall"] as const) {
+    const path = NodePath.join(scripts, script);
+    if (!isPlainExecutable(path)) return fail(`macOS package script must be executable: ${path}.`);
+  }
+  const componentPath = NodePath.join(workspace, "BiBCodeServer-component.pkg");
+  const packageEnv = { ...context.rust.env, COPYFILE_DISABLE: "1" };
+  await context.commandRunner(
+    {
+      command: "pkgbuild",
+      args: [
+        "--root",
+        packageRoot,
+        "--identifier",
+        "com.bibcode.server",
+        "--version",
+        context.version,
+        "--install-location",
+        "/",
+        "--scripts",
+        scripts,
+        "--ownership",
+        "recommended",
+        componentPath,
+      ],
+      cwd: workspace,
+      env: packageEnv,
+    },
+    context.limits,
+  );
+  const distributionPath = NodePath.join(workspace, "Distribution.xml");
+  await NodeFSP.writeFile(
+    distributionPath,
+    renderMacDistribution(
+      NodeFS.readFileSync(
+        NodePath.join(context.repoRoot, "packaging/server/macos/Distribution.xml"),
+        "utf8",
+      ),
+      context.version,
+    ),
+  );
+  const artifactName = `bibcode-server-${context.version}-macos-universal.pkg`;
+  const artifactPath = NodePath.join(context.publish, artifactName);
+  await context.commandRunner(
+    {
+      command: "productbuild",
+      args: ["--distribution", distributionPath, "--package-path", workspace, artifactPath],
+      cwd: workspace,
+      env: packageEnv,
+    },
+    context.limits,
+  );
+  assertPlainFile(artifactPath, "macOS universal product package");
+  const payloadListing = await context.commandRunner(
+    { command: "pkgutil", args: ["--payload-files", artifactPath], cwd: workspace },
+    context.limits,
+  );
+  validateMacPackagePayloadListing(payloadListing.stdout);
+  return [await publishMetadataFor(context.publish, artifactName, universalMetadataPath)];
+};
+
+const buildNativeInstallers = async (
+  context: NativeBuildContext,
+): Promise<ReadonlyArray<PublishedServerArtifact>> => {
+  switch (SERVER_PORTABLE_TARGETS[context.plan.target].platform) {
+    case "win32":
+      return buildWindowsNativeInstaller(context);
+    case "darwin":
+      return buildMacNativeInstaller(context);
+    case "linux":
+      return buildLinuxNativeInstallers(context);
+  }
+};
+
 export async function buildServerArtifact(
   input: ServerArtifactBuildInput,
   options: BuildServerArtifactOptions = {},
@@ -552,15 +1137,52 @@ export async function buildServerArtifact(
   if (NodeFS.existsSync(plan.outputDir)) {
     return fail(`Server artifact output already exists: ${plan.outputDir}.`);
   }
-  const requiredInputs = [
+  const requiredInputRelatives = [
     "Cargo.lock",
     "pnpm-lock.yaml",
+    "rust-toolchain.toml",
     "LICENSE",
+    "apps/web/package.json",
     "apps/server/package.json",
     "apps/server/Cargo.toml",
     "packaging/server/common/install-layout.json",
-  ].map((relative) => NodePath.join(repoRoot, relative));
+  ];
+  if (plan.formats.includes("native")) {
+    switch (SERVER_PORTABLE_TARGETS[plan.target].platform) {
+      case "win32":
+        requiredInputRelatives.push(
+          "packaging/server/windows/BiBCode.Server.wixproj",
+          "packaging/server/windows/Product.wxs",
+          "packaging/server/windows/variables.wxi",
+        );
+        break;
+      case "darwin":
+        requiredInputRelatives.push(
+          "packaging/server/macos/Distribution.xml",
+          "packaging/server/macos/scripts/preinstall",
+          "packaging/server/macos/scripts/postinstall",
+        );
+        break;
+      case "linux":
+        requiredInputRelatives.push(
+          "packaging/server/linux/deb/postinst",
+          "packaging/server/linux/deb/prerm",
+          "packaging/server/linux/deb/postrm",
+          "packaging/server/linux/rpm/metadata.toml",
+          "packaging/server/linux/rpm/post_install",
+          "packaging/server/linux/rpm/pre_uninstall",
+          "packaging/server/linux/rpm/post_uninstall",
+        );
+        break;
+    }
+  }
+  const requiredInputs = requiredInputRelatives.map((relative) =>
+    NodePath.join(repoRoot, relative),
+  );
   for (const path of requiredInputs) assertPlainFile(path, "Required frozen build input");
+  const rustToolchain = parsePinnedRustToolchainChannel(
+    NodeFS.readFileSync(NodePath.join(repoRoot, "rust-toolchain.toml"), "utf8"),
+  );
   if (Boolean(input.webAssetsDir) !== Boolean(input.webAssetsManifest)) {
     return fail("--web-assets-dir and --web-assets-manifest must be provided together.");
   }
@@ -571,6 +1193,13 @@ export async function buildServerArtifact(
     timeoutMs: plan.timeoutMs,
     ...(options.signal ? { signal: options.signal } : {}),
   };
+  const rust = await resolveRustToolchainRuntime(
+    rustToolchain,
+    env,
+    repoRoot,
+    commandRunner,
+    limits,
+  );
   const outputParent = NodePath.dirname(plan.outputDir);
   await NodeFSP.mkdir(outputParent, { recursive: true });
   const temporary = await NodeFSP.mkdtemp(
@@ -649,13 +1278,22 @@ export async function buildServerArtifact(
     const [cargoMetadata, rustc] = await Promise.all([
       commandRunner(
         {
-          command: "cargo",
+          command: rust.cargo,
           args: ["metadata", "--locked", "--format-version", "1", "--filter-platform", plan.target],
           cwd: repoRoot,
+          env: rust.env,
         },
         limits,
       ),
-      commandRunner({ command: "rustc", args: ["--version", "--verbose"], cwd: repoRoot }, limits),
+      commandRunner(
+        {
+          command: rust.rustc,
+          args: ["--version", "--verbose"],
+          cwd: repoRoot,
+          env: rust.env,
+        },
+        limits,
+      ),
     ]);
     const notices = generateThirdPartyNoticesMarkdown([
       ...parseCargoNoticePackages(cargoMetadata.stdout),
@@ -665,7 +1303,12 @@ export async function buildServerArtifact(
     await NodeFSP.writeFile(noticesPath, notices);
 
     const cargoBuild = await commandRunner(
-      { command: "cargo", args: plan.cargoArgs, cwd: repoRoot },
+      {
+        command: rust.cargo,
+        args: plan.cargoArgs,
+        cwd: repoRoot,
+        env: rust.env,
+      },
       limits,
     );
     const executable = parseCargoServerExecutable(cargoBuild.stdout, plan);
@@ -678,7 +1321,7 @@ export async function buildServerArtifact(
       return fail(`The built server executable does not report version ${version}.`);
     }
     const binarySha256 = await sha256File(executable);
-    const metadata = {
+    const metadata: ServerBuildMetadata = {
       schemaVersion: 1,
       product: "bibcode-server",
       buildMode: input.unsignedTest === true ? "unsigned-test" : "signing-candidate",
@@ -688,82 +1331,117 @@ export async function buildServerArtifact(
       sourceDateEpoch,
       rustc: rustc.stdout.trim(),
       binarySha256,
-    } as const;
+    };
     const metadataPath = NodePath.join(temporary, "build-metadata.json");
-    await NodeFSP.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+    await writeBuildMetadata(metadataPath, metadata);
     const readmePath = NodePath.join(temporary, "README.md");
     await NodeFSP.writeFile(readmePath, portableReadme(version));
 
     const stagedRoot = NodePath.join(temporary, "stage", "bibcode-server");
-    await commandRunner(
-      {
-        command: "cargo",
-        args: [
-          "run",
-          "--locked",
-          "-p",
-          "bibcode-server-packager",
-          "--",
-          "stage",
-          "--binary",
+    const requiresCurrentTargetStage =
+      plan.formats.includes("portable") ||
+      (plan.formats.includes("native") &&
+        SERVER_PORTABLE_TARGETS[plan.target].platform !== "darwin");
+    if (requiresCurrentTargetStage) {
+      await stageServerLayout(
+        {
+          repoRoot,
+          rust,
           executable,
-          "--web-root",
           webRoot,
-          "--web-asset-manifest",
           webManifestPath,
-          "--install-layout",
-          NodePath.join(repoRoot, "packaging/server/common/install-layout.json"),
-          "--license",
-          NodePath.join(repoRoot, "LICENSE"),
-          "--notices",
           noticesPath,
-          "--portable-readme",
           readmePath,
-          "--build-metadata",
           metadataPath,
-          "--output",
-          stagedRoot,
-        ],
-        cwd: repoRoot,
-      },
-      limits,
-    );
+          output: stagedRoot,
+        },
+        commandRunner,
+        limits,
+      );
+    }
 
     const publish = NodePath.join(temporary, "publish");
     await NodeFSP.mkdir(publish);
-    const suffix = plan.portableFormat;
-    const archiveName = `bibcode-server-${version}-${plan.target}.${suffix}`;
-    const archivePath = NodePath.join(publish, archiveName);
-    await commandRunner(
-      {
-        command: "cargo",
-        args: [
-          "run",
-          "--locked",
-          "-p",
-          "bibcode-server-packager",
-          "--",
-          "archive",
-          "--input",
+    const published: PublishedServerArtifact[] = [];
+    let archiveName: string | undefined;
+    if (plan.formats.includes("portable")) {
+      const suffix = plan.portableFormat;
+      archiveName = `bibcode-server-${version}-${plan.target}.${suffix}`;
+      const archivePath = NodePath.join(publish, archiveName);
+      await commandRunner(
+        {
+          command: rust.cargo,
+          args: [
+            "run",
+            "--locked",
+            "-p",
+            "bibcode-server-packager",
+            "--",
+            "archive",
+            "--input",
+            stagedRoot,
+            "--output",
+            archivePath,
+            "--format",
+            plan.portableFormat === "tar.gz" ? "tar-gz" : "zip",
+            "--source-date-epoch",
+            String(sourceDateEpoch),
+          ],
+          cwd: repoRoot,
+          env: rust.env,
+        },
+        limits,
+      );
+      assertPlainFile(archivePath, "Portable server archive");
+      published.push(await publishMetadataFor(publish, archiveName, metadataPath));
+    }
+
+    if (plan.formats.includes("native")) {
+      published.push(
+        ...(await buildNativeInstallers({
+          repoRoot,
+          rust,
+          temporary,
+          publish,
+          plan,
+          version,
+          executable,
           stagedRoot,
-          "--output",
-          archivePath,
-          "--format",
-          plan.portableFormat === "tar.gz" ? "tar-gz" : "zip",
-          "--source-date-epoch",
-          String(sourceDateEpoch),
-        ],
-        cwd: repoRoot,
-      },
-      limits,
-    );
-    assertPlainFile(archivePath, "Portable server archive");
-    const publishedMetadata = NodePath.join(publish, `${archiveName}.build.json`);
-    await NodeFSP.copyFile(metadataPath, publishedMetadata);
+          metadata,
+          metadataPath,
+          webRoot,
+          webManifestPath,
+          noticesPath,
+          readmePath,
+          commandRunner,
+          limits,
+        })),
+      );
+    }
+    if (published.length === 0) return fail("The server build produced no requested artifacts.");
+    for (const artifact of published) {
+      assertPlainFile(NodePath.join(publish, artifact.fileName), "Published server artifact");
+      assertPlainFile(NodePath.join(publish, artifact.metadataName), "Published build metadata");
+    }
     await NodeFSP.rename(publish, plan.outputDir);
+    const artifactPaths = published.map((artifact) =>
+      NodePath.join(plan.outputDir, artifact.fileName),
+    );
+    const metadataPaths = published.map((artifact) =>
+      NodePath.join(plan.outputDir, artifact.metadataName),
+    );
+    const archiveIndex = archiveName
+      ? published.findIndex((artifact) => artifact.fileName === archiveName)
+      : -1;
     return {
-      archivePath: NodePath.join(plan.outputDir, archiveName),
-      metadataPath: NodePath.join(plan.outputDir, NodePath.basename(publishedMetadata)),
+      artifactPaths,
+      metadataPaths,
+      ...(archiveIndex >= 0
+        ? {
+            archivePath: artifactPaths[archiveIndex],
+            metadataPath: metadataPaths[archiveIndex],
+          }
+        : {}),
     };
   } finally {
     await NodeFSP.rm(temporary, { recursive: true, force: true });
@@ -774,7 +1452,7 @@ export async function runBuildServerArtifactMain(
   argv: ReadonlyArray<string> = process.argv.slice(2),
 ): Promise<void> {
   const result = await buildServerArtifact(parseServerArtifactCliArgs(argv));
-  process.stdout.write(`${result.archivePath}\n${result.metadataPath}\n`);
+  process.stdout.write(`${[...result.artifactPaths, ...result.metadataPaths].join("\n")}\n`);
 }
 
 const invokedPath = process.argv[1] ? NodePath.resolve(process.argv[1]) : undefined;

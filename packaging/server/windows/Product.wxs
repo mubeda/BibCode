@@ -1,0 +1,109 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" RequiredVersion="7.0.0">
+  <?include variables.wxi ?>
+  <Package
+    Name="$(ProductName)"
+    Manufacturer="$(Manufacturer)"
+    Version="$(ProductVersion)"
+    UpgradeCode="$(UpgradeCode)"
+    Scope="perUser"
+    InstallerVersion="500"
+    Compressed="yes">
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of BiBCode Server is already installed."
+      Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="BiBCode Server">
+          <Component Id="OwnedUserPath" Guid="{2768835B-A258-4290-9885-7BB903B5CE1B}">
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\BiBCode\Server"
+              Name="InstallRoot"
+              Type="string"
+              Value="[INSTALLFOLDER]"
+              KeyPath="yes" />
+            <Environment
+              Id="OwnedUserPathEntry"
+              Name="PATH"
+              Action="set"
+              Part="last"
+              System="no"
+              Permanent="no"
+              Value="[INSTALLFOLDER]bin" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="ServerFeature" Title="BiBCode Server" Level="1">
+      <ComponentRef Id="OwnedUserPath" />
+      <ComponentGroupRef Id="ServerFiles" />
+    </Feature>
+
+    <CustomAction
+      Id="RollbackWorkstationService"
+      FileRef="BibcodeExecutable"
+      ExeCommand="service uninstall --mode workstation --format json"
+      Execute="rollback"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="ignore" />
+    <CustomAction
+      Id="InstallWorkstationService"
+      FileRef="BibcodeExecutable"
+      ExeCommand="service install --mode workstation --host 127.0.0.1 --format json"
+      Execute="deferred"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="check" />
+    <CustomAction
+      Id="StopWorkstationServiceForUpgrade"
+      FileRef="BibcodeExecutable"
+      ExeCommand="service stop --mode workstation --format json"
+      Execute="deferred"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="check" />
+    <CustomAction
+      Id="UpdateWorkstationService"
+      FileRef="BibcodeExecutable"
+      ExeCommand="service install --mode workstation --host 127.0.0.1 --format json --update"
+      Execute="deferred"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="check" />
+    <CustomAction
+      Id="UninstallWorkstationService"
+      FileRef="BibcodeExecutable"
+      ExeCommand="service uninstall --mode workstation --format json"
+      Execute="deferred"
+      Impersonate="yes"
+      HideTarget="yes"
+      Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom
+        Action="RollbackWorkstationService"
+        Before="InstallWorkstationService"
+        Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom
+        Action="InstallWorkstationService"
+        After="InstallFiles"
+        Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom
+        Action="StopWorkstationServiceForUpgrade"
+        Before="RemoveExistingProducts"
+        Condition="WIX_UPGRADE_DETECTED" />
+      <Custom
+        Action="UpdateWorkstationService"
+        After="InstallWorkstationService"
+        Condition="WIX_UPGRADE_DETECTED" />
+      <Custom
+        Action="UninstallWorkstationService"
+        Before="RemoveFiles"
+        Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

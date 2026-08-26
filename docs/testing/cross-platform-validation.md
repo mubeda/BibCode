@@ -141,6 +141,40 @@ create or alter a service, login item, PATH entry, firewall rule, or data root.
 Use a disposable root when exercising the foreground command or the explicit
 `service install` command.
 
+### Native server installer evidence
+
+When native package templates, hooks, artifact formats, compiler selection, or
+installed paths change, run:
+
+```sh
+vp test scripts/build-server-artifact.test.ts scripts/server-packaging-contract.test.ts
+vp check
+vp run typecheck
+```
+
+Then build `--formats native,portable --unsigned-test` on the matching native
+runner. The builder uses the exact channel from `rust-toolchain.toml`; inventory
+and install any required secondary target or pinned package tool before the
+build rather than allowing a system compiler or a different tool version to
+take over. Use a fresh output directory. Record every artifact and adjacent
+metadata path, SHA-256, architecture, package ID/version, installed-path count,
+script/custom-action inventory, executable version, and native signature state.
+
+Inspect before install with the platform-native tools documented in the
+Windows, macOS, and Linux runbooks. Every ordinary payload path must remain
+inside the platform allowlist. Current macOS `pkgutil --payload-files` may show
+a `._name` AppleDouble metadata record; accept it only when the allowlisted
+sibling `name` exists and `pkgutil --expand-full` does not materialize a
+separate `._name` file. Reject an unpaired record, an escaped path, a link to an
+unexpected target, a missing binary/assets/metadata file, an executable with
+the wrong architecture or version, and any secret, non-loopback HTTP, firewall,
+telemetry, Connect, purge, or data-root deletion action.
+
+Installing or uninstalling a package mutates the native host. Perform those
+scenarios only on an approved disposable runner with an isolated BiBCode data
+root. Format inspection on another OS or architecture is compatibility evidence
+only; it is not native installation evidence.
+
 ### Environment, project, and Main invariant evidence
 
 When environment identity, project admission, project navigation, or thread

@@ -10,6 +10,7 @@ import {
   buildServerArtifact,
   collectWebAssetManifest,
   parseCargoServerExecutable,
+  parsePinnedRustToolchainChannel,
   parseServerArtifactCliArgs,
   resolveServerArtifactBuildPlan,
   runBoundedCommand,
@@ -18,6 +19,7 @@ import {
 } from "./build-server-artifact.ts";
 
 const repoRoot = NodePath.resolve("/repo");
+const sourceRepoRoot = NodePath.resolve(import.meta.dirname, "..");
 
 describe("server artifact build planning", () => {
   it.each([
@@ -89,6 +91,13 @@ describe("server artifact build planning", () => {
     expect(() =>
       parseServerArtifactCliArgs(["--target", "x86_64-unknown-linux-gnu", "--timeout-ms", "0"]),
     ).toThrow(/positive/iu);
+  });
+
+  it("accepts only an exact checked-in Rust toolchain channel", () => {
+    expect(parsePinnedRustToolchainChannel('[toolchain]\nchannel = "1.97.1"\n')).toBe("1.97.1");
+    expect(() => parsePinnedRustToolchainChannel('[toolchain]\nchannel = "stable"\n')).toThrow(
+      /exact stable Rust channel/iu,
+    );
   });
 });
 
@@ -284,7 +293,9 @@ describe("bounded build lifecycle", () => {
     for (const [relative, contents] of [
       ["Cargo.lock", "lock"],
       ["pnpm-lock.yaml", "lock"],
+      ["rust-toolchain.toml", '[toolchain]\nchannel = "1.97.1"\n'],
       ["LICENSE", "license"],
+      ["apps/web/package.json", '{"name":"@bibcode/web","version":"0.4.1"}'],
       ["apps/server/package.json", '{"version":"0.4.1"}'],
       ["apps/server/Cargo.toml", '[package]\nname="bibcode-server"\n'],
       ["packaging/server/common/install-layout.json", '{"packageVersion":"0.4.1"}'],
@@ -336,5 +347,198 @@ describe("bounded build lifecycle", () => {
     ).rejects.toThrow("injected child failure");
     expect(NodeFS.existsSync(outputDir)).toBe(false);
     expect(NodeFS.readdirSync(root)).toEqual(["repo"]);
+  });
+
+  it("dry-runs universal macOS assembly through the injected bounded command runner", async () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-native-build-"));
+    const fixtureRepo = NodePath.join(root, "repo");
+    const write = (relative: string, contents: string, mode?: number): string => {
+      const path = NodePath.join(fixtureRepo, relative);
+      NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
+      NodeFS.writeFileSync(path, contents, mode === undefined ? undefined : { mode });
+      return path;
+    };
+    for (const [relative, contents] of [
+      ["Cargo.lock", "lock"],
+      ["pnpm-lock.yaml", "lock"],
+      ["rust-toolchain.toml", '[toolchain]\nchannel = "1.97.1"\n'],
+      ["LICENSE", "license"],
+      ["apps/web/package.json", '{"name":"@bibcode/web","version":"0.4.1"}'],
+      ["apps/server/package.json", '{"version":"0.4.1"}'],
+      ["apps/server/Cargo.toml", '[package]\nname="bibcode-server"\n'],
+      ["packaging/server/common/install-layout.json", '{"packageVersion":"0.4.1"}'],
+      [
+        "packaging/server/macos/Distribution.xml",
+        NodeFS.readFileSync(
+          NodePath.join(sourceRepoRoot, "packaging/server/macos/Distribution.xml"),
+          "utf8",
+        ),
+      ],
+    ] as const) {
+      write(relative, contents);
+    }
+    for (const script of ["preinstall", "postinstall"] as const) {
+      write(
+        `packaging/server/macos/scripts/${script}`,
+        NodeFS.readFileSync(
+          NodePath.join(sourceRepoRoot, `packaging/server/macos/scripts/${script}`),
+          "utf8",
+        ),
+        0o755,
+      );
+    }
+    const webRoot = write("frozen-web/index.html", "<main>server</main>");
+    const webDirectory = NodePath.dirname(webRoot);
+    const webManifest = await collectWebAssetManifest(webDirectory);
+    const webManifestPath = write(
+      "frozen-web-assets.json",
+      `${JSON.stringify(webManifest, null, 2)}\n`,
+    );
+    const commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }> = [];
+    const argumentValue = (args: ReadonlyArray<string>, name: string): string => {
+      const index = args.indexOf(name);
+      const value = index >= 0 ? args[index + 1] : undefined;
+      if (value === undefined) throw new Error(`dry-run command is missing ${name}`);
+      return value;
+    };
+    const stage = (args: ReadonlyArray<string>): void => {
+      const output = argumentValue(args, "--output");
+      const binary = argumentValue(args, "--binary");
+      NodeFS.mkdirSync(NodePath.join(output, "bin"), { recursive: true });
+      NodeFS.mkdirSync(NodePath.join(output, "share/bibcode/web"), { recursive: true });
+      NodeFS.copyFileSync(binary, NodePath.join(output, "bin/bibcode"));
+      NodeFS.chmodSync(NodePath.join(output, "bin/bibcode"), 0o755);
+      NodeFS.copyFileSync(
+        NodePath.join(argumentValue(args, "--web-root"), "index.html"),
+        NodePath.join(output, "share/bibcode/web/index.html"),
+      );
+      for (const [flag, relative] of [
+        ["--web-asset-manifest", "share/bibcode/web-assets.json"],
+        ["--install-layout", "share/bibcode/install-layout.json"],
+        ["--license", "share/bibcode/LICENSE"],
+        ["--notices", "share/bibcode/THIRD-PARTY-NOTICES.md"],
+        ["--build-metadata", "share/bibcode/build-metadata.json"],
+        ["--portable-readme", "README.md"],
+      ] as const) {
+        NodeFS.copyFileSync(argumentValue(args, flag), NodePath.join(output, relative));
+      }
+    };
+    const runner: ServerArtifactCommandRunner = async ({ command, args }) => {
+      commands.push({ command, args });
+      if (command === "rustup" && args[0] === "which") {
+        const tool = args.at(-1);
+        if (tool !== "cargo" && tool !== "rustc") throw new Error("unexpected Rust tool lookup");
+        return { stdout: `${write(`toolchain/bin/${tool}`, tool, 0o755)}\n`, stderr: "" };
+      }
+      const delegatedTool = NodePath.basename(command);
+      const delegatedArgs = args;
+      if (delegatedTool === "cargo" && delegatedArgs[0] === "metadata") {
+        const id = "path+file:///fixture#bibcode-server@0.4.1";
+        return {
+          stdout: JSON.stringify({
+            packages: [{ id, name: "bibcode-server", version: "0.4.1", license: "Apache-2.0" }],
+            resolve: { nodes: [{ id, deps: [] }] },
+          }),
+          stderr: "",
+        };
+      }
+      if (delegatedTool === "rustc") {
+        return { stdout: "rustc 1.90.0 (fixture)\nhost: aarch64-apple-darwin\n", stderr: "" };
+      }
+      if (delegatedTool === "cargo" && delegatedArgs[0] === "build") {
+        const target = argumentValue(delegatedArgs, "--target");
+        const executable = write(`target/${target}/release/bibcode`, `binary:${target}`, 0o755);
+        return {
+          stdout: `${JSON.stringify({
+            reason: "compiler-artifact",
+            target: { name: "bibcode", kind: ["bin"] },
+            executable,
+          })}\n`,
+          stderr: "",
+        };
+      }
+      if (NodePath.basename(command) === "bibcode" && args[0] === "--version") {
+        return { stdout: "bibcode 0.4.1\n", stderr: "" };
+      }
+      if (delegatedTool === "cargo" && delegatedArgs.includes("stage")) {
+        stage(delegatedArgs);
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "lipo" && args[0] === "-create") {
+        NodeFS.copyFileSync(args[1] ?? "", argumentValue(args, "-output"));
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "lipo" && args[0] === "-archs") {
+        return { stdout: "x86_64 arm64\n", stderr: "" };
+      }
+      if (command === "codesign") return { stdout: "", stderr: "" };
+      if (command === "xattr") return { stdout: "", stderr: "" };
+      if (command === "pkgbuild" || command === "productbuild") {
+        write(NodePath.relative(fixtureRepo, args.at(-1) ?? ""), `${command} output`);
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "pkgutil" && args[0] === "--payload-files") {
+        return {
+          stdout: [
+            ".",
+            "./usr",
+            "./usr/local",
+            "./usr/local/bin",
+            "./usr/local/bin/bibcode",
+            "./usr/local/libexec/bibcode-server/bin/bibcode",
+            "./usr/local/libexec/bibcode-server/share/bibcode/build-metadata.json",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected dry-run command: ${command} ${args.join(" ")}`);
+    };
+    const outputDir = NodePath.join(root, "output");
+
+    const result = await buildServerArtifact(
+      {
+        target: "aarch64-apple-darwin",
+        formats: ["native"],
+        outputDir,
+        unsignedTest: true,
+        sourceSha: "a".repeat(40),
+        sourceDateEpoch: 1_700_000_000,
+        webAssetsDir: webDirectory,
+        webAssetsManifest: webManifestPath,
+      },
+      {
+        repoRoot: fixtureRepo,
+        host: { platform: "darwin", arch: "arm64" },
+        commandRunner: runner,
+      },
+    );
+
+    expect(result.artifactPaths.map((path) => NodePath.basename(path))).toEqual([
+      "bibcode-server-0.4.1-macos-universal.pkg",
+    ]);
+    expect(result.archivePath).toBeUndefined();
+    const metadata = JSON.parse(NodeFS.readFileSync(result.metadataPaths[0] ?? "", "utf8")) as {
+      readonly targetTriple: string;
+      readonly sliceSha256: Record<string, string>;
+    };
+    expect(metadata.targetTriple).toBe("universal-apple-darwin");
+    expect(Object.keys(metadata.sliceSha256).sort()).toEqual([
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+    ]);
+    expect(commands.some(({ command, args }) => command === "lipo" && args[0] === "-create")).toBe(
+      true,
+    );
+    expect(commands.some(({ command }) => command === "pkgbuild")).toBe(true);
+    expect(commands.some(({ command }) => command === "productbuild")).toBe(true);
+    expect(commands.some(({ command, args }) => command === "xattr" && args[0] === "-cr")).toBe(
+      true,
+    );
+    expect(commands.some(({ command }) => command === "pkgutil")).toBe(true);
+    expect(
+      commands.some(
+        ({ command, args }) => NodePath.basename(command) === "cargo" && args.includes("archive"),
+      ),
+    ).toBe(false);
   });
 });
