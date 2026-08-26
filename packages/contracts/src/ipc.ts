@@ -104,7 +104,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ServerArtifactRecordSchema } from "./serverArtifact.ts";
-import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
+import { AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -1633,6 +1633,13 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
   input: PreviewAutomationWaitForInput,
 });
 
+export const DesktopSshSessionEnrollment = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionSecret: TrimmedNonEmptyString,
+  tokenType: Schema.Literal("DPoP"),
+});
+export type DesktopSshSessionEnrollment = typeof DesktopSshSessionEnrollment.Type;
+
 export interface DesktopBridge {
   getHostMetadata?: () => Promise<DesktopBridgeHostMetadata>;
   getAppBranding: () => DesktopAppBranding | null;
@@ -1690,11 +1697,11 @@ export interface DesktopBridge {
   pairSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
     descriptor: ExecutionEnvironmentDescriptor,
-  ) => Promise<AuthAccessTokenResult>;
-  fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) => Promise<AuthSessionState>;
+  ) => Promise<DesktopSshSessionEnrollment>;
+  fetchSshSessionState: (httpBaseUrl: string, sessionSecret: string) => Promise<AuthSessionState>;
   issueSshWebSocketTicket: (
     httpBaseUrl: string,
-    bearerToken: string,
+    sessionSecret: string,
   ) => Promise<AuthWebSocketTicketResult>;
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;

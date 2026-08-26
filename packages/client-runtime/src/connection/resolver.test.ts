@@ -82,6 +82,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeVerifiedBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeVerifiedBearer"];
   readonly primaryBearerToken?: string;
   readonly inspectSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["inspect"];
+  readonly authorizeSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["authorize"];
   readonly descriptor?: ExecutionEnvironmentDescriptor;
   readonly routeSecret?: string;
   readonly verifyDirectHttps?: ConnectionResolver.RouteTransportSecurityService["verifyDirectHttps"];
@@ -172,6 +173,12 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
           }),
         )),
     exchange: () => Effect.die("unused"),
+    authorize:
+      options?.authorizeSsh ??
+      (() =>
+        Effect.sync(() => options?.events?.push("open-session")).pipe(
+          Effect.as({ socketUrl: "ws://127.0.0.1:4010/ws?wsTicket=native-dpop" }),
+        )),
     disconnect: () => Effect.void,
   });
 

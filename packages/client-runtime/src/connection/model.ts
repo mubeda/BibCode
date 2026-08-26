@@ -322,6 +322,9 @@ export type PreparedHttpAuthorization =
   | {
       readonly _tag: "Dpop";
       readonly accessToken: string;
+    }
+  | {
+      readonly _tag: "NativeDpop";
     };
 
 export interface PreparedConnection {

@@ -809,7 +809,10 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
   );
 
   const registerEnvironmentLocked = Effect.fn("EnvironmentRegistry.registerEnvironmentLocked")(
-    function* (input: EnvironmentRegistrationInput) {
+    function* (
+      input: EnvironmentRegistrationInput,
+      options?: { readonly retainEquivalentRuntime?: boolean },
+    ) {
       const environmentId = input.environment.environmentId;
       const current = (yield* SubscriptionRef.get(environments)).get(environmentId);
       if (
@@ -884,7 +887,7 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           ),
         };
         yield* environmentCatalog.put(nextEnvironment);
-        yield* installEnvironmentLocked(nextEnvironment, null);
+        yield* installEnvironmentLocked(nextEnvironment, null, options);
       }).pipe(
         Effect.onError(() =>
           importedSecretRef === null
@@ -1003,7 +1006,7 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
           yield* removePersistedPlatformShadow(target.environmentId);
           const normalized = normalizedPlatformRegistration(registration);
           if (normalized !== null) {
-            yield* registerEnvironmentLocked(normalized);
+            yield* registerEnvironmentLocked(normalized, { retainEquivalentRuntime: true });
             return;
           }
 

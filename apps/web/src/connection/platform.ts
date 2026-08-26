@@ -238,7 +238,13 @@ export const exchangeDesktopSshEnvironment = Effect.fn(
     try: () => bridge.pairSshEnvironment(input.bootstrap.target, input.descriptor),
     catch: sshPreparationError,
   });
-  if (access === null || typeof access.access_token !== "string" || access.access_token === "") {
+  if (
+    access === null ||
+    access.schemaVersion !== 1 ||
+    access.tokenType !== "DPoP" ||
+    typeof access.sessionSecret !== "string" ||
+    access.sessionSecret === ""
+  ) {
     return yield* new ConnectionBlockedError({
       reason: "authentication",
       detail: "The SSH environment did not return a paired administrator session.",
@@ -246,8 +252,39 @@ export const exchangeDesktopSshEnvironment = Effect.fn(
   }
   return {
     bootstrap: input.bootstrap,
-    bearerToken: access.access_token,
+    sessionSecret: access.sessionSecret,
   };
+});
+
+export const authorizeDesktopSshEnvironment = Effect.fn(
+  "web.connectionPlatform.ssh.authorizeDesktop",
+)(function* (
+  bridge: DesktopBridge,
+  input: {
+    readonly bootstrap: Awaited<ReturnType<DesktopBridge["ensureSshEnvironment"]>>;
+    readonly sessionSecret: string;
+  },
+) {
+  const session = yield* Effect.tryPromise({
+    try: () => bridge.fetchSshSessionState(input.bootstrap.httpBaseUrl, input.sessionSecret),
+    catch: sshPreparationError,
+  });
+  if (!session.authenticated) {
+    return yield* new ConnectionBlockedError({
+      reason: "authentication",
+      detail: "The SSH administrator session is no longer valid. Re-enroll this environment.",
+    });
+  }
+  const ticket = yield* Effect.tryPromise({
+    try: () => bridge.issueSshWebSocketTicket(input.bootstrap.httpBaseUrl, input.sessionSecret),
+    catch: sshPreparationError,
+  });
+  const socketUrl = new URL(input.bootstrap.wsBaseUrl);
+  if (socketUrl.pathname === "" || socketUrl.pathname === "/") {
+    socketUrl.pathname = "/ws";
+  }
+  socketUrl.searchParams.set("wsTicket", ticket.ticket);
+  return { socketUrl: socketUrl.toString() };
 });
 
 const capabilitiesLayer = Layer.effectContext(
@@ -311,6 +348,23 @@ const capabilitiesLayer = Layer.effectContext(
           });
         }
         return yield* exchangeDesktopSshEnvironment(bridge, input);
+      }),
+      authorize: Effect.fn("web.connectionPlatform.ssh.authorize")(function* (input) {
+        const bridge = window.desktopBridge;
+        if (bridge === undefined) {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail: "SSH environments are only available in the desktop app.",
+          });
+        }
+        if (input.cancellation.aborted) {
+          return yield* Effect.interrupt;
+        }
+        const authorized = yield* authorizeDesktopSshEnvironment(bridge, input);
+        if (input.cancellation.aborted) {
+          return yield* Effect.interrupt;
+        }
+        return authorized;
       }),
       disconnect: Effect.fn("web.connectionPlatform.ssh.disconnect")(
         function* (target, expectedHostKeyFingerprint) {

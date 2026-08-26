@@ -369,7 +369,11 @@ function installTauriHarness(options?: {
       case "desktop_bridge_fetch_environment_descriptor":
         return Promise.resolve(options?.sshDescriptor ?? defaultSshDescriptor);
       case "desktop_bridge_pair_ssh_environment":
-        return Promise.resolve({ access_token: "ssh-bearer" });
+        return Promise.resolve({
+          schemaVersion: 1,
+          sessionSecret: "protected-dpop-session",
+          tokenType: "DPoP",
+        });
       case "desktop_bridge_fetch_ssh_session_state":
         return Promise.resolve({ authenticated: true });
       case "desktop_bridge_issue_ssh_web_socket_ticket":
@@ -634,7 +638,9 @@ describe("tauriDesktopBridge", () => {
       },
     } as const;
     await expect(bridge.pairSshEnvironment(target, descriptor)).resolves.toEqual({
-      access_token: "ssh-bearer",
+      schemaVersion: 1,
+      sessionSecret: "protected-dpop-session",
+      tokenType: "DPoP",
     });
     await expect(
       bridge.fetchSshSessionState("http://127.0.0.1:3773", "bearer-token"),
@@ -652,11 +658,11 @@ describe("tauriDesktopBridge", () => {
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_fetch_ssh_session_state", {
       httpBaseUrl: "http://127.0.0.1:3773",
-      bearerToken: "bearer-token",
+      sessionSecret: "bearer-token",
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_issue_ssh_web_socket_ticket", {
       httpBaseUrl: "http://127.0.0.1:3773",
-      bearerToken: "bearer-token",
+      sessionSecret: "bearer-token",
     });
   });
 

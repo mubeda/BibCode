@@ -13,7 +13,11 @@ import type { ConnectionAttemptError } from "../connection/model.ts";
 
 export interface PreparedSshEnvironment {
   readonly bootstrap: DesktopSshEnvironmentBootstrap;
-  readonly bearerToken: string;
+  readonly sessionSecret: string;
+}
+
+export interface AuthorizedSshEnvironment {
+  readonly socketUrl: string;
 }
 
 export interface InspectedSshEnvironment {
@@ -51,6 +55,12 @@ export class SshEnvironmentGateway extends Context.Service<
     readonly exchange: (
       input: InspectedSshEnvironment,
     ) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
+    /** Uses the protected DPoP session to mint one WebSocket ticket. */
+    readonly authorize: (input: {
+      readonly bootstrap: DesktopSshEnvironmentBootstrap;
+      readonly sessionSecret: string;
+      readonly cancellation: AbortSignal;
+    }) => Effect.Effect<AuthorizedSshEnvironment, ConnectionAttemptError>;
     readonly disconnect: (
       target: DesktopSshEnvironmentTarget,
       expectedHostKeyFingerprint: string,

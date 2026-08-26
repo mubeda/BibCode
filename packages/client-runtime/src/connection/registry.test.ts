@@ -636,6 +636,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   const sshGateway = ClientCapabilities.SshEnvironmentGateway.of({
     inspect: () => Effect.die(new Error("SSH inspection is not used.")),
     exchange: () => Effect.die(new Error("SSH exchange is not used.")),
+    authorize: () => Effect.die(new Error("SSH authorization is not used.")),
     disconnect: (target, hostKeyFingerprint) =>
       Effect.gen(function* () {
         yield* Ref.update(lifecycleEvents, (current) => [...current, "disconnect-ssh"]);
@@ -1910,15 +1911,34 @@ describe("EnvironmentRegistry", () => {
 
       yield* Effect.gen(function* () {
         const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
-        const registration = new PrimaryConnectionRegistration({ target: TARGET });
+        const environmentId = DurableEnvironmentId.make("00000000-0000-4000-8000-0000000000e1");
+        const target = new PrimaryConnectionTarget({
+          environmentId,
+          label: "Local",
+          httpBaseUrl: "http://127.0.0.1:48291",
+          wsBaseUrl: "ws://127.0.0.1:48291",
+        });
+        const registration = new PrimaryConnectionRegistration({
+          target,
+          descriptor: {
+            ...PREPARED.descriptor,
+            environmentId,
+            storageInstanceId: "00000000-0000-4000-8000-0000000000e2",
+          },
+        });
         yield* registry.registerPlatform(registration);
         yield* awaitConnectionState(
           registry,
-          TARGET.environmentId,
+          environmentId,
           (state) => state.phase === "connected",
         );
 
         yield* registry.registerPlatform(registration);
+        yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (state) => state.phase === "connected",
+        );
 
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);

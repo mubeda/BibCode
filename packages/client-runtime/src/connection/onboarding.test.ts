@@ -75,8 +75,9 @@ function attemptSshEnrollmentWithDescriptor(descriptor: unknown) {
       exchange: () =>
         Effect.sync(() => {
           exchangeCalls += 1;
-          return { bootstrap, bearerToken: "must-not-exist" };
+          return { bootstrap, sessionSecret: "must-not-exist" };
         }),
+      authorize: () => Effect.die("unused"),
       disconnect: () => Effect.die("unused"),
     });
 
@@ -138,7 +139,8 @@ function inspectSavedPinForTarget(
           inspectedPin = input.hostKeyFingerprint;
           return { bootstrap, descriptor };
         }),
-      exchange: () => Effect.succeed({ bootstrap, bearerToken: "bearer-token" }),
+      exchange: () => Effect.succeed({ bootstrap, sessionSecret: "protected-dpop-session" }),
+      authorize: () => Effect.die("unused"),
       disconnect: () => Effect.die("unused"),
     });
 
@@ -421,7 +423,8 @@ describe("connection onboarding", () => {
       const gateway = SshEnvironmentGateway.of({
         inspect: () => Effect.succeed({ bootstrap, descriptor: sshDescriptor() }),
         exchange: (input) =>
-          Effect.succeed({ bootstrap: input.bootstrap, bearerToken: "bearer-token" }),
+          Effect.succeed({ bootstrap: input.bootstrap, sessionSecret: "protected-dpop-session" }),
+        authorize: () => Effect.die("unused"),
         disconnect: () => Effect.die("unused"),
       });
       const registration = yield* prepareSshRegistration({ target }).pipe(
@@ -558,8 +561,9 @@ describe("connection onboarding", () => {
         exchange: (input) =>
           Effect.sync(() => {
             events.push("verify-environment-storage-protocol", "create-pairing", "redeem-pairing");
-            return { bootstrap: input.bootstrap, bearerToken: "bearer-token" };
+            return { bootstrap: input.bootstrap, sessionSecret: "protected-dpop-session" };
           }),
+        authorize: () => Effect.die("unused"),
         disconnect: () => Effect.die("unused"),
       });
 
@@ -596,7 +600,7 @@ describe("connection onboarding", () => {
         },
         sessionSecret: {
           routeId: `ssh:${SSH_ENVIRONMENT_ID}`,
-          value: "bearer-token",
+          value: "protected-dpop-session",
         },
       });
     }),
@@ -660,8 +664,9 @@ describe("connection onboarding", () => {
         exchange: () =>
           Effect.sync(() => {
             exchangeCalls += 1;
-            return { bootstrap, bearerToken: "must-not-exist" };
+            return { bootstrap, sessionSecret: "must-not-exist" };
           }),
+        authorize: () => Effect.die("unused"),
         disconnect: () => Effect.die("unused"),
       });
 
@@ -734,8 +739,9 @@ describe("connection onboarding", () => {
         exchange: () =>
           Effect.sync(() => {
             exchangeCalls += 1;
-            return { bootstrap, bearerToken: "must-not-exist" };
+            return { bootstrap, sessionSecret: "must-not-exist" };
           }),
+        authorize: () => Effect.die("unused"),
         disconnect: () => Effect.die("unused"),
       });
 

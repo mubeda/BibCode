@@ -11,12 +11,27 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   environmentRemovalHostAuthority,
+  environmentRemovalPlanErrorDescription,
   removalReachability,
 } from "./_chat.environments.$environmentId_.remove";
 
 const environmentId = EnvironmentId.make("76aa78e8-67aa-477e-bd25-68f491885224");
 
 describe("environment removal route", () => {
+  it("preserves bounded native removal-plan failures for the user", () => {
+    expect(
+      environmentRemovalPlanErrorDescription(
+        "BiBCode Server is not installed on the selected SSH host.",
+      ),
+    ).toBe("BiBCode Server is not installed on the selected SSH host.");
+    expect(environmentRemovalPlanErrorDescription(new Error("SSH transport failed."))).toBe(
+      "SSH transport failed.",
+    );
+    expect(environmentRemovalPlanErrorDescription({ reason: "opaque" })).toBe(
+      "The host did not return an identity-bound removal plan.",
+    );
+  });
+
   it("does not treat stopped or setup-required WSL as remotely reachable", () => {
     expect(
       removalReachability({

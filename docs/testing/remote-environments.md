@@ -214,7 +214,8 @@ it for reconnect.
 
 On each native, WSL, and SSH environment, use disposable roots to:
 
-1. pick a folder through that environment's own filesystem surface;
+1. select that environment in Add Project's center Host/Location selector and
+   pick or enter a folder through that environment's own filesystem surface;
 2. add a repository and receive one Project plus Main;
 3. add its primary path and a linked worktree again and receive the existing
    Project/Main rather than a duplicate;

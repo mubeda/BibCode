@@ -1,5 +1,4 @@
 import {
-  AuthStandardClientScopes,
   EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   type DesktopBridge,
@@ -259,8 +258,8 @@ const SSH_BOOTSTRAP = {
 interface BridgeOptions {
   readonly failDescriptor?: boolean;
   readonly failEnsure?: unknown;
-  readonly accessToken?: string | null;
-  readonly failBearer?: boolean;
+  readonly sessionSecret?: string | null;
+  readonly failDpop?: boolean;
   readonly failDisconnect?: boolean;
   readonly onEnsure?: (options: {
     readonly operationId?: string;
@@ -310,20 +309,26 @@ function makeBridge(calls: string[], options: BridgeOptions = {}): DesktopBridge
     },
     pairSshEnvironment: async () => {
       calls.push("pairing");
-      if (options.accessToken === null) {
+      if (options.sessionSecret === null) {
         return null as never;
       }
       calls.push("token");
-      if (options.failBearer === true) {
-        throw new Error("bearer denied");
+      if (options.failDpop === true) {
+        throw new Error("DPoP denied");
       }
       return {
-        access_token: options.accessToken ?? "bearer-token",
-        issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
-        token_type: "Bearer",
-        expires_in: 3_600,
-        scope: AuthStandardClientScopes.join(" "),
+        schemaVersion: 1,
+        sessionSecret: options.sessionSecret ?? "protected-dpop-session",
+        tokenType: "DPoP",
       };
+    },
+    fetchSshSessionState: async () => {
+      calls.push("session");
+      return { authenticated: true } as never;
+    },
+    issueSshWebSocketTicket: async () => {
+      calls.push("ticket");
+      return { ticket: "one-use-ticket" } as never;
     },
     disconnectSshEnvironment: async () => {
       calls.push("disconnect");
@@ -444,7 +449,7 @@ describe("desktop SSH pairing", () => {
         bootstrap: SSH_BOOTSTRAP,
         descriptor: SSH_DESCRIPTOR,
       });
-      expect(prepared.bearerToken).toBe("bearer-token");
+      expect(prepared.sessionSecret).toBe("protected-dpop-session");
       expect(calls).toEqual(["pairing", "token"]);
     }),
   );
@@ -452,19 +457,22 @@ describe("desktop SSH pairing", () => {
   it.effect("blocks exchange when the SSH environment issues no paired session", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
-      const error = yield* exchangeDesktopSshEnvironment(makeBridge(calls, { accessToken: null }), {
-        bootstrap: SSH_BOOTSTRAP,
-        descriptor: SSH_DESCRIPTOR,
-      }).pipe(Effect.flip);
+      const error = yield* exchangeDesktopSshEnvironment(
+        makeBridge(calls, { sessionSecret: null }),
+        {
+          bootstrap: SSH_BOOTSTRAP,
+          descriptor: SSH_DESCRIPTOR,
+        },
+      ).pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionBlockedError);
       expect(calls).toEqual(["pairing"]);
     }),
   );
 
-  it.effect("propagates a bearer-session failure while exchanging", () =>
+  it.effect("propagates a DPoP-session failure while exchanging", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
-      const error = yield* exchangeDesktopSshEnvironment(makeBridge(calls, { failBearer: true }), {
+      const error = yield* exchangeDesktopSshEnvironment(makeBridge(calls, { failDpop: true }), {
         bootstrap: SSH_BOOTSTRAP,
         descriptor: SSH_DESCRIPTOR,
       }).pipe(Effect.flip);
@@ -741,8 +749,24 @@ describe("connectionPlatformLayer ssh gateway", () => {
         bootstrap: SSH_BOOTSTRAP,
         descriptor: SSH_DESCRIPTOR,
       });
-      expect(prepared.bearerToken).toBe("bearer-token");
+      expect(prepared.sessionSecret).toBe("protected-dpop-session");
       expect(calls).toEqual(["pairing", "token"]);
+    }).pipe(Effect.provide(connectionPlatformLayer));
+  });
+
+  it.effect("mints an SSH WebSocket ticket through the native DPoP session", () => {
+    const calls: string[] = [];
+    const bridge = makeBridge(calls);
+    stubBrowser({ desktopBridge: bridge });
+    return Effect.gen(function* () {
+      const ssh = yield* SshEnvironmentGateway;
+      const authorized = yield* ssh.authorize({
+        bootstrap: SSH_BOOTSTRAP,
+        sessionSecret: "protected-dpop-session",
+        cancellation: new AbortController().signal,
+      });
+      expect(authorized.socketUrl).toBe("ws://127.0.0.1:3201/ws?wsTicket=one-use-ticket");
+      expect(calls).toEqual(["session", "ticket"]);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 

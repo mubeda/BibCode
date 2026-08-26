@@ -40,6 +40,12 @@ export function removalReachability(input: {
   return input.phase === "connected" ? "online" : "offline";
 }
 
+export function environmentRemovalPlanErrorDescription(error: unknown): string {
+  if (typeof error === "string" && error.trim() !== "") return error;
+  if (error instanceof Error && error.message.trim() !== "") return error.message;
+  return "The host did not return an identity-bound removal plan.";
+}
+
 export interface EnvironmentRemovalHostAuthority {
   readonly target: DesktopEnvironmentRemovalTarget;
   readonly environmentGeneration: number;
@@ -202,10 +208,7 @@ function EnvironmentRemovalRouteView() {
         stackedThreadToast({
           type: "error",
           title: "Could not verify remote removal",
-          description:
-            error instanceof Error
-              ? error.message
-              : "The host did not return an identity-bound removal plan.",
+          description: environmentRemovalPlanErrorDescription(error),
         }),
       );
     } finally {

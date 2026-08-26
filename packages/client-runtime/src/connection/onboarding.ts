@@ -470,7 +470,7 @@ const prepareSshEnrollment = Effect.fn("clientRuntime.connection.onboarding.prep
     return {
       registration: inspectedEnrollment.registration,
       environment: inspectedEnrollment.environment,
-      sessionSecret: exchanged.bearerToken,
+      sessionSecret: exchanged.sessionSecret,
     } satisfies PreparedSshEnrollment;
   },
 );

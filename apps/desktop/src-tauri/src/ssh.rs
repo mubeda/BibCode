@@ -262,7 +262,7 @@ if [ -z "$REMOTE_PORT" ]; then
   printf 'Failed to find an available port on the remote host.\n' >&2
   exit 1
 fi
-nohup env BIBCODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" --no-startup-pairing >>"$LOG_FILE" 2>&1 < /dev/null &
+nohup env BIBCODE_NO_BROWSER=true "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$SERVER_HOME" --no-startup-pairing >>"$LOG_FILE" 2>&1 < /dev/null &
 REMOTE_PID="$!"
 printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
 printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
@@ -9020,6 +9020,8 @@ mod tests {
         }
         assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v bibcode"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("native BiBCode CLI"));
+        assert!(REMOTE_LAUNCH_SCRIPT.contains("BIBCODE_NO_BROWSER=true"));
+        assert!(!REMOTE_LAUNCH_SCRIPT.contains("BIBCODE_NO_BROWSER=1"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("--no-startup-pairing"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("umask 077"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains(": > \"$LOG_FILE\""));

@@ -645,10 +645,10 @@ function createTauriDesktopBridge(
       ),
     pairSshEnvironment: (target, descriptor) =>
       tauriInvoke("desktop_bridge_pair_ssh_environment", { target, descriptor }),
-    fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) =>
-      tauriInvoke("desktop_bridge_fetch_ssh_session_state", { httpBaseUrl, bearerToken }),
-    issueSshWebSocketTicket: (httpBaseUrl: string, bearerToken: string) =>
-      tauriInvoke("desktop_bridge_issue_ssh_web_socket_ticket", { httpBaseUrl, bearerToken }),
+    fetchSshSessionState: (httpBaseUrl: string, sessionSecret: string) =>
+      tauriInvoke("desktop_bridge_fetch_ssh_session_state", { httpBaseUrl, sessionSecret }),
+    issueSshWebSocketTicket: (httpBaseUrl: string, sessionSecret: string) =>
+      tauriInvoke("desktop_bridge_issue_ssh_web_socket_ticket", { httpBaseUrl, sessionSecret }),
     onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) =>
       tauriListen(SSH_PASSWORD_PROMPT_EVENT, listener),
     resolveSshPasswordPrompt: (requestId, password) =>

@@ -50,7 +50,8 @@ Select focused tests from affected source and verify at least:
 - the local-control directory/socket remain owned by the service user with
   modes `0700`/`0600`, reject a wrong peer UID before frame reads, replace only
   a verified stale owned socket, and unlink only the current process's socket;
-- local-only desktop presentation omits WSL and remote-device controls;
+- desktop presentation omits WSL but exposes enrolled SSH/Direct HTTPS
+  environments and their center-workspace controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
 - Linux AppImage/desktop identity and taskbar behavior remain covered.
 
@@ -205,8 +206,10 @@ user profile globally.
 Use Codex Computer Use, not Orca. Capture the actual X11/Wayland and desktop
 environment in the report. At normal and minimum sizes verify:
 
-- Add Project creates a project only beneath the selected owning environment;
-  it has no cross-environment repository grouping or Host selector;
+- Add Project creates a project only beneath the selected owning environment,
+  has no cross-environment repository grouping, and shows **Host** when more
+  than one usable local/SSH/Direct HTTPS environment is connected. Remote hosts
+  use explicit host paths rather than the native Linux folder picker;
 - **Settings > Environments** lists Known and Hidden environments, while the
   center **Add environment** workspace exposes SSH and strict Direct HTTPS but
   omits WSL. With a

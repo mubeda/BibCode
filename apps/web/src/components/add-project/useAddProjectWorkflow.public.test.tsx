@@ -240,14 +240,7 @@ function presentation(
   return {
     surface,
     platform,
-    presentsTarget: (target) => {
-      if (surface === "browser" || target._tag === "PrimaryConnectionTarget") return true;
-      return (
-        platform === "windows" &&
-        "connectionId" in target &&
-        target.connectionId.startsWith("local:")
-      );
-    },
+    presentsTarget: (_target) => true,
   };
 }
 
@@ -321,7 +314,7 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflow public adapter", () => {
-  it("presents only this device without a location selector on macOS desktop", async () => {
+  it("presents remote environments with a host selector on macOS desktop", async () => {
     harness.environments = [
       ...harness.environments,
       environment(wslEnvironmentId, "Ubuntu (WSL)", {
@@ -341,8 +334,12 @@ describe("useAddProjectWorkflow public adapter", () => {
 
     await mountWorkflow();
 
-    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual(["This device"]);
-    expect(currentWorkflow).toHaveProperty("locationLabel", null);
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
+      "This device",
+      "Build server",
+      "Remote server",
+    ]);
+    expect(currentWorkflow).toHaveProperty("locationLabel", "Host");
   });
 
   it("presents primary and WSL locations on Windows desktop", async () => {
@@ -370,6 +367,8 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
       "This device",
       "Ubuntu (WSL)",
+      "Build server",
+      "Remote server",
     ]);
     expect(currentWorkflow).toHaveProperty("locationLabel", "Location");
   });

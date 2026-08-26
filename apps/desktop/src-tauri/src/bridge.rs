@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use http_body_util::{BodyExt as _, Full};
@@ -8,14 +9,16 @@ use hyper::{
     header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
 };
 use hyper_util::rt::TokioIo;
+use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -219,6 +222,121 @@ fn remote_api_client() -> Result<reqwest::Client, String> {
     build_remote_api_client(reqwest::Client::builder())
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SshDpopSessionSecret {
+    schema_version: u16,
+    access_token: String,
+    private_key: String,
+}
+
+struct SshDpopKey {
+    signing_key: SigningKey,
+}
+
+impl SshDpopKey {
+    fn generate() -> Result<Self, String> {
+        for _ in 0..8 {
+            let mut bytes = [0_u8; 32];
+            getrandom::fill(&mut bytes)
+                .map_err(|error| bridge_error("Could not generate the SSH DPoP key", error))?;
+            if let Ok(key) = Self::from_private_bytes(bytes) {
+                return Ok(key);
+            }
+        }
+        Err("Could not generate a valid SSH DPoP key.".to_string())
+    }
+
+    fn from_private_bytes(bytes: [u8; 32]) -> Result<Self, String> {
+        SigningKey::from_bytes((&bytes).into())
+            .map(|signing_key| Self { signing_key })
+            .map_err(|_| "The SSH DPoP private key is invalid.".to_string())
+    }
+
+    fn session_secret(&self, access_token: &str) -> Result<String, String> {
+        serde_json::to_string(&SshDpopSessionSecret {
+            schema_version: 1,
+            access_token: access_token.to_string(),
+            private_key: URL_SAFE_NO_PAD.encode(self.signing_key.to_bytes()),
+        })
+        .map_err(|error| bridge_error("Could not encode the SSH DPoP session", error))
+    }
+
+    fn from_session_secret(value: &str) -> Result<(Self, String), String> {
+        let secret: SshDpopSessionSecret = serde_json::from_str(value)
+            .map_err(|_| "The protected SSH session is invalid.".to_string())?;
+        if secret.schema_version != 1
+            || secret.access_token.trim().is_empty()
+            || secret.access_token.trim() != secret.access_token
+        {
+            return Err("The protected SSH session is invalid.".to_string());
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(secret.private_key)
+            .map_err(|_| "The protected SSH session is invalid.".to_string())?;
+        let private_key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "The protected SSH session is invalid.".to_string())?;
+        Ok((Self::from_private_bytes(private_key)?, secret.access_token))
+    }
+
+    fn proof(&self, method: &str, url: &str, access_token: Option<&str>) -> Result<String, String> {
+        let point = self.signing_key.verifying_key().to_sec1_point(false);
+        let x = point
+            .x()
+            .ok_or_else(|| "Could not encode the SSH DPoP public key.".to_string())?;
+        let y = point
+            .y()
+            .ok_or_else(|| "Could not encode the SSH DPoP public key.".to_string())?;
+        let header = json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(x),
+                "y": URL_SAFE_NO_PAD.encode(y),
+            }
+        });
+        let mut normalized_url = url::Url::parse(url)
+            .map_err(|error| bridge_error("Could not build the SSH DPoP proof URL", error))?;
+        normalized_url.set_query(None);
+        normalized_url.set_fragment(None);
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "The system clock cannot issue an SSH DPoP proof.".to_string())?
+            .as_secs();
+        let mut payload = json!({
+            "htm": method,
+            "htu": normalized_url.to_string(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "iat": issued_at,
+        });
+        if let Some(token) = access_token {
+            payload["ath"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())));
+        }
+        let encoded_header =
+            URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&header).map_err(|error| {
+                    bridge_error("Could not encode the SSH DPoP header", error)
+                })?);
+        let encoded_payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&payload)
+                .map_err(|error| bridge_error("Could not encode the SSH DPoP payload", error))?,
+        );
+        let signing_input = format!("{encoded_header}.{encoded_payload}");
+        let digest = Sha256::digest(signing_input.as_bytes());
+        let signature: Signature = self
+            .signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| "Could not sign the SSH DPoP proof.".to_string())?;
+        Ok(format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        ))
+    }
+}
+
 struct SshPairingConnection {
     sender: http1::SendRequest<Full<Bytes>>,
     authority: String,
@@ -275,7 +393,7 @@ impl SshPairingConnection {
         self.request_json(operation, request).await
     }
 
-    async fn redeem(&mut self, credential: String) -> Result<Value, String> {
+    async fn redeem(&mut self, credential: String, dpop: &SshDpopKey) -> Result<Value, String> {
         let body = {
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             serializer.append_pair("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE);
@@ -292,11 +410,17 @@ impl SshPairingConnection {
             .header(HOST, &self.authority)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(CONTENT_LENGTH, body.len())
+            .header(
+                "dpop",
+                dpop.proof(
+                    "POST",
+                    &format!("http://{}/oauth/token", self.authority),
+                    None,
+                )?,
+            )
             .body(Full::new(Bytes::from(body)))
             .map_err(|error| bridge_error("Could not build the environment API request", error))?;
-        let result = self
-            .request_json("bootstrap-bearer-session", request)
-            .await?;
+        let result = self.request_json("bootstrap-dpop-session", request).await?;
         canonicalize_ssh_access_token_result(&result)
     }
 
@@ -417,18 +541,21 @@ async fn remote_get_json(
     remote_json_response(operation, response).await
 }
 
-async fn remote_post_json(
+async fn remote_dpop_json(
     operation: &str,
+    method: reqwest::Method,
     http_base_url: String,
     pathname: &str,
-    bearer_token: Option<String>,
+    session_secret: String,
 ) -> Result<Value, String> {
     let client = remote_api_client()?;
-    let mut request = client.post(ssh_loopback_endpoint_url(&http_base_url, pathname)?);
-    if let Some(token) = bearer_token {
-        request = request.bearer_auth(token);
-    }
-    let response = request
+    let url = ssh_loopback_endpoint_url(&http_base_url, pathname)?;
+    let (dpop, access_token) = SshDpopKey::from_session_secret(&session_secret)?;
+    let proof = dpop.proof(method.as_str(), url.as_str(), Some(&access_token))?;
+    let response = client
+        .request(method, url)
+        .header("authorization", format!("DPoP {access_token}"))
+        .header("dpop", proof)
         .send()
         .await
         .map_err(|error| bridge_error("Could not reach the environment API", error))?;
@@ -1324,7 +1451,17 @@ pub async fn desktop_bridge_pair_ssh_environment(
     let retained_bootstrap = ssh.active_bootstrap(&target)?;
     validate_retained_ssh_pairing_tunnel(&bootstrap, retained_bootstrap.as_ref())?;
     let credential = ssh.create_pairing(&app, &prompts, target).await?;
-    connection.redeem(credential).await
+    let dpop = SshDpopKey::generate()?;
+    let access = connection.redeem(credential, &dpop).await?;
+    let access_token = access
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "The SSH pairing response has no valid access token.".to_string())?;
+    Ok(json!({
+        "schemaVersion": 1,
+        "sessionSecret": dpop.session_secret(access_token)?,
+        "tokenType": "DPoP",
+    }))
 }
 
 fn validate_retained_ssh_pairing_tunnel(
@@ -1370,7 +1507,7 @@ fn canonicalize_ssh_access_token_result(result: &Value) -> Result<Value, String>
     if result.issued_token_type != AUTH_ACCESS_TOKEN_TYPE {
         return Err("The SSH pairing response has an invalid issued-token type.".to_string());
     }
-    if result.token_type != "Bearer" {
+    if result.token_type != "DPoP" {
         return Err("The SSH pairing response has an invalid token type.".to_string());
     }
     if result.expires_in == 0 {
@@ -1386,13 +1523,14 @@ fn canonicalize_ssh_access_token_result(result: &Value) -> Result<Value, String>
 #[tauri::command]
 pub async fn desktop_bridge_fetch_ssh_session_state(
     http_base_url: String,
-    bearer_token: String,
+    session_secret: String,
 ) -> Result<Value, String> {
-    remote_get_json(
+    remote_dpop_json(
         "fetch-session-state",
+        reqwest::Method::GET,
         http_base_url,
         "/api/auth/session",
-        Some(bearer_token),
+        session_secret,
     )
     .await
 }
@@ -1400,13 +1538,14 @@ pub async fn desktop_bridge_fetch_ssh_session_state(
 #[tauri::command]
 pub async fn desktop_bridge_issue_ssh_web_socket_ticket(
     http_base_url: String,
-    bearer_token: String,
+    session_secret: String,
 ) -> Result<Value, String> {
-    remote_post_json(
+    remote_dpop_json(
         "issue-websocket-ticket",
+        reqwest::Method::POST,
         http_base_url,
         "/api/auth/websocket-ticket",
-        Some(bearer_token),
+        session_secret,
     )
     .await
 }
@@ -3530,26 +3669,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_ssh_session_state_routes_with_bearer_authorization() {
+    async fn fetch_ssh_session_state_routes_with_dpop_authorization() {
         let (base_url, requests) = spawn_json_test_server(r#"{"status":"authenticated"}"#);
+        let session_secret = SshDpopKey::from_private_bytes([10; 32])
+            .expect("deterministic DPoP key should be valid")
+            .session_secret("session-dpop-token")
+            .expect("session secret should encode");
 
-        let state =
-            desktop_bridge_fetch_ssh_session_state(base_url, "session-bearer-token".to_string())
-                .await
-                .expect("session state should load");
+        let state = desktop_bridge_fetch_ssh_session_state(base_url, session_secret)
+            .await
+            .expect("session state should load");
 
         assert_eq!(state, json!({ "status": "authenticated" }));
         let request = requests.recv().expect("request should be captured");
         assert!(request.starts_with("GET /api/auth/session HTTP/1.1"));
-        assert!(request.contains("authorization: Bearer session-bearer-token"));
+        assert!(request.contains("authorization: DPoP session-dpop-token"));
+        assert!(request.contains("dpop: "));
     }
 
     #[tokio::test]
-    async fn redeem_ssh_pairing_posts_oauth_token_exchange() {
+    async fn redeem_ssh_pairing_posts_dpop_token_exchange() {
         let response = json!({
-            "access_token": "bearer-token",
+            "access_token": "dpop-token",
             "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-            "token_type": "Bearer",
+            "token_type": "DPoP",
             "expires_in": 3600,
             "scope": "environment:read environment:write",
             "credential": "bootstrap-token",
@@ -3576,17 +3719,19 @@ mod tests {
         let mut connection = SshPairingConnection::connect(&format!("http://{address}"))
             .await
             .expect("pairing connection should open");
+        let dpop = SshDpopKey::from_private_bytes([7; 32])
+            .expect("deterministic DPoP key should be valid");
         let session = connection
-            .redeem("bootstrap-token".to_string())
+            .redeem("bootstrap-token".to_string(), &dpop)
             .await
             .expect("bootstrap request should succeed");
 
         assert_eq!(
             session,
             json!({
-                "access_token": "bearer-token",
+                "access_token": "dpop-token",
                 "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-                "token_type": "Bearer",
+                "token_type": "DPoP",
                 "expires_in": 3600,
                 "scope": "environment:read environment:write",
             })
@@ -3601,6 +3746,7 @@ mod tests {
                 .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
         );
         assert!(request.contains("client_label=BiBCode+Tauri+Desktop"));
+        assert!(request.contains("dpop: "));
     }
 
     #[tokio::test]
@@ -3609,7 +3755,7 @@ mod tests {
         let token_body = serde_json::to_string(&json!({
             "access_token": "retained-stream-token",
             "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-            "token_type": "Bearer",
+            "token_type": "DPoP",
             "expires_in": 3600,
             "scope": "environment:read environment:write",
         }))
@@ -3649,6 +3795,8 @@ mod tests {
         let mut connection = SshPairingConnection::connect(&format!("http://{address}"))
             .await
             .expect("retained pairing connection should open");
+        let dpop = SshDpopKey::from_private_bytes([8; 32])
+            .expect("deterministic DPoP key should be valid");
         assert_eq!(
             connection
                 .get_json("verify-before-pairing", "/.well-known/bibcode/environment")
@@ -3657,7 +3805,7 @@ mod tests {
             json!({ "environmentId": "retained-stream" })
         );
         let session = connection
-            .redeem("one-use-secret".to_string())
+            .redeem("one-use-secret".to_string(), &dpop)
             .await
             .expect("redemption should reuse the retained stream after the listener closes");
         assert_eq!(session["access_token"], "retained-stream-token");
@@ -3723,8 +3871,10 @@ mod tests {
         let mut connection = SshPairingConnection::connect(&format!("http://{redirect_address}"))
             .await
             .expect("pairing connection should open");
+        let dpop = SshDpopKey::from_private_bytes([9; 32])
+            .expect("deterministic DPoP key should be valid");
         let error = connection
-            .redeem("pairing-credential".to_string())
+            .redeem("pairing-credential".to_string(), &dpop)
             .await
             .expect_err("SSH pairing must reject redirects");
         assert!(error.contains("ssh_http:307"), "{error}");
@@ -3896,35 +4046,35 @@ mod tests {
     }
 
     #[test]
-    fn ssh_pairing_requires_a_complete_access_token_result() {
+    fn ssh_pairing_requires_a_complete_dpop_access_token_result() {
         let valid = json!({
-            "access_token": "bearer-token",
+            "access_token": "dpop-token",
             "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-            "token_type": "Bearer",
+            "token_type": "DPoP",
             "expires_in": 3600,
             "scope": "environment:read environment:write",
         });
         canonicalize_ssh_access_token_result(&valid).expect("complete access token result");
         for invalid in [
-            json!({"access_token":"bearer-token","token_type":"Bearer"}),
+            json!({"access_token":"dpop-token","token_type":"DPoP"}),
             json!({
                 "access_token": "bearer-token",
                 "issued_token_type": "wrong",
-                "token_type": "Bearer",
+                "token_type": "DPoP",
                 "expires_in": 3600,
                 "scope": "environment:read",
             }),
             json!({
                 "access_token": "bearer-token",
                 "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-                "token_type": "Bearer",
+                "token_type": "DPoP",
                 "expires_in": 3600,
                 "scope": " ",
             }),
             json!({
-                "access_token": "dpop-token",
+                "access_token": "bearer-token",
                 "issued_token_type": AUTH_ACCESS_TOKEN_TYPE,
-                "token_type": "DPoP",
+                "token_type": "Bearer",
                 "expires_in": 3600,
                 "scope": "environment:read",
             }),
@@ -3934,14 +4084,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_web_socket_ticket_sends_bearer_authorization() {
+    async fn issue_web_socket_ticket_sends_dpop_authorization() {
         let (base_url, requests) =
             spawn_json_test_server(r#"{"ticket":"ticket-1","expiresAt":"2026-07-08T00:00:00Z"}"#);
+        let session_secret = SshDpopKey::from_private_bytes([11; 32])
+            .expect("deterministic DPoP key should be valid")
+            .session_secret("session-dpop-token")
+            .expect("session secret should encode");
 
-        let ticket =
-            desktop_bridge_issue_ssh_web_socket_ticket(base_url, "bearer-token".to_string())
-                .await
-                .expect("ticket request should succeed");
+        let ticket = desktop_bridge_issue_ssh_web_socket_ticket(base_url, session_secret)
+            .await
+            .expect("ticket request should succeed");
 
         assert_eq!(
             ticket,
@@ -3949,7 +4102,8 @@ mod tests {
         );
         let request = requests.recv().expect("request should be captured");
         assert!(request.starts_with("POST /api/auth/websocket-ticket HTTP/1.1"));
-        assert!(request.contains("authorization: Bearer bearer-token"));
+        assert!(request.contains("authorization: DPoP session-dpop-token"));
+        assert!(request.contains("dpop: "));
     }
 
     #[test]
@@ -4319,14 +4473,14 @@ mod tests {
                 "desktop_bridge_fetch_ssh_session_state",
                 json!({
                     "httpBaseUrl":"file:///tmp/blocked",
-                    "bearerToken":"bearer-token",
+                    "sessionSecret":"opaque-session-secret",
                 }),
             ),
             (
                 "desktop_bridge_issue_ssh_web_socket_ticket",
                 json!({
                     "httpBaseUrl":"file:///tmp/blocked",
-                    "bearerToken":"bearer-token",
+                    "sessionSecret":"opaque-session-secret",
                 }),
             ),
         ] {

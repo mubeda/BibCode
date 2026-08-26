@@ -225,18 +225,12 @@ pub fn run() {
                 event: tauri::WindowEvent::Focused(true),
                 ..
             } => wsl::request_refresh(app_handle.clone(), "application focus"),
-            tauri::RunEvent::ExitRequested { .. } => {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 if let Err(error) =
                     tauri::async_runtime::block_on(prepare_desktop_runtime_for_exit(app_handle))
                 {
                     tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
                 }
-            }
-            tauri::RunEvent::Exit => {
-                app_handle.state::<wsl::WslDiscoveryService>().shutdown();
-                app_handle
-                    .state::<wsl_setup::WslSetupManager>()
-                    .cancel_all();
             }
             _ => {}
         });

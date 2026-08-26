@@ -1,6 +1,5 @@
 import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
 
-import { isDesktopLocalConnectionTarget } from "./desktopLocal";
 import { isLinuxPlatform, isMacPlatform, isWindowsPlatform } from "../lib/utils";
 
 export type ClientPresentationSurface = "browser" | "desktop";
@@ -30,38 +29,18 @@ export function normalizeDesktopHostPlatform(platform: string): DesktopHostPlatf
   return "unknown";
 }
 
-function isLocalDesktopTarget(
-  policy: Pick<EnvironmentPresentationPolicy, "surface" | "platform">,
-  target: ConnectionTarget,
-): boolean {
-  if (target._tag === "PrimaryConnectionTarget") {
-    return true;
-  }
-  return (
-    policy.surface === "desktop" &&
-    policy.platform === "windows" &&
-    isDesktopLocalConnectionTarget(target)
-  );
-}
-
 export function createEnvironmentPresentationPolicy(input: {
   readonly surface: ClientPresentationSurface;
   readonly platform: DesktopHostPlatform;
 }): EnvironmentPresentationPolicy {
-  const browser = input.surface === "browser";
-  const connectionsPresentation = browser
-    ? "full"
-    : input.platform === "windows"
-      ? "local-wsl"
-      : "redirect-general";
-  const presentsTarget = (target: ConnectionTarget) =>
-    browser || isLocalDesktopTarget(input, target);
+  const connectionsPresentation = "full";
+  const presentsTarget = (_target: ConnectionTarget) => true;
 
   return {
     ...input,
     connectionsPresentation,
-    showRemoteDeviceControls: browser,
-    showLocalEnvironmentSettings: connectionsPresentation === "local-wsl",
+    showRemoteDeviceControls: true,
+    showLocalEnvironmentSettings: false,
     presentsTarget,
     permitsConnectionAction: presentsTarget,
   };

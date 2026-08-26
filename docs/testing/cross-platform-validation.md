@@ -798,7 +798,10 @@ Capture original-resolution screenshots at normal and minimum supported window
 sizes. Cover relevant:
 
 - Environment -> Project -> Main/thread hierarchy and Add Project duplicate
-  disposition, with no left-panel settings/information tabs;
+  disposition, with no left-panel settings/information tabs. With two or more
+  usable environments, verify the center dialog's Host/Location selector routes
+  the project to the selected owner and an SSH/Direct HTTPS host uses explicit
+  host paths instead of the desktop native folder picker;
 - first run; several online environments; WSL **Setup required** and **Stopped**;
   connecting/reconnecting; offline full-cache, metadata-only, and no-cache;
   authentication required; version mismatch; updating; identity mismatch;

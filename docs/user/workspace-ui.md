@@ -43,12 +43,14 @@ the server reuses it when free and still suffixes it when another worktree owns
 it.
 
 Use Add Project to open one existing project folder, clone a Git URL, or create
-a new Git repository. On macOS and Linux desktop, Add Project uses this device
-and omits a redundant location selector. On Windows, it shows **Location** when
-a mapped WSL backend is available, offering **This device** and the usable WSL
-locations. Browser clients retain connected-host selection. Local and mapped
-WSL locations use the native folder picker; browser-only remote hosts accept an
-explicit host path. Selecting a folder adds that folder as one project and does
+a new Git repository. When more than one usable environment is connected,
+desktop clients show a **Host** selector on macOS/Linux and a **Location**
+selector on Windows; browser clients show **Host**. The choices include the
+primary device, usable mapped WSL environments on Windows, and connected SSH or
+Direct HTTPS environments. Local and mapped WSL locations use the native folder
+picker. SSH, Direct HTTPS, and other non-local hosts accept an explicit path on
+that host and never open the desktop filesystem picker. A single available host
+omits the redundant selector. Selecting a folder adds that folder as one project and does
 not scan for nested repositories. If that local Git common-directory/worktree
 family is already a project in the selected environment, BiBCode opens the
 existing project/Main and reports **Already added in this environment.** It does

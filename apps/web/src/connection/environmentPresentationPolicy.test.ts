@@ -58,10 +58,10 @@ const allTargetKinds: readonly ConnectionTarget[] = [
 describe("environment presentation policy", () => {
   it.each([
     ["browser", "macos", "full", true],
-    ["desktop", "macos", "redirect-general", false],
-    ["desktop", "linux", "redirect-general", false],
-    ["desktop", "windows", "local-wsl", false],
-    ["desktop", "unknown", "redirect-general", false],
+    ["desktop", "macos", "full", true],
+    ["desktop", "linux", "full", true],
+    ["desktop", "windows", "full", true],
+    ["desktop", "unknown", "full", true],
   ] as const)("derives %s/%s presentation", (surface, platform, connections, remote) => {
     const policy = createEnvironmentPresentationPolicy({ surface, platform });
 
@@ -69,44 +69,17 @@ describe("environment presentation policy", () => {
     expect(policy.showRemoteDeviceControls).toBe(remote);
   });
 
-  it("shows only primary and Windows desktop-local targets in local-only desktop mode", () => {
-    const windows = createEnvironmentPresentationPolicy({
-      surface: "desktop",
-      platform: "windows",
-    });
+  it.each(["browser", "desktop"] as const)(
+    "presents every environment target on the %s surface",
+    (surface) => {
+      const policy = createEnvironmentPresentationPolicy({ surface, platform: "unknown" });
 
-    expect(windows.presentsTarget(primaryTarget)).toBe(true);
-    expect(windows.presentsTarget(wslTarget)).toBe(true);
-    expect(windows.presentsTarget(unavailableWslTarget)).toBe(true);
-    expect(windows.presentsTarget(sshTarget)).toBe(false);
-    expect(windows.presentsTarget(remoteBearerTarget)).toBe(false);
-    expect(windows.permitsConnectionAction(remoteBearerTarget)).toBe(false);
-  });
-
-  it.each(["macos", "linux", "unknown"] as const)(
-    "rejects WSL and remote targets on %s desktop hosts",
-    (platform) => {
-      const policy = createEnvironmentPresentationPolicy({ surface: "desktop", platform });
-
-      expect(policy.presentsTarget(primaryTarget)).toBe(true);
-      expect(policy.presentsTarget(wslTarget)).toBe(false);
-      expect(policy.presentsTarget(unavailableWslTarget)).toBe(false);
-      expect(policy.presentsTarget(sshTarget)).toBe(false);
-      expect(policy.presentsTarget(remoteBearerTarget)).toBe(false);
+      for (const target of allTargetKinds) {
+        expect(policy.presentsTarget(target)).toBe(true);
+        expect(policy.permitsConnectionAction(target)).toBe(true);
+      }
     },
   );
-
-  it("presents every target kind in browser mode", () => {
-    const browser = createEnvironmentPresentationPolicy({
-      surface: "browser",
-      platform: "unknown",
-    });
-
-    for (const target of allTargetKinds) {
-      expect(browser.presentsTarget(target)).toBe(true);
-      expect(browser.permitsConnectionAction(target)).toBe(true);
-    }
-  });
 
   it.each([
     ["MacIntel", "macos"],

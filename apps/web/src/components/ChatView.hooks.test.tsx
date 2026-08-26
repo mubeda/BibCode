@@ -5351,7 +5351,7 @@ describe("ChatView banners and dialogs", () => {
     return renderToStaticMarkup(<>{bannerStack.items[0]!.actions}</>);
   }
 
-  it("gates reconnect by target while always exposing the center environment workspace", () => {
+  it("exposes reconnect and the center environment workspace for supported targets", () => {
     const remoteTarget = new BearerConnectionTarget({
       connectionId: "remote:server",
       environmentId,
@@ -5368,7 +5368,7 @@ describe("ChatView banners and dialogs", () => {
       platform: "macos",
       target: remoteTarget,
     });
-    expect(macRemoteBanner).not.toContain("Reconnect");
+    expect(macRemoteBanner).toContain("Reconnect");
     expect(macRemoteBanner).toContain("Environment");
 
     const windowsWslBanner = unavailableBannerActions({

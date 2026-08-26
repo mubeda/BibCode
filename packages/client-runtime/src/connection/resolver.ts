@@ -508,14 +508,23 @@ export const make = Effect.gen(function* () {
             detail: `${route.label} must be explicitly re-enrolled before SSH pairing.`,
           });
         }
-        const bearerToken = yield* loadRouteSecret(route.secretRef, route.label);
-        return yield* authorizeVerified({
-          identity,
-          route,
-          httpBaseUrl,
-          wsBaseUrl,
-          bearerToken,
+        const sessionSecret = yield* loadRouteSecret(route.secretRef, route.label);
+        const authorized = yield* routeSsh.authorize({
+          bootstrap: sshBootstrap,
+          sessionSecret,
+          cancellation,
         });
+        return {
+          environmentId: identity.environmentId,
+          label: identity.descriptor.label,
+          descriptor: identity.descriptor,
+          httpBaseUrl,
+          socketUrl: authorized.socketUrl,
+          httpAuthorization: { _tag: "NativeDpop" as const },
+          target: routeTarget(route),
+          route,
+          verifiedRouteIdentity: identity,
+        } satisfies PreparedConnection;
       }
     }
   });

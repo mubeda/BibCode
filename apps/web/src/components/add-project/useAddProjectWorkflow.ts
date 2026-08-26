@@ -587,9 +587,17 @@ export function useAddProjectWorkflow(input: {
         nativePickerAvailable: typeof window !== "undefined" && window.desktopBridge !== undefined,
       };
     });
+    const desktopLocalEnvironmentIds = new Set(
+      presentedEnvironments
+        .filter((environment) => isDesktopLocalConnectionTarget(environment.entry.target))
+        .map((environment) => environment.environmentId),
+    );
     const usableHosts = catalogHosts.filter(
       (host) =>
-        presentation.surface === "browser" || host.isPrimary || host.desktopInstanceId !== null,
+        presentation.surface === "browser" ||
+        host.isPrimary ||
+        host.desktopInstanceId !== null ||
+        !desktopLocalEnvironmentIds.has(host.environmentId),
     );
     return usableHosts.length > 0 ? usableHosts : [fallbackHost(primaryEnvironmentId)];
   }, [
@@ -602,9 +610,11 @@ export function useAddProjectWorkflow(input: {
   const locationLabel: AddProjectLocationLabel =
     presentation.surface === "browser"
       ? "Host"
-      : presentation.platform === "windows" && hosts.length > 1
-        ? "Location"
-        : null;
+      : hosts.length <= 1
+        ? null
+        : presentation.platform === "windows"
+          ? "Location"
+          : "Host";
 
   const operations = useMemo(
     () =>

@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_desktop_lib::{
     WSL_DISCOVERY_CHANGED_EVENT, WslDiscoveryHealth, WslDiscoverySnapshot, WslDistro,
     WslDistroState, desktop_bridge_fetch_environment_descriptor,
@@ -150,6 +151,15 @@ fn spawn_json_server(status: &'static str, body: &'static str) -> (String, mpsc:
     (format!("http://{address}"), receiver)
 }
 
+fn dpop_session_secret(access_token: &str) -> String {
+    json!({
+        "schemaVersion": 1,
+        "accessToken": access_token,
+        "privateKey": URL_SAFE_NO_PAD.encode([10_u8; 32]),
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn public_remote_bridge_commands_route_and_decode_environment_requests() {
     let descriptor = r#"{"environmentId":"00000000-0000-4000-8000-000000000061","label":"SSH environment","platform":{"os":"linux","arch":"x64"},"serverVersion":"0.4.2","storageInstanceId":"00000000-0000-4000-8000-000000000062","protocol":{"minimum":1,"maximum":1},"capabilities":{"repositoryIdentity":true},"transport":{"mode":"loopback-http"}}"#;
@@ -184,31 +194,26 @@ async fn public_remote_bridge_commands_route_and_decode_environment_requests() {
 
     let (base_url, requests) = spawn_json_server("200 OK", r#"{"status":"authenticated"}"#);
     assert_eq!(
-        desktop_bridge_fetch_ssh_session_state(base_url, "bearer-token".to_string())
+        desktop_bridge_fetch_ssh_session_state(base_url, dpop_session_secret("dpop-token"))
             .await
             .expect("session should load"),
         json!({"status":"authenticated"}),
     );
-    assert!(
-        requests
-            .recv()
-            .expect("session request")
-            .contains("authorization: Bearer bearer-token")
-    );
+    let request = requests.recv().expect("session request");
+    assert!(request.contains("authorization: DPoP dpop-token"));
+    assert!(request.contains("dpop: "));
 
     let (base_url, requests) = spawn_json_server("200 OK", r#"{"ticket":"ticket-1"}"#);
     assert_eq!(
-        desktop_bridge_issue_ssh_web_socket_ticket(base_url, "bearer-token".to_string())
+        desktop_bridge_issue_ssh_web_socket_ticket(base_url, dpop_session_secret("dpop-token"))
             .await
             .expect("ticket should issue")["ticket"],
         "ticket-1",
     );
-    assert!(
-        requests
-            .recv()
-            .expect("ticket request")
-            .starts_with("POST /api/auth/websocket-ticket HTTP/1.1")
-    );
+    let request = requests.recv().expect("ticket request");
+    assert!(request.starts_with("POST /api/auth/websocket-ticket HTTP/1.1"));
+    assert!(request.contains("authorization: DPoP dpop-token"));
+    assert!(request.contains("dpop: "));
 
     for invalid_base_url in ["not a URL", "file:///tmp/blocked"] {
         assert!(
