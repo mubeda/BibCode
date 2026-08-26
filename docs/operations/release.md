@@ -1,7 +1,8 @@
 # Release Checklist
 
-This document describes the Tauri 2 desktop release workflow. The repository
-does not package or publish Electron artifacts.
+This document describes the Tauri 2 desktop and native server release workflow.
+The repository does not package or publish Electron artifacts, a production
+Node.js runtime, or a hosted control service.
 
 ## Release Workflow
 
@@ -30,6 +31,37 @@ Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
 releases are GitHub prereleases, are never marked latest, and remain
 installer-only.
+
+### Server-only release set
+
+The same release also publishes server-only packages built by the reusable
+`.github/workflows/server-native-smoke.yml` matrix:
+
+| Platform | Native runners          | Native package    | Portable package          |
+| -------- | ----------------------- | ----------------- | ------------------------- |
+| Windows  | x64 and ARM64           | MSI               | ZIP                       |
+| macOS    | Intel and Apple Silicon | one universal PKG | per-architecture `tar.gz` |
+| Linux    | x64 and ARM64           | DEB and RPM       | `tar.gz`                  |
+
+The server pipeline has one explicit source of truth and these gates:
+
+1. `server_web_assets` freezes one production web tree and its source identity.
+2. `server_build` builds and natively exercises every target/format without
+   publishing mutable candidates.
+3. `server_sign` generates one CycloneDX 1.7 SBOM per artifact, checksum
+   inventory, signed `artifacts.json`, and detached Minisign signatures.
+4. `server_smoke` re-verifies the complete signed set plus privacy and removed
+   hosted-runtime policy.
+5. `server_aggregate` requires exact matrix cardinality before creating
+   `server-release-set`; `server_attest` then emits GitHub artifact provenance.
+6. The publish job downloads that exact aggregate and repeats complete-matrix
+   signature verification before it can enter a draft release.
+
+`artifacts.json` is authoritative for OS, architecture, format, version, source
+SHA, byte count, SHA-256, SBOM, native signing, notarization, and channel.
+Candidates are immutable between native execution and final signing. The
+public server Minisign key is `packaging/server/server-release.pub`; release
+secrets are never embedded in artifacts or logs.
 
 ## Supported Platforms
 
@@ -64,6 +96,8 @@ web application.
 
 ## Signing And OS Trust
 
+Desktop and server signing policies are separate.
+
 macOS application bundles are signed with Tauri's ad-hoc `-` identity. This
 seals the complete bundle so Gatekeeper can verify that it is intact, but it
 does not associate the app with an Apple Developer team or notarize it. Users
@@ -75,6 +109,20 @@ Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized. Tauri updater signatures verify update payloads; they do
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
+
+Stable Windows **server** executables and MSIs, unlike the current desktop NSIS
+artifact, must be timestamped Authenticode-signed and must pass both embedded
+signature verification and the declared certificate subject/thumbprint policy.
+The server release is rejected if the dedicated certificate configuration is
+missing or inconsistent.
+
+macOS server Developer ID signing and notarization remain optional. A
+credential-free server build has an ad-hoc-signed executable and an unsigned,
+unnotarized PKG; the manifest states that condition explicitly. When optional
+credentials are supplied, the workflow verifies the package signature and
+notarization result rather than silently changing the policy. Every server
+artifact on every platform still requires its dedicated Minisign signature,
+checksum entry, and signed SBOM inventory.
 
 Keep a password-protected backup of the updater private key in an approved
 offline recovery location, with access restricted to release maintainers. Keep
@@ -202,8 +250,10 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
 1. Confirm the intended version and commit have passed the local verification
    commands below. Create and push the intended tag (or dispatch `stable` with
    that explicit version) with `publish` left at its default `false`.
-2. Confirm the four native build jobs complete and that the stable jobs received
-   the two signing secrets above. Do not inspect or print their values.
+2. Confirm the four native desktop build jobs and complete native server matrix
+   finish. Confirm desktop updater secrets and the dedicated server Minisign
+   secret are present; stable Windows server rows also require their dedicated
+   certificate settings. Do not inspect or print secret values.
 3. Confirm the workflow's descriptor-validation and updater-signature steps
    passed. The workflow must validate exactly four `updater-*.json` descriptors,
    one for each manifest target listed above, before it removes those internal
@@ -215,8 +265,10 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
    - each target has a nonempty signature and a tag-specific HTTPS payload URL;
    - the release contains a nonempty `.sig` asset for each target;
    - the release contains `latest.json`, the two macOS DMGs, Linux AppImage,
-     and Windows NSIS installer, plus the updater payload archives required by
-     the manifest; and
+     Windows NSIS installer, updater payload archives, and every server artifact
+     listed in the verified complete `artifacts.json` matrix;
+   - each server artifact has an adjacent `.minisig`, CycloneDX `.cdx.json`, and
+     signed inventory coverage; and
    - no private key or passphrase is present in any asset, manifest, or log.
 
 5. Compare the draft's sorted asset names with the workflow's
@@ -228,8 +280,10 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
    repeats validation, and only then publishes it. It does not upload or
    replace the inspected draft assets. Only numeric non-prerelease stable
    releases are marked latest.
-7. Install and smoke-test each ordinary installer on its target operating
-   system after publication.
+7. Install and smoke-test each ordinary desktop installer and server package on
+   its target operating system after publication. Follow
+   [Server installer validation](../testing/server-installers.md); missing
+   native evidence is unavailable, never an inferred pass.
 
 ## Local Verification
 
@@ -252,7 +306,7 @@ Run the updater/release regression set before changing stable release
 infrastructure:
 
 ```powershell
-vp test scripts/tauri-hardening.test.ts scripts/build-desktop-artifact.test.ts scripts/build-tauri-update-manifest.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
+vp test scripts/tauri-hardening.test.ts scripts/build-desktop-artifact.test.ts scripts/build-tauri-update-manifest.test.ts scripts/build-server-artifact.test.ts scripts/verify-server-artifacts.test.ts scripts/server-install-smoke.test.ts scripts/privacy-contract.test.ts scripts/legacy-cloud-removal-contract.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
 vp test apps/web/src/components/settings/SettingsPanels.test.tsx apps/web/src/components/AppSidebarLayout.test.tsx apps/web/src/tauriDesktopBridge.test.ts apps/web/src/components/desktopUpdate.logic.test.ts apps/web/src/state/desktopUpdate.test.ts
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop -j 2
 ```
@@ -301,6 +355,18 @@ Equivalent root shortcuts are `dist:desktop:dmg`,
 `dist:desktop:linux`, `dist:desktop:win`, and `dist:desktop:win:x64`. The root
 package retains an ARM64 Windows artifact command for development experiments,
 but Windows ARM is not a supported release target.
+
+For a host-native server candidate, choose a fresh absolute output directory:
+
+```powershell
+node scripts/build-server-artifact.ts --target <native-rust-target> --formats native,portable --output-dir <fresh-absolute-output> --unsigned-test
+```
+
+This is local compatibility/build evidence, not a signed release. Finalization
+uses `scripts/sign-server-artifacts.ts`; verification uses
+`scripts/verify-server-artifacts.ts --require-complete-matrix`. Do not publish
+an `unsigned-test` manifest or substitute a cross-built package for native
+installer evidence.
 
 ## References
 

@@ -6,6 +6,10 @@ Read [Cross-platform validation](./cross-platform-validation.md) and the native
 [macOS](./macos-desktop.md) page first. Record results in the
 [execution report](./execution-report-template.md).
 
+When the target begins from a released MSI, PKG, DEB, RPM, ZIP, or tar archive,
+verify and execute that package with the
+[server installer runbook](./server-installers.md) before testing enrollment.
+
 This is a native integration runbook. Host-independent contracts prove schema,
 ordering, and failure behavior, but they do not prove `wsl.exe`, OpenSSH,
 PowerShell, launchd, systemd, Windows services, sockets, Jobs, or process groups

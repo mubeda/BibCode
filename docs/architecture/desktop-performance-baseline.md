@@ -98,7 +98,7 @@ inside the operating-system WebView.
 
 The final architecture keeps React/Vite in the operating-system WebView and
 moves HTTP/WebSocket RPC, provider supervision, orchestration, persistence,
-terminal, Git, filesystem, diagnostics, and relay behavior into the in-process
+terminal, Git, filesystem, diagnostics, and remote-route behavior into the in-process
 Rust server. It packages no Node runtime, TypeScript server, Electron APIs, or
 native helper sidecars.
 

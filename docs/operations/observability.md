@@ -69,6 +69,14 @@ Desktop diagnostics come from the shared in-process Rust runtime and the same
 `server.log`; no child server process is involved. The old `server-child.log`
 belonged to the removed Node sidecar and is not part of the final architecture.
 
+Native service managers retain their own bounded operating-system status and
+installer output. Package lifecycle state is not telemetry: the selected data
+root contains a local identity-bound receipt and verified backup used to finish
+or safely recover an interrupted update. Preserve those files for recovery,
+but do not include roots, usernames, credentials, or package logs in public CI
+evidence. The server installer harness emits a separate redacted
+`evidence.json`; it records only bounded scenario/result metadata.
+
 ## Trace Diagnostics
 
 The native server writes actionable RPC failures to
@@ -266,7 +274,8 @@ Add spans and structured fields at meaningful Rust boundaries:
 - SQLite transactions and migrations;
 - Git and source-control commands;
 - terminal lifecycle and process-tree cleanup;
-- relay installation, authentication, and tunnel lifecycle.
+- environment route connection, SSH/WSL tunnel, local-control, service, and
+  package lifecycle.
 
 Keep high-cardinality values such as thread IDs, paths, and command IDs in span
 fields, not metric labels. Never record prompts, credentials, bearer tokens,

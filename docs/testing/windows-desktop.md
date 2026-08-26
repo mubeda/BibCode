@@ -66,8 +66,8 @@ Select focused tests from affected source and verify at least:
 - local Windows and WSL presentation follows current environment capability;
 - **Settings > Environments** mounts Known and Hidden environment lists, while
   the center **Add environment** workspace exposes WSL, SSH, and strict Direct
-  HTTPS. Tailscale,
-  relay, and generic remote-device actions remain absent. Exercise the native
+  HTTPS. Dedicated Tailscale and generic remote-device actions remain absent.
+  Exercise the native
   Windows OpenSSH adapter with its fixed UTF-16LE encoded PowerShell commands;
   prove every dynamic path crosses through bounded JSON stdin and do not
   substitute a POSIX shell or host-independent fixture for the native pass; and
@@ -297,7 +297,7 @@ When WSL is unavailable:
 
 Do not install a distribution or change system WSL configuration without
 permission. The Add environment SSH choice remains visible in both WSL branches;
-Tailscale, relay, and generic remote-device targets remain absent. Validate the
+Dedicated Tailscale and generic remote-device targets remain absent. Validate the
 native Windows OpenSSH/PowerShell setup independently of whether WSL is
 available.
 
@@ -330,6 +330,10 @@ and `git diff --check` in the recorded gate set. Do not run separate broad
 Cargo commands concurrently.
 
 ## Server MSI build and inspection
+
+Use this platform-specific inspection together with the shared
+[server installer runbook](./server-installers.md), which owns manifest trust,
+the twelve lifecycle scenarios, evidence classes, and cleanup.
 
 On matching native Windows x64 or ARM64, build the server artifacts into a new
 directory. The target must match `rustc -vV` from the repository-pinned Rustup
@@ -431,7 +435,7 @@ Windows DPI states. Verify:
   exact fenced operation during password presentation, transfer/install, and
   tunnel readiness; verify bounded rollback/reaping, no second cleanup prompt,
   no late route publication, and local disconnect with an unreachable target
-  performs no remote stop/uninstall request. Tailscale, relay, exposure, and generic
+  performs no remote stop/uninstall request. Dedicated Tailscale, exposure, and generic
   remote-retry UI remains absent;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;

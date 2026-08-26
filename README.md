@@ -59,6 +59,20 @@ Desktop releases are built by the Tauri 2 pipeline in `apps/desktop`.
 > Windows releases remain unsigned; choose "More info" → "Run anyway" if
 > SmartScreen warns.
 
+### Server-only packages
+
+Use a server-only package when an environment should own its projects,
+worktrees, provider processes, and data on a Windows, macOS, or Linux host.
+Releases provide Windows MSI/ZIP, macOS PKG/tar.gz, and Linux DEB/RPM/tar.gz
+artifacts for the supported architectures. The package contains the native
+Rust server and browser assets; it does not require Node.js, Tauri, or the
+desktop app at runtime.
+
+Read [Server-only installation](./docs/getting-started/server-installation.md)
+before installing. It covers signed-manifest verification, platform paths,
+workstation/headless service modes, upgrades, uninstall-with-data-preservation,
+and the separate irreversible purge flow.
+
 ### Run from source
 
 See [Getting started](./docs/getting-started/quick-start.md), or jump to the
@@ -72,20 +86,24 @@ not shipped as part of the application runtime.
 
 BiBCode is organized around three work areas:
 
-- The left panel groups projects, the primary checkout for each project, and
-  eager worktree threads. Use it to add local projects, clone repositories,
-  create worktrees, pin/unread rows, and switch between agent sessions.
-- The center panel hosts the active chat. Its `+` menu can open additional AI
-  chat panels, a terminal panel in the same worktree, or the custom action
-  dialog. Up to four split panes can share a worktree while keeping their agent
-  sessions isolated.
+- The left panel is a navigation-only **Environment → Project → Main/threads**
+  tree. An environment owns its projects; the same repository family cannot be
+  added twice in one environment, while copies on different environments are
+  separate projects. Use the tree to select work, add projects, and create or
+  adopt worktree threads. It does not host settings tabs or information panels.
+- The center panel hosts chats, terminals, and environment-management
+  workspaces. Environment Overview, Connection, Service, Security, Projects &
+  Storage, Updates, Diagnostics, and Removal appear as center tabs. Up to four
+  split panes can share a worktree while keeping their agent sessions isolated.
 - The right panel hosts Browser, Terminal, Diff, Activity, Plan, Files, and
   Source Control tools. Source Control supports staging, commit history, AI
   commit messages, per-file actions, and pull/push/PR flows. Files supports
   context menus, create/rename/delete/duplicate, external open/preview, and
   explicit Ctrl/Cmd+S saves.
 
-See [Workspace UI](./docs/user/workspace-ui.md) for the detailed guide.
+See [Environments](./docs/user/environments.md),
+[Environment navigation](./docs/user/environment-navigation.md), and
+[Workspace UI](./docs/user/workspace-ui.md) for the detailed model.
 
 ## Some notes
 
@@ -99,11 +117,14 @@ There's no public docs site yet, so start with the [documentation index](./docs/
 
 - [Documentation index](./docs/README.md)
 - [Getting started](./docs/getting-started/quick-start.md)
+- [Server-only installation](./docs/getting-started/server-installation.md)
+- [Environments](./docs/user/environments.md)
 - [Workspace UI](./docs/user/workspace-ui.md)
 - [Source Control](./docs/integrations/source-control-providers.md#source-control-panel)
 - [Architecture overview](./docs/architecture/overview.md)
 - [Provider guides](./docs/providers/README.md)
 - [Operations](./docs/operations/ci.md)
+- [Server administration](./docs/operations/server-administration.md)
 - [Reference](./docs/reference/encyclopedia.md)
 
 ## If you REALLY want to contribute still.... read this first
@@ -133,3 +154,7 @@ vp install
 ```
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening an issue or PR.
+
+BiBCode has no telemetry or crash-upload path. Normal application traffic goes
+only to an explicitly selected local, WSL, SSH-tunneled, or HTTPS environment;
+plain non-loopback HTTP is forbidden.

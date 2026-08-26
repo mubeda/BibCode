@@ -126,4 +126,4 @@ host-local output and must still be handled as sensitive operational data.
 
 See [Remote architecture](./remote.md),
 [Runtime and process model](./runtime-process-model.md), and
-[Server administration](../user/server-administration.md).
+[Server administration](../operations/server-administration.md).

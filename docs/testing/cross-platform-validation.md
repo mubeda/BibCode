@@ -133,7 +133,7 @@ metadata match and that the executable hash matches both.
 
 Inspect every archive path before execution. It must contain no symlink,
 device, source map, secret, `.env`, log, database, `node_modules`, Node binary,
-Tauri/Desktop runtime, Connect/relay, telemetry, or developer-path payload.
+Tauri/Desktop runtime, removed hosted-runtime code, telemetry, or developer-path payload.
 Re-hash every compiled web asset against the embedded sorted
 `web-assets.json`; confirm the generated notices include both locked Rust and
 installed production-web dependency closures. Extraction alone must not
@@ -168,12 +168,16 @@ sibling `name` exists and `pkgutil --expand-full` does not materialize a
 separate `._name` file. Reject an unpaired record, an escaped path, a link to an
 unexpected target, a missing binary/assets/metadata file, an executable with
 the wrong architecture or version, and any secret, non-loopback HTTP, firewall,
-telemetry, Connect, purge, or data-root deletion action.
+telemetry, hosted-control, purge, or data-root deletion action.
 
 Installing or uninstalling a package mutates the native host. Perform those
 scenarios only on an approved disposable runner with an isolated BiBCode data
 root. Format inspection on another OS or architecture is compatibility evidence
 only; it is not native installation evidence.
+
+Use [Server installer validation](./server-installers.md) for the complete
+manifest verification, bounded twelve-scenario harness, evidence schema,
+privacy observer, and cleanup procedure.
 
 Before native execution, run the shared lifecycle owners:
 
@@ -246,7 +250,7 @@ must prove each of these cases:
    an OS-secret reference is created before publication, and exactly one
    migration receipt survives retry after an injected abort. A loopback HTTP
    entry may become a loopback route; non-loopback HTTP is quarantined.
-2. **v1 Relay-only:** the migration produces no environment, route, credential,
+2. **v1 unsupported hosted-only:** the migration produces no environment, route, credential,
    or DPoP row; it records only discarded counts and a receipt. Assert that no
    token or endpoint secret appears in metadata or diagnostics.
 3. **Corrupt input:** invalid catalog or row data remains isolated, cannot become
@@ -328,7 +332,7 @@ impersonation/revert, and administrator/service-account admission require a
 native Windows run.
 
 For pairing CLI changes, also record exact nested parsing, human and one-line
-JSON output, five-minute expiry, fixed non-Relay administrator scopes, wrong
+JSON output, five-minute expiry, fixed administrator scopes, wrong
 data root versus stopped server, inaccessible endpoint, invalid/expired reply,
 request/response identity matching, URL-fragment validation, and absence of the
 credential from stderr. Confirm the client never calls an HTTP pairing route as

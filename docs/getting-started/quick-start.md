@@ -1,5 +1,10 @@
 # Quick Start
 
+For released binaries, install the
+[desktop app](../../README.md#desktop-app) or follow the
+[server-only installation guide](./server-installation.md). The commands below
+are for a source checkout.
+
 Install Vite+ and workspace dependencies first (see the root README), then use:
 
 ```bash
@@ -75,3 +80,9 @@ fingerprint and cannot recover the raw value.
 See [Environment navigation](../user/environment-navigation.md) for environment
 statuses, center settings, offline behavior, and removal choices, and
 [Workspace UI](../user/workspace-ui.md) for the full UI map.
+
+For a persistent remote host, continue with
+[Server administration](../operations/server-administration.md). Installation
+does not pair a client automatically: create a five-minute, single-use pairing
+on the server host and enroll it through a WSL, SSH-tunneled, or direct
+HTTPS/WSS route.

@@ -128,13 +128,13 @@ second in-memory source of truth.
 
 The one-time `catalog-v1-to-v3` migration is deterministic and bounded:
 
-- a legacy direct bearer or SSH target is accepted only with its matching
+- a legacy direct-token or SSH target is accepted only with its matching
   profile and an accepted storage UUID;
 - non-loopback direct routes must decode as HTTPS, while safe loopback URLs may
   become a desktop loopback route;
 - bearer values stay in a memory-only staging list until the desktop OS secret
   provider returns opaque references;
-- Relay-only targets and legacy remote DPoP tokens are counted and discarded,
+- unsupported hosted-route targets and their old DPoP tokens are counted and discarded,
   not copied into normalized rows;
 - corrupt, incomplete, conflicting, or unsafe entries produce only a bounded
   SHA-256 fingerprint and stable reason code; and
@@ -276,12 +276,11 @@ lock and remain a documented residual risk.
 Accepted identities use target keys that remain stable when endpoints, labels,
 credentials, or local paths change:
 
-| Target  | Accepted-identity key   |
-| ------- | ----------------------- |
-| Primary | `platform:primary`      |
-| Bearer  | `bearer:<connectionId>` |
-| Relay   | `relay:<environmentId>` |
-| SSH     | `ssh:<connectionId>`    |
+| Target     | Accepted-identity key   |
+| ---------- | ----------------------- |
+| Primary    | `platform:primary`      |
+| Direct/WSL | `bearer:<connectionId>` |
+| SSH        | `ssh:<connectionId>`    |
 
 Keys never contain bearer/DPoP credentials, endpoint URLs, SSH host/profile
 data, or filesystem paths. `AcceptedStorageIdentityStore` exposes an atomic

@@ -6,8 +6,8 @@ desktop bridge is reserved for host-native capabilities.
 
 ## Session establishment
 
-`ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
-DPoP clients exchange their credential for a short-lived, one-purpose
+`ConnectionResolver` first produces a `PreparedConnection`. Direct HTTPS and
+other remote DPoP clients exchange their credential for a short-lived, one-purpose
 WebSocket ticket and put only `wsTicket` on the `/ws` URL. `RpcSessionFactory`
 then opens the socket, builds the Effect RPC client, and calls
 `server.getConfig`. The session is ready only after both steps succeed.

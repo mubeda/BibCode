@@ -11,6 +11,7 @@ Start with the shared procedure, then use the page for the native host:
 - [Windows desktop](./windows-desktop.md)
 - [Linux desktop](./linux-desktop.md)
 - [macOS desktop](./macos-desktop.md)
+- [Server installers](./server-installers.md)
 - [Remote environments](./remote-environments.md)
 - [Process lifecycle](./process-lifecycle.md)
 - [Worktree process lifecycle](./worktree-process-lifecycle.md)

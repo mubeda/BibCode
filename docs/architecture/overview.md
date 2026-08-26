@@ -42,7 +42,7 @@ flowchart TB
   explicitly safe capabilities.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
-  orchestration, providers, terminals, Git, files, diagnostics, relay access,
+  orchestration, providers, terminals, Git, files, diagnostics, environment routing,
   and process supervision. Its worktree catalog joins bounded live Git and
   filesystem observations with durable project and canonical-thread
   projections. An authoritative `project_repository_claims` row admits at most
@@ -200,7 +200,7 @@ only the exact Cargo compiler artifact, verified static assets, install-layout
 metadata, build metadata, license, notices, and portable README. It rejects
 links and normalizes archive paths, modes, order, and timestamps. The resulting
 server artifact has no production Node/TypeScript runtime, Tauri shell,
-WebView, privileged helper, Connect component, or telemetry uploader.
+WebView, privileged helper, hosted control component, or telemetry uploader.
 
 Native packaging consumes that same verified stage without introducing another
 runtime or service-definition source. WiX owns only the per-user Windows file,
@@ -450,7 +450,7 @@ sequenceDiagram
 The primary backend uses `BackendLaunchTarget::InProcess`. Optional WSL
 backends use `BackendLaunchTarget::ExternalProcess`, so not every desktop
 environment shares the host process. SSH forwarding is owned by the Tauri host;
-provider, terminal, and managed relay processes are supervised by the server.
+provider and terminal processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
 When WSL-only mode is selected, that intent is authoritative even if an older
@@ -576,8 +576,8 @@ the departed renderer or its terminal buffers reachable.
 
 ## Request and event flow
 
-1. The client runtime resolves a connection target and obtains any required
-   bearer, DPoP, relay, or SSH authorization.
+1. The client runtime resolves a local, WSL, SSH-tunneled, or Direct HTTPS route
+   and obtains its DPoP-bound session authorization.
 2. `RpcSessionFactory` opens a WebSocket and synchronizes `server.getConfig`.
 3. Effect RPC schemas encode requests and decode unary results or streams.
 4. The Rust `RpcRegistry` authorizes and routes each method.
@@ -705,7 +705,7 @@ Main is permanent; worktree-backed workspace threads still use the worktree cata
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
-  contracts, shared utilities, relay infrastructure, and development tooling.
+  contracts, shared utilities, and development tooling.
 - Git worktree registration, directory availability, and path ownership are
   resolved by the server catalog. Clients do not infer recovery from directory
   existence or treat a degraded observation as an authoritative empty set.

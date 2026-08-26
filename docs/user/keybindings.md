@@ -96,13 +96,21 @@ surface them.
 - `preview.resetZoom`: reset the preview zoom to 100% (in focused preview context by default)
 - `commandPalette.toggle`: open or close the global command palette
 - `chat.new`: create a new worktree/chat thread preserving the active context where possible
-- `chat.newLocal`: create a new chat thread for the active project in a new environment (local/worktree determined by app settings (default `local`))
+- `chat.newLocal`: create a new thread for the active project using its default
+  thread options instead of inheriting the current thread's contextual options
 - `modelPicker.toggle`: open/close the model picker
 - `editor.openFavorite`: open current project/worktree in the last-used editor
 - `thread.previous` / `thread.next`: jump through visible left-panel workspace rows
 - `thread.jump.1` through `thread.jump.9`: jump to a visible left-panel workspace row
 - `modelPicker.jump.1` through `modelPicker.jump.9`: jump to a model/provider row while the model picker is open
 - `script.{id}.run`: run a project script by id (for example `script.test.run`)
+
+The environment tree also implements the standard ARIA-tree keys directly:
+Up/Down, Left/Right, Home/End, character type-ahead, Enter/Space, Shift+F10,
+and Escape. These are interaction semantics rather than configurable command
+IDs. Environment settings open as center workspace tabs; the left panel never
+captures a settings or information tab. See
+[Environment navigation](./environment-navigation.md#keyboard-and-assistive-technology).
 
 ### Key Syntax
 

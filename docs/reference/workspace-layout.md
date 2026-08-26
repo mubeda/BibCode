@@ -8,7 +8,7 @@
   in-process server lifecycle.
 - `/apps/server`: Rust/Axum/Tokio server and native `bibcode` CLI. It owns
   providers, Git, files, terminals, persistence, orchestration, HTTP/WebSocket
-  RPC, authentication, diagnostics, and relay integration.
+  RPC, authentication, diagnostics, and remote-environment integration.
 - `/apps/web`: shared React 19 + Vite UI for browser and Tauri WebView modes.
 - `/apps/marketing`: Astro marketing site; it is not part of the desktop or
   server production runtime.

@@ -120,6 +120,10 @@ not replace the normal Rust test harness with a serial harness.
 
 ## Server DEB and RPM build and inspection
 
+Use this platform-specific inspection together with the shared
+[server installer runbook](./server-installers.md), which owns manifest trust,
+the twelve lifecycle scenarios, evidence classes, and cleanup.
+
 On a matching native Linux runner, first verify that `cargo-deb 3.7.0` and
 `cargo-generate-rpm 0.21.0` are installed. Installation of missing global tools
 requires approval. Build into a new output directory:
@@ -218,7 +222,7 @@ environment in the report. At normal and minimum sizes verify:
   Disconnect with the destination unreachable and verify the local tunnel is
   reaped without a remote stop/uninstall request. No raw pairing value is
   rendered;
-- WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
+- WSL, dedicated Tailscale, exposure, and generic remote-retry UI remains absent
   from the ordinary Linux presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;

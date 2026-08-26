@@ -18,6 +18,13 @@ runs the BiBCode server:
   inside that environment.
 - Browser clients do not run provider CLIs locally.
 
+Provider installations, credentials, configuration, and processes belong to
+their environment. Adding the same Git repository on a second environment does
+not reuse the first environment's provider session or project data. See
+[Environments](../user/environments.md) for the ownership model and
+[Server-only installation](./server-installation.md) when preparing a remote
+host.
+
 BiBCode resolves provider executables from the server process's `PATH`. You can
 also set an explicit **Binary path** on a provider instance in Settings.
 

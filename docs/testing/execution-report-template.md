@@ -58,7 +58,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 ## Environment catalog, routes, secrets, cache, and cleanup
 
 - v1 direct migration route/result and receipt count:
-- v1 Relay-only discarded counts and negative secret/metadata evidence:
+- v1 unsupported hosted-only discarded counts and negative secret/metadata evidence:
 - Corrupt input quarantine/recovery result:
 - Secret provider used and unavailable/locked fail-closed result:
 - Renderer/IndexedDB credential negative evidence:
@@ -192,9 +192,15 @@ native targets are unavailable evidence, not compatibility passes.
 
 ## Native package artifacts
 
-| Artifact | Absolute path | Version/architecture | Identity/trust verification |
-| -------- | ------------- | -------------------- | --------------------------- |
-|          |               |                      |                             |
+- Server manifest path/SHA-256/signature result:
+- Complete tuple cardinality result:
+- Minisign public-key ID:
+- SBOM count/schema/relationship result:
+- Native signing/notarization policy result:
+
+| Artifact | Absolute path | Version/OS/architecture/format | Identity/trust verification | Evidence class |
+| -------- | ------------- | ------------------------------ | --------------------------- | -------------- |
+|          |               |                                |                             |                |
 
 ## Packaged UI and visual evidence
 

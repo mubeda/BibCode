@@ -345,10 +345,9 @@ endpoint can install software, start a process, or use SSH.
   pairing sessions require DPoP; bearer exchange is limited to the host-local
   desktop bootstrap. Only a single-purpose, one-use, short-lived `wsTicket`
   appears in the socket URL.
-- DPoP binds compatibility Connect-issued relay and environment tokens to the
-  client's proof key and the target HTTP request.
-- Relay request proofs and environment health/mint responses are independently
-  signed and scoped to their nonce and operation.
+- DPoP binds remote environment sessions to the client's proof key and the
+  exact target HTTP method and URL. Pairing credentials are five-minute,
+  single-use grants and are never reusable session credentials.
 - A tunnel changes reachability, not the environment's authorization rules.
 - The in-process runtime owns its managed tunnel as an exact per-runtime helper
   root with a dedicated Unix process group or Windows Job. Shutdown closes
@@ -377,7 +376,7 @@ desktop-managed SSH routes: a different non-null
 recovery screen is intentionally narrower. It can inspect or mutate only a
 desktop-owned native or WSL launch plan whose root the Rust host can resolve.
 It cannot open, restore, start empty, or export local-path diagnostics for a
-bearer, relay, or SSH remote environment. Recovery of a remote store must be
+Direct HTTPS or SSH remote environment. Recovery of a remote store must be
 performed on the machine that owns that server and filesystem.
 
 ## Client lifecycle versus host lifecycle
@@ -414,7 +413,7 @@ levels.
 The same protected channel coordinates service stop and update preparation.
 Managed workstation/headless services remain loopback-only. Their native
 Task Scheduler/SCM, launchd, or systemd registration is owned by the host CLI,
-not by network RPC. See [Server administration](../user/server-administration.md)
+not by network RPC. See [Server administration](../operations/server-administration.md)
 and [Runtime and process model](./runtime-process-model.md).
 
 ## Current limitations

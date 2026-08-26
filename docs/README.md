@@ -8,18 +8,22 @@ current behavior.
 ## Start here
 
 - [Quick start](./getting-started/quick-start.md)
+- [Server-only installation](./getting-started/server-installation.md)
+- [Environments](./user/environments.md)
 - [Workspace UI](./user/workspace-ui.md)
 - [Provider setup](./providers/README.md)
 - [Remote access](./user/remote-access.md)
-- [Server administration](./user/server-administration.md)
+- [Server administration](./operations/server-administration.md)
 - [Architecture overview](./architecture/overview.md)
 
 ## User guides
 
 - [Workspace UI](./user/workspace-ui.md)
+- [Environments](./user/environments.md)
+- [Environment navigation](./user/environment-navigation.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
-- [Server administration](./user/server-administration.md)
+- [Server administration](./operations/server-administration.md)
 - [Project data safety and recovery](./guides/project-data-recovery.md)
 - [Source control providers](./integrations/source-control-providers.md)
 
@@ -48,7 +52,8 @@ current behavior.
 
 - [Remote architecture](./architecture/remote.md)
 - [Authentication architecture](./architecture/authentication.md)
-- [Server administration](./user/server-administration.md)
+- [Server installation](./getting-started/server-installation.md)
+- [Server administration](./operations/server-administration.md)
 
 ## Operations and reference
 
@@ -56,6 +61,8 @@ current behavior.
 
 - [Environment navigation](./user/environment-navigation.md)
 - [Testing runbooks](./testing/README.md)
+- [Server installer validation](./testing/server-installers.md)
+- [Remote environment validation](./testing/remote-environments.md)
 - [Continuous integration](./operations/ci.md)
 - [Release process](./operations/release.md)
 - [Observability](./operations/observability.md)

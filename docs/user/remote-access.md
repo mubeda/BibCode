@@ -9,7 +9,7 @@ trusted LAN or tailnet: BiBCode has no packaged switch or override that binds an
 unencrypted server to another interface.
 
 For service installation, host authority, local-control pairing, and recovery,
-use [Server administration](./server-administration.md).
+use [Server administration](../operations/server-administration.md).
 
 ## Supported routes
 
@@ -100,7 +100,7 @@ Windows uses Task Scheduler or SCM, macOS uses a LaunchAgent or LaunchDaemon,
 and Linux uses a systemd user or system unit. Stop/restart first drain through
 protected local control. Uninstall preserves the data root and has no purge
 option. Exact commands and platform accounts are in
-[Server administration](./server-administration.md).
+[Server administration](../operations/server-administration.md).
 
 ## Pairing
 

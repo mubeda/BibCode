@@ -602,29 +602,29 @@ as a local-machine run.
 - Create: `docs/testing/server-installers.md`, `remote-environments.md`
 - Delete/rewrite remaining obsolete living cloud/Connect pages as required by Plan 60.
 
-- [ ] **Step 1: Update entry points and complete installation matrix**
+- [x] **Step 1: Update entry points and complete installation matrix**
 
 Root README and docs index link to desktop installation and server-only Windows x64/ARM64, macOS universal/per-arch, and Linux x64/ARM64 instructions. For every format document prerequisites, checksum/signature verification, native-signing state, install/binary/web/data/log/control paths, default loopback/service behavior, CLI PATH, upgrade, uninstall-preserves-data, explicit purge, and recovery.
 
-- [ ] **Step 2: Document the approved application usage**
+- [x] **Step 2: Document the approved application usage**
 
 Explain `Environment -> Project -> Main/ordinary/worktree thread`, same repository in different environments as distinct projects, one repository family per environment, permanent Main, preserved server-owned worktree management, center workspace tabs/settings, status/search/offline read-only behavior, WSL visibility, and explicit removal consequences using the exact UI labels from Plan 50.
 
-- [ ] **Step 3: Document environment enrollment and administration**
+- [x] **Step 3: Document environment enrollment and administration**
 
 Provide exact local, WSL, SSH, and HTTPS sequences; pairing expiry/single use; full-administrator clients; revocation; route/identity/certificate mismatch; secret-store locked/session-only behavior; workstation/headless services; TLS; backup/restore; update rollback; logs/diagnostics; and force remove versus remote uninstall versus purge.
 
 State clearly that non-loopback HTTP does not exist, WSL Stopped distros are never auto-started, no action unregisters WSL, and installer completion does not mean a desktop client is paired.
 
-- [ ] **Step 4: Align architecture/reference/operations with source ownership**
+- [x] **Step 4: Align architecture/reference/operations with source ownership**
 
 Document server-authoritative domain/database/worktrees, client catalog/routes/cache/secrets, DesktopBridge privilege boundary, local-control authority, WSL byte-forwarding, SSH tunnel ordering, installed layout, artifact manifest, CI job graph, signing distinctions, release draft inspection, and no-telemetry/no-hosted-control-plane policy. Update package/workspace/script/CLI/environment-variable reference using actual implemented commands.
 
-- [ ] **Step 5: Expand living runbooks and report schema**
+- [x] **Step 5: Expand living runbooks and report schema**
 
 Add repeatable native installer and remote-environment procedures. The execution report records exact source SHA, artifact manifest digest, installer/target/arch, native signature/notarization/detached signature, service mode/owner, data-root identity before/after, route/TLS/SSH/WSL evidence, no-unexpected-network result, process survivors, commands/exits/durations, screenshots/logs, and native versus compatibility versus unavailable classification.
 
-- [ ] **Step 6: Verify every command/link against current source**
+- [x] **Step 6: Verify every command/link against current source**
 
 ```sh
 vp check
@@ -636,12 +636,24 @@ git diff --check
 
 The search may contain only explicit statements that non-loopback HTTP is forbidden; every Connect/config hit must be within the one manual decommission runbook.
 
-- [ ] **Step 7: Commit living documentation together**
+- [x] **Step 7: Commit living documentation together**
 
 ```sh
 git add README.md docs
 git commit -m "docs: publish environment and server operations guides"
 ```
+
+Implementation evidence: the root/docs entry points now cover desktop and the
+complete server package matrix; the environment ownership/UI/removal guide and
+canonical operations administration guide are linked from living indexes; CI,
+release, architecture, recovery, references, and native runbooks reflect the
+implemented owners and privacy boundaries. Existing `workspace-ui.md`,
+`worktree-catalog.md`, and `remote-environments.md` already carried the approved
+model and were reviewed rather than rewritten. `vp check`, `vp run typecheck`,
+the focused 22-test release/installer/privacy set, changed-document local-link
+validation, the retired-product scan, and `git diff --check` pass. The exact
+forbidden-term scan contains only explicit statements rejecting plain
+non-loopback HTTP.
 
 ### Task 10: Run the final repository, artifact, native, and privacy gates
 

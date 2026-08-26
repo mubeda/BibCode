@@ -174,6 +174,6 @@ Network host actions always fail closed with `hostAuthorityRequired`.
 Workstation/server administration must cross the desktop bridge, protected
 local control, or an explicit SSH host-administration session.
 
-See [Server administration](../user/server-administration.md),
+See [Server administration](../operations/server-administration.md),
 [Authentication architecture](./authentication.md), and
 [Cross-platform validation](../testing/cross-platform-validation.md).

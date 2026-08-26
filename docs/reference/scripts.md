@@ -66,7 +66,7 @@ values. A changed definition requires the explicit `service install --update`
 form after the administrator inspects the difference. That flag updates the
 native definition, not standalone binary package bytes.
 
-See [Server administration](../user/server-administration.md) for per-platform
+See [Server administration](../operations/server-administration.md) for per-platform
 authority, accounts, defaults, and recovery.
 
 ## Remote Environment Validation
@@ -180,7 +180,7 @@ the exact channel in `rust-toolchain.toml`, sets the selected compiler
 explicitly, uses frozen Cargo and pnpm inputs, consumes Cargo's exact
 compiler-artifact record, and refuses links,
 source maps, secrets, logs, databases, `node_modules`, Node executables, Tauri
-runtime bytes, and legacy Connect/telemetry content. The archive contains only
+runtime bytes, removed hosted-runtime content, and telemetry code. The archive contains only
 the native CLI/server, a browser-only static application, install-layout
 metadata, build metadata, license, notices, and a README; extraction performs
 no service, login-item, PATH, firewall, or data-root mutation.
@@ -203,6 +203,26 @@ record the target/compiler/binary digest; universal PKG metadata additionally
 records both slice digests. Signing, SBOM, manifest, and stable-release gates
 are later finalization steps and must not treat `unsigned-test` output as
 publishable evidence.
+
+Release-finalization and native execution commands are intentionally direct
+scripts rather than developer shortcuts:
+
+- `node scripts/sign-server-artifacts.ts ...`: generate CycloneDX SBOMs,
+  checksums, the complete manifest, and detached signatures after native bytes
+  are final. It requires the dedicated server release key.
+- `node scripts/verify-server-artifacts.ts --manifest <path> --directory
+<path> --public-key packaging/server/server-release.pub
+--require-complete-matrix`: verify signatures, hashes, SBOM relationships,
+  matrix cardinality, and native signing policy before publication.
+- `node scripts/create-server-install-smoke-set.ts ...`: create only the
+  ephemeral source-bound `unsigned-test` manifest used by native CI execution.
+- `node scripts/server-install-smoke.ts ... --allow-system-mutation`: run the
+  bounded twelve-scenario native installer harness in a fresh absolute work
+  root. This mutates services/packages/accounts and belongs only on a disposable
+  runner with explicit authority.
+
+See [Server installer validation](../testing/server-installers.md) for the exact
+preflight, arguments, evidence classes, cleanup, and privacy requirements.
 
 ## Repository Maintenance
 

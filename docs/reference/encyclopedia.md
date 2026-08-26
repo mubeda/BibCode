@@ -127,6 +127,22 @@ canonical root, prior binary path/SHA-256, service mode/owner, verified backup,
 backup schema version, and operation ID. One data-root operation lock
 serializes retries and competing installers.
 
+### Server Artifact Manifest
+
+The signed `artifacts.json` inventory for one complete server release. It binds
+every OS/architecture/format tuple to its version, source SHA, bytes, SHA-256,
+CycloneDX SBOM, detached signature, native-signing state, notarization state,
+and release channel. A filename is never sufficient evidence of support or
+trust.
+
+### Installer Evidence Class
+
+**Native** evidence executes the package on the exact OS and architecture in
+its manifest tuple. **Compatibility** evidence inspects a format or target
+contract elsewhere but cannot prove install, service, ACL, rollback, or cleanup
+behavior. **Unavailable** records that the native runner or capability was not
+present; it is not a pass.
+
 ### Storage Purge Plan
 
 A five-minute host-local authorization that records the exact environment and

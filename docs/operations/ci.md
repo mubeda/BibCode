@@ -1,7 +1,7 @@
 # CI Quality Gates
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`. It has
-four job groups:
+six job groups:
 
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
@@ -15,6 +15,16 @@ four job groups:
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.
+- **Frozen server web assets** builds the server-only browser graph once,
+  applies production branding, records the source SHA, and uploads a one-day
+  immutable input. Native rows consume those exact bytes instead of rebuilding
+  platform-specific frontend variants.
+- **Native server** calls `.github/workflows/server-native-smoke.yml` for
+  Windows x64/ARM64, macOS Intel/Apple Silicon, and Linux x64/ARM64. Each row
+  builds only on its matching OS/architecture, statically inspects the package,
+  creates an ephemeral source-bound smoke manifest, and executes the bounded
+  installer lifecycle. The workflow uploads redacted per-format evidence;
+  compatibility checks on another host are not native evidence.
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux x64, Windows x64, macOS
   arm64, and macOS x64 runners. Windows ARM is intentionally excluded while
@@ -36,6 +46,9 @@ runtime or TypeScript server.
 
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app
   UI smoke matrix for the same four supported native targets.
+- `.github/workflows/server-native-smoke.yml` is the reusable native server
+  build/package/lifecycle matrix used by both CI and release. Its
+  `unsigned-test` CI channel never creates a publishable release set.
 - `.github/workflows/release.yml` runs the stable/nightly release pipeline. See
   the [Release Checklist](./release.md).
 - `.github/workflows/issue-labels.yml`, `pr-size.yml`, and `pr-vouch.yml` enforce
@@ -47,4 +60,5 @@ the repository gates documented in [Scripts](../reference/scripts.md).
 Repeatable native manual and packaged validation follows the
 [shared cross-platform runbook](../testing/cross-platform-validation.md) plus
 the matching Windows, Linux, or macOS page in the
-[testing runbook index](../testing/README.md).
+[testing runbook index](../testing/README.md). Server package execution follows
+the separate [server installer runbook](../testing/server-installers.md).

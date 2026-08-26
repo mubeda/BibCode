@@ -14,6 +14,14 @@ Runtime mode is a per-thread safety policy. The canonical values are defined by
 mode is persisted in orchestration state and sent to the provider runtime when
 a session starts or the thread mode changes.
 
+Runtime mode is not an environment permission level. Every paired client
+currently receives the fixed full environment-administrator scope set; there
+is no viewer/editor/admin selector. That administrator scope can operate
+environment data and authorized-client records, but it does not grant native
+host authority for service installation, package replacement, or data purge.
+Those operations still require the desktop bridge, protected local control, or
+an explicit authorized SSH/local shell.
+
 ## Provider mappings
 
 Provider capabilities differ, so the common policy is translated at the driver

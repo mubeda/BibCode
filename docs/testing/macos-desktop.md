@@ -114,6 +114,10 @@ classifying it.
 
 ## Server PKG build and inspection
 
+Use this platform-specific inspection together with the shared
+[server installer runbook](./server-installers.md), which owns manifest trust,
+the twelve lifecycle scenarios, evidence classes, and cleanup.
+
 Install both repository-pinned macOS Rust targets, then build into a new output
 directory:
 
@@ -264,7 +268,7 @@ using any frame as evidence. At normal and minimum sizes verify:
   publication. Disconnect with the destination unreachable and verify the local
   tunnel is reaped without a remote stop/uninstall request. No raw pairing value
   is rendered;
-- WSL, Tailscale, relay, exposure, and generic remote-retry UI remains absent
+- WSL, dedicated Tailscale, exposure, and generic remote-retry UI remains absent
   from the ordinary macOS presentation;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
