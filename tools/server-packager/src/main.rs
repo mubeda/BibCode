@@ -32,6 +32,10 @@ enum Command {
         #[arg(long)]
         notices: PathBuf,
         #[arg(long)]
+        portable_readme: PathBuf,
+        #[arg(long)]
+        build_metadata: PathBuf,
+        #[arg(long)]
         output: PathBuf,
     },
     Archive {
@@ -86,6 +90,8 @@ fn run(cli: Cli) -> Result<(), PackagerError> {
             install_layout,
             license,
             notices,
+            portable_readme,
+            build_metadata,
             output,
         } => stage_server(StageInputs {
             binary: &binary,
@@ -94,6 +100,8 @@ fn run(cli: Cli) -> Result<(), PackagerError> {
             install_layout: &install_layout,
             license: &license,
             notices: &notices,
+            portable_readme: &portable_readme,
+            build_metadata: &build_metadata,
             output: &output,
         }),
         Command::Archive {

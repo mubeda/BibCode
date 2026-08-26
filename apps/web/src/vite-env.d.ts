@@ -7,6 +7,7 @@ interface ImportMetaEnv {
   readonly VITE_WS_URL: string;
   readonly VITE_HOSTED_APP_URL: string;
   readonly VITE_HOSTED_APP_CHANNEL: string;
+  readonly VITE_BIBCODE_SERVER_ASSETS?: string;
   readonly APP_VERSION: string;
 }
 
@@ -30,6 +31,7 @@ declare global {
 
   interface Window {
     __TAURI__?: TauriGlobalApi;
+    __TAURI_INTERNALS__?: unknown;
     nativeApi?: LocalApi;
     desktopBridge?: DesktopBridge;
   }

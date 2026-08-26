@@ -190,6 +190,18 @@ flowchart TB
 - **Shared runtime (`packages/shared`)** contains runtime utilities used by
   multiple packages through explicit subpath exports.
 
+## Server-only distribution boundary
+
+Portable server builds compile the same Rust `bibcode` binary but use a
+browser-only web-assets mode. The compile-time mode removes the desktop bridge,
+desktop shortcut router, and Tauri API graph; the artifact scanner rejects any
+remaining Tauri marker or desktop-named payload. `tools/server-packager` stages
+only the exact Cargo compiler artifact, verified static assets, install-layout
+metadata, build metadata, license, notices, and portable README. It rejects
+links and normalizes archive paths, modes, order, and timestamps. The resulting
+server artifact has no production Node/TypeScript runtime, Tauri shell,
+WebView, privileged helper, Connect component, or telemetry uploader.
+
 ## Project-data ownership and identity
 
 The Rust server is the source of truth for the requested and effective data

@@ -1,7 +1,7 @@
-import { isTauri as isImportedTauri } from "@tauri-apps/api/core";
-
 export const isTauri =
-  typeof window !== "undefined" && (window.__TAURI__ !== undefined || isImportedTauri());
+  import.meta.env.VITE_BIBCODE_SERVER_ASSETS !== "1" &&
+  typeof window !== "undefined" &&
+  (window.__TAURI__ !== undefined || window.__TAURI_INTERNALS__ !== undefined);
 
 export const isDesktopHost =
   typeof window !== "undefined" && (isTauri || window.desktopBridge !== undefined);

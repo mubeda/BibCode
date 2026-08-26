@@ -6,9 +6,9 @@ import * as Socket from "effect/unstable/socket/Socket";
 
 import { remoteHttpClientLayer } from "@bibcode/client-runtime/rpc";
 import { browserCryptoLayer } from "./browserCrypto";
+import { desktopBridgeReady } from "../desktopBridgeReady";
 import * as PrimaryEnvironmentHttpClient from "../environments/primary/httpClient";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
-import { tauriDesktopBridgeReady } from "../tauriDesktopBridge";
 
 const httpClientLayer = remoteHttpClientLayer((input, init) => globalThis.fetch(input, init));
 
@@ -31,13 +31,13 @@ const makePrimaryRawHttpRuntime = () => ManagedRuntime.make(primaryEnvironmentHt
 let primaryRawHttpRuntime: ReturnType<typeof makePrimaryRawHttpRuntime> | null = null;
 
 async function getPrimaryHttpRuntime(): Promise<ReturnType<typeof makePrimaryHttpRuntime>> {
-  await tauriDesktopBridgeReady.catch(() => undefined);
+  await desktopBridgeReady;
   primaryHttpRuntime ??= makePrimaryHttpRuntime();
   return primaryHttpRuntime;
 }
 
 async function getPrimaryRawHttpRuntime(): Promise<ReturnType<typeof makePrimaryRawHttpRuntime>> {
-  await tauriDesktopBridgeReady.catch(() => undefined);
+  await desktopBridgeReady;
   primaryRawHttpRuntime ??= makePrimaryRawHttpRuntime();
   return primaryRawHttpRuntime;
 }

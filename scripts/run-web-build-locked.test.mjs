@@ -111,9 +111,15 @@ describe("run-web-build-locked", () => {
   it("spawns Unix and Windows builds and normalizes empty exit codes", async () => {
     const unix = childProcess();
     const unixSpawn = vi.fn(() => unix.child);
-    const unixResult = runWebBuild({ spawn: unixSpawn, env: {}, webDirectory: "/web" });
+    const unixResult = runWebBuild({
+      spawn: unixSpawn,
+      env: { ORIGINAL: "preserved" },
+      serverAssets: true,
+      webDirectory: "/web",
+    });
     expect(unixSpawn).toHaveBeenCalledWith("vp", ["build"], {
       cwd: "/web",
+      env: { ORIGINAL: "preserved", VITE_BIBCODE_SERVER_ASSETS: "1" },
       shell: false,
       stdio: "inherit",
     });
@@ -129,6 +135,7 @@ describe("run-web-build-locked", () => {
     });
     expect(windowsSpawn).toHaveBeenCalledWith("vp build", {
       cwd: "/web",
+      env: { OS: "Windows_NT" },
       shell: true,
       stdio: "inherit",
     });

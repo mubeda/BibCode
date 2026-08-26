@@ -111,6 +111,36 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Portable server artifact evidence
+
+When the server-only web build, portable layout, target matrix, release
+metadata, or archive policy changes, run the portable owners before broader
+gates:
+
+```sh
+vp test scripts/build-server-artifact.test.ts scripts/run-web-build-locked.test.mjs packaging/server/common/generate-notices.test.ts apps/web/src/env.test.ts apps/web/src/bootstrap.test.tsx
+cargo test -p bibcode-server-packager zip_and_tar_archives_are_reproducible_across_fresh_staging_roots -- --nocapture
+node scripts/build-server-artifact.ts --target "$(rustc -vV | sed -n 's/^host: //p')" --formats portable --output-dir release/server-local --unsigned-test
+```
+
+Use a new output directory for each execution. The last command is native
+evidence only for the reported host target; contract fixtures for the other
+five tuples remain compatibility evidence until each matching native runner
+executes it. Record the archive SHA-256, exact target/version/source SHA,
+`buildMode`, Rust version, executable SHA-256, archive entry count, and
+`bibcode --version` output. Verify that the adjacent and embedded build
+metadata match and that the executable hash matches both.
+
+Inspect every archive path before execution. It must contain no symlink,
+device, source map, secret, `.env`, log, database, `node_modules`, Node binary,
+Tauri/Desktop runtime, Connect/relay, telemetry, or developer-path payload.
+Re-hash every compiled web asset against the embedded sorted
+`web-assets.json`; confirm the generated notices include both locked Rust and
+installed production-web dependency closures. Extraction alone must not
+create or alter a service, login item, PATH entry, firewall rule, or data root.
+Use a disposable root when exercising the foreground command or the explicit
+`service install` command.
+
 ### Environment, project, and Main invariant evidence
 
 When environment identity, project admission, project navigation, or thread

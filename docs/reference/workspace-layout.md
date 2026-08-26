@@ -24,6 +24,9 @@
 - `/packages/shared`: cross-runtime TypeScript utilities exposed through
   explicit package subpaths.
 - `/oxlint-plugin-bibcode`: repository-specific Oxlint rules.
+- `/tools/server-packager`: deterministic server layout, ZIP/tar.gz archive,
+  signed-manifest, and release-verification tooling. It accepts only explicit
+  allowlisted inputs and normalizes archive paths, modes, order, and times.
 - `/tools/updater-verifier`: Rust tool used to verify signed updater artifacts.
 - `/third_party/portable-pty`: vendored Rust PTY crate included in the Cargo
   workspace.
@@ -51,6 +54,12 @@ packaged desktop build, the Tauri Rust host starts the server in-process,
 installs `window.desktopBridge`, and exposes only native host capabilities
 through Tauri commands/events. Browser mode connects directly to a native
 `bibcode` server and has no native bridge.
+
+The server-only distribution uses a separate compile-time web-assets mode.
+That build removes the desktop bridge and Tauri API graph, then packages only
+the native `bibcode` executable and verified browser assets. Node.js,
+TypeScript, and Tauri remain build-time or desktop-product dependencies and are
+not server-package runtime dependencies.
 
 Native discovery and host mutation stay separate. The desktop emits WSL
 topology and setup events and owns SSH processes; the client runtime reconciles

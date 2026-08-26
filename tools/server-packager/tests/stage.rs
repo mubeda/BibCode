@@ -12,6 +12,8 @@ struct Fixture {
     install_layout: PathBuf,
     license: PathBuf,
     notices: PathBuf,
+    portable_readme: PathBuf,
+    build_metadata: PathBuf,
     output: PathBuf,
 }
 
@@ -28,6 +30,8 @@ impl Fixture {
             ("install-layout.json", "{}"),
             ("LICENSE", "license"),
             ("THIRD-PARTY-NOTICES.md", "notices"),
+            ("README.md", "portable instructions"),
+            ("build-metadata.json", "{}"),
         ] {
             std::fs::write(source.join(path), contents).unwrap();
         }
@@ -38,6 +42,8 @@ impl Fixture {
         let install_layout = source.join("install-layout.json");
         let license = source.join("LICENSE");
         let notices = source.join("THIRD-PARTY-NOTICES.md");
+        let portable_readme = source.join("README.md");
+        let build_metadata = source.join("build-metadata.json");
         Self {
             _temporary: temporary,
             source,
@@ -47,6 +53,8 @@ impl Fixture {
             install_layout,
             license,
             notices,
+            portable_readme,
+            build_metadata,
             output,
         }
     }
@@ -59,6 +67,8 @@ impl Fixture {
             install_layout: &self.install_layout,
             license: &self.license,
             notices: &self.notices,
+            portable_readme: &self.portable_readme,
+            build_metadata: &self.build_metadata,
             output: &self.output,
         }
     }
@@ -96,9 +106,11 @@ fn stages_only_the_canonical_server_layout() {
     assert_eq!(
         relative_files(&fixture.output),
         [
+            "README.md",
             "bin/bibcode",
             "share/bibcode/LICENSE",
             "share/bibcode/THIRD-PARTY-NOTICES.md",
+            "share/bibcode/build-metadata.json",
             "share/bibcode/install-layout.json",
             "share/bibcode/web-assets.json",
             "share/bibcode/web/assets/app.js",

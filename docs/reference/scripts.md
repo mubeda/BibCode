@@ -145,6 +145,32 @@ under `release/desktop/<platform>-<arch>` unless an output directory is supplied
 The desktop artifact contains the Tauri host, in-process Rust server, and built
 web assets. It does not stage Node.js, a TypeScript server, or helper sidecars.
 
+## Portable Server Artifacts
+
+- `vp run dist:server:artifact -- --target <native-target> --formats portable
+--output-dir <new-directory>`: build the native `bibcode` executable, the
+  browser-only production web assets, notices, build metadata, and the target's
+  deterministic ZIP or tar.gz archive.
+- `vp run dist:server:artifact -- --target <native-target> --formats portable
+--output-dir <new-directory> --unsigned-test`: label a local validation build
+  as `unsigned-test`; this does not make the artifact a signed release.
+
+The target must match the native host architecture. Supported target triples
+are Windows x64/ARM64, macOS x64/ARM64, and Linux x64/ARM64. The output
+directory must not already exist. The builder uses frozen Cargo and pnpm
+inputs, consumes Cargo's exact compiler-artifact record, and refuses links,
+source maps, secrets, logs, databases, `node_modules`, Node executables, Tauri
+runtime bytes, and legacy Connect/telemetry content. The archive contains only
+the native CLI/server, a browser-only static application, install-layout
+metadata, build metadata, license, notices, and a README; extraction performs
+no service, login-item, PATH, firewall, or data-root mutation.
+
+CI may supply an already built immutable web directory together with its
+sorted `web-assets.json`; both options are required together and every path,
+size, and SHA-256 is revalidated before staging. Native installers and signed
+release manifests are separate later release steps and must not treat an
+unsigned portable archive as publishable evidence.
+
 ## Repository Maintenance
 
 - `vp run sync:repos`: synchronize configured read-only reference repositories

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "check:dependency-ledger": "node check-dependency-upgrade-ledger.ts",
+    "dist:server": "node build-server-artifact.ts",
     "typecheck": "tsc --noEmit",
     "test": "vp test run"
   },

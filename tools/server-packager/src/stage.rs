@@ -9,6 +9,8 @@ pub struct StageInputs<'a> {
     pub install_layout: &'a Path,
     pub license: &'a Path,
     pub notices: &'a Path,
+    pub portable_readme: &'a Path,
+    pub build_metadata: &'a Path,
     pub output: &'a Path,
 }
 
@@ -25,6 +27,8 @@ pub fn stage_server(inputs: StageInputs<'_>) -> Result<(), PackagerError> {
         inputs.install_layout,
         inputs.license,
         inputs.notices,
+        inputs.portable_readme,
+        inputs.build_metadata,
     ] {
         reject_link(path)?;
     }
@@ -87,6 +91,12 @@ pub fn stage_server(inputs: StageInputs<'_>) -> Result<(), PackagerError> {
         )?;
         copy_file(inputs.license, &share.join("LICENSE"), false)?;
         copy_file(inputs.notices, &share.join("THIRD-PARTY-NOTICES.md"), false)?;
+        copy_file(
+            inputs.build_metadata,
+            &share.join("build-metadata.json"),
+            false,
+        )?;
+        copy_file(inputs.portable_readme, &temporary.join("README.md"), false)?;
         fs::rename(&temporary, inputs.output).map_err(|source| PackagerError::Io {
             operation: "publish staged layout",
             path: inputs.output.to_path_buf(),

@@ -14,8 +14,8 @@ const harness = vi.hoisted(() => {
   };
 });
 
-vi.mock("./tauriDesktopBridge", () => ({
-  tauriDesktopBridgeReady: harness.ready,
+vi.mock("./desktopBridgeReady", () => ({
+  desktopBridgeReady: harness.ready,
 }));
 
 vi.mock("./router", () => {

@@ -55,11 +55,13 @@
 
 ```text
 bibcode-server/
+├── README.md
 ├── bin/bibcode[.exe]
 ├── share/bibcode/web/index.html
 ├── share/bibcode/web/assets/**
 ├── share/bibcode/web-assets.json
 ├── share/bibcode/install-layout.json
+├── share/bibcode/build-metadata.json
 ├── share/bibcode/LICENSE
 └── share/bibcode/THIRD-PARTY-NOTICES.md
 ```
@@ -190,35 +192,61 @@ Implementation evidence (2026-08-26):
 | `x86_64-unknown-linux-gnu`  | `ubuntu-22.04`     | tar.gz          |
 | `aarch64-unknown-linux-gnu` | `ubuntu-22.04-arm` | tar.gz          |
 
-- [ ] **Step 1: Write argument/output/ownership tests first**
+- [x] **Step 1: Write argument/output/ownership tests first**
 
 Cover unknown target/format, host/target mismatch, missing frozen dependencies, dirty output directory, stale web artifact SHA, wrong Rust executable kind, missing notices/license, symlink input, output overwrite, abort signal, child timeout, and cleanup after a failed stage.
 
-- [ ] **Step 2: Build and publish one immutable web-assets input**
+- [x] **Step 2: Build and publish one immutable web-assets input**
 
 Run the production web build once in the release preflight for the exact source SHA/lockfile. Apply the existing production brand assets, generate a sorted `web-assets.json` of relative path/size/SHA-256, and upload that directory as a workflow artifact named with the source SHA. Matrix jobs download and re-hash it; they do not rebuild divergent web bytes.
 
-- [ ] **Step 3: Compile the exact native server binary**
+- [x] **Step 3: Compile the exact native server binary**
 
 Use `cargo build --locked --release -p bibcode-server --bin bibcode --target <triple>` on the matching architecture. Consume Cargo JSON `compiler-artifact` output rather than assuming `target/<triple>/release/bibcode`. Record Rust version, target triple, package version, source SHA, and binary hash in staging metadata.
 
-- [ ] **Step 4: Stage only allowlisted production files**
+- [x] **Step 4: Stage only allowlisted production files**
 
 Invoke `server-packager stage` with the compiler artifact, verified web-assets input, root license, generated notices, and install-layout template. Reject unexpected executables, `.map` files unless intentionally published, secrets, `.env`, logs, databases, developer paths, `node_modules`, Node binaries, desktop/Tauri libraries, and Connect/telemetry patterns.
 
-- [ ] **Step 5: Produce deterministic portable archives**
+- [x] **Step 5: Produce deterministic portable archives**
 
 Windows creates ZIP; macOS/Linux create tar.gz. Portable README text gives foreground and explicit `bibcode service install --mode workstation` commands but the archive extraction itself changes no service, login item, firewall, data directory, or PATH.
 
-- [ ] **Step 6: Add root package commands and run reproducibility tests**
+- [x] **Step 6: Add root package commands and run reproducibility tests**
 
 ```sh
 vp test scripts/build-server-artifact.test.ts packaging/server/common/generate-notices.test.ts
 node scripts/build-server-artifact.ts --target "$(rustc -vV | sed -n 's/^host: //p')" --formats portable --output-dir release/server-local --unsigned-test
-node scripts/run-msvc-x64.mjs cargo test -p bibcode-server-packager archive_is_reproducible -- --nocapture
+node scripts/run-msvc-x64.mjs cargo test -p bibcode-server-packager zip_and_tar_archives_are_reproducible_across_fresh_staging_roots -- --nocapture
 git add scripts/build-server-artifact.ts scripts/build-server-artifact.test.ts scripts/lib/build-target-arch.ts scripts/lib/build-target-arch.test.ts packaging/server/common package.json apps/server/package.json scripts/package.json apps/web/package.json
 git commit -m "build(server): create deterministic portable artifacts"
 ```
+
+Implementation evidence (2026-08-26):
+
+- The builder accepts exactly the six approved native target tuples, refuses
+  host/target and format drift, discovers the exact Cargo compiler artifact,
+  bounds every child command, and cleans unpublished staging after failure or
+  cancellation.
+- The server-assets build is compile-time browser-only. An initial native
+  integration build exposed five retained Tauri chunks; the dedicated mode now
+  removes the desktop bridge/shortcut graph, while the ordinary web build
+  retains its Tauri bridge. Content and path policy reject any Tauri runtime,
+  Node runtime, link, source map, secret, log, database, Connect, or telemetry
+  payload before staging.
+- The native macOS ARM64 unsigned-test archive ran `bibcode --version`, matched
+  its embedded executable hash and adjacent/embedded build metadata, contained
+  560 re-hashed web assets and 231 generated dependency-notice rows, and had no
+  forbidden path or content hit. The other target tuples remain native CI
+  evidence for Task 7 rather than being misreported from cross-target fixtures.
+- ZIP and tar.gz output is byte-reproducible across fresh staging roots with
+  normalized order, paths, modes, and `SOURCE_DATE_EPOCH`; the original stale
+  sample filter was corrected to the exact discovered Rust test name.
+- Passed: 29 focused script/web tests, all 10 server-packager tests, the exact
+  reproducibility test, the ordinary and server-only web builds, `vp check`,
+  `vp run typecheck`, `cargo fmt --all --check`, and packager Clippy with
+  warnings denied. Living architecture, workspace, script, and cross-platform
+  testing documentation now describes the portable boundary and procedure.
 
 ### Task 4: Build native MSI, PKG, DEB, and RPM installers
 

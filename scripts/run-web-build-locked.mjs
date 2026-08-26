@@ -63,13 +63,22 @@ export async function acquireBuildLock(options = {}) {
 export function runWebBuild(options = {}) {
   const spawn = options.spawn ?? NodeChildProcess.spawn;
   const environment = options.env ?? process.env;
+  const childEnvironment = options.serverAssets
+    ? { ...environment, VITE_BIBCODE_SERVER_ASSETS: "1" }
+    : environment;
   const directory = options.webDirectory ?? webDirectory;
   return new Promise((resolve, reject) => {
     const isWindows = environment.OS === "Windows_NT" || environment.ComSpec !== undefined;
     const child = isWindows
-      ? spawn("vp build", { cwd: directory, shell: true, stdio: "inherit" })
+      ? spawn("vp build", {
+          cwd: directory,
+          env: childEnvironment,
+          shell: true,
+          stdio: "inherit",
+        })
       : spawn("vp", ["build"], {
           cwd: directory,
+          env: childEnvironment,
           shell: false,
           stdio: "inherit",
         });
@@ -93,5 +102,7 @@ if (
   process.argv[1] !== undefined &&
   import.meta.url === NodeURL.pathToFileURL(process.argv[1]).href
 ) {
-  process.exitCode = await runWebBuildLocked();
+  process.exitCode = await runWebBuildLocked({
+    serverAssets: process.argv.includes("--server-assets"),
+  });
 }
