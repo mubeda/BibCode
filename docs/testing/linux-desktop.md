@@ -154,7 +154,8 @@ environment in the report. At normal and minimum sizes verify:
 - external worktree grouping, paths, actions, physical identity, and restart
   are correct;
 - thread switching, terminal I/O, Activity elapsed time, keyboard focus, and
-  responsive overlays work; and
+  responsive overlays work, including reopening the global right panel after
+  a sibling chat suppresses a previously active Activity surface; and
 - repeated loaded interaction does not freeze, duplicate events, or grow an
   unbounded process tree.
 

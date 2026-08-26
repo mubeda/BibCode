@@ -815,13 +815,21 @@ interface TestEnvironmentPresentation {
   readonly connection: TestConnectionPresentation;
   readonly serverConfig: {
     readonly providers: ReadonlyArray<ServerProvider>;
-    readonly environment: { readonly label: string; readonly serverVersion?: string };
+    readonly environment: {
+      readonly label: string;
+      readonly serverVersion?: string;
+      readonly platform?: { readonly os: "linux"; readonly arch: "x64" };
+    };
   } | null;
 }
 
 function makeEnvironmentPresentation(
   overrides: Partial<TestEnvironmentPresentation> = {},
 ): TestEnvironmentPresentation {
+  const defaultServerConfig = {
+    providers: [codexProvider],
+    environment: { label: "Local", platform: { os: "linux" as const, arch: "x64" as const } },
+  };
   return {
     environmentId,
     label: "Local",
@@ -836,11 +844,19 @@ function makeEnvironmentPresentation(
       }),
     },
     connection: { phase: "connected", error: null, traceId: null },
-    serverConfig: {
-      providers: [codexProvider],
-      environment: { label: "Local" },
-    },
     ...overrides,
+    serverConfig:
+      overrides.serverConfig === undefined
+        ? defaultServerConfig
+        : overrides.serverConfig === null
+          ? null
+          : {
+              ...overrides.serverConfig,
+              environment: {
+                platform: defaultServerConfig.environment.platform,
+                ...overrides.serverConfig.environment,
+              },
+            },
   };
 }
 
@@ -2758,6 +2774,31 @@ describe("ChatView right panel handlers", () => {
     expect(controls).not.toHaveProperty("onToggleTerminal");
     expect(controls).not.toHaveProperty("terminalOpen");
     expect(controls).not.toHaveProperty("terminalAvailable");
+  });
+
+  it("opens Files with one layout-control click when a sibling chat suppresses host Activity", () => {
+    const siblingThreadId = ThreadId.make("thread-sibling-suppressed-activity");
+    seedConnectedServerThread();
+    seedServerThread(makeThread({ id: siblingThreadId, title: "Sibling thread" }));
+    useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
+    useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
+    publishSeededStoreState(useRightPanelStore);
+    publishSeededStoreState(useCenterPanelStore);
+
+    renderServerRoute();
+    const controls = capturedProps("panelLayoutControls");
+    expect(controls["rightPanelOpen"]).toBe(false);
+
+    (controls["onToggleRightPanel"] as () => void)();
+
+    const panelState = useRightPanelStore.getState().byThreadKey[threadKey];
+    expect(panelState?.isOpen).toBe(true);
+    expect(panelState?.activeSurfaceId).toBe("files");
+    expect(panelState?.surfaces.map((surface) => surface.kind)).toEqual(["activity", "files"]);
+
+    publishSeededStoreState(useRightPanelStore);
+    renderServerRoute();
+    expect(capturedProps("panelLayoutControls")["rightPanelOpen"]).toBe(true);
   });
 
   it("maximizes the inline right panel via the maximize control", () => {
