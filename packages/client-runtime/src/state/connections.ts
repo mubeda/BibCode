@@ -6,7 +6,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
-import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
+import type { ConnectionCatalogEntry, KnownEnvironment } from "../connection/catalog.ts";
 import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import {
@@ -50,6 +50,22 @@ export function createEnvironmentCatalogAtoms<R, E>(
     Option.getOrElse(AsyncResult.value(get(catalogAtom)), () => EMPTY_ENVIRONMENT_CATALOG_STATE),
   ).pipe(Atom.withLabel("environment-catalog-value"));
 
+  const environmentRecordsAtom = runtime.atom(
+    Stream.unwrap(
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.map((registry) => SubscriptionRef.changes(registry.environments)),
+      ),
+    ),
+    { initialValue: new Map<EnvironmentIdType, KnownEnvironment>() },
+  );
+
+  const environmentRecordsValueAtom = Atom.make((get) =>
+    Option.getOrElse(
+      AsyncResult.value(get(environmentRecordsAtom)),
+      () => new Map<EnvironmentIdType, KnownEnvironment>(),
+    ),
+  ).pipe(Atom.withLabel("environment-records-value"));
+
   const networkStatusAtom = runtime.atom(
     Stream.unwrap(
       EnvironmentRegistry.EnvironmentRegistry.pipe(
@@ -76,6 +92,16 @@ export function createEnvironmentCatalogAtoms<R, E>(
       { initialValue: AVAILABLE_CONNECTION_STATE },
     ),
   );
+
+  const updateEnvironment = createRuntimeCommand(runtime, {
+    label: "environment-catalog:update-environment",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (environment: KnownEnvironment) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.registerEnvironment({ environment })),
+      ),
+  });
 
   const register = createRuntimeCommand(runtime, {
     label: "environment-catalog:register",
@@ -128,9 +154,12 @@ export function createEnvironmentCatalogAtoms<R, E>(
   return {
     catalogAtom,
     catalogValueAtom,
+    environmentRecordsAtom,
+    environmentRecordsValueAtom,
     networkStatusAtom,
     networkStatusValueAtom,
     stateAtom,
+    updateEnvironment,
     register,
     remove,
     removeRelayEnvironments,

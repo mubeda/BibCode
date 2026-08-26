@@ -16,6 +16,14 @@ type NavigationStateUpdate = (
   current: EnvironmentNavigationStateV2,
 ) => EnvironmentNavigationStateV2;
 
+type NavigationStateListener = (state: EnvironmentNavigationStateV2, origin: symbol) => void;
+
+const navigationStateListeners = new Set<NavigationStateListener>();
+
+function publishNavigationState(state: EnvironmentNavigationStateV2, origin: symbol): void {
+  for (const listener of navigationStateListeners) listener(state, origin);
+}
+
 export interface UseEnvironmentNavigationStateInput {
   readonly ready: boolean;
   readonly environmentIds: readonly EnvironmentId[];
@@ -67,6 +75,7 @@ export function useEnvironmentNavigationState(
   selectedRef.current = input.selected;
   const fallbackRef = useRef(fallback);
   fallbackRef.current = fallback;
+  const controllerIdRef = useRef(Symbol("environment-navigation-controller"));
   const stateRef = useRef<EnvironmentNavigationStateV2 | null>(null);
   const pendingUpdatesRef = useRef<NavigationStateUpdate[]>([]);
   const hydrationStartedRef = useRef(false);
@@ -89,12 +98,25 @@ export function useEnvironmentNavigationState(
       setState(next);
       if (hydratedRef.current) {
         persist(next);
+        publishNavigationState(next, controllerIdRef.current);
       } else {
         pendingUpdatesRef.current.push(apply);
       }
     },
     [persist],
   );
+
+  useEffect(() => {
+    const receiveState: NavigationStateListener = (next, origin) => {
+      if (origin === controllerIdRef.current || !hydratedRef.current) return;
+      stateRef.current = next;
+      setState(next);
+    };
+    navigationStateListeners.add(receiveState);
+    return () => {
+      navigationStateListeners.delete(receiveState);
+    };
+  }, []);
 
   useEffect(() => {
     if (!input.ready || hydrationStartedRef.current || hydratedRef.current) return;

@@ -46,10 +46,22 @@ function state(overrides: Partial<EnvironmentNavigationStateV2> = {}) {
 }
 
 let controller: EnvironmentNavigationStateController | null = null;
+const controllers = new Map<string, EnvironmentNavigationStateController>();
 
 function Harness({ input }: { readonly input: UseEnvironmentNavigationStateInput }) {
   controller = useEnvironmentNavigationState(input);
   return <div data-hydrated={String(controller.hydrated)} />;
+}
+
+function SharedHarness({
+  id,
+  input,
+}: {
+  readonly id: string;
+  readonly input: UseEnvironmentNavigationStateInput;
+}) {
+  controllers.set(id, useEnvironmentNavigationState(input));
+  return null;
 }
 
 const mounted: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivElement }> = [];
@@ -59,6 +71,7 @@ afterEach(async () => {
     for (const entry of mounted.splice(0)) entry.root.unmount();
   });
   controller = null;
+  controllers.clear();
   commands.load.mockReset();
   commands.save.mockClear();
 });
@@ -217,5 +230,40 @@ describe("useEnvironmentNavigationState", () => {
 
     expect(controller?.state).toEqual(state());
     expect(commands.save).not.toHaveBeenCalled();
+  });
+
+  it("synchronizes client-local pin/order edits between the sidebar and center workspace", async () => {
+    commands.load.mockResolvedValue({ _tag: "Success", value: state() });
+    const input: UseEnvironmentNavigationStateInput = {
+      ready: true,
+      environmentIds: [ENVIRONMENT],
+      projects: [],
+      selected: { environmentId: ENVIRONMENT, projectId: null, threadId: null },
+    };
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+
+    await act(async () => {
+      root.render(
+        <>
+          <SharedHarness id="sidebar" input={input} />
+          <SharedHarness id="workspace" input={input} />
+        </>,
+      );
+      await Promise.resolve();
+    });
+    commands.save.mockClear();
+
+    await act(async () => {
+      controllers.get("workspace")?.update((current) => ({
+        ...current,
+        pinnedEnvironmentIds: [ENVIRONMENT],
+      }));
+    });
+
+    expect(controllers.get("sidebar")?.state.pinnedEnvironmentIds).toEqual([ENVIRONMENT]);
+    expect(controllers.get("workspace")?.state.pinnedEnvironmentIds).toEqual([ENVIRONMENT]);
+    expect(commands.save).toHaveBeenCalledOnce();
   });
 });

@@ -7,7 +7,6 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../components/
 import { SidebarInset } from "../components/ui/sidebar";
 import { useEnvironments } from "../state/environments";
 import { APP_DISPLAY_NAME } from "~/branding";
-import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 
@@ -27,8 +26,6 @@ export const Route = createFileRoute("/_chat/")({
 });
 
 function HostedStaticOnboardingState() {
-  const cloudEnabled = hasCloudPublicConfig();
-
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
@@ -55,14 +52,13 @@ function HostedStaticOnboardingState() {
                 Connect an environment to get started
               </EmptyTitle>
               <EmptyDescription className="mt-2 text-sm leading-relaxed text-muted-foreground/78">
-                {cloudEnabled
-                  ? "Sign in to BiBCode Connect to connect a linked environment through its managed tunnel, or add a reachable backend manually."
-                  : "Add a reachable backend manually to start working from this browser."}
+                Add a reachable environment to start working from this browser. Direct remote
+                connections require HTTPS or secure WebSocket transport.
               </EmptyDescription>
               <div className="mt-6 flex justify-center">
-                <Button render={<Link to="/settings/connections" />} size="sm">
+                <Button render={<Link to="/environments/add" />} size="sm">
                   <PlusIcon className="size-4" />
-                  {cloudEnabled ? "Open Connections" : "Add environment"}
+                  Add environment
                 </Button>
               </div>
             </EmptyHeader>

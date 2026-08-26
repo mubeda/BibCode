@@ -46,11 +46,14 @@ describe("createEnvironmentCatalogAtoms", () => {
     const registry = AtomRegistry.make();
 
     expect(registry.get(atoms.catalogValueAtom)).toBe(EMPTY_ENVIRONMENT_CATALOG_STATE);
+    expect(registry.get(atoms.environmentRecordsValueAtom)).toEqual(new Map());
     expect(registry.get(atoms.networkStatusValueAtom)).toBe("unknown");
 
     registry.set(runtimeAtoms[0]!, AsyncResult.initial(false) as never);
     registry.set(runtimeAtoms[1]!, AsyncResult.initial(false) as never);
+    registry.set(runtimeAtoms[2]!, AsyncResult.initial(false) as never);
     expect(registry.get(atoms.catalogValueAtom)).toBe(EMPTY_ENVIRONMENT_CATALOG_STATE);
+    expect(registry.get(atoms.environmentRecordsValueAtom)).toEqual(new Map());
     expect(registry.get(atoms.networkStatusValueAtom)).toBe("unknown");
     registry.dispose();
   });
@@ -70,7 +73,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         expect.objectContaining({ _tag: "Some", value: AVAILABLE_CONNECTION_STATE }),
       );
       expect(harness.followStream).toHaveBeenCalledWith(environmentId, expect.anything());
-      expect(harness.commandConfigs).toHaveLength(5);
+      expect(harness.commandConfigs).toHaveLength(6);
       for (const config of harness.commandConfigs) {
         expect(config.scheduler).toBe(harness.scheduler);
         expect(config.concurrency).toMatchObject({ mode: "serial" });
@@ -80,19 +83,29 @@ describe("createEnvironmentCatalogAtoms", () => {
       }
 
       const service = {
+        registerEnvironment: vi.fn((input: unknown) => Effect.succeed(input)),
         register: vi.fn((input: unknown) => Effect.succeed(input)),
         remove: vi.fn((input: unknown) => Effect.succeed(input)),
         removeRelayEnvironments: vi.fn(() => Effect.void),
         retryNow: vi.fn((input: unknown) => Effect.succeed(input)),
         acceptStorageIdentity: vi.fn((input: unknown) => Effect.succeed(input)),
       };
-      const inputs = [{ id: "target" }, environmentId, undefined, environmentId, environmentId];
+      const environment = { environmentId };
+      const inputs = [
+        environment,
+        { id: "target" },
+        environmentId,
+        undefined,
+        environmentId,
+        environmentId,
+      ];
       for (const [index, input] of inputs.entries()) {
         const execute = harness.commandConfigs[index]!.execute as (
           value: unknown,
         ) => Effect.Effect<unknown>;
         yield* execute(input).pipe(Effect.provideService(EnvironmentRegistry, service as never));
       }
+      expect(service.registerEnvironment).toHaveBeenCalledWith({ environment });
       expect(service.register).toHaveBeenCalledWith({ id: "target" });
       expect(service.remove).toHaveBeenCalledWith(environmentId);
       expect(service.removeRelayEnvironments).toHaveBeenCalled();

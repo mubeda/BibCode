@@ -428,7 +428,7 @@ export class EnvironmentMutationBlocked extends Data.TaggedError("EnvironmentMut
 
 Check the verified supervisor session/generation immediately before dispatch in `createEnvironmentCommand` and `createEnvironmentRpcCommand`. Queries may read cache; mutations never enter a replay queue.
 
-- [ ] **Step 4: Present the same reason in center surfaces**
+- [x] **Step 4: Present the same reason in center surfaces**
 
 Show `Offline · last synchronized …`, stale/read-only banners, content-unavailable-offline where cache is absent, and nearby disabled-action reasons. Keep cached messages and tree rows readable without replacing their domain statuses.
 
@@ -459,11 +459,11 @@ The complete client-runtime suite passed 56 files and 666 tests; the focused
 tree suites passed 24 tests; client-runtime and web package typechecks passed;
 and `vp check` passed with no warnings. Independent review found one P2 because
 the initial `updating` reason was unreachable; the wire-level admission mapping
-above closed it, and focused re-review returned CLEAR. Step 4 remains
-intentionally open: the shared privacy-safe reason text is exported, but the
-approved center banners, cache-empty state, and disabled-action explanations
-land with the center Environment workspace in Task 7 rather than as a
-temporary chat-only surface.
+above closed it, and focused re-review returned CLEAR. Step 4 is now complete
+through Task 7's center workspace: the shared privacy-safe reason appears in
+offline/stopped/updating banners, the metadata-only state says
+`Content unavailable offline`, and host mutations show a nearby reason rather
+than entering a replay queue.
 
 ### Task 7: Build the center environment workspace and Add Environment flow
 
@@ -478,15 +478,15 @@ temporary chat-only surface.
 - Modify: `apps/web/src/components/settings/SettingsSidebarNav.tsx`, test
 - Modify: `apps/web/src/routes/settings.connections.tsx`
 
-- [ ] **Step 1: Write route/tab/authority tests**
+- [x] **Step 1: Write route/tab/authority tests**
 
 Assert environment-name selection opens Overview, reload preserves selected tab, cached server fields become read-only, client alias/order/pin remain editable offline, host controls require DesktopBridge/local-control/SSH admin authority, and no permission editor or telemetry control exists.
 
-- [ ] **Step 2: Create one center route with stable tabs**
+- [x] **Step 2: Create one center route with stable tabs**
 
 Use `/environments/$environmentId?tab=overview|connection|service|security|projects|updates|diagnostics|platform`. Validate search params and default to Overview. Do not hand-edit `routeTree.gen.ts`; regenerate through normal router/build tooling.
 
-- [ ] **Step 3: Build the approved content model**
+- [x] **Step 3: Build the approved content model**
 
 - Overview: alias/canonical label, environment/storage UUIDs, OS/arch/version/capabilities/status/counts/active route.
 - Connection: ordered routes, active/pin/autoconnect, identity/trust verification, pair again.
@@ -494,15 +494,15 @@ Use `/environments/$environmentId?tab=overview|connection|service|security|proje
 - Security: full-admin paired clients, DPoP fingerprints/timestamps/revoke; no permission levels.
 - Projects & Storage, Updates, Diagnostics, and Platform fields exactly from the approved spec.
 
-- [ ] **Step 4: Build Add Environment in the center**
+- [x] **Step 4: Build Add Environment in the center**
 
 Offer discovered WSL cards, SSH import/manual target, and Direct HTTPS. Direct entry accepts `https://`/`wss://` only and explains certificate system trust or secure-channel pinning; no HTTP option or insecure override is rendered. Probe/setup/pair progress consumes Plan 40 stages.
 
-- [ ] **Step 5: Redirect legacy Connections navigation**
+- [x] **Step 5: Redirect legacy Connections navigation**
 
 Make `/settings/connections` redirect to `/settings/environments`; global settings lists Known/Hidden environments and Add Environment, while selecting one opens its center workspace. Plan 60 deletes the old Connect-heavy component after replacement coverage is green.
 
-- [ ] **Step 6: Run route/workspace tests and commit**
+- [x] **Step 6: Run route/workspace tests and commit**
 
 ```sh
 vp test apps/web/src/components/environments apps/web/src/routes/_chat.environments.\$environmentId.test.tsx apps/web/src/routes/_chat.environments.add.test.tsx apps/web/src/components/settings/SettingsSidebarNav.test.tsx
@@ -510,6 +510,31 @@ vp run --filter @bibcode/web typecheck
 git add apps/web/src/components/environments apps/web/src/routes/_chat.environments.\$environmentId.tsx apps/web/src/routes/_chat.environments.\$environmentId.test.tsx apps/web/src/routes/_chat.environments.add.tsx apps/web/src/routes/_chat.environments.add.test.tsx apps/web/src/routes/settings.environments.tsx apps/web/src/routes/settings.connections.tsx apps/web/src/components/settings/SettingsSidebarNav.tsx apps/web/src/components/settings/SettingsSidebarNav.test.tsx apps/web/src/routeTree.gen.ts
 git commit -m "feat(web): add center environment workspaces"
 ```
+
+Implementation evidence: environment selection now opens
+`/environments/$environmentId` with eight stable URL-backed center tabs. The
+workspace projects verified identity, routes/trust, service/update state,
+environment-owned project inventory, live paired-client metadata, diagnostics
+privacy, and platform details without placing informational panels in the left
+tree. Client alias/order/pin remain local and editable offline; server fields
+become cached read-only state and host actions remain gated by explicit
+authority.
+
+Add Environment presents all discovered WSL distributions without starting
+stopped ones, imports discovered OpenSSH hosts or accepts a strictly parsed
+manual target, runs probe-before-consent remote setup with typed progress, and
+accepts only explicit `https://`/`wss://` direct endpoints. It renders no HTTP
+or insecure override. SPKI pinning is described as enrollment-channel evidence,
+not an arbitrary value trusted from the network endpoint. The legacy
+`/settings/connections` route always redirects to `/settings/environments`,
+which lists Known and Hidden environments plus Add Environment; environment
+rows, unavailable banners, and the global onboarding action navigate to center
+workspaces.
+
+Focused environment/settings route suites passed 29 tests, Sidebar projection
+and component suites passed 101 tests, the ChatView banner suite passed 150
+tests, the web production build passed, and the web typecheck passed (existing
+Effect schema suggestions only).
 
 ### Task 8: Implement Hide, Forget, Uninstall, Purge, and Force Remove consequences
 

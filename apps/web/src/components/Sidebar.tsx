@@ -652,7 +652,11 @@ export default function Sidebar() {
   const handleTreeSelect = useCallback(
     (row: EnvironmentTreeRow) => {
       if (row.kind === "environment") {
-        void navigate({ to: "/settings/connections" });
+        void navigate({
+          to: "/environments/$environmentId",
+          params: { environmentId: row.environmentId },
+          search: { tab: "overview" },
+        });
         return;
       }
       const thread =
@@ -699,7 +703,11 @@ export default function Sidebar() {
           );
           if (clicked === "retry") void retryEnvironment(row.environmentId);
           if (clicked === "open" || clicked === "settings") {
-            void navigate({ to: "/settings/connections" });
+            void navigate({
+              to: "/environments/$environmentId",
+              params: { environmentId: row.environmentId },
+              search: { tab: clicked === "open" ? "overview" : "connection" },
+            });
           }
           return;
         }

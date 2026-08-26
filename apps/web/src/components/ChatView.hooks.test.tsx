@@ -5353,7 +5353,7 @@ describe("ChatView banners and dialogs", () => {
     return renderToStaticMarkup(<>{bannerStack.items[0]!.actions}</>);
   }
 
-  it("gates unavailable environment actions by desktop target while preserving browser recovery", () => {
+  it("gates reconnect by target while always exposing the center environment workspace", () => {
     const remoteTarget = new BearerConnectionTarget({
       connectionId: "remote:server",
       environmentId,
@@ -5371,7 +5371,7 @@ describe("ChatView banners and dialogs", () => {
       target: remoteTarget,
     });
     expect(macRemoteBanner).not.toContain("Reconnect");
-    expect(macRemoteBanner).not.toContain("Connections");
+    expect(macRemoteBanner).toContain("Environment");
 
     const windowsWslBanner = unavailableBannerActions({
       surface: "desktop",
@@ -5379,7 +5379,7 @@ describe("ChatView banners and dialogs", () => {
       target: wslTarget,
     });
     expect(windowsWslBanner).toContain("Reconnect");
-    expect(windowsWslBanner).not.toContain("Connections");
+    expect(windowsWslBanner).toContain("Environment");
 
     const browserRemoteBanner = unavailableBannerActions({
       surface: "browser",
@@ -5387,7 +5387,7 @@ describe("ChatView banners and dialogs", () => {
       target: remoteTarget,
     });
     expect(browserRemoteBanner).toContain("Reconnect");
-    expect(browserRemoteBanner).toContain("Connections");
+    expect(browserRemoteBanner).toContain("Environment");
   });
 
   it("reconnects the environment from the unavailable banner and toasts failures", async () => {
@@ -5419,7 +5419,11 @@ describe("ChatView banners and dialogs", () => {
     ).toBe(true);
 
     (buttons[1]!.props as { onClick: () => void }).onClick();
-    expect(h.navigateCalls).toContainEqual({ to: "/settings/connections" });
+    expect(h.navigateCalls).toContainEqual({
+      to: "/environments/$environmentId",
+      params: { environmentId: "environment-local" },
+      search: { tab: "connection" },
+    });
   });
 
   it("dismisses the version mismatch banner persistently", () => {

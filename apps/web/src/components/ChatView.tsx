@@ -2299,7 +2299,7 @@ function ChatViewContent(props: ChatViewProps) {
       const target = environmentById.get(activeEnvironmentUnavailableState.environmentId)?.entry
         ?.target;
       const permitsReconnect = target !== undefined && presentation.permitsConnectionAction(target);
-      const showConnections = presentation.showRemoteDeviceControls;
+      const showEnvironment = activeEnvironmentUnavailableState.environmentId !== null;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
       items.push({
@@ -2311,7 +2311,7 @@ function ChatViewContent(props: ChatViewProps) {
           connection.error ??
           "Reconnect this environment before sending messages or running actions.",
         actions:
-          permitsReconnect || showConnections ? (
+          permitsReconnect || showEnvironment ? (
             <>
               {permitsReconnect ? (
                 <Button
@@ -2326,13 +2326,19 @@ function ChatViewContent(props: ChatViewProps) {
                   {isReconnecting ? "Reconnecting..." : "Reconnect"}
                 </Button>
               ) : null}
-              {showConnections ? (
+              {showEnvironment ? (
                 <Button
                   size="xs"
                   variant="outline"
-                  onClick={() => void navigate({ to: "/settings/connections" })}
+                  onClick={() =>
+                    void navigate({
+                      to: "/environments/$environmentId",
+                      params: { environmentId: activeEnvironmentUnavailableState.environmentId },
+                      search: { tab: "connection" },
+                    })
+                  }
                 >
-                  Connections
+                  Environment
                 </Button>
               ) : null}
             </>
