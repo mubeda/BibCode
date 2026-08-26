@@ -5,6 +5,9 @@ navigation-only `Environment -> Project -> Main/threads` tree. The center panel
 owns conversations, terminals, environment overview/settings, and other tabbed
 workspaces; the right panel hosts tools for the selected thread.
 
+See [Environment navigation](./environment-navigation.md) for the tree's
+search, status, keyboard, environment-settings, and removal behavior.
+
 ## Left Panel
 
 Each project appears only beneath its owning environment:

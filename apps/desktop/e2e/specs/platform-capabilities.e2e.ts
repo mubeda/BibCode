@@ -43,6 +43,24 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(browser.$("//*[contains(., 'fixture@example.test')]")).toBeDisplayed();
 
     await browser.url(`${appOrigin}/#/settings/connections`);
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).endsWith("/#/settings/environments"),
+      {
+        timeoutMsg: "Legacy Connections settings did not redirect to Environments.",
+      },
+    );
+    await expect(browser.$("//*[normalize-space()='Known environments']")).toBeDisplayed();
+    await expect(browser.$("//*[normalize-space()='Hidden environments']")).toBeDisplayed();
+    const addEnvironment = browser.$("a=Add environment");
+    await expect(addEnvironment).toBeDisplayed();
+    await addEnvironment.click();
+    await expect(browser.$('main[aria-label="Add environment workspace"]')).toBeDisplayed();
+    await expect(browser.$("//*[normalize-space()='SSH']")).toBeDisplayed();
+    await expect(browser.$("//*[normalize-space()='Direct HTTPS']")).toBeDisplayed();
+    await expect(browser.$("//*[contains(., 'https:// or wss:// endpoint')]")).toBeDisplayed();
+    await expect(browser.$("//*[contains(., 'insecure override')]")).not.toExist();
+    await expect(browser.$("//*[contains(., 'BiBCode Connect')]")).not.toExist();
+
     if (process.env.BIBCODE_E2E_PLATFORM === "win") {
       const wslState = await browser.execute(async () => {
         const bridge = Reflect.get(window, "desktopBridge") as
@@ -60,21 +78,15 @@ describe("packaged preferences, native integrations, and platform capabilities",
         throw new Error("Expected the packaged Windows desktop bridge to report WSL state.");
       }
 
-      await expect(browser.$("//*[normalize-space()='Local environment']")).toBeDisplayed();
-      await expect(browser.$("//*[normalize-space()='WSL backend']")).toBeDisplayed();
+      await expect(
+        browser.$("//*[normalize-space()='Windows Subsystem for Linux']"),
+      ).toBeDisplayed();
     } else {
-      await browser.waitUntil(
-        async () => (await browser.getUrl()).endsWith("/#/settings/general"),
-        {
-          timeoutMsg: "Local-only non-Windows desktop settings did not redirect to General.",
-        },
-      );
+      await expect(browser.$("//*[normalize-space()='Windows Subsystem for Linux']")).not.toExist();
     }
 
     await expect(browser.$("//*[normalize-space()='Network access']")).not.toExist();
     await expect(browser.$("//*[normalize-space()='Tailscale HTTPS']")).not.toExist();
-    await expect(browser.$('button[aria-label="Add environment"]')).not.toExist();
-    await expect(browser.$("//*[normalize-space()='SSH']")).not.toExist();
 
     await browser.url(`${appOrigin}/#/settings/diagnostics`);
     const openLogsFolder = browser.$('button[aria-label="Open logs folder"]');

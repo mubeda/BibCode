@@ -64,7 +64,9 @@ Select focused tests from affected source and verify at least:
   default, admits only the effective service account or an enabled Builtin
   Administrator token, and reverts impersonation before any await;
 - local Windows and WSL presentation follows current environment capability;
-- Settings > Connections mounts the SSH enrollment card, while Tailscale,
+- **Settings > Environments** mounts Known and Hidden environment lists, while
+  the center **Add environment** workspace exposes WSL, SSH, and strict Direct
+  HTTPS. Tailscale,
   relay, and generic remote-device actions remain absent. Exercise the native
   Windows OpenSSH adapter with its fixed UTF-16LE encoded PowerShell commands;
   prove every dynamic path crosses through bounded JSON stdin and do not
@@ -243,7 +245,8 @@ wsl.exe --list --verbose
 
 When WSL and a supported distribution are usable:
 
-- Settings shows **Local environment** and WSL status/setup controls;
+- **Settings > Environments** and the center environment **Platform** tab show
+  WSL status/setup controls;
 - every Running distro is visible, including **Setup required** when unproved;
 - an accepted Stopped distro remains in the environment hierarchy, while an
   unaccepted stopped distro remains only in **Add Environment**, and no setup
@@ -286,14 +289,14 @@ When WSL and a supported distribution are usable:
 
 When WSL is unavailable:
 
-- Local Environment still renders a meaningful unavailable state, not an empty
-  section;
+- the primary environment still renders a meaningful unavailable state, not an
+  empty section;
 - refresh/retry remains accessible;
 - Add Project does not present an unusable distribution; and
 - local Windows projects remain usable.
 
 Do not install a distribution or change system WSL configuration without
-permission. The Connections SSH card remains visible in both WSL branches;
+permission. The Add environment SSH choice remains visible in both WSL branches;
 Tailscale, relay, and generic remote-device targets remain absent. Validate the
 native Windows OpenSSH/PowerShell setup independently of whether WSL is
 available.
@@ -367,9 +370,12 @@ the E2E build in the current worktree, not an installed production copy.
 Use Codex Computer Use, not Orca. Capture normal, minimum-size, and relevant
 Windows DPI states. Verify:
 
-- Add Project shows **This device** and usable WSL locations only;
-- Local Environment is visible and never empty;
-- Settings > Connections shows SSH enrollment without rendering raw pairing
+- Add Project creates a project only beneath the selected owning environment
+  and never groups repositories across environments;
+- the primary environment is visible and never represented by an empty state;
+- **Settings > Environments** lists Known and Hidden environments; its center
+  **Add environment** workspace shows WSL, SSH, and strict Direct HTTPS. SSH
+  enrollment does not render raw pairing
   credentials; on a disposable Windows OpenSSH target, verify explicit setup
   consent, signed artifact transfer and remote checksum/size validation,
   private ZIP extraction plus atomic directory promotion, the requested service

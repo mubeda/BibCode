@@ -23,6 +23,14 @@ authority.
 lives in the server catalog, orchestration, and availability services; React
 does not reproduce it.
 
+The client presents a worktree-backed workspace as a level-3 thread directly
+under its owning project in the `Environment -> Project -> Main/threads` tree;
+there is no additional Worktrees navigation level. This flattening changes no
+catalog authority or lifecycle behavior. Repository claims remain local to one
+environment: the same verified common directory cannot create two active
+projects there, while a repository on another environment has an independent
+claim, project, catalog, and worktree set.
+
 ## Identity and trust
 
 Clients address candidates by project ID, opaque worktree key, and catalog

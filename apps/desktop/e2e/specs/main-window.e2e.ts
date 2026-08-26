@@ -130,6 +130,26 @@ describe("packaged main window and add-project flow", () => {
       browser.$(`//*[normalize-space()="${desktopUiFixture.projectName}"]`),
     ).toBeDisplayed();
 
+    const environmentTree = browser.$(
+      '[role="tree"][aria-label="Environments, projects, and threads"]',
+    );
+    await expect(environmentTree).toBeDisplayed();
+    const semanticTree = await browser.execute(() =>
+      [...document.querySelectorAll<HTMLElement>('[role="treeitem"]')].map((row) => ({
+        level: row.getAttribute("aria-level"),
+        label: row.getAttribute("aria-label"),
+      })),
+    );
+    if (!semanticTree.some((row) => row.level === "1" && row.label?.startsWith("Environment "))) {
+      throw new Error(`Environment ownership row is missing: ${JSON.stringify(semanticTree)}`);
+    }
+    if (!semanticTree.some((row) => row.level === "2" && row.label?.startsWith("Project "))) {
+      throw new Error(`Project ownership row is missing: ${JSON.stringify(semanticTree)}`);
+    }
+    if (!semanticTree.some((row) => row.level === "3" && row.label?.includes("Main"))) {
+      throw new Error(`Permanent Main row is missing: ${JSON.stringify(semanticTree)}`);
+    }
+
     await setDesktopUiWindowSize(1280, 900);
     await browser.saveScreenshot(NodePath.join(artifactDirectory, "main-window-marketing.png"));
 

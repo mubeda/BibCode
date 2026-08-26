@@ -193,8 +193,11 @@ report the residual instead of attempting a destructive repair.
 Use Codex Computer Use, not Orca. Confirm the executable path and PID before
 using any frame as evidence. At normal and minimum sizes verify:
 
-- Add Project has no Host selector or remote-device choice for the local Mac;
-- Settings > Connections exposes the desktop SSH enrollment card; with a
+- Add Project creates a project only beneath the selected owning environment;
+  it has no cross-environment repository grouping or Host selector;
+- **Settings > Environments** lists Known and Hidden environments, while the
+  center **Add environment** workspace exposes SSH and strict Direct HTTPS but
+  omits WSL. With a
   disposable native macOS/OpenSSH host, exercise compatible-service enrollment
   and explicit signed-artifact setup. Verify x86-64/ARM64 normalization as
   applicable, local and remote checksum/size checks, private extraction plus

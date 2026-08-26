@@ -66,6 +66,21 @@ references, and atomically removes local routes, bindings, UI state, cache, and
 environment metadata. It does not imply that a remote server was stopped or
 that remote projects/worktrees/data were deleted.
 
+### Force Remove From This Client
+
+An offline Forget with stronger user confirmation. The user must type the
+environment alias and acknowledge that the remote result is unknown. It runs
+only local client cleanup, queues no remote operation, and warns that the
+server, service, projects, worktrees, credentials, and data may remain.
+
+### Remote Removal Plan
+
+A short-lived, versioned host-authority description of an optional remote
+uninstall or purge. It binds the environment and storage identities, service
+mode, data root, projects, worktrees, running processes, and other paired
+clients before mutation. Remote cleanup and client Forget have separate
+outcomes; no network session may infer host authority from administrator scope.
+
 ### Pairing Credential
 
 A reveal-once, five-minute bootstrap created through authenticated startup or
@@ -188,7 +203,10 @@ in center workspaces rather than extra left-panel tabs or information panels.
 
 ### Center Panel
 
-The main chat and terminal workspace. Center surfaces live in tab groups, with
+The main chat, terminal, and environment-management workspace. Environment
+Overview, Connection, Service, Security, Projects & Storage, Updates,
+Diagnostics, Platform, and removal surfaces are center routes and never sidebar
+detail panels. Chat and terminal surfaces live in tab groups, with
 up to four groups arranged as resizable horizontal or vertical split panes.
 Each group has its own active tab; the focused group receives newly created AI
 chat and terminal panels. Layout, focus, tab order, and split ratios persist

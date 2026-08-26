@@ -76,15 +76,23 @@ describe("@wdio/tauri-service compatibility", () => {
     expect(wdioConfig).not.toContain("browser.waitUntil");
     expect(wdioConfig).toContain("window.localStorage.clear()");
     expect(wdioConfig).toContain("window.sessionStorage.clear()");
-    expect(wdioConfig).toContain('indexedDB.open("bibcode:connection-runtime", 2)');
-    expect(wdioConfig).toContain('["catalog", "shell", "thread"]');
+    expect(wdioConfig).toContain('indexedDB.open("bibcode:connection-runtime")');
+    expect(wdioConfig).not.toMatch(/indexedDB\.open\("bibcode:connection-runtime",\s*\d+\)/u);
+    expect(wdioConfig).toContain('const storeNames = ["catalog", "shell", "thread"]');
     expect(wdioConfig).toContain("transaction.objectStore(storeName).clear()");
     expect(wdioConfig).not.toContain("indexedDB.deleteDatabase");
     expect(wdioConfig.indexOf("window.localStorage.clear()")).toBeLessThan(
-      wdioConfig.indexOf('indexedDB.open("bibcode:connection-runtime", 2)'),
+      wdioConfig.indexOf('indexedDB.open("bibcode:connection-runtime")'),
     );
     expect(wdioConfig.indexOf("transaction.objectStore(storeName).clear()")).toBeLessThan(
       wdioConfig.indexOf("await browser.refresh()"),
     );
+  });
+
+  it("settles native window resizing without waiting on throttled animation frames", () => {
+    const uiState = NodeFS.readFileSync(new URL("./ui-state.ts", import.meta.url), "utf8");
+
+    expect(uiState).toContain("await browser.pause(100)");
+    expect(uiState).not.toContain("requestAnimationFrame");
   });
 });

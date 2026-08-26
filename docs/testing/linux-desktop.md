@@ -154,9 +154,11 @@ user profile globally.
 Use Codex Computer Use, not Orca. Capture the actual X11/Wayland and desktop
 environment in the report. At normal and minimum sizes verify:
 
-- Add Project has no Host selector or remote-device choice when only the local
-  Linux environment is supported;
-- Settings > Connections exposes the desktop SSH enrollment card; with a
+- Add Project creates a project only beneath the selected owning environment;
+  it has no cross-environment repository grouping or Host selector;
+- **Settings > Environments** lists Known and Hidden environments, while the
+  center **Add environment** workspace exposes SSH and strict Direct HTTPS but
+  omits WSL. With a
   disposable Linux/OpenSSH host, exercise both compatible-service enrollment
   and explicit setup consent. Verify the exact signed artifact, local and remote
   checksum/size checks, private extraction plus atomic promotion for portable

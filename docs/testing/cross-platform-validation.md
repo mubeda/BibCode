@@ -133,6 +133,7 @@ offline cache, or environment removal changes, run the current owners together:
 
 ```sh
 vp test apps/web/src/connection/catalogMigration.test.ts apps/web/src/connection/catalog.test.ts apps/web/src/connection/storage.test.ts apps/web/src/environmentNavigationStore.test.ts apps/web/src/ForgottenEnvironmentClientCleanupCoordinator.test.tsx apps/web/src/uiStateStore.test.ts apps/web/src/sidebarWorkspaceMetaStore.test.ts packages/client-runtime/src/connection/catalog.test.ts packages/client-runtime/src/connection/routeSelection.test.ts packages/client-runtime/src/connection/supervisor.test.ts packages/client-runtime/src/connection/registry.test.ts --run
+vp test apps/web/src/environmentTree.test.ts apps/web/src/components/Sidebar.test.tsx apps/web/src/components/sidebar apps/web/src/components/environments
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-desktop secret_store -- --nocapture
 ```
 
@@ -690,6 +691,15 @@ sizes. Cover relevant:
 
 - Environment -> Project -> Main/thread hierarchy and Add Project duplicate
   disposition, with no left-panel settings/information tabs;
+- first run; several online environments; WSL **Setup required** and **Stopped**;
+  connecting/reconnecting; offline full-cache, metadata-only, and no-cache;
+  authentication required; version mismatch; updating; identity mismatch;
+  search ancestry; hidden restoration; online removal; offline force removal;
+  reduced motion; and a 100-environment/at-least-1,000-row fixture;
+- the center environment tabs and removal workspace, text plus non-color status,
+  stable manual ordering during status churn, every documented tree key,
+  context menus, focus after route changes, virtual-row activation, 200% zoom,
+  narrow layout, and measured search/large-tree latency;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears

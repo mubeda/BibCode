@@ -556,6 +556,29 @@ the departed renderer or its terminal buffers reachable.
 See [RPC and orchestration](./rpc-and-orchestration.md) and
 [Connection runtime](./connection-runtime.md) for the detailed boundaries.
 
+## Environment-owned presentation
+
+The renderer projects normalized environment aggregates as one navigation-only
+ARIA tree: `Environment -> Project -> Main/threads`. Environment, project, and
+thread identity remain present in every selected route and cache key. Search
+may filter descendants, but it retains matching ownership ancestors; live
+status never changes manual row order. The tree virtualizes rows without
+changing logical level, position, set size, focus, or stable row identity.
+
+Environment overview and administration belong to center workspaces, not to a
+second sidebar tab or detail panel. The center route owns aliases, pin/manual
+order, connections, service state, security, projects/storage, updates,
+diagnostics, platform capabilities, and removal consequences. Offline project
+and thread snapshots are read-only. No mutating project, Git, filesystem,
+terminal, or provider command is queued for a later reconnect.
+
+Disconnect, Hide, Forget, remote service uninstall, and remote data purge are
+distinct transitions. Only Forget is the normalized client-catalog deletion
+transaction described by the connection runtime. Remote uninstall or purge
+requires an explicit versioned plan plus a trusted host-authority channel and
+reports independently from local removal; an offline force-Forget cannot
+claim or schedule remote cleanup.
+
 ## Boundaries and invariants
 
 ```text

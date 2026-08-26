@@ -33,6 +33,7 @@ const desktopUiSpecFiles =
   requestedSpec && requestedSpec.length > 0
     ? [requestedSpec]
     : [
+        "./specs/environment-navigation.e2e.ts",
         "./specs/main-window.e2e.ts",
         "./specs/project-session-terminal.e2e.ts",
         "./specs/platform-capabilities.e2e.ts",
@@ -66,7 +67,9 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
         settled = true;
         done({ error });
       };
-      const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
+      // Open the schema already created by the packaged app. Pinning a version here makes the
+      // harness fail with VersionError whenever the production database advances.
+      const openRequest = indexedDB.open("bibcode:connection-runtime");
       openRequest.addEventListener("error", () => {
         finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
       });
@@ -75,6 +78,8 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
       });
       openRequest.addEventListener("success", () => {
         const database = openRequest.result;
+        // The packaged app uses a fresh server state root for each run, so its WebView catalog
+        // must also start empty instead of retaining an environment identity from an older run.
         const storeNames = ["catalog", "shell", "thread"];
         const transaction = database.transaction(storeNames, "readwrite");
         transaction.addEventListener("error", () => {

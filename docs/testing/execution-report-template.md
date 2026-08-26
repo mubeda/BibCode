@@ -197,6 +197,20 @@ native targets are unavailable evidence, not compatibility passes.
 | -------- | ------------------------ | ----- | -------------------- |
 |          |                          |       |                      |
 
+- Required environment states covered: first run | several online | WSL setup
+  required | WSL stopped | connecting | reconnecting | offline full cache |
+  offline metadata only | offline no cache | authentication required | version
+  mismatch | updating | identity mismatch | duplicate add | search | hidden
+  restoration | online removal | offline force removal | narrow | reduced
+  motion | large tree
+- Environment hierarchy/flat threads/search ancestry result:
+- Left-panel settings, tabs, or information-panel negative evidence:
+- Center environment tabs/removal workspace result:
+- Tree keys, route-change focus, virtual activation, and context-menu result:
+- Text/non-color status and status-churn ordering result:
+- 200% zoom and reduced-motion result:
+- Environment count / visible row count / projection duration:
+- Search query / input-to-projection duration:
 - Exact executable launched:
 - Exact PID/start identity:
 - Other installed or development copies excluded:

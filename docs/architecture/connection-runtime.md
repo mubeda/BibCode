@@ -156,6 +156,14 @@ group key only when the current project catalog resolves it to exactly one
 `environmentId + projectId`. After the receipt exists, v1 localStorage is never
 consulted for navigation.
 
+The v2 document is presentation state, not catalog authority. It may store
+expanded ownership paths, manual environment order, pin/hidden intent, focus,
+and selection, but it cannot manufacture an environment, project, thread,
+route, or live result. The renderer's flat tree retains a descendant's
+environment/project ancestry under search and never uses connection status as
+a sorting input. Environment settings and lifecycle controls route to center
+workspaces; the left panel remains navigation-only.
+
 ### Desktop topology reconciliation
 
 The renderer owns one reference-counted desktop topology controller. Native
@@ -420,6 +428,16 @@ or a prepared receipt for an absent environment, is repaired idempotently.
 Failure to make the receipt durable prevents Forget from starting, while
 incomplete post-success cleanup is reported explicitly and remains retryable
 rather than being presented as a clean removal.
+
+Disconnect is earlier and weaker than every removal operation: it cancels the
+active client session but retains routes, credentials, cache, bindings,
+settings, and remote state. The removal workspace may request optional remote
+service uninstall or purge only through a fresh versioned plan and a trusted
+desktop, local-control, or SSH host-authority adapter. Those remote outcomes
+are separate from Forget. When the environment is offline, force-Forget
+requires explicit unknown-outcome confirmation, executes no remote command,
+queues nothing for reconnect, and warns that the server, projects, worktrees,
+credentials, and data may remain.
 
 ## Worktree catalog subscriptions
 

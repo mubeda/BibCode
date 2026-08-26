@@ -11,11 +11,9 @@ export async function setDesktopUiWindowSize(width: number, height: number): Pro
   let outerSize = scaleDesktopUiWindowSize(requestedViewportSize, devicePixelRatio);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await browser.setWindowSize(outerSize.width, outerSize.height);
-    await browser.executeAsync((done: () => void) => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(done);
-      });
-    });
+    // A packaged WebView may throttle animation frames while its native window is resizing.
+    // Settle on the driver side so this wait stays bounded even when no frame is delivered.
+    await browser.pause(100);
     const observedViewportSize = await browser.execute(() => ({
       width: window.innerWidth,
       height: window.innerHeight,

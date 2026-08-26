@@ -660,4 +660,39 @@ describe("environment tree projection", () => {
     expect(projection.rows).toHaveLength(1_100);
     expect(elapsedMs).toBeLessThan(250);
   });
+
+  it("filters 100 environments without exceeding the 250ms interaction budget", () => {
+    const environments = Array.from({ length: 100 }, (_, environmentIndex) => {
+      const environmentId = EnvironmentId.make(`search-environment-${environmentIndex}`);
+      const projects = Array.from({ length: 3 }, (_, projectIndex) => ({
+        id: ProjectId.make(`search-project-${projectIndex}`),
+        title: projectIndex === 2 ? `Auth project ${environmentIndex}` : `Project ${projectIndex}`,
+        workspaceRoot: `/src/${environmentIndex}/${projectIndex}`,
+        createdAt: EARLY,
+        updatedAt: LATE,
+        activityLabel: null,
+      }));
+      return environment(environmentId, {
+        projects,
+        threads: projects.flatMap((project) => [
+          thread(ThreadId.make(`search-main-${project.id}`), project.id, { kind: "default" }),
+          thread(ThreadId.make(`search-thread-${project.id}`), project.id, { kind: "workspace" }),
+        ]),
+      });
+    });
+    const start = performance.now();
+    const projection = createEnvironmentTreeProjector()(
+      input(environments, {
+        searchQuery: "auth",
+        preferences: preferences({
+          expandedEnvironmentIds: environments.map((candidate) => candidate.environmentId),
+        }),
+      }),
+    );
+    const elapsedMs = performance.now() - start;
+
+    expect(projection.rows.filter((row) => row.kind === "environment")).toHaveLength(100);
+    expect(projection.rows.filter((row) => row.kind === "project")).toHaveLength(100);
+    expect(elapsedMs).toBeLessThan(250);
+  });
 });

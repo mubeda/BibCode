@@ -52,6 +52,7 @@ current behavior.
 
 ## Operations and reference
 
+- [Environment navigation](./user/environment-navigation.md)
 - [Testing runbooks](./testing/README.md)
 - [Continuous integration](./operations/ci.md)
 - [Release process](./operations/release.md)

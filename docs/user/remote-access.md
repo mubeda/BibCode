@@ -152,8 +152,8 @@ secret.
 The issued session is a full environment administrator for the current
 feature: permission levels are not user-selectable, and a paired client can
 operate projects and terminals and administer other client access. In the
-browser/hosted UI, **Settings → Connections** shows this warning before
-creation. The raw value is shown once in the creation result so it can be
+browser/hosted UI, the environment's center **Security** tab shows this warning
+before creation. The raw value is shown once in the creation result so it can be
 copied; closing that result permanently leaves only a fingerprint, label, and
 expiry. BiBCode stores a SHA-256 hash rather than a recoverable pairing value.
 
@@ -252,6 +252,12 @@ offline or remote cleanup cannot be proved, force local removal must explicitly
 warn that the server, projects, worktrees, credentials, and data may still be
 present on the remote machine.
 
+Use the environment's center removal workspace for these choices. Offline
+force removal requires the exact alias plus an explicit unknown-outcome
+acknowledgement and never queues remote cleanup. See
+[Environment navigation](./environment-navigation.md) for the complete UI and
+consequence model.
+
 ## Windows Subsystem for Linux
 
 The optional WSL backend runs a native Linux `bibcode` binary. It does not invoke
@@ -319,11 +325,12 @@ for explicit recovery.
 
 When **WSL only** is enabled, a missing distribution, binary, or failed WSL
 startup leaves the local backend unavailable; the desktop does not silently
-start the Windows backend. In **Settings → Local environment**, choose another
-distribution or **Retry WSL** after correcting the prerequisite. Use
-**Diagnostics** to save diagnostic logs. **Switch to Windows** is the explicit
-way to make the native Windows backend primary; the normal restart and storage
-identity checks then apply.
+start the Windows backend. In **Settings → Environments**, open the WSL
+environment's center **Platform** tab to choose another distribution or retry
+after correcting the prerequisite. Use its **Diagnostics** tab to save
+diagnostic logs. **Switch to Windows** is the explicit way to make the native
+Windows backend primary; the normal restart and storage identity checks then
+apply.
 
 ## Security notes
 
@@ -336,7 +343,7 @@ identity checks then apply.
 - Treat pairing URLs and credentials as secrets.
 - Copy a newly created pairing credential before closing its reveal-once
   result; BiBCode cannot display it again.
-- In the browser/hosted UI, review and revoke sessions you no longer trust in
-  **Settings → Connections**.
+- In the browser/hosted UI, review and revoke sessions you no longer trust from
+  the environment's center **Security** tab.
 - Credentials can leak through browser history, screenshots, logs, or copied
   text even when they are placed in a URL fragment.

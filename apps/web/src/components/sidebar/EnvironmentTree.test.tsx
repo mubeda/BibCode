@@ -232,6 +232,7 @@ describe("EnvironmentTree", () => {
       key(item(3), "Home");
       key(item(0), "A");
       key(item(1), "Enter");
+      key(item(1), " ");
       key(item(1), "F10", { shiftKey: true });
       key(item(1), "Escape");
       await Promise.resolve();
@@ -239,6 +240,7 @@ describe("EnvironmentTree", () => {
 
     expect(onToggle).toHaveBeenCalledWith(rows[1]);
     expect(onSelect).toHaveBeenCalledWith(rows[1]);
+    expect(onSelect).toHaveBeenCalledTimes(2);
     expect(onContextMenu).toHaveBeenCalledWith(rows[1], {
       source: "keyboard",
       clientX: 0,

@@ -240,6 +240,12 @@ choice must ask again and state these consequences. Confirmation means only
 "remove this client connection"; it must never be recorded as proof that the
 remote service or data was removed.
 
+The center removal workspace keeps these operations separate and shows the
+exact consequences before confirmation. Offline force removal requires the
+environment alias and an explicit unknown-remote-outcome acknowledgement; it
+never schedules uninstall or purge for a later reconnect. See
+[Environment navigation](./environment-navigation.md).
+
 ## Partial install and update recovery
 
 On a fresh failed install, BiBCode rolls back only service files and accounts
@@ -275,6 +281,7 @@ Until that transaction is available, do not treat update preparation or
 8. Verify no server-owned child process remains after stop before force-removing
    an exact native registration.
 
-See [Remote access](./remote-access.md),
+See [Environment navigation](./environment-navigation.md),
+[Remote access](./remote-access.md),
 [Authentication architecture](../architecture/authentication.md), and
 [Runtime and process model](../architecture/runtime-process-model.md).
