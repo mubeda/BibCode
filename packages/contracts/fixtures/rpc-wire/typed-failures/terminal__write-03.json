@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "%W!q)$Qzx",
-          "requiredScope": "review:write"
+          "requiredScope": "access:write"
         }
       }
     ]

@@ -4,7 +4,6 @@ pub mod activity;
 pub mod assets;
 mod auth;
 pub mod checkpointing;
-pub mod cloud;
 mod config;
 mod crypto;
 pub mod data_root;

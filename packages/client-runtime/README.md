@@ -15,7 +15,6 @@ subpath. The package intentionally has no root export.
 | `operations`         | Multi-step application workflows                                 |
 | `platform`           | Platform capability and persistence service contracts            |
 | `platform/migration` | Bounded schemas for one-time persisted-data migrations           |
-| `relay`              | Transitional BiBCode Connect compatibility pending removal       |
 | `rpc`                | HTTP/RPC clients, protocol, sessions, and subscriptions          |
 | `state/<domain>`     | Focused shared state, retention, reducers, and Atom constructors |
 
@@ -24,8 +23,7 @@ subpath. The package intentionally has no root export.
 Platform applications provide `platform` persistence and host capabilities.
 `connection` composes those capabilities with `authorization` and `rpc` and is
 the sole owner of route admission, failover, reconnect, and environment
-sessions. The legacy `relay` package is not an alternative state owner.
-Independent `state` modules consume the connection registry and expose focused
+sessions. Independent `state` modules consume the connection registry and expose focused
 state or Atom constructors to application-owned runtimes.
 
 The normalized runtime has one aggregate boundary:

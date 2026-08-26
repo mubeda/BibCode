@@ -6,8 +6,6 @@ pub const SCOPE_TERMINAL_OPERATE: &str = "terminal:operate";
 pub const SCOPE_REVIEW_WRITE: &str = "review:write";
 pub const SCOPE_ACCESS_READ: &str = "access:read";
 pub const SCOPE_ACCESS_WRITE: &str = "access:write";
-pub const SCOPE_RELAY_READ: &str = "relay:read";
-pub const SCOPE_RELAY_WRITE: &str = "relay:write";
 
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ORCHESTRATION_READ,
@@ -16,16 +14,14 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_REVIEW_WRITE,
     SCOPE_ACCESS_READ,
     SCOPE_ACCESS_WRITE,
-    SCOPE_RELAY_READ,
-    SCOPE_RELAY_WRITE,
 ];
 
+#[cfg(test)]
 pub const STANDARD_SCOPES: &[&str] = &[
     SCOPE_ORCHESTRATION_READ,
     SCOPE_ORCHESTRATION_OPERATE,
     SCOPE_TERMINAL_OPERATE,
     SCOPE_REVIEW_WRITE,
-    SCOPE_RELAY_READ,
 ];
 
 pub const ADMINISTRATIVE_SCOPES: &[&str] = &[
@@ -33,10 +29,8 @@ pub const ADMINISTRATIVE_SCOPES: &[&str] = &[
     SCOPE_ORCHESTRATION_OPERATE,
     SCOPE_TERMINAL_OPERATE,
     SCOPE_REVIEW_WRITE,
-    SCOPE_RELAY_READ,
     SCOPE_ACCESS_READ,
     SCOPE_ACCESS_WRITE,
-    SCOPE_RELAY_WRITE,
 ];
 
 pub const ENVIRONMENT_ADMINISTRATOR_SCOPES: &[&str] = &[

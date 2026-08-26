@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "__proto__",
-          "requiredScope": "relay:write"
+          "requiredScope": "access:write"
         }
       }
     ]

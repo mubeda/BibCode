@@ -39,7 +39,6 @@ describe("repository toolchain contract", () => {
     expect(workspace).toMatch(/^  vite-plus: 0\.2\.5$/m);
     expect(workspaceConfiguration.minimumReleaseAgeExclude).toEqual([
       "geckodriver@6.1.1",
-      "@cloudflare/workers-types@5.20260718.1",
       "@tanstack/router-generator@1.167.21",
       "@tanstack/router-plugin@1.168.22",
     ]);
@@ -84,7 +83,6 @@ describe("repository toolchain contract", () => {
     for (const packagePath of [
       "apps/desktop/package.json",
       "apps/web/package.json",
-      "infra/relay/package.json",
       "oxlint-plugin-bibcode/package.json",
       "packages/client-runtime/package.json",
       "packages/contracts/package.json",

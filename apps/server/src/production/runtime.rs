@@ -35,14 +35,12 @@ use crate::{
     process::configure_background_command,
     production::{
         agent_activity::ProductionAgentActivity,
-        connect_mcp::ConnectMcpService,
         control::{NativeServerControl, ProviderUpdateCheckTask},
         git_vcs::{GitVcsRpcServices, WorktreeRemovalTaskTracker, register_git_vcs_rpc},
         http_routes::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
             JsonRouteResponse, RouteContext,
         },
-        managed_endpoint::ManagedEndpointRuntime,
         operational_logs::{OperationalLogOptions, OperationalLogs},
         orchestration_effects::{
             BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
@@ -53,7 +51,6 @@ use crate::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             reconcile_abandoned_provider_sessions,
         },
-        relay::relay_client_service,
         server_terminal::{
             ProcessTreeCleanup, ServerTerminalServices, register_server_terminal_rpc,
         },
@@ -96,7 +93,6 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
-    managed_endpoint: ManagedEndpointRuntime,
     _worktree_catalog: WorktreeCatalogService,
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
@@ -117,15 +113,6 @@ pub fn finalize_rpc_registry(
 }
 
 impl ProductionRuntime {
-    pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
-        self.provider_runtime.attach_connect_mcp(service).await;
-    }
-
-    #[must_use]
-    pub fn managed_endpoint_runtime(&self) -> ManagedEndpointRuntime {
-        self.managed_endpoint.clone()
-    }
-
     pub async fn start(
         config: &ServerConfig,
         database: Database,
@@ -210,8 +197,6 @@ impl ProductionRuntime {
             .await
             .map_err(|error| error.to_string())?;
         let process_attribution = ProcessAttributionRegistry::new();
-        let managed_endpoint =
-            ManagedEndpointRuntime::with_process_attribution(process_attribution.clone());
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
             Arc::new(ProviderSettingsInventoryAuthority::new(provider_settings)),
@@ -320,7 +305,6 @@ impl ProductionRuntime {
         ));
         let provider_usage =
             ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
-        let relay = relay_client_service(config.state_dir());
         let agent_activity = Arc::new(ProductionAgentActivity::new(
             activity_projections.clone(),
             provider_runtime.clone(),
@@ -339,7 +323,6 @@ impl ProductionRuntime {
             resource_sampler.clone(),
             process_monitor,
             provider_usage,
-            relay,
             control.clone(),
             process_tree_cleanup,
         )
@@ -410,7 +393,6 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
-            managed_endpoint,
             _worktree_catalog: worktree_catalog,
             worktree_catalog_operations,
             worktree_runtime,
@@ -463,7 +445,6 @@ impl ProductionRuntime {
                     serde_json::to_value(result).map_err(internal_error)?,
                 ))
             }
-            _ => Err(bad_request("Unsupported core HTTP operation.")),
         }
     }
 
@@ -542,7 +523,6 @@ impl ProductionRuntime {
             return Ok(());
         }
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
-        self.managed_endpoint.shutdown().await;
         self.workspace.shutdown().await;
         self.status_broadcaster.shutdown().await;
         self.worktree_catalog_operations.shutdown().await;
@@ -2270,13 +2250,6 @@ mod tests {
             None,
         );
 
-        assert!(
-            runtime
-                .json(JsonOperation::ConnectLinkState, None, route_context())
-                .await
-                .is_err(),
-            "connect operation should be owned by its route adapter",
-        );
         assert!(
             runtime
                 .asset("invalid-token".to_string(), "missing.png".to_string())

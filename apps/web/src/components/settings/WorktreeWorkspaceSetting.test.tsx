@@ -150,7 +150,6 @@ function connectedEnvironment(id: string, label: string): EnvironmentPresentatio
     environmentId: EnvironmentId.make(id),
     label,
     displayUrl: null,
-    relayManaged: false,
     entry: {
       target: { _tag: "PrimaryConnectionTarget" },
     } as EnvironmentPresentation["entry"],

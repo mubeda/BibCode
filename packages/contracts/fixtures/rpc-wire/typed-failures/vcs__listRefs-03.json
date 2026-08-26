@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "otypxPro",
-          "requiredScope": "access:read"
+          "requiredScope": "orchestration:read"
         }
       }
     ]

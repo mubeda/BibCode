@@ -5,25 +5,20 @@
     "terminal:operate",
     "review:write",
     "access:read",
-    "access:write",
-    "relay:read",
-    "relay:write"
+    "access:write"
   ],
   "standardClient": [
     "orchestration:read",
     "orchestration:operate",
     "terminal:operate",
-    "review:write",
-    "relay:read"
+    "review:write"
   ],
   "administrative": [
     "orchestration:read",
     "orchestration:operate",
     "terminal:operate",
     "review:write",
-    "relay:read",
     "access:read",
-    "access:write",
-    "relay:write"
+    "access:write"
   ]
 }

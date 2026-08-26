@@ -120,7 +120,6 @@ import { useAddProjectWorkflow, type AddProjectWorkflow } from "./useAddProjectW
 const environmentId = EnvironmentId.make("public-workflow");
 const wslEnvironmentId = EnvironmentId.make("wsl-workflow");
 const sshEnvironmentId = EnvironmentId.make("ssh-workflow");
-const relayEnvironmentId = EnvironmentId.make("relay-workflow");
 const bearerEnvironmentId = EnvironmentId.make("bearer-workflow");
 const defaultThreadId = ThreadId.make("canonical-main");
 const codexInstanceId = ProviderInstanceId.make("codex");
@@ -203,7 +202,6 @@ function environment(
     environmentId,
     label,
     displayUrl,
-    relayManaged: false,
     entry: {
       target: {
         environmentId,
@@ -334,7 +332,6 @@ describe("useAddProjectWorkflow public adapter", () => {
         _tag: "SshConnectionTarget",
         connectionId: "ssh:build-server",
       }),
-      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
       environment(bearerEnvironmentId, "Remote server", {
         _tag: "BearerConnectionTarget",
         connectionId: "remote:server",
@@ -360,7 +357,6 @@ describe("useAddProjectWorkflow public adapter", () => {
         _tag: "SshConnectionTarget",
         connectionId: "ssh:build-server",
       }),
-      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
       environment(bearerEnvironmentId, "Remote server", {
         _tag: "BearerConnectionTarget",
         connectionId: "remote:server",
@@ -409,7 +405,6 @@ describe("useAddProjectWorkflow public adapter", () => {
         _tag: "SshConnectionTarget",
         connectionId: "ssh:build-server",
       }),
-      environment(relayEnvironmentId, "Relay server", { _tag: "RelayConnectionTarget" }),
       environment(bearerEnvironmentId, "Remote server", {
         _tag: "BearerConnectionTarget",
         connectionId: "remote:server",
@@ -422,7 +417,6 @@ describe("useAddProjectWorkflow public adapter", () => {
       "This device",
       "Ubuntu (WSL)",
       "Build server",
-      "Relay server",
       "Remote server",
     ]);
     expect(currentWorkflow).toHaveProperty("locationLabel", "Host");

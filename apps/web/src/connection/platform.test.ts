@@ -8,7 +8,6 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import { afterEach, vi } from "vite-plus/test";
 import * as Cause from "effect/Cause";
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -16,7 +15,6 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import {
   ClientPresentation,
-  CloudSession,
   EnvironmentOwnedDataCleanup,
   PlatformConnectionSource,
   PrimaryEnvironmentAuth,
@@ -72,7 +70,6 @@ function platformWslState(generation: number, distroState: "running" | "stopped"
 // ── Controllable mock state ──────────────────────────────────────────
 const pf = vi.hoisted(() => ({
   isHostedStatic: false,
-  session: null as null | { readClerkToken: () => unknown },
   desktopPrimaryBearer: null as null | (() => Promise<string | null>),
   primaryTarget: null as unknown,
   secondaryRead: { _tag: "Success", bootstraps: [] as unknown[] } as unknown,
@@ -93,10 +90,6 @@ const pf = vi.hoisted(() => ({
 
 vi.mock("../hostedPairing", () => ({
   isHostedStaticApp: () => pf.isHostedStatic,
-}));
-
-vi.mock("../rpc/atomRegistry", () => ({
-  appAtomRegistry: { get: () => pf.session },
 }));
 
 vi.mock("../rpc/requestLatencyState", () => ({
@@ -207,14 +200,6 @@ vi.mock("./storage", async () => {
   };
 });
 
-vi.mock("@bibcode/client-runtime/relay", async () => {
-  const Stream = await import("effect/Stream");
-  return {
-    managedRelaySessionAtom: { _tag: "managedRelaySessionAtom" },
-    managedRelayAccountChanges: () => Stream.empty,
-  };
-});
-
 vi.mock("@bibcode/client-runtime/environment", () => ({
   fetchRemoteEnvironmentDescriptor: (input: { httpBaseUrl: string }) => {
     pf.descriptorCalls.push(input.httpBaseUrl);
@@ -270,10 +255,6 @@ const SSH_BOOTSTRAP = {
   wsBaseUrl: "ws://127.0.0.1:3201/",
   hostKeyFingerprint: "SHA256:known-host-key",
 };
-
-class ReadClerkTokenError extends Data.TaggedError("ReadClerkTokenError")<{
-  readonly message: string;
-}> {}
 
 interface BridgeOptions {
   readonly failDescriptor?: boolean;
@@ -428,7 +409,6 @@ function waitFor(check: () => boolean) {
 
 function resetPf(): void {
   pf.isHostedStatic = false;
-  pf.session = null;
   pf.desktopPrimaryBearer = null;
   pf.primaryTarget = null;
   pf.secondaryRead = { _tag: "Success", bootstraps: [] };
@@ -631,7 +611,6 @@ describe("connectionPlatformLayer capabilities", () => {
       const presentation = yield* ClientPresentation;
       expect(presentation.metadata.label).toBe("BiBCode Desktop");
       expect(yield* ClientPresentation).toBeDefined();
-      expect(yield* CloudSession).toBeDefined();
       expect(yield* PrimaryEnvironmentAuth).toBeDefined();
       expect(yield* SshEnvironmentGateway).toBeDefined();
       expect(yield* PlatformConnectionSource).toBeDefined();
@@ -646,49 +625,6 @@ describe("connectionPlatformLayer capabilities", () => {
       const presentation = yield* ClientPresentation;
       expect(presentation.metadata.label).toBe("BiBCode Web");
       expect("os" in presentation.metadata).toBe(false);
-    }).pipe(Effect.provide(connectionPlatformLayer));
-  });
-});
-
-describe("connectionPlatformLayer cloud session token", () => {
-  it.effect("blocks when no relay session is signed in", () => {
-    stubBrowser();
-    pf.session = null;
-    return Effect.gen(function* () {
-      const cloud = yield* CloudSession;
-      const error = yield* cloud.clerkToken.pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionBlockedError);
-    }).pipe(Effect.provide(connectionPlatformLayer));
-  });
-
-  it.effect("returns the clerk token when the relay session yields one", () => {
-    stubBrowser();
-    pf.session = { readClerkToken: () => Effect.succeed("clerk-token") };
-    return Effect.gen(function* () {
-      const cloud = yield* CloudSession;
-      expect(yield* cloud.clerkToken).toBe("clerk-token");
-    }).pipe(Effect.provide(connectionPlatformLayer));
-  });
-
-  it.effect("blocks when the relay session has no clerk token", () => {
-    stubBrowser();
-    pf.session = { readClerkToken: () => Effect.succeed(null) };
-    return Effect.gen(function* () {
-      const cloud = yield* CloudSession;
-      const error = yield* cloud.clerkToken.pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionBlockedError);
-    }).pipe(Effect.provide(connectionPlatformLayer));
-  });
-
-  it.effect("maps a clerk token read failure to a transient error", () => {
-    stubBrowser();
-    pf.session = {
-      readClerkToken: () => Effect.fail(new ReadClerkTokenError({ message: "network down" })),
-    };
-    return Effect.gen(function* () {
-      const cloud = yield* CloudSession;
-      const error = yield* cloud.clerkToken.pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ConnectionTransientError);
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 });

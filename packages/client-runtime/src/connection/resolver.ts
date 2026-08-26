@@ -1,5 +1,4 @@
 import type { ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
-import { RelayEnvironmentConnectScope } from "@bibcode/contracts/relay";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -8,7 +7,6 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
-import * as ManagedRelay from "../relay/managedRelay.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 import {
@@ -22,7 +20,6 @@ import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
   credentialMissingError,
   environmentMismatchError,
-  mapManagedRelayError,
   mapRemoteEnvironmentError,
   profileMissingError,
 } from "./errors.ts";
@@ -32,7 +29,6 @@ import type {
   EnvironmentRoute,
   PreparedConnection,
   PrimaryConnectionTarget,
-  RelayConnectionTarget,
   SshConnectionTarget,
   VerifiedRouteIdentity,
 } from "./model.ts";
@@ -260,46 +256,6 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
   });
 });
 
-const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(function* () {
-  const relay = yield* ManagedRelay.ManagedRelayClient;
-  const session = yield* ClientCapabilities.CloudSession;
-  const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
-
-  return Effect.fnUntraced(function* (target: RelayConnectionTarget) {
-    const authorized = yield* remote.authorizeDpop({
-      expectedEnvironmentId: target.environmentId,
-      obtainBootstrap: Effect.gen(function* () {
-        const clerkToken = yield* session.clerkToken.pipe(
-          Effect.withSpan("relay.connection.cloudSessionToken.resolve"),
-        );
-        const connected = yield* relay
-          .connectEnvironment({
-            clerkToken,
-            scopes: [RelayEnvironmentConnectScope],
-            environmentId: target.environmentId,
-          })
-          .pipe(Effect.mapError(mapManagedRelayError));
-        if (connected.environmentId !== target.environmentId) {
-          return yield* environmentMismatchError({
-            expected: target.environmentId,
-            actual: connected.environmentId,
-          });
-        }
-        return connected;
-      }).pipe(Effect.withSpan("relay.connection.bootstrap.obtain")),
-    });
-    return {
-      environmentId: authorized.environmentId,
-      label: authorized.label,
-      descriptor: authorized.descriptor,
-      httpBaseUrl: authorized.httpBaseUrl,
-      socketUrl: authorized.socketUrl,
-      httpAuthorization: authorized.httpAuthorization,
-      target,
-    } satisfies PreparedConnection;
-  }, Effect.withSpan("clientRuntime.connection.broker.relay"));
-});
-
 const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(() =>
   Effect.succeed(
     Effect.fn("clientRuntime.connection.broker.ssh")(function* (
@@ -333,7 +289,6 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(() =>
 export const make = Effect.gen(function* () {
   const primary = yield* makePrimaryBroker();
   const bearer = yield* makeBearerBroker();
-  const relay = yield* makeRelayBroker();
   const routeTransportSecurity = yield* RouteTransportSecurity;
   const routeSecrets = yield* Persistence.EnvironmentSecretStore;
   const routePrimaryAuth = yield* ClientCapabilities.PrimaryEnvironmentAuth;
@@ -579,8 +534,6 @@ export const make = Effect.gen(function* () {
         return yield* primary(target);
       case "BearerConnectionTarget":
         return yield* bearer({ ...entry, target });
-      case "RelayConnectionTarget":
-        return yield* relay(target);
       case "SshConnectionTarget":
         return yield* ssh({ ...entry, target });
       case "UnavailableConnectionTarget":

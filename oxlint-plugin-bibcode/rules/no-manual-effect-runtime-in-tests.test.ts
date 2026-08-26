@@ -193,15 +193,6 @@ runOxlintRuleTests(
           void [source, EffectRoot, Layer];
         `,
       },
-      {
-        name: "allows the exact legacy budget in an existing debt file",
-        filename: `${repoRoot}/apps/web/src/cloud/dpop.test.ts`,
-        code: `
-          import * as Effect from "effect/Effect";
-          Effect.runPromise(first);
-          Effect.runPromise(second);
-        `,
-      },
     ],
     invalid: [
       {
@@ -235,15 +226,15 @@ runOxlintRuleTests(
         errors: 4,
       },
       {
-        name: "reports only occurrences beyond the legacy budget",
-        filename: `${repoRoot}/apps/web/src/cloud/dpop.test.ts`,
+        name: "reports every occurrence in a zero-budget test file",
+        filename: `${repoRoot}/apps/web/src/runtime.test.ts`,
         code: `
           import * as Effect from "effect/Effect";
           Effect.runPromise(first);
           Effect.runPromise(second);
           Effect.runPromise(third);
         `,
-        errors: 1,
+        errors: 3,
       },
       {
         name: "reports test JSX filenames",

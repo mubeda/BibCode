@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "\"'kVT/_82:",
-          "requiredScope": "relay:read"
+          "requiredScope": "terminal:operate"
         }
       }
     ]

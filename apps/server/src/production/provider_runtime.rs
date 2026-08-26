@@ -45,8 +45,7 @@ use crate::{
         wrap_launch_program,
     },
     production::{
-        connect_mcp::ConnectMcpService, operational_logs::ProviderOperationalLog,
-        orchestration_effects::process_compatible_path,
+        operational_logs::ProviderOperationalLog, orchestration_effects::process_compatible_path,
     },
     provider::{
         attachments::{
@@ -434,7 +433,6 @@ pub struct ProviderRuntimeSupervisor {
     sender: mpsc::Sender<SupervisorMessage>,
     stopped: CancellationToken,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 }
 
@@ -807,7 +805,6 @@ impl ProviderRuntimeSupervisor {
             sender,
             stopped,
             worker: Arc::new(Mutex::new(Some(worker))),
-            connect_mcp: Arc::new(RwLock::new(None)),
             activity_cancellation,
         }
     }
@@ -816,34 +813,7 @@ impl ProviderRuntimeSupervisor {
         *self.activity_cancellation.write().await = Some(service);
     }
 
-    pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
-        *self.connect_mcp.write().await = Some(service);
-    }
-
-    pub async fn launch(
-        &self,
-        mut request: ProviderLaunchRequest,
-    ) -> Result<(), ProviderRuntimeError> {
-        if request.mcp.is_none()
-            && let Some(connect) = self.connect_mcp.read().await.clone()
-        {
-            let provider_instance_id = request
-                .provider_instance_id
-                .clone()
-                .unwrap_or_else(|| request.provider.clone());
-            let issued = connect
-                .issue_mcp_credential(request.thread_id.clone(), provider_instance_id)
-                .await
-                .map_err(|error| ProviderRuntimeError::Provider {
-                    provider: request.provider.clone(),
-                    detail: format!("could not issue BiBCode MCP credential: {error:?}"),
-                })?;
-            request.mcp = Some(ProviderMcpConfig {
-                endpoint: issued.endpoint,
-                authorization_header: issued.authorization_header,
-                provider_session_id: issued.provider_session_id,
-            });
-        }
+    pub async fn launch(&self, request: ProviderLaunchRequest) -> Result<(), ProviderRuntimeError> {
         self.request(|response| SupervisorMessage::Launch {
             request: Box::new(request),
             response,
@@ -13274,7 +13244,6 @@ done
             sender,
             stopped: tokio_util::sync::CancellationToken::new(),
             worker: Arc::new(tokio::sync::Mutex::new(None)),
-            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
         };
         assert_eq!(
@@ -13293,7 +13262,6 @@ done
             sender,
             stopped: tokio_util::sync::CancellationToken::new(),
             worker: Arc::new(tokio::sync::Mutex::new(None)),
-            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
         };
         let drop_response = tokio::spawn(async move {

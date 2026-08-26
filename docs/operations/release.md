@@ -50,26 +50,17 @@ workflow aligns versioned application packages before building. After a
 successful stable release, the finalize job updates the versioned package files
 on `main` when branch protection permits the workflow token to push.
 
-## Cloud Configuration
+## Network and privacy posture
 
-BiBCode Connect public configuration is optional for this fork. When Cloudflare and
-Clerk production configuration exists, the workflow resolves and injects:
+Release builds have no hosted account or connection-control configuration.
+Ordinary startup, local use, pairing, diagnostics export, and crash handling do
+not require or contact a vendor service. A client connects only to its selected
+local/WSL loopback route, desktop-owned SSH forward, or explicitly enrolled
+HTTPS environment. The updater endpoint is contacted only by an intentional
+update check. Telemetry and crash upload are forbidden.
 
-- `BIBCODE_CLERK_PUBLISHABLE_KEY`;
-- `BIBCODE_CLERK_JWT_TEMPLATE`;
-- `BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID`;
-- `BIBCODE_RELAY_URL`.
-
-`BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID` remains in build and release plumbing, but
-the current native runtime has no matching headless Connect CLI or OAuth
-consumer. It does not enable a CLI login flow.
-
-Without that configuration, desktop artifacts are still built with BiBCode Connect
-disabled. Never place `CLERK_SECRET_KEY` in client build variables or artifacts.
-
-Relay deployment and hosted web deployment are separate from this fork's
-desktop release. The workflow intentionally does not publish the upstream
-`bibcode` npm package or deploy the upstream Vercel project.
+The workflow intentionally does not publish an npm package or deploy a hosted
+web application.
 
 ## Signing And OS Trust
 

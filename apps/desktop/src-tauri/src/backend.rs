@@ -5675,7 +5675,6 @@ exit /b 9
             .expect("desktop runtime WebSocket should connect");
 
         for (id, method) in [
-            "cloud.getRelayClientStatus",
             "filesystem.browse",
             "git.preparePullRequestThread",
             "git.resolvePullRequest",

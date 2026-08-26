@@ -5,12 +5,11 @@ use bibcode_server::{
         StoreInspectionStatus, StoreStartupError, create_verified_backup, inspect_store,
         prepare_store, preserve_and_start_empty, restore_backup, run_migrations,
     },
-    production::jwt::PersistentJwtCodec,
     resolve_data_root,
 };
 use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
@@ -19,10 +18,6 @@ use std::{
 };
 use tempfile::TempDir;
 use uuid::Uuid;
-
-#[path = "support/dpop.rs"]
-mod dpop;
-use dpop::exchange_pairing;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -147,81 +142,6 @@ async fn fetch_axum_descriptor(client: &Client, handle: &bibcode_server::ServerH
     response.json().await.expect("environment descriptor JSON")
 }
 
-async fn fetch_connect_descriptor(
-    client: &Client,
-    handle: &bibcode_server::ServerHandle,
-    environment_id: &str,
-) -> Value {
-    let credential = handle
-        .startup_access()
-        .expect("web startup access")
-        .credential
-        .clone();
-    let token_url = server_endpoint(handle, "/oauth/token");
-    let access = exchange_pairing(client, &token_url, &credential, 67).await;
-    let cloud_keys = TempDir::new().expect("temporary Connect cloud key directory");
-    let cloud_codec = PersistentJwtCodec::open(cloud_keys.path().join("cloud-keypair.json"))
-        .await
-        .expect("Connect cloud JWT codec");
-    let (_, cloud_public_key) = cloud_codec
-        .key_pair()
-        .await
-        .expect("Connect cloud key pair");
-    let config_url = server_endpoint(handle, "/api/connect/relay-config");
-    let config_response = access
-        .authorize(client.post(&config_url), "POST", &config_url)
-        .json(&json!({
-            "relayUrl": "https://relay.example",
-            "relayIssuer": "https://relay.example",
-            "cloudUserId": "project-data-safety-user",
-            "environmentCredential": "project-data-safety-credential",
-            "cloudMintPublicKey": cloud_public_key,
-            "endpointRuntime": null
-        }))
-        .send()
-        .await
-        .expect("Connect relay configuration response");
-    let config_status = config_response.status();
-    let config_body = config_response
-        .text()
-        .await
-        .expect("Connect relay configuration response body");
-    assert_eq!(
-        config_status,
-        StatusCode::OK,
-        "Connect relay configuration error: {config_body}"
-    );
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let proof = cloud_codec
-        .sign(
-            "bibcode-cloud-health+jwt",
-            json!({
-                "iss": "https://relay.example",
-                "aud": format!("bibcode-env:{environment_id}"),
-                "sub": "project-data-safety-user",
-                "jti": Uuid::new_v4().to_string(),
-                "iat": now,
-                "exp": now + 300,
-                "environmentId": environment_id,
-                "nonce": Uuid::new_v4().to_string(),
-                "scope": ["environment:status"]
-            }),
-        )
-        .await
-        .expect("signed Connect health proof");
-    let health_url = server_endpoint(handle, "/api/bibcode-connect/health");
-    let response = access
-        .authorize(client.post(&health_url), "POST", &health_url)
-        .json(&json!({ "proof": proof }))
-        .send()
-        .await
-        .expect("Connect health response");
-    let status = response.status();
-    let body = response.text().await.expect("Connect health response body");
-    assert_eq!(status, StatusCode::OK, "Connect health error: {body}");
-    serde_json::from_str::<Value>(&body).expect("Connect health JSON")["descriptor"].clone()
-}
-
 #[tokio::test]
 async fn descriptor_identities_survive_restart_and_remain_distinct_without_path_leakage() {
     let root = TempDir::new().expect("temporary absolute data root");
@@ -242,14 +162,10 @@ async fn descriptor_identities_survive_restart_and_remain_distinct_without_path_
     let first_environment_id = first_axum["environmentId"]
         .as_str()
         .expect("new local server environment UUID");
-    let first_connect = fetch_connect_descriptor(&client, &first, first_environment_id).await;
     Uuid::parse_str(first_storage_id).expect("valid server storage UUID");
     Uuid::parse_str(first_environment_id).expect("valid server environment UUID");
     assert_ne!(first_environment_id, first_storage_id);
-    assert_eq!(first_connect["environmentId"], first_environment_id);
-    assert_eq!(first_connect["storageInstanceId"], first_storage_id);
     assert_descriptor_is_path_redacted(&first_axum, &requested_root, &effective_root);
-    assert_descriptor_is_path_redacted(&first_connect, &requested_root, &effective_root);
     first.shutdown();
     first.join().await.expect("first server shutdown");
 
@@ -257,16 +173,9 @@ async fn descriptor_identities_survive_restart_and_remain_distinct_without_path_
         .await
         .expect("second server start");
     let second_axum = fetch_axum_descriptor(&client, &second).await;
-    let second_environment_id = second_axum["environmentId"]
-        .as_str()
-        .expect("restarted local server environment UUID");
-    let second_connect = fetch_connect_descriptor(&client, &second, second_environment_id).await;
     assert_eq!(second_axum["environmentId"], first_environment_id);
-    assert_eq!(second_connect["environmentId"], first_environment_id);
     assert_eq!(second_axum["storageInstanceId"], first_storage_id);
-    assert_eq!(second_connect["storageInstanceId"], first_storage_id);
     assert_descriptor_is_path_redacted(&second_axum, &requested_root, &effective_root);
-    assert_descriptor_is_path_redacted(&second_connect, &requested_root, &effective_root);
     second.shutdown();
     second.join().await.expect("second server shutdown");
 }

@@ -123,10 +123,6 @@ vi.mock("./session", () => ({
   usePreparedConnection: () => h.preparedConnection,
 }));
 
-vi.mock("./relay", () => ({
-  relayEnvironmentDiscovery: { stateValueAtom: { key: "relay-discovery" } },
-}));
-
 import { useAssetUrl, useAssetUrls } from "../assets/assetUrls";
 import {
   useEnvironment,
@@ -135,7 +131,6 @@ import {
   useEnvironments,
   usePrimaryEnvironment,
   usePrimaryEnvironmentId,
-  useRelayEnvironmentDiscovery,
 } from "./environments";
 import { useEnvironmentPresentation } from "./presentation";
 import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
@@ -244,7 +239,7 @@ describe("primary server state projections", () => {
 });
 
 describe("environment presentation hooks", () => {
-  it("projects catalogs, individual environments, primary ids, and relay discovery", () => {
+  it("projects catalogs, individual environments, and primary ids", () => {
     const primaryPresentation = {
       entry: {
         target: {
@@ -255,43 +250,22 @@ describe("environment presentation hooks", () => {
       },
       connection: { status: "available" },
     };
-    const relayId = EnvironmentId.make("environment-relay");
-    const relayPresentation = {
-      entry: {
-        target: {
-          _tag: "RelayConnectionTarget",
-          label: "Cloud",
-        },
-      },
-      connection: { status: "available" },
-    };
-    const presentations = new Map([
-      [environmentId, primaryPresentation],
-      [relayId, relayPresentation],
-    ]);
+    const presentations = new Map([[environmentId, primaryPresentation]]);
     h.atomValues.set("catalog", { isReady: true, entries: new Map() });
     h.atomValues.set("presentations", presentations);
     h.atomValues.set(`presentation:${environmentId}`, primaryPresentation);
-    h.atomValues.set(`presentation:${relayId}`, relayPresentation);
-    h.atomValues.set("relay-discovery", { _tag: "Ready", environments: [] });
 
     expect(useEnvironments()).toMatchObject({
       isReady: true,
       networkStatus: "online",
-      environments: [
-        { environmentId, label: "Local", relayManaged: false },
-        { environmentId: relayId, label: "Cloud", relayManaged: true },
-      ],
+      environments: [{ environmentId, label: "Local" }],
     });
     expect(useEnvironment(null)).toBeNull();
     expect(useEnvironment(environmentId)).toMatchObject({
       environmentId,
       label: "Local",
       displayUrl: "http://127.0.0.1:4321",
-      relayManaged: false,
     });
-    expect(useEnvironment(relayId)).toMatchObject({ relayManaged: true });
-    expect(useRelayEnvironmentDiscovery()).toEqual({ _tag: "Ready", environments: [] });
 
     h.atomValues.set("catalog", {
       isReady: true,

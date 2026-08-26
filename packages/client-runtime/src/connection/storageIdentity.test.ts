@@ -1,12 +1,7 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
-import {
-  BearerConnectionTarget,
-  PrimaryConnectionTarget,
-  RelayConnectionTarget,
-  SshConnectionTarget,
-} from "./model.ts";
+import { BearerConnectionTarget, PrimaryConnectionTarget, SshConnectionTarget } from "./model.ts";
 import { decideStorageIdentity, storageIdentityTargetKey } from "./storageIdentity.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -31,15 +26,6 @@ describe("storageIdentityTargetKey", () => {
     });
 
     expect(storageIdentityTargetKey(target)).toBe("bearer:bearer-connection-1");
-  });
-
-  it("keys relay targets by their stable logical environment ID", () => {
-    const target = new RelayConnectionTarget({
-      environmentId: ENVIRONMENT_ID,
-      label: "Relay secret label",
-    });
-
-    expect(storageIdentityTargetKey(target)).toBe("relay:environment-1");
   });
 
   it("keys SSH targets only by their stable connection ID", () => {

@@ -92,7 +92,6 @@ export function connectionCatalogDisplayUrl(entry: ConnectionCatalogEntry): stri
   switch (entry.target._tag) {
     case "PrimaryConnectionTarget":
       return entry.target.httpBaseUrl;
-    case "RelayConnectionTarget":
     case "UnavailableConnectionTarget":
       return null;
     case "BearerConnectionTarget":

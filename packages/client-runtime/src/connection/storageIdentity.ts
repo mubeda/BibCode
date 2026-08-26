@@ -39,8 +39,6 @@ export function storageIdentityTargetKey(target: ConnectionTarget): string {
     case "BearerConnectionTarget":
     case "UnavailableConnectionTarget":
       return `bearer:${target.connectionId}`;
-    case "RelayConnectionTarget":
-      return `relay:${target.environmentId}`;
     case "SshConnectionTarget":
       return `ssh:${target.connectionId}`;
   }

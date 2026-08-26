@@ -73,7 +73,7 @@ describe("createEnvironmentCatalogAtoms", () => {
         expect.objectContaining({ _tag: "Some", value: AVAILABLE_CONNECTION_STATE }),
       );
       expect(harness.followStream).toHaveBeenCalledWith(environmentId, expect.anything());
-      expect(harness.commandConfigs).toHaveLength(9);
+      expect(harness.commandConfigs).toHaveLength(8);
       for (const config of harness.commandConfigs) {
         expect(config.scheduler).toBe(harness.scheduler);
         expect(config.concurrency).toMatchObject({ mode: "serial" });
@@ -88,7 +88,6 @@ describe("createEnvironmentCatalogAtoms", () => {
         hide: vi.fn((input: unknown) => Effect.succeed(input)),
         restore: vi.fn((input: unknown) => Effect.succeed(input)),
         forget: vi.fn((input: unknown) => Effect.succeed(input)),
-        removeRelayEnvironments: vi.fn(() => Effect.void),
         disconnect: vi.fn((input: unknown) => Effect.succeed(input)),
         retryNow: vi.fn((input: unknown) => Effect.succeed(input)),
         acceptStorageIdentity: vi.fn((input: unknown) => Effect.succeed(input)),
@@ -100,7 +99,6 @@ describe("createEnvironmentCatalogAtoms", () => {
         environmentId,
         environmentId,
         environmentId,
-        undefined,
         environmentId,
         environmentId,
         environmentId,
@@ -116,7 +114,6 @@ describe("createEnvironmentCatalogAtoms", () => {
       expect(service.hide).toHaveBeenCalledWith(environmentId);
       expect(service.restore).toHaveBeenCalledWith(environmentId);
       expect(service.forget).toHaveBeenCalledWith(environmentId);
-      expect(service.removeRelayEnvironments).toHaveBeenCalled();
       expect(service.disconnect).toHaveBeenCalledWith(environmentId);
       expect(service.retryNow).toHaveBeenCalledWith(environmentId);
       expect(service.acceptStorageIdentity).toHaveBeenCalledWith(environmentId);

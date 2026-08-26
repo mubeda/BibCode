@@ -1,6 +1,6 @@
 import type { DesktopWslState } from "@bibcode/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import { applyWslEnableSelection } from "./localEnvironmentSettings.logic";
 
 const baseWslState: DesktopWslState = {
   enabled: false,

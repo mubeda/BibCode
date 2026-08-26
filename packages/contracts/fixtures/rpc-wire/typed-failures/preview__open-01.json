@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "mzP}",
-          "requiredScope": "relay:read"
+          "requiredScope": "access:read"
         }
       }
     ]

@@ -44,7 +44,6 @@ pub fn rpc_mutability(method: &str) -> RpcMutability {
         | "activity.listDetail"
         | "activity.listRoster"
         | "assets.createUrl"
-        | "cloud.getRelayClientStatus"
         | "filesystem.browse"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"

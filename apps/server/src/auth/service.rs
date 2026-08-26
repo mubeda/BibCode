@@ -19,7 +19,7 @@ use super::{
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
         ClientMetadata, ClientSessionView, ENVIRONMENT_ADMINISTRATOR_SCOPES,
-        PairingCredentialResult, PairingLinkView, Principal, STANDARD_SCOPES,
+        PairingCredentialResult, PairingLinkView, Principal,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -36,7 +36,6 @@ const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const DPOP_SESSION_TTL_MS: i64 = 60 * 60 * 1_000;
 const WEBSOCKET_TICKET_TTL_MS: i64 = 5 * 60 * 1_000;
 const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
-const CLOUD_PAIRING_TTL_MS: i64 = 2 * 60 * 1_000;
 const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_LENGTH: usize = 12;
@@ -598,23 +597,6 @@ impl AuthService {
             "one-time-token",
             Some(proof_key_thumbprint),
             PAIRING_TTL_MS,
-        )
-        .await
-    }
-
-    pub async fn issue_cloud_pairing(
-        &self,
-        proof_key_thumbprint: String,
-    ) -> Result<PairingCredentialResult, AuthError> {
-        if proof_key_thumbprint.trim().is_empty() {
-            return Err(AuthError::InvalidCredential);
-        }
-        self.issue_pairing_for_subject(
-            owned_scopes(STANDARD_SCOPES),
-            Some("BiBCode Connect connect".to_owned()),
-            "cloud-connect",
-            Some(proof_key_thumbprint),
-            CLOUD_PAIRING_TTL_MS,
         )
         .await
     }
@@ -1443,6 +1425,7 @@ fn generate_pairing_credential() -> Result<String, AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::model::STANDARD_SCOPES;
     use crate::rpc::RpcSessionContext;
 
     use super::*;
@@ -1591,10 +1574,6 @@ mod tests {
                 .await,
             Err(AuthError::InvalidCredential)
         ));
-        assert!(matches!(
-            service.issue_cloud_pairing(String::new()).await,
-            Err(AuthError::InvalidCredential)
-        ));
 
         let proof_pairing = service
             .issue_pairing_with_proof(
@@ -1629,20 +1608,7 @@ mod tests {
             Some("proof-thumbprint")
         );
 
-        let cloud_pairing = service
-            .issue_cloud_pairing("cloud-thumbprint".to_owned())
-            .await
-            .expect("cloud pairing should issue");
-        assert!(
-            service
-                .list_pairings()
-                .await
-                .iter()
-                .any(|pairing| pairing.id == cloud_pairing.id)
-        );
         assert!(!service.revoke_pairing("missing-pairing").await.unwrap());
-        assert!(service.revoke_pairing(&cloud_pairing.id).await.unwrap());
-        assert!(!service.revoke_pairing(&cloud_pairing.id).await.unwrap());
 
         let current = service
             .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)

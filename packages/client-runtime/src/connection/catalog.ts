@@ -13,7 +13,6 @@ import {
   BearerConnectionTarget,
   EnvironmentRoute as EnvironmentRouteSchema,
   PrimaryConnectionTarget,
-  RelayConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
   UnavailableConnectionTarget,
@@ -204,13 +203,6 @@ export class PrimaryConnectionRegistration extends Schema.TaggedClass<PrimaryCon
   },
 ) {}
 
-export class RelayConnectionRegistration extends Schema.TaggedClass<RelayConnectionRegistration>()(
-  "RelayConnectionRegistration",
-  {
-    target: RelayConnectionTarget,
-  },
-) {}
-
 export class BearerConnectionRegistration extends Schema.TaggedClass<BearerConnectionRegistration>()(
   "BearerConnectionRegistration",
   {
@@ -243,7 +235,6 @@ export class UnavailableConnectionRegistration extends Schema.TaggedClass<Unavai
 ) {}
 
 export const ConnectionRegistration = Schema.Union([
-  RelayConnectionRegistration,
   BearerConnectionRegistration,
   SshConnectionRegistration,
 ]);
@@ -282,7 +273,6 @@ export function connectionRegistrationCatalogEntry(
 ): ConnectionCatalogEntry {
   switch (registration._tag) {
     case "PrimaryConnectionRegistration":
-    case "RelayConnectionRegistration":
     case "UnavailableConnectionRegistration":
       return {
         target: registration.target,

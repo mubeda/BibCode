@@ -272,7 +272,7 @@ async fn credential_scrub_upgrade_skips_a_plaintext_preserving_migration_backup(
         inventory.verified.is_empty(),
         "migration 48 must not create a new artifact containing legacy plaintext credentials"
     );
-    assert_eq!(fixture.schema_version(), 48);
+    assert_eq!(fixture.schema_version(), 49);
     assert_eq!(project_ids(&prepared.paths.database), ["project-a"]);
 }
 

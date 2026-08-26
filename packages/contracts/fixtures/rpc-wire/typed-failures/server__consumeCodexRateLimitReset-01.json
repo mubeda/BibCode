@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "",
-          "requiredScope": "orchestration:operate"
+          "requiredScope": "access:write"
         }
       }
     ]

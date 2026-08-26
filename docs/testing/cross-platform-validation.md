@@ -86,6 +86,15 @@ process ownership, environment presentation, desktop bridge operations,
 provider availability, network trust, cancellation, restart, duplicate
 delivery, partial streams, and cleanup.
 
+For every native Windows, macOS, Linux, WSL, SSH, packaged-UI, and diagnostics
+run, capture outbound connection evidence with a deny-by-default proxy or
+equivalent native socket/process inspection. Cold startup, ordinary local use,
+pairing, diagnostics export, and intentional crash handling must make no
+unexpected internet request. Allow only the selected local/SSH/HTTPS
+environment endpoint and, when deliberately invoked, the documented updater
+endpoint. Record destination, initiating PID, scenario, and zero unexpected
+requests in the execution report. Telemetry and crash upload are forbidden.
+
 ## Focused tests
 
 Run the closest behavioral coverage before broad suites. Discover exact Rust

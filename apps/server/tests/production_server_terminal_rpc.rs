@@ -22,8 +22,8 @@ use bibcode_server::production::server_terminal::{
     register_server_terminal_rpc,
 };
 use bibcode_server::{
-    CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime, cloud,
-    diagnostics, provider_usage,
+    CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime, diagnostics,
+    provider_usage,
     terminal::{self, PtyBackend, PtyExit, PtyProcess, PtySpawnInput},
     worktree_catalog::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
@@ -1489,12 +1489,10 @@ async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_int
         .expect("Rust server starts");
 
     let mut control = Some(open_socket(handle.local_addr()).await);
-    let mut cloud_install = Some(open_socket(handle.local_addr()).await);
     let mut interruptible_attach = Some(open_socket(handle.local_addr()).await);
 
     let result = AssertUnwindSafe(async {
         let control = control.as_mut().expect("control socket");
-        let cloud_install = cloud_install.as_mut().expect("cloud install socket");
         let interruptible_attach = interruptible_attach
             .as_mut()
             .expect("interruptible attach socket");
@@ -1553,33 +1551,6 @@ async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_int
             .await,
             "RpcRequestInvalid",
         );
-
-        let relay_status =
-            success_value(request(control, "6", "cloud.getRelayClientStatus", json!({})).await);
-        assert_eq!(relay_status["status"], "missing");
-        assert_eq!(relay_status["version"], "1.0.0");
-
-        send_request(cloud_install, "1", "cloud.installRelayClient", json!({})).await;
-        let progress = next_chunk_and_ack(cloud_install, "1").await;
-        assert_eq!(
-            progress,
-            vec![json!({ "type": "progress", "stage": "download" })]
-        );
-        let complete = next_chunk_and_ack(cloud_install, "1").await;
-        assert_eq!(
-            complete,
-            vec![json!({
-                "type": "complete",
-                "status": { "status": "missing", "version": "1.0.0" }
-            })]
-        );
-        assert!(matches!(
-            next_message(cloud_install).await,
-            ServerMessage::Exit {
-                exit: RpcExit::Success { value: None },
-                ..
-            }
-        ));
 
         send_request(
             interruptible_attach,
@@ -1663,7 +1634,6 @@ async fn server_terminal_auxiliary_rpcs_surface_runtime_state_validation_and_int
     .await;
 
     close_socket(&mut interruptible_attach).await;
-    close_socket(&mut cloud_install).await;
     close_socket(&mut control).await;
     handle.shutdown();
     handle.join().await.expect("server joins");
@@ -1721,8 +1691,6 @@ fn registrar_source_contains_every_owned_rpc_name() {
         "subscribeServerConfig",
         "subscribeServerLifecycle",
         "subscribeDiscoveredLocalServers",
-        "cloud.getRelayClientStatus",
-        "cloud.installRelayClient",
     ] {
         assert!(source.contains(method), "registrar is missing {method}");
     }
@@ -1765,29 +1733,12 @@ fn fixture_services_with_manager(
         resource_sampler.clone(),
         Duration::from_secs(60),
     ));
-    let relay = cloud::RelayClientService::new(
-        || async {
-            cloud::RelayClientStatus::Missing {
-                version: "1.0.0".into(),
-            }
-        },
-        |report| async move {
-            report(cloud::RelayClientInstallEvent::Progress {
-                stage: "download".into(),
-            })
-            .await?;
-            Ok(cloud::RelayClientStatus::Missing {
-                version: "1.0.0".into(),
-            })
-        },
-    );
     ServerTerminalServices::new(
         terminal,
         sampler,
         resource_sampler,
         monitor,
         usage,
-        relay,
         Arc::new(FixtureControl),
     )
 }

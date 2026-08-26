@@ -15,7 +15,6 @@ import { resolveServerBackedAppDisplayName } from "../branding.logic";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
 import { CommandPalette } from "../components/CommandPalette";
 import { AppStatusBar } from "../components/status-bar/AppStatusBar";
-import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
 import { SlowRpcRequestToastCoordinator } from "../components/SlowRpcRequestToastCoordinator";
@@ -127,7 +126,6 @@ function RootRouteView() {
     <ToastProvider>
       <AnchoredToastProvider>
         <DocumentTitleSync />
-        {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
         {presentation.showRemoteDeviceControls ? <SshPasswordPromptDialog /> : null}
         <SlowRpcRequestToastCoordinator />
         <HostedStaticEnvironmentBootstrap />

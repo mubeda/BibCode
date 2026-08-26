@@ -253,9 +253,6 @@ describe("connection presentation", () => {
       ),
     ).toBe("http://localhost:3000");
     expect(
-      connectionCatalogDisplayUrl(entry({ _tag: "RelayConnectionTarget" }, Option.none())),
-    ).toBeNull();
-    expect(
       connectionCatalogDisplayUrl(
         entry(
           { _tag: "BearerConnectionTarget" },

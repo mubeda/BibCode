@@ -1,7 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{
-    Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey, Verifier as _,
-};
 use hmac::{Hmac, KeyInit as _, Mac};
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey,
@@ -11,56 +7,8 @@ use sha2::{Digest as _, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn decode_hex<const N: usize>(input: &str) -> [u8; N] {
-    assert_eq!(input.len(), N * 2, "hex fixture length");
-    let mut output = [0_u8; N];
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&input[index * 2..index * 2 + 2], 16)
-            .expect("valid fixed hex fixture");
-    }
-    output
-}
-
 fn encode_hex(input: &[u8]) -> String {
     input.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[test]
-fn ed25519_rfc8032_vector_and_public_jwk_are_stable() {
-    let secret = decode_hex::<32>(
-        "9d61b19deffd5a60ba844af492ec2cc4\
-         4449c5697b326919703bac031cae7f60",
-    );
-    let signing_key = Ed25519SigningKey::from_bytes(&secret);
-    let verifying_key = signing_key.verifying_key();
-
-    assert_eq!(
-        encode_hex(verifying_key.as_bytes()),
-        "d75a980182b10ab7d54bfed3c964073a\
-         0ee172f3daa62325af021a68f707511a"
-            .replace(' ', "")
-    );
-    assert_eq!(
-        URL_SAFE_NO_PAD.encode(verifying_key.as_bytes()),
-        "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
-    );
-
-    let signature = signing_key.sign(b"");
-    assert_eq!(
-        encode_hex(&signature.to_bytes()),
-        "e5564300c360ac729086e2cc806e828a\
-         84877f1eb8e5d974d873e06522490155\
-         5fb8821590a33bacc61e39701cf9b46b\
-         d25bf5f0595bbe24655141438e7a100b"
-            .replace(' ', "")
-    );
-    verifying_key
-        .verify(b"", &signature)
-        .expect("RFC 8032 signature verifies");
-
-    let malformed = Ed25519Signature::from_slice(&[0_u8; 64]).expect("64-byte signature");
-    assert!(verifying_key.verify(b"", &malformed).is_err());
-    assert!(Ed25519Signature::from_slice(&[0_u8; 63]).is_err());
 }
 
 #[test]

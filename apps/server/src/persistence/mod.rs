@@ -1,5 +1,6 @@
 mod backup;
 mod database;
+mod legacy_connect_cleanup;
 mod migrations;
 mod repositories;
 mod state_files;
@@ -13,6 +14,11 @@ pub use backup::{
 };
 pub(crate) use database::{CommitFence, CommitPermit};
 pub use database::{Database, PersistenceError, Result};
+pub use legacy_connect_cleanup::{
+    LegacyConnectCleanupError, LegacyConnectCleanupFailpointForIntegrationTest,
+    LegacyConnectCleanupReceipt, complete_legacy_connect_cleanup,
+    complete_legacy_connect_cleanup_for_integration_test,
+};
 pub use migrations::{MIGRATIONS, Migration, apply_migrations, pending_migrations, run_migrations};
 pub use repositories::*;
 pub use state_files::{

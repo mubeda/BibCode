@@ -10,6 +10,8 @@ import { Effect } from "effect";
 import { vi } from "vite-plus/test";
 
 import {
+  assertNoLegacyCloudArtifacts,
+  assertNoLegacyCloudDependencies,
   copyWorkspaceManifestFixture,
   makeReleaseSmokeRuntime,
   releaseSmokeWorkspaceFiles,
@@ -159,6 +161,47 @@ it("includes every Rust release version file in the smoke workspace", () => {
   }
 });
 
+it("rejects retired hosted-service dependencies and built artifact strings", () => {
+  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-release-policy-"));
+  const webArtifact = NodePath.join(root, "apps", "web", "dist", "assets", "app.js");
+  const serverArtifact = NodePath.join(root, "target", "release", "bibcode");
+  try {
+    NodeFS.mkdirSync(NodePath.dirname(webArtifact), { recursive: true });
+    NodeFS.mkdirSync(NodePath.dirname(serverArtifact), { recursive: true });
+    NodeFS.writeFileSync(NodePath.join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    NodeFS.writeFileSync(NodePath.join(root, "Cargo.lock"), "version = 4\n");
+    NodeFS.writeFileSync(webArtifact, "console.log('direct environments')\n");
+    NodeFS.writeFileSync(serverArtifact, Buffer.from("direct environments\0", "utf8"));
+
+    assertNoLegacyCloudDependencies(root);
+    assertNoLegacyCloudArtifacts(root, [webArtifact, serverArtifact]);
+
+    NodeFS.writeFileSync(
+      NodePath.join(root, "pnpm-lock.yaml"),
+      `lockfileVersion: '9.0'\n  ${["@clerk", "react"].join("/")}: 1.0.0\n`,
+    );
+    assert.throws(() => assertNoLegacyCloudDependencies(root), /pnpm-lock\.yaml/u);
+
+    const boundedMigrationMarker = ["Relay", "ConnectionTarget"].join("");
+    NodeFS.writeFileSync(webArtifact, boundedMigrationMarker.repeat(3));
+    assert.throws(
+      () => assertNoLegacyCloudArtifacts(root, [webArtifact, serverArtifact]),
+      /appears 3 times/u,
+    );
+
+    NodeFS.writeFileSync(
+      webArtifact,
+      `console.log(${JSON.stringify(["BiBCode", "Connect"].join(" "))})`,
+    );
+    assert.throws(
+      () => assertNoLegacyCloudArtifacts(root, [webArtifact, serverArtifact]),
+      /dist.*app\.js/u,
+    );
+  } finally {
+    NodeFS.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it.effect("lists the legacy diagnostic archive with the platform archive tool", () =>
   Effect.gen(function* () {
     const archivePath = NodePath.resolve(
@@ -201,6 +244,7 @@ it("executes the release command plan and always removes its temporary workspace
       repoRoot: source,
       tempRoot,
       runtime: successfulRuntime(calls),
+      verifyBuiltArtifacts: false,
       stdout: (text) => stdout.push(text),
       stderr: (text) => stderr.push(text),
       log: (text) => stdout.push(`${text}\n`),
@@ -275,7 +319,7 @@ it("uses default repository, temp, and output adapters with an injected process 
   const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   try {
-    runReleaseSmoke({ runtime: wrappedRuntime });
+    runReleaseSmoke({ runtime: wrappedRuntime, verifyBuiltArtifacts: false });
     assert.ok(generatedRoot);
     assert.equal(NodeFS.existsSync(generatedRoot), false);
     assert.ok(stdout.mock.calls.length >= 2);
@@ -354,6 +398,7 @@ it("propagates process and validation failures without leaking temporary workspa
             repoRoot: source,
             tempRoot,
             runtime,
+            verifyBuiltArtifacts: false,
             stdout: () => undefined,
             stderr: () => undefined,
             log: () => undefined,
@@ -379,6 +424,7 @@ it("runs the smoke workflow only for the direct CLI entrypoint", () => {
         repoRoot: source,
         tempRoot,
         runtime: successfulRuntime([]),
+        verifyBuiltArtifacts: false,
         stdout: () => undefined,
         stderr: () => undefined,
         log: () => undefined,

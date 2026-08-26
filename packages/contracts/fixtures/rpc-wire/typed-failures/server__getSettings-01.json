@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "j;",
-          "requiredScope": "relay:read"
+          "requiredScope": "orchestration:read"
         }
       }
     ]

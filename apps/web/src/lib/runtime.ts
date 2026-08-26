@@ -5,25 +5,17 @@ import { HttpClient } from "effect/unstable/http";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import { remoteHttpClientLayer } from "@bibcode/client-runtime/rpc";
+import { browserCryptoLayer } from "./browserCrypto";
 import * as PrimaryEnvironmentHttpClient from "../environments/primary/httpClient";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import { tauriDesktopBridgeReady } from "../tauriDesktopBridge";
-
-import { browserCryptoLayer } from "../cloud/dpop";
-import { managedRelayClientLayer } from "../cloud/managedRelayLayer";
-import { resolveCloudPublicConfig } from "../cloud/publicConfig";
-
-function configuredRelayUrl(): string {
-  return resolveCloudPublicConfig().relayUrl ?? "http://relay.invalid";
-}
 
 const httpClientLayer = remoteHttpClientLayer((input, init) => globalThis.fetch(input, init));
 
 type RuntimeLayerSource =
   | typeof httpClientLayer
   | typeof browserCryptoLayer
-  | typeof Socket.layerWebSocketConstructorGlobal
-  | ReturnType<typeof managedRelayClientLayer>;
+  | typeof Socket.layerWebSocketConstructorGlobal;
 
 export const remoteHttpRuntime = ManagedRuntime.make(httpClientLayer);
 
@@ -87,9 +79,6 @@ const runtimeLayer = Layer.mergeAll(
   httpClientLayer,
   browserCryptoLayer,
   Socket.layerWebSocketConstructorGlobal,
-  managedRelayClientLayer(configuredRelayUrl()).pipe(
-    Layer.provide(Layer.mergeAll(httpClientLayer, browserCryptoLayer)),
-  ),
 );
 
 export const runtime: ManagedRuntime.ManagedRuntime<

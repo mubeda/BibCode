@@ -39,10 +39,6 @@
       "types": "./src/platform/migration.ts",
       "default": "./src/platform/migration.ts"
     },
-    "./relay": {
-      "types": "./src/relay/index.ts",
-      "default": "./src/relay/index.ts"
-    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"
@@ -90,10 +86,6 @@
     "./state/projects": {
       "types": "./src/state/projects.ts",
       "default": "./src/state/projects.ts"
-    },
-    "./state/relay": {
-      "types": "./src/state/relayDiscovery.ts",
-      "default": "./src/state/relayDiscovery.ts"
     },
     "./state/review": {
       "types": "./src/state/review.ts",

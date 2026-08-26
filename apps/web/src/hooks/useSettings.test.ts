@@ -24,7 +24,17 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
-import { EnvironmentRegistry, EnvironmentSupervisor } from "@bibcode/client-runtime/connection";
+import {
+  AVAILABLE_CONNECTION_STATE,
+  EnvironmentRegistry,
+  EnvironmentSupervisor,
+  PrimaryConnectionTarget,
+  type EnvironmentRouteResult,
+  type PreparedConnection,
+  type SupervisorConnectionState,
+  legacyCatalogEnvironment,
+} from "@bibcode/client-runtime/connection";
+import type { RpcSession } from "@bibcode/client-runtime/rpc";
 import { createServerEnvironmentAtoms } from "@bibcode/client-runtime/state/server";
 
 const h = vi.hoisted(() => ({
@@ -136,8 +146,8 @@ const installRejectedSettingsCommand = Effect.fn("installRejectedSettingsCommand
   initialSettings = DEFAULT_SERVER_SETTINGS,
 ) {
   const calls: Array<unknown> = [];
-  const session = yield* SubscriptionRef.make(
-    Option.some({
+  const session = yield* SubscriptionRef.make<Option.Option<RpcSession>>(
+    Option.some<RpcSession>({
       client: {
         [WS_METHODS.serverUpdateSettings]: (input: unknown) =>
           Effect.gen(function* () {
@@ -150,10 +160,30 @@ const installRejectedSettingsCommand = Effect.fn("installRejectedSettingsCommand
       },
     } as never),
   );
+  const target = new PrimaryConnectionTarget({
+    environmentId,
+    label: "Settings environment",
+    httpBaseUrl: "http://127.0.0.1:43110",
+    wsBaseUrl: "ws://127.0.0.1:43110",
+  });
   const supervisor = EnvironmentSupervisor.of({
-    target: { environmentId, label: "Settings environment" },
+    environment: legacyCatalogEnvironment({ target, profile: Option.none() }),
+    target,
+    activeRouteId: yield* SubscriptionRef.make<string | null>(null),
+    routeResults: yield* SubscriptionRef.make<ReadonlyArray<EnvironmentRouteResult>>([]),
+    state: yield* SubscriptionRef.make<SupervisorConnectionState>({
+      ...AVAILABLE_CONNECTION_STATE,
+      desired: true,
+      network: "online",
+      phase: "connected",
+      generation: 1,
+    }),
     session,
-  } as never);
+    prepared: yield* SubscriptionRef.make<Option.Option<PreparedConnection>>(Option.none()),
+    connect: Effect.void,
+    disconnect: Effect.void,
+    retryNow: Effect.void,
+  } satisfies EnvironmentSupervisor["Service"]);
   const selectedEnvironments: Array<EnvironmentId> = [];
   const environmentRegistry = EnvironmentRegistry.of({
     run: (selectedEnvironmentId, effect) => {

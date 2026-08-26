@@ -91,9 +91,9 @@
       "types": "./src/remote.ts",
       "import": "./src/remote.ts"
     },
-    "./relaySigning": {
-      "types": "./src/relaySigning.ts",
-      "import": "./src/relaySigning.ts"
+    "./canonicalJson": {
+      "types": "./src/canonicalJson.ts",
+      "import": "./src/canonicalJson.ts"
     },
     "./dpop": {
       "types": "./src/dpop.ts",
@@ -102,18 +102,6 @@
     "./dpopCommon": {
       "types": "./src/dpopCommon.ts",
       "import": "./src/dpopCommon.ts"
-    },
-    "./relayAuth": {
-      "types": "./src/relayAuth.ts",
-      "import": "./src/relayAuth.ts"
-    },
-    "./relayUrl": {
-      "types": "./src/relayUrl.ts",
-      "import": "./src/relayUrl.ts"
-    },
-    "./relayJwt": {
-      "types": "./src/relayJwt.ts",
-      "import": "./src/relayJwt.ts"
     },
     "./oauthScope": {
       "types": "./src/oauthScope.ts",
@@ -190,7 +178,6 @@
     "@noble/curves": "catalog:",
     "@noble/hashes": "catalog:",
     "effect": "catalog:",
-    "jose": "catalog:",
     "yaml": "catalog:"
   },
   "devDependencies": {

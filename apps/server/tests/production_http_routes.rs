@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -7,8 +7,7 @@ use axum::{
 };
 use bibcode_server::production::http_routes::{
     AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, HttpRoutesState, JsonOperation,
-    JsonRouteResponse, MAX_DIAGNOSTIC_BODY_BYTES, MAX_JSON_BODY_BYTES, McpHttpResponse,
-    RouteContext, add_routes,
+    JsonRouteResponse, MAX_DIAGNOSTIC_BODY_BYTES, MAX_JSON_BODY_BYTES, RouteContext, add_routes,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
@@ -42,55 +41,6 @@ async fn routes_apply_exact_scopes_and_preserve_json_wire_shapes() {
             JsonOperation::OrchestrationDispatch,
             Some("orchestration:operate"),
             Some(json!({"_tag":"project.create","commandId":"c1"})),
-        ),
-        (
-            "POST",
-            "/api/connect/link-proof",
-            JsonOperation::ConnectLinkProof,
-            Some("relay:write"),
-            Some(json!({"cloudOrigin":"https://cloud.example"})),
-        ),
-        (
-            "POST",
-            "/api/connect/relay-config",
-            JsonOperation::ConnectRelayConfig,
-            Some("relay:write"),
-            Some(json!({"relayUrl":"https://relay.example"})),
-        ),
-        (
-            "GET",
-            "/api/connect/link-state",
-            JsonOperation::ConnectLinkState,
-            Some("relay:read"),
-            None,
-        ),
-        (
-            "POST",
-            "/api/connect/unlink",
-            JsonOperation::ConnectUnlink,
-            Some("relay:write"),
-            None,
-        ),
-        (
-            "POST",
-            "/api/bibcode-connect/health",
-            JsonOperation::ConnectHealth,
-            None,
-            Some(json!({"environmentId":"env-1"})),
-        ),
-        (
-            "POST",
-            "/api/connect/mint-credential",
-            JsonOperation::ConnectMintCredential,
-            None,
-            Some(json!({"environmentId":"env-1"})),
-        ),
-        (
-            "POST",
-            "/api/bibcode-connect/mint-credential",
-            JsonOperation::ConnectMintCredential,
-            None,
-            Some(json!({"environmentId":"env-1"})),
         ),
     ];
 
@@ -141,6 +91,41 @@ async fn routes_apply_exact_scopes_and_preserve_json_wire_shapes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn removed_remote_control_routes_are_not_mounted() {
+    let state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
+    let app = add_routes(Router::new()).with_state(TestState(state));
+    let removed = [
+        ("POST", concat!("/api/", "connect", "/link-proof")),
+        ("POST", concat!("/api/", "connect", "/relay-config")),
+        ("GET", concat!("/api/", "connect", "/link-state")),
+        ("POST", concat!("/api/", "connect", "/unlink")),
+        ("POST", concat!("/api/bibcode-", "connect", "/health")),
+        ("POST", concat!("/api/", "connect", "/mint-credential")),
+        (
+            "POST",
+            concat!("/api/bibcode-", "connect", "/mint-credential"),
+        ),
+        ("POST", "/mcp"),
+        ("DELETE", "/mcp"),
+    ];
+
+    for (method, uri) in removed {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
 }
 
 #[tokio::test]
@@ -258,7 +243,7 @@ async fn diagnostic_logs_route_is_bounded_authorized_and_returns_zip_headers() {
 }
 
 #[tokio::test]
-async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
+async fn assets_use_native_handlers_with_protocol_headers() {
     let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
     state.assets = Arc::new(|token, path, _context| {
         Box::pin(async move {
@@ -268,16 +253,6 @@ async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
                 content_type: "image/svg+xml".to_owned(),
                 bytes: b"<svg/>".to_vec(),
                 cache_control: "private, max-age=3600".to_owned(),
-            })
-        })
-    });
-    state.mcp = Arc::new(|method, body, _context| {
-        Box::pin(async move {
-            assert_eq!(body.as_slice(), b"{}");
-            Ok(McpHttpResponse {
-                status: if method == Method::POST { 200 } else { 204 },
-                headers: BTreeMap::from([("mcp-session-id".to_owned(), "session-1".to_owned())]),
-                body: Vec::new(),
             })
         })
     });
@@ -303,20 +278,6 @@ async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
         to_bytes(asset.into_body(), 1024).await.unwrap().as_ref(),
         b"<svg/>"
     );
-
-    let post = app
-        .clone()
-        .oneshot(Request::post("/mcp").body(Body::from("{}")).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(post.status(), StatusCode::ACCEPTED);
-    assert_eq!(post.headers()["mcp-session-id"], "session-1");
-
-    let delete = app
-        .oneshot(Request::delete("/mcp").body(Body::from("{}")).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -411,18 +372,6 @@ fn state_with_json_recorder(calls: Arc<Mutex<Vec<JsonRecorderCall>>>) -> HttpRou
                     StatusCode::NOT_FOUND,
                     json!({"message": "Not Found"}),
                 ))
-            })
-        }),
-        Arc::new(|_method, _body, _context| {
-            Box::pin(async {
-                Err(HttpRouteError::new(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "error": "invalid_mcp_credential",
-                        "message": "A valid provider-scoped MCP bearer credential is required."
-                    }),
-                )
-                .with_header("www-authenticate", "Bearer"))
             })
         }),
     )

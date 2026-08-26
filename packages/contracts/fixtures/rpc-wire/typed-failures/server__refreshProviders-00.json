@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "!y5lat^A",
-          "requiredScope": "relay:write"
+          "requiredScope": "access:write"
         }
       }
     ]

@@ -36,9 +36,8 @@ describe("settings navigation", () => {
     ]);
   });
 
-  it("renders one Environments destination and no Connect footer controls", () => {
+  it("renders one Environments destination", () => {
     const markup = renderToStaticMarkup(<SettingsSidebarNav pathname="/settings/environments" />);
     expect(markup.match(/Environments/gu)).toHaveLength(1);
-    expect(markup).not.toContain("BiBCode Connect");
   });
 });

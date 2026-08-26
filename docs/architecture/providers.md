@@ -91,7 +91,7 @@ before provider supervision drains. A root that races the freeze is not
 published: the spawn returns the typed shutdown error only after its local
 process-group or Windows Job owner has terminated and reaped the child. The
 same per-runtime registry is shared with terminal roots, independently spawned
-provider-terminal helpers, and the managed endpoint tunnel and is the only input
+provider-terminal helpers, and desktop-owned SSH forwards and is the only input
 to residual runtime cleanup; provider shutdown never infers ownership from the
 shared application PID.
 

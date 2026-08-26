@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "IenFS*~4^n",
-          "requiredScope": "orchestration:operate"
+          "requiredScope": "access:write"
         }
       }
     ]

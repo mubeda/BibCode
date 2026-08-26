@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -1079,9 +1079,10 @@ impl NativeServerControl {
         let control = self.clone();
         let refresh_task = Arc::new(Mutex::new(None));
         let task_refresh = refresh_task.clone();
+        let period = Duration::from_secs(60 * 60);
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     () = task_cancellation.cancelled() => break,
@@ -2960,24 +2961,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_update_checks_run_immediately_and_every_hour() {
+    async fn provider_update_checks_wait_one_hour_and_then_run_every_hour() {
         let temp = tempfile::tempdir().expect("state directory");
         let control = scheduler_control(&temp).await;
         let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
         let checks = control.start_provider_update_checks();
 
-        let after_startup = wait_for_probe_after(&control, before).await;
-        wait_for_full_refresh_idle(&control).await;
-
         tokio::time::advance(Duration::from_secs(60 * 60 - 1)).await;
         tokio::task::yield_now().await;
         assert_eq!(
             control.next_provider_probe_sequence.load(Ordering::Acquire),
-            after_startup
+            before
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_probe_after(&control, after_startup).await;
+        let after_first_hour = wait_for_probe_after(&control, before).await;
+        wait_for_full_refresh_idle(&control).await;
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        wait_for_probe_after(&control, after_first_hour).await;
         checks.shutdown().await;
     }
 
@@ -2987,6 +2988,7 @@ mod tests {
         let control = scheduler_control(&temp).await;
         let checks = control.start_provider_update_checks();
         let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
         wait_for_probe_after(&control, before).await;
         checks.shutdown().await;
         let stopped_at = control.next_provider_probe_sequence.load(Ordering::Acquire);
@@ -3004,6 +3006,7 @@ mod tests {
         let control = scheduler_control(&temp).await;
         let checks = control.start_provider_update_checks();
         let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
         wait_for_probe_after(&control, before).await;
         wait_for_full_refresh_idle(&control).await;
         drop(checks);
@@ -3023,6 +3026,7 @@ mod tests {
         let control = scheduler_control(&temp).await;
         let pause = control.install_next_full_provider_probe_pause().await;
         let checks = control.start_provider_update_checks();
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
         pause.wait_until_entered().await;
 
         checks.shutdown().await;
@@ -3041,6 +3045,7 @@ mod tests {
         let control = scheduler_control(&temp).await;
         let pause = control.install_next_full_provider_probe_pause().await;
         let checks = control.start_provider_update_checks();
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
         pause.wait_until_entered().await;
         let running_sequence = control.next_provider_probe_sequence.load(Ordering::Acquire);
         let requested = control

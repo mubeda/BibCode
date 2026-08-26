@@ -5,7 +5,7 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction, TransactionBehavior,
     backup::{Backup, StepResult},
     params_from_iter,
     types::Value,
@@ -678,6 +678,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(46, "ProjectRepositoryClaims", migration_046),
     Migration::new(47, "OneActiveMainThread", migration_047),
     Migration::new(48, "HashedPairingCredentials", migration_048),
+    Migration::new(49, "RemoveLegacyConnectTables", migration_049),
 ];
 
 impl Migration {
@@ -736,7 +737,13 @@ pub fn apply_migrations(
     }
     connection.execute_batch(MIGRATIONS_TABLE_SQL)?;
 
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(
+        if pending.iter().any(|migration| migration.id == 49) {
+            TransactionBehavior::Exclusive
+        } else {
+            TransactionBehavior::Deferred
+        },
+    )?;
     let latest_id = transaction
         .query_row(
             "SELECT migration_id FROM effect_sql_migrations ORDER BY migration_id DESC LIMIT 1",
@@ -2696,8 +2703,27 @@ fn migration_048(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_049(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.pragma_update(None, "secure_delete", "ON")?;
+    let secure_delete =
+        transaction.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))?;
+    if secure_delete != 1 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "SQLite secure_delete could not be enabled for legacy privacy cleanup".to_owned(),
+        ));
+    }
+    transaction.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS connect_native_secrets;
+        DROP TABLE IF EXISTS connect_native_replay;
+        "#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar, table_exists,
         validate_existing_bibcode_store, validate_existing_bibcode_store_with_barrier,
@@ -3217,7 +3243,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=48).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=49).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3237,10 +3263,150 @@ mod tests {
         assert_eq!(MIGRATIONS[45].name, "ProjectRepositoryClaims");
         assert_eq!(MIGRATIONS[46].name, "OneActiveMainThread");
         assert_eq!(MIGRATIONS[47].name, "HashedPairingCredentials");
+        assert_eq!(MIGRATIONS[48].name, "RemoveLegacyConnectTables");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
         assert_eq!(migration.name, "RuntimeFixture");
+    }
+
+    #[test]
+    fn migration_49_drops_only_legacy_connect_tables_with_secure_delete_enabled()
+    -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(48))?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE connect_native_secrets (
+              secret_id TEXT PRIMARY KEY,
+              secret_value TEXT NOT NULL
+            );
+            CREATE TABLE connect_native_replay (
+              replay_id TEXT PRIMARY KEY,
+              replay_value TEXT NOT NULL
+            );
+            CREATE TABLE unrelated_user_data (value TEXT NOT NULL);
+            INSERT INTO connect_native_secrets VALUES ('secret', 'canary-secret-value');
+            INSERT INTO connect_native_replay VALUES ('replay', 'canary-replay-value');
+            INSERT INTO unrelated_user_data VALUES ('keep-me');
+            "#,
+        )?;
+        connection.pragma_update(None, "secure_delete", "OFF")?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [49]
+        );
+        assert!(!table_exists(&connection, "connect_native_secrets")?);
+        assert!(!table_exists(&connection, "connect_native_replay")?);
+        assert!(table_exists(&connection, "unrelated_user_data")?);
+        assert_eq!(
+            connection.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            connection.query_row("SELECT value FROM unrelated_user_data", [], |row| {
+                row.get::<_, String>(0)
+            })?,
+            "keep-me"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_49_is_idempotent_when_only_one_legacy_table_exists() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(48))?;
+        connection.execute_batch(
+            "CREATE TABLE connect_native_replay (value TEXT NOT NULL);\
+             INSERT INTO connect_native_replay VALUES ('secret-canary');",
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [49]
+        );
+        assert!(!table_exists(&connection, "connect_native_replay")?);
+        assert!(!table_exists(&connection, "connect_native_secrets")?);
+        assert!(run_migrations(&mut connection, None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_49_rolls_back_a_partial_drop_and_retries() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(48))?;
+        connection.execute_batch(
+            "CREATE TABLE connect_native_secrets (value TEXT NOT NULL);\
+             INSERT INTO connect_native_secrets VALUES ('secret-canary');\
+             CREATE VIEW connect_native_replay AS SELECT 'fixture' AS value;",
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert!(table_exists(&connection, "connect_native_secrets")?);
+        assert_eq!(
+            connection.query_row(
+                "SELECT MAX(migration_id) FROM effect_sql_migrations",
+                [],
+                |row| row.get::<_, u32>(0),
+            )?,
+            48
+        );
+
+        connection.execute_batch(
+            "DROP VIEW connect_native_replay;\
+             CREATE TABLE connect_native_replay (value TEXT NOT NULL);",
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [49]
+        );
+        assert!(!table_exists(&connection, "connect_native_secrets")?);
+        assert!(!table_exists(&connection, "connect_native_replay")?);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_49_does_not_mutate_a_locked_database() -> rusqlite::Result<()> {
+        let temp = tempfile::TempDir::new().expect("temporary database root");
+        let path = temp.path().join("state.sqlite");
+        let mut owner = rusqlite::Connection::open(&path)?;
+        run_migrations(&mut owner, Some(48))?;
+        owner.execute_batch(
+            "CREATE TABLE connect_native_secrets (value TEXT NOT NULL);\
+             CREATE TABLE connect_native_replay (value TEXT NOT NULL);\
+             BEGIN EXCLUSIVE;",
+        )?;
+        let mut contender = rusqlite::Connection::open(&path)?;
+        contender.busy_timeout(Duration::ZERO)?;
+
+        assert!(run_migrations(&mut contender, None).is_err());
+        owner.execute_batch("ROLLBACK")?;
+        assert!(table_exists(&owner, "connect_native_secrets")?);
+        assert!(table_exists(&owner, "connect_native_replay")?);
+        assert_eq!(
+            owner.query_row(
+                "SELECT MAX(migration_id) FROM effect_sql_migrations",
+                [],
+                |row| row.get::<_, u32>(0),
+            )?,
+            48
+        );
+        Ok(())
     }
 
     #[test]
@@ -3263,7 +3429,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48]
+            [48, 49]
         );
         let columns = connection
             .prepare("PRAGMA table_info(auth_pairing_links)")?
@@ -3378,9 +3544,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 32);
+        assert_eq!(second.len(), 33);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[31].id, 48);
+        assert_eq!(second[32].id, 49);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3749,7 +3915,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            (34..=48).collect::<Vec<_>>()
+            (34..=49).collect::<Vec<_>>()
         );
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)

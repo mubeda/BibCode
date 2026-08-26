@@ -7,10 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
-  auth: { isLoaded: false, isSignedIn: false },
-  authPrompt: null as ReactNode,
   canGoBack: false,
-  cloudConfigured: false,
   draftThread: null as Record<string, unknown> | null,
   panelProps: null as Record<string, unknown> | null,
   knownSessions: [] as Array<Record<string, any>>,
@@ -19,7 +16,6 @@ const h = vi.hoisted(() => ({
     release: vi.fn(),
   },
   navigate: vi.fn(),
-  openAuthPrompt: vi.fn(),
   previewSupported: false,
   previewViewProps: null as Record<string, unknown> | null,
   project: null as Record<string, unknown> | null,
@@ -85,22 +81,6 @@ vi.mock("./components/auth/PairingRouteSurface", () => ({
   ),
 }));
 
-vi.mock("@clerk/react", () => ({
-  UserButton: () => <div data-user-button />,
-  useAuth: () => h.auth,
-}));
-
-vi.mock("./cloud/publicConfig", () => ({
-  hasCloudPublicConfig: () => h.cloudConfigured,
-}));
-
-vi.mock("./components/clerk/useBiBCodeConnectAuthPrompt", () => ({
-  useBiBCodeConnectAuthPrompt: () => ({
-    authPrompt: h.authPrompt,
-    openAuthPrompt: h.openAuthPrompt,
-  }),
-}));
-
 vi.mock("./composerDraftStore", () => ({
   useComposerDraftStore: (selector: (state: unknown) => unknown) =>
     selector({ getDraftThreadByRef: () => h.draftThread }),
@@ -148,10 +128,6 @@ vi.mock("./components/preview/usePreviewBridge", () => ({
 }));
 
 import { CenterTerminalPanel } from "./components/CenterTerminalPanel";
-import {
-  BiBCodeConnectSidebarAvatar,
-  BiBCodeConnectSidebarSignIn,
-} from "./components/clerk/BiBCodeConnectSidebarSignIn";
 import { PreviewPanel } from "./components/preview/PreviewPanel";
 import { PreviewUnreachable } from "./components/preview/PreviewUnreachable";
 import { useLoadingProgress } from "./components/preview/useLoadingProgress";
@@ -191,15 +167,11 @@ async function click(element: HTMLElement): Promise<void> {
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  h.auth = { isLoaded: false, isSignedIn: false };
-  h.authPrompt = null;
   h.canGoBack = false;
-  h.cloudConfigured = false;
   h.draftThread = null;
   h.panelProps = null;
   h.knownSessions = [];
   h.navigate.mockReset().mockResolvedValue(undefined);
-  h.openAuthPrompt.mockReset();
   h.previewSupported = false;
   h.previewViewProps = null;
   h.project = null;
@@ -325,33 +297,6 @@ describe("settings and pairing routes", () => {
       .pendingComponent;
     await rerender(mounted, <Pending />);
     expect(mounted.container.textContent).toContain("Pairing pending");
-  });
-});
-
-describe("cloud sign-in surfaces", () => {
-  it("hides unconfigured and unresolved auth before rendering sign-in or avatar", async () => {
-    const mounted = await mount(<BiBCodeConnectSidebarSignIn key="unconfigured" />);
-    expect(mounted.container.innerHTML).toBe("");
-
-    h.cloudConfigured = true;
-    await rerender(mounted, <BiBCodeConnectSidebarSignIn key="auth-loading" />);
-    expect(mounted.container.innerHTML).toBe("");
-
-    h.auth = { isLoaded: true, isSignedIn: false };
-    h.authPrompt = <div>Auth dialog</div>;
-    await rerender(mounted, <BiBCodeConnectSidebarSignIn key="signed-out" />);
-    await click(mounted.container.querySelector("button")!);
-    expect(h.openAuthPrompt).toHaveBeenCalledOnce();
-    expect(mounted.container.textContent).toContain("Auth dialog");
-
-    h.auth = { isLoaded: true, isSignedIn: true };
-    await rerender(mounted, <BiBCodeConnectSidebarSignIn key="signed-in" />);
-    expect(mounted.container.innerHTML).toBe("");
-    await rerender(mounted, <BiBCodeConnectSidebarAvatar key="configured-avatar" />);
-    expect(mounted.container.querySelector("[data-user-button]")).not.toBeNull();
-    h.cloudConfigured = false;
-    await rerender(mounted, <BiBCodeConnectSidebarAvatar key="unconfigured-avatar" />);
-    expect(mounted.container.innerHTML).toBe("");
   });
 });
 

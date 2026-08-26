@@ -78,6 +78,11 @@ Delete the unused result values above. Do not leave an ambiguous status.
 
 ## Listener, authentication, and local-control evidence
 
+- Outbound harness/inspection method and deny-by-default result:
+- Cold startup / ordinary use / pairing / diagnostics / crash destinations:
+- Permitted environment/updater destinations and initiating PIDs:
+- Unexpected internet requests (must be zero):
+- Telemetry and crash-upload negative evidence:
 - Loopback HTTP listener address/PID and admission result:
 - Plain non-loopback HTTP rejection and no-override evidence:
 - Direct HTTPS listener address/PID:

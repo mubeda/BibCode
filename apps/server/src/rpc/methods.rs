@@ -34,8 +34,6 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     unary("activity.listRoster"),
     unary("activity.retrySubtreeCancellation"),
     unary("assets.createUrl"),
-    unary("cloud.getRelayClientStatus"),
-    stream("cloud.installRelayClient"),
     unary("filesystem.browse"),
     unary("git.preparePullRequestThread"),
     unary("git.resolvePullRequest"),

@@ -39,7 +39,7 @@ describe("OAuth scopes", () => {
     ).toEqual(["orchestration:read", "access:write"]);
     expect(
       parseAllowedOAuthScope({
-        value: "orchestration:read relay:write",
+        value: "orchestration:read review:write",
         allowedScopes: new Set(["orchestration:read", "access:write"] as const),
       }),
     ).toBeNull();

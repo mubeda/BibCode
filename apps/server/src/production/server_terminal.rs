@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
     diagnostics::{
         AttributedProcess, AttributionConfidence, AttributionKind, AttributionScope, BucketMetric,
         CurrentProcessDiagnostics, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
@@ -66,7 +65,6 @@ pub struct ServerTerminalServices {
     resource_sampler: Arc<NativeResourceSampler>,
     process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
     provider_usage: ProviderUsageService,
-    relay: RelayClientService,
     control: Arc<dyn ProductionServerControl>,
     workspace_admission: Option<WorkspaceAdmissionController>,
 }
@@ -84,7 +82,6 @@ impl ServerTerminalServices {
         resource_sampler: Arc<NativeResourceSampler>,
         process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
         provider_usage: ProviderUsageService,
-        relay: RelayClientService,
         control: Arc<dyn ProductionServerControl>,
     ) -> Self {
         Self::new_with_process_tree_cleanup(
@@ -93,7 +90,6 @@ impl ServerTerminalServices {
             resource_sampler,
             process_monitor,
             provider_usage,
-            relay,
             control,
             ProcessTreeCleanup::EmbeddedHost,
         )
@@ -106,7 +102,6 @@ impl ServerTerminalServices {
         resource_sampler: Arc<NativeResourceSampler>,
         process_monitor: Arc<DiagnosticsMonitor<NativeResourceSampler>>,
         provider_usage: ProviderUsageService,
-        relay: RelayClientService,
         control: Arc<dyn ProductionServerControl>,
         process_tree_cleanup: ProcessTreeCleanup,
     ) -> Self {
@@ -119,7 +114,6 @@ impl ServerTerminalServices {
             resource_sampler,
             process_monitor,
             provider_usage,
-            relay,
             control,
             workspace_admission: None,
         }
@@ -333,7 +327,6 @@ pub fn register_server_terminal_rpc(registry: &mut RpcRegistry, services: Server
     register_control_rpcs(registry, &services);
     register_diagnostics_rpcs(registry, &services);
     register_provider_usage_rpcs(registry, &services);
-    register_cloud_rpcs(registry, &services);
     register_terminal_rpcs(registry, &services);
 }
 
@@ -473,50 +466,6 @@ fn register_provider_usage_rpcs(registry: &mut RpcRegistry, services: &ServerTer
             }
         },
     );
-}
-
-fn register_cloud_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
-    let relay = services.relay.clone();
-    registry.register_unary(
-        "cloud.getRelayClientStatus",
-        move |_request, _cancellation| {
-            let relay = relay.clone();
-            async move { Ok(relay_status_to_wire(relay.resolve().await)) }
-        },
-    );
-
-    let relay = services.relay.clone();
-    registry.register_stream("cloud.installRelayClient", move |_request, cancellation| {
-        let relay = relay.clone();
-        spawn_stream(cancellation, move |sender, cancellation| async move {
-            let result = tokio::select! {
-                () = cancellation.cancelled() => return,
-                result = relay.install() => result,
-            };
-            match result {
-                Ok(events) => {
-                    for event in events {
-                        if sender
-                            .send(Ok(vec![relay_event_to_wire(event)]))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(message) => {
-                    let _ = sender
-                        .send(Err(json!({
-                            "_tag": "RelayClientInstallFailedError",
-                            "reason": "download_failed",
-                            "message": message,
-                        })))
-                        .await;
-                }
-            }
-        })
-    });
 }
 
 fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
@@ -1356,39 +1305,6 @@ fn bucket_u64_to_wire(metric: BucketMetric<u64>) -> Value {
     })
 }
 
-fn relay_status_to_wire(status: RelayClientStatus) -> Value {
-    match status {
-        RelayClientStatus::Available {
-            executable_path,
-            source,
-            version,
-        } => json!({
-            "status": "available", "executablePath": executable_path, "source": source, "version": version,
-        }),
-        RelayClientStatus::Missing { version } => {
-            json!({ "status": "missing", "version": version })
-        }
-        RelayClientStatus::Unsupported {
-            platform,
-            arch,
-            version,
-        } => json!({
-            "status": "unsupported", "platform": platform, "arch": arch, "version": version,
-        }),
-    }
-}
-
-fn relay_event_to_wire(event: RelayClientInstallEvent) -> Value {
-    match event {
-        RelayClientInstallEvent::Progress { stage } => {
-            json!({ "type": "progress", "stage": stage })
-        }
-        RelayClientInstallEvent::Complete { status } => {
-            json!({ "type": "complete", "status": relay_status_to_wire(status) })
-        }
-    }
-}
-
 fn terminal_metadata_to_wire(event: TerminalMetadataEvent) -> Value {
     serde_json::to_value(event).expect("terminal metadata event serializes")
 }
@@ -1570,30 +1486,10 @@ mod tests {
             Duration::from_secs(60),
         ));
         let usage = ProviderUsageService::new(Vec::new(), Arc::new(OffsetDateTime::now_utc));
-        let relay = RelayClientService::new(
-            || async {
-                RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                }
-            },
-            |_report| async {
-                Ok(RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                })
-            },
-        );
         let control = Arc::new(
             NativeServerControl::new(ServerConfig::new(root), json!({"policy":"test"})).await,
         );
-        ServerTerminalServices::new(
-            terminal,
-            sampler,
-            resource_sampler,
-            monitor,
-            usage,
-            relay,
-            control,
-        )
+        ServerTerminalServices::new(terminal, sampler, resource_sampler, monitor, usage, control)
     }
 
     fn write_probe_command(value: &str) -> String {
@@ -2643,22 +2539,6 @@ mod tests {
             Duration::from_secs(60),
         ));
         let usage = ProviderUsageService::new(Vec::new(), Arc::new(OffsetDateTime::now_utc));
-        let relay = RelayClientService::new(
-            || async {
-                RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                }
-            },
-            |report| async move {
-                report(RelayClientInstallEvent::Progress {
-                    stage: "checking".to_owned(),
-                })
-                .await?;
-                Ok(RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                })
-            },
-        );
         let control = Arc::new(
             NativeServerControl::new(ServerConfig::new(temp.path()), json!({"policy":"test"}))
                 .await,
@@ -2669,7 +2549,6 @@ mod tests {
             resource_sampler,
             monitor,
             usage,
-            relay,
             control,
         );
 
@@ -2865,36 +2744,6 @@ mod tests {
         assert_eq!(history["error"]["_tag"], "Some");
 
         assert_eq!(
-            relay_status_to_wire(RelayClientStatus::Available {
-                executable_path: "/tmp/cloudflared".to_owned(),
-                source: "managed".to_owned(),
-                version: "1".to_owned(),
-            })["status"],
-            "available"
-        );
-        assert_eq!(
-            relay_status_to_wire(RelayClientStatus::Unsupported {
-                platform: "plan9".to_owned(),
-                arch: "mips".to_owned(),
-                version: "1".to_owned(),
-            })["status"],
-            "unsupported"
-        );
-        assert_eq!(
-            relay_event_to_wire(RelayClientInstallEvent::Progress {
-                stage: "download".to_owned()
-            })["type"],
-            "progress"
-        );
-        assert_eq!(
-            relay_event_to_wire(RelayClientInstallEvent::Complete {
-                status: RelayClientStatus::Missing {
-                    version: "1".to_owned()
-                }
-            })["type"],
-            "complete"
-        );
-        assert_eq!(
             terminal_metadata_to_wire(TerminalMetadataEvent::Remove {
                 thread_id: "thread".to_owned(),
                 terminal_id: "terminal".to_owned(),
@@ -2907,18 +2756,6 @@ mod tests {
         assert_eq!(format_epoch_ms(i128::MAX), "1970-01-01T00:00:00Z");
         assert!(format_time(now).contains("1970-01-01"));
 
-        assert!(matches!(
-            services.relay.resolve().await,
-            RelayClientStatus::Missing { .. }
-        ));
-        assert!(
-            !services
-                .relay
-                .install()
-                .await
-                .expect("relay install events")
-                .is_empty()
-        );
         services.shutdown().await;
     }
 

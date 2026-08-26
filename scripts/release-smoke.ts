@@ -24,7 +24,6 @@ export const releaseSmokeWorkspaceFiles = [
   ...releaseRustPackageFiles,
   releaseCargoLockFile,
   "apps/marketing/package.json",
-  "infra/relay/package.json",
   "oxlint-plugin-bibcode/package.json",
   "packages/client-runtime/package.json",
   "packages/shared/package.json",
@@ -69,9 +68,149 @@ export interface ReleaseSmokeOptions {
   readonly repoRoot?: string;
   readonly tempRoot?: string;
   readonly runtime: ReleaseSmokeRuntime;
+  readonly verifyBuiltArtifacts?: boolean;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   readonly log?: (text: string) => void;
+}
+
+const retiredDependencyMarkers = [
+  ["@clerk", ""].join("/"),
+  ["alchemy", "effect"].join("-"),
+  ["@effect", "sql-pg"].join("/"),
+  ["ed25519", "dalek"].join("-"),
+  ["@cloudflare", "workers-types"].join("/"),
+] as const;
+
+const retiredArtifactMarkers = [
+  ["BiBCode", "Connect"].join(" "),
+  ["bibcode", "connect"].join("-"),
+  ["connect", "mcp"].join("_"),
+  ["Connect", "Mcp"].join(""),
+  ["Relay", "ConnectionTarget"].join(""),
+  ["Relay", "ConnectionRegistration"].join(""),
+  ["Managed", "Relay"].join(""),
+  ["managed", "endpoint"].join("_"),
+  ["Managed", "Endpoint"].join(""),
+  ["cloud", "flared"].join(""),
+  ["BIBCODE", "RELAY"].join("_"),
+  ["VITE", "BIBCODE", "RELAY"].join("_"),
+  ["BIBCODE", "CLERK"].join("_"),
+  ["VITE", "CLERK"].join("_"),
+  ["@clerk", ""].join("/"),
+  ["SCOPE", "RELAY"].join("_"),
+  ["Auth", "Relay"].join(""),
+  ["", "api", "connect"].join("/"),
+  ["cloud", "getRelayClientStatus"].join("."),
+  ["cloud", "installRelayClient"].join("."),
+  ["infra", "relay"].join("/"),
+] as const;
+
+const boundedMigrationArtifactMarker = ["Relay", "ConnectionTarget"].join("");
+
+function countBufferOccurrences(source: Buffer, marker: string): number {
+  const needle = Buffer.from(marker, "utf8");
+  let count = 0;
+  let offset = 0;
+  while (offset <= source.length - needle.length) {
+    const found = source.indexOf(needle, offset);
+    if (found < 0) break;
+    count += 1;
+    offset = found + needle.length;
+  }
+  return count;
+}
+
+export function assertNoLegacyCloudDependencies(repoRoot: string): void {
+  for (const relativePath of ["pnpm-lock.yaml", "Cargo.lock"] as const) {
+    const path = NodePath.resolve(repoRoot, relativePath);
+    if (!NodeFS.existsSync(path)) {
+      throw new Error(`Expected dependency inventory ${relativePath}.`);
+    }
+    const source = NodeFS.readFileSync(path, "utf8");
+    for (const marker of retiredDependencyMarkers) {
+      if (source.toLocaleLowerCase("en-US").includes(marker.toLocaleLowerCase("en-US"))) {
+        throw new Error(`Retired dependency marker '${marker}' remains in ${relativePath}.`);
+      }
+    }
+  }
+}
+
+export function assertNoLegacyCloudArtifacts(
+  repoRoot: string,
+  artifactPaths: ReadonlyArray<string>,
+): void {
+  if (artifactPaths.length === 0) throw new Error("Expected built artifacts to scan.");
+
+  let boundedMigrationOccurrences = 0;
+  for (const path of artifactPaths) {
+    if (!NodeFS.existsSync(path) || !NodeFS.statSync(path).isFile()) {
+      throw new Error(`Expected built artifact ${NodePath.relative(repoRoot, path)}.`);
+    }
+    const source = NodeFS.readFileSync(path);
+    for (const marker of retiredArtifactMarkers) {
+      const occurrences = countBufferOccurrences(source, marker);
+      if (occurrences === 0) continue;
+      const relativePath = NodePath.relative(repoRoot, path);
+      if (
+        marker === boundedMigrationArtifactMarker &&
+        relativePath.startsWith(NodePath.join("apps", "web", "dist") + NodePath.sep)
+      ) {
+        boundedMigrationOccurrences += occurrences;
+        continue;
+      }
+      throw new Error(`Retired product marker '${marker}' remains in ${relativePath}.`);
+    }
+  }
+  if (boundedMigrationOccurrences > 2) {
+    throw new Error(
+      `Bounded catalog migration marker appears ${boundedMigrationOccurrences} times in web artifacts.`,
+    );
+  }
+}
+
+function artifactFiles(path: string): ReadonlyArray<string> {
+  if (!NodeFS.existsSync(path)) return [];
+  return NodeFS.readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
+    const child = NodePath.join(path, entry.name);
+    return entry.isDirectory() ? artifactFiles(child) : entry.isFile() ? [child] : [];
+  });
+}
+
+function buildAndVerifyLegacyCloudFreeArtifacts(
+  repoRoot: string,
+  runtime: ReleaseSmokeRuntime,
+  log: (text: string) => void,
+): void {
+  runtime.execFile("vp", ["run", "--filter", "@bibcode/web", "build"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+  });
+  runtime.execFile(
+    process.execPath,
+    [
+      NodePath.resolve(repoRoot, "scripts/run-msvc-x64.mjs"),
+      "cargo",
+      "build",
+      "-p",
+      "bibcode-server",
+      "--release",
+      "--bin",
+      "bibcode",
+    ],
+    { cwd: repoRoot, stdio: "inherit" },
+  );
+
+  const webArtifacts = artifactFiles(NodePath.resolve(repoRoot, "apps/web/dist"));
+  const serverCandidates = [
+    NodePath.resolve(repoRoot, "target/release/bibcode"),
+    NodePath.resolve(repoRoot, "target/release/bibcode.exe"),
+  ].filter((path) => NodeFS.existsSync(path));
+  if (serverCandidates.length !== 1) {
+    throw new Error("Expected exactly one release server binary to scan.");
+  }
+  assertNoLegacyCloudArtifacts(repoRoot, [...webArtifacts, ...serverCandidates]);
+  log(`Scanned ${webArtifacts.length} web artifacts and one server binary.`);
 }
 
 export function makeReleaseSmokeRuntime(
@@ -176,6 +315,10 @@ export function runReleaseSmoke(options: ReleaseSmokeOptions): void {
   const log = options.log ?? ((text: string) => process.stdout.write(`${text}\n`));
 
   try {
+    assertNoLegacyCloudDependencies(repoRoot);
+    if (options.verifyBuiltArtifacts ?? true) {
+      buildAndVerifyLegacyCloudFreeArtifacts(repoRoot, runtime, log);
+    }
     copyWorkspaceManifestFixture(repoRoot, tempRoot);
     runtime.execFile(
       process.execPath,

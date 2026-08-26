@@ -17,13 +17,7 @@ use crate::{
     persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
-    production::{
-        connect_mcp::{
-            ConnectMcpConfig, ConnectMcpService, PairingCredential, PairingIssuer, PreviewInvoker,
-        },
-        jwt::PersistentJwtCodec,
-        server_terminal::ProcessTreeCleanup,
-    },
+    production::server_terminal::ProcessTreeCleanup,
     rpc::RpcRegistry,
     transport::{self, TransportError},
 };
@@ -247,102 +241,9 @@ impl ServerRuntime {
                     .await
                     .map_err(ServerError::ProductionInitialize)?,
                 );
-                let jwt = PersistentJwtCodec::open(state_directory.join("environment-jwt.json"))
-                    .await
-                    .map_err(|error| ServerError::ProductionInitialize(error.to_string()))?;
-                let endpoint = runtime.managed_endpoint_runtime();
-                let pairing_auth = auth.clone();
-                let pairing = PairingIssuer::new(move |thumbprint| {
-                    let auth = pairing_auth.clone();
-                    async move {
-                        auth.issue_cloud_pairing(thumbprint)
-                            .await
-                            .map(|issued| PairingCredential {
-                                credential: issued.credential,
-                                expires_at: issued.expires_at,
-                            })
-                            .map_err(|error| format!("{error:?}"))
-                    }
-                });
-                let automation = runtime.preview_automation.clone();
-                let preview = PreviewInvoker::new(
-                    move |scope, operation, input, tab_id, cancellation| {
-                        let automation = automation.clone();
-                        async move {
-                            let operation = crate::mcp::preview_automation::PreviewAutomationOperation::from_wire(&operation)
-                                .ok_or_else(|| format!("unsupported preview operation: {operation}"))?;
-                            automation
-                                .invoke(
-                                    crate::mcp::preview_automation::PreviewAutomationInvokeInput {
-                                        environment_id: scope.environment_id,
-                                        thread_id: scope.thread_id,
-                                        provider_session_id: scope.provider_session_id,
-                                        provider_instance_id: scope.provider_instance_id,
-                                        operation,
-                                        input,
-                                        tab_id,
-                                        timeout_ms: None,
-                                    },
-                                )
-                                .await
-                                .map_err(|error| format!("{}: {}", error.tag(), error.message()))
-                                .and_then(|value| {
-                                    if cancellation.is_cancelled() {
-                                        Err("preview automation request was cancelled".to_owned())
-                                    } else {
-                                        Ok(value)
-                                    }
-                                })
-                        }
-                    },
-                );
-                let descriptor = serde_json::json!({
-                    "environmentId": config
-                        .environment_id
-                        .expect("a running server has a prepared environment identity")
-                        .to_string(),
-                    "label": config.environment_label,
-                    "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
-                    "serverVersion": config.server_version,
-                    "storageInstanceId": config
-                        .storage_instance_id
-                        .expect("a running server has a prepared persistent store")
-                        .to_string(),
-                    "protocol": {
-                        "minimum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
-                        "maximum": crate::http::ENVIRONMENT_PROTOCOL_VERSION,
-                    },
-                    "capabilities": { "repositoryIdentity": true },
-                    "transport": config.transport_identity.clone(),
-                });
-                let connect = Arc::new(
-                    ConnectMcpService::open(
-                        config.database_path(),
-                        ConnectMcpConfig {
-                            environment_id: config
-                                .environment_id
-                                .expect("a running server has a prepared environment identity")
-                                .to_string(),
-                            descriptor,
-                            mcp_endpoint: format!("{advertised_base_url}/mcp"),
-                            now_epoch_seconds: Arc::new(|| {
-                                time::OffsetDateTime::now_utc().unix_timestamp()
-                            }),
-                            max_mcp_credentials: 1_024,
-                            max_mcp_sessions: 1_024,
-                        },
-                        jwt.jwt_codec(),
-                        endpoint.endpoint(),
-                        pairing,
-                        preview,
-                    )
-                    .await
-                    .map_err(|error| ServerError::ProductionInitialize(format!("{error:?}")))?,
-                );
-                runtime.attach_connect_mcp(connect.clone()).await;
                 (
                     runtime.registry.clone(),
-                    core_http_routes(auth.clone(), runtime.clone(), connect),
+                    core_http_routes(auth.clone(), runtime.clone()),
                     Some(runtime),
                 )
             }
@@ -422,30 +323,13 @@ impl ServerRuntime {
     }
 }
 
-fn core_http_routes(
-    auth: AuthService,
-    runtime: Arc<ProductionRuntime>,
-    connect: Arc<ConnectMcpService>,
-) -> HttpRoutesState {
+fn core_http_routes(auth: AuthService, runtime: Arc<ProductionRuntime>) -> HttpRoutesState {
     let authorize = authorize_handler(auth);
     let json_runtime = runtime.clone();
-    let json_connect = connect.clone();
     let json = Arc::new(move |operation, payload, context| {
         let runtime = json_runtime.clone();
-        let connect = json_connect.clone();
-        Box::pin(async move {
-            match operation {
-                crate::production::http_routes::JsonOperation::ConnectLinkProof
-                | crate::production::http_routes::JsonOperation::ConnectRelayConfig
-                | crate::production::http_routes::JsonOperation::ConnectLinkState
-                | crate::production::http_routes::JsonOperation::ConnectUnlink
-                | crate::production::http_routes::JsonOperation::ConnectHealth
-                | crate::production::http_routes::JsonOperation::ConnectMintCredential => {
-                    connect.json_http(operation, payload, context).await
-                }
-                _ => runtime.json(operation, payload, context).await,
-            }
-        }) as crate::production::http_routes::BoxFuture<_>
+        Box::pin(async move { runtime.json(operation, payload, context).await })
+            as crate::production::http_routes::BoxFuture<_>
     });
     let diagnostic_runtime = runtime.clone();
     let diagnostic_logs = Arc::new(move |frontend_log, _context| {
@@ -459,12 +343,7 @@ fn core_http_routes(
         Box::pin(async move { runtime.asset(token, path).await })
             as crate::production::http_routes::BoxFuture<_>
     });
-    let mcp = Arc::new(move |method, body, context| {
-        let connect = connect.clone();
-        Box::pin(async move { connect.mcp_http(method, body, context).await })
-            as crate::production::http_routes::BoxFuture<_>
-    });
-    HttpRoutesState::new(authorize, json, diagnostic_logs, assets, mcp)
+    HttpRoutesState::new(authorize, json, diagnostic_logs, assets)
 }
 
 fn default_ui_process_observer(mode: ServerMode) -> Arc<dyn DesktopUiProcessObserver> {
@@ -518,15 +397,7 @@ fn fallback_http_routes(auth: AuthService) -> HttpRoutesState {
             ))
         }) as crate::production::http_routes::BoxFuture<_>
     });
-    let mcp = Arc::new(move |_method, _body, _context| {
-        Box::pin(async move {
-            Err(HttpRouteError::new(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({ "_tag": "McpUnavailableError" }),
-            ))
-        }) as crate::production::http_routes::BoxFuture<_>
-    });
-    HttpRoutesState::new(authorize, json, diagnostic_logs, assets, mcp)
+    HttpRoutesState::new(authorize, json, diagnostic_logs, assets)
 }
 
 impl ServerHandle {
@@ -725,16 +596,17 @@ mod tests {
             .await
             .expect("orchestration snapshot should respond");
         assert!(snapshot.status().is_success());
-        let link_state = client
+        let removed_route = client
             .get(format!(
-                "http://{}/api/connect/link-state",
-                production.local_addr()
+                "http://{}/api/{}/link-state",
+                production.local_addr(),
+                "connect",
             ))
             .header(reqwest::header::COOKIE, &cookie)
             .send()
             .await
-            .expect("connect link state should respond");
-        assert!(link_state.status().is_success());
+            .expect("removed remote-control route should respond");
+        assert_eq!(removed_route.status(), reqwest::StatusCode::NOT_FOUND);
         let diagnostic = client
             .post(format!(
                 "http://{}/api/diagnostics/logs.zip",

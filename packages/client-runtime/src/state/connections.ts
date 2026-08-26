@@ -141,15 +141,6 @@ export function createEnvironmentCatalogAtoms<R, E>(
         Effect.flatMap((registry) => registry.forget(environmentId)),
       ),
   });
-  const removeRelayEnvironments = createRuntimeCommand(runtime, {
-    label: "environment-catalog:remove-relay-environments",
-    scheduler: commandScheduler,
-    concurrency: serial,
-    execute: (_input: void) =>
-      EnvironmentRegistry.EnvironmentRegistry.pipe(
-        Effect.flatMap((registry) => registry.removeRelayEnvironments()),
-      ),
-  });
   const disconnect = createRuntimeCommand(runtime, {
     label: "environment-catalog:disconnect",
     scheduler: commandScheduler,
@@ -193,7 +184,6 @@ export function createEnvironmentCatalogAtoms<R, E>(
     forget,
     /** Compatibility alias for call sites that still use the former command name. */
     remove: forget,
-    removeRelayEnvironments,
     disconnect,
     retryNow,
     acceptStorageIdentity,

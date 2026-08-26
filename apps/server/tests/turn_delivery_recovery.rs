@@ -17,7 +17,7 @@ use std::{
 use bibcode_server::{
     RpcExit, RpcRegistry, RpcResult, ServerConfig, ServerMessage, ServerRuntime,
     activity::{ActivityProjection, ActivityRepository},
-    cloud, diagnostics,
+    diagnostics,
     git::GitRepository,
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, TurnDeliveryState},
     persistence::{Database, run_migrations},
@@ -990,25 +990,12 @@ fn terminal_services(terminal: TerminalManager) -> ServerTerminalServices {
         resource_sampler.clone(),
         Duration::from_secs(60),
     ));
-    let relay = cloud::RelayClientService::new(
-        || async {
-            cloud::RelayClientStatus::Missing {
-                version: "1.0.0".into(),
-            }
-        },
-        |_report| async {
-            Ok(cloud::RelayClientStatus::Missing {
-                version: "1.0.0".into(),
-            })
-        },
-    );
     ServerTerminalServices::new(
         terminal,
         sampler,
         resource_sampler,
         monitor,
         usage,
-        relay,
         Arc::new(RecoveryControl),
     )
 }

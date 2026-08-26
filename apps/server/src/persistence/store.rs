@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::config::ServerConfig;
 
 use super::{
-    BackupError, BackupTrigger, Database, Migration, PersistenceError, StatePaths,
-    StoreOperationGuard, create_verified_backup,
+    BackupError, BackupTrigger, Database, LegacyConnectCleanupError, Migration, PersistenceError,
+    StatePaths, StoreOperationGuard, complete_legacy_connect_cleanup, create_verified_backup,
     migrations::{
         ExistingStoreValidationError, apply_migrations, pending_migrations, run_migrations,
         validate_existing_bibcode_store, validate_existing_bibcode_store_immutable,
@@ -186,6 +186,8 @@ pub enum StoreStartupError {
         #[source]
         source: Box<PersistenceError>,
     },
+    #[error("failed to complete one-time legacy privacy cleanup")]
+    LegacyPrivacyCleanup(#[source] LegacyConnectCleanupError),
     #[error("failed to protect persistent storage before mutation")]
     Backup(#[source] BackupError),
     #[error("failed to publish identity marker {path}")]
@@ -225,7 +227,7 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
         .then(|| read_marker::<StorageInstanceId>(&paths.storage_instance_id))
         .transpose()?;
 
-    match (database_exists, environment_marker, storage_marker) {
+    let prepared = match (database_exists, environment_marker, storage_marker) {
         (false, None, None) => prepare_first_run(paths).await,
         (false, environment_marker, storage_marker) => Err(StoreStartupError::DatabaseMissing {
             database: paths.database,
@@ -274,7 +276,11 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
             )
             .await
         }
-    }
+    }?;
+    complete_legacy_connect_cleanup(&prepared.paths, &prepared.database)
+        .await
+        .map_err(StoreStartupError::LegacyPrivacyCleanup)?;
+    Ok(prepared)
 }
 
 fn recovery_staging_entry(paths: &StatePaths) -> Result<Option<PathBuf>, StoreStartupError> {

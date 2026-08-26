@@ -10,6 +10,8 @@ import {
   verifyDpopProof,
 } from "./dpop.ts";
 
+import { canonicalJson } from "./canonicalJson.ts";
+
 const textEncoder = new TextEncoder();
 const FIXED_P256_PUBLIC_KEY_HEX =
   "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
@@ -110,6 +112,22 @@ function expectRejected(
 }
 
 describe("verifyDpopProof", () => {
+  it("keeps the canonical thumbprint input independent from Relay helpers", () => {
+    assert.equal(
+      canonicalJson({
+        y: FIXED_PUBLIC_JWK.y,
+        x: FIXED_PUBLIC_JWK.x,
+        kty: FIXED_PUBLIC_JWK.kty,
+        crv: FIXED_PUBLIC_JWK.crv,
+      }),
+      '{"crv":"P-256","kty":"EC","x":"axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY","y":"T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU"}',
+    );
+    assert.equal(
+      computeDpopJwkThumbprint(FIXED_PUBLIC_JWK),
+      "xx0BcA-wMohw8atYDJOe6peGModklG2wRHBlXHMvl0M",
+    );
+  });
+
   it("verifies a generated ES256 proof and returns its signed replay identity", async () => {
     const { proof, publicJwk } = await validFixture({ jti: "replay-id", iat: 100 });
     const thumbprint = computeDpopJwkThumbprint(publicJwk);

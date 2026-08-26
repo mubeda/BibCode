@@ -9,15 +9,7 @@ import {
   AuthOtherClientSessionsRevokeResult,
   AuthPairingLinkRevokeResult,
   EnvironmentAuthInvalidError,
-  EnvironmentCloudEndpointUnavailableError,
-  EnvironmentCloudLinkStateResult,
-  EnvironmentCloudRelayConfigResult,
-  EnvironmentHttpBadRequestError,
   EnvironmentHttpCommonError,
-  EnvironmentHttpConflictError,
-  EnvironmentHttpForbiddenError,
-  EnvironmentHttpInternalServerError,
-  EnvironmentHttpUnauthorizedError,
   EnvironmentInternalError,
   EnvironmentOperationForbiddenError,
   EnvironmentRequestInvalidError,
@@ -57,23 +49,8 @@ const commonErrors = [
   }),
 ] as const;
 
-const legacyHttpErrors = [
-  new EnvironmentHttpBadRequestError({ message: "bad request" }),
-  new EnvironmentHttpUnauthorizedError({ message: "unauthorized" }),
-  new EnvironmentHttpForbiddenError({ message: "forbidden" }),
-  new EnvironmentHttpInternalServerError({ message: "internal" }),
-  new EnvironmentHttpConflictError({ message: "conflict" }),
-  new EnvironmentCloudEndpointUnavailableError({
-    message: "endpoint unavailable",
-    endpointRuntimeStatus: { state: "provisioning" },
-  }),
-] as const;
-
 const decodeCommonError = Schema.decodeUnknownSync(EnvironmentHttpCommonError);
 const encodeCommonError = Schema.encodeUnknownSync(EnvironmentHttpCommonError);
-const decodeCloudLinkState = Schema.decodeUnknownSync(EnvironmentCloudLinkStateResult);
-const encodeCloudLinkState = Schema.encodeSync(EnvironmentCloudLinkStateResult);
-const decodeCloudRelayConfig = Schema.decodeUnknownSync(EnvironmentCloudRelayConfigResult);
 const decodePairingLinkRevoke = Schema.decodeUnknownSync(AuthPairingLinkRevokeResult);
 const decodeClientSessionRevoke = Schema.decodeUnknownSync(AuthClientSessionRevokeResult);
 const decodeOtherClientSessionsRevoke = Schema.decodeUnknownSync(
@@ -89,26 +66,6 @@ describe("environment HTTP errors", () => {
     }
   });
 
-  it("encodes and decodes legacy HTTP error constructors", () => {
-    const schemas = [
-      EnvironmentHttpBadRequestError,
-      EnvironmentHttpUnauthorizedError,
-      EnvironmentHttpForbiddenError,
-      EnvironmentHttpInternalServerError,
-      EnvironmentHttpConflictError,
-      EnvironmentCloudEndpointUnavailableError,
-    ] as const;
-
-    for (const [index, error] of legacyHttpErrors.entries()) {
-      const schema = schemas[index] as Schema.Top;
-      const encoded = Schema.encodeUnknownSync(schema as never)(error);
-      const decoded = Schema.decodeUnknownSync(schema as never)(encoded) as {
-        readonly _tag: string;
-      };
-      expect(decoded._tag).toBe(error._tag);
-    }
-  });
-
   it.effect("converts every error to its declared HTTP response boundary", () =>
     Effect.gen(function* () {
       const cases = [
@@ -117,12 +74,6 @@ describe("environment HTTP errors", () => {
         [commonErrors[2], 403],
         [commonErrors[3], 403],
         [commonErrors[4], 500],
-        [legacyHttpErrors[0], 400],
-        [legacyHttpErrors[1], 401],
-        [legacyHttpErrors[2], 403],
-        [legacyHttpErrors[3], 500],
-        [legacyHttpErrors[4], 409],
-        [legacyHttpErrors[5], 503],
       ] as const;
 
       for (const [error, expectedStatus] of cases) {
@@ -155,34 +106,20 @@ describe("environment HTTP errors", () => {
 });
 
 describe("environment HTTP result schemas", () => {
-  it("round-trips nullable cloud state and operation results", () => {
-    const state = {
-      linked: false,
-      cloudUserId: null,
-      relayUrl: null,
-      relayIssuer: null,
-    } as const;
-    expect(encodeCloudLinkState(decodeCloudLinkState(state))).toEqual(state);
-
-    expect(
-      decodeCloudRelayConfig({
-        ok: true,
-        endpointRuntimeStatus: { state: "ready" },
-      }).ok,
-    ).toBe(true);
+  it("round-trips administrator revoke results", () => {
     expect(decodePairingLinkRevoke({ revoked: true }).revoked).toBe(true);
     expect(decodeClientSessionRevoke({ revoked: false }).revoked).toBe(false);
     expect(decodeOtherClientSessionsRevoke({ revokedCount: 2 }).revokedCount).toBe(2);
   });
 
   it("reports invalid result fields by path", () => {
-    const invalid = { linked: "yes", cloudUserId: null, relayUrl: null, relayIssuer: null };
+    const invalid = { revoked: "yes" };
     const expected = {
       rootTag: "Composite" as const,
-      paths: [["linked"]],
+      paths: [["revoked"]],
       containsTag: "InvalidType" as const,
     };
-    expectDecodeFailure(EnvironmentCloudLinkStateResult, invalid, expected);
-    expectEncodeFailure(EnvironmentCloudLinkStateResult, invalid, expected);
+    expectDecodeFailure(AuthPairingLinkRevokeResult, invalid, expected);
+    expectEncodeFailure(AuthPairingLinkRevokeResult, invalid, expected);
   });
 });

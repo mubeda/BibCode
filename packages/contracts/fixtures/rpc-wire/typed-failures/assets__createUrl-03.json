@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "PUQ67~_R",
-          "requiredScope": "orchestration:operate"
+          "requiredScope": "access:write"
         }
       }
     ]

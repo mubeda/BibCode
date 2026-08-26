@@ -806,7 +806,6 @@ interface TestEnvironmentPresentation {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly displayUrl: string | null;
-  readonly relayManaged: boolean;
   readonly entry: { readonly target: ConnectionTarget };
   readonly connection: TestConnectionPresentation;
   readonly serverConfig: {
@@ -822,7 +821,6 @@ function makeEnvironmentPresentation(
     environmentId,
     label: "Local",
     displayUrl: null,
-    relayManaged: false,
     entry: {
       target: new PrimaryConnectionTarget({
         environmentId,

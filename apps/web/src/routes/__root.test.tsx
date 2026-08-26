@@ -231,10 +231,6 @@ vi.mock("../components/status-bar/AppStatusBar", () => ({
   AppStatusBar: () => <div data-mock="app-status-bar" />,
 }));
 
-vi.mock("../components/cloud/RelayClientInstallDialog", () => ({
-  RelayClientInstallDialog: () => <div data-mock="relay-install" />,
-}));
-
 vi.mock("../components/ProviderUpdateLaunchNotification", () => ({
   ProviderUpdateLaunchNotification: () => <div data-mock="provider-update" />,
 }));
@@ -462,18 +458,18 @@ describe("RootRouteView", () => {
     expect(markup).toContain('data-mock="command-palette"');
     expect(markup).toContain('data-mock="sidebar-layout"');
     expect(markup).toContain('data-mock="app-status-bar"');
-    expect(markup).toContain('data-mock="relay-install"');
+    expect(markup).not.toContain("relay-install");
     expect(markup).toContain('data-mock="provider-update"');
     runEffects();
   });
 
-  it("mounts the relay installer in the browser but not the authenticated desktop shell", () => {
+  it("never mounts a hosted relay installer", () => {
     s.routeContext = { authGateState: { status: "authenticated" } };
     s.showRemoteDeviceControls = false;
-    expect(renderComponent()).not.toContain('data-mock="relay-install"');
+    expect(renderComponent()).not.toContain("relay-install");
 
     s.showRemoteDeviceControls = true;
-    expect(renderComponent()).toContain('data-mock="relay-install"');
+    expect(renderComponent()).not.toContain("relay-install");
   });
 
   it("does not subscribe to SSH password prompts in the authenticated desktop shell", () => {

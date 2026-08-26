@@ -1062,13 +1062,6 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/auth/clients/revoke-others"),
         ("GET", "/api/orchestration/snapshot"),
         ("POST", "/api/orchestration/dispatch"),
-        ("POST", "/api/connect/link-proof"),
-        ("POST", "/api/connect/relay-config"),
-        ("GET", "/api/connect/link-state"),
-        ("POST", "/api/connect/unlink"),
-        ("POST", "/api/bibcode-connect/health"),
-        ("POST", "/api/connect/mint-credential"),
-        ("POST", "/api/bibcode-connect/mint-credential"),
         ("GET", "/ws"),
         ("POST", "/api/diagnostics/logs.zip"),
         ("GET", "/api/assets/*"),
@@ -1077,8 +1070,6 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/maintenance/update/commit"),
         ("POST", "/api/maintenance/update/cancel"),
         ("GET", "/api/maintenance/update/status"),
-        ("POST", "/mcp"),
-        ("DELETE", "/mcp"),
         ("GET", "*"),
     ]
 }

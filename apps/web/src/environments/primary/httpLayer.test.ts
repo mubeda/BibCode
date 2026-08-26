@@ -55,7 +55,7 @@ describe.sequential("primary environment HTTP layer", () => {
     });
 
     return Effect.gen(function* () {
-      yield* HttpClient.get("http://127.0.0.1:3773/api/connect/link-state");
+      yield* HttpClient.get("http://127.0.0.1:3773/api/auth/session");
 
       const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
       expect(request.credentials).not.toBe("include");

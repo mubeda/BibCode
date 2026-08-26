@@ -98,8 +98,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
-            scope:
-              "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+            scope: "orchestration:read orchestration:operate terminal:operate review:write",
           },
           { status: 200 },
         ),
@@ -113,7 +112,7 @@ describe("remote environment authorization", () => {
       expect(result).toMatchObject({
         token_type: "Bearer",
         access_token: "bearer-token",
-        scope: "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+        scope: "orchestration:read orchestration:operate terminal:operate review:write",
       });
       expectFetchCall(fetch.calls, 1, {
         url: "https://remote.example.com/oauth/token",
@@ -184,8 +183,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
-            scope:
-              "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+            scope: "orchestration:read orchestration:operate terminal:operate review:write",
           },
           { status: 200 },
         ),
@@ -272,7 +270,6 @@ describe("remote environment authorization", () => {
               "orchestration:operate",
               "terminal:operate",
               "review:write",
-              "relay:read",
             ],
             sessionMethod: "bearer-access-token",
             expiresAt: "2026-05-01T12:00:00.000Z",
@@ -302,13 +299,7 @@ describe("remote environment authorization", () => {
       }).pipe(provideRemoteHttp(fetch.fetchFn));
       expect(session).toMatchObject({
         authenticated: true,
-        scopes: [
-          "orchestration:read",
-          "orchestration:operate",
-          "terminal:operate",
-          "review:write",
-          "relay:read",
-        ],
+        scopes: ["orchestration:read", "orchestration:operate", "terminal:operate", "review:write"],
       });
 
       const ticket = yield* issueRemoteWebSocketTicket({
@@ -434,8 +425,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
-            scope:
-              "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+            scope: "orchestration:read orchestration:operate terminal:operate review:write",
           },
           { status: 200 },
         ),

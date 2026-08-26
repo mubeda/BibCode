@@ -44,13 +44,15 @@ current behavior.
 - [Authentication](./architecture/authentication.md)
 - [Runtime and process model](./architecture/runtime-process-model.md)
 
-## Cloud and environment authentication
+## Environment access and authentication
 
-- [BiBCode Connect](./cloud/bibcode-connect-clerk.md)
-- [Environment authentication](./cloud/environment-auth.md)
-- [Connect authentication flow](./cloud/bibcode-connect-auth-flow.md)
+- [Remote architecture](./architecture/remote.md)
+- [Authentication architecture](./architecture/authentication.md)
+- [Server administration](./user/server-administration.md)
 
 ## Operations and reference
+
+- [Legacy hosted-service decommission](./operations/legacy-cloud-decommission.md)
 
 - [Environment navigation](./user/environment-navigation.md)
 - [Testing runbooks](./testing/README.md)

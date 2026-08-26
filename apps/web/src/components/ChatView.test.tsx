@@ -763,7 +763,6 @@ interface TestEnvironmentPresentation {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly displayUrl: string | null;
-  readonly relayManaged: boolean;
   readonly connection: TestConnectionPresentation;
   readonly serverConfig: {
     readonly providers: ReadonlyArray<ServerProvider>;
@@ -785,7 +784,6 @@ function makeEnvironmentPresentation(
     environmentId,
     label: "Local",
     displayUrl: null,
-    relayManaged: false,
     connection: { phase: "connected", error: null, traceId: null },
     serverConfig: {
       providers: [codexProvider],

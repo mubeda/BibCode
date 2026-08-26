@@ -22,10 +22,8 @@ const EFFECT_RUNTIME_METHODS = new Set([
 // Existing manual runners are tracked as debt. The rule permits no net-new
 // occurrences in these files, while unlisted test files must have zero.
 const LEGACY_BASELINE = new Map<string, number>([
-  ["apps/web/src/cloud/dpop.test.ts", 2],
   ["apps/web/src/environments/runtime/service.addSavedEnvironment.test.ts", 1],
   ["oxlint-plugin-bibcode/rules/no-manual-effect-runtime-in-tests.test.ts", 7],
-  ["packages/client-runtime/src/relay/managedRelayState.test.ts", 1],
   ["packages/client-runtime/src/wsTransport.test.ts", 2],
 ]);
 

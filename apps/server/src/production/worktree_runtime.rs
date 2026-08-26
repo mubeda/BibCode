@@ -1332,7 +1332,6 @@ mod tests {
         WorkspaceRemovalIdentity,
     };
     use crate::{
-        cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
         diagnostics::{
             DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
             NotApplicableUiProcessObserver, ProcessAttributionRegistry, ProcessIdentity,
@@ -1704,25 +1703,12 @@ mod tests {
         ));
         let provider_usage =
             ProviderUsageService::new(Vec::new(), Arc::new(time::OffsetDateTime::now_utc));
-        let relay = RelayClientService::new(
-            || async {
-                RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                }
-            },
-            |_report: Arc<dyn Fn(RelayClientInstallEvent) -> _ + Send + Sync>| async {
-                Ok(RelayClientStatus::Missing {
-                    version: "1.0.0".to_owned(),
-                })
-            },
-        );
         ServerTerminalServices::new(
             manager,
             sampler,
             resource_sampler,
             monitor,
             provider_usage,
-            relay,
             Arc::new(RuntimeTestControl),
         )
     }

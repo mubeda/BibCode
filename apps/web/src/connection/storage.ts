@@ -37,7 +37,6 @@ import {
   removeConnectionFromCatalog,
   replaceCatalogValue,
 } from "@bibcode/client-runtime/platform";
-import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
   type DesktopWslBinding,
   EnvironmentBinding,
@@ -82,6 +81,7 @@ import {
 } from "./cacheCrypto.ts";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
+const LEGACY_AUTHENTICATION_DATABASE_NAME = "bibcode:cloud-auth";
 const DATABASE_VERSION = 3;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
@@ -367,6 +367,43 @@ export const openConnectionDatabase = Effect.fn("web.connectionStorage.openDatab
     });
   });
 });
+
+export function deleteLegacyAuthenticationDatabase() {
+  return Effect.callback<void, ConnectionPersistenceError>((resume) => {
+    if (typeof indexedDB === "undefined" || indexedDB.deleteDatabase === undefined) {
+      resume(
+        Effect.fail(
+          normalizedPersistenceError(
+            "save-migration-receipt",
+            "Legacy authentication storage deletion is unavailable.",
+          ),
+        ),
+      );
+      return;
+    }
+    const request = indexedDB.deleteDatabase(LEGACY_AUTHENTICATION_DATABASE_NAME);
+    let settled = false;
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      resume(
+        Effect.fail(
+          normalizedPersistenceError(
+            "save-migration-receipt",
+            "Legacy authentication storage deletion is blocked.",
+          ),
+        ),
+      );
+    };
+    request.addEventListener("error", fail);
+    request.addEventListener("blocked", fail);
+    request.addEventListener("success", () => {
+      if (settled) return;
+      settled = true;
+      resume(Effect.void);
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.deleteLegacyAuthenticationDatabase"));
+}
 
 function readDatabaseValue(database: IDBDatabase, storeName: string, key: IDBValidKey) {
   return Effect.callback<unknown, ConnectionTransientError>((resume) => {
@@ -848,6 +885,7 @@ export const activateCatalogV1ToV3Migration = Effect.fn(
     CATALOG_V1_TO_V3_MIGRATION_ID,
   );
   if (existingReceipt !== undefined) {
+    yield* deleteLegacyAuthenticationDatabase();
     return "already-applied" as const;
   }
 
@@ -908,6 +946,7 @@ export const activateCatalogV1ToV3Migration = Effect.fn(
         discard: true,
       }).pipe(Effect.ignore);
     }
+    yield* deleteLegacyAuthenticationDatabase();
     return outcome;
   }).pipe(
     Effect.onError(() =>
@@ -2513,34 +2552,6 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
         })),
     });
-    const remoteTokenStore = TokenStore.make({
-      get: (environmentId) =>
-        catalog.read.pipe(
-          Effect.map((document) =>
-            Option.fromUndefinedOr(
-              document.remoteDpopTokens.find((token) => token.environmentId === environmentId),
-            ),
-          ),
-        ),
-      put: (token) =>
-        catalog.update((document) => ({
-          ...document,
-          remoteDpopTokens: replaceCatalogValue(
-            document.remoteDpopTokens,
-            (value) => value.environmentId,
-            token,
-          ),
-        })),
-      remove: (environmentId) =>
-        catalog.update((document) => ({
-          ...document,
-          remoteDpopTokens: removeCatalogValue(
-            document.remoteDpopTokens,
-            (value) => value.environmentId,
-            environmentId,
-          ),
-        })),
-    });
     const acceptedStorageIdentityStore = AcceptedStorageIdentityStore.of({
       get: (targetKey) =>
         catalog.read.pipe(
@@ -3260,7 +3271,6 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(ConnectionRegistrationStore, registrationStore),
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
-      Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
       Context.add(AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
       Context.add(ConnectionCatalogHealthStore, catalogHealthStore),
       Context.add(EnvironmentCacheStore, cacheStore),

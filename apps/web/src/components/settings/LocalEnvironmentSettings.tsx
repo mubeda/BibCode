@@ -6,7 +6,7 @@ import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { desktopWslStateAtom, refreshDesktopWslState } from "~/state/desktopWslState";
 import { useEnvironments } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import { applyWslEnableSelection } from "./localEnvironmentSettings.logic";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import {
   AlertDialog,

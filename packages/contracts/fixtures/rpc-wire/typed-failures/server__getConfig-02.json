@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "keyca",
-          "requiredScope": "orchestration:operate"
+          "requiredScope": "review:write"
         }
       }
     ]

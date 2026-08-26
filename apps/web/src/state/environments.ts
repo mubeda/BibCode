@@ -3,7 +3,6 @@ import {
   connectionCatalogDisplayUrl,
   type EnvironmentPresentation as BaseEnvironmentPresentation,
 } from "@bibcode/client-runtime/connection";
-import { Discovery } from "@bibcode/client-runtime/relay";
 import { EnvironmentId, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { useMemo } from "react";
@@ -12,14 +11,12 @@ import { environmentCatalog } from "../connection/catalog";
 import { environmentPresentations, useEnvironmentPresentation } from "./presentation";
 import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
 import { useEnvironmentQuery } from "./query";
-import { relayEnvironmentDiscovery } from "./relay";
 import { usePreparedConnection } from "./session";
 
 export interface EnvironmentPresentation extends BaseEnvironmentPresentation {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly displayUrl: string | null;
-  readonly relayManaged: boolean;
 }
 
 export function selectPrimaryLocalEnvironmentId(input: {
@@ -42,7 +39,6 @@ function projectEnvironmentPresentation(
     environmentId,
     label: presentation.entry.target.label,
     displayUrl: connectionCatalogDisplayUrl(presentation.entry),
-    relayManaged: presentation.entry.target._tag === "RelayConnectionTarget",
   };
 }
 
@@ -103,10 +99,6 @@ export function usePrimaryLocalEnvironmentForSelected(
 export function useEnvironmentHttpBaseUrl(environmentId: EnvironmentId | null): string | null {
   const prepared = usePreparedConnection(environmentId);
   return Option.isSome(prepared) ? prepared.value.httpBaseUrl : null;
-}
-
-export function useRelayEnvironmentDiscovery(): Discovery.RelayEnvironmentDiscoveryState {
-  return useAtomValue(relayEnvironmentDiscovery.stateValueAtom);
 }
 
 export function useEnvironmentConnectionState(environmentId: EnvironmentId) {

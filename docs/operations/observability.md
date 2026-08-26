@@ -9,10 +9,11 @@ production Node.js logger or TypeScript server observability layer.
 
 - The Tauri host and in-process server share one native desktop process.
 - A headless `bibcode serve` process runs the same Rust server library without Tauri.
-- Provider CLIs, terminals, SSH forwards, and `cloudflared` are supervised child
-  processes and appear in process diagnostics.
+- Provider CLIs, terminals, and SSH forwards are supervised child processes and
+  appear in process diagnostics.
 - Browser and WebView clients do not export traces to a remote collector.
-- The hosted BiBCode Connect relay has no remote request trace exporter.
+- BiBCode has no hosted account/control service, telemetry exporter, or crash
+  upload destination.
 
 Native diagnostics remain local to each BiBCode installation.
 

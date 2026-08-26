@@ -14,7 +14,6 @@ block2 = "0.6"
 cairo-rs = { version = "0.18", features = ["png"] }
 clap = { version = "4.6.2", features = ["derive", "env"] }
 dirs = "6.0.0"
-ed25519-dalek = { version = "3.0.0", features = ["pem", "pkcs8"] }
 futures-util = { version = "0.3.33", features = ["sink"] }
 getrandom = "0.4.3"
 gtk = "0.18"

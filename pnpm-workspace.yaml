@@ -1,6 +1,5 @@
 packages:
   - apps/*
-  - infra/*
   - oxlint-plugin-bibcode
   - packages/*
   - scripts
@@ -10,19 +9,13 @@ packages:
 # so future releases still wait for the default quarantine period.
 minimumReleaseAgeExclude:
   - geckodriver@6.1.1
-  - "@cloudflare/workers-types@5.20260718.1"
   - "@tanstack/router-generator@1.167.21"
   - "@tanstack/router-plugin@1.168.22"
 
 catalog:
-  "@clerk/backend": 3.11.7
-  "@clerk/clerk-js": 6.25.5
-  "@clerk/react": 6.12.5
-  "@clerk/shared": 4.25.5
   "@tauri-apps/api": 2.11.1
   "@effect/atom-react": 4.0.0-beta.99
   "@effect/platform-node": 4.0.0-beta.99
-  "@effect/sql-pg": 4.0.0-beta.99
   "@effect/tsgo": 0.24.1
   "@effect/vitest": 4.0.0-beta.99
   "@noble/curves": 2.2.0
@@ -53,22 +46,8 @@ overrides:
   # nominal state and cannot safely cross between duplicate package instances.
   fast-check: 4.9.0
 
-  # Keep every Clerk consumer on the same stable train. Clerk publishes wallet
-  # auth integrations as required dependencies, but BiBCode does not support
-  # wallet auth, so keep that unused dependency tree out of installs.
-  "@clerk/backend": "catalog:"
-  "@clerk/clerk-js": "catalog:"
-  "@clerk/react": "catalog:"
-  "@clerk/shared": "catalog:"
-  "@clerk/clerk-js>@base-org/account": "-"
-  "@clerk/clerk-js>@coinbase/wallet-sdk": "-"
-  "@clerk/clerk-js>@solana/wallet-adapter-base": "-"
-  "@clerk/clerk-js>@solana/wallet-adapter-react": "-"
-  "@clerk/clerk-js>@solana/wallet-standard": "-"
-  "@clerk/clerk-js>@wallet-standard/core": "-"
   "@effect/atom-react": "catalog:"
   "@effect/platform-node": "catalog:"
-  "@effect/sql-pg": "catalog:"
   "@effect/vitest": "catalog:"
   # @effect/vitest is patched to use vite-plus/test; do not auto-install its
   # upstream Vitest peer and create a second Vite/Vitest toolchain.

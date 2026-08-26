@@ -1,7 +1,6 @@
 import {
   BearerConnectionTarget,
   PrimaryConnectionTarget,
-  RelayConnectionTarget,
   SshConnectionTarget,
   UnavailableConnectionTarget,
   type ConnectionTarget,
@@ -42,11 +41,6 @@ const sshTarget = new SshConnectionTarget({
   label: "SSH server",
 });
 
-const relayTarget = new RelayConnectionTarget({
-  environmentId: EnvironmentId.make("relay"),
-  label: "Relay server",
-});
-
 const remoteBearerTarget = new BearerConnectionTarget({
   connectionId: "remote:server",
   environmentId: EnvironmentId.make("bearer"),
@@ -58,7 +52,6 @@ const allTargetKinds: readonly ConnectionTarget[] = [
   wslTarget,
   unavailableWslTarget,
   sshTarget,
-  relayTarget,
   remoteBearerTarget,
 ];
 
@@ -86,7 +79,6 @@ describe("environment presentation policy", () => {
     expect(windows.presentsTarget(wslTarget)).toBe(true);
     expect(windows.presentsTarget(unavailableWslTarget)).toBe(true);
     expect(windows.presentsTarget(sshTarget)).toBe(false);
-    expect(windows.presentsTarget(relayTarget)).toBe(false);
     expect(windows.presentsTarget(remoteBearerTarget)).toBe(false);
     expect(windows.permitsConnectionAction(remoteBearerTarget)).toBe(false);
   });
@@ -100,7 +92,6 @@ describe("environment presentation policy", () => {
       expect(policy.presentsTarget(wslTarget)).toBe(false);
       expect(policy.presentsTarget(unavailableWslTarget)).toBe(false);
       expect(policy.presentsTarget(sshTarget)).toBe(false);
-      expect(policy.presentsTarget(relayTarget)).toBe(false);
       expect(policy.presentsTarget(remoteBearerTarget)).toBe(false);
     },
   );

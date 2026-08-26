@@ -142,12 +142,6 @@ export class EnvironmentRegistry extends Context.Service<
       | EnvironmentNotRegisteredError
       | PlatformEnvironmentRemovalError
     >;
-    readonly removeRelayEnvironments: () => Effect.Effect<
-      void,
-      | Persistence.ConnectionPersistenceError
-      | ConnectionAttemptError
-      | PlatformEnvironmentRemovalError
-    >;
     readonly disconnect: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly acceptStorageIdentity: (
@@ -1447,26 +1441,6 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     );
   });
 
-  const removeRelayEnvironments = Effect.fn("EnvironmentRegistry.removeRelayEnvironments")(
-    function* () {
-      const relayEnvironmentIds = [...(yield* SubscriptionRef.get(entries)).values()]
-        .filter((entry) => entry.target._tag === "RelayConnectionTarget")
-        .map((entry) => entry.target.environmentId);
-
-      yield* Effect.forEach(
-        relayEnvironmentIds,
-        (environmentId) =>
-          remove(environmentId).pipe(
-            Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
-          ),
-        {
-          concurrency: "unbounded",
-          discard: true,
-        },
-      );
-    },
-  );
-
   const disconnect = (environmentId: EnvironmentId) =>
     acquireSupervisor(environmentId).pipe(
       Effect.flatMap((supervisor) => supervisor.disconnect),
@@ -1574,7 +1548,6 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     removeRoute,
     forget,
     remove,
-    removeRelayEnvironments,
     disconnect,
     retryNow,
     acceptStorageIdentity,

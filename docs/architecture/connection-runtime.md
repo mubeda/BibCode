@@ -4,9 +4,9 @@
 supervised connection model for local, WSL, manually paired HTTPS, and
 desktop-managed SSH environments. The public package has no root export;
 callers use focused subpaths such as `connection`, `cache`, `authorization`,
-`rpc`, and `state/<domain>`. Pre-v3 connection targets and BiBCode Connect
-remain bounded migration/compatibility inputs until their dedicated removal;
-they are not a second environment model.
+`rpc`, and `state/<domain>`. Pre-v3 direct and SSH connection targets remain
+bounded migration inputs; they are not a second environment model. BiBCode has
+no hosted account or connection control plane.
 
 ## Ownership
 
@@ -94,28 +94,28 @@ Only one route may publish the live lease. Route results retain environment and
 route generations so late success, failure, or progress from an older attempt
 cannot replace current state.
 
-## Pre-v3 target compatibility
+## Pre-v3 direct-target migration
 
-Legacy target adapters are defined in
+Legacy direct-target adapters are defined in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
-They remain current executable evidence while v1 catalogs and BiBCode Connect
-still exist, but normalized persistence and supervision use `KnownEnvironment`
-routes rather than one target per environment.
+They exist only to migrate v1 direct and SSH catalog entries. Normalized
+persistence and supervision use `KnownEnvironment` routes rather than one
+target per environment.
 
 | Target                        | Preparation                                                                                                                                                     |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PrimaryConnectionTarget`     | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection.              |
 | `BearerConnectionTarget`      | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                                    |
-| `RelayConnectionTarget`       | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                                            |
 | `SshConnectionTarget`         | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.                     |
 | `UnavailableConnectionTarget` | Retains a platform-owned desired environment and its cached projections without an endpoint or credential; preparation fails transiently before transport work. |
 
-Bearer, relay, and SSH targets may still appear in the v1 connection catalog.
-Unavailable targets are reconciled only from host topology and are never
-persisted as saved connections. Profiles and credentials remain separate so
-legacy metadata can be listed without exposing secrets. After the v1-to-v3
-migration receipt exists, registry startup reads normalized environment rows
-exclusively.
+Bearer and SSH targets may still appear in the v1 connection catalog.
+Obsolete hosted entries are discarded and their credentials are deleted during
+migration; they cannot produce a route. Unavailable targets are reconciled only
+from host topology and are never persisted as saved connections. Profiles and
+credentials remain separate so legacy metadata can be listed without exposing
+secrets. After the v1-to-v3 migration receipt exists, registry startup reads
+normalized environment rows exclusively.
 
 ## Normalized persistence and migration
 

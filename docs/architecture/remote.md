@@ -66,9 +66,9 @@ blocked route does not prevent another eligible route from connecting. A late
 attempt is fenced by both environment and route generation and cannot publish a
 session after reconnect, route replacement, or Forget.
 
-Pre-v3 primary, bearer, relay, SSH, and unavailable target classes remain only
-as current compatibility inputs. The v1-to-v3 migration converts safe direct
-and SSH entries into routes and discards Relay-only entries and remote DPoP
+Pre-v3 primary, bearer, SSH, and unavailable target classes remain only as
+current migration inputs. The v1-to-v3 migration converts safe direct and SSH
+entries into routes and discards obsolete hosted entries and their remote DPoP
 tokens. Once its receipt exists, startup reads normalized environments only.
 The legacy SSH broker itself cannot create a pairing: an entry that was not
 safely migrated must be explicitly re-enrolled so accepted storage and protocol
@@ -115,22 +115,6 @@ receipt commit atomically. A same-key lost-response retry returns the same
 logical session; a different key fails. Administrative lists and access events
 never contain the raw pairing value, and revoking a client closes its live
 socket.
-
-### BiBCode Connect
-
-BiBCode Connect is a transitional pre-v3 compatibility path scheduled for
-complete removal. While it remains executable, the signed-in client discovers
-linked environments from the relay. To connect,
-it exchanges a Clerk token and client DPoP proof for a relay DPoP token, asks
-the relay for environment status or a connection bootstrap, then exchanges that
-bootstrap with the environment for a DPoP-bound access token. HTTP requests use
-that token and fresh DPoP proofs; the WebSocket URL contains only a short-lived
-`wsTicket`.
-
-The relay is a legacy control plane. It verifies user and DPoP authorization, stores
-environment links, provisions the managed endpoint, and brokers signed health
-and mint requests. It does not become the owner of environment sessions or
-provider state. See [BiBCode Connect auth flow](../cloud/bibcode-connect-auth-flow.md).
 
 ### Desktop-managed SSH
 
@@ -384,8 +368,8 @@ endpoint, service credentials, raw environment variables, binary/data/backup
 paths, or permission-changing actions. A network host-action request fails with
 the typed `hostAuthorityRequired` result.
 
-Storage-identity mismatch protection applies equally to direct HTTPS,
-compatibility BiBCode Connect, WSL, and desktop-managed SSH routes: a different non-null
+Storage-identity mismatch protection applies equally to direct HTTPS, WSL, and
+desktop-managed SSH routes: a different non-null
 `storageInstanceId` is blocked before synchronization. The desktop project-data
 recovery screen is intentionally narrower. It can inspect or mutate only a
 desktop-owned native or WSL launch plan whose root the Rust host can resolve.

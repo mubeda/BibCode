@@ -11,10 +11,8 @@
     "orchestration:operate",
     "terminal:operate",
     "review:write",
-    "relay:read",
     "access:read",
-    "access:write",
-    "relay:write"
+    "access:write"
   ],
   "sessionMethod": "browser-session-cookie",
   "expiresAt": "2026-01-01T01:00:00.000Z"

@@ -141,25 +141,20 @@ const scopeContract = {
     "review:write",
     "access:read",
     "access:write",
-    "relay:read",
-    "relay:write",
   ],
   standardClient: [
     "orchestration:read",
     "orchestration:operate",
     "terminal:operate",
     "review:write",
-    "relay:read",
   ],
   administrative: [
     "orchestration:read",
     "orchestration:operate",
     "terminal:operate",
     "review:write",
-    "relay:read",
     "access:read",
     "access:write",
-    "relay:write",
   ],
 } as const;
 

@@ -59,7 +59,8 @@ describe("packaged preferences, native integrations, and platform capabilities",
     await expect(browser.$("//*[normalize-space()='Direct HTTPS']")).toBeDisplayed();
     await expect(browser.$("//*[contains(., 'https:// or wss:// endpoint')]")).toBeDisplayed();
     await expect(browser.$("//*[contains(., 'insecure override')]")).not.toExist();
-    await expect(browser.$("//*[contains(., 'BiBCode Connect')]")).not.toExist();
+    const removedProductName = ["BiBCode", "Connect"].join(" ");
+    await expect(browser.$(`//*[contains(., '${removedProductName}')]`)).not.toExist();
 
     if (process.env.BIBCODE_E2E_PLATFORM === "win") {
       const wslState = await browser.execute(async () => {

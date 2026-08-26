@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "UE",
-          "requiredScope": "relay:read"
+          "requiredScope": "terminal:operate"
         }
       }
     ]

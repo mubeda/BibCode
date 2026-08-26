@@ -221,6 +221,13 @@ wildcard plaintext binds, remote artifact downloads, telemetry, and unexpected
 internet requests. Expected signed-artifact download occurs on the desktop; the
 remote host receives only the verified transfer.
 
+Run WSL and each Linux, macOS, and Windows SSH row through the shared
+deny-by-default outbound harness. Cold startup, pairing, ordinary use,
+diagnostics export, and intentional crash handling may contact only the
+selected loopback/SSH/HTTPS environment endpoint; invoke and allow the updater
+separately. Record zero unexpected destinations and the initiating process for
+every permitted request.
+
 Capture and revalidate every run-owned desktop, server, WSL, SSH, askpass,
 tunnel, provider, terminal, and service process using the native identity fields
 in [Process lifecycle](./process-lifecycle.md). Final shutdown must leave zero

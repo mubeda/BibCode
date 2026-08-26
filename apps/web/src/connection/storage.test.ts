@@ -29,7 +29,6 @@ import {
   EnvironmentSecretStore,
   EnvironmentUiStateStore,
 } from "@bibcode/client-runtime/platform";
-import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
   EnvironmentId,
   type DesktopBridge,
@@ -56,6 +55,7 @@ import {
   commitCatalogMigrationMetadata,
   commitEnvironmentUiStateMigration,
   connectionStorageLayer,
+  deleteLegacyAuthenticationDatabase,
   makeCatalogBackend,
   makeCatalogStore,
   makeEnvironmentSecretStore,
@@ -68,7 +68,6 @@ const emptyCatalog = {
   targets: [],
   profiles: [],
   credentials: [],
-  remoteDpopTokens: [],
   acceptedStorageIdentities: [],
 } as const;
 const decodeCatalog = Schema.decodeUnknownSync(Schema.fromJsonString(ConnectionCatalogDocument));
@@ -270,6 +269,11 @@ function installFakeIndexedDb(
         });
         return request;
       },
+      deleteDatabase: (_name: string) => {
+        const request = new FakeRequest();
+        queueMicrotask(() => request.fire("success"));
+        return request;
+      },
     });
   }
   vi.stubGlobal("IDBKeyRange", {
@@ -393,8 +397,9 @@ function encodeLegacyBearerCatalog(
   registration: BearerConnectionRegistration,
   storageInstanceId: string,
 ) {
-  return encodeCatalog({
+  return encodeUnknownJson({
     ...emptyCatalog,
+    remoteDpopTokens: [],
     targets: [registration.target],
     profiles: [registration.profile],
     credentials: [
@@ -513,19 +518,6 @@ function orchestrationThread(): OrchestrationThread {
     session: null,
   } as OrchestrationThread;
 }
-
-const remoteToken = new TokenStore.RemoteDpopAccessToken({
-  environmentId,
-  label: "Remote",
-  endpoint: {
-    httpBaseUrl: "https://relay.example/",
-    wsBaseUrl: "wss://relay.example/",
-    providerKind: "bibcode_relay",
-  },
-  accessToken: "remote-access-token",
-  expiresAtEpochMs: 1_000,
-  dpopThumbprint: "thumb",
-});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -797,7 +789,6 @@ describe("makeCatalogStore", () => {
                 credential: registration.credential,
               },
             ],
-            remoteDpopTokens: [remoteToken],
           })),
           { startImmediately: true },
         );
@@ -811,7 +802,6 @@ describe("makeCatalogStore", () => {
         expect(document.targets).toEqual([registration.target]);
         expect(document.profiles).toEqual([registration.profile]);
         expect(document.credentials).toHaveLength(1);
-        expect(document.remoteDpopTokens).toEqual([remoteToken]);
       }),
   );
 
@@ -1448,6 +1438,73 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("deletes the obsolete authentication database including its proof key", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+
+    return Effect.gen(function* () {
+      const legacyDatabase = yield* Effect.promise(
+        () =>
+          new Promise<IDBDatabase>((resolve, reject) => {
+            const request = factory.open("bibcode:cloud-auth", 1);
+            request.addEventListener("upgradeneeded", () => {
+              request.result.createObjectStore("keys");
+            });
+            request.addEventListener("success", () => resolve(request.result));
+            request.addEventListener("error", () => reject(request.error));
+          }),
+      );
+      yield* Effect.promise(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            const transaction = legacyDatabase.transaction("keys", "readwrite");
+            transaction.objectStore("keys").put("private-key-canary", "relay-dpop-proof-key");
+            transaction.addEventListener("complete", () => resolve());
+            transaction.addEventListener("error", () => reject(transaction.error));
+          }),
+      );
+      legacyDatabase.close();
+
+      yield* deleteLegacyAuthenticationDatabase();
+
+      expect(
+        (yield* Effect.promise(() => factory.databases())).map(({ name }) => name),
+      ).not.toContain("bibcode:cloud-auth");
+    });
+  });
+
+  it.effect(
+    "reports a blocked legacy database deletion and succeeds after the owner closes",
+    () => {
+      const factory = new IDBFactory();
+      vi.stubGlobal("indexedDB", factory);
+      vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+      vi.stubGlobal("window", {});
+
+      return Effect.gen(function* () {
+        const blockingDatabase = yield* Effect.promise(
+          () =>
+            new Promise<IDBDatabase>((resolve, reject) => {
+              const request = factory.open("bibcode:cloud-auth", 1);
+              request.addEventListener("success", () => resolve(request.result));
+              request.addEventListener("error", () => reject(request.error));
+            }),
+        );
+
+        const error = yield* deleteLegacyAuthenticationDatabase().pipe(Effect.flip);
+        expect(error.message).not.toContain("private-key");
+        blockingDatabase.close();
+        yield* deleteLegacyAuthenticationDatabase();
+
+        expect(
+          (yield* Effect.promise(() => factory.databases())).map(({ name }) => name),
+        ).not.toContain("bibcode:cloud-auth");
+      });
+    },
+  );
+
   it.effect("deletes staged secret references after an aborted migration and retries once", () => {
     const factory = new IDBFactory();
     const firstRef =
@@ -2533,7 +2590,6 @@ describe("connectionStorageLayer", () => {
             credential: registration.credential,
           },
         ],
-        remoteDpopTokens: [remoteToken],
         acceptedStorageIdentities: [
           { targetKey: "bearer:connection-1", storageInstanceId: "indexeddb-winner" },
         ],
@@ -2629,8 +2685,10 @@ describe("connectionStorageLayer", () => {
           getConnectionCatalog: vi.fn(async () => {
             const raw = storedCatalog;
             reads += 1;
-            if (reads === 2) reportBothReads();
-            if (reads <= 2) await readsReleased;
+            // The first two reads belong to each layer's one-time legacy migration.
+            // Hold the following mutation reads so the CAS collision is deterministic.
+            if (reads === 4) reportBothReads();
+            if (reads === 3 || reads === 4) await readsReleased;
             return raw;
           }),
           compareAndSetConnectionCatalog,
@@ -2709,11 +2767,9 @@ describe("connectionStorageLayer", () => {
     const handle = installFakeIndexedDb();
     return Effect.gen(function* () {
       const registrationStore = yield* ConnectionRegistrationStore;
-      const tokenStore = yield* TokenStore.RemoteDpopAccessTokenStore;
       const identityStore = yield* AcceptedStorageIdentityStore;
 
       yield* registrationStore.register(bearerRegistration());
-      yield* tokenStore.put(remoteToken);
 
       const rawBefore = handle.stores.get("catalog")?.get("document");
       expect(typeof rawBefore).toBe("string");
@@ -2779,12 +2835,10 @@ describe("connectionStorageLayer", () => {
       const registrationStore = yield* ConnectionRegistrationStore;
       const profileStore = yield* ProfileStore.ConnectionProfileStore;
       const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
-      const tokenStore = yield* TokenStore.RemoteDpopAccessTokenStore;
 
       expect(yield* targetStore.list).toEqual([]);
       expect(Option.isNone(yield* profileStore.get(connectionId))).toBe(true);
       expect(Option.isNone(yield* credentialStore.get(connectionId))).toBe(true);
-      expect(Option.isNone(yield* tokenStore.get(environmentId))).toBe(true);
 
       yield* registrationStore.register(bearerRegistration());
 
@@ -2793,13 +2847,6 @@ describe("connectionStorageLayer", () => {
       expect(targets[0]!.environmentId).toBe(environmentId);
       expect(Option.isSome(yield* profileStore.get(connectionId))).toBe(true);
       expect(Option.isSome(yield* credentialStore.get(connectionId))).toBe(true);
-
-      // Remote DPoP token round-trip.
-      yield* tokenStore.put(remoteToken);
-      const token = yield* tokenStore.get(environmentId);
-      expect(Option.isSome(token)).toBe(true);
-      yield* tokenStore.remove(environmentId);
-      expect(Option.isNone(yield* tokenStore.get(environmentId))).toBe(true);
 
       // Direct profile/credential mutation seams.
       yield* profileStore.put(bearerRegistration().profile);

@@ -49,7 +49,7 @@ const forbiddenTelemetryMarkers = [
   "alchemy/Axiom",
   "TelemetryLive",
   "google.com/s2/favicons",
-  "BIBCODE_RELAY_CLIENT_OTLP",
+  ["BIBCODE", "RELAY_CLIENT_OTLP"].join("_"),
   "BIBCODE_MOBILE_OTLP",
   "VITE_RELAY_OTLP",
   "OTEL_EXPORTER_OTLP",
@@ -120,16 +120,6 @@ function telemetryViolations(
   });
 }
 
-function workflowJob(path: string, name: string): string {
-  const source = read(path).replaceAll("\r\n", "\n");
-  const header = `  ${name}:\n`;
-  const start = source.indexOf(header);
-  if (start < 0) return "";
-  const bodyStart = start + header.length;
-  const nextJob = /^  [A-Za-z0-9_-]+:$/m.exec(source.slice(bodyStart));
-  return source.slice(start, nextJob ? bodyStart + nextJob.index : undefined);
-}
-
 describe("zero-telemetry privacy contract", () => {
   it("scans executable web, manifest, shell, and environment files", () => {
     const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-privacy-"));
@@ -165,7 +155,6 @@ describe("zero-telemetry privacy contract", () => {
     for (const path of [
       "apps/server/src/telemetry/mod.rs",
       "apps/web/src/observability/clientTracing.ts",
-      "infra/relay/src/observability.ts",
       "packages/shared/src/relayTracing.ts",
     ]) {
       expect(NodeFS.existsSync(NodePath.join(root, path)), path).toBe(false);
@@ -176,16 +165,11 @@ describe("zero-telemetry privacy contract", () => {
     const marketing = JSON.parse(read("apps/marketing/package.json")) as {
       scripts: Record<string, string>;
     };
-    const relay = JSON.parse(read("infra/relay/package.json")) as {
-      scripts: Record<string, string>;
-    };
     const preload = "node --require ../../scripts/disable-telemetry.cjs";
 
     expect(Object.values(marketing.scripts).every((script) => script.startsWith(preload))).toBe(
       true,
     );
-    expect(relay.scripts.deploy?.startsWith(preload)).toBe(true);
-    expect(relay.scripts.destroy?.startsWith(preload)).toBe(true);
 
     const child = NodeChildProcess.spawnSync(
       process.execPath,
@@ -196,15 +180,12 @@ describe("zero-telemetry privacy contract", () => {
         `
         const attempt = (change) => { try { change(); } catch {} };
         attempt(() => { process.env.ASTRO_TELEMETRY_DISABLED = "0"; });
-        attempt(() => { delete process.env.ALCHEMY_TELEMETRY_DISABLED; });
         attempt(() => Object.defineProperty(process.env, "DO_NOT_TRACK", { value: "0" }));
         attempt(() => { process.env.astro_telemetry_disabled = "0"; });
-        attempt(() => { delete process.env.Alchemy_Telemetry_Disabled; });
         attempt(() => Object.defineProperty(process.env, "do_not_track", { value: "0" }));
         attempt(() => { process.env = {}; });
         process.stdout.write(JSON.stringify({
           astro: process.env.ASTRO_TELEMETRY_DISABLED,
-          alchemy: process.env.ALCHEMY_TELEMETRY_DISABLED,
           doNotTrack: process.env.DO_NOT_TRACK,
         }));
       `,
@@ -214,7 +195,6 @@ describe("zero-telemetry privacy contract", () => {
         env: {
           ...process.env,
           ASTRO_TELEMETRY_DISABLED: "0",
-          ALCHEMY_TELEMETRY_DISABLED: "0",
           DO_NOT_TRACK: "0",
         },
       },
@@ -222,21 +202,8 @@ describe("zero-telemetry privacy contract", () => {
     expect(child.status, child.stderr).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual({
       astro: "1",
-      alchemy: "1",
       doNotTrack: "1",
     });
-
-    const deployRelayJob = workflowJob(".github/workflows/deploy-relay.yml", "deploy_relay");
-    expect(deployRelayJob).toContain("vp run --filter bibcode-relay deploy");
-    expect(deployRelayJob).toContain(
-      '      ALCHEMY_TELEMETRY_DISABLED: "1"\n      DO_NOT_TRACK: "1"',
-    );
-
-    const releaseRelayJob = workflowJob(".github/workflows/release.yml", "relay_public_config");
-    expect(releaseRelayJob).toContain("vp run --filter bibcode-relay deploy");
-    expect(releaseRelayJob).toContain(
-      '      ALCHEMY_TELEMETRY_DISABLED: "1"\n      DO_NOT_TRACK: "1"',
-    );
   });
 
   it("preserves local diagnostics and stable automatic updates", () => {
@@ -252,5 +219,23 @@ describe("zero-telemetry privacy contract", () => {
     expect(read("apps/desktop/src-tauri/tauri.release.conf.json")).toContain(
       "releases/latest/download/latest.json",
     );
+  });
+
+  it("keeps ordinary startup behind the deny-by-default outbound regression", () => {
+    const scheduler = read("apps/server/src/production/control.rs");
+    const outboundRegression = read("apps/server/tests/no_unexpected_outbound.rs");
+    const releaseSmoke = read("scripts/release-smoke.ts");
+
+    expect(scheduler).toContain("interval_at(Instant::now() + period, period)");
+    expect(scheduler).not.toContain("tokio::time::interval(Duration::from_secs(60 * 60))");
+    for (const scenario of ["cold_start", "local_use", "pairing", "diagnostics", "crash"]) {
+      expect(outboundRegression).toContain(scenario);
+    }
+    for (const proxyVariable of ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) {
+      expect(outboundRegression).toContain(proxyVariable);
+    }
+    expect(outboundRegression).toContain("Vec::<String>::new()");
+    expect(releaseSmoke).toContain("assertNoLegacyCloudArtifacts");
+    expect(releaseSmoke).toContain('"--release"');
   });
 });

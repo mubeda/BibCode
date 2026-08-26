@@ -21,13 +21,6 @@ export interface InspectedSshEnvironment {
   readonly descriptor: ExecutionEnvironmentDescriptor;
 }
 
-export class CloudSession extends Context.Service<
-  CloudSession,
-  {
-    readonly clerkToken: Effect.Effect<string, ConnectionAttemptError>;
-  }
->()("@bibcode/client-runtime/platform/capabilities/CloudSession") {}
-
 export class ClientPresentation extends Context.Service<
   ClientPresentation,
   {

@@ -14,7 +14,6 @@ import {
   WsShellOpenInEditorRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeVcsStatusSummaryRpc,
-  WsCloudInstallRelayClientRpc,
   WsTerminalOpenRpc,
   WsTerminalWriteRpc,
   WsPreviewListRpc,
@@ -92,7 +91,7 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.terminalOpen).toBe("terminal.open");
     expect(WS_METHODS.subscribeVcsStatus).toBe("subscribeVcsStatus");
     expect(WS_METHODS.subscribeVcsStatusSummary).toBe("subscribeVcsStatusSummary");
-    expect(WS_METHODS.cloudInstallRelayClient).toBe("cloud.installRelayClient");
+    expect(Object.keys(WS_METHODS).some((key) => key.startsWith("cloud"))).toBe(false);
     expect(WS_METHODS.sourceControlLookupRepository).toBe("sourceControl.lookupRepository");
     expect(WS_METHODS.activityGetSnapshot).toBe("activity.getSnapshot");
     expect(WS_METHODS.activityListRoster).toBe("activity.listRoster");
@@ -254,7 +253,6 @@ describe("individual RPC definitions", () => {
     for (const streamRpc of [
       WsSubscribeVcsStatusRpc,
       WsSubscribeVcsStatusSummaryRpc,
-      WsCloudInstallRelayClientRpc,
       WsSubscribeAuthAccessRpc,
       WsOrchestrationSubscribeShellRpc,
       WsSubscribeWorktreeCatalogRpc,
@@ -286,7 +284,6 @@ describe("WsRpcGroup", () => {
       WsShellOpenInEditorRpc,
       WsSubscribeVcsStatusRpc,
       WsSubscribeVcsStatusSummaryRpc,
-      WsCloudInstallRelayClientRpc,
       WsTerminalOpenRpc,
       WsPreviewListRpc,
       WsSourceControlLookupRepositoryRpc,

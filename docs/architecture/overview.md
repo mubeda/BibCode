@@ -482,7 +482,7 @@ identities before either manager shuts down. A provider or PTY that finishes
 spawning after this fence is rejected with the typed shutdown outcome and its
 uncommitted owner terminates and reaps it before returning. Existing provider
 process-group or Windows Job owners, terminal PTY owners, independently spawned
-provider helpers, and the managed endpoint tunnel perform their
+provider helpers, and desktop-owned SSH forwards perform their
 normal cleanup first; a final native sample kills only residual identities in
 the captured runtime-owned closure, including descendants forked after the
 initial sample. It never sweeps every descendant of the shared application

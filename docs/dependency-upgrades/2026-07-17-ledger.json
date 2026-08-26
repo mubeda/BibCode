@@ -82,9 +82,9 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 80,
-    "javascriptLedger": 79,
-    "rustRegistry": 88,
+    "javascriptDirect": 72,
+    "javascriptLedger": 70,
+    "rustRegistry": 87,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -798,45 +798,49 @@
       "key": "js:catalog:@clerk/backend",
       "name": "@clerk/backend",
       "current": "3.11.7",
-      "target": "3.11.7",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@clerk/backend",
       "cohort": "clerk",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted Connect and Clerk authentication stack."
     },
     {
       "key": "js:catalog:@clerk/clerk-js",
       "name": "@clerk/clerk-js",
       "current": "6.25.5",
-      "target": "6.25.5",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@clerk/clerk-js",
       "cohort": "clerk",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted Connect and Clerk authentication stack."
     },
     {
       "key": "js:catalog:@clerk/react",
       "name": "@clerk/react",
       "current": "6.12.5",
-      "target": "6.12.5",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@clerk/react",
       "cohort": "clerk",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted Connect and Clerk authentication stack."
     },
     {
       "key": "js:catalog:@clerk/shared",
       "name": "@clerk/shared",
       "current": "4.25.5",
-      "target": "4.25.5",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@clerk/shared",
       "cohort": "clerk",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted Connect and Clerk authentication stack."
     },
     {
       "key": "js:catalog:@effect/atom-react",
@@ -864,12 +868,13 @@
       "key": "js:catalog:@effect/sql-pg",
       "name": "@effect/sql-pg",
       "current": "4.0.0-beta.99",
-      "target": "4.0.0-beta.99",
-      "channel": "preview",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@effect/sql-pg",
       "cohort": "effect",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted relay persistence implementation."
     },
     {
       "key": "js:catalog:@effect/tsgo",
@@ -1009,46 +1014,49 @@
       "key": "js:infra/relay:@cloudflare/workers-types",
       "name": "@cloudflare/workers-types",
       "current": "^5.20260718.1",
-      "target": "5.20260718.1",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/@cloudflare/workers-types",
       "cohort": "stable-javascript-tooling",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted relay infrastructure package."
     },
     {
       "key": "js:infra/relay:alchemy",
       "name": "alchemy",
       "current": "2.0.0-beta.63",
-      "target": "2.0.0-beta.63",
-      "channel": "preview",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/alchemy",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green",
-      "notes": "Use the published npm artifact for the audited beta.63 build; its release tag resolves to the same cde008ab6b77783d3edbf5dc82750fbdfd279347 source revision."
+      "status": "removed",
+      "notes": "Removed with the retired hosted relay infrastructure package."
     },
     {
       "key": "js:infra/relay:drizzle-kit",
       "name": "drizzle-kit",
       "current": "1.0.0-rc.4",
-      "target": "1.0.0-rc.4",
-      "channel": "preview",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/drizzle-kit",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted relay infrastructure package."
     },
     {
       "key": "js:infra/relay:drizzle-orm",
       "name": "drizzle-orm",
       "current": "1.0.0-rc.4",
-      "target": "1.0.0-rc.4",
-      "channel": "preview",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://www.npmjs.com/package/drizzle-orm",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired hosted relay infrastructure package."
     },
     {
       "key": "js:oxlint-plugin-bibcode:@oxlint/plugins",
@@ -1480,12 +1488,13 @@
       "key": "rust:workspace:ed25519-dalek",
       "name": "ed25519-dalek",
       "current": "3.0.0",
-      "target": "3.0.0",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://crates.io/crates/ed25519-dalek",
       "cohort": "rust-cryptography",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "removed",
+      "notes": "Removed with the retired Connect signing implementation; direct DPoP remains P-256 based."
     },
     {
       "key": "rust:workspace:futures-util",

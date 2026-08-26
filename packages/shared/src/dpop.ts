@@ -5,7 +5,7 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
-import { stableStringify } from "./relaySigning.ts";
+import { canonicalJson } from "./canonicalJson.ts";
 
 const DPOP_TYP = "dpop+jwt";
 const DPOP_ALG = "ES256";
@@ -69,7 +69,7 @@ function decodeBase64UrlDpopJwtPayload(value: string) {
 }
 
 function dpopThumbprintInput(jwk: DpopPublicJwk): string {
-  return stableStringify({
+  return canonicalJson({
     crv: jwk.crv,
     kty: jwk.kty,
     x: jwk.x,

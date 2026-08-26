@@ -90,13 +90,6 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/auth/clients/revoke-others"),
     route(RouteMethod::Get, "/api/orchestration/snapshot"),
     route(RouteMethod::Post, "/api/orchestration/dispatch"),
-    route(RouteMethod::Post, "/api/connect/link-proof"),
-    route(RouteMethod::Post, "/api/connect/relay-config"),
-    route(RouteMethod::Get, "/api/connect/link-state"),
-    route(RouteMethod::Post, "/api/connect/unlink"),
-    route(RouteMethod::Post, "/api/bibcode-connect/health"),
-    route(RouteMethod::Post, "/api/connect/mint-credential"),
-    route(RouteMethod::Post, "/api/bibcode-connect/mint-credential"),
     route(RouteMethod::Get, "/ws"),
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
@@ -105,8 +98,6 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, MAINTENANCE_UPDATE_COMMIT_PATH),
     route(RouteMethod::Post, MAINTENANCE_UPDATE_CANCEL_PATH),
     route(RouteMethod::Get, MAINTENANCE_UPDATE_STATUS_PATH),
-    route(RouteMethod::Post, "/mcp"),
-    route(RouteMethod::Delete, "/mcp"),
     route(RouteMethod::Get, "*"),
 ];
 
@@ -501,6 +492,10 @@ async fn static_or_dev(
     headers: HeaderMap,
 ) -> Response {
     if method != Method::GET {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    if uri.path().starts_with("/api/") || uri.path() == "/mcp" {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
 

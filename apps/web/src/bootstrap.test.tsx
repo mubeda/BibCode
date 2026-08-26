@@ -44,9 +44,6 @@ vi.mock("./diagnostics/frontendLogCapture", () => ({
 }));
 
 vi.mock("./env", () => ({ isDesktopHost: false }));
-vi.mock("./cloud/publicConfig", () => ({ hasCloudPublicConfig: vi.fn(() => false) }));
-vi.mock("./cloud/managedAuth", () => ({ ManagedRelayAuthProvider: () => null }));
-vi.mock("@clerk/react", () => ({ ClerkProvider: () => null }));
 
 describe("renderApplication", () => {
   afterEach(() => {

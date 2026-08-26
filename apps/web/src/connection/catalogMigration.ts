@@ -31,7 +31,17 @@ type StoredLegacyCredential = typeof StoredLegacyCredential.Type;
 const StorageInstanceId = Schema.String.check(Schema.isUUID());
 
 const decodeLegacyCatalog = Schema.decodeUnknownSync(LegacyConnectionCatalogV1);
-const decodeLegacyTarget = Schema.decodeUnknownSync(PersistedConnectionTarget);
+const LegacyRelayConnectionTarget = Schema.Struct({
+  _tag: Schema.Literal("RelayConnectionTarget"),
+  environmentId: Schema.String,
+  label: Schema.String,
+});
+const LegacyPersistedConnectionTarget = Schema.Union([
+  PersistedConnectionTarget,
+  LegacyRelayConnectionTarget,
+]);
+type LegacyPersistedConnectionTarget = typeof LegacyPersistedConnectionTarget.Type;
+const decodeLegacyTarget = Schema.decodeUnknownSync(LegacyPersistedConnectionTarget);
 const decodeLegacyProfile = Schema.decodeUnknownSync(ConnectionProfile);
 const decodeLegacyCredential = Schema.decodeUnknownSync(StoredLegacyCredential);
 const decodeAcceptedStorageIdentity = Schema.decodeUnknownSync(AcceptedStorageIdentitySchema);
@@ -237,7 +247,7 @@ export async function planCatalogV1ToV3Migration(
   const sessionSecretImports: CatalogMigrationSessionSecretImport[] = [];
 
   for (const [targetIndex, rawTarget] of document.targets.entries()) {
-    let target: PersistedConnectionTarget;
+    let target: LegacyPersistedConnectionTarget;
     try {
       target = decodeLegacyTarget(rawTarget);
     } catch {

@@ -10,6 +10,10 @@ const releaseWorkflow = NodeFS.readFileSync(
   NodePath.join(repoRoot, ".github", "workflows", "release.yml"),
   "utf8",
 );
+const ciWorkflow = NodeFS.readFileSync(
+  NodePath.join(repoRoot, ".github", "workflows", "ci.yml"),
+  "utf8",
+);
 const releaseDocumentation = NodeFS.readFileSync(
   NodePath.join(repoRoot, "docs", "operations", "release.md"),
   "utf8",
@@ -121,5 +125,12 @@ it("builds the stable manifest with a runner-generated UTC publication timestamp
   assert.match(
     releaseWorkflow,
     /--pub-date "\$\{\{ steps\.release_timestamp\.outputs\.pub_date \}\}"/,
+  );
+});
+
+it("pins Rust before scanning the optimized release artifacts", () => {
+  assert.match(
+    ciWorkflow,
+    /release_smoke:[\s\S]*dtolnay\/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b[\s\S]*Swatinem\/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4[\s\S]*node scripts\/release-smoke\.ts/,
   );
 });

@@ -23,7 +23,6 @@
   environment caches, and client state used by browser and desktop clients.
 - `/packages/shared`: cross-runtime TypeScript utilities exposed through
   explicit package subpaths.
-- `/infra/relay`: BiBCode Connect relay deployment package.
 - `/oxlint-plugin-bibcode`: repository-specific Oxlint rules.
 - `/tools/updater-verifier`: Rust tool used to verify signed updater artifacts.
 - `/third_party/portable-pty`: vendored Rust PTY crate included in the Cargo

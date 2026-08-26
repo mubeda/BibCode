@@ -38,8 +38,6 @@ runtime or TypeScript server.
   UI smoke matrix for the same four supported native targets.
 - `.github/workflows/release.yml` runs the stable/nightly release pipeline. See
   the [Release Checklist](./release.md).
-- `.github/workflows/deploy-relay.yml` deploys the BiBCode Connect relay from
-  `main` only when the required Cloudflare repository configuration exists.
 - `.github/workflows/issue-labels.yml`, `pr-size.yml`, and `pr-vouch.yml` enforce
   repository-maintenance policy independently of the application quality
   gates.

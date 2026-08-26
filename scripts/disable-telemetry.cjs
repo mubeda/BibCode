@@ -2,7 +2,6 @@
 
 const optOuts = {
   ASTRO_TELEMETRY_DISABLED: "1",
-  ALCHEMY_TELEMETRY_DISABLED: "1",
   DO_NOT_TRACK: "1",
 };
 const protectedKeys = new Set(Object.keys(optOuts));

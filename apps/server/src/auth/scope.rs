@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::model::{
-    SCOPE_ACCESS_READ, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ, SCOPE_RELAY_WRITE,
-    SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
+    SCOPE_ACCESS_READ, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ, SCOPE_REVIEW_WRITE,
+    SCOPE_TERMINAL_OPERATE,
 };
 
 pub(crate) const ACTIVITY_READ_SCOPE: &str = SCOPE_ORCHESTRATION_READ;
@@ -110,7 +110,6 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeTerminalEvents"
         | "subscribeTerminalMetadata" => Some(SCOPE_TERMINAL_OPERATE),
         "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
-        "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
         _ => None,
     }
