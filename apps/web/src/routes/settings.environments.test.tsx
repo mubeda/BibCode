@@ -15,12 +15,14 @@ describe("environment settings list", () => {
           alias: null,
           hidden: true,
           descriptor: { label: "Hidden host" },
+          bindings: [],
         },
         {
           environmentId: VISIBLE,
           alias: "Build box",
           hidden: false,
           descriptor: { label: "build.example.test" },
+          bindings: [],
         },
       ]),
     ).toEqual([
@@ -29,12 +31,14 @@ describe("environment settings list", () => {
         label: "Build box",
         canonicalLabel: "build.example.test",
         hidden: false,
+        primary: false,
       },
       {
         environmentId: HIDDEN,
         label: "Hidden host",
         canonicalLabel: "Hidden host",
         hidden: true,
+        primary: false,
       },
     ]);
   });

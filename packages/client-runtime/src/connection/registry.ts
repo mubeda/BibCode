@@ -147,6 +147,7 @@ export class EnvironmentRegistry extends Context.Service<
       | ConnectionAttemptError
       | PlatformEnvironmentRemovalError
     >;
+    readonly disconnect: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly acceptStorageIdentity: (
       environmentId: EnvironmentId,
@@ -1457,6 +1458,12 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     },
   );
 
+  const disconnect = (environmentId: EnvironmentId) =>
+    acquireSupervisor(environmentId).pipe(
+      Effect.flatMap((supervisor) => supervisor.disconnect),
+      Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
+      Effect.withSpan("EnvironmentRegistry.disconnect"),
+    );
   const retryNow = (environmentId: EnvironmentId) =>
     acquireSupervisor(environmentId).pipe(
       Effect.flatMap((supervisor) => supervisor.retryNow),
@@ -1559,6 +1566,7 @@ export const make = Effect.fn("EnvironmentRegistry.make")(function* (
     forget,
     remove,
     removeRelayEnvironments,
+    disconnect,
     retryNow,
     acceptStorageIdentity,
     state,

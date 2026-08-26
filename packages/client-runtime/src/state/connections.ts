@@ -114,13 +114,31 @@ export function createEnvironmentCatalogAtoms<R, E>(
         Effect.flatMap((registry) => registry.register(target)),
       ),
   });
-  const remove = createRuntimeCommand(runtime, {
-    label: "environment-catalog:remove",
+  const hide = createRuntimeCommand(runtime, {
+    label: "environment-catalog:hide",
     scheduler: commandScheduler,
     concurrency: serial,
     execute: (environmentId: EnvironmentIdType) =>
       EnvironmentRegistry.EnvironmentRegistry.pipe(
-        Effect.flatMap((registry) => registry.remove(environmentId)),
+        Effect.flatMap((registry) => registry.hide(environmentId)),
+      ),
+  });
+  const restore = createRuntimeCommand(runtime, {
+    label: "environment-catalog:restore",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (environmentId: EnvironmentIdType) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.restore(environmentId)),
+      ),
+  });
+  const forget = createRuntimeCommand(runtime, {
+    label: "environment-catalog:forget",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (environmentId: EnvironmentIdType) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.forget(environmentId)),
       ),
   });
   const removeRelayEnvironments = createRuntimeCommand(runtime, {
@@ -130,6 +148,15 @@ export function createEnvironmentCatalogAtoms<R, E>(
     execute: (_input: void) =>
       EnvironmentRegistry.EnvironmentRegistry.pipe(
         Effect.flatMap((registry) => registry.removeRelayEnvironments()),
+      ),
+  });
+  const disconnect = createRuntimeCommand(runtime, {
+    label: "environment-catalog:disconnect",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (environmentId: EnvironmentIdType) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.disconnect(environmentId)),
       ),
   });
   const retryNow = createRuntimeCommand(runtime, {
@@ -161,8 +188,13 @@ export function createEnvironmentCatalogAtoms<R, E>(
     stateAtom,
     updateEnvironment,
     register,
-    remove,
+    hide,
+    restore,
+    forget,
+    /** Compatibility alias for call sites that still use the former command name. */
+    remove: forget,
     removeRelayEnvironments,
+    disconnect,
     retryNow,
     acceptStorageIdentity,
   };

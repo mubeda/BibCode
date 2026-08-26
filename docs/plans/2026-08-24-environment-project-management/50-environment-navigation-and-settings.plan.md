@@ -547,11 +547,11 @@ Effect schema suggestions only).
 - Modify: `packages/client-runtime/src/connection/registry.ts`, test
 - Modify: `apps/web/src/connection/storage.ts`, test
 
-- [ ] **Step 1: Write the complete action matrix as tests**
+- [x] **Step 1: Write the complete action matrix as tests**
 
 Cover Disconnect, Hide/restore, Forget, online optional uninstall, online optional purge, stale removal plan, partial remote failure, offline force removal, primary environment, WSL stopped/setup required, and typed alias mismatch. Assert remote action options are unavailable offline and never queued.
 
-- [ ] **Step 2: Implement reversible Hide**
+- [x] **Step 2: Implement reversible Hide**
 
 Explain that routes, credentials, cache, and settings remain. Hide updates client metadata only and immediately offers Undo. Hidden environments appear in Settings -> Environments -> Hidden and normal search excludes them.
 
@@ -563,7 +563,7 @@ The required effect is `Remove from this client`. Independently offer unchecked 
 
 Require the current environment alias, show verified data root/storage identity and project/worktree/process counts, reject stale identity/plan versions, close admission, drain/reap, execute server deletion, verify outcome, then clear local state. A failed remote step retains catalog metadata and a resumable outcome record.
 
-- [ ] **Step 5: Implement explicit offline force removal**
+- [x] **Step 5: Implement explicit offline force removal**
 
 Warn that the server may keep running; remote projects/worktrees/data remain; other clients remain paired; re-adding requires pairing; and manual host cleanup may be required. Require the alias plus an explicit Force remove checkbox. Then cancel local supervisors/operations and clear secrets, cache, UI state, routes/bindings, and environment metadata in Plan 20 order. Record remote outcome as `unknown`, not success.
 
@@ -571,13 +571,35 @@ Warn that the server may keep running; remote projects/worktrees/data remain; ot
 
 Uninstall removes service/binary, preserves data by default, and asks whether to Forget locally after verified success. It never implies purge. WSL menus expose Stop Server and Windows WSL management but never distro unregister/delete.
 
-- [ ] **Step 7: Run removal/storage tests and commit**
+- [x] **Step 7: Run removal/storage tests and commit**
 
 ```sh
 vp test apps/web/src/components/environments/EnvironmentRemovalWorkspace.test.tsx apps/web/src/components/environments/environmentRemovalModel.test.ts apps/web/src/components/sidebar/EnvironmentRow.test.tsx apps/web/src/connection/storage.test.ts packages/client-runtime/src/connection/registry.test.ts
 git add apps/web/src/components/environments/EnvironmentRemovalWorkspace.tsx apps/web/src/components/environments/EnvironmentRemovalWorkspace.test.tsx apps/web/src/components/environments/environmentRemovalModel.ts apps/web/src/components/environments/environmentRemovalModel.test.ts apps/web/src/components/sidebar/EnvironmentRow.tsx apps/web/src/components/sidebar/EnvironmentRow.test.tsx apps/web/src/routes/settings.environments.tsx apps/web/src/connection/storage.ts apps/web/src/connection/storage.test.ts packages/client-runtime/src/connection/registry.ts packages/client-runtime/src/connection/registry.test.ts
 git commit -m "feat(environments): make removal consequences explicit"
 ```
+
+Implementation evidence (client-side portion): the environment registry now
+exposes separate disconnect, hide, restore, and forget commands. Hide changes
+only client presentation metadata and both the tree and Settings offer an
+immediate Undo. A dedicated center removal workspace presents the required
+local removal effect, keep-data recommendation, independently unchecked
+uninstall and purge choices, verified-plan identity/count fields, and the full
+offline force-removal warning with exact alias plus explicit confirmation.
+The pure execution model rejects stale plans and identity mismatches, never
+invokes or queues a remote action while offline, records the remote outcome as
+unknown, and retains the catalog after a partial remote failure.
+
+Remote uninstall/purge remains deliberately disabled because the current
+desktop host-authority surface implements install but has no versioned
+environment-removal-plan or purge adapter. Plan 70 Task 5 owns that service-safe
+backend. Steps 3, 4, and 6 stay open until that adapter supplies fresh plans,
+drain/reap/verification, resumable failure receipts, data-preserving uninstall,
+and explicit purge. No UI path fabricates remote success in the meantime.
+The focused environment, removal-route, settings, registry, state-command, and
+storage suites passed 149 tests; web typecheck passed with existing Effect
+schema suggestions only, and `vp check` passed all 1,975 formatting and 1,403
+lint targets.
 
 ### Task 9: Validate visuals, accessibility, scale, and update living documentation
 

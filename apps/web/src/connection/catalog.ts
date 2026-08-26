@@ -250,8 +250,10 @@ export async function reconcileForgottenEnvironmentClientCleanup(
 }
 
 const catalog = createEnvironmentCatalogAtoms(connectionAtomRuntime);
+const forget = withForgottenEnvironmentClientCleanup(catalog.forget);
 
 export const environmentCatalog = {
   ...catalog,
-  remove: withForgottenEnvironmentClientCleanup(catalog.remove),
+  forget,
+  remove: forget,
 };

@@ -29,6 +29,7 @@ import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$e
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatEnvironmentsEnvironmentIdRouteImport } from './routes/_chat.environments.$environmentId'
 import { Route as ChatEnvironmentsAddRouteImport } from './routes/_chat.environments.add'
+import { Route as ChatEnvironmentsEnvironmentIdRemoveRouteImport } from './routes/_chat.environments.$environmentId_.remove'
 
 const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
@@ -131,6 +132,12 @@ const ChatEnvironmentsAddRoute = ChatEnvironmentsAddRouteImport.update({
   path: '/environments/add',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatEnvironmentsEnvironmentIdRemoveRoute =
+  ChatEnvironmentsEnvironmentIdRemoveRouteImport.update({
+    id: '/environments/$environmentId_/remove',
+    path: '/environments/$environmentId/remove',
+    getParentRoute: () => ChatRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
@@ -152,6 +159,7 @@ export interface FileRoutesByFullPath {
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/environments/$environmentId': typeof ChatEnvironmentsEnvironmentIdRoute
   '/environments/add': typeof ChatEnvironmentsAddRoute
+  '/environments/$environmentId/remove': typeof ChatEnvironmentsEnvironmentIdRemoveRoute
 }
 export interface FileRoutesByTo {
   '/pair': typeof PairRoute
@@ -173,6 +181,7 @@ export interface FileRoutesByTo {
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/environments/$environmentId': typeof ChatEnvironmentsEnvironmentIdRoute
   '/environments/add': typeof ChatEnvironmentsAddRoute
+  '/environments/$environmentId/remove': typeof ChatEnvironmentsEnvironmentIdRemoveRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -196,6 +205,7 @@ export interface FileRoutesById {
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
   '/_chat/environments/$environmentId': typeof ChatEnvironmentsEnvironmentIdRoute
   '/_chat/environments/add': typeof ChatEnvironmentsAddRoute
+  '/_chat/environments/$environmentId_/remove': typeof ChatEnvironmentsEnvironmentIdRemoveRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -219,6 +229,7 @@ export interface FileRouteTypes {
     | '/draft/$draftId'
     | '/environments/$environmentId'
     | '/environments/add'
+    | '/environments/$environmentId/remove'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/pair'
@@ -240,6 +251,7 @@ export interface FileRouteTypes {
     | '/draft/$draftId'
     | '/environments/$environmentId'
     | '/environments/add'
+    | '/environments/$environmentId/remove'
   id:
     | '__root__'
     | '/_chat'
@@ -262,6 +274,7 @@ export interface FileRouteTypes {
     | '/_chat/draft/$draftId'
     | '/_chat/environments/$environmentId'
     | '/_chat/environments/add'
+    | '/_chat/environments/$environmentId_/remove'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -412,6 +425,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatEnvironmentsAddRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/environments/$environmentId_/remove': {
+      id: '/_chat/environments/$environmentId_/remove'
+      path: '/environments/$environmentId/remove'
+      fullPath: '/environments/$environmentId/remove'
+      preLoaderRoute: typeof ChatEnvironmentsEnvironmentIdRemoveRouteImport
+      parentRoute: typeof ChatRoute
+    }
   }
 }
 
@@ -421,6 +441,7 @@ interface ChatRouteChildren {
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
   ChatEnvironmentsEnvironmentIdRoute: typeof ChatEnvironmentsEnvironmentIdRoute
   ChatEnvironmentsAddRoute: typeof ChatEnvironmentsAddRoute
+  ChatEnvironmentsEnvironmentIdRemoveRoute: typeof ChatEnvironmentsEnvironmentIdRemoveRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
@@ -429,6 +450,8 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
   ChatEnvironmentsEnvironmentIdRoute: ChatEnvironmentsEnvironmentIdRoute,
   ChatEnvironmentsAddRoute: ChatEnvironmentsAddRoute,
+  ChatEnvironmentsEnvironmentIdRemoveRoute:
+    ChatEnvironmentsEnvironmentIdRemoveRoute,
 }
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)

@@ -880,6 +880,38 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("disconnects without forgetting client or remote metadata", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([], [], [], {
+        initialEnvironments: [NORMALIZED_ENVIRONMENT],
+        migrationCompleted: true,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          NORMALIZED_ENVIRONMENT_ID,
+          (state) => state.phase === "connected",
+        );
+
+        yield* registry.disconnect(NORMALIZED_ENVIRONMENT_ID);
+        yield* awaitConnectionState(
+          registry,
+          NORMALIZED_ENVIRONMENT_ID,
+          (state) => state.phase === "available",
+        );
+
+        expect((yield* Ref.get(harness.storedEnvironments)).has(NORMALIZED_ENVIRONMENT_ID)).toBe(
+          true,
+        );
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(1);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect(
     "removes one route secret while retaining the environment and its remaining route",
     () =>

@@ -17,6 +17,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
 import { useOpenAddProjectCommandPalette } from "../commandPaletteContext";
+import { environmentCatalog } from "../connection/catalog";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import {
   createEnvironmentTreeProjector,
@@ -440,6 +441,8 @@ export default function Sidebar() {
   const retryEnvironment = useAtomCommand(environmentAvailabilityCommands.retry, {
     reportFailure: false,
   });
+  const hideEnvironment = useAtomCommand(environmentCatalog.hide, { reportFailure: false });
+  const restoreEnvironment = useAtomCommand(environmentCatalog.restore, { reportFailure: false });
   const pinnedThreadKeys = useSidebarWorkspaceMetaStore((state) => state.pinnedThreadKeys);
   const unreadThreadKeys = useSidebarWorkspaceMetaStore((state) => state.unreadThreadKeys);
   const togglePinnedThreadKey = useSidebarWorkspaceMetaStore((state) => state.togglePinned);
@@ -693,15 +696,55 @@ export default function Sidebar() {
         if (!api) return;
         const position = { x: request.clientX, y: request.clientY };
         if (row.kind === "environment") {
+          const primary = row.environmentId === primaryEnvironmentId;
           const clicked = await api.contextMenu.show(
             [
               { id: "open", label: "Open overview" },
               ...(row.status === "online" ? [] : [{ id: "retry", label: "Retry connection" }]),
               { id: "settings", label: "Environment settings" },
+              ...(primary
+                ? []
+                : [
+                    { id: "hide", label: "Hide from navigation" },
+                    { id: "remove", label: "Fully remove…" },
+                  ]),
             ],
             position,
           );
           if (clicked === "retry") void retryEnvironment(row.environmentId);
+          if (clicked === "hide") {
+            const result = await hideEnvironment(row.environmentId);
+            if (result._tag === "Failure") {
+              const error = squashAtomCommandFailure(result);
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Could not hide environment",
+                  description:
+                    error instanceof Error ? error.message : "The client metadata update failed.",
+                }),
+              );
+            } else {
+              toastManager.add(
+                stackedThreadToast({
+                  type: "success",
+                  title: `${row.label} hidden`,
+                  description: "Routes, credentials, cache, and settings remain.",
+                  actionProps: {
+                    children: "Undo",
+                    onClick: () => void restoreEnvironment(row.environmentId),
+                  },
+                }),
+              );
+            }
+          }
+          if (clicked === "remove") {
+            void navigate({
+              to: "/environments/$environmentId/remove",
+              params: { environmentId: row.environmentId },
+              search: { tab: "overview" },
+            });
+          }
           if (clicked === "open" || clicked === "settings") {
             void navigate({
               to: "/environments/$environmentId",
@@ -772,13 +815,16 @@ export default function Sidebar() {
       confirmAndDeleteThread,
       handleNewThread,
       handleTreeSelect,
+      hideEnvironment,
       markThreadRowRead,
       markThreadRowUnread,
       navigate,
       openCreateWorktreeDialog,
       pinnedThreadKeys,
+      primaryEnvironmentId,
       requestWorktreeRemoval,
       retryEnvironment,
+      restoreEnvironment,
       sidebarProjectByKey,
       togglePinnedThreadKey,
       unreadThreadKeys,
