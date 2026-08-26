@@ -592,7 +592,7 @@ async fn hides_the_desktop_shutdown_route_outside_desktop_mode() {
 }
 
 #[tokio::test]
-async fn removed_connect_mcp_http_routes_are_not_mounted() {
+async fn removed_mcp_http_routes_are_not_mounted() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = ServerRuntime::start(test_config(&temp))
         .await
