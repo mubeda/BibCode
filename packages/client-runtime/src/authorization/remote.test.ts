@@ -243,13 +243,15 @@ describe("remote environment authorization", () => {
       const fetch = recordedFetch(
         Response.json(
           {
-            environmentId: "environment-remote",
+            environmentId: "00000000-0000-4000-8000-000000000002",
             label: "Remote environment",
             platform: {
               os: "linux",
               arch: "x64",
             },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000012",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: {
               repositoryIdentity: true,
             },
@@ -290,7 +292,7 @@ describe("remote environment authorization", () => {
         httpBaseUrl: "https://remote.example.com/",
       }).pipe(provideRemoteHttp(fetch.fetchFn));
       expect(environment).toMatchObject({
-        environmentId: "environment-remote",
+        environmentId: "00000000-0000-4000-8000-000000000002",
         label: "Remote environment",
       });
 

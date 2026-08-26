@@ -11,6 +11,8 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ManagedRelay from "./managedRelay.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 
+const TEST_ENVIRONMENT_ID = EnvironmentId.make("00000000-0000-4000-8000-000000000001");
+
 function managedRelayTestLayer(
   fetchFn: typeof globalThis.fetch,
   relayUrl = "https://relay.example.test",
@@ -63,7 +65,7 @@ describe("ManagedRelayClient", () => {
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "env-1",
+          environmentId: TEST_ENVIRONMENT_ID,
           endpoint: {
             httpBaseUrl: "https://desktop.example.test/",
             wsBaseUrl: "wss://desktop.example.test/ws",
@@ -72,10 +74,12 @@ describe("ManagedRelayClient", () => {
           status: "online",
           checkedAt: "2026-06-05T20:00:00.000Z",
           descriptor: {
-            environmentId: "env-1",
+            environmentId: TEST_ENVIRONMENT_ID,
             label: "Desktop",
             platform: { os: "darwin", arch: "arm64" },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000011",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: { repositoryIdentity: true },
           },
         }),
@@ -87,7 +91,7 @@ describe("ManagedRelayClient", () => {
       yield* relayClient.getEnvironmentStatus({
         clerkToken: clerkToken("user-1", "session-1"),
         scopes: [RelayEnvironmentStatusScope],
-        environmentId: EnvironmentId.make("env-1"),
+        environmentId: TEST_ENVIRONMENT_ID,
       });
 
       expect(spanNames).toEqual(
@@ -149,7 +153,7 @@ describe("ManagedRelayClient", () => {
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "env-1",
+          environmentId: TEST_ENVIRONMENT_ID,
           endpoint: {
             httpBaseUrl: "https://desktop.example.test/",
             wsBaseUrl: "wss://desktop.example.test/ws",
@@ -158,10 +162,12 @@ describe("ManagedRelayClient", () => {
           status: "online",
           checkedAt: "2026-05-25T00:01:00.000Z",
           descriptor: {
-            environmentId: "env-1",
+            environmentId: TEST_ENVIRONMENT_ID,
             label: "Desktop",
             platform: { os: "darwin", arch: "arm64" },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000011",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: { repositoryIdentity: true },
           },
         }),
@@ -173,7 +179,7 @@ describe("ManagedRelayClient", () => {
       const statusInput = {
         clerkToken: clerkToken("user-1", "session-1"),
         scopes: [RelayEnvironmentStatusScope],
-        environmentId: EnvironmentId.make("env-1"),
+        environmentId: TEST_ENVIRONMENT_ID,
       } as const;
 
       yield* relayClient.getEnvironmentStatus(statusInput);
@@ -219,7 +225,7 @@ describe("ManagedRelayClient", () => {
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "env-1",
+          environmentId: TEST_ENVIRONMENT_ID,
           endpoint: {
             httpBaseUrl: "https://desktop.example.test/",
             wsBaseUrl: "wss://desktop.example.test/ws",
@@ -228,10 +234,12 @@ describe("ManagedRelayClient", () => {
           status: "online",
           checkedAt: "2026-06-05T20:00:00.000Z",
           descriptor: {
-            environmentId: "env-1",
+            environmentId: TEST_ENVIRONMENT_ID,
             label: "Desktop",
             platform: { os: "darwin", arch: "arm64" },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000011",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: { repositoryIdentity: true },
           },
         }),
@@ -241,7 +249,7 @@ describe("ManagedRelayClient", () => {
       ({
         clerkToken: token,
         scopes: [RelayEnvironmentStatusScope],
-        environmentId: EnvironmentId.make("env-1"),
+        environmentId: TEST_ENVIRONMENT_ID,
       }) as const;
 
     return Effect.gen(function* () {
@@ -318,7 +326,7 @@ describe("ManagedRelayClient", () => {
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "env-1",
+          environmentId: TEST_ENVIRONMENT_ID,
           endpoint: {
             httpBaseUrl: "https://desktop.example.test/",
             wsBaseUrl: "wss://desktop.example.test/ws",
@@ -327,10 +335,12 @@ describe("ManagedRelayClient", () => {
           status: "online",
           checkedAt: "2026-06-05T20:00:00.000Z",
           descriptor: {
-            environmentId: "env-1",
+            environmentId: TEST_ENVIRONMENT_ID,
             label: "Desktop",
             platform: { os: "darwin", arch: "arm64" },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000011",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: { repositoryIdentity: true },
           },
         }),
@@ -342,7 +352,7 @@ describe("ManagedRelayClient", () => {
       const result = yield* relayClient.getEnvironmentStatus({
         clerkToken: clerkToken("user-1", "session-1"),
         scopes: [RelayEnvironmentStatusScope],
-        environmentId: EnvironmentId.make("env-1"),
+        environmentId: TEST_ENVIRONMENT_ID,
       });
 
       expect(result.status).toBe("online");
@@ -381,7 +391,7 @@ describe("ManagedRelayClient", () => {
       }
       return Promise.resolve(
         Response.json({
-          environmentId: "env-1",
+          environmentId: TEST_ENVIRONMENT_ID,
           endpoint: {
             httpBaseUrl: "https://desktop.example.test/",
             wsBaseUrl: "wss://desktop.example.test/ws",
@@ -390,10 +400,12 @@ describe("ManagedRelayClient", () => {
           status: "online",
           checkedAt: "2026-06-05T20:00:00.000Z",
           descriptor: {
-            environmentId: "env-1",
+            environmentId: TEST_ENVIRONMENT_ID,
             label: "Desktop",
             platform: { os: "darwin", arch: "arm64" },
             serverVersion: "0.0.0-test",
+            storageInstanceId: "00000000-0000-4000-8000-000000000011",
+            protocol: { minimum: 1, maximum: 1 },
             capabilities: { repositoryIdentity: true },
           },
         }),
@@ -405,7 +417,7 @@ describe("ManagedRelayClient", () => {
       yield* relayClient.getEnvironmentStatus({
         clerkToken: "not-a-jwt",
         scopes: [RelayEnvironmentStatusScope],
-        environmentId: EnvironmentId.make("env-1"),
+        environmentId: TEST_ENVIRONMENT_ID,
       });
 
       expect(persistedTokens).toEqual([]);

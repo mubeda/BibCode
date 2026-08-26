@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 80,
     "javascriptLedger": 79,
-    "rustRegistry": 78,
+    "rustRegistry": 88,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -1345,6 +1345,17 @@
       "status": "current"
     },
     {
+      "key": "rust:workspace:bytes",
+      "name": "bytes",
+      "current": "1.12.1",
+      "target": "1.12.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/bytes",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:block2",
       "name": "block2",
       "current": "0.6",
@@ -1521,6 +1532,39 @@
       "status": "current"
     },
     {
+      "key": "rust:workspace:http-body-util",
+      "name": "http-body-util",
+      "current": "0.1.4",
+      "target": "0.1.4",
+      "channel": "stable",
+      "source": "https://crates.io/crates/http-body-util",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:hyper",
+      "name": "hyper",
+      "current": "1.10.1",
+      "target": "1.10.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/hyper",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:hyper-util",
+      "name": "hyper-util",
+      "current": "0.1.20",
+      "target": "0.1.20",
+      "channel": "stable",
+      "source": "https://crates.io/crates/hyper-util",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:junction",
       "name": "junction",
       "current": "2.0.0",
@@ -1531,6 +1575,17 @@
       "platforms": ["windows"],
       "status": "green",
       "notes": "Windows junction lifecycle and bounded error regression coverage added; the Windows Server 2025 native CI leg performs the authoritative platform execution."
+    },
+    {
+      "key": "rust:workspace:keyring",
+      "name": "keyring",
+      "current": "=4.1.6",
+      "target": "4.1.6",
+      "channel": "stable",
+      "source": "https://crates.io/crates/keyring",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
     },
     {
       "key": "rust:workspace:libc",
@@ -1644,6 +1699,17 @@
       "status": "current"
     },
     {
+      "key": "rust:workspace:rcgen",
+      "name": "rcgen",
+      "current": "0.14.9",
+      "target": "0.14.9",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rcgen",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:reqwest",
       "name": "reqwest",
       "current": "0.13.4",
@@ -1664,6 +1730,28 @@
       "cohort": "rust-storage-protocol",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "rust:workspace:rustls",
+      "name": "rustls",
+      "current": "0.23.42",
+      "target": "0.23.42",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rustls",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:rustls-pemfile",
+      "name": "rustls-pemfile",
+      "current": "2.2.0",
+      "target": "2.2.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rustls-pemfile",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
     },
     {
       "key": "rust:workspace:security-framework",
@@ -1876,6 +1964,17 @@
       "status": "green"
     },
     {
+      "key": "rust:workspace:tokio-rustls",
+      "name": "tokio-rustls",
+      "current": "0.26.4",
+      "target": "0.26.4",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio-rustls",
+      "cohort": "remote-environment-security",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
       "key": "rust:workspace:tokio-tungstenite",
       "name": "tokio-tungstenite",
       "current": "0.30.0",
@@ -1994,6 +2093,17 @@
       "channel": "stable",
       "source": "https://crates.io/crates/windows-sys",
       "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:x509-parser",
+      "name": "x509-parser",
+      "current": "0.18.1",
+      "target": "0.18.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/x509-parser",
+      "cohort": "remote-environment-security",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"
     },

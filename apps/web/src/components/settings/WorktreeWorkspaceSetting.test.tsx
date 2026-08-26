@@ -233,7 +233,27 @@ function button(label: string): Props {
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  Object.defineProperty(window, "desktopBridge", { configurable: true, value: {} });
+  Object.defineProperty(window, "desktopBridge", {
+    configurable: true,
+    value: {
+      getWslState: async () => ({
+        enabled: false,
+        distro: null,
+        legacyAcceptedDistro: null,
+        available: false,
+        wslOnly: false,
+        distros: [],
+        discovery: {
+          generation: 0,
+          observedAt: "1970-01-01T00:00:00.000Z",
+          health: "missing",
+          detail: "WSL discovery is unavailable.",
+          distros: [],
+        },
+        preflightError: null,
+      }),
+    },
+  });
   harness.reset();
 });
 
