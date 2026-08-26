@@ -1,3 +1,11 @@
+use crate::environment_removal::{
+    EnvironmentRemovalAction, EnvironmentRemovalExecuteInput, EnvironmentRemovalPlan,
+    EnvironmentRemovalPlanInput, EnvironmentRemovalResult, EnvironmentRemovalTarget,
+    managed_install_root, parse_server_plan, parse_server_purge_result,
+    parse_service_uninstall_result, plan_arguments, purge_arguments, remote_binary_command,
+    remote_remove_install_command, remote_test_path_command, service_uninstall_arguments,
+    validate_install_root_disjoint,
+};
 use crate::remote_host::{
     linux::LinuxRemoteHostAdapter,
     macos::MacOsRemoteHostAdapter,
@@ -78,6 +86,7 @@ const SSH_TRUST_PROBE_MARKER: &str = "bibcode-ssh-trust-ok";
 const SSH_SETUP_CONSENT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const SSH_SETUP_REQUIRED_SPACE_MULTIPLIER: u64 = 3;
 const SSH_SETUP_DESCRIPTOR_LIMIT: usize = 256 * 1024;
+const SSH_REMOVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ASKPASS_POSIX_SCRIPT: &str = r#"#!/bin/sh
 if [ "${BIBCODE_SSH_AUTH_SECRET+x}" = "x" ]; then
   printf "%s\n" "$BIBCODE_SSH_AUTH_SECRET"
@@ -444,6 +453,18 @@ struct PreparedSshSetup {
     paths: SshInstallPaths,
     expires_at: OffsetDateTime,
     operation_fence: RemoteOperationFence,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSshRemoval {
+    target: SshEnvironmentTarget,
+    host_key_fingerprint: String,
+    host: RemoteHostProbe,
+    binary_path: String,
+    install_root: Option<String>,
+    data_root: String,
+    service_mode: RemoteServiceMode,
+    port: u16,
 }
 
 #[derive(Default)]
@@ -1401,6 +1422,201 @@ impl SshEnvironmentManager {
         })
     }
 
+    pub(crate) async fn plan_environment_removal<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        input: &EnvironmentRemovalPlanInput,
+    ) -> Result<EnvironmentRemovalPlan, String> {
+        input.validate()?;
+        let EnvironmentRemovalTarget::Ssh {
+            target,
+            expected_host_key_fingerprint,
+        } = &input.target
+        else {
+            return Err("An SSH removal plan requires an SSH target.".to_string());
+        };
+        let target = normalize_ssh_environment_target(target.clone())?;
+        let key = target_connection_key(&target);
+        let fence = self.operation_fence(&key, None, None, None)?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Provisioning)
+            .await?;
+        let trust = self
+            .probe_with_expected(
+                app,
+                prompts,
+                target.clone(),
+                Some(expected_host_key_fingerprint),
+                &owner,
+            )
+            .await?;
+        let host = self
+            .inspect_remote_host(app, prompts, trust.clone(), &owner)
+            .await?;
+        let prepared = prepared_ssh_removal(target, trust.host_key_fingerprint, host, true)?;
+        let command = remote_binary_command(
+            &prepared.host,
+            &prepared.binary_path,
+            &plan_arguments(&prepared.data_root, &input.environment_name),
+            RemoteCommandPurpose::RemovalPlan,
+            SSH_REMOVAL_COMMAND_TIMEOUT,
+        )?;
+        let output = self
+            .execute_environment_removal_command(app, prompts, &prepared, &command, &owner)
+            .await?;
+        if !output.succeeded() {
+            return Err("The remote server rejected the environment removal plan.".to_string());
+        }
+        let plan = parse_server_plan(
+            &output.stdout,
+            input,
+            &prepared.data_root,
+            prepared.install_root.as_deref(),
+        )?;
+        if !owner.can_publish() {
+            return Err("The SSH removal plan was superseded before publication.".to_string());
+        }
+        Ok(plan)
+    }
+
+    pub(crate) async fn execute_environment_removal<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        input: &EnvironmentRemovalExecuteInput,
+    ) -> Result<EnvironmentRemovalResult, String> {
+        input.validate()?;
+        let EnvironmentRemovalTarget::Ssh {
+            target,
+            expected_host_key_fingerprint,
+        } = input.target()
+        else {
+            return Err("An SSH removal operation requires an SSH target.".to_string());
+        };
+        let target = normalize_ssh_environment_target(target.clone())?;
+        let key = target_connection_key(&target);
+        let fence = self.operation_fence(&key, None, None, None)?;
+        let owner = self
+            .begin_operation(&target, fence, RemoteOperationClass::Provisioning)
+            .await?;
+        let trust = self
+            .probe_with_expected(
+                app,
+                prompts,
+                target.clone(),
+                Some(expected_host_key_fingerprint),
+                &owner,
+            )
+            .await?;
+        let host = self
+            .inspect_remote_host(app, prompts, trust.clone(), &owner)
+            .await?;
+        let prepared = prepared_ssh_removal(target, trust.host_key_fingerprint, host, true)?;
+        let plan = input.plan();
+        if prepared.data_root != plan.data_root {
+            return Err("The remote data root changed after the removal plan.".to_string());
+        }
+        let install_root = prepared.install_root.as_ref().ok_or_else(|| {
+            "This server was installed by the host package manager; use its native uninstaller."
+                .to_string()
+        })?;
+        validate_install_root_disjoint(install_root, &prepared.data_root, prepared.host.os)?;
+        if self.close_setup_tunnel(&prepared.target).await != CleanupStatus::Completed {
+            return Err(
+                "The SSH tunnel could not be closed, so remote removal did not start.".to_string(),
+            );
+        }
+
+        if input.action() == EnvironmentRemovalAction::Purge {
+            let command = remote_binary_command(
+                &prepared.host,
+                &prepared.binary_path,
+                &purge_arguments(plan),
+                RemoteCommandPurpose::RemovalExecute,
+                SSH_REMOVAL_COMMAND_TIMEOUT,
+            )?;
+            let output = self
+                .execute_environment_removal_command(app, prompts, &prepared, &command, &owner)
+                .await?;
+            if !output.succeeded() {
+                return Err("The remote server rejected the approved data purge.".to_string());
+            }
+            parse_server_purge_result(&output.stdout, plan)?;
+        }
+
+        let uninstall = remote_binary_command(
+            &prepared.host,
+            &prepared.binary_path,
+            &service_uninstall_arguments(&prepared.data_root, prepared.service_mode, prepared.port),
+            RemoteCommandPurpose::RemovalExecute,
+            SSH_REMOVAL_COMMAND_TIMEOUT,
+        )?;
+        let output = self
+            .execute_environment_removal_command(app, prompts, &prepared, &uninstall, &owner)
+            .await?;
+        if !output.succeeded() {
+            return Err("The remote service uninstall failed; managed files were retained.".into());
+        }
+        parse_service_uninstall_result(&output.stdout, &prepared.data_root)?;
+
+        if let Some(command) = remote_test_path_command(
+            &prepared.host,
+            &prepared.data_root,
+            (input.action() == EnvironmentRemovalAction::Uninstall).then_some(true),
+            SSH_REMOVAL_COMMAND_TIMEOUT,
+        )? {
+            let output = self
+                .execute_environment_removal_command(app, prompts, &prepared, &command, &owner)
+                .await?;
+            if !output.succeeded() {
+                return Err("The remote data-root outcome could not be verified.".to_string());
+            }
+        }
+
+        let cleanup = remote_remove_install_command(
+            &prepared.host,
+            install_root,
+            &prepared.data_root,
+            input.action() == EnvironmentRemovalAction::Uninstall,
+            SSH_REMOVAL_COMMAND_TIMEOUT,
+        )?;
+        let output = self
+            .execute_environment_removal_command(app, prompts, &prepared, &cleanup, &owner)
+            .await?;
+        if !output.succeeded() {
+            return Err("The managed remote server files could not be removed.".to_string());
+        }
+        if let Some(command) = remote_test_path_command(
+            &prepared.host,
+            install_root,
+            None,
+            SSH_REMOVAL_COMMAND_TIMEOUT,
+        )? {
+            let output = self
+                .execute_environment_removal_command(app, prompts, &prepared, &command, &owner)
+                .await?;
+            if !output.succeeded() {
+                return Err("The managed remote server files remain after uninstall.".to_string());
+            }
+        }
+        if !owner.can_publish() {
+            return Err(
+                "The SSH removal operation was superseded before verification.".to_string(),
+            );
+        }
+        Ok(EnvironmentRemovalResult {
+            action: input.action(),
+            environment_id: plan.environment_id.clone(),
+            storage_id: plan.storage_id.clone(),
+            service_removed: true,
+            binary_removed: true,
+            data_removed: input.action() == EnvironmentRemovalAction::Purge,
+            data_root_preserved: input.action() == EnvironmentRemovalAction::Uninstall,
+            verified: true,
+        })
+    }
+
     fn next_setup_generation(&self) -> Result<u64, String> {
         let mut state = self
             .setup_state
@@ -1892,6 +2108,47 @@ impl SshEnvironmentManager {
                 let fingerprint = prepared.host_key_fingerprint.clone();
                 let command = command.clone();
                 let os = prepared.probe.os;
+                let operation_cancellation = operation_cancellation.clone();
+                async move {
+                    run_remote_command(
+                        &target,
+                        os,
+                        &command,
+                        &auth,
+                        askpass_launcher,
+                        &fingerprint,
+                        &operation_cancellation,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+    }
+
+    async fn execute_environment_removal_command<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        prepared: &PreparedSshRemoval,
+        command: &RemoteCommand,
+        owner: &RemoteOperationLease,
+    ) -> Result<RemoteCommandOutput, String> {
+        let key = target_connection_key(&prepared.target);
+        let askpass_launcher = self.askpass_launcher()?;
+        let operation_cancellation = owner.cancellation().clone();
+        self.run_with_ssh_auth(
+            app,
+            prompts,
+            &key,
+            &prepared.target,
+            owner.cancellation(),
+            |auth| {
+                let target = prepared.target.clone();
+                let askpass_launcher = askpass_launcher.clone();
+                let fingerprint = prepared.host_key_fingerprint.clone();
+                let command = command.clone();
+                let os = prepared.host.os;
                 let operation_cancellation = operation_cancellation.clone();
                 async move {
                     run_remote_command(
@@ -2503,6 +2760,51 @@ fn validate_managed_binary_path(host: &RemoteHostProbe, binary_path: &str) -> Re
                 .to_string(),
         )
     }
+}
+
+fn prepared_ssh_removal(
+    target: SshEnvironmentTarget,
+    host_key_fingerprint: String,
+    host: RemoteHostProbe,
+    require_running_control: bool,
+) -> Result<PreparedSshRemoval, String> {
+    let binary_path = host
+        .binary_path
+        .clone()
+        .ok_or_else(|| "BiBCode Server is not installed on the selected SSH host.".to_string())?;
+    validate_managed_binary_path(&host, &binary_path)?;
+    let data_root = host
+        .data_root
+        .clone()
+        .ok_or_else(|| "The SSH server did not report its exact data root.".to_string())?;
+    let service_mode = host
+        .service_mode
+        .ok_or_else(|| "The SSH server did not report its service mode.".to_string())?;
+    let port = host
+        .bind_port
+        .ok_or_else(|| "The SSH server did not report its loopback port.".to_string())?;
+    if require_running_control
+        && (host.service_state != RemoteServiceState::Running || !host.control_available)
+    {
+        return Err(
+            "Remote removal requires a running server and its protected local-control channel."
+                .to_string(),
+        );
+    }
+    let install_root = managed_install_root(&host, &binary_path);
+    if let Some(install_root) = &install_root {
+        validate_install_root_disjoint(install_root, &data_root, host.os)?;
+    }
+    Ok(PreparedSshRemoval {
+        target,
+        host_key_fingerprint,
+        host,
+        binary_path,
+        install_root,
+        data_root,
+        service_mode,
+        port,
+    })
 }
 
 fn ssh_install_paths(

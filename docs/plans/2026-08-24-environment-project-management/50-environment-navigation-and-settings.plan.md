@@ -555,11 +555,11 @@ Cover Disconnect, Hide/restore, Forget, online optional uninstall, online option
 
 Explain that routes, credentials, cache, and settings remain. Hide updates client metadata only and immediately offers Undo. Hidden environments appear in Settings -> Environments -> Hidden and normal search excludes them.
 
-- [ ] **Step 3: Build the online full-removal decision model**
+- [x] **Step 3: Build the online full-removal decision model**
 
 The required effect is `Remove from this client`. Independently offer unchecked `Uninstall BiBCode Server` and unchecked destructive `Delete remote data, projects, and worktrees`. Keep data is visibly recommended. Fetch a fresh versioned server removal plan and restate exact effects before execution.
 
-- [ ] **Step 4: Guard purge separately**
+- [x] **Step 4: Guard purge separately**
 
 Require the current environment alias, show verified data root/storage identity and project/worktree/process counts, reject stale identity/plan versions, close admission, drain/reap, execute server deletion, verify outcome, then clear local state. A failed remote step retains catalog metadata and a resumable outcome record.
 
@@ -567,7 +567,7 @@ Require the current environment alias, show verified data root/storage identity 
 
 Warn that the server may keep running; remote projects/worktrees/data remain; other clients remain paired; re-adding requires pairing; and manual host cleanup may be required. Require the alias plus an explicit Force remove checkbox. Then cancel local supervisors/operations and clear secrets, cache, UI state, routes/bindings, and environment metadata in Plan 20 order. Record remote outcome as `unknown`, not success.
 
-- [ ] **Step 6: Make remote uninstall optional and data-preserving**
+- [x] **Step 6: Make remote uninstall optional and data-preserving**
 
 Uninstall removes service/binary, preserves data by default, and asks whether to Forget locally after verified success. It never implies purge. WSL menus expose Stop Server and Windows WSL management but never distro unregister/delete.
 
@@ -590,16 +590,29 @@ The pure execution model rejects stale plans and identity mismatches, never
 invokes or queues a remote action while offline, records the remote outcome as
 unknown, and retains the catalog after a partial remote failure.
 
-Remote uninstall/purge remains deliberately disabled because the current
-desktop host-authority surface implements install but has no versioned
-environment-removal-plan or purge adapter. Plan 70 Task 5 owns that service-safe
-backend. Steps 3, 4, and 6 stay open until that adapter supplies fresh plans,
-drain/reap/verification, resumable failure receipts, data-preserving uninstall,
-and explicit purge. No UI path fabricates remote success in the meantime.
-The focused environment, removal-route, settings, registry, state-command, and
-storage suites passed 149 tests; web typecheck passed with existing Effect
-schema suggestions only, and `vp check` passed all 1,975 formatting and 1,403
-lint targets.
+Plan 70 Task 5 now supplies the missing host-authority adapter. The desktop
+bridge accepts only a Running WSL binding at its current discovery generation
+or the active SSH route with its saved SHA-256 host-key pin; Direct HTTPS has
+no host mutation channel. A fresh server plan binds the environment, storage,
+alias, exact data root, expiry, and current project/worktree/process counts.
+The UI permits preserve-data uninstall independently, but disables purge until
+the owned project, worktree, and process counts are zero and still relies on
+the server's close-admission/recheck/durable authorization before deletion.
+Exact typed confirmation crosses the typed bridge and every returned effect is
+identity-checked before local Forget begins. The native desktop retains at most
+64 unexpired plans and atomically consumes one only when the renderer echoes
+the exact issued target and plan; fabricated, modified, duplicate, or
+cross-host executions fail before mutation. Failure retains the catalog for a
+fresh-plan retry.
+WSL removes only BiBCode's managed portable root and never
+unregisters the distro. SSH removes only a fingerprint-pinned portable install;
+a natively packaged server is explicitly unsupported in this remote UI and
+must use its OS uninstaller so BiBCode cannot claim a partial removal.
+
+Final focused validation passed 219 contract, bridge, route, workspace,
+sidebar, registry, and storage tests plus all 399 desktop unit tests. Desktop
+Clippy passed with warnings denied; `cargo fmt --all --check`, `vp check`, the
+serial ten-target workspace typecheck, and the web production build passed.
 
 ### Task 9: Validate visuals, accessibility, scale, and update living documentation
 

@@ -33,6 +33,10 @@ use crate::context_menu::{
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
 use crate::data_safety;
+use crate::environment_removal::{
+    EnvironmentRemovalAction, EnvironmentRemovalExecuteInput, EnvironmentRemovalPlanInput,
+    EnvironmentRemovalPlanStore, EnvironmentRemovalResult, EnvironmentRemovalTarget,
+};
 use crate::secret_store::{
     DesktopSecretInput, DesktopSecretStore, SecretStoreError, SecretStoreIpcError,
 };
@@ -1046,6 +1050,7 @@ pub fn desktop_bridge_get_bridge_metadata(app: AppHandle<DesktopRuntime>) -> Val
             "connectionCatalog": true,
             "protectedConnectionCatalog": cfg!(target_os = "windows"),
             "sshProvisioning": true,
+            "environmentRemoval": true,
             "preview": crate::preview::host::is_supported(),
             "updater": app.updater().is_ok(),
             "menuEvents": true,
@@ -1803,6 +1808,108 @@ pub fn desktop_bridge_cancel_wsl_setup(
     let input = serde_json::from_value::<RemoteSetupCancelInput>(input)
         .map_err(|error| bridge_error("Could not decode the WSL setup cancellation", error))?;
     Ok(setup.cancel(&input))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_plan_environment_removal(
+    app: AppHandle<DesktopRuntime>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    setup: State<'_, WslSetupManager>,
+    plans: State<'_, EnvironmentRemovalPlanStore>,
+    input: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<EnvironmentRemovalPlanInput>(input).map_err(|error| {
+        bridge_error("Could not decode the environment removal plan input", error)
+    })?;
+    input.validate()?;
+    let plan = match &input.target {
+        EnvironmentRemovalTarget::Wsl { .. } => {
+            let discovery = app.state::<WslDiscoveryService>().snapshot();
+            setup.plan_environment_removal(&discovery, &input).await?
+        }
+        EnvironmentRemovalTarget::Ssh { .. } => {
+            ssh.plan_environment_removal(&app, &prompts, &input).await?
+        }
+    };
+    plans.issue(&plan)?;
+    serde_json::to_value(plan)
+        .map_err(|error| bridge_error("Could not encode the environment removal plan", error))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_execute_environment_removal(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    setup: State<'_, WslSetupManager>,
+    plans: State<'_, EnvironmentRemovalPlanStore>,
+    input: Value,
+) -> Result<Value, String> {
+    let input =
+        serde_json::from_value::<EnvironmentRemovalExecuteInput>(input).map_err(|error| {
+            bridge_error(
+                "Could not decode the environment removal execution input",
+                error,
+            )
+        })?;
+    plans.consume(&input)?;
+    let result = match input.target() {
+        EnvironmentRemovalTarget::Ssh { .. } => {
+            ssh.execute_environment_removal(&app, &prompts, &input)
+                .await?
+        }
+        EnvironmentRemovalTarget::Wsl {
+            distro,
+            discovery_generation,
+        } => {
+            let discovery = app.state::<WslDiscoveryService>().snapshot();
+            let prepared = setup
+                .prepare_environment_removal(&discovery, distro, *discovery_generation)
+                .await?;
+            let plan = input.plan();
+            let mut operation = backend
+                .begin_project_data_operation(&plan.environment_id)
+                .await?;
+            if operation.target().running_distro.as_deref() != Some(prepared.distro()) {
+                return Err(
+                    "The selected WSL runtime no longer matches the approved environment."
+                        .to_string(),
+                );
+            }
+            match input.action() {
+                EnvironmentRemovalAction::Uninstall => operation.stop_selected().await?,
+                EnvironmentRemovalAction::Purge => {
+                    operation.expect_selected_exit()?;
+                    setup.purge_environment_data(&prepared, plan).await?;
+                    operation.stop_selected().await?;
+                }
+            }
+            setup
+                .remove_managed_installation(
+                    &prepared,
+                    input.action() == EnvironmentRemovalAction::Uninstall,
+                )
+                .await?;
+            let discovery = app.state::<WslDiscoveryService>().inner().clone();
+            let _ = discovery
+                .refresh_and_emit(&app, "environment removal")
+                .await;
+            EnvironmentRemovalResult {
+                action: input.action(),
+                environment_id: plan.environment_id.clone(),
+                storage_id: plan.storage_id.clone(),
+                service_removed: true,
+                binary_removed: true,
+                data_removed: input.action() == EnvironmentRemovalAction::Purge,
+                data_root_preserved: input.action() == EnvironmentRemovalAction::Uninstall,
+                verified: true,
+            }
+        }
+    };
+    serde_json::to_value(result)
+        .map_err(|error| bridge_error("Could not encode the environment removal result", error))
 }
 
 #[tauri::command]
@@ -3224,6 +3331,7 @@ mod tests {
         );
         assert_eq!(metadata["features"]["sshProvisioning"], true);
         assert_eq!(metadata["features"]["wslProvisioning"], true);
+        assert_eq!(metadata["features"]["environmentRemoval"], true);
         assert_eq!(metadata["features"]["menuEvents"], true);
         assert_eq!(metadata["features"]["updater"], false);
         assert_eq!(

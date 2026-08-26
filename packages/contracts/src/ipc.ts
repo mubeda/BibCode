@@ -96,7 +96,13 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { DurableEnvironmentId, EnvironmentId, IsoDateTime, NonNegativeInt } from "./baseSchemas.ts";
+import {
+  DurableEnvironmentId,
+  EnvironmentId,
+  IsoDateTime,
+  NonNegativeInt,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ServerArtifactRecordSchema } from "./serverArtifact.ts";
 import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
@@ -339,6 +345,7 @@ export interface DesktopBridgeFeatureFlags {
   preview: boolean;
   updater: boolean;
   menuEvents: boolean;
+  environmentRemoval?: boolean;
 }
 
 export const DesktopBridgeFeatureFlagsSchema = Schema.Struct({
@@ -354,6 +361,7 @@ export const DesktopBridgeFeatureFlagsSchema = Schema.Struct({
   preview: Schema.Boolean,
   updater: Schema.Boolean,
   menuEvents: Schema.Boolean,
+  environmentRemoval: Schema.optionalKey(Schema.Boolean),
 });
 
 export interface DesktopBridgeHostMetadata {
@@ -976,6 +984,140 @@ export const DesktopSshSetupResultSchema = Schema.Struct({
 );
 export type DesktopSshSetupResult = typeof DesktopSshSetupResultSchema.Type;
 
+const DesktopEnvironmentRemovalHostKeyFingerprint = Schema.String.check(
+  Schema.isPattern(/^SHA256:[A-Za-z0-9+/]{43}$/u),
+);
+
+export const DesktopEnvironmentRemovalTargetSchema = Schema.Union([
+  Schema.Struct({
+    transport: Schema.Literal("wsl"),
+    distro: TrimmedNonEmptyString,
+    discoveryGeneration: NonNegativeInt,
+  }),
+  Schema.Struct({
+    transport: Schema.Literal("ssh"),
+    target: DesktopSshEnvironmentTargetSchema,
+    expectedHostKeyFingerprint: DesktopEnvironmentRemovalHostKeyFingerprint,
+  }),
+]);
+export type DesktopEnvironmentRemovalTarget = typeof DesktopEnvironmentRemovalTargetSchema.Type;
+
+export const DesktopEnvironmentRemovalPlanInputSchema = Schema.Struct({
+  target: DesktopEnvironmentRemovalTargetSchema,
+  expectedEnvironmentId: DurableEnvironmentId,
+  expectedStorageId: Schema.String.check(Schema.isUUID()),
+  environmentName: TrimmedNonEmptyString,
+});
+export type DesktopEnvironmentRemovalPlanInput =
+  typeof DesktopEnvironmentRemovalPlanInputSchema.Type;
+
+function sameDesktopEnvironmentRemovalTarget(
+  left: DesktopEnvironmentRemovalTarget,
+  right: DesktopEnvironmentRemovalTarget,
+): boolean {
+  if (left.transport !== right.transport) return false;
+  if (left.transport === "wsl" && right.transport === "wsl") {
+    return left.distro === right.distro && left.discoveryGeneration === right.discoveryGeneration;
+  }
+  if (left.transport === "ssh" && right.transport === "ssh") {
+    return (
+      left.expectedHostKeyFingerprint === right.expectedHostKeyFingerprint &&
+      left.target.alias === right.target.alias &&
+      left.target.hostname === right.target.hostname &&
+      left.target.username === right.target.username &&
+      left.target.port === right.target.port
+    );
+  }
+  return false;
+}
+
+export const DesktopEnvironmentRemovalPlanSchema = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  planId: Schema.String.check(Schema.isUUID()),
+  target: DesktopEnvironmentRemovalTargetSchema,
+  environmentId: DurableEnvironmentId,
+  storageId: Schema.String.check(Schema.isUUID()),
+  environmentName: TrimmedNonEmptyString,
+  dataRoot: TrimmedNonEmptyString,
+  projectCount: NonNegativeInt,
+  worktreeCount: NonNegativeInt,
+  processCount: NonNegativeInt,
+  otherPairedClientCount: NonNegativeInt,
+  createdAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+  uninstallSupported: Schema.Boolean,
+  uninstallUnavailableReason: Schema.NullOr(BoundedDesktopDiagnosticSchema),
+}).check(
+  Schema.makeFilter(
+    ({ uninstallSupported, uninstallUnavailableReason }) =>
+      uninstallSupported === (uninstallUnavailableReason === null) ||
+      "An unavailable uninstall must include one bounded reason.",
+  ),
+  Schema.makeFilter(
+    ({ createdAt, expiresAt }) =>
+      Date.parse(createdAt) < Date.parse(expiresAt) ||
+      "An environment removal plan must expire after it was created.",
+  ),
+);
+export type DesktopEnvironmentRemovalPlan = typeof DesktopEnvironmentRemovalPlanSchema.Type;
+
+export const DesktopEnvironmentRemovalExecuteInputSchema = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("uninstall"),
+    target: DesktopEnvironmentRemovalTargetSchema,
+    plan: DesktopEnvironmentRemovalPlanSchema,
+  }).check(
+    Schema.makeFilter(
+      ({ target, plan }) =>
+        sameDesktopEnvironmentRemovalTarget(target, plan.target) ||
+        "Environment removal execution target must match its approved plan.",
+    ),
+  ),
+  Schema.Struct({
+    action: Schema.Literal("purge"),
+    target: DesktopEnvironmentRemovalTargetSchema,
+    plan: DesktopEnvironmentRemovalPlanSchema,
+    confirmEnvironmentName: TrimmedNonEmptyString,
+  }).check(
+    Schema.makeFilter(
+      ({ target, plan }) =>
+        sameDesktopEnvironmentRemovalTarget(target, plan.target) ||
+        "Environment removal execution target must match its approved plan.",
+    ),
+    Schema.makeFilter(
+      ({ plan, confirmEnvironmentName }) =>
+        plan.environmentName === confirmEnvironmentName ||
+        "Purge confirmation must exactly match the planned environment name.",
+    ),
+  ),
+]);
+export type DesktopEnvironmentRemovalExecuteInput =
+  typeof DesktopEnvironmentRemovalExecuteInputSchema.Type;
+
+const DesktopEnvironmentRemovalResultBase = {
+  environmentId: DurableEnvironmentId,
+  storageId: Schema.String.check(Schema.isUUID()),
+  serviceRemoved: Schema.Literal(true),
+  binaryRemoved: Schema.Literal(true),
+  verified: Schema.Literal(true),
+};
+
+export const DesktopEnvironmentRemovalResultSchema = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("uninstall"),
+    ...DesktopEnvironmentRemovalResultBase,
+    dataRemoved: Schema.Literal(false),
+    dataRootPreserved: Schema.Literal(true),
+  }),
+  Schema.Struct({
+    action: Schema.Literal("purge"),
+    ...DesktopEnvironmentRemovalResultBase,
+    dataRemoved: Schema.Literal(true),
+    dataRootPreserved: Schema.Literal(false),
+  }),
+]);
+export type DesktopEnvironmentRemovalResult = typeof DesktopEnvironmentRemovalResultSchema.Type;
+
 export interface DesktopWslState {
   // True when authoritative discovery contains at least one Running distro.
   // Running distros are host-managed candidates by default; this is no longer
@@ -1568,6 +1710,12 @@ export interface DesktopBridge {
   prepareWslServer?: (input: DesktopWslSetupProbeInput) => Promise<DesktopWslServerProbe>;
   installWslServer?: (decision: RemoteSetupConsentDecision) => Promise<DesktopWslSetupResult>;
   cancelWslSetup?: (input: RemoteSetupCancelInput) => Promise<boolean>;
+  planEnvironmentRemoval?: (
+    input: DesktopEnvironmentRemovalPlanInput,
+  ) => Promise<DesktopEnvironmentRemovalPlan>;
+  executeEnvironmentRemoval?: (
+    input: DesktopEnvironmentRemovalExecuteInput,
+  ) => Promise<DesktopEnvironmentRemovalResult>;
   onRemoteSetupProgress?: (listener: (progress: RemoteSetupProgress) => void) => () => void;
   /** @deprecated Compatibility refresh; Running distro discovery owns availability. */
   setWslBackendEnabled: (enabled: boolean) => Promise<DesktopWslState>;

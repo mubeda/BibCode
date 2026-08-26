@@ -17,6 +17,9 @@ mod tests {
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
+    type FakeCommandLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+    type FakeCommandOutputs = Arc<Mutex<VecDeque<Result<Vec<u8>, String>>>>;
+
     #[derive(Clone)]
     struct FakeHost {
         probes: Arc<Mutex<VecDeque<WslHostProbe>>>,
@@ -27,6 +30,8 @@ mod tests {
         block_rollback: Arc<AtomicBool>,
         rollback_started: Arc<Notify>,
         rollback_release: Arc<Notify>,
+        commands: FakeCommandLog,
+        command_outputs: FakeCommandOutputs,
     }
 
     impl FakeHost {
@@ -40,7 +45,16 @@ mod tests {
                 block_rollback: Arc::new(AtomicBool::new(false)),
                 rollback_started: Arc::new(Notify::new()),
                 rollback_release: Arc::new(Notify::new()),
+                commands: Arc::new(Mutex::new(Vec::new())),
+                command_outputs: Arc::new(Mutex::new(VecDeque::new())),
             })
+        }
+
+        fn push_command_output(&self, output: Result<Vec<u8>, String>) {
+            self.command_outputs
+                .lock()
+                .expect("fake command outputs")
+                .push_back(output);
         }
     }
 
@@ -111,6 +125,27 @@ mod tests {
             _paths: &'a WslSetupPaths,
         ) -> HostFuture<'a, ()> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn command<'a>(
+            &'a self,
+            _distro: &'a str,
+            program: &'a str,
+            arguments: &'a [String],
+            _timeout: Duration,
+            _cancellation: &'a CancellationToken,
+        ) -> HostFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                self.commands
+                    .lock()
+                    .expect("fake commands")
+                    .push((program.to_string(), arguments.to_vec()));
+                self.command_outputs
+                    .lock()
+                    .expect("fake command outputs")
+                    .pop_front()
+                    .unwrap_or_else(|| Err("missing fake command output".to_string()))
+            })
         }
     }
 
@@ -227,6 +262,109 @@ mod tests {
 
     fn progress_sink() -> SetupProgressSink {
         Arc::new(|_, _, _| {})
+    }
+
+    fn fresh_removal_plan_output() -> Vec<u8> {
+        let created_at = (time::OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("created at");
+        let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("expires at");
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "planId": "6eef32c8-3c6d-4c0d-ad5c-2e9f6dd54074",
+            "environmentId": "76aa78e8-67aa-477e-bd25-68f491885224",
+            "storageInstanceId": "3039b232-95d0-4b2f-a35e-c297b4c895af",
+            "environmentName": "Ubuntu",
+            "dataRoot": "/home/dev/.bibcode",
+            "projectCount": 0,
+            "worktreeCount": 0,
+            "processCount": 0,
+            "otherPairedClientCount": 1,
+            "createdAt": created_at,
+            "expiresAt": expires_at,
+        }))
+        .expect("removal plan JSON")
+    }
+
+    #[tokio::test]
+    async fn wsl_removal_uses_live_discovery_and_only_deletes_the_managed_install_root() {
+        let host = FakeHost::new([
+            host_probe("x86_64", Some("0.4.2"), true, 1_000_000),
+            host_probe("x86_64", Some("0.4.2"), true, 1_000_000),
+        ]);
+        host.push_command_output(Ok(fresh_removal_plan_output()));
+        let manager = WslSetupManager::with_dependencies(host.clone(), FakeArtifacts::new(1024));
+        let snapshot = running_snapshot(7, WslDistroState::Running);
+        let input = EnvironmentRemovalPlanInput {
+            target: EnvironmentRemovalTarget::Wsl {
+                distro: "Ubuntu".into(),
+                discovery_generation: 7,
+            },
+            expected_environment_id: "76aa78e8-67aa-477e-bd25-68f491885224".into(),
+            expected_storage_id: "3039b232-95d0-4b2f-a35e-c297b4c895af".into(),
+            environment_name: "Ubuntu".into(),
+        };
+        let plan = manager
+            .plan_environment_removal(&snapshot, &input)
+            .await
+            .expect("identity-bound WSL plan");
+        assert!(plan.uninstall_supported);
+
+        let prepared = manager
+            .prepare_environment_removal(&snapshot, "Ubuntu", 7)
+            .await
+            .expect("live managed WSL server");
+        for _ in 0..4 {
+            host.push_command_output(Ok(Vec::new()));
+        }
+        manager
+            .remove_managed_installation(&prepared, true)
+            .await
+            .expect("data-preserving managed uninstall");
+
+        let commands = host.commands.lock().expect("fake commands");
+        assert_eq!(
+            commands[0].0,
+            "/home/dev/.local/share/bibcode/server/current/bin/bibcode"
+        );
+        assert_eq!(
+            commands[1],
+            (
+                "test".into(),
+                vec!["-d".into(), "/home/dev/.bibcode".into()]
+            )
+        );
+        assert_eq!(
+            commands[2],
+            (
+                "rm".into(),
+                vec![
+                    "-rf".into(),
+                    "--".into(),
+                    "/home/dev/.local/share/bibcode/server".into(),
+                ],
+            )
+        );
+        assert_eq!(
+            commands[3],
+            (
+                "test".into(),
+                vec![
+                    "!".into(),
+                    "-e".into(),
+                    "/home/dev/.local/share/bibcode/server".into(),
+                ],
+            )
+        );
+        assert_eq!(
+            commands[4],
+            (
+                "test".into(),
+                vec!["-d".into(), "/home/dev/.bibcode".into()]
+            )
+        );
     }
 
     #[tokio::test]
@@ -663,6 +801,10 @@ mod tests {
     }
 }
 use crate::{
+    environment_removal::{
+        EnvironmentRemovalPlan, EnvironmentRemovalPlanInput, EnvironmentRemovalTarget,
+        parse_server_plan, parse_server_purge_result, plan_arguments, purge_arguments,
+    },
     server_artifacts::{
         ResolvedServerArtifact, ServerArtifactProgress, ServerArtifactRecord,
         ServerArtifactRequest, ServerArtifactSource, VerifiedServerArtifact,
@@ -700,6 +842,7 @@ const SETUP_REQUIRED_SPACE_MULTIPLIER: u64 = 3;
 const WSL_SETUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const WSL_SETUP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WSL_SETUP_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const WSL_REMOVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 pub(crate) type HostFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 pub(crate) type ArtifactFuture<'a, T> =
@@ -756,6 +899,19 @@ pub(crate) trait WslSetupHost: Send + Sync {
     ) -> HostFuture<'a, ()>;
 
     fn cleanup<'a>(&'a self, distro: &'a str, paths: &'a WslSetupPaths) -> HostFuture<'a, ()>;
+
+    fn command<'a>(
+        &'a self,
+        _distro: &'a str,
+        _program: &'a str,
+        _arguments: &'a [String],
+        _timeout: Duration,
+        _cancellation: &'a CancellationToken,
+    ) -> HostFuture<'a, Vec<u8>> {
+        Box::pin(async {
+            Err("This WSL setup host does not support environment removal commands.".to_string())
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1141,6 +1297,20 @@ impl PendingWslInstallation {
 pub(crate) enum WslInstallAttempt {
     Pending(Box<PendingWslInstallation>),
     Terminal(Box<WslSetupResult>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedWslRemoval {
+    distro: String,
+    binary_path: String,
+    install_root: String,
+    data_root: String,
+}
+
+impl PreparedWslRemoval {
+    pub(crate) fn distro(&self) -> &str {
+        &self.distro
+    }
 }
 
 #[derive(Clone)]
@@ -1624,6 +1794,147 @@ impl WslSetupManager {
         }
         publish();
         true
+    }
+
+    pub(crate) async fn plan_environment_removal(
+        &self,
+        discovery: &WslDiscoverySnapshot,
+        input: &EnvironmentRemovalPlanInput,
+    ) -> Result<EnvironmentRemovalPlan, String> {
+        input.validate()?;
+        let EnvironmentRemovalTarget::Wsl {
+            distro,
+            discovery_generation,
+        } = &input.target
+        else {
+            return Err("A WSL removal plan requires a WSL target.".to_string());
+        };
+        let prepared = self
+            .prepare_environment_removal(discovery, distro, *discovery_generation)
+            .await?;
+        let arguments = plan_arguments(&prepared.data_root, &input.environment_name);
+        let cancellation = self.cancellation.child_token();
+        let output = self
+            .host
+            .command(
+                &prepared.distro,
+                &prepared.binary_path,
+                &arguments,
+                WSL_REMOVAL_COMMAND_TIMEOUT,
+                &cancellation,
+            )
+            .await?;
+        parse_server_plan(
+            &output,
+            input,
+            &prepared.data_root,
+            Some(&prepared.install_root),
+        )
+    }
+
+    pub(crate) async fn prepare_environment_removal(
+        &self,
+        discovery: &WslDiscoverySnapshot,
+        distro: &str,
+        discovery_generation: u64,
+    ) -> Result<PreparedWslRemoval, String> {
+        validate_running_distro(discovery, discovery_generation, distro)?;
+        self.reject_active_distro(distro)?;
+        let cancellation = self.cancellation.child_token();
+        let host = self.host.probe(distro, &cancellation).await?;
+        let binary_path = host.installed_binary_path.ok_or_else(|| {
+            "BiBCode Server is not installed in the selected WSL distribution.".to_string()
+        })?;
+        let expected_binary = managed_wsl_server_binary(&host.home)?;
+        if binary_path != expected_binary {
+            return Err("The WSL server binary is outside the managed installation root.".into());
+        }
+        let install_root = format!(
+            "{}/.local/share/bibcode/server",
+            host.home.trim_end_matches('/')
+        );
+        Ok(PreparedWslRemoval {
+            distro: distro.to_string(),
+            binary_path,
+            install_root,
+            data_root: host.data_root,
+        })
+    }
+
+    pub(crate) async fn purge_environment_data(
+        &self,
+        prepared: &PreparedWslRemoval,
+        plan: &EnvironmentRemovalPlan,
+    ) -> Result<(), String> {
+        let cancellation = self.cancellation.child_token();
+        let output = self
+            .host
+            .command(
+                &prepared.distro,
+                &prepared.binary_path,
+                &purge_arguments(plan),
+                WSL_REMOVAL_COMMAND_TIMEOUT,
+                &cancellation,
+            )
+            .await?;
+        parse_server_purge_result(&output, plan)
+    }
+
+    pub(crate) async fn remove_managed_installation(
+        &self,
+        prepared: &PreparedWslRemoval,
+        preserve_data: bool,
+    ) -> Result<(), String> {
+        let cancellation = self.cancellation.child_token();
+        if preserve_data {
+            self.host
+                .command(
+                    &prepared.distro,
+                    "test",
+                    &["-d".to_string(), prepared.data_root.clone()],
+                    WSL_REMOVAL_COMMAND_TIMEOUT,
+                    &cancellation,
+                )
+                .await?;
+        }
+        self.host
+            .command(
+                &prepared.distro,
+                "rm",
+                &[
+                    "-rf".to_string(),
+                    "--".to_string(),
+                    prepared.install_root.clone(),
+                ],
+                WSL_REMOVAL_COMMAND_TIMEOUT,
+                &cancellation,
+            )
+            .await?;
+        self.host
+            .command(
+                &prepared.distro,
+                "test",
+                &[
+                    "!".to_string(),
+                    "-e".to_string(),
+                    prepared.install_root.clone(),
+                ],
+                WSL_REMOVAL_COMMAND_TIMEOUT,
+                &cancellation,
+            )
+            .await?;
+        if preserve_data {
+            self.host
+                .command(
+                    &prepared.distro,
+                    "test",
+                    &["-d".to_string(), prepared.data_root.clone()],
+                    WSL_REMOVAL_COMMAND_TIMEOUT,
+                    &cancellation,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     fn next_generation(&self) -> u64 {
@@ -2541,6 +2852,22 @@ impl WslSetupHost for ProcessWslSetupHost {
                 (Ok(_), Err(second)) => Err(second),
                 (Err(first), Err(second)) => Err(format!("{first} {second}")),
             }
+        })
+    }
+
+    fn command<'a>(
+        &'a self,
+        distro: &'a str,
+        program: &'a str,
+        arguments: &'a [String],
+        timeout: Duration,
+        cancellation: &'a CancellationToken,
+    ) -> HostFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let command = WslExecCommand::new(distro, program, arguments.iter().cloned())?;
+            Ok(run_wsl_exec(&command, None, timeout, cancellation)
+                .await?
+                .stdout)
         })
     }
 }

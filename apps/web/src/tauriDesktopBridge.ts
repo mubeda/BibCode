@@ -6,6 +6,10 @@ import type {
   DesktopBridge,
   DesktopBridgeHostMetadata,
   DesktopEnvironmentBootstrap,
+  DesktopEnvironmentRemovalExecuteInput,
+  DesktopEnvironmentRemovalPlan,
+  DesktopEnvironmentRemovalPlanInput,
+  DesktopEnvironmentRemovalResult,
   DesktopProjectDataStatusChangedEvent,
   DesktopSecretStoreErrorCode,
   DesktopServerExposureState,
@@ -23,6 +27,8 @@ import {
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
   DesktopEnvironmentBootstrapSchema,
+  DesktopEnvironmentRemovalPlanSchema,
+  DesktopEnvironmentRemovalResultSchema,
   DesktopSshServerProbeSchema,
   DesktopSshSetupResultSchema,
   DesktopWslDiscoverySchema,
@@ -57,6 +63,10 @@ const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
 const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
 const decodeSshEnvironmentDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+const decodeEnvironmentRemovalPlan = Schema.decodeUnknownSync(DesktopEnvironmentRemovalPlanSchema);
+const decodeEnvironmentRemovalResult = Schema.decodeUnknownSync(
+  DesktopEnvironmentRemovalResultSchema,
+);
 const decodeSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
 const decodeSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
 const decodeRemoteSetupProgress = Schema.decodeUnknownSync(RemoteSetupProgressSchema);
@@ -679,6 +689,18 @@ function createTauriDesktopBridge(
       ),
     cancelWslSetup: (input) =>
       tauriInvokeDesktop<boolean>("desktop_bridge_cancel_wsl_setup", { input }),
+    planEnvironmentRemoval: (
+      input: DesktopEnvironmentRemovalPlanInput,
+    ): Promise<DesktopEnvironmentRemovalPlan> =>
+      tauriInvokeDesktop<unknown>("desktop_bridge_plan_environment_removal", { input }).then(
+        decodeEnvironmentRemovalPlan,
+      ),
+    executeEnvironmentRemoval: (
+      input: DesktopEnvironmentRemovalExecuteInput,
+    ): Promise<DesktopEnvironmentRemovalResult> =>
+      tauriInvokeDesktop<unknown>("desktop_bridge_execute_environment_removal", { input }).then(
+        decodeEnvironmentRemovalResult,
+      ),
     onRemoteSetupProgress: (listener: (progress: RemoteSetupProgress) => void) =>
       tauriListenDecoded(REMOTE_SETUP_PROGRESS_EVENT, decodeRemoteSetupProgress, listener),
     setWslBackendEnabled: (enabled) =>

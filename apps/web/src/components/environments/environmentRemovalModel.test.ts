@@ -28,12 +28,16 @@ function context(overrides: Partial<EnvironmentRemovalContext> = {}): Environmen
       environmentId,
       environmentGeneration: 4,
       storageId: "storage-1",
+      environmentName: "Build host",
       dataRoot: "/srv/bibcode",
       projectCount: 2,
       worktreeCount: 3,
       processCount: 1,
       otherPairedClientCount: 1,
+      createdAt: "2026-08-25T12:00:00.000Z",
       expiresAt: "2026-08-25T12:05:00.000Z",
+      uninstallSupported: true,
+      uninstallUnavailableReason: null,
     },
     ...overrides,
   };
@@ -60,8 +64,10 @@ describe("environment removal action matrix", () => {
       canForget: true,
       canForceRemove: false,
       canUninstall: true,
-      canPurge: true,
+      canPurge: false,
       remoteActionReason: null,
+      purgeActionReason:
+        "Remove 2 projects and 3 worktrees, and stop 1 running process before deleting remote data.",
     });
     expect(getEnvironmentRemovalAvailability(context({ hidden: true }), NOW)).toMatchObject({
       canHide: false,
@@ -116,16 +122,60 @@ describe("environment removal action matrix", () => {
     ).toMatchObject({ valid: false });
   });
 
+  it("shows a verified managed-install limitation instead of offering a partial uninstall", () => {
+    const unavailable = context({
+      plan: {
+        ...context().plan!,
+        uninstallSupported: false,
+        uninstallUnavailableReason:
+          "This server was installed by the host package manager; use its native uninstaller.",
+      },
+    });
+    expect(getEnvironmentRemovalAvailability(unavailable, NOW)).toMatchObject({
+      canUninstall: false,
+      canPurge: false,
+      remoteActionReason:
+        "This server was installed by the host package manager; use its native uninstaller.",
+      purgeActionReason: null,
+    });
+    expect(
+      validateEnvironmentRemoval(unavailable, selection({ uninstallServer: true }), NOW),
+    ).toEqual({
+      valid: false,
+      reason: "This server was installed by the host package manager; use its native uninstaller.",
+    });
+  });
+
   it("requires the exact alias independently for purge", () => {
+    const emptyPlan = {
+      ...context().plan!,
+      projectCount: 0,
+      worktreeCount: 0,
+      processCount: 0,
+    };
     expect(
       validateEnvironmentRemoval(
-        context(),
+        context({ plan: emptyPlan }),
         selection({ purgeRemoteData: true, typedAlias: "build host" }),
         NOW,
       ),
     ).toEqual({
       valid: false,
       reason: "Type Build host exactly to delete remote data.",
+    });
+  });
+
+  it("permits purge only when the verified plan has no owned projects, worktrees, or processes", () => {
+    const emptyPlan = {
+      ...context().plan!,
+      projectCount: 0,
+      worktreeCount: 0,
+      processCount: 0,
+    };
+    expect(getEnvironmentRemovalAvailability(context({ plan: emptyPlan }), NOW)).toMatchObject({
+      canUninstall: true,
+      canPurge: true,
+      purgeActionReason: null,
     });
   });
 
@@ -183,6 +233,38 @@ describe("environment removal action matrix", () => {
     );
     expect(events).toEqual(["remote:uninstall:true", "local:forget"]);
     expect(result.remoteOutcome).toBe("verified");
+  });
+
+  it("passes the exact typed alias through the destructive purge request", async () => {
+    const requests: unknown[] = [];
+    const emptyPlan = {
+      ...context().plan!,
+      projectCount: 0,
+      worktreeCount: 0,
+      processCount: 0,
+    };
+    const result = await executeEnvironmentRemoval(
+      context({ plan: emptyPlan }),
+      selection({ purgeRemoteData: true, typedAlias: "Build host" }),
+      {
+        executeRemote: async (request) => {
+          requests.push(request);
+          return { verified: true };
+        },
+        forgetLocal: async () => undefined,
+      },
+      NOW,
+    );
+    expect(requests).toEqual([
+      {
+        action: "purge",
+        environmentId,
+        planId: "plan-1",
+        confirmEnvironmentName: "Build host",
+        preserveData: false,
+      },
+    ]);
+    expect(result.status).toBe("removed");
   });
 
   it("retains catalog metadata when the remote step fails", async () => {

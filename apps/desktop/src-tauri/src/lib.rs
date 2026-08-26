@@ -40,6 +40,8 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_prepare_wsl_server,
             desktop_bridge_install_wsl_server,
             desktop_bridge_cancel_wsl_setup,
+            desktop_bridge_plan_environment_removal,
+            desktop_bridge_execute_environment_removal,
             desktop_bridge_get_wsl_state,
             desktop_bridge_refresh_wsl_discovery,
             desktop_bridge_set_wsl_backend_enabled,
@@ -95,6 +97,7 @@ pub fn run() {
         .manage(backend::BackendSupervisor::new())
         .manage(wsl::WslDiscoveryService::new())
         .manage(wsl_setup::WslSetupManager::new())
+        .manage(environment_removal::EnvironmentRemovalPlanStore::new())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(secret_store::DesktopSecretStore::new())
         .manage(context_menu::NativeContextMenuManager::new())
@@ -180,6 +183,8 @@ pub fn run() {
         bridge::desktop_bridge_prepare_wsl_server,
         bridge::desktop_bridge_install_wsl_server,
         bridge::desktop_bridge_cancel_wsl_setup,
+        bridge::desktop_bridge_plan_environment_removal,
+        bridge::desktop_bridge_execute_environment_removal,
         bridge::desktop_bridge_get_wsl_state,
         bridge::desktop_bridge_refresh_wsl_discovery,
         bridge::desktop_bridge_set_wsl_backend_enabled,
@@ -291,6 +296,7 @@ mod bridge;
 mod config;
 mod context_menu;
 mod data_safety;
+mod environment_removal;
 mod preview;
 mod remote_host;
 mod remote_operation;
@@ -329,6 +335,12 @@ mod tests {
     use serde_json::Value;
 
     use super::{DESKTOP_BRIDGE_COMMAND_NAMES, DESKTOP_PREVIEW_COMMAND_NAMES};
+
+    #[test]
+    fn environment_removal_commands_are_linked_in_test_builds() {
+        let _ = super::bridge::desktop_bridge_plan_environment_removal;
+        let _ = super::bridge::desktop_bridge_execute_environment_removal;
+    }
 
     #[derive(Debug, Deserialize)]
     struct PermissionsFile {

@@ -24,12 +24,16 @@ function context(overrides: Partial<EnvironmentRemovalContext> = {}): Environmen
       environmentId,
       environmentGeneration: 3,
       storageId: "storage-build",
+      environmentName: "Build Linux",
       dataRoot: "/home/dev/.bibcode",
       projectCount: 2,
       worktreeCount: 4,
       processCount: 1,
       otherPairedClientCount: 2,
+      createdAt: "2026-08-25T12:00:00.000Z",
       expiresAt: "2026-08-25T12:05:00.000Z",
+      uninstallSupported: true,
+      uninstallUnavailableReason: null,
     },
     ...overrides,
   };
@@ -104,5 +108,25 @@ describe("EnvironmentRemovalWorkspace", () => {
     );
     expect(markup).toContain("Remote consequences cannot be verified");
     expect(markup).not.toMatch(/unregister|delete distro/iu);
+  });
+
+  it("shows the verified native-package reason without enabling partial removal", () => {
+    const markup = renderToStaticMarkup(
+      <EnvironmentRemovalWorkspace
+        context={context({
+          plan: {
+            ...context().plan!,
+            uninstallSupported: false,
+            uninstallUnavailableReason:
+              "This server was installed by the host package manager; use its native uninstaller.",
+          },
+        })}
+        now={NOW}
+        {...callbacks}
+      />,
+    );
+    expect(markup).toContain("installed by the host package manager");
+    expect(markup).toContain('aria-label="Uninstall BiBCode Server"');
+    expect(markup).toContain("disabled");
   });
 });

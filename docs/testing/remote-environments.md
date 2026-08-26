@@ -186,12 +186,25 @@ mutation.
 
 Ordinary **Disconnect** and **Forget** are local-only. Prove they close
 admission, cancel/drain owners, reap the local tunnel, clear local
-authentication, and leave the remote service/data untouched. The current UI has
-no remote uninstall. For a future optional uninstall, require a separate online
-host-authorized preview/result. If the host is offline or cleanup is unproved,
-force local removal must ask again and warn that the remote service, projects,
-worktrees, credentials, and data may remain. Never record force removal as
-remote cleanup success.
+authentication, and leave the remote service/data untouched. Then use a
+disposable BiBCode-managed portable install to prove the separate online flow:
+
+1. an unpinned SSH route, Direct HTTPS route, stale WSL discovery generation,
+   wrong environment/storage identity, changed root, or expired plan fails
+   before host mutation;
+2. uninstall closes the local tunnel, removes the managed service/binary, proves
+   the exact data root still exists, and only then permits local Forget;
+3. purge is disabled while any project, worktree, or process count is nonzero,
+   rejects wrong-case confirmation, and after guards clear removes only the
+   approved root before local Forget;
+4. a native MSI/PKG/DEB/RPM probe displays the OS-uninstaller limitation and
+   runs no partial remote cleanup; and
+5. any failed or unverifiable remote step retains the local catalog for retry.
+
+If the host is offline or cleanup is unproved, force local removal must ask
+again and warn that the remote service, projects, worktrees, credentials, and
+data may remain. Never record force removal as remote cleanup success or queue
+it for reconnect.
 
 ## Environment-owned project and worktree checks
 

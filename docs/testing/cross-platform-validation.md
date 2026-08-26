@@ -535,11 +535,15 @@ behavior on the named native desktop.
 
 Disconnect and Forget must remain local-only: close admission, drain native
 owners, reap the tunnel, clear local authentication/catalog state, and leave the
-remote service/data untouched. The current UI has no remote uninstall. Any
-future optional uninstall needs a separate host-authorized preview/result. If
-the host is offline or cleanup cannot be proved, force local removal must ask
-again, warn that the remote service, projects, worktrees, credentials, and data
-may remain, and never report remote cleanup success.
+remote service/data untouched. Exercise optional remote uninstall/purge only
+through the separate fresh host-authorized preview/result. Verify WSL discovery
+generation and SSH fingerprint fencing, preserve-data uninstall, exact-name
+purge, zero project/worktree/process guards, and identity/effect verification
+before local Forget. A native package must direct the operator to its OS
+uninstaller without partial cleanup. If the host is offline or cleanup cannot
+be proved, force local removal must ask again, warn that the remote service,
+projects, worktrees, credentials, and data may remain, and never report remote
+cleanup success.
 
 ### VCS coordination gates
 

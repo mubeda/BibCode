@@ -220,11 +220,14 @@ an unauthenticated remote uninstall/stop for it.
 This local-only boundary is visible in removal UX. The ordinary action removes
 the client route, credentials, bindings, and cached presentation after its
 owned tunnel is drained; it cannot claim that the remote server or its data was
-removed. A future optional remote uninstall must be a separate, online,
-host-authorized operation with its own preview and result. If that operation is
-unavailable or fails, the user may explicitly force local removal only after a
-warning that the remote service, projects, worktrees, credentials, and data may
-continue to exist. Force removal must never infer success for remote cleanup.
+removed. Optional remote uninstall/purge is a separate online operation. It
+re-probes the saved host-key pin, obtains a short-lived identity/root-bound
+server plan, closes the local tunnel, and reports verified host effects before
+Forget. Only BiBCode's managed portable layout is eligible; native packages
+must use their OS uninstaller. If the operation is unavailable or fails, the
+user may explicitly force local removal only after a warning that the remote
+service, projects, worktrees, credentials, and data may continue to exist.
+Force removal must never infer success for remote cleanup.
 
 ### Desktop-managed WSL
 
@@ -400,11 +403,13 @@ requests, and releases the database/store guard only after both network and
 control tasks join. Service installation/uninstallation and remote data purge
 remain outside that command and are not implied by Forget.
 
-`bibcode auth pairing create` is the only current CLI client of this control
-channel. It resolves the same data root as the server, verifies the durable
-environment marker and response identity/expiry, and emits either a single JSON
-document or a human pairing URL. It has no HTTP fallback and grants one fixed
-environment-administrator scope set rather than exposing permission levels.
+`bibcode auth pairing create`, service lifecycle/update coordination, and the
+two-step storage purge use this control channel. Each resolves the same data
+root as the server and verifies the durable environment/storage marker plus
+the operation-specific identity and expiry. Pairing emits either a single JSON
+document or a human pairing URL. None has an HTTP fallback, and pairing grants
+one fixed environment-administrator scope set rather than exposing permission
+levels.
 
 The same protected channel coordinates service stop and update preparation.
 Managed workstation/headless services remain loopback-only. Their native

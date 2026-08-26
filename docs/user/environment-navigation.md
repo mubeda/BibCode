@@ -105,15 +105,23 @@ Open the environment's center removal workspace before changing its lifecycle:
   that the remote result is unknown. The server, service, projects, worktrees,
   credentials, and data may remain. No remote operation is queued for later.
 
-Remote server uninstall and remote data deletion are separate, optional host
+Remote server uninstall and remote data deletion are separate, unchecked host
 administration choices. The UI describes uninstall as preserving the data root
-and recommends keeping data. These choices remain disabled until BiBCode has a
-fresh, versioned removal plan and a trusted desktop, local-control, or SSH
-host-authority adapter. Remote data deletion must additionally enumerate the
-affected storage identity, projects, worktrees, running processes, and other
-paired clients and require exact typed confirmation. Local removal and remote
-cleanup report separate outcomes; an unknown remote outcome is never shown as
-success.
+and recommends keeping data. Fetching the preview uses either the current
+Running WSL binding or the active SSH route with its saved host-key fingerprint;
+Direct HTTPS cannot authorize host mutation. The versioned plan shows the exact
+data root, storage identity, projects, worktrees, running processes, and other
+paired clients. Purge remains disabled until all owned projects, worktrees, and
+processes are gone, then requires the exact environment alias. The server
+closes admission and rechecks those guards before deletion.
+
+BiBCode can remotely uninstall only a server installed into its managed
+portable layout. If the host reports a native MSI, PKG, DEB, or RPM installation,
+the workspace says that remote uninstall is unavailable and directs the user
+to the OS uninstaller. This prevents removal of a service registration without
+also proving package-owned file cleanup. Local removal and remote cleanup
+report separate outcomes; failure keeps the environment available for retry,
+and an unknown remote outcome is never shown as success.
 
 The primary environment cannot be hidden, forgotten, remotely uninstalled, or
 purged from this workspace.

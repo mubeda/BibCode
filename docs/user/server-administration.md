@@ -272,10 +272,18 @@ For a desktop-managed SSH environment, **Disconnect** and **Forget** do not run
 these service commands remotely. They close and reap local tunnels and remove
 only that client's routes, secrets, bindings, caches, and presentation state.
 The server registration, binary, projects, repositories, worktrees,
-credentials, and data root remain on the remote host. The current UI has no
-remote-uninstall action. Any future optional remote uninstall must first show
-the exact host, mode, binary, service registration, and preserved data root,
-then report its remote result separately from local removal.
+credentials, and data root remain on the remote host. The separate center
+removal action first verifies the active SSH target and saved host-key pin,
+then shows a short-lived identity-bound plan. Optional uninstall removes the
+managed service and portable binary while preserving the exact data root.
+Optional purge additionally requires the exact environment alias and server
+guards to show no owned project, worktree, or process. The verified remote
+result is reported separately and must complete before local Forget.
+
+The desktop does not remotely invoke MSI, PKG, DEB, or RPM uninstallers. If the
+probe identifies a native package, the plan explains that the OS uninstaller
+owns service and package-file cleanup. This limitation is fail-closed: BiBCode
+does not remove only the service and then claim the native package is gone.
 
 If the destination is offline or remote cleanup fails, a force-local-removal
 choice must ask again and state these consequences. Confirmation means only

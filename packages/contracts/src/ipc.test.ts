@@ -14,6 +14,10 @@ import {
   DesktopSshServerProbeSchema,
   DesktopSshSetupProbeInputSchema,
   DesktopSshSetupResultSchema,
+  DesktopEnvironmentRemovalExecuteInputSchema,
+  DesktopEnvironmentRemovalPlanInputSchema,
+  DesktopEnvironmentRemovalPlanSchema,
+  DesktopEnvironmentRemovalResultSchema,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
   DesktopWslServerProbeSchema,
@@ -55,6 +59,18 @@ const decodeDesktopSshOperationCancelInput = Schema.decodeUnknownSync(
 const decodeDesktopSshSetupProbeInput = Schema.decodeUnknownSync(DesktopSshSetupProbeInputSchema);
 const decodeDesktopSshServerProbe = Schema.decodeUnknownSync(DesktopSshServerProbeSchema);
 const decodeDesktopSshSetupResult = Schema.decodeUnknownSync(DesktopSshSetupResultSchema);
+const decodeDesktopEnvironmentRemovalExecuteInput = Schema.decodeUnknownSync(
+  DesktopEnvironmentRemovalExecuteInputSchema,
+);
+const decodeDesktopEnvironmentRemovalPlanInput = Schema.decodeUnknownSync(
+  DesktopEnvironmentRemovalPlanInputSchema,
+);
+const decodeDesktopEnvironmentRemovalPlan = Schema.decodeUnknownSync(
+  DesktopEnvironmentRemovalPlanSchema,
+);
+const decodeDesktopEnvironmentRemovalResult = Schema.decodeUnknownSync(
+  DesktopEnvironmentRemovalResultSchema,
+);
 const decodeDesktopWslDiscovery = Schema.decodeUnknownSync(DesktopWslDiscoverySchema);
 const decodeDesktopWslSetupProbeInput = Schema.decodeUnknownSync(DesktopWslSetupProbeInputSchema);
 const decodeDesktopWslServerProbe = Schema.decodeUnknownSync(DesktopWslServerProbeSchema);
@@ -253,6 +269,141 @@ describe("Remote setup contracts", () => {
         message: "Installation was cancelled; the previous version remains active.",
       }),
     ).toMatchObject({ status: "cancelled", mutationStatus: "partial" });
+  });
+});
+
+describe("Environment removal host-authority contracts", () => {
+  const target = { transport: "wsl" as const, distro: "Ubuntu", discoveryGeneration: 7 };
+  const plan = {
+    schemaVersion: 1 as const,
+    planId: "6eef32c8-3c6d-4c0d-ad5c-2e9f6dd54074",
+    target,
+    environmentId: "76aa78e8-67aa-477e-bd25-68f491885224",
+    storageId: "3039b232-95d0-4b2f-a35e-c297b4c895af",
+    environmentName: "Build host",
+    dataRoot: "/home/dev/.bibcode",
+    projectCount: 0,
+    worktreeCount: 0,
+    processCount: 0,
+    otherPairedClientCount: 2,
+    createdAt: "2036-08-25T12:00:00.000Z",
+    expiresAt: "2036-08-25T12:05:00.000Z",
+    uninstallSupported: true,
+    uninstallUnavailableReason: null,
+  };
+
+  it("accepts only a running WSL locator or fingerprint-pinned SSH locator", () => {
+    expect(
+      decodeDesktopEnvironmentRemovalPlanInput({
+        target: { transport: "wsl", distro: "Ubuntu", discoveryGeneration: 7 },
+        expectedEnvironmentId: plan.environmentId,
+        expectedStorageId: plan.storageId,
+        environmentName: plan.environmentName,
+      }),
+    ).toMatchObject({ target: { transport: "wsl", distro: "Ubuntu" } });
+    expect(
+      decodeDesktopEnvironmentRemovalPlanInput({
+        target: {
+          transport: "ssh",
+          target: { alias: "builder", hostname: "builder.example", username: "dev", port: 22 },
+          expectedHostKeyFingerprint: `SHA256:${"a".repeat(43)}`,
+        },
+        expectedEnvironmentId: plan.environmentId,
+        expectedStorageId: plan.storageId,
+        environmentName: plan.environmentName,
+      }),
+    ).toMatchObject({ target: { transport: "ssh" } });
+    expect(() =>
+      decodeDesktopEnvironmentRemovalPlanInput({
+        target: {
+          transport: "ssh",
+          target: { alias: "builder", hostname: "builder.example", username: "dev", port: 22 },
+          expectedHostKeyFingerprint: "trust-on-first-use",
+        },
+        expectedEnvironmentId: plan.environmentId,
+        expectedStorageId: plan.storageId,
+        environmentName: plan.environmentName,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeDesktopEnvironmentRemovalPlanInput({
+        target: { transport: "https", endpoint: "https://builder.example" },
+        expectedEnvironmentId: plan.environmentId,
+        expectedStorageId: plan.storageId,
+        environmentName: plan.environmentName,
+      }),
+    ).toThrow();
+  });
+
+  it("keeps the server plan identity-bound and makes native-package limits explicit", () => {
+    expect(decodeDesktopEnvironmentRemovalPlan(plan)).toEqual(plan);
+    expect(() =>
+      decodeDesktopEnvironmentRemovalPlan({
+        ...plan,
+        uninstallSupported: false,
+        uninstallUnavailableReason: null,
+      }),
+    ).toThrow();
+  });
+
+  it("requires exact purge confirmation but never adds it to uninstall", () => {
+    expect(
+      decodeDesktopEnvironmentRemovalExecuteInput({
+        action: "uninstall",
+        target,
+        plan,
+      }),
+    ).toMatchObject({ action: "uninstall" });
+    expect(
+      decodeDesktopEnvironmentRemovalExecuteInput({
+        action: "purge",
+        target,
+        plan,
+        confirmEnvironmentName: "Build host",
+      }),
+    ).toMatchObject({ action: "purge", confirmEnvironmentName: "Build host" });
+    expect(() =>
+      decodeDesktopEnvironmentRemovalExecuteInput({
+        action: "purge",
+        target,
+        plan,
+        confirmEnvironmentName: "build host",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeDesktopEnvironmentRemovalExecuteInput({
+        action: "uninstall",
+        target: { ...target, distro: "Debian" },
+        plan,
+      }),
+    ).toThrow();
+  });
+
+  it("reports verified uninstall and purge effects separately", () => {
+    expect(
+      decodeDesktopEnvironmentRemovalResult({
+        action: "uninstall",
+        environmentId: plan.environmentId,
+        storageId: plan.storageId,
+        serviceRemoved: true,
+        binaryRemoved: true,
+        dataRemoved: false,
+        dataRootPreserved: true,
+        verified: true,
+      }),
+    ).toMatchObject({ action: "uninstall", dataRootPreserved: true });
+    expect(() =>
+      decodeDesktopEnvironmentRemovalResult({
+        action: "purge",
+        environmentId: plan.environmentId,
+        storageId: plan.storageId,
+        serviceRemoved: true,
+        binaryRemoved: true,
+        dataRemoved: false,
+        dataRootPreserved: true,
+        verified: true,
+      }),
+    ).toThrow();
   });
 });
 

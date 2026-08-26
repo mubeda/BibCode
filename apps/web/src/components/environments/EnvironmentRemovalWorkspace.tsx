@@ -44,7 +44,7 @@ export function EnvironmentRemovalWorkspace({
   onRequestFreshPlan,
   onRemove,
 }: EnvironmentRemovalWorkspaceProps) {
-  const removalNow = useMemo(() => now ?? new Date(), [now]);
+  const removalNow = now ?? new Date();
   const [uninstallServer, setUninstallServer] = useState(false);
   const [purgeRemoteData, setPurgeRemoteData] = useState(false);
   const [typedAlias, setTypedAlias] = useState("");
@@ -61,7 +61,19 @@ export function EnvironmentRemovalWorkspace({
   const working = busy || submitting;
 
   const remove = async () => {
-    if (!validation.valid || working) return;
+    const currentValidation = validateEnvironmentRemoval(context, selection, now ?? new Date());
+    if (!currentValidation.valid || working) {
+      if (!currentValidation.valid) {
+        setOutcome({
+          status: "local-failed",
+          localRemoved: false,
+          remoteOutcome: "not-requested",
+          retainCatalog: true,
+          message: currentValidation.reason,
+        });
+      }
+      return;
+    }
     setSubmitting(true);
     setOutcome(null);
     try {
@@ -206,6 +218,11 @@ export function EnvironmentRemovalWorkspace({
                       </span>
                     </span>
                   </label>
+                  {availability.purgeActionReason ? (
+                    <p className="text-xs text-destructive" role="status">
+                      {availability.purgeActionReason} Data-preserving uninstall remains available.
+                    </p>
+                  ) : null}
                   {availability.remoteActionReason ? (
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/45 p-3 text-xs text-muted-foreground">
                       <span>{availability.remoteActionReason}</span>

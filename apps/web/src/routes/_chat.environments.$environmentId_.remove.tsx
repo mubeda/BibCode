@@ -1,8 +1,19 @@
 import { useAtomValue } from "@effect/atom-react";
+import type {
+  ConnectionTarget,
+  EnvironmentBinding,
+  EnvironmentRoute,
+} from "@bibcode/client-runtime/connection";
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
-import { EnvironmentId, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
+import {
+  EnvironmentId,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type DesktopEnvironmentRemovalPlan,
+  type DesktopEnvironmentRemovalResult,
+  type DesktopEnvironmentRemovalTarget,
+} from "@bibcode/contracts";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { EnvironmentRemovalWorkspace } from "../components/environments/EnvironmentRemovalWorkspace";
 import {
@@ -29,6 +40,76 @@ export function removalReachability(input: {
   return input.phase === "connected" ? "online" : "offline";
 }
 
+export interface EnvironmentRemovalHostAuthority {
+  readonly target: DesktopEnvironmentRemovalTarget;
+  readonly environmentGeneration: number;
+}
+
+export function environmentRemovalHostAuthority(input: {
+  readonly target: ConnectionTarget;
+  readonly routes: ReadonlyArray<EnvironmentRoute>;
+  readonly bindings: ReadonlyArray<EnvironmentBinding>;
+}): EnvironmentRemovalHostAuthority | null {
+  const activeTarget = input.target;
+  if (!("connectionId" in activeTarget)) return null;
+  const route = input.routes.find((candidate) => candidate.routeId === activeTarget.connectionId);
+  if (route?._tag === "DesktopWslRoute") {
+    const binding = input.bindings.find(
+      (candidate) =>
+        candidate._tag === "DesktopWslBinding" && candidate.bindingId === route.bindingId,
+    );
+    if (binding?._tag !== "DesktopWslBinding") return null;
+    return {
+      target: {
+        transport: "wsl",
+        distro: binding.distroName,
+        discoveryGeneration: binding.lastDiscoveryGeneration,
+      },
+      environmentGeneration: binding.lastDiscoveryGeneration,
+    };
+  }
+  if (route?._tag === "SshTunnelRoute" && route.hostKeyFingerprint !== null) {
+    if (!/^SHA256:[A-Za-z0-9+/]{43}$/u.test(route.hostKeyFingerprint)) return null;
+    return {
+      target: {
+        transport: "ssh",
+        target: route.target,
+        expectedHostKeyFingerprint: route.hostKeyFingerprint,
+      },
+      environmentGeneration: 0,
+    };
+  }
+  return null;
+}
+
+function assertVerifiedRemovalResult(input: {
+  readonly requestAction: "uninstall" | "purge";
+  readonly environmentId: EnvironmentId;
+  readonly storageId: string;
+  readonly result: DesktopEnvironmentRemovalResult;
+}): void {
+  if (
+    input.result.action !== input.requestAction ||
+    input.result.environmentId !== input.environmentId ||
+    input.result.storageId !== input.storageId ||
+    !input.result.verified
+  ) {
+    throw new Error("The desktop host returned a removal result for another environment.");
+  }
+  if (
+    input.requestAction === "uninstall" &&
+    (!input.result.dataRootPreserved || input.result.dataRemoved)
+  ) {
+    throw new Error("The desktop host could not verify that server data was preserved.");
+  }
+  if (
+    input.requestAction === "purge" &&
+    (!input.result.dataRemoved || input.result.dataRootPreserved)
+  ) {
+    throw new Error("The desktop host could not verify the approved remote data deletion.");
+  }
+}
+
 function EnvironmentRemovalRouteView() {
   const params = Route.useParams();
   const navigate = useNavigate();
@@ -42,6 +123,28 @@ function EnvironmentRemovalRouteView() {
     reportFailure: true,
   });
   const forgetEnvironment = useAtomCommand(environmentCatalog.forget, { reportFailure: false });
+  const [remotePlan, setRemotePlan] = useState<DesktopEnvironmentRemovalPlan | null>(null);
+  const [planningRemoval, setPlanningRemoval] = useState(false);
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+
+  const hostAuthority = useMemo(
+    () =>
+      environment === null || presentation === null
+        ? null
+        : environmentRemovalHostAuthority({
+            target: presentation.entry.target,
+            routes: environment.routes,
+            bindings: environment.bindings,
+          }),
+    [environment, presentation],
+  );
+  const alias =
+    environment?.alias ?? environment?.descriptor?.label ?? presentation?.label ?? "Environment";
+  const authorityKey = hostAuthority === null ? null : JSON.stringify(hostAuthority.target);
+
+  useEffect(() => {
+    setRemotePlan(null);
+  }, [alias, authorityKey, environmentId, environment?.acceptedStorageInstanceId]);
 
   const context = useMemo<EnvironmentRemovalContext | null>(() => {
     if (environment === null || presentation === null) return null;
@@ -51,8 +154,8 @@ function EnvironmentRemovalRouteView() {
     const wsl = environment.bindings.some((binding) => binding._tag === "DesktopWslBinding");
     return {
       environmentId,
-      environmentGeneration: 0,
-      alias: environment.alias ?? environment.descriptor?.label ?? presentation.label,
+      environmentGeneration: hostAuthority?.environmentGeneration ?? 0,
+      alias,
       kind: primary ? "primary" : wsl ? "wsl" : "remote",
       hidden: environment.hidden,
       reachability: removalReachability({
@@ -64,11 +167,51 @@ function EnvironmentRemovalRouteView() {
             : null,
       }),
       storageId: environment.acceptedStorageInstanceId,
-      // Remote host mutation is enabled only after Plan 70 supplies its removal-plan adapter.
-      hostAuthorityAvailable: false,
-      plan: null,
+      hostAuthorityAvailable:
+        hostAuthority !== null &&
+        bridge?.planEnvironmentRemoval !== undefined &&
+        bridge.executeEnvironmentRemoval !== undefined,
+      plan:
+        remotePlan === null
+          ? null
+          : { ...remotePlan, environmentGeneration: hostAuthority?.environmentGeneration ?? 0 },
     };
-  }, [environment, environmentId, presentation]);
+  }, [alias, bridge, environment, environmentId, hostAuthority, presentation, remotePlan]);
+
+  const requestFreshPlan = async () => {
+    if (
+      context === null ||
+      hostAuthority === null ||
+      context.storageId === null ||
+      bridge?.planEnvironmentRemoval === undefined
+    ) {
+      return;
+    }
+    setPlanningRemoval(true);
+    try {
+      const plan = await bridge.planEnvironmentRemoval({
+        target: hostAuthority.target,
+        expectedEnvironmentId: context.environmentId,
+        expectedStorageId: context.storageId,
+        environmentName: context.alias,
+      });
+      setRemotePlan(plan);
+    } catch (error) {
+      setRemotePlan(null);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not verify remote removal",
+          description:
+            error instanceof Error
+              ? error.message
+              : "The host did not return an identity-bound removal plan.",
+        }),
+      );
+    } finally {
+      setPlanningRemoval(false);
+    }
+  };
 
   const runVisibilityCommand = async (hidden: boolean) => {
     const result = await (hidden
@@ -143,10 +286,38 @@ function EnvironmentRemovalRouteView() {
       context,
       selection,
       {
-        executeRemote: async () => {
-          throw new Error(
-            "This build has no verified host-authority removal adapter. No remote action ran.",
+        executeRemote: async (request) => {
+          if (
+            hostAuthority === null ||
+            remotePlan === null ||
+            bridge?.executeEnvironmentRemoval === undefined ||
+            request.environmentId !== context.environmentId ||
+            request.planId !== remotePlan.planId
+          ) {
+            throw new Error("The verified host removal plan is no longer available.");
+          }
+          setRemotePlan(null);
+          const result = await bridge.executeEnvironmentRemoval(
+            request.action === "purge"
+              ? {
+                  action: "purge",
+                  target: hostAuthority.target,
+                  plan: remotePlan,
+                  confirmEnvironmentName: request.confirmEnvironmentName,
+                }
+              : {
+                  action: "uninstall",
+                  target: hostAuthority.target,
+                  plan: remotePlan,
+                },
           );
+          assertVerifiedRemovalResult({
+            requestAction: request.action,
+            environmentId: context.environmentId,
+            storageId: remotePlan.storageId,
+            result,
+          });
+          return { verified: true };
         },
         forgetLocal: async (id) => {
           const result = await forgetEnvironment(id);
@@ -187,6 +358,7 @@ function EnvironmentRemovalRouteView() {
     <ChatRouteInset>
       <EnvironmentRemovalWorkspace
         context={context}
+        busy={planningRemoval}
         onBack={() =>
           void navigate({
             to: "/environments/$environmentId",
@@ -197,7 +369,7 @@ function EnvironmentRemovalRouteView() {
         onHide={() => runVisibilityCommand(true)}
         onRestore={() => runVisibilityCommand(false)}
         onDisconnect={disconnect}
-        onRequestFreshPlan={() => undefined}
+        onRequestFreshPlan={requestFreshPlan}
         onRemove={remove}
       />
     </ChatRouteInset>

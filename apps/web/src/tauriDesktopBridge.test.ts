@@ -140,6 +140,7 @@ function installTauriHarness(options?: {
             updater: false,
             menuEvents: true,
             sshProvisioning: true,
+            environmentRemoval: true,
           },
         });
       case "desktop_bridge_check_for_update":
@@ -278,6 +279,35 @@ function installTauriHarness(options?: {
         });
       case "desktop_bridge_cancel_wsl_setup":
         return Promise.resolve(true);
+      case "desktop_bridge_plan_environment_removal":
+        return Promise.resolve({
+          schemaVersion: 1,
+          planId: "6eef32c8-3c6d-4c0d-ad5c-2e9f6dd54074",
+          target: { transport: "wsl", distro: "Ubuntu", discoveryGeneration: 7 },
+          environmentId: "76aa78e8-67aa-477e-bd25-68f491885224",
+          storageId: "3039b232-95d0-4b2f-a35e-c297b4c895af",
+          environmentName: "Build host",
+          dataRoot: "/home/dev/.bibcode",
+          projectCount: 0,
+          worktreeCount: 0,
+          processCount: 0,
+          otherPairedClientCount: 1,
+          createdAt: "2036-08-25T12:00:00.000Z",
+          expiresAt: "2036-08-25T12:05:00.000Z",
+          uninstallSupported: true,
+          uninstallUnavailableReason: null,
+        });
+      case "desktop_bridge_execute_environment_removal":
+        return Promise.resolve({
+          action: "uninstall",
+          environmentId: "76aa78e8-67aa-477e-bd25-68f491885224",
+          storageId: "3039b232-95d0-4b2f-a35e-c297b4c895af",
+          serviceRemoved: true,
+          binaryRemoved: true,
+          dataRemoved: false,
+          dataRootPreserved: true,
+          verified: true,
+        });
       case "desktop_bridge_get_wsl_state":
       case "desktop_bridge_refresh_wsl_discovery":
         return options?.rejectFallbackCommands
@@ -696,6 +726,7 @@ describe("tauriDesktopBridge", () => {
         sshRemoteHttp: true,
         connectionCatalog: true,
         protectedConnectionCatalog: true,
+        environmentRemoval: true,
         preview: false,
         updater: false,
         menuEvents: true,
@@ -1513,6 +1544,33 @@ describe("tauriDesktopBridge", () => {
     await Promise.resolve();
     expect(harness.unlisteners.get("desktop:wsl-discovery-changed")).toHaveBeenCalledTimes(1);
     expect(harness.unlisteners.get("desktop:remote-setup-progress")).toHaveBeenCalledTimes(1);
+  });
+
+  it("decodes identity-bound environment removal plans and verified effects", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const target = { transport: "wsl" as const, distro: "Ubuntu", discoveryGeneration: 7 };
+    const input = {
+      target,
+      expectedEnvironmentId: EnvironmentId.make("76aa78e8-67aa-477e-bd25-68f491885224"),
+      expectedStorageId: "3039b232-95d0-4b2f-a35e-c297b4c895af",
+      environmentName: "Build host",
+    };
+    const plan = await bridge.planEnvironmentRemoval?.(input);
+    expect(plan).toMatchObject({ environmentName: "Build host", uninstallSupported: true });
+    await expect(
+      bridge.executeEnvironmentRemoval?.({ action: "uninstall", target, plan: plan! }),
+    ).resolves.toMatchObject({
+      action: "uninstall",
+      dataRootPreserved: true,
+      verified: true,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_plan_environment_removal", {
+      input,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_execute_environment_removal", {
+      input: { action: "uninstall", target, plan },
+    });
   });
 
   it("wraps Tauri event listeners and tears them down", async () => {

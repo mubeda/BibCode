@@ -8,12 +8,16 @@ export interface EnvironmentRemovalPlan {
   readonly environmentId: EnvironmentId;
   readonly environmentGeneration: number;
   readonly storageId: string;
+  readonly environmentName: string;
   readonly dataRoot: string;
   readonly projectCount: number;
   readonly worktreeCount: number;
   readonly processCount: number;
   readonly otherPairedClientCount: number;
+  readonly createdAt: string;
   readonly expiresAt: string;
+  readonly uninstallSupported: boolean;
+  readonly uninstallUnavailableReason: string | null;
 }
 
 export interface EnvironmentRemovalContext {
@@ -44,6 +48,7 @@ export interface EnvironmentRemovalAvailability {
   readonly canUninstall: boolean;
   readonly canPurge: boolean;
   readonly remoteActionReason: string | null;
+  readonly purgeActionReason: string | null;
 }
 
 export type EnvironmentRemovalValidation =
@@ -61,6 +66,7 @@ export type EnvironmentRemoteRemovalRequest =
       readonly action: "purge";
       readonly environmentId: EnvironmentId;
       readonly planId: string;
+      readonly confirmEnvironmentName: string;
       readonly preserveData: false;
     };
 
@@ -83,6 +89,23 @@ function isOnline(context: EnvironmentRemovalContext): boolean {
   return context.reachability === "online";
 }
 
+function purgeBlockReason(plan: EnvironmentRemovalPlan): string | null {
+  if (plan.projectCount === 0 && plan.worktreeCount === 0 && plan.processCount === 0) return null;
+  const blockers: string[] = [];
+  if (plan.projectCount > 0) {
+    blockers.push(`${plan.projectCount} project${plan.projectCount === 1 ? "" : "s"}`);
+  }
+  if (plan.worktreeCount > 0) {
+    blockers.push(`${plan.worktreeCount} worktree${plan.worktreeCount === 1 ? "" : "s"}`);
+  }
+  const ownedData = blockers.join(" and ");
+  const processAction =
+    plan.processCount === 0
+      ? ""
+      : `${ownedData === "" ? "Stop" : ", and stop"} ${plan.processCount} running process${plan.processCount === 1 ? "" : "es"}`;
+  return `${ownedData === "" ? "" : `Remove ${ownedData}`}${processAction} before deleting remote data.`;
+}
+
 export function isFreshEnvironmentRemovalPlan(
   context: EnvironmentRemovalContext,
   now: Date,
@@ -95,6 +118,7 @@ export function isFreshEnvironmentRemovalPlan(
     plan.environmentGeneration === context.environmentGeneration &&
     context.storageId !== null &&
     plan.storageId === context.storageId &&
+    plan.environmentName === context.alias &&
     Number.isFinite(Date.parse(plan.expiresAt)) &&
     Date.parse(plan.expiresAt) > now.getTime()
   );
@@ -119,9 +143,19 @@ export function getEnvironmentRemovalAvailability(
     remoteActionReason = "This client has no verified host-authority channel for remote actions.";
   } else if (!freshPlan) {
     remoteActionReason = "Fetch a fresh removal plan before changing the remote host.";
+  } else if (!context.plan.uninstallSupported) {
+    remoteActionReason =
+      context.plan.uninstallUnavailableReason ??
+      "This server installation cannot be safely removed by this client.";
   }
 
-  const canMutateRemote = !primary && online && context.hostAuthorityAvailable && freshPlan;
+  const canMutateRemote =
+    !primary &&
+    online &&
+    context.hostAuthorityAvailable &&
+    freshPlan &&
+    context.plan.uninstallSupported;
+  const purgeActionReason = canMutateRemote ? purgeBlockReason(context.plan) : null;
   return {
     canDisconnect: !primary && online,
     canHide: !primary && !context.hidden,
@@ -129,8 +163,9 @@ export function getEnvironmentRemovalAvailability(
     canForget: !primary && online,
     canForceRemove: !primary && !online,
     canUninstall: canMutateRemote,
-    canPurge: canMutateRemote,
+    canPurge: canMutateRemote && purgeActionReason === null,
     remoteActionReason: canMutateRemote ? null : remoteActionReason,
+    purgeActionReason,
   };
 }
 
@@ -170,6 +205,18 @@ export function validateEnvironmentRemoval(
   }
   if (!isFreshEnvironmentRemovalPlan(context, now)) {
     return { valid: false, reason: "The removal plan is missing, stale, or for another identity." };
+  }
+  if (!context.plan.uninstallSupported) {
+    return {
+      valid: false,
+      reason:
+        context.plan.uninstallUnavailableReason ??
+        "This server installation cannot be safely removed by this client.",
+    };
+  }
+  if (selection.purgeRemoteData) {
+    const reason = purgeBlockReason(context.plan);
+    if (reason !== null) return { valid: false, reason };
   }
   if (selection.purgeRemoteData && selection.typedAlias !== context.alias) {
     return { valid: false, reason: `Type ${context.alias} exactly to delete remote data.` };
@@ -213,6 +260,7 @@ export async function executeEnvironmentRemoval(
               action: "purge",
               environmentId: context.environmentId,
               planId: plan.planId,
+              confirmEnvironmentName: selection.typedAlias,
               preserveData: false,
             }
           : {

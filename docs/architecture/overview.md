@@ -611,6 +611,16 @@ requires an explicit versioned plan plus a trusted host-authority channel and
 reports independently from local removal; an offline force-Forget cannot
 claim or schedule remote cleanup.
 
+The desktop host-authority channel is deliberately narrower than an ordinary
+connection route. It accepts the current Running WSL binding/discovery
+generation or the active SSH target plus its persisted SHA-256 host-key pin.
+Direct HTTPS never grants filesystem or service authority. Plans bind the
+environment, storage, alias, exact root, expiry, and effect counts. Purge is
+blocked by owned projects, worktrees, or processes in both the renderer and
+server, while uninstall preserves the data root. Only BiBCode-managed portable
+layouts can be removed remotely; native packages remain owned by their OS
+uninstaller.
+
 ## Boundaries and invariants
 
 ```text

@@ -439,6 +439,20 @@ requires explicit unknown-outcome confirmation, executes no remote command,
 queues nothing for reconnect, and warns that the server, projects, worktrees,
 credentials, and data may remain.
 
+The renderer derives host authority from the active route, never merely from a
+reachable endpoint. WSL supplies its authoritative distro and discovery
+generation; SSH supplies the normalized target and saved SHA-256 host-key pin.
+Direct HTTPS is excluded. The bridge returns a short-lived plan bound to the
+accepted environment/storage identities, alias, and canonical data root.
+The desktop keeps the issued capability in a bounded in-memory store and
+atomically consumes it before host dispatch only when the renderer returns that
+exact target and plan. Restart, prior consumption, modification, duplicate
+delivery, or cross-host replay invalidates it.
+Execution repeats the host probe, identity/root checks, and server-side purge
+guards. The result must prove service/binary removal and either preserved or
+deleted data exactly as requested before Forget starts. A failed or mismatched
+result leaves the catalog intact for retry.
+
 ## Worktree catalog subscriptions
 
 The worktree catalog is capability gated through one exported policy selector.

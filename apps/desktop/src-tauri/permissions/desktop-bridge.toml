@@ -38,6 +38,8 @@ commands.allow = [
   "desktop_bridge_prepare_wsl_server",
   "desktop_bridge_install_wsl_server",
   "desktop_bridge_cancel_wsl_setup",
+  "desktop_bridge_plan_environment_removal",
+  "desktop_bridge_execute_environment_removal",
   "desktop_bridge_get_wsl_state",
   "desktop_bridge_refresh_wsl_discovery",
   "desktop_bridge_set_wsl_backend_enabled",

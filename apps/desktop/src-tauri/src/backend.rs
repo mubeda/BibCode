@@ -746,6 +746,27 @@ impl BackendProjectDataOperation {
         Ok(())
     }
 
+    pub(crate) fn expect_selected_exit(&self) -> Result<(), String> {
+        let mut state = self
+            .supervisor
+            .state
+            .lock()
+            .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+        let slot = state
+            .slots
+            .get_mut(&self.target.environment_id)
+            .ok_or_else(|| "The selected desktop backend is no longer registered.".to_owned())?;
+        slot.restart_scheduled = false;
+        let backend = slot.backend.as_ref().ok_or_else(|| {
+            "The selected desktop backend stopped before removal began.".to_owned()
+        })?;
+        match backend {
+            ManagedBackend::Child(child) => child.request_stop(),
+            ManagedBackend::Runtime(runtime) => runtime.request_stop(),
+        }
+        Ok(())
+    }
+
     pub(crate) async fn restart_after_commit(&self) -> Result<(), String> {
         self.supervisor
             .start_with_options_inner(

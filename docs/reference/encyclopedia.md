@@ -90,9 +90,10 @@ to the client's DPoP key.
 
 ### Local Control
 
-The host-only, versioned protocol used for pairing creation and bounded
-service/update drain coordination. It uses a protected Unix socket on macOS and
-Linux or a remote-rejecting named pipe on Windows and never falls back to HTTP.
+The host-only, versioned protocol used for pairing creation, bounded
+service/update drain coordination, and fresh purge authorization. It uses a
+protected Unix socket on macOS and Linux or a remote-rejecting named pipe on
+Windows and never falls back to HTTP.
 
 ### Host Authority Channel
 

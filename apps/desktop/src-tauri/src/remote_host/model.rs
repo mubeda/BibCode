@@ -32,6 +32,9 @@ pub(crate) enum RemoteCommandPurpose {
     VerifyTransferSize,
     Install,
     Service,
+    RemovalPlan,
+    RemovalExecute,
+    RemovalCleanup,
     Cleanup,
 }
 

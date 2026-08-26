@@ -193,7 +193,7 @@ fn encode_powershell_command(script: &str) -> String {
     STANDARD.encode(bytes)
 }
 
-fn powershell_command(
+pub(crate) fn powershell_command(
     purpose: RemoteCommandPurpose,
     script: &'static str,
     stdin: RemoteStdin,

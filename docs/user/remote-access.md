@@ -245,11 +245,14 @@ re-enroll it before remote administration.
 
 **Disconnect** and ordinary **Forget** are local operations: they drain the
 owned SSH work, close the tunnel, remove local authorization and catalog state,
-and leave the remote service and data unchanged. The current release does not
-offer remote uninstall from this dialog. If a later release offers it, it is an
-optional, separately confirmed host-administration operation. When the host is
-offline or remote cleanup cannot be proved, force local removal must explicitly
-warn that the server, projects, worktrees, credentials, and data may still be
+and leave the remote service and data unchanged. The center removal workspace
+can separately preview and run remote uninstall or purge while the SSH route is
+online and its saved SHA-256 host-key pin still matches. Uninstall is optional
+and preserves the data root; purge requires an exact-name plan and zero owned
+projects, worktrees, or processes. Only the BiBCode-managed portable layout can
+be removed this way. Use the OS uninstaller for a native package. When the host
+is offline or remote cleanup cannot be proved, force local removal explicitly
+warns that the server, projects, worktrees, credentials, and data may still be
 present on the remote machine.
 
 Use the environment's center removal workspace for these choices. Offline
