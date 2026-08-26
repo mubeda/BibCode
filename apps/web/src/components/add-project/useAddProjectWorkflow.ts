@@ -9,8 +9,6 @@ import {
   type AtomCommandResult,
 } from "@bibcode/client-runtime/state/runtime";
 import {
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  DEFAULT_RUNTIME_MODE,
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
@@ -24,11 +22,9 @@ import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEn
 import { useDesktopLocalBootstraps } from "~/connection/useDesktopLocalBootstraps";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { readLocalApi } from "~/localApi";
-import { newThreadId } from "~/lib/utils";
 import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
-import { readEnvironmentThreadRefs, readThreadShell, useProjects } from "~/state/entities";
+import { useProjects } from "~/state/entities";
 import { projectEnvironment } from "~/state/projects";
-import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { vcsEnvironment } from "~/state/vcs";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
@@ -559,7 +555,6 @@ export function useAddProjectWorkflow(input: {
   projectsRef.current = projects;
   const navigate = useNavigate();
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
-  const createDefaultThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
   const cloneRepository = useAtomCommand(vcsEnvironment.clone, { reportFailure: false });
   const primaryEnvironmentId =
     primaryEnvironment?.environmentId ?? EnvironmentId.make(PRIMARY_LOCAL_ENVIRONMENT_ID);
@@ -652,7 +647,8 @@ export function useAddProjectWorkflow(input: {
                 }
                 return {
                   projectId: result.projectId,
-                  defaultThreadId: result.mainThreadId,
+                  mainThreadId: result.mainThreadId,
+                  disposition: result.disposition,
                 };
               },
             ),
@@ -669,12 +665,6 @@ export function useAddProjectWorkflow(input: {
             }),
           ),
         openProject: async (commandInput) => {
-          let defaultThreadId =
-            commandInput.defaultThreadId ??
-            readEnvironmentThreadRefs(commandInput.environmentId).find((ref) => {
-              const thread = readThreadShell(ref);
-              return thread?.projectId === commandInput.projectId && thread.kind === "default";
-            })?.threadId;
           const serverConfig = environments.find(
             (candidate) => candidate.environmentId === commandInput.environmentId,
           )?.serverConfig;
@@ -683,44 +673,7 @@ export function useAddProjectWorkflow(input: {
             buildProviderAgentActions(serverConfig?.providers ?? [], settings),
             settings.defaultAgent,
           );
-          if (!defaultThreadId) {
-            defaultThreadId = newThreadId();
-            const project = projectsRef.current.find(
-              (candidate) =>
-                candidate.environmentId === commandInput.environmentId &&
-                candidate.id === commandInput.projectId,
-            );
-            const resolution = resolveProviderSessionSelectionForInstance({
-              instanceId: selectedAction?.entry.instanceId ?? ProviderInstanceId.make("codex"),
-              providers: serverConfig?.providers ?? [],
-              settings,
-              projectSelection: project?.defaultModelSelection ?? null,
-            });
-            if (resolution.fallback) {
-              console.warn("Provider session default fallback", resolution.fallback);
-            }
-            const created = adaptAtomResult(
-              mapAtomCommandResult(
-                await createDefaultThread({
-                  environmentId: commandInput.environmentId,
-                  input: {
-                    threadId: defaultThreadId,
-                    projectId: commandInput.projectId,
-                    title: project?.title ?? "Main",
-                    modelSelection: resolution.modelSelection,
-                    runtimeMode: DEFAULT_RUNTIME_MODE,
-                    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                    branch: null,
-                  },
-                }),
-                () => undefined,
-              ),
-            );
-            if (created._tag === "Failure") {
-              return created;
-            }
-          }
-          const threadRef = scopeThreadRef(commandInput.environmentId, defaultThreadId);
+          const threadRef = scopeThreadRef(commandInput.environmentId, commandInput.mainThreadId);
           if (
             selectedAction?.kind === "terminal" &&
             selectedAction.terminalAction.command !== null
@@ -730,7 +683,7 @@ export function useAddProjectWorkflow(input: {
               command: selectedAction.terminalAction.command,
             });
           }
-          return adaptAtomResult(
+          const navigated = adaptAtomResult(
             await settlePromise(() =>
               navigate({
                 to: "/$environmentId/$threadId",
@@ -738,6 +691,10 @@ export function useAddProjectWorkflow(input: {
               }),
             ),
           );
+          if (navigated._tag === "Success" && commandInput.disposition === "existing") {
+            toastManager.add({ type: "info", title: "Already added in this environment." });
+          }
+          return navigated;
         },
         reportFailure: (title, error) => {
           toastManager.add(
@@ -749,7 +706,7 @@ export function useAddProjectWorkflow(input: {
           );
         },
       }),
-    [cloneRepository, createDefaultThread, createProject, environments, navigate],
+    [cloneRepository, createProject, environments, navigate],
   );
 
   const wslCandidates = useMemo(

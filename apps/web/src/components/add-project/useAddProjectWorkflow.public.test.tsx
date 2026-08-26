@@ -39,6 +39,7 @@ const harness = vi.hoisted(() => ({
   readEnvironmentThreadRefs: vi.fn(),
   readThreadShell: vi.fn(),
   replaceMainWithTerminal: vi.fn(),
+  toastAdd: vi.fn(),
   onOpenChange: vi.fn(),
 }));
 
@@ -58,6 +59,11 @@ vi.mock("~/centerPanelStore", () => ({
   useCenterPanelStore: {
     getState: () => ({ replaceMainWithTerminal: harness.replaceMainWithTerminal }),
   },
+}));
+
+vi.mock("../ui/toast", () => ({
+  stackedThreadToast: (toast: unknown) => toast,
+  toastManager: { add: (toast: unknown) => harness.toastAdd(toast) },
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -301,6 +307,7 @@ beforeEach(() => {
   harness.readEnvironmentThreadRefs.mockReset().mockReturnValue([]);
   harness.readThreadShell.mockReset().mockReturnValue(null);
   harness.replaceMainWithTerminal.mockReset();
+  harness.toastAdd.mockReset();
   harness.onOpenChange.mockReset();
 });
 
@@ -561,6 +568,10 @@ describe("useAddProjectWorkflow public adapter", () => {
       to: "/$environmentId/$threadId",
       params: { environmentId, threadId: canonicalThreadId },
     });
+    expect(harness.toastAdd).toHaveBeenCalledWith({
+      type: "info",
+      title: "Already added in this environment.",
+    });
   });
 
   it("fails closed instead of manufacturing a Main when the server omits it", async () => {
@@ -581,6 +592,12 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(harness.createProject).toHaveBeenCalledTimes(1);
     expect(harness.createThread).not.toHaveBeenCalled();
     expect(harness.navigate).not.toHaveBeenCalled();
+    expect(harness.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Failed to add project",
+      }),
+    );
   });
 
   it("keeps the canonical Main chat fallback when no provider is ready", async () => {

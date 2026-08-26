@@ -356,15 +356,15 @@ and 29 skipped. The first sandboxed full run could not bind loopback test ports
 - Modify: `apps/web/src/hooks/useHandleNewThread.ts`, test
 - Modify: `apps/web/src/components/Sidebar.logic.ts`, test
 
-- [ ] **Step 1: Write failing Main and duplicate-add tests**
+- [x] **Step 1: Write failing Main and duplicate-add tests**
 
 Assert project click navigates to its existing default thread, Main reads `Main` even when stored title differs, Main has no rename/archive/delete menu, missing Main reports an invariant fault without a client-created thread, and `disposition: existing` focuses the returned project/Main with an informational notice.
 
-- [ ] **Step 2: Delete client-side default-thread creation**
+- [x] **Step 2: Delete client-side default-thread creation**
 
 Remove the fallback in `handlePrimaryRowClick`, `newThreadId()`, provider fallback selection, and `createDefaultThread`. Plan 10 guarantees `mainThreadId` in project create/read results.
 
-- [ ] **Step 3: Handle idempotent project creation**
+- [x] **Step 3: Handle idempotent project creation**
 
 ```ts
 if (result.disposition === "existing") {
@@ -375,17 +375,29 @@ if (result.disposition === "existing") {
 
 An identical remote in another environment remains unrelated; an independent clone in the same environment is accepted by the server and receives its own project/Main.
 
-- [ ] **Step 4: Preserve flat workspace semantics**
+- [x] **Step 4: Preserve flat workspace semantics**
 
 Main remains first. Ordinary and worktree-backed threads keep current activity, branch, missing-path, dirty, locked, detach, Git removal-plan, terminal, unread, and pin behaviors without adding a Worktrees parent.
 
-- [ ] **Step 5: Run workflow/sidebar tests and commit**
+- [x] **Step 5: Run workflow/sidebar tests and commit**
 
 ```sh
 vp test apps/web/src/components/add-project/useAddProjectWorkflow.test.ts apps/web/src/hooks/useHandleNewThread.test.tsx apps/web/src/components/sidebar/ProjectRow.test.tsx apps/web/src/components/Sidebar.logic.test.ts
 git add apps/web/src/components/add-project/useAddProjectWorkflow.ts apps/web/src/components/add-project/useAddProjectWorkflow.test.ts apps/web/src/hooks/useHandleNewThread.ts apps/web/src/hooks/useHandleNewThread.test.tsx apps/web/src/components/sidebar/ProjectRow.tsx apps/web/src/components/sidebar/ProjectRow.test.tsx apps/web/src/components/Sidebar.logic.ts apps/web/src/components/Sidebar.logic.test.ts
 git commit -m "feat(web): open permanent Main for project navigation"
 ```
+
+Implementation evidence: add/register/clone now carry the required
+server-returned `mainThreadId` and `created | existing` disposition through one
+typed operation boundary. The client no longer searches the shell cache or
+creates a replacement default thread. An existing repository claim navigates
+to its authoritative project/Main and emits the approved informational notice;
+a malformed response fails closed and reports the invariant fault. Project-row
+activation resolves Main only inside the owning environment, while the tested
+context-menu matrix keeps Main immutable and preserves ordinary/worktree
+archive, delete, and removal behavior without a Worktrees parent. The focused
+gate passed 201 tests and the web package typecheck passed. Independent review
+returned CLEAR with no P0-P2 findings.
 
 ### Task 6: Add ancestor-preserving search and central offline mutation admission
 

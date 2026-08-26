@@ -34,7 +34,8 @@ export interface AddProjectOperationsDependencies {
   }) => Promise<
     AddProjectCommandResult<{
       readonly projectId: ProjectId;
-      readonly defaultThreadId?: ThreadId;
+      readonly mainThreadId: ThreadId;
+      readonly disposition: "created" | "existing";
     }>
   >;
   readonly cloneRepository: (input: {
@@ -45,7 +46,8 @@ export interface AddProjectOperationsDependencies {
   readonly openProject: (input: {
     readonly environmentId: EnvironmentId;
     readonly projectId: ProjectId;
-    readonly defaultThreadId?: ThreadId;
+    readonly mainThreadId: ThreadId;
+    readonly disposition: "created" | "existing";
   }) => Promise<AddProjectCommandResult<void>>;
   readonly reportFailure: (title: string, error: unknown) => void;
 }
@@ -116,7 +118,7 @@ export function createAddProjectOperations(dependencies: AddProjectOperationsDep
       return false;
     }
     projectId = created.value.projectId;
-    const defaultThreadId = created.value.defaultThreadId;
+    const { disposition, mainThreadId } = created.value;
     if (!input.shouldContinue()) {
       return false;
     }
@@ -124,7 +126,8 @@ export function createAddProjectOperations(dependencies: AddProjectOperationsDep
       dependencies.openProject({
         environmentId: input.environmentId,
         projectId,
-        ...(defaultThreadId ? { defaultThreadId } : {}),
+        mainThreadId,
+        disposition,
       }),
     );
     if (opened === null || !input.shouldContinue()) {

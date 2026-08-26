@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { scopedProjectKey, scopeProjectRef } from "@bibcode/client-runtime/environment";
 import {
   createThreadJumpHintVisibilityController,
+  buildSidebarThreadContextMenuItems,
   findDefaultThread,
   formatSessionDuration,
   getSidebarThreadIdsToPrewarm,
@@ -16,6 +17,7 @@ import {
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   resolveProjectStatusIndicator,
+  resolveProjectMainThread,
   resolveSidebarNewThreadSeedContext,
   resolveSidebarNewThreadEnvMode,
   resolveSidebarProjectAvailability,
@@ -1421,6 +1423,77 @@ describe("findDefaultThread / splitPrimaryAndWorkspaceThreads", () => {
   it("panel threads are never picked as the primary thread", () => {
     const threads = [{ id: "p1", kind: "panel" as const }];
     expect(findDefaultThread(threads)).toBeNull();
+  });
+});
+
+describe("resolveProjectMainThread", () => {
+  it("returns only the permanent Main owned by the selected environment and project", () => {
+    const remoteEnvironmentId = EnvironmentId.make("environment-remote-main");
+    const projectId = ProjectId.make("project-main");
+    const wrongEnvironmentMain = {
+      id: ThreadId.make("wrong-environment-main"),
+      environmentId: localEnvironmentId,
+      projectId,
+      kind: "default" as const,
+    };
+    const ordinaryThread = {
+      id: ThreadId.make("ordinary-thread"),
+      environmentId: remoteEnvironmentId,
+      projectId,
+      kind: "workspace" as const,
+    };
+    const mainThread = {
+      id: ThreadId.make("canonical-main"),
+      environmentId: remoteEnvironmentId,
+      projectId,
+      kind: "default" as const,
+    };
+
+    expect(
+      resolveProjectMainThread(
+        [wrongEnvironmentMain, ordinaryThread, mainThread],
+        scopeProjectRef(remoteEnvironmentId, projectId),
+      ),
+    ).toBe(mainThread);
+  });
+
+  it("returns null instead of manufacturing a Main when the invariant is missing", () => {
+    expect(
+      resolveProjectMainThread(
+        [
+          {
+            id: ThreadId.make("ordinary-only"),
+            environmentId: localEnvironmentId,
+            projectId: ProjectId.make("project-without-main"),
+            kind: "workspace" as const,
+          },
+        ],
+        scopeProjectRef(localEnvironmentId, ProjectId.make("project-without-main")),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("buildSidebarThreadContextMenuItems", () => {
+  it.each([
+    {
+      role: "main" as const,
+      expected: ["open", "mark-unread", "toggle-pin"],
+    },
+    {
+      role: "ordinary" as const,
+      expected: ["open", "mark-unread", "toggle-pin", "archive", "delete"],
+    },
+    {
+      role: "worktree" as const,
+      expected: ["open", "mark-unread", "toggle-pin", "remove-worktree"],
+    },
+  ])("preserves the $role action contract", ({ role, expected }) => {
+    expect(
+      buildSidebarThreadContextMenuItems({ role, isPinned: false, isUnread: false }).map(
+        (item) => item.id,
+      ),
+    ).toEqual(expected);
   });
 });
 

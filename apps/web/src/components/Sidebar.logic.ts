@@ -2,7 +2,7 @@ import * as React from "react";
 import type { SidebarThreadSortOrder } from "@bibcode/contracts/settings";
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
 import type { ConnectionCatalogHealth } from "@bibcode/client-runtime/platform";
-import type { EnvironmentId } from "@bibcode/contracts";
+import type { EnvironmentId, ScopedProjectRef } from "@bibcode/contracts";
 import { sortThreads, type ThreadSortInput } from "../lib/threadSort";
 import type { SidebarThreadSummary, Thread } from "../types";
 import { cn } from "../lib/utils";
@@ -24,6 +24,55 @@ export const THREAD_JUMP_HINT_SHOW_DELAY_MS = 100;
 // nearby thread usually reuses an already-hot subscription.
 export const SIDEBAR_THREAD_PREWARM_LIMIT = 10;
 export type SidebarNewThreadEnvMode = "local" | "worktree";
+
+interface ProjectMainThreadCandidate {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: string;
+  readonly kind?: "default" | "workspace" | "panel" | undefined;
+}
+
+export function resolveProjectMainThread<T extends ProjectMainThreadCandidate>(
+  threads: readonly T[],
+  projectRef: ScopedProjectRef,
+): T | null {
+  return (
+    threads.find(
+      (thread) =>
+        thread.environmentId === projectRef.environmentId &&
+        thread.projectId === projectRef.projectId &&
+        thread.kind === "default",
+    ) ?? null
+  );
+}
+
+export interface SidebarThreadContextMenuItem {
+  readonly id: string;
+  readonly label: string;
+  readonly destructive?: boolean;
+}
+
+export function buildSidebarThreadContextMenuItems(input: {
+  readonly role: "main" | "ordinary" | "worktree";
+  readonly isPinned: boolean;
+  readonly isUnread: boolean;
+}): readonly SidebarThreadContextMenuItem[] {
+  return [
+    { id: "open", label: "Open" },
+    {
+      id: input.isUnread ? "mark-read" : "mark-unread",
+      label: input.isUnread ? "Mark read" : "Mark unread",
+    },
+    { id: "toggle-pin", label: input.isPinned ? "Unpin" : "Pin" },
+    ...(input.role === "main"
+      ? []
+      : input.role === "worktree"
+        ? [{ id: "remove-worktree", label: "Remove worktree", destructive: true }]
+        : [
+            { id: "archive", label: "Archive" },
+            { id: "delete", label: "Delete", destructive: true },
+          ]),
+  ];
+}
 
 export type SidebarProjectAvailabilityView =
   | {

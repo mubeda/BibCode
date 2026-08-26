@@ -123,7 +123,11 @@ function deferredResult<T>(): {
 function makeIntegratedOperations() {
   const createProject = vi.fn<AddProjectOperationsDependencies["createProject"]>(async (input) => ({
     _tag: "Success",
-    value: { projectId: input.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+    value: {
+      projectId: input.projectId,
+      mainThreadId: DEFAULT_THREAD_ID,
+      disposition: "created",
+    },
   }));
   const cloneRepository = vi.fn<AddProjectOperationsDependencies["cloneRepository"]>(async () => ({
     _tag: "Success",
@@ -502,7 +506,8 @@ describe("useAddProjectWorkflowState", () => {
     const createResult = deferredResult<
       AddProjectCommandResult<{
         readonly projectId: ProjectId;
-        readonly defaultThreadId: ThreadId;
+        readonly mainThreadId: ThreadId;
+        readonly disposition: "created" | "existing";
       }>
     >();
     harness.createProject.mockReturnValue(createResult.promise);
@@ -535,7 +540,8 @@ describe("useAddProjectWorkflowState", () => {
     const createResult = deferredResult<
       AddProjectCommandResult<{
         readonly projectId: ProjectId;
-        readonly defaultThreadId: ThreadId;
+        readonly mainThreadId: ThreadId;
+        readonly disposition: "created" | "existing";
       }>
     >();
     harness.createProject.mockReturnValue(createResult.promise);
@@ -559,7 +565,11 @@ describe("useAddProjectWorkflowState", () => {
       if (command === undefined) throw new Error("Missing project command");
       createResult.resolve({
         _tag: "Success",
-        value: { projectId: command.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+        value: {
+          projectId: command.projectId,
+          mainThreadId: DEFAULT_THREAD_ID,
+          disposition: "created",
+        },
       });
       await submission;
     });
@@ -574,7 +584,8 @@ describe("useAddProjectWorkflowState", () => {
     const createResult = deferredResult<
       AddProjectCommandResult<{
         readonly projectId: ProjectId;
-        readonly defaultThreadId: ThreadId;
+        readonly mainThreadId: ThreadId;
+        readonly disposition: "created" | "existing";
       }>
     >();
     harness.createProject.mockReturnValue(createResult.promise);
@@ -594,7 +605,11 @@ describe("useAddProjectWorkflowState", () => {
       if (command === undefined) throw new Error("Missing project command");
       createResult.resolve({
         _tag: "Success",
-        value: { projectId: command.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+        value: {
+          projectId: command.projectId,
+          mainThreadId: DEFAULT_THREAD_ID,
+          disposition: "created",
+        },
       });
       await submission;
     });

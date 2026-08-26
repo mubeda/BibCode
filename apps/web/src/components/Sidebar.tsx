@@ -60,8 +60,10 @@ import type { Project, SidebarThreadSummary } from "../types";
 import { useEnvironmentNavigationState } from "../useEnvironmentNavigationState";
 import { useClientSettings } from "~/hooks/useSettings";
 import {
+  buildSidebarThreadContextMenuItems,
   getSidebarThreadIdsToPrewarm,
   resolveAdjacentThreadId,
+  resolveProjectMainThread,
   resolveProjectStatusIndicator,
   resolveSidebarStageBadgeLabel,
   resolveThreadStatusPill,
@@ -656,13 +658,23 @@ export default function Sidebar() {
       const thread =
         row.kind === "thread"
           ? sidebarThreadByKey.get(scopedThreadKey(scopeThreadRef(row.environmentId, row.threadId)))
-          : sidebarThreads.find(
-              (candidate) =>
-                candidate.environmentId === row.environmentId &&
-                candidate.projectId === row.projectId &&
-                candidate.kind === "default",
+          : resolveProjectMainThread(
+              sidebarThreads,
+              scopeProjectRef(row.environmentId, row.projectId),
             );
-      if (!thread) return;
+      if (!thread) {
+        if (row.kind === "project") {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Project Main unavailable",
+              description:
+                "The server did not provide the permanent Main thread for this project. Reconnect the environment and try again.",
+            }),
+          );
+        }
+        return;
+      }
       const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
       markThreadRowRead(threadKey);
       navigateToThread(scopeThreadRef(thread.environmentId, thread.id));
@@ -722,22 +734,7 @@ export default function Sidebar() {
         const isPinned = selectIsPinned(pinnedThreadKeys, threadKey);
         const isUnread = selectIsUnread(unreadThreadKeys, threadKey);
         const clicked = await api.contextMenu.show(
-          [
-            { id: "open", label: "Open" },
-            {
-              id: isUnread ? "mark-read" : "mark-unread",
-              label: isUnread ? "Mark read" : "Mark unread",
-            },
-            { id: "toggle-pin", label: isPinned ? "Unpin" : "Pin" },
-            ...(row.role === "main"
-              ? []
-              : row.role === "worktree"
-                ? [{ id: "remove-worktree", label: "Remove worktree", destructive: true }]
-                : [
-                    { id: "archive", label: "Archive" },
-                    { id: "delete", label: "Delete", destructive: true },
-                  ]),
-          ],
+          buildSidebarThreadContextMenuItems({ role: row.role, isPinned, isUnread }),
           position,
         );
         const threadRef = scopeThreadRef(row.environmentId, row.threadId);

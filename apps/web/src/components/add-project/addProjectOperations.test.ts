@@ -40,7 +40,11 @@ function makeHarness(options: HarnessOptions = {}) {
         ? ({ _tag: "Failure", error: options.createError } as const)
         : ({
             _tag: "Success",
-            value: { projectId: input.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+            value: {
+              projectId: input.projectId,
+              mainThreadId: DEFAULT_THREAD_ID,
+              disposition: "created",
+            },
           } as const),
   );
   const cloneRepository = vi.fn<AddProjectOperationsDependencies["cloneRepository"]>(async () =>
@@ -87,7 +91,11 @@ describe("add project operations", () => {
     });
     harness.createProject.mockResolvedValue({
       _tag: "Success",
-      value: { projectId: canonicalProjectId, defaultThreadId: canonicalThreadId },
+      value: {
+        projectId: canonicalProjectId,
+        mainThreadId: canonicalThreadId,
+        disposition: "existing",
+      },
     });
     const operations = createAddProjectOperations(harness.dependencies);
 
@@ -112,7 +120,8 @@ describe("add project operations", () => {
     expect(harness.openProject).toHaveBeenCalledWith({
       environmentId: EnvironmentId.make("local"),
       projectId: canonicalProjectId,
-      defaultThreadId: canonicalThreadId,
+      mainThreadId: canonicalThreadId,
+      disposition: "existing",
     });
   });
 
@@ -140,7 +149,11 @@ describe("add project operations", () => {
     const authoritativeProjectId = ProjectId.make("server-existing");
     harness.createProject.mockResolvedValue({
       _tag: "Success",
-      value: { projectId: authoritativeProjectId, defaultThreadId: DEFAULT_THREAD_ID },
+      value: {
+        projectId: authoritativeProjectId,
+        mainThreadId: DEFAULT_THREAD_ID,
+        disposition: "existing",
+      },
     } as never);
     const operations = createAddProjectOperations(harness.dependencies);
 
@@ -153,7 +166,8 @@ describe("add project operations", () => {
     expect(harness.openProject).toHaveBeenCalledWith({
       environmentId: EnvironmentId.make("remote"),
       projectId: authoritativeProjectId,
-      defaultThreadId: DEFAULT_THREAD_ID,
+      mainThreadId: DEFAULT_THREAD_ID,
+      disposition: "existing",
     });
   });
 
@@ -190,7 +204,11 @@ describe("add project operations", () => {
       .mockResolvedValueOnce({ _tag: "Failure", error: registrationError })
       .mockImplementation(async (input) => ({
         _tag: "Success",
-        value: { projectId: input.projectId, defaultThreadId: DEFAULT_THREAD_ID },
+        value: {
+          projectId: input.projectId,
+          mainThreadId: DEFAULT_THREAD_ID,
+          disposition: "created",
+        },
       }));
     const operations = createAddProjectOperations(harness.dependencies);
     const input = {
@@ -218,7 +236,11 @@ describe("add project operations", () => {
     const navigationError = new Error("navigation unavailable");
     harness.createProject.mockResolvedValue({
       _tag: "Success",
-      value: { projectId: authoritativeProjectId, defaultThreadId: DEFAULT_THREAD_ID },
+      value: {
+        projectId: authoritativeProjectId,
+        mainThreadId: DEFAULT_THREAD_ID,
+        disposition: "created",
+      },
     });
     harness.openProject
       .mockResolvedValueOnce({ _tag: "Failure", error: navigationError })
@@ -240,7 +262,8 @@ describe("add project operations", () => {
     expect(harness.openProject).toHaveBeenLastCalledWith({
       environmentId: EnvironmentId.make("local"),
       projectId: authoritativeProjectId,
-      defaultThreadId: DEFAULT_THREAD_ID,
+      mainThreadId: DEFAULT_THREAD_ID,
+      disposition: "created",
     });
     expect(harness.reportFailure).toHaveBeenCalledWith("Failed to open project", navigationError);
   });
@@ -428,7 +451,8 @@ describe("add project operations", () => {
     const createResult = deferredResult<
       AddProjectCommandResult<{
         readonly projectId: ProjectId;
-        readonly defaultThreadId: ThreadId;
+        readonly mainThreadId: ThreadId;
+        readonly disposition: "created" | "existing";
       }>
     >();
     harness.createProject.mockReturnValue(createResult.promise);
@@ -456,7 +480,8 @@ describe("add project operations", () => {
     const createResult = deferredResult<
       AddProjectCommandResult<{
         readonly projectId: ProjectId;
-        readonly defaultThreadId: ThreadId;
+        readonly mainThreadId: ThreadId;
+        readonly disposition: "created" | "existing";
       }>
     >();
     harness.createProject.mockReturnValue(createResult.promise);
@@ -473,7 +498,8 @@ describe("add project operations", () => {
       _tag: "Success",
       value: {
         projectId: ProjectId.make("created"),
-        defaultThreadId: DEFAULT_THREAD_ID,
+        mainThreadId: DEFAULT_THREAD_ID,
+        disposition: "created",
       },
     });
 
