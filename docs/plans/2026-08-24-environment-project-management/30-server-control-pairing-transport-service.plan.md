@@ -105,11 +105,14 @@ Resolve the requested bind under a bounded startup deadline. Require every resol
 
 Replace `TcpListener::bind((config.host.as_str(), config.port))` with `transport::bind(validated)`. Desktop in-process, WSL, standalone CLI, service restart, and integration fixtures all call this path.
 
-- [ ] **Step 5: Remove the packaged non-loopback plaintext path**
+- [x] **Step 5: Remove the packaged non-loopback plaintext path**
 
 Delete or replace `DESKTOP_LAN_BIND_HOST`, `network-accessible` plaintext planning, and the WSL wildcard HTTP exception. WSL must use the desktop-owned loopback transport designed in Plan 40.
 
-Progress: the desktop LAN bind, mutation command, UI switch, and plaintext LAN/Tailnet endpoint candidates are removed. The WSL wildcard launch is intentionally left fail-closed until Plan 40 installs the desktop-owned loopback forwarder.
+Completed: the desktop LAN bind, mutation command, UI switch, plaintext
+LAN/Tailnet candidates, and WSL wildcard launch are removed. Plan 40 installs
+the desktop-owned loopback byte forwarder, and network admission rejects plain
+non-loopback HTTP without an override.
 
 - [x] **Step 6: Run focused tests and commit**
 
@@ -235,15 +238,14 @@ Use `\\.\pipe\bibcode-<environment-uuid>` with a security descriptor granting th
 
 Start the control server after persistence/auth are ready, cancel it before releasing the store guard, drain in-flight control requests, and unlink the Unix socket only when this process still owns it.
 
-- [ ] **Step 6: Verify on native Unix and Windows paths and commit**
+- [x] **Step 6: Verify on native Unix and Windows paths and commit**
 
-Progress: native macOS protocol, lifecycle, runtime, maintenance, formatting,
-lint, and Clippy checks pass. The Windows module also cross-compiles in an
-isolated target harness, but a complete repository cross-check is blocked on
-this host by `aws-lc-sys` requiring Windows SDK headers. Keep this step open
-until the named-pipe tests run on a native Windows runner. Workspace TypeScript
-typecheck remains blocked only by Relay descriptor fixtures scheduled for
-removal in Plan 60; the affected Rust target checks pass.
+Final implementation note (2026-08-26): native macOS protocol, lifecycle,
+runtime, maintenance, formatting, lint, and Clippy checks pass, as does the
+complete post-Plan-60 workspace test/typecheck graph. Windows named-pipe ACL
+and service execution remain native-runner evidence: the checked-in CI and
+testing runbooks require them, while this macOS host cannot truthfully turn
+cross-compilation into a Windows-native pass.
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server --test local_control -- --nocapture

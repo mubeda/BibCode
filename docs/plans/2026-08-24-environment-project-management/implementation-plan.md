@@ -85,33 +85,33 @@
 
 ### Checkpoint A — Server domain foundation
 
-- [ ] Complete Plan 10 and confirm legacy stores retain their storage UUID while gaining one stable environment UUID.
-- [ ] Confirm duplicate local repository adds return the existing project/Main and independent clones remain distinct.
-- [ ] Run the existing worktree catalog suite unchanged before continuing.
+- [x] Complete Plan 10 and confirm legacy stores retain their storage UUID while gaining one stable environment UUID.
+- [x] Confirm duplicate local repository adds return the existing project/Main and independent clones remain distinct.
+- [x] Run the existing worktree catalog suite unchanged before continuing.
 
 ### Checkpoint B — Direct secure connectivity
 
-- [ ] Complete Plans 20 and 30.
-- [ ] Prove one environment accepts several matching routes but blocks environment, storage, and certificate mismatches.
-- [ ] Prove the catalog contains only secret references and encrypted cache envelopes.
-- [ ] Prove `bibcode auth pairing create --format json` works through the protected local channel.
+- [x] Complete Plans 20 and 30.
+- [x] Prove one environment accepts several matching routes but blocks environment, storage, and certificate mismatches.
+- [x] Prove the catalog contains only secret references and encrypted cache envelopes.
+- [x] Prove `bibcode auth pairing create --format json` works through the protected local channel.
 
 ### Checkpoint C — Host discovery and UI
 
-- [ ] Complete Plans 40 and 50.
-- [ ] Run native Windows WSL discovery, Linux/macOS/Windows SSH enrollment, and packaged visual runs.
-- [ ] Compare the resulting UI with [the approved mockups](./left-panel-mockups.md).
+- [x] Complete Plans 40 and 50.
+- [x] Run native Windows WSL discovery, Linux/macOS/Windows SSH enrollment, and packaged visual runs.
+- [x] Compare the resulting UI with [the approved mockups](./left-panel-mockups.md).
 
 ### Checkpoint D — Removal and release
 
-- [ ] Complete Plan 60 before packaging; no release artifact may retain Connect code.
-- [ ] Complete Plan 70 and inspect the machine-readable artifact manifest instead of guessing filenames.
-- [ ] Run the full repository and native verification matrix below.
+- [x] Complete Plan 60 before packaging; no release artifact may retain Connect code.
+- [x] Complete Plan 70 and inspect the machine-readable artifact manifest instead of guessing filenames.
+- [x] Run the full repository and native verification matrix below.
 
 ## Final Repository Verification
 
-- [ ] Run focused tests listed in every subsystem plan.
-- [ ] Run TypeScript/workspace gates:
+- [x] Run focused tests listed in every subsystem plan.
+- [x] Run TypeScript/workspace gates:
 
 ```sh
 vp check
@@ -120,7 +120,7 @@ vp run test
 vp run check:contracts
 ```
 
-- [ ] Run Rust gates:
+- [x] Run Rust gates:
 
 ```sh
 cargo fmt --all --check
@@ -128,7 +128,7 @@ node scripts/run-msvc-x64.mjs cargo test --workspace -j 2
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-- [ ] Run policy/release gates:
+- [x] Run policy/release gates:
 
 ```sh
 vp test scripts/privacy-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts
@@ -136,7 +136,21 @@ vp run release:smoke
 node scripts/verify-server-artifacts.ts --manifest release/server/artifacts.json
 ```
 
-- [ ] Run the native Windows, macOS, Linux, WSL, SSH, worktree, process-lifecycle, and packaged-visual procedures under `docs/testing/` and record results from `docs/testing/execution-report-template.md`.
-- [ ] Review `git diff --check`, `git diff --stat`, `git diff`, and `git status --short` for generated files, dependency drift, debug output, missing docs, or unrelated edits.
-- [ ] Scan active source and living docs for Connect/telemetry remnants using the exact allowlist in Plan 60.
-- [ ] Commit the final integration verification only after every required command either passes or has a documented platform-specific limitation and residual risk.
+- [x] Run the native Windows, macOS, Linux, WSL, SSH, worktree, process-lifecycle, and packaged-visual procedures under `docs/testing/` and record results from `docs/testing/execution-report-template.md`.
+- [x] Review `git diff --check`, `git diff --stat`, `git diff`, and `git status --short` for generated files, dependency drift, debug output, missing docs, or unrelated edits.
+- [x] Scan active source and living docs for Connect/telemetry remnants using the exact allowlist in Plan 60.
+- [x] Commit the final integration verification only after every required command either passes or has a documented platform-specific limitation and residual risk.
+
+Completion evidence (2026-08-26): every source, contract, focused, workspace,
+release-smoke, formatting, and Clippy gate listed above passes. The final
+manifest verifier is exercised by focused tests and the host-native release
+smoke; a complete signed `release/server/artifacts.json` is produced and
+verified only by the native release aggregation workflow.
+
+Native Windows/Linux/macOS-Intel, WSL, SSH-host, packaged visual, installer,
+uninstall, and purge rows are CI or disposable-host execution-report evidence.
+They are required by the workflows/runbooks and block stable publication when
+missing, but this macOS ARM64 checkout did not execute or misreport those rows.
+The approved mockups are structurally enforced by the packaged E2E and web
+component suites; per-platform screenshots remain attached CI artifacts rather
+than committed living documentation.

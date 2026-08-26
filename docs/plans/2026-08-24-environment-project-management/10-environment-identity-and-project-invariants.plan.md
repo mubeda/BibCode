@@ -187,11 +187,11 @@ pub struct BackupManifest {
 
 Decode old manifests through a migration-only schema, infer only the storage ID from legacy data, and require the active prepared environment identity for in-place restore.
 
-- [ ] **Step 5: Add copied-root conflict and restore tests**
+- [x] **Step 5: Add copied-root conflict and restore tests**
 
 Verify that in-place restore preserves both IDs, `storage start-empty` produces new identities, and an explicit future clone operation rotates both. Do not add automatic last-writer-wins handling.
 
-- [ ] **Step 6: Run focused tests and commit**
+- [x] **Step 6: Run focused tests and commit**
 
 ```sh
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::backup maintenance lifecycle -- --nocapture
@@ -458,14 +458,14 @@ Keep existing delete/archive guards and add title protection in `ThreadMetaUpdat
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server persistence::migrations orchestration::engine -- --nocapture
 ```
 
-- [ ] **Step 7: Run plan-level verification and commit**
+- [x] **Step 7: Run plan-level verification and commit**
 
-Implementation note: the Task 6 migration, engine, integration, formatting,
-contract, `vp check`, direct server all-target check, and Clippy gates pass.
-The workspace typecheck remains open because the Connect-only `infra/relay`
-test fixtures have not adopted the strict descriptor protocol field; Plan 60
-deletes that package. Avoid compatibility edits to code scheduled for removal,
-then close this gate with the final post-removal workspace typecheck.
+Final implementation note (2026-08-26): the Task 6 migration, engine,
+integration, formatting, contract, `vp check`, direct server all-target check,
+and Clippy gates pass. Plan 60 removed the Connect-only `infra/relay` fixtures,
+and the complete post-removal workspace typecheck and test graph now pass. The
+identity/data-safety suites cover in-place identity preservation, foreign-root
+restore rejection, explicit start-empty identity rotation, and restart.
 
 ```sh
 vp run check:contracts

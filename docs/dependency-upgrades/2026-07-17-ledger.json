@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 72,
     "javascriptLedger": 70,
-    "rustRegistry": 87,
+    "rustRegistry": 89,
     "rustPath": 1,
     "actions": 10,
     "toolchains": 9
@@ -1510,6 +1510,18 @@
       "notes": "Removed with the retired Connect signing implementation; direct DPoP remains P-256 based."
     },
     {
+      "key": "rust:workspace:flate2",
+      "name": "flate2",
+      "current": "1.1.9",
+      "target": "1.1.9",
+      "channel": "stable",
+      "source": "https://crates.io/crates/flate2",
+      "cohort": "rust-archive",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Used by the deterministic server archive packager with reproducibility and traversal coverage."
+    },
+    {
       "key": "rust:workspace:futures-util",
       "name": "futures-util",
       "current": "0.3.33",
@@ -1940,6 +1952,18 @@
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"
+    },
+    {
+      "key": "rust:workspace:tar",
+      "name": "tar",
+      "current": "0.4.46",
+      "target": "0.4.46",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tar",
+      "cohort": "rust-archive",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Used by the deterministic server archive packager with reproducibility and traversal coverage."
     },
     {
       "key": "rust:workspace:tempfile",

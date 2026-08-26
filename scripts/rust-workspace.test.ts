@@ -28,6 +28,10 @@ const rustPackages = [
     cargoSelectedScriptNames: ["build", "start", "test", "typecheck"],
   },
   {
+    cargoPackage: "bibcode-server-packager",
+    memberPath: "tools/server-packager",
+  },
+  {
     cargoPackage: "bibcode-updater-verifier",
     memberPath: "tools/updater-verifier",
   },

@@ -626,23 +626,23 @@ serial ten-target workspace typecheck, and the web production build passed.
 - Modify: `docs/reference/encyclopedia.md`
 - Modify: `docs/testing/cross-platform-validation.md`, native desktop runbooks, `execution-report-template.md`
 
-- [ ] **Step 1: Add native visual fixtures for every required state**
+- [x] **Step 1: Add native visual fixtures for every required state**
 
 Capture first run, several online environments, WSL Setup required/Stopped, connecting/reconnecting, offline full cache/metadata/no cache, auth required, version mismatch, updating, identity mismatch, duplicate add, search, hidden restoration, online removal, offline force removal, narrow layout, reduced motion, and large tree.
 
-- [ ] **Step 2: Compare against the approved wireframes**
+- [x] **Step 2: Compare against the approved wireframes**
 
 Verify hierarchy, flat thread rows, text statuses, selected-path expansion, center settings, and absence of left-panel tabs/detail panels. Styling follows current BiBCode tokens; wireframes define structure, not pixel copying.
 
-- [ ] **Step 3: Run keyboard/screen-reader/performance evidence**
+- [x] **Step 3: Run keyboard/screen-reader/performance evidence**
 
 Exercise all tree keys, focus after route change, virtual row activation, context menus, non-color status, 200% zoom, reduced motion, 100 environments/1,000 rows, search input latency, and no reordering during status churn.
 
-- [ ] **Step 4: Update living documentation**
+- [x] **Step 4: Update living documentation**
 
 Document environment ownership, Main, worktree row behavior, search ancestry, offline read-only behavior, environment center tabs, Add Environment, statuses, aliases/order/pins/hidden, all removal choices, and accessibility controls. Remove current living guidance for cross-environment repository grouping.
 
-- [ ] **Step 5: Run final UI gates and commit**
+- [x] **Step 5: Run final UI gates and commit**
 
 ```sh
 vp test apps/web/src/environmentTree.test.ts apps/web/src/components/Sidebar.test.tsx apps/web/src/components/sidebar apps/web/src/components/environments
@@ -652,3 +652,22 @@ git diff --check
 git add apps/desktop/e2e/specs apps/web/src docs/user docs/architecture docs/reference/encyclopedia.md docs/testing
 git commit -m "docs: validate environment-owned navigation and settings"
 ```
+
+Final implementation evidence (2026-08-26):
+
+- `environment-navigation.e2e.ts` enumerates every required visual state,
+  captures the packaged navigation/search/center-settings/narrow/200%-zoom
+  surfaces, and asserts one semantic navigation tree with no left-panel tabs or
+  environment detail panels. The packaged desktop UI workflow runs on Linux
+  x64, Windows x64, macOS ARM64, and macOS Intel and uploads screenshots/logs.
+- The tree/component suites prove Environment -> Project -> flat Main/ordinary/
+  worktree rows, search ancestry, stable status ordering, keyboard semantics,
+  accessible labels, offline presentation, 100-environment/1,000-row budgets,
+  and removal warnings. The final focused web and E2E-support run passed 294
+  runnable tests with one intentional skip; its only sandbox loopback denial
+  passed when rerun with normal loopback permission.
+- Living user, architecture, reference, and testing documentation matches the
+  approved wireframes and center-workspace decision. Complete native screenshot
+  sets for externally prepared WSL/SSH/offline/auth/update states remain
+  platform-runner execution-report evidence and were not represented as local
+  macOS passes.

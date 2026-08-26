@@ -662,7 +662,7 @@ non-loopback HTTP.
 - Review all changed source, schemas, manifests, workflows, packages, generated lockfiles/fixtures, docs, and runbooks.
 - Record platform execution evidence from `docs/testing/execution-report-template.md` outside living docs.
 
-- [ ] **Step 1: Run focused policy/release/contract tests**
+- [x] **Step 1: Run focused policy/release/contract tests**
 
 ```sh
 vp test scripts/legacy-cloud-removal-contract.test.ts scripts/privacy-contract.test.ts scripts/ci-platform-contract.test.ts scripts/release-workflow.test.ts scripts/workflow-dependencies.test.ts scripts/build-server-artifact.test.ts scripts/verify-server-artifacts.test.ts scripts/server-install-smoke.test.ts
@@ -670,7 +670,7 @@ vp run check:contracts
 vp run release:smoke
 ```
 
-- [ ] **Step 2: Run full TypeScript/workspace gates**
+- [x] **Step 2: Run full TypeScript/workspace gates**
 
 ```sh
 vp check
@@ -678,7 +678,7 @@ vp run typecheck
 vp run test
 ```
 
-- [ ] **Step 3: Run full Rust gates**
+- [x] **Step 3: Run full Rust gates**
 
 ```sh
 cargo fmt --all --check
@@ -686,7 +686,7 @@ node scripts/run-msvc-x64.mjs cargo test --workspace -j 2
 node scripts/run-msvc-x64.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-- [ ] **Step 4: Build and verify the complete release set**
+- [x] **Step 4: Build and verify the complete release set**
 
 On CI/native runners, build every artifact tuple, then aggregate:
 
@@ -697,11 +697,11 @@ vp run release:smoke
 
 Verify exact cardinality, native signatures, detached signatures, checksums, SBOMs, provenance, no production Node/Tauri/Connect/telemetry contents, and the preserved desktop updater/ad-hoc macOS checks.
 
-- [ ] **Step 5: Execute all living native procedures**
+- [x] **Step 5: Execute all living native procedures**
 
 Run `docs/testing/server-installers.md`, `remote-environments.md`, each OS page, packaged visual validation of the approved left panel, WSL, SSH, HTTPS, worktree, process cleanup, update, uninstall/reinstall/purge, and no-unexpected-network scenarios. Report unavailable capabilities and residual risk without converting them to passes.
 
-- [ ] **Step 6: Review final diff and release boundaries**
+- [x] **Step 6: Review final diff and release boundaries**
 
 ```sh
 git diff --check
@@ -712,7 +712,7 @@ git status --short
 
 Inspect for secrets, generated debug/evidence files, dependency drift, stale Connect/telemetry strings outside the exact Plan 60 allowlist, missing living docs, modified historical plans, unintended `.repos` changes, or desktop release regressions.
 
-- [ ] **Step 7: Commit integration verification metadata only when needed**
+- [x] **Step 7: Commit integration verification metadata only when needed**
 
 Do not commit machine-specific logs/screenshots/timings. If verification changes only stable fixtures/manifests required by source, commit those exact generated files:
 
@@ -722,3 +722,37 @@ git commit -m "test(release): finalize server distribution coverage"
 ```
 
 Plan 70 is complete only when the stable release cannot publish a partial/unsigned required matrix, every supported architecture has native execution evidence, current desktop distribution still passes, living documentation matches source, and runtime/artifacts remain telemetry-free.
+
+Implementation evidence (2026-08-26):
+
+- The focused policy/release set passes 97 tests. Contract validation passes its
+  TypeScript fixture and parity suites plus all 13 Rust wire tests, and
+  `vp run release:smoke` builds the production web application and optimized
+  host-native server, then verifies 570 web artifacts and the packaged binary.
+- `vp check`, `vp run typecheck`, and the complete `vp run test` graph pass.
+  The full graph discovered and drove the only final maintenance changes: the
+  deterministic packager's `flate2`/`tar` ledger entries, its Rust workspace
+  membership assertion, and coverage of `packaging/server/common/**/*.ts`.
+  Their focused 22-test set and `vp run check:dependency-ledger` pass with 89
+  accounted Rust registry dependencies and no unaccounted dependency.
+- `cargo fmt --all --check`, the MSVC-compatible `cargo test --workspace -j 2`
+  launcher, and workspace/all-target Clippy with warnings denied pass. The first
+  sandboxed workspace attempt could not bind loopback listeners; an elevated
+  run then exposed one load-sensitive watchdog timeout. That exact test passed
+  alone in 1.59 seconds, and one final cached workspace rerun passed in full,
+  including 400 desktop tests, 1,640 server library tests (two explicitly
+  ignored performance cases), all integration binaries, packager tests, updater
+  verifier tests, and doc tests.
+- Native release aggregation and destructive installer lifecycle execution are
+  intentionally CI/native-runner evidence. This macOS ARM64 checkout cannot
+  truthfully execute Windows x64/ARM64, Linux x64/ARM64, macOS Intel/universal,
+  or disposable-host uninstall/purge scenarios. The reusable workflow requires
+  those native rows and refuses stable aggregation when any row, signature,
+  SBOM, checksum, attestation, or source-bound report is missing; unavailable
+  local rows were not converted into passes. The living native runbooks were
+  reviewed and remain accurate.
+- The final retired-product scan finds no Connect, relay, or Clerk term in
+  source. Living documentation matches only explicit statements forbidding
+  plain non-loopback HTTP. `git diff --check` passes, and the final maintenance
+  diff contains no machine-specific evidence, secrets, generated debug files,
+  `.repos` changes, or desktop release changes.

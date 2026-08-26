@@ -11,6 +11,7 @@ export const coverageInclude = [
   "apps/web/vercel.ts",
   "apps/web/vite.config.app.mjs",
   "oxlint-plugin-bibcode/**/*.ts",
+  "packaging/server/common/**/*.ts",
   "packages/client-runtime/scripts/**/*.ts",
   "packages/client-runtime/src/**/*.ts",
   "packages/client-runtime/vite.config.runtime.ts",
