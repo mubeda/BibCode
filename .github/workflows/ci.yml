@@ -139,6 +139,69 @@ jobs:
       - name: Exercise release-only workflow steps
         run: node scripts/release-smoke.ts
 
+  server_web_assets:
+    name: Frozen server web assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - id: identity
+        name: Resolve frozen web identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'artifact_name=server-web-assets-%s\n' "${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          printf 'source_date_epoch=%s\n' "$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$(node -p "require('./apps/server/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Build server-only web assets
+        run: vp run --filter @bibcode/web build:server-assets
+
+      - name: Apply production brand assets
+        run: node scripts/apply-web-brand-assets.ts production apps/web/dist
+
+      - name: Freeze source-bound server web assets
+        run: |
+          node scripts/freeze-server-web-assets.ts \
+            --assets-dir apps/web/dist \
+            --output-dir release/server-web-input \
+            --source-sha "$GITHUB_SHA"
+
+      - name: Upload frozen server web assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: release/server-web-input/*
+          if-no-files-found: error
+          retention-days: 1
+
+  native_server:
+    name: Native server
+    needs: [server_web_assets]
+    uses: ./.github/workflows/server-native-smoke.yml
+    with:
+      release-ref: ${{ github.sha }}
+      source-sha: ${{ github.sha }}
+      source-date-epoch: ${{ needs.server_web_assets.outputs.source_date_epoch }}
+      version: ${{ needs.server_web_assets.outputs.version }}
+      channel: unsigned-test
+      web-assets-artifact: ${{ needs.server_web_assets.outputs.artifact_name }}
+
   native_desktop:
     name: Native desktop - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}

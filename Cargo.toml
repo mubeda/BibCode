@@ -115,6 +115,11 @@ version = "0.14.9"
 [workspace.lints.rust]
 warnings = "deny"
 
+[workspace.metadata.bibcode.release-tools]
+cargo-cyclonedx = "0.5.9"
+cyclonedx-cli = "0.32.0"
+minisign = "0.12.0"
+
 [patch.crates-io]
 portable-pty = { path = "third_party/portable-pty" }
 # Upstream fix for Windows reentrant keyboard/IME deadlocks; remove once Tauri uses Tao >= 0.36.

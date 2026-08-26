@@ -68,6 +68,21 @@ it("publishes stable updater metadata atomically from a verified draft", () => {
   assert.match(releaseWorkflow, /files:\s*\|\s*\n\s+release-assets\/\*/);
 });
 
+it("publishes only after re-verifying the complete signed server release set", () => {
+  assert.match(
+    releaseWorkflow,
+    /name: Download complete server release set[\s\S]*name: server-release-set[\s\S]*path: release-assets/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /name: Verify signed server release before publication[\s\S]*verify-server-artifacts\.ts[\s\S]*--require-complete-matrix/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /name: Publish nightly release[\s\S]*files:\s*\|\s*\n\s+release-assets\/\*/,
+  );
+});
+
 it("keeps stable prereleases outside the updater signing overlay", () => {
   assert.match(
     releaseWorkflow,

@@ -93,6 +93,7 @@ describe("GitHub workflow dependencies", () => {
 
   it.each([
     ["actions/checkout", "v7"],
+    ["actions/attest", "v4"],
     ["actions/github-script", "v9"],
     ["actions/upload-artifact", "v7"],
     ["actions/download-artifact", "v8"],

@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -12,8 +13,12 @@ import {
   parseCargoServerExecutable,
   parsePinnedRustToolchainChannel,
   parseServerArtifactCliArgs,
+  resolveMacDeveloperIdConfiguration,
   resolveServerArtifactBuildPlan,
+  resolveWindowsAuthenticodeConfiguration,
   runBoundedCommand,
+  signAndVerifyMacExecutable,
+  signAndVerifyWindowsArtifact,
   verifyWebAssetManifest,
   type ServerArtifactCommandRunner,
 } from "./build-server-artifact.ts";
@@ -98,6 +103,152 @@ describe("server artifact build planning", () => {
     expect(() => parsePinnedRustToolchainChannel('[toolchain]\nchannel = "stable"\n')).toThrow(
       /exact stable Rust channel/iu,
     );
+  });
+});
+
+describe("native server signing policy", () => {
+  const certificate = {
+    subject: "CN=BiBCode Server Release",
+    thumbprint: "a".repeat(40),
+    timestampUrl: "https://timestamp.example.test/",
+  } as const;
+  const windowsEnvironment = {
+    WINDOWS_SIGNING_CERTIFICATE_SUBJECT: certificate.subject,
+    WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT: certificate.thumbprint.toUpperCase(),
+    WINDOWS_SIGNING_TIMESTAMP_URL: certificate.timestampUrl,
+  };
+
+  it("requires exact Windows signer identity and an HTTPS RFC 3161 endpoint", () => {
+    expect(resolveWindowsAuthenticodeConfiguration(windowsEnvironment)).toEqual({
+      signerSubject: certificate.subject,
+      signerThumbprint: certificate.thumbprint,
+      timestampUrl: certificate.timestampUrl,
+    });
+    expect(() =>
+      resolveWindowsAuthenticodeConfiguration({
+        ...windowsEnvironment,
+        WINDOWS_SIGNING_TIMESTAMP_URL: "http://timestamp.example.test",
+      }),
+    ).toThrow(/HTTPS/iu);
+    expect(() => resolveWindowsAuthenticodeConfiguration({})).toThrow(/certificate subject/iu);
+  });
+
+  it("keeps no-credential macOS ad-hoc mode distinct from complete Developer ID mode", () => {
+    expect(resolveMacDeveloperIdConfiguration({})).toBeNull();
+    expect(
+      resolveMacDeveloperIdConfiguration({
+        BIBCODE_SERVER_MACOS_APPLICATION_IDENTITY: "Developer ID Application: BiBCode (ABCDE12345)",
+        BIBCODE_SERVER_MACOS_INSTALLER_IDENTITY: "Developer ID Installer: BiBCode (ABCDE12345)",
+        APPLE_TEAM_ID: "ABCDE12345",
+        BIBCODE_SERVER_MACOS_NOTARY_PROFILE: "bibcode-server-notary",
+      }),
+    ).toMatchObject({ teamId: "ABCDE12345", notaryProfile: "bibcode-server-notary" });
+    expect(() =>
+      resolveMacDeveloperIdConfiguration({
+        BIBCODE_SERVER_MACOS_APPLICATION_IDENTITY: "Developer ID Application: BiBCode (ABCDE12345)",
+      }),
+    ).toThrow(/matching Developer ID/iu);
+  });
+
+  it("records ad-hoc and Developer ID executable verification separately", async () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-macos-signing-"));
+    const executable = NodePath.join(root, "bibcode");
+    NodeFS.writeFileSync(executable, "binary", { mode: 0o755 });
+    const commands: string[] = [];
+    const commandRunner: ServerArtifactCommandRunner = async ({ command, args }) => {
+      commands.push(`${command}:${args[0]}`);
+      return { stdout: "", stderr: "" };
+    };
+    await expect(
+      signAndVerifyMacExecutable({
+        path: executable,
+        cwd: root,
+        configuration: null,
+        commandRunner,
+        limits: { timeoutMs: 5_000 },
+      }),
+    ).resolves.toMatchObject({ binary: "adhoc", package: "none", verified: false });
+    const configuration = resolveMacDeveloperIdConfiguration({
+      BIBCODE_SERVER_MACOS_APPLICATION_IDENTITY: "Developer ID Application: BiBCode (ABCDE12345)",
+      BIBCODE_SERVER_MACOS_INSTALLER_IDENTITY: "Developer ID Installer: BiBCode (ABCDE12345)",
+      APPLE_TEAM_ID: "ABCDE12345",
+      BIBCODE_SERVER_MACOS_NOTARY_PROFILE: "bibcode-server-notary",
+    });
+    if (configuration === null) throw new Error("Developer ID fixture configuration is missing.");
+    await expect(
+      signAndVerifyMacExecutable({
+        path: executable,
+        cwd: root,
+        configuration,
+        commandRunner,
+        limits: { timeoutMs: 5_000 },
+      }),
+    ).resolves.toMatchObject({
+      binary: "developer-id",
+      package: "none",
+      verified: true,
+      teamId: "ABCDE12345",
+    });
+    expect(commands).toEqual([
+      "codesign:--force",
+      "codesign:--verify",
+      "codesign:--force",
+      "codesign:--verify",
+      "spctl:--assess",
+    ]);
+  });
+
+  it("signs and independently verifies Windows bytes without leaking child output", async () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-authenticode-"));
+    const executable = NodePath.join(root, "bibcode.exe");
+    NodeFS.writeFileSync(executable, "binary");
+    const commands: string[] = [];
+    const runner: ServerArtifactCommandRunner = async ({ command, args }) => {
+      commands.push(`${command}:${args[0]}`);
+      if (command === "pwsh") {
+        return {
+          stdout: JSON.stringify({
+            status: "Valid",
+            subject: certificate.subject,
+            thumbprint: certificate.thumbprint,
+            notBefore: "2035-01-01T00:00:00.000Z",
+            notAfter: "2037-01-01T00:00:00.000Z",
+          }),
+          stderr: "",
+        };
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await expect(
+      signAndVerifyWindowsArtifact({
+        path: executable,
+        cwd: root,
+        env: windowsEnvironment,
+        commandRunner: runner,
+        limits: { timeoutMs: 5_000 },
+        nowEpochMs: Date.parse("2036-01-01T00:00:00.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      binary: "authenticode",
+      package: "none",
+      verified: true,
+      timestamped: true,
+      signerSubject: certificate.subject,
+      signerThumbprint: certificate.thumbprint,
+    });
+    expect(commands).toEqual(["signtool:sign", "signtool:verify", "pwsh:-NoLogo"]);
+
+    const canary = "SECRET_SIGNING_OUTPUT_CANARY";
+    await expect(
+      signAndVerifyWindowsArtifact({
+        path: executable,
+        cwd: root,
+        env: windowsEnvironment,
+        commandRunner: async () => Promise.reject(new Error(canary)),
+        limits: { timeoutMs: 5_000 },
+      }),
+    ).rejects.toThrow("Windows Authenticode signing or timestamping failed.");
   });
 });
 
@@ -394,6 +545,20 @@ describe("bounded build lifecycle", () => {
       "frozen-web-assets.json",
       `${JSON.stringify(webManifest, null, 2)}\n`,
     );
+    const externalSlice = write("native-input/x86_64/bibcode", "binary:x86_64-apple-darwin", 0o755);
+    const externalSliceMetadata = write(
+      "native-input/x86_64/build.json",
+      `${JSON.stringify({
+        schemaVersion: 1,
+        product: "bibcode-server",
+        version: "0.4.1",
+        sourceSha: "a".repeat(40),
+        targetTriple: "x86_64-apple-darwin",
+        binarySha256: NodeCrypto.createHash("sha256")
+          .update(NodeFS.readFileSync(externalSlice))
+          .digest("hex"),
+      })}\n`,
+    );
     const commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }> = [];
     const argumentValue = (args: ReadonlyArray<string>, name: string): string => {
       const index = args.indexOf(name);
@@ -469,7 +634,13 @@ describe("bounded build lifecycle", () => {
         return { stdout: "", stderr: "" };
       }
       if (command === "lipo" && args[0] === "-archs") {
-        return { stdout: "x86_64 arm64\n", stderr: "" };
+        return {
+          stdout:
+            NodePath.basename(NodePath.dirname(args[1] ?? "")) === "macos"
+              ? "x86_64 arm64\n"
+              : "x86_64\n",
+          stderr: "",
+        };
       }
       if (command === "codesign") return { stdout: "", stderr: "" };
       if (command === "xattr") return { stdout: "", stderr: "" };
@@ -505,6 +676,8 @@ describe("bounded build lifecycle", () => {
         sourceDateEpoch: 1_700_000_000,
         webAssetsDir: webDirectory,
         webAssetsManifest: webManifestPath,
+        macosOtherSlice: externalSlice,
+        macosOtherSliceMetadata: externalSliceMetadata,
       },
       {
         repoRoot: fixtureRepo,
@@ -520,15 +693,42 @@ describe("bounded build lifecycle", () => {
     const metadata = JSON.parse(NodeFS.readFileSync(result.metadataPaths[0] ?? "", "utf8")) as {
       readonly targetTriple: string;
       readonly sliceSha256: Record<string, string>;
+      readonly artifact: {
+        readonly downloadName: string;
+        readonly nativeSigning: {
+          readonly binary: string;
+          readonly package: string;
+          readonly verified: boolean;
+          readonly timestamped: boolean;
+        };
+      };
+      readonly fileInventory: ReadonlyArray<{ readonly path: string }>;
     };
     expect(metadata.targetTriple).toBe("universal-apple-darwin");
     expect(Object.keys(metadata.sliceSha256).sort()).toEqual([
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
     ]);
+    expect(metadata.artifact).toMatchObject({
+      downloadName: "bibcode-server-0.4.1-macos-universal.pkg",
+      nativeSigning: {
+        binary: "adhoc",
+        package: "none",
+        verified: false,
+        timestamped: false,
+      },
+    });
+    expect(metadata.fileInventory.map((record) => record.path)).toEqual(
+      expect.arrayContaining(["bin/bibcode", "share/bibcode/web/index.html"]),
+    );
     expect(commands.some(({ command, args }) => command === "lipo" && args[0] === "-create")).toBe(
       true,
     );
+    expect(
+      commands.filter(
+        ({ command, args }) => NodePath.basename(command) === "cargo" && args[0] === "build",
+      ),
+    ).toHaveLength(1);
     expect(commands.some(({ command }) => command === "pkgbuild")).toBe(true);
     expect(commands.some(({ command }) => command === "productbuild")).toBe(true);
     expect(commands.some(({ command, args }) => command === "xattr" && args[0] === "-cr")).toBe(

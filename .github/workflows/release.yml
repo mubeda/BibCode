@@ -340,13 +340,282 @@ jobs:
           path: release-publish/*
           if-no-files-found: error
 
+  server_web_assets:
+    name: Frozen server web assets
+    needs: [preflight]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Align release versions
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - id: identity
+        name: Resolve frozen web identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'artifact_name=server-web-assets-%s\n' "${{ needs.preflight.outputs.ref }}" >> "$GITHUB_OUTPUT"
+          printf 'source_date_epoch=%s\n' "$(git show -s --format=%ct '${{ needs.preflight.outputs.ref }}')" >> "$GITHUB_OUTPUT"
+
+      - name: Build server-only web assets
+        run: vp run --filter @bibcode/web build:server-assets
+
+      - name: Apply production brand assets
+        run: node scripts/apply-web-brand-assets.ts production apps/web/dist
+
+      - name: Freeze source-bound server web assets
+        run: |
+          node scripts/freeze-server-web-assets.ts \
+            --assets-dir apps/web/dist \
+            --output-dir release/server-web-input \
+            --source-sha "${{ needs.preflight.outputs.ref }}"
+
+      - name: Upload frozen server web assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: release/server-web-input/*
+          if-no-files-found: error
+          retention-days: 1
+
+  server_build:
+    name: Native server candidates
+    needs: [preflight, server_web_assets]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.server_web_assets.result == 'success' }}
+    uses: ./.github/workflows/server-native-smoke.yml
+    with:
+      release-ref: ${{ needs.preflight.outputs.ref }}
+      source-sha: ${{ needs.preflight.outputs.ref }}
+      source-date-epoch: ${{ needs.server_web_assets.outputs.source_date_epoch }}
+      version: ${{ needs.preflight.outputs.version }}
+      channel: ${{ needs.preflight.outputs.release_channel }}
+      web-assets-artifact: ${{ needs.server_web_assets.outputs.artifact_name }}
+    secrets: inherit
+
+  server_sign:
+    name: Sign and inventory server artifacts
+    needs: [preflight, server_build]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.server_build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      - name: Align release versions
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Download every source-bound server candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: server-candidate-${{ needs.preflight.outputs.ref }}-*
+          merge-multiple: true
+          path: release/server-candidates
+
+      - name: Install pinned SBOM and signing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo install minisign --version 0.12.0 --locked
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/cyclonedx" \
+            https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.32.0/cyclonedx-linux-x64
+          printf '%s  %s\n' \
+            454879e6a4a405c8a13bff49b8982adcb0596f3019b26b0811c66e4d7f0783e1 \
+            "$RUNNER_TEMP/cyclonedx" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/cyclonedx"
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          cargo cyclonedx --version | grep -F '0.5.9'
+          "$RUNNER_TEMP/cyclonedx" --version | grep -F '0.32.0'
+          minisign -v | grep -F '0.12'
+
+      - name: Finalize signed checksums, SBOMs, and manifest
+        shell: bash
+        env:
+          BIBCODE_SERVER_SIGNING_PRIVATE_KEY: ${{ secrets.BIBCODE_SERVER_SIGNING_PRIVATE_KEY }}
+          BIBCODE_SERVER_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.BIBCODE_SERVER_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git show -s --format=%ct '${{ needs.preflight.outputs.ref }}')"
+          generated_at="$(date -u -d "@$source_date_epoch" +'%Y-%m-%dT%H:%M:%SZ')"
+          node scripts/sign-server-artifacts.ts \
+            --artifact-root release/server-candidates \
+            --output-dir release/server-signed \
+            --channel "${{ needs.preflight.outputs.release_channel }}" \
+            --generated-at "$generated_at"
+
+      - name: Verify the signed server release set
+        run: |
+          node scripts/verify-server-artifacts.ts \
+            --manifest release/server-signed/artifacts.json \
+            --directory release/server-signed \
+            --public-key packaging/server/server-release.pub \
+            --require-complete-matrix
+
+      - name: Upload signed server release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-signed-${{ needs.preflight.outputs.ref }}
+          path: release/server-signed/*
+          if-no-files-found: error
+          retention-days: 1
+
+  server_smoke:
+    name: Verify signed server release policy
+    needs: [preflight, server_sign]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.server_sign.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Download signed server release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: server-signed-${{ needs.preflight.outputs.ref }}
+          path: release/server
+
+      - name: Verify manifest, privacy, and retired-cloud policy
+        run: |
+          node scripts/verify-server-artifacts.ts \
+            --manifest release/server/artifacts.json \
+            --directory release/server \
+            --public-key packaging/server/server-release.pub \
+            --require-complete-matrix
+          vp test --run scripts/privacy-contract.test.ts scripts/legacy-cloud-removal-contract.test.ts
+
+  server_aggregate:
+    name: Aggregate complete server release set
+    needs: [preflight, server_smoke]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.server_smoke.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Download signed server release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: server-signed-${{ needs.preflight.outputs.ref }}
+          path: release/server
+
+      - name: Verify exact aggregate cardinality and signatures
+        run: |
+          node scripts/verify-server-artifacts.ts \
+            --manifest release/server/artifacts.json \
+            --directory release/server \
+            --public-key packaging/server/server-release.pub \
+            --require-complete-matrix
+
+      - name: Upload complete server release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-release-set
+          path: release/server/*
+          if-no-files-found: error
+          retention-days: 1
+
+  server_attest:
+    name: Attest server ${{ matrix.artifact-suffix }}
+    needs: [preflight, server_aggregate]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.server_aggregate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact-suffix:
+          - x86_64-pc-windows-msvc.zip
+          - windows-x86_64.msi
+          - aarch64-pc-windows-msvc.zip
+          - windows-aarch64.msi
+          - x86_64-apple-darwin.tar.gz
+          - aarch64-apple-darwin.tar.gz
+          - macos-universal.pkg
+          - x86_64-unknown-linux-gnu.tar.gz
+          - linux-x86_64.deb
+          - linux-x86_64.rpm
+          - aarch64-unknown-linux-gnu.tar.gz
+          - linux-aarch64.deb
+          - linux-aarch64.rpm
+    steps:
+      - name: Download complete server release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: server-release-set
+          path: release/server
+
+      - id: attest
+        name: Attest artifact with its exact CycloneDX SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: release/server/bibcode-server-${{ needs.preflight.outputs.version }}-${{ matrix.artifact-suffix }}
+          sbom-path: release/server/bibcode-server-${{ needs.preflight.outputs.version }}-${{ matrix.artifact-suffix }}.cdx.json
+
   # CLI publishing remains omitted until the `bibcode` package has its own npm
   # trusted-publisher binding. Configure that binding before restoring the job.
 
   release:
     name: Publish GitHub Release
-    needs: [preflight, build]
-    if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build.result == 'success' }}
+    needs: [preflight, build, server_aggregate, server_attest]
+    if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build.result == 'success' && needs.server_aggregate.result == 'success' && needs.server_attest.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Fork adaptation: publish with the workflow's own GITHUB_TOKEN instead of
@@ -376,6 +645,20 @@ jobs:
           pattern: desktop-*
           merge-multiple: true
           path: release-assets
+
+      - name: Download complete server release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: server-release-set
+          path: release-assets
+
+      - name: Verify signed server release before publication
+        run: |
+          node scripts/verify-server-artifacts.ts \
+            --manifest release-assets/artifacts.json \
+            --directory release-assets \
+            --public-key packaging/server/server-release.pub \
+            --require-complete-matrix
 
       - id: release_timestamp
         name: Capture release timestamp
@@ -468,9 +751,7 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            release-assets/*.dmg
-            release-assets/*.AppImage
-            release-assets/*.exe
+            release-assets/*
           fail_on_unmatched_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -485,9 +766,7 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            release-assets/*.dmg
-            release-assets/*.AppImage
-            release-assets/*.exe
+            release-assets/*
           fail_on_unmatched_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 

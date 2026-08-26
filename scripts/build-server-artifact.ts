@@ -8,7 +8,14 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
+import type {
+  NativeSigningState,
+  ServerArtifactArchitecture,
+  ServerArtifactFormat,
+  ServerArtifactOs,
+} from "@bibcode/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@bibcode/shared/hostProcess";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import {
@@ -91,6 +98,8 @@ export interface ServerArtifactBuildInput {
   readonly sourceDateEpoch?: number;
   readonly webAssetsDir?: string;
   readonly webAssetsManifest?: string;
+  readonly macosOtherSlice?: string;
+  readonly macosOtherSliceMetadata?: string;
 }
 
 export interface ServerArtifactBuildHost {
@@ -201,6 +210,8 @@ export function parseServerArtifactCliArgs(argv: ReadonlyArray<string>): ServerA
       "source-date-epoch": { type: "string" },
       "web-assets-dir": { type: "string" },
       "web-assets-manifest": { type: "string" },
+      "macos-other-slice": { type: "string" },
+      "macos-other-slice-metadata": { type: "string" },
     },
     allowPositionals: false,
     strict: true,
@@ -224,6 +235,10 @@ export function parseServerArtifactCliArgs(argv: ReadonlyArray<string>): ServerA
       : {}),
     ...(values["web-assets-dir"] ? { webAssetsDir: values["web-assets-dir"] } : {}),
     ...(values["web-assets-manifest"] ? { webAssetsManifest: values["web-assets-manifest"] } : {}),
+    ...(values["macos-other-slice"] ? { macosOtherSlice: values["macos-other-slice"] } : {}),
+    ...(values["macos-other-slice-metadata"]
+      ? { macosOtherSliceMetadata: values["macos-other-slice-metadata"] }
+      : {}),
   };
 }
 
@@ -385,6 +400,135 @@ const forbiddenWebPath = (relative: string): boolean => {
 const byteOrder = (left: string, right: string): number =>
   Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 
+const unsignedNativeSigning = (): NativeSigningState => ({
+  binary: "none",
+  package: "none",
+  verified: false,
+  timestamped: false,
+  signerSubject: null,
+  signerThumbprint: null,
+  teamId: null,
+});
+
+const adhocMacNativeSigning = (): NativeSigningState => ({
+  ...unsignedNativeSigning(),
+  binary: "adhoc",
+});
+
+export interface WindowsAuthenticodeConfiguration {
+  readonly signerSubject: string;
+  readonly signerThumbprint: string;
+  readonly timestampUrl: string;
+}
+
+export interface MacDeveloperIdConfiguration {
+  readonly applicationIdentity: string;
+  readonly installerIdentity: string;
+  readonly teamId: string;
+  readonly notaryProfile: string;
+}
+
+const requiredTrimmedEnvironmentValue = (
+  env: NodeJS.ProcessEnv,
+  name: string,
+): string | undefined => {
+  const value = env[name];
+  return value !== undefined && value.trim() === value && value.length > 0 ? value : undefined;
+};
+
+export function resolveWindowsAuthenticodeConfiguration(
+  env: NodeJS.ProcessEnv,
+): WindowsAuthenticodeConfiguration {
+  const signerSubject = requiredTrimmedEnvironmentValue(env, "WINDOWS_SIGNING_CERTIFICATE_SUBJECT");
+  const rawThumbprint = requiredTrimmedEnvironmentValue(
+    env,
+    "WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT",
+  );
+  const timestampUrl = requiredTrimmedEnvironmentValue(env, "WINDOWS_SIGNING_TIMESTAMP_URL");
+  const signerThumbprint = rawThumbprint?.toLocaleLowerCase("en-US");
+  if (
+    signerSubject === undefined ||
+    signerSubject.length > 512 ||
+    signerThumbprint === undefined ||
+    !/^[a-f0-9]{40}$/u.test(signerThumbprint) ||
+    timestampUrl === undefined
+  ) {
+    return fail(
+      "Stable Windows server builds require an expected certificate subject, SHA-1 thumbprint, and HTTPS RFC 3161 timestamp URL.",
+    );
+  }
+  let parsedTimestamp: URL;
+  try {
+    parsedTimestamp = new URL(timestampUrl);
+  } catch {
+    return fail("The Windows signing timestamp URL must be a valid HTTPS URL.");
+  }
+  if (parsedTimestamp.protocol !== "https:") {
+    return fail("The Windows signing timestamp URL must be a valid HTTPS URL.");
+  }
+  return { signerSubject, signerThumbprint, timestampUrl: parsedTimestamp.href };
+}
+
+export function resolveMacDeveloperIdConfiguration(
+  env: NodeJS.ProcessEnv,
+): MacDeveloperIdConfiguration | null {
+  const names = [
+    "BIBCODE_SERVER_MACOS_APPLICATION_IDENTITY",
+    "BIBCODE_SERVER_MACOS_INSTALLER_IDENTITY",
+    "APPLE_TEAM_ID",
+    "BIBCODE_SERVER_MACOS_NOTARY_PROFILE",
+  ] as const;
+  const values = names.map((name) => requiredTrimmedEnvironmentValue(env, name));
+  if (values.every((value) => value === undefined)) return null;
+  const [applicationIdentity, installerIdentity, teamId, notaryProfile] = values;
+  if (
+    applicationIdentity === undefined ||
+    installerIdentity === undefined ||
+    teamId === undefined ||
+    notaryProfile === undefined ||
+    !/^[A-Z0-9]{10}$/u.test(teamId) ||
+    !applicationIdentity.startsWith("Developer ID Application:") ||
+    !installerIdentity.startsWith("Developer ID Installer:") ||
+    !applicationIdentity.endsWith(`(${teamId})`) ||
+    !installerIdentity.endsWith(`(${teamId})`) ||
+    !/^[A-Za-z0-9._-]+$/u.test(notaryProfile)
+  ) {
+    return fail(
+      "Optional macOS server signing requires matching Developer ID Application/Installer identities, team ID, and a keychain notary profile.",
+    );
+  }
+  return { applicationIdentity, installerIdentity, teamId, notaryProfile };
+}
+
+const artifactOsForTarget = (target: ServerTargetTriple): ServerArtifactOs => {
+  switch (SERVER_PORTABLE_TARGETS[target].platform) {
+    case "win32":
+      return "windows";
+    case "darwin":
+      return "macos";
+    case "linux":
+      return "linux";
+  }
+};
+
+const artifactArchitectureForTarget = (
+  target: ServerTargetTriple,
+): Exclude<ServerArtifactArchitecture, "universal"> =>
+  SERVER_PORTABLE_TARGETS[target].architecture === "arm64" ? "aarch64" : "x86_64";
+
+const fileInventoryForPayload = async (
+  root: string,
+  executableName: "bibcode" | "bibcode.exe",
+): Promise<ReadonlyArray<ServerBuildFileRecord>> => {
+  const payload = await collectInstallerPayload(root, executableName);
+  return Promise.all(
+    payload.map(async ({ path, sourcePath }) => {
+      const metadata = await NodeFSP.lstat(sourcePath);
+      return { path, size: metadata.size, sha256: await sha256File(sourcePath) };
+    }),
+  );
+};
+
 export async function collectWebAssetManifest(rootInput: string): Promise<WebAssetManifest> {
   const root = NodePath.resolve(rootInput);
   const rootMetadata = await NodeFSP.lstat(root);
@@ -489,6 +633,182 @@ export async function runBoundedCommand(
   }
 }
 
+const windowsSignatureInspectionScript = [
+  "$ErrorActionPreference = 'Stop'",
+  "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]",
+  "if ($null -eq $signature.SignerCertificate) { throw 'missing signer certificate' }",
+  "[ordered]@{",
+  "  status = [string]$signature.Status",
+  "  subject = $signature.SignerCertificate.Subject",
+  "  thumbprint = $signature.SignerCertificate.Thumbprint.ToLowerInvariant()",
+  "  notBefore = $signature.SignerCertificate.NotBefore.ToUniversalTime().ToString('O')",
+  "  notAfter = $signature.SignerCertificate.NotAfter.ToUniversalTime().ToString('O')",
+  "} | ConvertTo-Json -Compress",
+].join("\n");
+
+interface WindowsSignatureInspection {
+  readonly status: string;
+  readonly subject: string;
+  readonly thumbprint: string;
+  readonly notBefore: string;
+  readonly notAfter: string;
+}
+
+export async function signAndVerifyWindowsArtifact(input: {
+  readonly path: string;
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly commandRunner: ServerArtifactCommandRunner;
+  readonly limits: ServerArtifactCommandOptions;
+  readonly nowEpochMs?: number;
+}): Promise<NativeSigningState> {
+  assertPlainFile(input.path, "Windows signing input");
+  const configuration = resolveWindowsAuthenticodeConfiguration(input.env);
+  const runSensitive = async (
+    plan: ServerArtifactCommandPlan,
+    failure: string,
+  ): Promise<ServerArtifactCommandResult> => {
+    try {
+      return await input.commandRunner(plan, input.limits);
+    } catch {
+      return fail(failure);
+    }
+  };
+  await runSensitive(
+    {
+      command: "signtool",
+      args: [
+        "sign",
+        "/sha1",
+        configuration.signerThumbprint,
+        "/fd",
+        "SHA256",
+        "/tr",
+        configuration.timestampUrl,
+        "/td",
+        "SHA256",
+        input.path,
+      ],
+      cwd: input.cwd,
+    },
+    "Windows Authenticode signing or timestamping failed.",
+  );
+  await runSensitive(
+    {
+      command: "signtool",
+      args: ["verify", "/pa", "/all", "/v", input.path],
+      cwd: input.cwd,
+    },
+    "Windows Authenticode verification failed.",
+  );
+  const inspectionResult = await runSensitive(
+    {
+      command: "pwsh",
+      args: [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        windowsSignatureInspectionScript,
+        input.path,
+      ],
+      cwd: input.cwd,
+    },
+    "Windows Authenticode identity inspection failed.",
+  );
+  let inspection: WindowsSignatureInspection;
+  try {
+    inspection = JSON.parse(inspectionResult.stdout) as WindowsSignatureInspection;
+  } catch {
+    return fail("Windows Authenticode identity inspection returned invalid evidence.");
+  }
+  const notBefore = Date.parse(inspection.notBefore);
+  const notAfter = Date.parse(inspection.notAfter);
+  const now = input.nowEpochMs ?? DateTime.toEpochMillis(DateTime.nowUnsafe());
+  if (
+    inspection.status !== "Valid" ||
+    inspection.subject !== configuration.signerSubject ||
+    inspection.thumbprint !== configuration.signerThumbprint ||
+    !Number.isFinite(notBefore) ||
+    !Number.isFinite(notAfter) ||
+    now < notBefore ||
+    now > notAfter
+  ) {
+    return fail(
+      "Windows Authenticode signer identity, validity, or verification did not match policy.",
+    );
+  }
+  return {
+    binary: "authenticode",
+    package:
+      NodePath.extname(input.path).toLocaleLowerCase("en-US") === ".msi" ? "authenticode" : "none",
+    verified: true,
+    timestamped: true,
+    signerSubject: configuration.signerSubject,
+    signerThumbprint: configuration.signerThumbprint,
+    teamId: null,
+  };
+}
+
+export async function signAndVerifyMacExecutable(input: {
+  readonly path: string;
+  readonly cwd: string;
+  readonly configuration: MacDeveloperIdConfiguration | null;
+  readonly commandRunner: ServerArtifactCommandRunner;
+  readonly limits: ServerArtifactCommandOptions;
+}): Promise<NativeSigningState> {
+  assertPlainFile(input.path, "macOS signing input");
+  const runSensitive = async (plan: ServerArtifactCommandPlan, failure: string): Promise<void> => {
+    try {
+      await input.commandRunner(plan, input.limits);
+    } catch {
+      fail(failure);
+    }
+  };
+  const signingArgs =
+    input.configuration === null
+      ? ["--force", "--sign", "-", "--timestamp=none", input.path]
+      : [
+          "--force",
+          "--options",
+          "runtime",
+          "--sign",
+          input.configuration.applicationIdentity,
+          "--timestamp",
+          input.path,
+        ];
+  await runSensitive(
+    { command: "codesign", args: signingArgs, cwd: input.cwd },
+    "macOS executable signing failed.",
+  );
+  await runSensitive(
+    {
+      command: "codesign",
+      args: ["--verify", "--strict", "--verbose=2", input.path],
+      cwd: input.cwd,
+    },
+    "macOS executable signature verification failed.",
+  );
+  if (input.configuration === null) return adhocMacNativeSigning();
+  await runSensitive(
+    {
+      command: "spctl",
+      args: ["--assess", "--type", "execute", "--verbose=4", input.path],
+      cwd: input.cwd,
+    },
+    "macOS Developer ID executable assessment failed.",
+  );
+  return {
+    binary: "developer-id",
+    package: "none",
+    verified: true,
+    timestamped: true,
+    signerSubject: input.configuration.applicationIdentity,
+    signerThumbprint: null,
+    teamId: input.configuration.teamId,
+  };
+}
+
 const assertPlainFile = (path: string, label: string): void => {
   let metadata: NodeFS.Stats;
   try {
@@ -549,7 +869,7 @@ const resolveRustToolchainRuntime = async (
   };
 };
 
-const copyPlainTree = async (source: string, destination: string): Promise<void> => {
+export const copyPlainTree = async (source: string, destination: string): Promise<void> => {
   const manifest = await collectWebAssetManifest(source);
   await NodeFSP.mkdir(destination, { recursive: true });
   for (const file of manifest.files) {
@@ -608,6 +928,24 @@ interface ServerBuildMetadata {
   readonly rustc: string;
   readonly binarySha256: string;
   readonly sliceSha256?: Readonly<Record<string, string>>;
+}
+
+interface ServerBuildFileRecord {
+  readonly path: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
+interface PublishedServerBuildMetadata extends ServerBuildMetadata {
+  readonly artifact: {
+    readonly downloadName: string;
+    readonly os: ServerArtifactOs;
+    readonly architecture: ServerArtifactArchitecture;
+    readonly format: ServerArtifactFormat;
+    readonly nativeSigning: NativeSigningState;
+    readonly notarized: boolean;
+  };
+  readonly fileInventory: ReadonlyArray<ServerBuildFileRecord>;
 }
 
 interface PublishedServerArtifact {
@@ -769,8 +1107,13 @@ interface NativeBuildContext {
   readonly version: string;
   readonly executable: string;
   readonly stagedRoot: string;
+  readonly stagedInventory: ReadonlyArray<ServerBuildFileRecord>;
+  readonly macosOtherSlice?: string;
+  readonly macosOtherSliceMetadata?: string;
   readonly metadata: ServerBuildMetadata;
   readonly metadataPath: string;
+  readonly nativeSigning: NativeSigningState;
+  readonly releaseEnv: NodeJS.ProcessEnv;
   readonly webRoot: string;
   readonly webManifestPath: string;
   readonly noticesPath: string;
@@ -782,10 +1125,20 @@ interface NativeBuildContext {
 const publishMetadataFor = async (
   publish: string,
   artifactName: string,
-  metadataSource: string,
+  metadata: ServerBuildMetadata,
+  artifact: Omit<PublishedServerBuildMetadata["artifact"], "downloadName">,
+  fileInventory: ReadonlyArray<ServerBuildFileRecord>,
 ): Promise<PublishedServerArtifact> => {
   const metadataName = `${artifactName}.build.json`;
-  await NodeFSP.copyFile(metadataSource, NodePath.join(publish, metadataName));
+  const publishedMetadata: PublishedServerBuildMetadata = {
+    ...metadata,
+    artifact: { downloadName: artifactName, ...artifact },
+    fileInventory,
+  };
+  await NodeFSP.writeFile(
+    NodePath.join(publish, metadataName),
+    `${JSON.stringify(publishedMetadata, null, 2)}\n`,
+  );
   return { fileName: artifactName, metadataName };
 };
 
@@ -832,8 +1185,33 @@ const buildWindowsNativeInstaller = async (
   );
   const built = await requireExactlyOneOutput(output, ".msi", "WiX");
   const artifactName = `bibcode-server-${context.version}-windows-${descriptor.manifestArchitecture}.msi`;
-  await NodeFSP.copyFile(built, NodePath.join(context.publish, artifactName));
-  return [await publishMetadataFor(context.publish, artifactName, context.metadataPath)];
+  const artifactPath = NodePath.join(context.publish, artifactName);
+  await NodeFSP.copyFile(built, artifactPath);
+  const nativeSigning =
+    context.metadata.buildMode === "signing-candidate"
+      ? await signAndVerifyWindowsArtifact({
+          path: artifactPath,
+          cwd: workspace,
+          env: context.releaseEnv,
+          commandRunner: context.commandRunner,
+          limits: context.limits,
+        })
+      : context.nativeSigning;
+  return [
+    await publishMetadataFor(
+      context.publish,
+      artifactName,
+      context.metadata,
+      {
+        os: "windows",
+        architecture: descriptor.manifestArchitecture,
+        format: "msi",
+        nativeSigning,
+        notarized: false,
+      },
+      context.stagedInventory,
+    ),
+  ];
 };
 
 const buildLinuxNativeInstallers = async (
@@ -961,8 +1339,32 @@ const buildLinuxNativeInstallers = async (
   assertPlainFile(debPath, `DEB ${debArchitecture} installer`);
   assertPlainFile(rpmPath, `RPM ${rpmArchitecture} installer`);
   return Promise.all([
-    publishMetadataFor(context.publish, debName, context.metadataPath),
-    publishMetadataFor(context.publish, rpmName, context.metadataPath),
+    publishMetadataFor(
+      context.publish,
+      debName,
+      context.metadata,
+      {
+        os: "linux",
+        architecture: descriptor.manifestArchitecture,
+        format: "deb",
+        nativeSigning: unsignedNativeSigning(),
+        notarized: false,
+      },
+      context.stagedInventory,
+    ),
+    publishMetadataFor(
+      context.publish,
+      rpmName,
+      context.metadata,
+      {
+        os: "linux",
+        architecture: descriptor.manifestArchitecture,
+        format: "rpm",
+        nativeSigning: unsignedNativeSigning(),
+        notarized: false,
+      },
+      context.stagedInventory,
+    ),
   ]);
 };
 
@@ -971,20 +1373,44 @@ const buildMacNativeInstaller = async (
 ): Promise<ReadonlyArray<PublishedServerArtifact>> => {
   const otherTarget: ServerTargetTriple =
     context.plan.target === "aarch64-apple-darwin" ? "x86_64-apple-darwin" : "aarch64-apple-darwin";
-  const otherBuild = await context.commandRunner(
-    {
-      command: context.rust.cargo,
-      args: cargoArgsForTarget(otherTarget),
-      cwd: context.repoRoot,
-      env: context.rust.env,
-    },
+  let otherExecutable: string;
+  if (context.macosOtherSlice !== undefined && context.macosOtherSliceMetadata !== undefined) {
+    otherExecutable = context.macosOtherSlice;
+    const otherMetadata = readJson<Partial<ServerBuildMetadata>>(context.macosOtherSliceMetadata);
+    if (
+      otherMetadata.schemaVersion !== 1 ||
+      otherMetadata.product !== "bibcode-server" ||
+      otherMetadata.version !== context.version ||
+      otherMetadata.sourceSha !== context.metadata.sourceSha ||
+      otherMetadata.targetTriple !== otherTarget ||
+      otherMetadata.binarySha256 !== (await sha256File(otherExecutable))
+    ) {
+      return fail("The externally built macOS slice does not match the release identity.");
+    }
+  } else {
+    const otherBuild = await context.commandRunner(
+      {
+        command: context.rust.cargo,
+        args: cargoArgsForTarget(otherTarget),
+        cwd: context.repoRoot,
+        env: context.rust.env,
+      },
+      context.limits,
+    );
+    otherExecutable = parseCargoServerExecutable(otherBuild.stdout, {
+      cargoTargetDirectory: NodePath.join(context.repoRoot, "target", otherTarget, "release"),
+      executableName: "bibcode",
+    });
+  }
+  assertPlainFile(otherExecutable, `Cargo ${otherTarget} server executable`);
+  const otherArchitectures = await context.commandRunner(
+    { command: "lipo", args: ["-archs", otherExecutable], cwd: context.repoRoot },
     context.limits,
   );
-  const otherExecutable = parseCargoServerExecutable(otherBuild.stdout, {
-    cargoTargetDirectory: NodePath.join(context.repoRoot, "target", otherTarget, "release"),
-    executableName: "bibcode",
-  });
-  assertPlainFile(otherExecutable, `Cargo ${otherTarget} server executable`);
+  const expectedOtherArchitecture = otherTarget === "x86_64-apple-darwin" ? "x86_64" : "arm64";
+  if (otherArchitectures.stdout.trim() !== expectedOtherArchitecture) {
+    return fail(`The ${otherTarget} external server slice has the wrong Mach-O architecture.`);
+  }
   const otherVersion = await context.commandRunner(
     { command: otherExecutable, args: ["--version"], cwd: context.repoRoot },
     context.limits,
@@ -995,10 +1421,26 @@ const buildMacNativeInstaller = async (
 
   const workspace = NodePath.join(context.temporary, "native", "macos");
   await NodeFSP.mkdir(workspace, { recursive: true });
+  const developerConfiguration =
+    context.metadata.buildMode === "signing-candidate"
+      ? resolveMacDeveloperIdConfiguration(context.releaseEnv)
+      : null;
+  const otherPreparedDirectory = NodePath.join(workspace, "prepared", otherTarget);
+  await NodeFSP.mkdir(otherPreparedDirectory, { recursive: true });
+  const otherPreparedExecutable = NodePath.join(otherPreparedDirectory, "bibcode");
+  await NodeFSP.copyFile(otherExecutable, otherPreparedExecutable);
+  await NodeFSP.chmod(otherPreparedExecutable, 0o755);
+  await signAndVerifyMacExecutable({
+    path: otherPreparedExecutable,
+    cwd: workspace,
+    configuration: developerConfiguration,
+    commandRunner: context.commandRunner,
+    limits: context.limits,
+  });
   const universalExecutable = NodePath.join(workspace, "bibcode");
   const binaries = new Map<ServerTargetTriple, string>([
     [context.plan.target, context.executable],
-    [otherTarget, otherExecutable],
+    [otherTarget, otherPreparedExecutable],
   ]);
   await context.commandRunner(
     {
@@ -1023,22 +1465,13 @@ const buildMacNativeInstaller = async (
   if (observedArchs.size !== 2 || !observedArchs.has("x86_64") || !observedArchs.has("arm64")) {
     return fail(`The universal macOS executable has invalid slices: ${archs.stdout.trim()}.`);
   }
-  await context.commandRunner(
-    {
-      command: "codesign",
-      args: ["--force", "--sign", "-", "--timestamp=none", universalExecutable],
-      cwd: workspace,
-    },
-    context.limits,
-  );
-  await context.commandRunner(
-    {
-      command: "codesign",
-      args: ["--verify", "--strict", "--verbose=2", universalExecutable],
-      cwd: workspace,
-    },
-    context.limits,
-  );
+  const universalSigning = await signAndVerifyMacExecutable({
+    path: universalExecutable,
+    cwd: workspace,
+    configuration: developerConfiguration,
+    commandRunner: context.commandRunner,
+    limits: context.limits,
+  });
 
   const universalMetadata: ServerBuildMetadata = {
     ...context.metadata,
@@ -1137,22 +1570,103 @@ const buildMacNativeInstaller = async (
   );
   const artifactName = `bibcode-server-${context.version}-macos-universal.pkg`;
   const artifactPath = NodePath.join(context.publish, artifactName);
+  const unsignedArtifactPath =
+    developerConfiguration === null
+      ? artifactPath
+      : NodePath.join(workspace, "BiBCodeServer-unsigned.pkg");
   await context.commandRunner(
     {
       command: "productbuild",
-      args: ["--distribution", distributionPath, "--package-path", workspace, artifactPath],
+      args: ["--distribution", distributionPath, "--package-path", workspace, unsignedArtifactPath],
       cwd: workspace,
       env: packageEnv,
     },
     context.limits,
   );
+  if (developerConfiguration !== null) {
+    const runSensitive = async (
+      plan: ServerArtifactCommandPlan,
+      failure: string,
+    ): Promise<void> => {
+      try {
+        await context.commandRunner(plan, context.limits);
+      } catch {
+        fail(failure);
+      }
+    };
+    await runSensitive(
+      {
+        command: "productsign",
+        args: [
+          "--sign",
+          developerConfiguration.installerIdentity,
+          unsignedArtifactPath,
+          artifactPath,
+        ],
+        cwd: workspace,
+      },
+      "macOS Developer ID package signing failed.",
+    );
+    await runSensitive(
+      { command: "pkgutil", args: ["--check-signature", artifactPath], cwd: workspace },
+      "macOS Developer ID package signature verification failed.",
+    );
+    await runSensitive(
+      {
+        command: "xcrun",
+        args: [
+          "notarytool",
+          "submit",
+          artifactPath,
+          "--keychain-profile",
+          developerConfiguration.notaryProfile,
+          "--wait",
+        ],
+        cwd: workspace,
+      },
+      "macOS package notarization failed.",
+    );
+    await runSensitive(
+      { command: "xcrun", args: ["stapler", "staple", artifactPath], cwd: workspace },
+      "macOS package notarization staple failed.",
+    );
+    await runSensitive(
+      { command: "xcrun", args: ["stapler", "validate", artifactPath], cwd: workspace },
+      "macOS package notarization staple verification failed.",
+    );
+    await runSensitive(
+      {
+        command: "spctl",
+        args: ["--assess", "--type", "install", "--verbose=4", artifactPath],
+        cwd: workspace,
+      },
+      "macOS Developer ID package assessment failed.",
+    );
+  }
   assertPlainFile(artifactPath, "macOS universal product package");
   const payloadListing = await context.commandRunner(
     { command: "pkgutil", args: ["--payload-files", artifactPath], cwd: workspace },
     context.limits,
   );
   validateMacPackagePayloadListing(payloadListing.stdout);
-  return [await publishMetadataFor(context.publish, artifactName, universalMetadataPath)];
+  return [
+    await publishMetadataFor(
+      context.publish,
+      artifactName,
+      universalMetadata,
+      {
+        os: "macos",
+        architecture: "universal",
+        format: "pkg",
+        nativeSigning:
+          developerConfiguration === null
+            ? universalSigning
+            : { ...universalSigning, package: "developer-id" },
+        notarized: developerConfiguration !== null,
+      },
+      await fileInventoryForPayload(universalStage, "bibcode"),
+    ),
+  ];
 };
 
 const buildNativeInstallers = async (
@@ -1230,6 +1744,27 @@ export async function buildServerArtifact(
   );
   if (Boolean(input.webAssetsDir) !== Boolean(input.webAssetsManifest)) {
     return fail("--web-assets-dir and --web-assets-manifest must be provided together.");
+  }
+  if (Boolean(input.macosOtherSlice) !== Boolean(input.macosOtherSliceMetadata)) {
+    return fail("--macos-other-slice and --macos-other-slice-metadata must be provided together.");
+  }
+  if (
+    input.macosOtherSlice !== undefined &&
+    (SERVER_PORTABLE_TARGETS[plan.target].platform !== "darwin" || !plan.formats.includes("native"))
+  ) {
+    return fail("An external macOS slice is valid only for a native macOS package build.");
+  }
+  const macosOtherSlice =
+    input.macosOtherSlice === undefined
+      ? undefined
+      : NodePath.resolve(repoRoot, input.macosOtherSlice);
+  const macosOtherSliceMetadata =
+    input.macosOtherSliceMetadata === undefined
+      ? undefined
+      : NodePath.resolve(repoRoot, input.macosOtherSliceMetadata);
+  if (macosOtherSlice !== undefined && macosOtherSliceMetadata !== undefined) {
+    assertPlainFile(macosOtherSlice, "External macOS server slice");
+    assertPlainFile(macosOtherSliceMetadata, "External macOS server slice metadata");
   }
 
   const commandRunner: ServerArtifactCommandRunner =
@@ -1356,8 +1891,33 @@ export async function buildServerArtifact(
       },
       limits,
     );
-    const executable = parseCargoServerExecutable(cargoBuild.stdout, plan);
-    assertPlainFile(executable, "Cargo server executable");
+    const cargoExecutable = parseCargoServerExecutable(cargoBuild.stdout, plan);
+    assertPlainFile(cargoExecutable, "Cargo server executable");
+    const preparedDirectory = NodePath.join(temporary, "prepared-binary");
+    await NodeFSP.mkdir(preparedDirectory);
+    const executable = NodePath.join(preparedDirectory, plan.executableName);
+    await NodeFSP.copyFile(cargoExecutable, executable);
+    if (SERVER_PORTABLE_TARGETS[plan.target].platform !== "win32") {
+      await NodeFSP.chmod(executable, 0o755);
+    }
+    let nativeSigning = unsignedNativeSigning();
+    if (SERVER_PORTABLE_TARGETS[plan.target].platform === "win32" && input.unsignedTest !== true) {
+      nativeSigning = await signAndVerifyWindowsArtifact({
+        path: executable,
+        cwd: repoRoot,
+        env,
+        commandRunner,
+        limits,
+      });
+    } else if (SERVER_PORTABLE_TARGETS[plan.target].platform === "darwin") {
+      nativeSigning = await signAndVerifyMacExecutable({
+        path: executable,
+        cwd: repoRoot,
+        configuration: input.unsignedTest === true ? null : resolveMacDeveloperIdConfiguration(env),
+        commandRunner,
+        limits,
+      });
+    }
     const versionOutput = await commandRunner(
       { command: executable, args: ["--version"], cwd: repoRoot },
       limits,
@@ -1404,6 +1964,9 @@ export async function buildServerArtifact(
         limits,
       );
     }
+    const stagedInventory = requiresCurrentTargetStage
+      ? await fileInventoryForPayload(stagedRoot, plan.executableName)
+      : [];
 
     const publish = NodePath.join(temporary, "publish");
     await NodeFSP.mkdir(publish);
@@ -1438,7 +2001,21 @@ export async function buildServerArtifact(
         limits,
       );
       assertPlainFile(archivePath, "Portable server archive");
-      published.push(await publishMetadataFor(publish, archiveName, metadataPath));
+      published.push(
+        await publishMetadataFor(
+          publish,
+          archiveName,
+          metadata,
+          {
+            os: artifactOsForTarget(plan.target),
+            architecture: artifactArchitectureForTarget(plan.target),
+            format: plan.portableFormat,
+            nativeSigning,
+            notarized: false,
+          },
+          stagedInventory,
+        ),
+      );
     }
 
     if (plan.formats.includes("native")) {
@@ -1452,8 +2029,13 @@ export async function buildServerArtifact(
           version,
           executable,
           stagedRoot,
+          stagedInventory,
+          ...(macosOtherSlice ? { macosOtherSlice } : {}),
+          ...(macosOtherSliceMetadata ? { macosOtherSliceMetadata } : {}),
           metadata,
           metadataPath,
+          nativeSigning,
+          releaseEnv: env,
           webRoot,
           webManifestPath,
           noticesPath,

@@ -7591,10 +7591,16 @@ mod tests {
             sha256: "a".repeat(64),
             signature_name: "bibcode-server.tar.gz.minisig".to_string(),
             sbom_name: "bibcode-server.cdx.json".to_string(),
+            sbom_sha256: None,
+            sbom_signature_name: None,
             native_signing: crate::server_artifacts::NativeSigningState {
                 binary: "none".to_string(),
                 package: "none".to_string(),
                 verified: false,
+                timestamped: false,
+                signer_subject: None,
+                signer_thumbprint: None,
+                team_id: None,
             },
             notarized: false,
         };

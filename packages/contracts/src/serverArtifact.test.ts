@@ -20,7 +20,17 @@ const linuxArtifact = {
   sha256: "a".repeat(64),
   signatureName: "bibcode-server-linux-x86_64.tar.gz.minisig",
   sbomName: "bibcode-server-linux-x86_64.cdx.json",
-  nativeSigning: { binary: "none", package: "none", verified: false },
+  sbomSha256: "b".repeat(64),
+  sbomSignatureName: "bibcode-server-linux-x86_64.cdx.json.minisig",
+  nativeSigning: {
+    binary: "none",
+    package: "none",
+    verified: false,
+    timestamped: false,
+    signerSubject: null,
+    signerThumbprint: null,
+    teamId: null,
+  },
   notarized: false,
 } as const;
 
@@ -48,6 +58,9 @@ const manifestFor = (
     format: artifact.format,
   })),
   artifacts,
+  checksumsName: "SHA256SUMS",
+  checksumsSha256: "c".repeat(64),
+  checksumsSignatureName: "SHA256SUMS.minisig",
   manifestSignatureName: "artifacts.json.minisig",
 });
 
@@ -83,9 +96,27 @@ describe("ServerArtifactManifestSchema", () => {
         ...linuxArtifact,
         os: "windows",
         targetTriple: "x86_64-pc-windows-msvc",
-        nativeSigning: { binary: "none", package: "none", verified: true },
+        nativeSigning: {
+          ...linuxArtifact.nativeSigning,
+          verified: true,
+        },
       },
       "unsupported signing state",
+    ],
+    [
+      {
+        ...linuxArtifact,
+        nativeSigning: {
+          binary: "none",
+          package: "authenticode",
+          verified: true,
+          timestamped: true,
+          signerSubject: "BiBCode Release",
+          signerThumbprint: "a".repeat(40),
+          teamId: null,
+        },
+      },
+      "package-only certificate claim",
     ],
   ] as const)("rejects a record mismatch (%s: %s)", (artifact, _label) => {
     expect(() => decodeManifest(manifestFor([artifact]))).toThrow();
@@ -148,6 +179,10 @@ describe("ServerArtifactManifestSchema", () => {
                 binary: "authenticode",
                 package: "authenticode",
                 verified: true,
+                timestamped: true,
+                signerSubject: "BiBCode Release",
+                signerThumbprint: "a".repeat(40),
+                teamId: null,
               },
             },
           ],
@@ -167,7 +202,8 @@ describe("ServerArtifactManifestSchema", () => {
       downloadName: "bibcode-server-universal.pkg",
       signatureName: "bibcode-server-universal.pkg.minisig",
       sbomName: "bibcode-server-universal.cdx.json",
-      nativeSigning: { binary: "adhoc", package: "none", verified: false },
+      sbomSignatureName: "bibcode-server-universal.cdx.json.minisig",
+      nativeSigning: { ...linuxArtifact.nativeSigning, binary: "adhoc" },
     } as const;
     expect(() => decodeManifest(manifestFor([universal]))).toThrow();
 
@@ -178,7 +214,8 @@ describe("ServerArtifactManifestSchema", () => {
       downloadName: "bibcode-server-macos-x86_64.tar.gz",
       signatureName: "bibcode-server-macos-x86_64.tar.gz.minisig",
       sbomName: "bibcode-server-macos-x86_64.cdx.json",
-      nativeSigning: { binary: "adhoc", package: "none", verified: false },
+      sbomSignatureName: "bibcode-server-macos-x86_64.cdx.json.minisig",
+      nativeSigning: { ...linuxArtifact.nativeSigning, binary: "adhoc" },
     } as const;
     const arm64 = {
       ...x64,
@@ -187,6 +224,7 @@ describe("ServerArtifactManifestSchema", () => {
       downloadName: "bibcode-server-macos-aarch64.tar.gz",
       signatureName: "bibcode-server-macos-aarch64.tar.gz.minisig",
       sbomName: "bibcode-server-macos-aarch64.cdx.json",
+      sbomSignatureName: "bibcode-server-macos-aarch64.cdx.json.minisig",
     } as const;
     expect(decodeManifest(manifestFor([x64, arm64, universal])).artifacts).toHaveLength(3);
   });
@@ -204,6 +242,47 @@ describe("ServerArtifactManifestSchema", () => {
         },
         artifact: linuxArtifact,
       }),
+    ).toThrow();
+  });
+
+  it("binds every SBOM and checksum document to signed release bytes", () => {
+    expect(() =>
+      decodeManifest(
+        manifestFor([
+          {
+            ...linuxArtifact,
+            sbomSha256: "0".repeat(64),
+            sbomSignatureName: linuxArtifact.signatureName,
+          },
+        ]),
+      ),
+    ).toThrow();
+    expect(() =>
+      decodeManifest({
+        ...manifestFor([linuxArtifact]),
+        checksumsSha256: "not-a-hash",
+      }),
+    ).toThrow();
+  });
+
+  it("requires signing metadata to match the native platform signature", () => {
+    expect(() =>
+      decodeManifest(
+        manifestFor([
+          {
+            ...linuxArtifact,
+            nativeSigning: {
+              binary: "authenticode",
+              package: "none",
+              verified: true,
+              timestamped: false,
+              signerSubject: "BiBCode Release",
+              signerThumbprint: "a".repeat(40),
+              teamId: null,
+            },
+          },
+        ]),
+      ),
     ).toThrow();
   });
 });

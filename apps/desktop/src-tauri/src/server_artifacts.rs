@@ -40,6 +40,10 @@ pub(crate) struct ServerArtifactRecord {
     pub sha256: String,
     pub signature_name: String,
     pub sbom_name: String,
+    #[serde(default)]
+    pub sbom_sha256: Option<String>,
+    #[serde(default)]
+    pub sbom_signature_name: Option<String>,
     pub native_signing: NativeSigningState,
     pub notarized: bool,
 }
@@ -50,6 +54,14 @@ pub(crate) struct NativeSigningState {
     pub binary: String,
     pub package: String,
     pub verified: bool,
+    #[serde(default)]
+    pub timestamped: bool,
+    #[serde(default)]
+    pub signer_subject: Option<String>,
+    #[serde(default)]
+    pub signer_thumbprint: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +245,12 @@ struct ServerArtifactManifest {
     generated_at: String,
     required_matrix: Vec<ServerArtifactRequirement>,
     artifacts: Vec<ServerArtifactRecord>,
+    #[serde(default)]
+    checksums_name: Option<String>,
+    #[serde(default)]
+    checksums_sha256: Option<String>,
+    #[serde(default)]
+    checksums_signature_name: Option<String>,
     manifest_signature_name: String,
 }
 
@@ -255,10 +273,15 @@ fn safe_artifact_name(value: &str) -> bool {
 }
 
 fn validate_record(record: &ServerArtifactRecord) -> Result<(), String> {
-    let certificate_signed = matches!(
-        record.native_signing.binary.as_str(),
-        "authenticode" | "developer-id"
-    ) || record.native_signing.package != "none";
+    let provenance_complete = record.sbom_sha256.is_some() && record.sbom_signature_name.is_some();
+    let mut linked_names = BTreeSet::from([
+        record.download_name.as_str(),
+        record.signature_name.as_str(),
+        record.sbom_name.as_str(),
+    ]);
+    if let Some(name) = record.sbom_signature_name.as_deref() {
+        linked_names.insert(name);
+    }
     if record.product != "bibcode-server"
         || record.version.trim().is_empty()
         || !valid_source_sha(&record.source_sha)
@@ -275,27 +298,18 @@ fn validate_record(record: &ServerArtifactRecord) -> Result<(), String> {
         || !safe_artifact_name(&record.download_name)
         || !safe_artifact_name(&record.signature_name)
         || !safe_artifact_name(&record.sbom_name)
-        || BTreeSet::from([
-            record.download_name.as_str(),
-            record.signature_name.as_str(),
-            record.sbom_name.as_str(),
-        ])
-        .len()
-            != 3
-        || record.sha256.len() != 64
-        || !record
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || !matches!(
-            record.native_signing.binary.as_str(),
-            "none" | "adhoc" | "authenticode" | "developer-id"
-        )
-        || !matches!(
-            record.native_signing.package.as_str(),
-            "none" | "authenticode" | "developer-id"
-        )
-        || record.native_signing.verified != certificate_signed
+        || linked_names.len() != if provenance_complete { 4 } else { 3 }
+        || !valid_sha256(&record.sha256)
+        || record
+            .sbom_sha256
+            .as_deref()
+            .is_some_and(|hash| !valid_sha256(hash))
+        || record
+            .sbom_signature_name
+            .as_deref()
+            .is_some_and(|name| !safe_artifact_name(name))
+        || record.sbom_sha256.is_some() != record.sbom_signature_name.is_some()
+        || !valid_native_signing(&record.native_signing)
         || !valid_artifact_tuple(
             &record.target_triple,
             &record.os,
@@ -313,6 +327,12 @@ fn validate_record(record: &ServerArtifactRecord) -> Result<(), String> {
 }
 
 fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
+    let checksums_complete = manifest.checksums_name.is_some()
+        && manifest.checksums_sha256.is_some()
+        && manifest.checksums_signature_name.is_some();
+    let checksums_empty = manifest.checksums_name.is_none()
+        && manifest.checksums_sha256.is_none()
+        && manifest.checksums_signature_name.is_none();
     if manifest.schema_version != 1
         || manifest.product != "bibcode-server"
         || manifest.version.trim().is_empty()
@@ -322,6 +342,20 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
         )
         || !valid_source_sha(&manifest.source_sha)
         || !safe_artifact_name(&manifest.manifest_signature_name)
+        || !(checksums_complete || checksums_empty)
+        || manifest
+            .checksums_name
+            .as_deref()
+            .is_some_and(|name| !safe_artifact_name(name))
+        || manifest
+            .checksums_signature_name
+            .as_deref()
+            .is_some_and(|name| !safe_artifact_name(name))
+        || manifest
+            .checksums_sha256
+            .as_deref()
+            .is_some_and(|hash| !valid_sha256(hash))
+        || (manifest.channel == "stable" && !checksums_complete)
         || manifest.required_matrix.is_empty()
         || manifest.artifacts.is_empty()
         || time::OffsetDateTime::parse(
@@ -351,6 +385,19 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
     }
     let mut tuples = BTreeSet::new();
     let mut linked_names = BTreeSet::from([manifest.manifest_signature_name.clone()]);
+    for name in [
+        manifest.checksums_name.as_ref(),
+        manifest.checksums_signature_name.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !linked_names.insert(name.clone()) {
+            return Err(
+                "The signed server artifact manifest has duplicate linked names.".to_string(),
+            );
+        }
+    }
     for record in &manifest.artifacts {
         validate_record(record)?;
         if record.product != manifest.product
@@ -358,6 +405,14 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
             || record.source_sha != manifest.source_sha
         {
             return Err("A server artifact record does not match its signed manifest.".to_string());
+        }
+        if checksums_complete != record.sbom_sha256.is_some()
+            || (manifest.channel == "stable" && record.sbom_signature_name.is_none())
+        {
+            return Err(
+                "The signed server artifact manifest has incomplete checksum or SBOM provenance."
+                    .to_string(),
+            );
         }
         if manifest.channel == "stable"
             && record.os == "windows"
@@ -379,12 +434,14 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
         if !required.contains(&requirement)
             || !tuples.insert(requirement)
             || ![
-                &record.download_name,
-                &record.signature_name,
-                &record.sbom_name,
+                Some(&record.download_name),
+                Some(&record.signature_name),
+                Some(&record.sbom_name),
+                record.sbom_signature_name.as_ref(),
             ]
-            .iter()
-            .all(|name| linked_names.insert((*name).clone()))
+            .into_iter()
+            .flatten()
+            .all(|name| linked_names.insert(name.clone()))
         {
             return Err(
                 "The signed server artifact manifest does not match its required matrix exactly."
@@ -442,6 +499,59 @@ fn valid_source_sha(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_native_signing(signing: &NativeSigningState) -> bool {
+    let subject_valid = signing
+        .signer_subject
+        .as_deref()
+        .is_some_and(|value| !value.is_empty() && value.trim() == value && value.len() <= 512);
+    let thumbprint_valid = signing.signer_thumbprint.as_deref().is_some_and(|value| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    let team_valid = signing.team_id.as_deref().is_some_and(|value| {
+        value.len() == 10
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    });
+    match signing.binary.as_str() {
+        "authenticode" => {
+            matches!(signing.package.as_str(), "none" | "authenticode")
+                && signing.verified
+                && signing.timestamped
+                && subject_valid
+                && thumbprint_valid
+                && signing.team_id.is_none()
+        }
+        "developer-id" => {
+            matches!(signing.package.as_str(), "none" | "developer-id")
+                && signing.verified
+                && signing.timestamped
+                && subject_valid
+                && signing.signer_thumbprint.is_none()
+                && team_valid
+        }
+        "none" | "adhoc" => {
+            signing.package == "none"
+                && !signing.verified
+                && !signing.timestamped
+                && signing.signer_subject.is_none()
+                && signing.signer_thumbprint.is_none()
+                && signing.team_id.is_none()
+        }
+        _ => false,
+    }
 }
 
 fn validate_source_url(url: &url::Url) -> Result<(), String> {
@@ -796,6 +906,29 @@ mod tests {
             .remove(0);
         unsafe_record.download_name = "../escape.tar.gz".to_string();
         assert!(validate_record(&unsafe_record).is_err());
+    }
+
+    #[test]
+    fn current_manifest_requires_complete_checksum_sbom_and_native_signing_evidence() {
+        let mut manifest = serde_json::from_str::<ServerArtifactManifest>(FIXTURE_MANIFEST)
+            .expect("fixture manifest");
+        manifest.checksums_name = Some("SHA256SUMS".to_string());
+        manifest.checksums_sha256 = Some("a".repeat(64));
+        manifest.checksums_signature_name = Some("SHA256SUMS.minisig".to_string());
+        manifest.artifacts[0].sbom_sha256 = Some("b".repeat(64));
+        manifest.artifacts[0].sbom_signature_name =
+            Some("bibcode-server-linux-x86_64.cdx.json.minisig".to_string());
+        validate_manifest(&manifest).expect("complete current provenance should validate");
+
+        manifest.channel = "stable".to_string();
+        validate_manifest(&manifest).expect("stable Linux detached provenance should validate");
+        manifest.artifacts[0].sbom_signature_name = None;
+        assert!(validate_manifest(&manifest).is_err());
+
+        let mut record = manifest.artifacts.remove(0);
+        record.native_signing.binary = "authenticode".to_string();
+        record.native_signing.verified = true;
+        assert!(validate_record(&record).is_err());
     }
 
     #[test]

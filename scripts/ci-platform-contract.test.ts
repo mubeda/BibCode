@@ -8,6 +8,10 @@ import { parse as parseYaml } from "yaml";
 const REPOSITORY_ROOT = NodePath.resolve(import.meta.dirname, "..");
 const CI_WORKFLOW_PATH = NodePath.join(REPOSITORY_ROOT, ".github/workflows/ci.yml");
 const RELEASE_WORKFLOW_PATH = NodePath.join(REPOSITORY_ROOT, ".github/workflows/release.yml");
+const SERVER_NATIVE_WORKFLOW_PATH = NodePath.join(
+  REPOSITORY_ROOT,
+  ".github/workflows/server-native-smoke.yml",
+);
 const DESKTOP_UI_WORKFLOW_PATH = NodePath.join(
   REPOSITORY_ROOT,
   ".github/workflows/desktop-ui-smoke.yml",
@@ -33,8 +37,12 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly env?: Record<string, string>;
+  readonly if?: string;
+  readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
+  readonly permissions?: Record<string, string>;
   readonly "runs-on"?: string;
+  readonly secrets?: string | Record<string, string>;
   readonly strategy?: {
     readonly "fail-fast"?: boolean;
     readonly matrix?: {
@@ -42,6 +50,8 @@ interface WorkflowJob {
     };
   };
   readonly steps?: ReadonlyArray<WorkflowStep>;
+  readonly uses?: string;
+  readonly with?: Record<string, unknown>;
 }
 
 interface Workflow {
@@ -67,6 +77,22 @@ function allStepCommands(job: WorkflowJob): string {
 }
 
 describe("cross-platform CI contract", () => {
+  it("builds one frozen web input and calls the reusable unsigned native server matrix", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+    const web = requireJob(workflow, "server_web_assets");
+    const native = requireJob(workflow, "native_server");
+    const webCommands = allStepCommands(web);
+
+    expect(webCommands).toContain("build:server-assets");
+    expect(webCommands).toContain("freeze-server-web-assets.ts");
+    expect(native.uses).toBe("./.github/workflows/server-native-smoke.yml");
+    expect(native.needs).toEqual(["server_web_assets"]);
+    expect(native.with?.channel).toBe("unsigned-test");
+    expect(native.with?.["web-assets-artifact"]).toBe(
+      "${{ needs.server_web_assets.outputs.artifact_name }}",
+    );
+  });
+
   it("uses default Rust harness threads in standard package and CI commands", () => {
     const serverPackage = JSON.parse(NodeFS.readFileSync(SERVER_PACKAGE_JSON_PATH, "utf8")) as {
       readonly scripts: Record<string, string>;
@@ -203,7 +229,83 @@ describe("cross-platform CI contract", () => {
   });
 });
 
+describe("reusable native server workflow contract", () => {
+  it("uses every exact native runner and target without cross-labeling support", () => {
+    const { workflow } = readWorkflow(SERVER_NATIVE_WORKFLOW_PATH);
+    const build = requireJob(workflow, "build");
+    const matrix = build.strategy?.matrix?.include ?? [];
+    expect(matrix).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ runner: "windows-2025", target: "x86_64-pc-windows-msvc" }),
+        expect.objectContaining({ runner: "windows-11-arm", target: "aarch64-pc-windows-msvc" }),
+        expect.objectContaining({ runner: "macos-26-intel", target: "x86_64-apple-darwin" }),
+        expect.objectContaining({ runner: "macos-26", target: "aarch64-apple-darwin" }),
+        expect.objectContaining({ runner: "ubuntu-22.04", target: "x86_64-unknown-linux-gnu" }),
+        expect.objectContaining({
+          runner: "ubuntu-22.04-arm",
+          target: "aarch64-unknown-linux-gnu",
+        }),
+      ]),
+    );
+    expect(new Set(matrix.map((entry) => entry.target)).size).toBe(6);
+  });
+
+  it("freezes installs, tool versions, web identity, native signing, and source-bound uploads", () => {
+    const { workflow } = readWorkflow(SERVER_NATIVE_WORKFLOW_PATH);
+    const buildCommands = allStepCommands(requireJob(workflow, "build"));
+    const universalCommands = allStepCommands(requireJob(workflow, "mac_universal"));
+
+    expect(buildCommands).toContain("vp install --frozen-lockfile");
+    expect(buildCommands).toContain("--locked");
+    expect(buildCommands).toContain("cargo-deb --version 3.7.0");
+    expect(buildCommands).toContain("cargo-generate-rpm --version 0.21.0");
+    expect(buildCommands).toContain("WINDOWS_SIGNING_CERTIFICATE_PFX");
+    expect(buildCommands).toContain("signtool");
+    expect(buildCommands).toContain("--web-assets-dir");
+    expect(buildCommands).toContain("source-sha.txt");
+    expect(buildCommands).toContain(
+      "server-candidate-${{ inputs.source-sha }}-${{ matrix.target }}",
+    );
+    expect(universalCommands).toContain("--macos-other-slice");
+    expect(universalCommands).toContain("x86_64-apple-darwin.tar.gz.build.json");
+  });
+});
+
 describe("cross-platform release contract", () => {
+  it("gates the complete signed server set and least-privilege attestations before release", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const build = requireJob(workflow, "server_build");
+    const sign = requireJob(workflow, "server_sign");
+    const smoke = requireJob(workflow, "server_smoke");
+    const aggregate = requireJob(workflow, "server_aggregate");
+    const attest = requireJob(workflow, "server_attest");
+    const release = requireJob(workflow, "release");
+
+    expect(build.uses).toBe("./.github/workflows/server-native-smoke.yml");
+    expect(build.secrets).toBe("inherit");
+    expect(sign.needs).toEqual(["preflight", "server_build"]);
+    expect(allStepCommands(sign)).toContain("sign-server-artifacts.ts");
+    expect(allStepCommands(sign)).not.toContain("needs.server_web_assets");
+    expect(smoke.needs).toEqual(["preflight", "server_sign"]);
+    expect(aggregate.needs).toEqual(["preflight", "server_smoke"]);
+    expect(allStepCommands(aggregate)).toContain("verify-server-artifacts.ts");
+    expect(attest.needs).toEqual(["preflight", "server_aggregate"]);
+    expect(attest.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+      attestations: "write",
+      "artifact-metadata": "write",
+    });
+    expect(allStepCommands(attest)).toContain(
+      "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26",
+    );
+    expect(allStepCommands(attest)).toContain("sbom-path");
+    expect(release.needs).toEqual(["preflight", "build", "server_aggregate", "server_attest"]);
+    expect(allStepCommands(release)).toContain("server-release-set");
+    expect(allStepCommands(release)).toContain("verify-server-artifacts.ts");
+    expect(allStepCommands(release)).toContain("--require-complete-matrix");
+  });
+
   it("installs the pinned Rust toolchain before parallel preflight typechecks", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
     const steps = requireJob(workflow, "preflight").steps ?? [];

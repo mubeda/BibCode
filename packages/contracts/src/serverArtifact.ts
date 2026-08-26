@@ -36,19 +36,66 @@ export const NativeBinarySigningSchema = Schema.Literals([
   "developer-id",
 ]);
 export const NativePackageSigningSchema = Schema.Literals(["none", "authenticode", "developer-id"]);
+const NativeSignerSubjectSchema = Schema.NullOr(
+  TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+);
+const NativeSignerThumbprintSchema = Schema.NullOr(
+  Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
+);
+const AppleTeamIdSchema = Schema.NullOr(Schema.String.check(Schema.isPattern(/^[A-Z0-9]{10}$/u)));
 export const NativeSigningStateSchema = Schema.Struct({
   binary: NativeBinarySigningSchema,
   package: NativePackageSigningSchema,
   verified: Schema.Boolean,
+  timestamped: Schema.Boolean,
+  signerSubject: NativeSignerSubjectSchema,
+  signerThumbprint: NativeSignerThumbprintSchema,
+  teamId: AppleTeamIdSchema,
 }).check(
-  Schema.makeFilter(({ binary, package: packageSigning, verified }) => {
-    const requiresVerification =
-      binary === "authenticode" || binary === "developer-id" || packageSigning !== "none";
-    return (
-      verified === requiresVerification ||
-      "Verified must be true exactly when a native certificate signature is present."
-    );
-  }),
+  Schema.makeFilter(
+    ({
+      binary,
+      package: packageSigning,
+      verified,
+      timestamped,
+      signerSubject,
+      signerThumbprint,
+      teamId,
+    }) => {
+      const requiresVerification = binary === "authenticode" || binary === "developer-id";
+      if (verified !== requiresVerification) {
+        return "Verified must be true exactly when a native certificate signature is present.";
+      }
+      if (binary === "authenticode") {
+        return (
+          ((packageSigning === "none" || packageSigning === "authenticode") &&
+            timestamped &&
+            signerSubject !== null &&
+            signerThumbprint !== null &&
+            teamId === null) ||
+          "Authenticode state requires a timestamped verified subject and certificate thumbprint."
+        );
+      }
+      if (binary === "developer-id") {
+        return (
+          ((packageSigning === "none" || packageSigning === "developer-id") &&
+            timestamped &&
+            signerSubject !== null &&
+            signerThumbprint === null &&
+            teamId !== null) ||
+          "Developer ID state requires a timestamped verified authority and Apple team identifier."
+        );
+      }
+      return (
+        (packageSigning === "none" &&
+          !timestamped &&
+          signerSubject === null &&
+          signerThumbprint === null &&
+          teamId === null) ||
+        "Unsigned and ad-hoc state cannot claim certificate or timestamp metadata."
+      );
+    },
+  ),
 );
 export type NativeSigningState = typeof NativeSigningStateSchema.Type;
 
@@ -129,6 +176,8 @@ export const ServerArtifactRecordSchema = Schema.Struct({
   sha256: Sha256Hex,
   signatureName: SafeArtifactBasename,
   sbomName: SafeArtifactBasename,
+  sbomSha256: Sha256Hex,
+  sbomSignatureName: SafeArtifactBasename,
   nativeSigning: NativeSigningStateSchema,
   notarized: Schema.Boolean,
 }).check(
@@ -140,7 +189,12 @@ export const ServerArtifactRecordSchema = Schema.Struct({
       return "The artifact target triple or format does not match its OS and architecture.";
     }
     if (
-      new Set([record.downloadName, record.signatureName, record.sbomName]).size !== 3 ||
+      new Set([
+        record.downloadName,
+        record.signatureName,
+        record.sbomName,
+        record.sbomSignatureName,
+      ]).size !== 4 ||
       (record.notarized &&
         (record.os !== "macos" ||
           record.nativeSigning.package !== "developer-id" ||
@@ -165,6 +219,9 @@ export const ServerArtifactManifestSchema = Schema.Struct({
   generatedAt: IsoDateTime,
   requiredMatrix: Schema.Array(ServerArtifactRequirementSchema).check(Schema.isMinLength(1)),
   artifacts: Schema.Array(ServerArtifactRecordSchema).check(Schema.isMinLength(1)),
+  checksumsName: SafeArtifactBasename,
+  checksumsSha256: Sha256Hex,
+  checksumsSignatureName: SafeArtifactBasename,
   manifestSignatureName: SafeArtifactBasename,
 }).check(
   Schema.makeFilter((manifest) => {
@@ -177,7 +234,11 @@ export const ServerArtifactManifestSchema = Schema.Struct({
       required.add(key);
     }
     const records = new Set<string>();
-    const linkedNames = new Set<string>([manifest.manifestSignatureName]);
+    const linkedNames = new Set<string>([
+      manifest.checksumsName,
+      manifest.checksumsSignatureName,
+      manifest.manifestSignatureName,
+    ]);
     for (const artifact of manifest.artifacts) {
       if (
         artifact.product !== manifest.product ||
@@ -187,7 +248,12 @@ export const ServerArtifactManifestSchema = Schema.Struct({
         return "Every artifact must match the manifest product, version, and source SHA.";
       }
       const key = tupleKey(artifact);
-      const names = [artifact.downloadName, artifact.signatureName, artifact.sbomName];
+      const names = [
+        artifact.downloadName,
+        artifact.signatureName,
+        artifact.sbomName,
+        artifact.sbomSignatureName,
+      ];
       if (required.has(key) && !records.has(key) && names.every((name) => !linkedNames.has(name))) {
         records.add(key);
         names.forEach((name) => linkedNames.add(name));

@@ -86,7 +86,7 @@
     "javascriptLedger": 70,
     "rustRegistry": 87,
     "rustPath": 1,
-    "actions": 9,
+    "actions": 10,
     "toolchains": 9
   },
   "dependencies": [
@@ -189,6 +189,19 @@
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
       "notes": "Compile-time gated to packaged desktop UI automation builds."
+    },
+    {
+      "key": "action:actions/attest",
+      "name": "actions/attest",
+      "current": "59d89421af93a897026c735860bf21b6eb4f7b26",
+      "target": "4.1.0",
+      "tag": "v4.1.0",
+      "sha": "59d89421af93a897026c735860bf21b6eb4f7b26",
+      "channel": "stable",
+      "source": "https://github.com/actions/attest",
+      "cohort": "github-actions",
+      "platforms": ["linux"],
+      "status": "green"
     },
     {
       "key": "action:actions/checkout",
