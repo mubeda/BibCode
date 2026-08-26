@@ -30,6 +30,8 @@ const SERVER_ARTIFACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct ServerArtifactRecord {
     pub product: String,
     pub version: String,
+    pub source_sha: String,
+    pub target_triple: String,
     pub os: String,
     pub architecture: String,
     pub format: String,
@@ -37,6 +39,17 @@ pub(crate) struct ServerArtifactRecord {
     pub size: u64,
     pub sha256: String,
     pub signature_name: String,
+    pub sbom_name: String,
+    pub native_signing: NativeSigningState,
+    pub notarized: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeSigningState {
+    pub binary: String,
+    pub package: String,
+    pub verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,10 +136,12 @@ pub(crate) fn verify_manifest_and_select(
         .artifacts
         .into_iter()
         .filter(|record| {
+            let architecture_matches = record.architecture == request.architecture
+                || (record.os == "macos" && record.architecture == "universal");
             record.product == "bibcode-server"
                 && record.version == request.version
                 && record.os == request.os
-                && record.architecture == request.architecture
+                && architecture_matches
                 && request.preferred_formats.contains(&record.format)
         })
         .collect::<Vec<_>>();
@@ -213,8 +228,21 @@ struct ServerArtifactManifest {
     schema_version: u8,
     product: String,
     version: String,
+    channel: String,
+    source_sha: String,
     generated_at: String,
+    required_matrix: Vec<ServerArtifactRequirement>,
     artifacts: Vec<ServerArtifactRecord>,
+    manifest_signature_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerArtifactRequirement {
+    target_triple: String,
+    os: String,
+    architecture: String,
+    format: String,
 }
 
 fn safe_artifact_name(value: &str) -> bool {
@@ -227,8 +255,13 @@ fn safe_artifact_name(value: &str) -> bool {
 }
 
 fn validate_record(record: &ServerArtifactRecord) -> Result<(), String> {
+    let certificate_signed = matches!(
+        record.native_signing.binary.as_str(),
+        "authenticode" | "developer-id"
+    ) || record.native_signing.package != "none";
     if record.product != "bibcode-server"
         || record.version.trim().is_empty()
+        || !valid_source_sha(&record.source_sha)
         || !matches!(record.os.as_str(), "linux" | "macos" | "windows")
         || !matches!(
             record.architecture.as_str(),
@@ -241,12 +274,38 @@ fn validate_record(record: &ServerArtifactRecord) -> Result<(), String> {
         || record.size == 0
         || !safe_artifact_name(&record.download_name)
         || !safe_artifact_name(&record.signature_name)
+        || !safe_artifact_name(&record.sbom_name)
+        || BTreeSet::from([
+            record.download_name.as_str(),
+            record.signature_name.as_str(),
+            record.sbom_name.as_str(),
+        ])
+        .len()
+            != 3
         || record.sha256.len() != 64
         || !record
             .sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || (record.architecture == "universal" && record.os != "macos")
+        || !matches!(
+            record.native_signing.binary.as_str(),
+            "none" | "adhoc" | "authenticode" | "developer-id"
+        )
+        || !matches!(
+            record.native_signing.package.as_str(),
+            "none" | "authenticode" | "developer-id"
+        )
+        || record.native_signing.verified != certificate_signed
+        || !valid_artifact_tuple(
+            &record.target_triple,
+            &record.os,
+            &record.architecture,
+            &record.format,
+        )
+        || (record.notarized
+            && (record.os != "macos"
+                || record.native_signing.package != "developer-id"
+                || !record.native_signing.verified))
     {
         return Err("The signed server artifact manifest contains an invalid record.".to_string());
     }
@@ -257,6 +316,14 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
     if manifest.schema_version != 1
         || manifest.product != "bibcode-server"
         || manifest.version.trim().is_empty()
+        || !matches!(
+            manifest.channel.as_str(),
+            "stable" | "beta" | "nightly" | "unsigned-test"
+        )
+        || !valid_source_sha(&manifest.source_sha)
+        || !safe_artifact_name(&manifest.manifest_signature_name)
+        || manifest.required_matrix.is_empty()
+        || manifest.artifacts.is_empty()
         || time::OffsetDateTime::parse(
             &manifest.generated_at,
             &time::format_description::well_known::Rfc3339,
@@ -265,23 +332,116 @@ fn validate_manifest(manifest: &ServerArtifactManifest) -> Result<(), String> {
     {
         return Err("The signed server artifact manifest metadata is invalid.".to_string());
     }
+    let required = manifest
+        .required_matrix
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if required.len() != manifest.required_matrix.len()
+        || required.iter().any(|requirement| {
+            !valid_artifact_tuple(
+                &requirement.target_triple,
+                &requirement.os,
+                &requirement.architecture,
+                &requirement.format,
+            )
+        })
+    {
+        return Err("The signed server artifact required matrix is invalid.".to_string());
+    }
     let mut tuples = BTreeSet::new();
+    let mut linked_names = BTreeSet::from([manifest.manifest_signature_name.clone()]);
     for record in &manifest.artifacts {
         validate_record(record)?;
-        if record.product != manifest.product || record.version != manifest.version {
+        if record.product != manifest.product
+            || record.version != manifest.version
+            || record.source_sha != manifest.source_sha
+        {
             return Err("A server artifact record does not match its signed manifest.".to_string());
         }
-        if !tuples.insert((
-            record.os.clone(),
-            record.architecture.clone(),
-            record.format.clone(),
-        )) {
+        if manifest.channel == "stable"
+            && record.os == "windows"
+            && (record.native_signing.binary != "authenticode"
+                || !record.native_signing.verified
+                || (record.format == "msi" && record.native_signing.package != "authenticode"))
+        {
             return Err(
-                "The signed server artifact manifest contains a duplicate target.".to_string(),
+                "Stable Windows server artifacts require verified Authenticode signatures."
+                    .to_string(),
+            );
+        }
+        let requirement = ServerArtifactRequirement {
+            target_triple: record.target_triple.clone(),
+            os: record.os.clone(),
+            architecture: record.architecture.clone(),
+            format: record.format.clone(),
+        };
+        if !required.contains(&requirement)
+            || !tuples.insert(requirement)
+            || ![
+                &record.download_name,
+                &record.signature_name,
+                &record.sbom_name,
+            ]
+            .iter()
+            .all(|name| linked_names.insert((*name).clone()))
+        {
+            return Err(
+                "The signed server artifact manifest does not match its required matrix exactly."
+                    .to_string(),
             );
         }
     }
+    if tuples != required {
+        return Err(
+            "The signed server artifact manifest does not match its required matrix exactly."
+                .to_string(),
+        );
+    }
+    if manifest
+        .artifacts
+        .iter()
+        .any(|record| record.architecture == "universal")
+        && !["x86_64", "aarch64"].iter().all(|architecture| {
+            manifest
+                .artifacts
+                .iter()
+                .any(|record| record.os == "macos" && record.architecture == *architecture)
+        })
+    {
+        return Err(
+            "A universal macOS artifact requires both native architecture slices.".to_string(),
+        );
+    }
     Ok(())
+}
+
+fn valid_artifact_tuple(target_triple: &str, os: &str, architecture: &str, format: &str) -> bool {
+    let expected_target = match (os, architecture) {
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "universal") => "universal-apple-darwin",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        _ => return false,
+    };
+    let format_matches = match format {
+        "zip" | "msi" => os == "windows",
+        "pkg" => os == "macos",
+        "deb" | "rpm" => os == "linux",
+        "tar.gz" => matches!(os, "macos" | "linux"),
+        _ => false,
+    };
+    target_triple == expected_target && format_matches
+}
+
+fn valid_source_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_source_url(url: &url::Url) -> Result<(), String> {
@@ -530,9 +690,11 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     const FIXTURE_PUBLIC_KEY: &str = DEFAULT_SERVER_ARTIFACT_PUBLIC_KEY;
-    const FIXTURE_MANIFEST: &str = "{\"schemaVersion\":1,\"product\":\"bibcode-server\",\"version\":\"0.4.2\",\"generatedAt\":\"2036-08-25T12:00:00Z\",\"artifacts\":[{\"product\":\"bibcode-server\",\"version\":\"0.4.2\",\"os\":\"linux\",\"architecture\":\"x86_64\",\"format\":\"tar.gz\",\"downloadName\":\"bibcode-server-linux-x86_64.tar.gz\",\"size\":24,\"sha256\":\"19fd4b71e14ade2bb9dc23fa337ed6cde79dd8c785e0ca1099cfff94bce25a92\",\"signatureName\":\"bibcode-server-linux-x86_64.tar.gz.sig\"}]}\n";
-    const FIXTURE_MANIFEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRUTrtduhOnwv6cSZ4fA8hpkkQiyidOtaaN1vPbeHHswQd1NYpTpyWx24YJHfwbwqceI5tbI8DcxmDnJEUDGOCb4+kum5FCrrtwk=\ntrusted comment: fixture manifest\nAsYL9Nih5nGp368P8s+AFMdJ9W3lU2WDYiUSZ4Ce/yVaEJe/hSw2n+BRMD05ODpAmmtpqo8eZTaGCZQK2zP9Dw==";
-    const FIXTURE_ARTIFACT_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRUTrtduhOnwv6dQZi+ulBsgn7G/jGI2HQoAd8+sIPlWOBI2/PuzgxO/pNc0apDUhP3myVFUfzuOIkNdJZxJ4ztem8g/n8n55Ygw=\ntrusted comment: fixture artifact\ngr9tGEgxyWk5A4CUQ8E8PhOwIf1egyzWpbvH8cWNJNk4NkwBzDA+27QNIMBPUcam+nDVVaSoktwK4Xht+/W+CQ==";
+    const FIXTURE_MANIFEST: &str = include_str!("../fixtures/server-artifacts/artifacts.json");
+    const FIXTURE_MANIFEST_SIGNATURE: &str =
+        include_str!("../fixtures/server-artifacts/artifacts.json.minisig");
+    const FIXTURE_ARTIFACT_SIGNATURE: &str =
+        include_str!("../fixtures/server-artifacts/bibcode-server-linux-x86_64.tar.gz.minisig");
 
     fn request(architecture: &str) -> ServerArtifactRequest {
         ServerArtifactRequest {
@@ -599,7 +761,7 @@ mod tests {
         );
         assert_eq!(
             resolved.signature_url.as_str(),
-            "https://releases.example/bibcode-server-linux-x86_64.tar.gz.sig"
+            "https://releases.example/bibcode-server-linux-x86_64.tar.gz.minisig"
         );
     }
 
@@ -640,7 +802,9 @@ mod tests {
     fn payload_verification_requires_exact_size_sha256_and_detached_signature() {
         let temporary = tempfile::tempdir().expect("artifact fixture root");
         let artifact = temporary.path().join("artifact.tar.gz");
-        std::fs::write(&artifact, b"fixture-server-artifact\n").expect("fixture artifact");
+        let fixture_artifact =
+            include_bytes!("../fixtures/server-artifacts/bibcode-server-linux-x86_64.tar.gz");
+        std::fs::write(&artifact, fixture_artifact).expect("fixture artifact");
         let manifest_url =
             url::Url::parse("https://releases.example/artifacts.json").expect("manifest URL");
         let resolved = verify_manifest_and_select(
@@ -656,7 +820,7 @@ mod tests {
             .expect("signed artifact should verify");
         std::fs::write(&artifact, b"tampered-server-artifact\n").expect("tampered artifact");
         assert!(verify_artifact_file(&artifact, &resolved, FIXTURE_ARTIFACT_SIGNATURE).is_err());
-        std::fs::write(&artifact, b"fixture-server-artifact\n").expect("restore artifact");
+        std::fs::write(&artifact, fixture_artifact).expect("restore artifact");
         assert!(verify_artifact_file(&artifact, &resolved, FIXTURE_MANIFEST_SIGNATURE).is_err());
     }
 }

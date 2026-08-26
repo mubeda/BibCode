@@ -1,0 +1,23 @@
+[package]
+name = "bibcode-server-packager"
+version = "0.1.0"
+description = "Deterministic BiBCode Server staging and release verification"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+time.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

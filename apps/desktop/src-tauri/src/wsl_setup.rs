@@ -126,6 +126,8 @@ mod tests {
                 record: ServerArtifactRecord {
                     product: "bibcode-server".to_string(),
                     version: "0.4.2".to_string(),
+                    source_sha: "1".repeat(40),
+                    target_triple: "x86_64-unknown-linux-gnu".to_string(),
                     os: "linux".to_string(),
                     architecture: "x86_64".to_string(),
                     format: "tar.gz".to_string(),
@@ -133,6 +135,13 @@ mod tests {
                     size,
                     sha256: "a".repeat(64),
                     signature_name: "bibcode-server-linux-x86_64.tar.gz.sig".to_string(),
+                    sbom_name: "bibcode-server-linux-x86_64.cdx.json".to_string(),
+                    native_signing: crate::server_artifacts::NativeSigningState {
+                        binary: "none".to_string(),
+                        package: "none".to_string(),
+                        verified: false,
+                    },
+                    notarized: false,
                 },
                 downloads: Arc::new(AtomicUsize::new(0)),
             })

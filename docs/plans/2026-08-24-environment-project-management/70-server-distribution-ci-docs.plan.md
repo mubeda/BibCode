@@ -112,8 +112,11 @@ git commit -m "feat(server): run from a verified packaged web layout"
 - Test: `tools/server-packager/tests/manifest.rs`, `archive.rs`
 - Modify: root `Cargo.toml`, `Cargo.lock`
 - Create: `scripts/verify-server-artifacts.ts`, `verify-server-artifacts.test.ts`
+- Modify: `apps/desktop/src-tauri/src/server_artifacts.rs`, WSL/SSH artifact fixtures
+- Create: `apps/desktop/src-tauri/fixtures/server-artifacts/**`
+- Modify: `packaging/server/server-release.pub` (pre-release fixture key; production rotation remains Task 6)
 
-- [ ] **Step 1: Expand Plan 40's fixture schema into the release schema**
+- [x] **Step 1: Expand Plan 40's fixture schema into the release schema**
 
 ```ts
 export const ServerArtifactRecordSchema = Schema.Struct({
@@ -136,27 +139,35 @@ export const ServerArtifactRecordSchema = Schema.Struct({
 
 The top-level manifest has `schemaVersion: 1`, release version/channel, source SHA, generated-at timestamp derived from release metadata, required matrix, records, and detached manifest signature name.
 
-- [ ] **Step 2: Write rejection tests before the verifier**
+- [x] **Step 2: Write rejection tests before the verifier**
 
 Cover duplicate tuple, missing required tuple, extra product, filename traversal/Unicode confusable separator, bad size/hash/signature/SBOM link, wrong source/version, mismatched target triple, unsupported signing state, universal PKG without both slices, and stable Windows record not marked verified.
 
-- [ ] **Step 3: Add deterministic archive/manifest tooling**
+- [x] **Step 3: Add deterministic archive/manifest tooling**
 
 Add `server-packager stage|archive|manifest|verify`. Sort paths by UTF-8 byte order, normalize archive separators/modes, reject links/devices, set all archive timestamps from `SOURCE_DATE_EPOCH`, hash streaming bytes, and write JSON with stable key/record ordering. ZIP and tar.gz creation must produce identical hashes from two fresh staging directories with the same inputs.
 
-- [ ] **Step 4: Make resolution tuple-based**
+- [x] **Step 4: Make resolution tuple-based**
 
 Plan 40 requests `{ product, version, os, architecture, preferredFormats }`. Selection fails on zero or multiple matches and verifies the signed manifest before reading a record. It never constructs a download URL from `version-os-arch` string interpolation.
 
-- [ ] **Step 5: Run schema/tool tests and commit**
+- [x] **Step 5: Run schema/tool tests and commit**
 
 ```sh
 vp test packages/contracts/src/serverArtifact.test.ts scripts/verify-server-artifacts.test.ts
 node scripts/run-msvc-x64.mjs cargo test -p bibcode-server-packager -- --nocapture
 vp run check:contracts
-git add packages/contracts/src/serverArtifact.ts packages/contracts/src/serverArtifact.test.ts packages/contracts/src/index.ts packages/contracts/package.json tools/server-packager scripts/verify-server-artifacts.ts scripts/verify-server-artifacts.test.ts Cargo.toml Cargo.lock
+git add packages/contracts/src/serverArtifact.ts packages/contracts/src/serverArtifact.test.ts packages/contracts/src/index.ts packages/contracts/package.json tools/server-packager scripts/verify-server-artifacts.ts scripts/verify-server-artifacts.test.ts apps/desktop/src-tauri/src/server_artifacts.rs apps/desktop/src-tauri/src/wsl_setup.rs apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/fixtures/server-artifacts packaging/server/server-release.pub Cargo.toml Cargo.lock
 git commit -m "feat(release): define signed server artifact discovery"
 ```
+
+Implementation evidence (2026-08-26):
+
+- The TypeScript contract, Rust packager, release verifier, and desktop resolver enforce the same exact matrix, target-triple, source/version, linked-name, signing, notarization, and universal-mac invariants.
+- Desktop selection verifies the detached manifest signature before reading any record and joins only signed safe basenames to the manifest URL; no version/OS/architecture filename interpolation remains.
+- Deterministic ZIP and tar.gz tests compare byte-identical output from independent staging roots. Staging rejects links, noncanonical binary names, dirty output, and removes unpublished temporary layouts after failure.
+- The checked-in Minisign key and detached files are test fixtures only. Both signatures were verified after formatting; both generated private-key copies and their temporary directories were deleted. Task 6 still owns production release-key provisioning and rotation.
+- Passed: 63 focused TypeScript tests, 10 `bibcode-server-packager` tests, 5 desktop artifact tests, `vp run check:contracts`, `vp check`, `vp run typecheck`, `cargo fmt --all --check`, and Clippy with warnings denied for the packager and desktop.
 
 ### Task 3: Build one deterministic portable layout per native target
 
