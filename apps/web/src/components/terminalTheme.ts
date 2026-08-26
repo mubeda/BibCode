@@ -110,10 +110,15 @@ export function mergeTerminalSpawnEnv(input: {
 }
 
 /** Codex snapshots OSC (and on Windows, ConPTY) colors at spawn; live xterm theme changes leave unreadable UI. */
-export function usesPersistentWindowsConsoleTheme(command: {
-  readonly executable: string;
-  readonly args: ReadonlyArray<string>;
-} | null | undefined): boolean {
+export function usesPersistentWindowsConsoleTheme(
+  command:
+    | {
+        readonly executable: string;
+        readonly args: ReadonlyArray<string>;
+      }
+    | null
+    | undefined,
+): boolean {
   if (!command) return false;
   const executable = command.executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
   return (

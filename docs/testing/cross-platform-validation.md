@@ -352,7 +352,8 @@ sizes. Cover relevant:
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
 - thread creation, switching, persistence, and streaming;
-- terminal input/output and panel switching;
+- terminal input/output and panel switching, including reopening the global right panel after a
+  sibling chat suppresses a previously active Activity surface;
 - Files tree nesting, mutations, and moves: one row per directory with its own
   expand arrow rather than merged directory chains, **New File…** creating the
   entry in the clicked nested folder while expanded folders stay expanded, a
