@@ -384,33 +384,68 @@ function statusText(status: EnvironmentTreeStatus): string {
 }
 
 function normalizedSearchValue(value: string): string {
-  return value.toLocaleLowerCase();
+  return value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase();
 }
 
-function matches(query: string, ...values: readonly (string | null | undefined)[]): boolean {
-  return values.some((value) => normalizedSearchValue(value ?? "").includes(query));
+function normalizedSearchTerms(
+  ...values: readonly (string | null | undefined)[]
+): readonly string[] {
+  return values.map((value) => normalizedSearchValue(value ?? ""));
+}
+
+function matchesSearchTerms(query: string, terms: readonly string[]): boolean {
+  return terms.some((term) => term.includes(query));
 }
 
 function threadSearchLabel(thread: EnvironmentTreeThreadInput): string {
   return thread.kind === "default" ? "Main" : thread.title;
 }
 
+interface EnvironmentSearchIndex {
+  readonly environmentTerms: readonly string[];
+  readonly projectTerms: ReadonlyMap<ProjectId, readonly string[]>;
+  readonly threadTerms: ReadonlyMap<ThreadId, readonly string[]>;
+}
+
+function buildEnvironmentSearchIndex(
+  environment: EnvironmentTreeEnvironmentInput,
+): EnvironmentSearchIndex {
+  return {
+    environmentTerms: normalizedSearchTerms(environment.label, environment.canonicalLabel),
+    projectTerms: new Map(
+      environment.projects.map((project) => [
+        project.id,
+        normalizedSearchTerms(project.title, project.workspaceRoot),
+      ]),
+    ),
+    threadTerms: new Map(
+      environment.threads.map((thread) => [
+        thread.id,
+        normalizedSearchTerms(threadSearchLabel(thread), thread.branch, thread.worktreePath),
+      ]),
+    ),
+  };
+}
+
 function environmentContainsSearchMatch(
   environment: EnvironmentTreeEnvironmentInput,
+  index: EnvironmentSearchIndex,
   query: string,
 ): boolean {
-  if (query.length === 0 || matches(query, environment.label, environment.canonicalLabel)) {
+  if (query.length === 0 || matchesSearchTerms(query, index.environmentTerms)) {
     return true;
   }
   const projectIds = new Set(environment.projects.map((project) => project.id));
   return (
-    environment.projects.some((project) => matches(query, project.title, project.workspaceRoot)) ||
+    environment.projects.some((project) =>
+      matchesSearchTerms(query, index.projectTerms.get(project.id) ?? []),
+    ) ||
     environment.threads.some(
       (thread) =>
         projectIds.has(thread.projectId) &&
         thread.archivedAt === null &&
         thread.kind !== "panel" &&
-        matches(query, threadSearchLabel(thread), thread.branch, thread.worktreePath),
+        matchesSearchTerms(query, index.threadTerms.get(thread.id) ?? []),
     )
   );
 }
@@ -450,6 +485,7 @@ function projectSearch(
   environment: EnvironmentTreeEnvironmentInput,
   orderedProjects: readonly EnvironmentTreeProjectInput[],
   orderedThreadsByProject: ReadonlyMap<ProjectId, readonly EnvironmentTreeThreadInput[]>,
+  index: EnvironmentSearchIndex,
   query: string,
 ): SearchProjection {
   if (query.length === 0) {
@@ -464,14 +500,17 @@ function projectSearch(
     };
   }
 
-  const environmentMatches = matches(query, environment.label, environment.canonicalLabel);
+  const environmentMatches = matchesSearchTerms(query, index.environmentTerms);
   const projects = new Map<ProjectId, readonly EnvironmentTreeThreadInput[]>();
   for (const project of orderedProjects) {
     const orderedThreads = orderedThreadsByProject.get(project.id) ?? [];
     const matchingThreads = orderedThreads.filter((thread) =>
-      matches(query, threadSearchLabel(thread), thread.branch, thread.worktreePath),
+      matchesSearchTerms(query, index.threadTerms.get(thread.id) ?? []),
     );
-    if (matches(query, project.title, project.workspaceRoot) || matchingThreads.length > 0) {
+    if (
+      matchesSearchTerms(query, index.projectTerms.get(project.id) ?? []) ||
+      matchingThreads.length > 0
+    ) {
       projects.set(project.id, matchingThreads);
     }
   }
@@ -538,11 +577,12 @@ function buildEnvironmentRows(input: {
   readonly environment: EnvironmentTreeEnvironmentInput;
   readonly preferences: EnvironmentTreePreferences;
   readonly selected: EnvironmentTreeSelection | null;
+  readonly searchIndex: EnvironmentSearchIndex;
   readonly query: string;
   readonly ariaPosInSet: number;
   readonly ariaSetSize: number;
 }): readonly EnvironmentTreeRow[] {
-  const { environment, preferences, selected, query } = input;
+  const { environment, preferences, selected, searchIndex, query } = input;
   const environmentKey = environmentTreeEnvironmentKey(environment.environmentId);
   const manuallyToggled = new Set(preferences.manuallyToggledKeys);
   const savedEnvironmentExpanded = preferences.expandedEnvironmentIds.includes(
@@ -587,7 +627,13 @@ function buildEnvironmentRows(input: {
       }),
     ]),
   );
-  const search = projectSearch(environment, orderedProjects, orderedThreadsByProject, query);
+  const search = projectSearch(
+    environment,
+    orderedProjects,
+    orderedThreadsByProject,
+    searchIndex,
+    query,
+  );
   if (!search.includeEnvironment) return [];
 
   const visibleProjects = orderedProjects.filter((project) => search.projects.has(project.id));
@@ -687,6 +733,11 @@ interface CachedEnvironmentRows {
   readonly rows: readonly EnvironmentTreeRow[];
 }
 
+interface CachedEnvironmentSearchIndex {
+  readonly shellRevision: string | number;
+  readonly index: EnvironmentSearchIndex;
+}
+
 function environmentCacheSignature(input: {
   readonly environment: EnvironmentTreeEnvironmentInput;
   readonly preferences: EnvironmentTreePreferences;
@@ -720,6 +771,7 @@ export type EnvironmentTreeProjector = (
  */
 export function createEnvironmentTreeProjector(): EnvironmentTreeProjector {
   const cache = new Map<EnvironmentId, CachedEnvironmentRows>();
+  const searchIndexCache = new Map<EnvironmentId, CachedEnvironmentSearchIndex>();
 
   return (input) => {
     const currentEnvironmentIds = new Set(
@@ -728,33 +780,55 @@ export function createEnvironmentTreeProjector(): EnvironmentTreeProjector {
     for (const environmentId of cache.keys()) {
       if (!currentEnvironmentIds.has(environmentId)) cache.delete(environmentId);
     }
+    for (const environmentId of searchIndexCache.keys()) {
+      if (!currentEnvironmentIds.has(environmentId)) searchIndexCache.delete(environmentId);
+    }
     const ordered = resolveEnvironmentOrder(input);
     const query = normalizedSearchValue(input.searchQuery.trim());
-    const visibleEnvironments = ordered.environments.filter(
-      (environment) => !environment.hidden && environmentContainsSearchMatch(environment, query),
+    const visibleEnvironments = ordered.environments
+      .filter((environment) => !environment.hidden)
+      .map((environment) => {
+        const cached = searchIndexCache.get(environment.environmentId);
+        const searchIndex =
+          cached?.shellRevision === environment.shellRevision
+            ? cached.index
+            : buildEnvironmentSearchIndex(environment);
+        if (searchIndex !== cached?.index) {
+          searchIndexCache.set(environment.environmentId, {
+            shellRevision: environment.shellRevision,
+            index: searchIndex,
+          });
+        }
+        return { environment, searchIndex };
+      })
+      .filter(({ environment, searchIndex }) =>
+        environmentContainsSearchMatch(environment, searchIndex, query),
+      );
+    const candidateRows = visibleEnvironments.map(
+      ({ environment, searchIndex }, environmentIndex) => {
+        const signature = environmentCacheSignature({
+          environment,
+          preferences: input.preferences,
+          selected: input.selected,
+          query,
+          ariaPosInSet: environmentIndex + 1,
+          ariaSetSize: visibleEnvironments.length,
+        });
+        const cached = cache.get(environment.environmentId);
+        if (cached?.signature === signature) return cached.rows;
+        const rows = buildEnvironmentRows({
+          environment,
+          preferences: input.preferences,
+          selected: input.selected,
+          searchIndex,
+          query,
+          ariaPosInSet: environmentIndex + 1,
+          ariaSetSize: visibleEnvironments.length,
+        });
+        cache.set(environment.environmentId, { signature, rows });
+        return rows;
+      },
     );
-    const candidateRows = visibleEnvironments.map((environment, environmentIndex) => {
-      const signature = environmentCacheSignature({
-        environment,
-        preferences: input.preferences,
-        selected: input.selected,
-        query,
-        ariaPosInSet: environmentIndex + 1,
-        ariaSetSize: visibleEnvironments.length,
-      });
-      const cached = cache.get(environment.environmentId);
-      if (cached?.signature === signature) return cached.rows;
-      const rows = buildEnvironmentRows({
-        environment,
-        preferences: input.preferences,
-        selected: input.selected,
-        query,
-        ariaPosInSet: environmentIndex + 1,
-        ariaSetSize: visibleEnvironments.length,
-      });
-      cache.set(environment.environmentId, { signature, rows });
-      return rows;
-    });
     const rows = candidateRows.flat();
     const rowByKey = new Map<string, EnvironmentTreeRow>();
     const indexByKey = new Map<string, number>();

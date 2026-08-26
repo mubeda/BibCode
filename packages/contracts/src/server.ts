@@ -296,6 +296,14 @@ export const ServerUpdateView = Schema.Struct({
 });
 export type ServerUpdateView = typeof ServerUpdateView.Type;
 
+/** Returned by the server-wide admission gate while update maintenance owns mutations. */
+export class UpdateMaintenanceActiveError extends Schema.TaggedErrorClass<UpdateMaintenanceActiveError>()(
+  "UpdateMaintenanceActiveError",
+  {
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export const ServerHostControlView = Schema.Struct({
   available: Schema.Boolean,
   reason: Schema.Literal("hostAuthorityRequired"),

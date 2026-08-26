@@ -21,6 +21,10 @@ import {
   subscribe,
 } from "../rpc/client.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import {
+  mapEnvironmentMutationError,
+  requireEnvironmentMutationAdmission,
+} from "../operations/admission.ts";
 
 interface EnvironmentAtomOptions<Input, A, E, R> {
   readonly label: string;
@@ -556,7 +560,11 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (target) => runInEnvironment(target.environmentId, options.execute(target.input)),
+    execute: (target) =>
+      runInEnvironment(
+        target.environmentId,
+        requireEnvironmentMutationAdmission().pipe(Effect.andThen(options.execute(target.input))),
+      ),
   });
 }
 
@@ -577,9 +585,14 @@ function createEnvironmentStreamCommand<R, ER, Input, A, E>(
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
     execute: (target) =>
-      runStreamInEnvironment(target.environmentId, options.execute(target.input)).pipe(
-        Stream.withSpan(options.label),
-      ),
+      runStreamInEnvironment(
+        target.environmentId,
+        Stream.unwrap(
+          requireEnvironmentMutationAdmission().pipe(
+            Effect.map(() => options.execute(target.input)),
+          ),
+        ),
+      ).pipe(Stream.withSpan(options.label)),
   });
 }
 
@@ -652,7 +665,8 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (input: EnvironmentRpcInput<TTag>) => request(options.tag, input),
+    execute: (input: EnvironmentRpcInput<TTag>) =>
+      request(options.tag, input).pipe(Effect.mapError(mapEnvironmentMutationError)),
   });
 }
 
@@ -676,6 +690,7 @@ export function createEnvironmentRpcStreamCommand<
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (input: EnvironmentRpcInput<TTag>) => runStream(options.tag, input),
+    execute: (input: EnvironmentRpcInput<TTag>) =>
+      runStream(options.tag, input).pipe(Stream.mapError(mapEnvironmentMutationError)),
   });
 }

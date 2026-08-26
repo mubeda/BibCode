@@ -3,12 +3,11 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
-import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { makeConnectedSupervisorForTest } from "../connection/supervisor.testSupport.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 
 function configuredPositiveInteger(name: string, fallback: number): number {
@@ -50,24 +49,20 @@ describe("production VCS Atom queue benchmark", () => {
       let scheduledAt = 0;
       let collecting = false;
       const delays: number[] = [];
-      const session = yield* SubscriptionRef.make(
-        Option.some({
-          client: {
-            [WS_METHODS.vcsRefreshStatus]: () =>
-              Deferred.succeed(refreshStarted, undefined).pipe(
-                Effect.andThen(Deferred.await(refreshResult)),
-              ),
-            [WS_METHODS.vcsStageFiles]: () =>
-              Effect.sync(() => {
-                if (collecting) delays.push(performance.now() - scheduledAt);
-              }),
-          },
-        } as never),
-      );
-      const supervisor = EnvironmentSupervisor.of({
-        target: { environmentId, label: "VCS queue benchmark" },
-        session,
-      } as never);
+      const supervisor = yield* makeConnectedSupervisorForTest({
+        environmentId,
+        label: "VCS queue benchmark",
+        client: {
+          [WS_METHODS.vcsRefreshStatus]: () =>
+            Deferred.succeed(refreshStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(refreshResult)),
+            ),
+          [WS_METHODS.vcsStageFiles]: () =>
+            Effect.sync(() => {
+              if (collecting) delays.push(performance.now() - scheduledAt);
+            }),
+        } as never,
+      });
       const run: EnvironmentRegistry["Service"]["run"] = (_selectedEnvironmentId, effect) =>
         Effect.provideService(effect, EnvironmentSupervisor, supervisor);
       const environmentRegistry = EnvironmentRegistry.of({ run } as never);

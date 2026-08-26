@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, WS_METHODS } from "@bibcode/contracts";
+import { EnvironmentId, UpdateMaintenanceActiveError, WS_METHODS } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -10,10 +10,16 @@ import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
+import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { makeConnectedSupervisorForTest } from "../connection/supervisor.testSupport.ts";
+import { EnvironmentMutationBlocked } from "../operations/admission.ts";
 import {
   environmentRpcKey,
   type AtomCommandResult,
   createAtomCommandScheduler,
+  createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcStreamCommand,
@@ -29,6 +35,43 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "./runtime.ts";
+
+const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+
+const makeRuntimeHarness = Effect.fn("RuntimeTest.makeEnvironmentHarness")(function* (input: {
+  readonly client: object;
+  readonly offline?: boolean;
+}) {
+  const supervisor = yield* makeConnectedSupervisorForTest({
+    environmentId: ENVIRONMENT_ID,
+    label: "Runtime test environment",
+    client: input.client as never,
+    ...(input.offline
+      ? {
+          state: {
+            ...AVAILABLE_CONNECTION_STATE,
+            desired: true,
+            network: "offline" as const,
+            phase: "offline" as const,
+          },
+        }
+      : {}),
+  });
+  const run: EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+    Effect.provideService(effect, EnvironmentSupervisor, supervisor);
+  const runStream: EnvironmentRegistry["Service"]["runStream"] = (_environmentId, stream) =>
+    Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+  const followStream: EnvironmentRegistry["Service"]["followStream"] = (_environmentId, stream) =>
+    Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+  const environmentRegistry = EnvironmentRegistry.of({
+    run,
+    runStream,
+    followStream,
+  } as never);
+  return {
+    runtime: Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+  };
+});
 
 describe("settleAsyncResult", () => {
   it("preserves successful values and typed failures", async () => {
@@ -209,6 +252,149 @@ describe("environment RPC factory options", () => {
       } as never),
     ).toBeDefined();
   });
+});
+
+describe("environment mutation admission", () => {
+  it.effect("blocks generic offline commands before their effects execute", () =>
+    Effect.gen(function* () {
+      let executions = 0;
+      const { runtime } = yield* makeRuntimeHarness({ client: {}, offline: true });
+      const command = createEnvironmentCommand(runtime, {
+        label: "test.offline-command",
+        execute: () =>
+          Effect.sync(() => {
+            executions += 1;
+          }),
+      });
+      const registry = AtomRegistry.make();
+
+      const result = yield* Effect.promise(() =>
+        command.run(registry, { environmentId: ENVIRONMENT_ID, input: undefined }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        const error = Cause.squash(result.cause);
+        expect(error).toBeInstanceOf(EnvironmentMutationBlocked);
+        expect(error).toMatchObject({ reason: "offline" });
+      }
+      expect(executions).toBe(0);
+      registry.dispose();
+    }),
+  );
+
+  it.effect("blocks offline stream commands before opening an RPC stream", () =>
+    Effect.gen(function* () {
+      let dispatches = 0;
+      const { runtime } = yield* makeRuntimeHarness({
+        offline: true,
+        client: {
+          [WS_METHODS.gitRunStackedAction]: () => {
+            dispatches += 1;
+            return Stream.empty;
+          },
+        },
+      });
+      const command = createEnvironmentRpcStreamCommand(runtime, {
+        label: "test.offline-stream-command",
+        tag: WS_METHODS.gitRunStackedAction,
+      });
+      const registry = AtomRegistry.make();
+
+      const result = yield* Effect.promise(() =>
+        command.run(registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: {},
+        } as never),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(Cause.squash(result.cause)).toMatchObject({
+          _tag: "EnvironmentMutationBlocked",
+          reason: "offline",
+        });
+      }
+      expect(dispatches).toBe(0);
+      registry.dispose();
+    }),
+  );
+
+  it.effect("maps an authoritative unary update-maintenance rejection", () =>
+    Effect.gen(function* () {
+      let dispatches = 0;
+      const { runtime } = yield* makeRuntimeHarness({
+        client: {
+          [WS_METHODS.previewRefresh]: () => {
+            dispatches += 1;
+            return Effect.fail(
+              new UpdateMaintenanceActiveError({
+                message:
+                  "Persistent mutations are temporarily closed while project data is protected.",
+              }),
+            );
+          },
+        },
+      });
+      const command = createEnvironmentRpcCommand(runtime, {
+        label: "test.updating-unary-command",
+        tag: WS_METHODS.previewRefresh,
+      });
+      const registry = AtomRegistry.make();
+
+      const result = yield* Effect.promise(() =>
+        command.run(registry, { environmentId: ENVIRONMENT_ID, input: {} } as never),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(Cause.squash(result.cause)).toMatchObject({
+          _tag: "EnvironmentMutationBlocked",
+          reason: "updating",
+        });
+      }
+      expect(dispatches).toBe(1);
+      registry.dispose();
+    }),
+  );
+
+  it.effect("maps an authoritative stream update-maintenance rejection", () =>
+    Effect.gen(function* () {
+      let admissionChecks = 0;
+      const { runtime } = yield* makeRuntimeHarness({
+        client: {
+          [WS_METHODS.gitRunStackedAction]: () => {
+            admissionChecks += 1;
+            return Stream.fail(
+              new UpdateMaintenanceActiveError({
+                message:
+                  "Persistent mutations are temporarily closed while project data is protected.",
+              }),
+            );
+          },
+        },
+      });
+      const command = createEnvironmentRpcStreamCommand(runtime, {
+        label: "test.updating-stream-command",
+        tag: WS_METHODS.gitRunStackedAction,
+      });
+      const registry = AtomRegistry.make();
+
+      const result = yield* Effect.promise(() =>
+        command.run(registry, { environmentId: ENVIRONMENT_ID, input: {} } as never),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(Cause.squash(result.cause)).toMatchObject({
+          _tag: "EnvironmentMutationBlocked",
+          reason: "updating",
+        });
+      }
+      expect(admissionChecks).toBe(1);
+      registry.dispose();
+    }),
+  );
 });
 
 describe("environmentRpcKey", () => {

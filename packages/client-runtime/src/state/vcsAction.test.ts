@@ -10,14 +10,13 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { makeConnectedSupervisorForTest } from "../connection/supervisor.testSupport.ts";
 import type { AtomCommandResult } from "./runtime.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 import {
@@ -112,30 +111,26 @@ describe("vcsActionState", () => {
       const firstRefreshResult = yield* Deferred.make<VcsStatusResult>();
       let refreshExecutions = 0;
       let mutationExecutions = 0;
-      const session = yield* SubscriptionRef.make(
-        Option.some({
-          client: {
-            [WS_METHODS.vcsRefreshStatus]: () =>
-              Effect.suspend(() => {
-                refreshExecutions += 1;
-                if (refreshExecutions === 1) {
-                  return Deferred.succeed(firstRefreshStarted, undefined).pipe(
-                    Effect.andThen(Deferred.await(firstRefreshResult)),
-                  );
-                }
-                return Effect.succeed(status(`refresh-${refreshExecutions}`));
-              }),
-            [WS_METHODS.vcsStageFiles]: () =>
-              Effect.sync(() => {
-                mutationExecutions += 1;
-              }),
-          },
-        } as never),
-      );
-      const supervisor = EnvironmentSupervisor.of({
-        target: { environmentId, label: "VCS scheduler test" },
-        session,
-      } as never);
+      const supervisor = yield* makeConnectedSupervisorForTest({
+        environmentId,
+        label: "VCS scheduler test",
+        client: {
+          [WS_METHODS.vcsRefreshStatus]: () =>
+            Effect.suspend(() => {
+              refreshExecutions += 1;
+              if (refreshExecutions === 1) {
+                return Deferred.succeed(firstRefreshStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(firstRefreshResult)),
+                );
+              }
+              return Effect.succeed(status(`refresh-${refreshExecutions}`));
+            }),
+          [WS_METHODS.vcsStageFiles]: () =>
+            Effect.sync(() => {
+              mutationExecutions += 1;
+            }),
+        } as never,
+      });
       const selectedEnvironments: string[] = [];
       const run: EnvironmentRegistry["Service"]["run"] = (selectedEnvironmentId, effect) => {
         selectedEnvironments.push(selectedEnvironmentId);

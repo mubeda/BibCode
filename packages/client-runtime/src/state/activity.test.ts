@@ -37,6 +37,7 @@ import {
   type SupervisorConnectionState,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { makeConnectedSupervisorForTest } from "../connection/supervisor.testSupport.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type * as RpcSession from "../rpc/session.ts";
 import {
@@ -1487,13 +1488,11 @@ describe("createEnvironmentActivityAtoms", () => {
             }),
           ),
       } as unknown as WsRpcProtocolClient;
-      const session = yield* SubscriptionRef.make(
-        Option.some({ client } as unknown as RpcSession.RpcSession),
-      );
-      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
-        target: TARGET,
-        session,
-      } as never);
+      const supervisor = yield* makeConnectedSupervisorForTest({
+        environmentId: ENVIRONMENT_ID,
+        label: "Test environment",
+        client,
+      });
       const selectedEnvironments: string[] = [];
       const run: EnvironmentRegistry["Service"]["run"] = (environmentId, effect) => {
         selectedEnvironments.push(environmentId);

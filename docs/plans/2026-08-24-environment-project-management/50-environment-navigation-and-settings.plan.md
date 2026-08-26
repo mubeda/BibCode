@@ -410,15 +410,15 @@ returned CLEAR with no P0-P2 findings.
 - Modify: `packages/client-runtime/src/state/runtime.ts`, test
 - Modify: `apps/web/src/components/ChatView.tsx`, project/Git/terminal/worktree action surfaces and tests
 
-- [ ] **Step 1: Write search and offline command tests**
+- [x] **Step 1: Write search and offline command tests**
 
 Search matches alias/canonical environment label, project title/path, thread title, worktree path/branch; retains environment/project ancestors; omits hidden environments in normal search; supports type-ahead and activation. Every mutation category returns `environmentReadOnly` while cached/offline and records no deferred command.
 
-- [ ] **Step 2: Add normalized search terms to the projection**
+- [x] **Step 2: Add normalized search terms to the projection**
 
 Fold Unicode/case once per source revision. For each descendant match, include its ancestor chain and compute ARIA positions within the filtered tree. Do not create a global results group or clone rows under multiple parents.
 
-- [ ] **Step 3: Enforce read-only once in client runtime**
+- [x] **Step 3: Enforce read-only once in client runtime**
 
 ```ts
 export class EnvironmentMutationBlocked extends Data.TaggedError("EnvironmentMutationBlocked")<{
@@ -432,13 +432,38 @@ Check the verified supervisor session/generation immediately before dispatch in 
 
 Show `Offline · last synchronized …`, stale/read-only banners, content-unavailable-offline where cache is absent, and nearby disabled-action reasons. Keep cached messages and tree rows readable without replacing their domain statuses.
 
-- [ ] **Step 5: Run search/admission tests and commit**
+- [x] **Step 5: Run search/admission tests and commit**
 
 ```sh
 vp test apps/web/src/environmentTree.test.ts apps/web/src/components/sidebar/EnvironmentTree.test.tsx packages/client-runtime/src/operations/admission.test.ts packages/client-runtime/src/operations/commands.test.ts packages/client-runtime/src/state/runtime.test.ts
 git add apps/web/src/environmentTree.ts apps/web/src/environmentTree.test.ts apps/web/src/components/sidebar/EnvironmentTree.tsx apps/web/src/components/sidebar/EnvironmentTree.test.tsx packages/client-runtime/src/operations/admission.ts packages/client-runtime/src/operations/admission.test.ts packages/client-runtime/src/operations/commands.ts packages/client-runtime/src/operations/commands.test.ts packages/client-runtime/src/state/runtime.ts packages/client-runtime/src/state/runtime.test.ts apps/web/src/components/ChatView.tsx
 git commit -m "feat(environments): search ownership paths and block offline writes"
 ```
+
+Implementation evidence: the tree now retains matching ownership paths and
+folds case, compatibility forms, and diacritics through an environment search
+index cached by the source-owned shell revision. Hidden environments remain
+excluded and filtered rows retain projected ARIA positions. A shared typed
+admission check now runs inside both unary and streaming environment command
+factories immediately before execution; direct orchestration dispatch uses the
+same policy. Offline commands return `EnvironmentMutationBlocked` and neither
+execute their mutation effect nor open an RPC stream, so no replay queue is
+created. The server-wide update-maintenance admission error is now part of the
+typed client RPC protocol and maps to the same blocked error with reason
+`updating` for direct orchestration, unary RPC, and streaming RPC mutations;
+the pure presentation resolver also prioritizes authoritative active update
+phases. Test supervisors that issue mutations now model a structurally valid
+connected session instead of the impossible prior `available + session` state.
+
+The complete client-runtime suite passed 56 files and 666 tests; the focused
+tree suites passed 24 tests; client-runtime and web package typechecks passed;
+and `vp check` passed with no warnings. Independent review found one P2 because
+the initial `updating` reason was unreachable; the wire-level admission mapping
+above closed it, and focused re-review returned CLEAR. Step 4 remains
+intentionally open: the shared privacy-safe reason text is exported, but the
+approved center banners, cache-empty state, and disabled-action explanations
+land with the center Environment workspace in Task 7 rather than as a
+temporary chat-only surface.
 
 ### Task 7: Build the center environment workspace and Add Environment flow
 

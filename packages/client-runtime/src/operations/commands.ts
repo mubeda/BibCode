@@ -14,6 +14,11 @@ import {
   type EnvironmentRpcUnavailableError,
   request,
 } from "../rpc/client.ts";
+import {
+  EnvironmentMutationBlocked,
+  mapEnvironmentMutationError,
+  requireEnvironmentMutationAdmission,
+} from "./admission.ts";
 
 type CommandType = ClientOrchestrationCommand["type"];
 type CommandOf<T extends CommandType> = Extract<ClientOrchestrationCommand, { readonly type: T }>;
@@ -49,7 +54,7 @@ export type StopThreadSessionInput = CommandInput<"thread.session.stop">;
 type DispatchTag = typeof ORCHESTRATION_WS_METHODS.dispatchCommand;
 type CommandEffect = Effect.Effect<
   EnvironmentRpcSuccess<DispatchTag>,
-  EnvironmentRpcFailure<DispatchTag> | EnvironmentRpcUnavailableError,
+  EnvironmentMutationBlocked | EnvironmentRpcFailure<DispatchTag> | EnvironmentRpcUnavailableError,
   Crypto.Crypto | EnvironmentSupervisor
 >;
 
@@ -77,7 +82,13 @@ function timestampedCommandMetadata(input: {
 }
 
 function dispatch(command: ClientOrchestrationCommand) {
-  return request(ORCHESTRATION_WS_METHODS.dispatchCommand, command);
+  return requireEnvironmentMutationAdmission().pipe(
+    Effect.andThen(
+      request(ORCHESTRATION_WS_METHODS.dispatchCommand, command).pipe(
+        Effect.mapError(mapEnvironmentMutationError),
+      ),
+    ),
+  );
 }
 
 export const createProject: (input: CreateProjectInput) => CommandEffect = Effect.fn(

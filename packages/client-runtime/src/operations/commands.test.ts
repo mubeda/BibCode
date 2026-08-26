@@ -5,6 +5,7 @@ import {
   ORCHESTRATION_WS_METHODS,
   ProjectId,
   ThreadId,
+  UpdateMaintenanceActiveError,
   type ClientOrchestrationCommand,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -40,15 +41,32 @@ const TARGET = new PrimaryConnectionTarget({
   wsBaseUrl: "wss://environment.example.test",
 });
 
+const CONNECTED_CONNECTION_STATE = {
+  ...AVAILABLE_CONNECTION_STATE,
+  desired: true,
+  network: "online" as const,
+  phase: "connected" as const,
+  generation: 1,
+};
+
 const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(function* (
   dispatched: ClientOrchestrationCommand[],
+  state = CONNECTED_CONNECTION_STATE,
+  updateActive = false,
 ) {
   const client = {
     [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command: ClientOrchestrationCommand) =>
-      Effect.sync(() => {
-        dispatched.push(command);
-        return { sequence: dispatched.length };
-      }),
+      updateActive
+        ? Effect.fail(
+            new UpdateMaintenanceActiveError({
+              message:
+                "Persistent mutations are temporarily closed while project data is protected.",
+            }),
+          )
+        : Effect.sync(() => {
+            dispatched.push(command);
+            return { sequence: dispatched.length };
+          }),
   } as unknown as WsRpcProtocolClient;
   const session: RpcSession.RpcSession = {
     client,
@@ -67,7 +85,7 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
     routeResults: yield* SubscriptionRef.make<
       ReadonlyArray<EnvironmentSupervisor.EnvironmentRouteResult>
     >([]),
-    state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+    state: yield* SubscriptionRef.make(state),
     session: yield* SubscriptionRef.make(Option.some(session)),
     prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
     connect: Effect.void,
@@ -77,6 +95,55 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect("rejects offline mutations before dispatch and records no deferred command", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched, {
+        ...AVAILABLE_CONNECTION_STATE,
+        desired: true,
+        network: "offline",
+        phase: "offline",
+      });
+
+      const error = yield* createProject({
+        projectId: ProjectId.make("offline-project"),
+        title: "Offline Project",
+        workspaceRoot: "/workspace/offline",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "EnvironmentMutationBlocked",
+        reason: "offline",
+      });
+      expect(dispatched).toEqual([]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("maps the authoritative server maintenance gate to the updating reason", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched, CONNECTED_CONNECTION_STATE, true);
+
+      const error = yield* createProject({
+        projectId: ProjectId.make("updating-project"),
+        title: "Updating Project",
+        workspaceRoot: "/workspace/updating",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "EnvironmentMutationBlocked",
+        reason: "updating",
+      });
+      expect(dispatched).toEqual([]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
   it.effect("adds generated command metadata", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

@@ -508,6 +508,28 @@ describe("environment tree projection", () => {
     expect(projection.rows[2]).toMatchObject({ label: "Main" });
   });
 
+  it("folds Unicode case and accents while omitting hidden matches", () => {
+    const projection = createEnvironmentTreeProjector()(
+      input(
+        [
+          environment(PRIMARY, {
+            kind: "primary",
+            label: "Máquina Local",
+            canonicalLabel: "DEV-MAC",
+          }),
+          environment(REMOTE, {
+            hidden: true,
+            label: "Máquina Secreta",
+          }),
+        ],
+        { searchQuery: "MAQUINA" },
+      ),
+    );
+
+    expect(projection.rows.filter((row) => row.kind === "environment")).toHaveLength(1);
+    expect(projection.rows[0]).toMatchObject({ environmentId: PRIMARY, label: "Máquina Local" });
+  });
+
   it("computes environment ARIA positions from search results rather than hidden siblings", () => {
     const projection = createEnvironmentTreeProjector()(
       input(

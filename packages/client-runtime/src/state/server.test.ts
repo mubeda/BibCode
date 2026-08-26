@@ -10,7 +10,6 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
-import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
@@ -20,6 +19,7 @@ import {
 } from "./server.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { makeConnectedSupervisorForTest } from "../connection/supervisor.testSupport.ts";
 
 const CONFIG = {
   availableEditors: [],
@@ -83,21 +83,17 @@ describe("server provider usage commands", () => {
           providers: [],
         },
       };
-      const session = yield* SubscriptionRef.make(
-        Option.some({
-          client: {
-            [WS_METHODS.serverConsumeCodexRateLimitReset]: (input: unknown) =>
-              Effect.sync(() => {
-                calls.push({ method: WS_METHODS.serverConsumeCodexRateLimitReset, input });
-                return expected;
-              }),
-          },
-        } as never),
-      );
-      const supervisor = EnvironmentSupervisor.of({
-        target: { environmentId, label: "Reset environment" },
-        session,
-      } as never);
+      const supervisor = yield* makeConnectedSupervisorForTest({
+        environmentId,
+        label: "Reset environment",
+        client: {
+          [WS_METHODS.serverConsumeCodexRateLimitReset]: (input: unknown) =>
+            Effect.sync(() => {
+              calls.push({ method: WS_METHODS.serverConsumeCodexRateLimitReset, input });
+              return expected;
+            }),
+        } as never,
+      });
       const selectedEnvironments: string[] = [];
       const run: EnvironmentRegistry["Service"]["run"] = (selectedEnvironmentId, effect) => {
         selectedEnvironments.push(selectedEnvironmentId);
@@ -146,20 +142,16 @@ describe("server provider usage commands", () => {
           providers: [],
         },
       };
-      const session = yield* SubscriptionRef.make(
-        Option.some({
-          client: {
-            [WS_METHODS.serverConsumeCodexRateLimitReset]: () =>
-              Effect.sync(() => {
-                executions += 1;
-              }).pipe(Effect.andThen(latch.await), Effect.as(expected)),
-          },
-        } as never),
-      );
-      const supervisor = EnvironmentSupervisor.of({
-        target: { environmentId, label: "Single-flight environment" },
-        session,
-      } as never);
+      const supervisor = yield* makeConnectedSupervisorForTest({
+        environmentId,
+        label: "Single-flight environment",
+        client: {
+          [WS_METHODS.serverConsumeCodexRateLimitReset]: () =>
+            Effect.sync(() => {
+              executions += 1;
+            }).pipe(Effect.andThen(latch.await), Effect.as(expected)),
+        } as never,
+      });
       const run: EnvironmentRegistry["Service"]["run"] = (_selectedEnvironmentId, effect) =>
         Effect.provideService(effect, EnvironmentSupervisor, supervisor);
       const environmentRegistry = EnvironmentRegistry.of({

@@ -11,6 +11,7 @@ import {
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerServiceView,
+  UpdateMaintenanceActiveError,
 } from "./server.ts";
 import {
   expectDecodeFailure,
@@ -23,6 +24,7 @@ const decodeProviderDriverKind = Schema.decodeUnknownSync(ProviderDriverKind);
 const decodeProviderUpdateError = Schema.decodeUnknownSync(ServerProviderUpdateError);
 const decodeProcessDiagnosticsEntry = Schema.decodeUnknownSync(ServerProcessDiagnosticsEntry);
 const decodeProcessResourceTotals = Schema.decodeUnknownSync(ServerProcessResourceTotals);
+const decodeUpdateMaintenanceActiveError = Schema.decodeUnknownSync(UpdateMaintenanceActiveError);
 const decodeServerServiceView = Schema.decodeUnknownSync(ServerServiceView);
 const encodeProviderUpdateError = Schema.encodeSync(ServerProviderUpdateError);
 
@@ -41,6 +43,15 @@ const baseProviderSnapshot = {
 };
 
 describe("ServerServiceView", () => {
+  it("decodes the bounded server-wide update admission failure", () => {
+    expect(
+      decodeUpdateMaintenanceActiveError({
+        _tag: "UpdateMaintenanceActiveError",
+        message: "Persistent mutations are temporarily closed while project data is protected.",
+      }),
+    ).toMatchObject({ _tag: "UpdateMaintenanceActiveError" });
+  });
+
   it("decodes the redacted runtime, update, bind, and host-authority posture", () => {
     const decoded = decodeServerServiceView({
       serviceMode: null,
