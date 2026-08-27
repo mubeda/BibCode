@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BiBCode — Environment Rail Mockup (PROTOTYPE, throwaway)</title>
+<!-- PROTOTYPE: 3 variants of an icon-rail environment switcher for the BiBCode left
+     panel, switchable via the floating bottom bar or arrow keys. Not production code. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --radius: 0.625rem;
+    --background: #ffffff;
+    --foreground: #262626;
+    --muted: rgba(0,0,0,.04);
+    --muted-foreground: #6f6f74;
+    --border: rgba(0,0,0,.08);
+    --primary: #d8610e;
+    --primary-foreground: #fff;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --destructive: #ef4444;
+    --panel: #fafafa;
+    --rail: #f2f2f3;
+    --hover: rgba(0,0,0,.05);
+    --active: rgba(0,0,0,.08);
+    --chip: rgba(0,0,0,.05);
+  }
+  .dark {
+    color-scheme: dark;
+    --background: #131316;
+    --foreground: #f5f5f5;
+    --muted: rgba(255,255,255,.04);
+    --muted-foreground: #93939c;
+    --border: rgba(255,255,255,.07);
+    --panel: #18181c;
+    --rail: #101013;
+    --hover: rgba(255,255,255,.06);
+    --active: rgba(255,255,255,.1);
+    --chip: rgba(255,255,255,.06);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--background);
+    color: var(--foreground);
+    overflow: hidden;
+    font-size: 14px;
+  }
+  .app { display: flex; height: 100vh; }
+
+  /* ============ shared: icon rail ============ */
+  .rail {
+    width: 52px; flex: 0 0 52px;
+    background: var(--rail);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center;
+    padding: 10px 0; gap: 8px;
+  }
+  .rail .spacer { flex: 1; }
+  .env-btn {
+    position: relative; width: 36px; height: 36px;
+    border-radius: 10px; border: none; cursor: pointer;
+    background: transparent; color: var(--muted-foreground);
+    display: flex; align-items: center; justify-content: center;
+    font: inherit; font-weight: 600; font-size: 12px;
+    transition: background .12s, color .12s;
+  }
+  .env-btn:hover { background: var(--hover); color: var(--foreground); }
+  .env-btn.selected {
+    background: var(--active); color: var(--foreground);
+  }
+  .env-btn.selected::before {
+    content: ""; position: absolute; left: -8px; top: 8px; bottom: 8px;
+    width: 3px; border-radius: 2px; background: var(--primary);
+  }
+  .env-btn svg { width: 18px; height: 18px; }
+  .env-btn .avatar {
+    width: 26px; height: 26px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10.5px; letter-spacing: .02em;
+    background: var(--chip); color: inherit;
+  }
+  .env-btn.selected .avatar { background: var(--primary); color: var(--primary-foreground); }
+  .dot {
+    position: absolute; right: 3px; bottom: 3px;
+    width: 9px; height: 9px; border-radius: 50%;
+    border: 2px solid var(--rail);
+  }
+  .dot.on { background: var(--success); }
+  .dot.off { background: #71717a; }
+  .dot.warn { background: var(--warning); }
+  .dot.err { background: var(--destructive); }
+  .rail hr { width: 24px; border: none; border-top: 1px solid var(--border); margin: 2px 0; }
+  .tip { position: relative; }
+  .tip::after {
+    content: attr(data-tip);
+    position: absolute; left: 46px; top: 50%; transform: translateY(-50%);
+    background: var(--foreground); color: var(--background);
+    padding: 4px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 500;
+    white-space: pre; opacity: 0; pointer-events: none; transition: opacity .1s;
+    z-index: 30;
+  }
+  .tip:hover::after { opacity: 1; }
+
+  /* ============ shared: sidebar panel ============ */
+  .sidebar {
+    width: 268px; flex: 0 0 268px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 8px;
+    padding: 14px 14px 10px;
+    font-weight: 700; font-size: 14px; letter-spacing: -.01em;
+  }
+  .brand .logo {
+    width: 22px; height: 22px; border-radius: 6px;
+    background: var(--primary); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700;
+  }
+  .section-label {
+    padding: 12px 14px 6px; font-size: 11px; font-weight: 600;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--muted-foreground);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .icon-btn {
+    border: none; background: transparent; color: var(--muted-foreground);
+    width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--foreground); }
+  .proj { padding: 0 8px; }
+  .proj-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 8px; cursor: pointer;
+    color: var(--foreground); font-weight: 500;
+  }
+  .proj-row:hover { background: var(--hover); }
+  .proj-row .chev { color: var(--muted-foreground); font-size: 10px; width: 10px; }
+  .thread {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px 5px 26px; border-radius: 8px; cursor: pointer;
+    color: var(--muted-foreground); font-size: 13px;
+  }
+  .thread:hover { background: var(--hover); color: var(--foreground); }
+  .thread.active { background: var(--active); color: var(--foreground); }
+  .badge {
+    margin-left: auto; font-size: 10.5px; padding: 1px 6px;
+    border-radius: 999px; background: var(--chip); color: var(--muted-foreground);
+  }
+  .add-project {
+    margin: 10px 14px; padding: 7px 10px;
+    border: 1px dashed var(--border); border-radius: 8px;
+    background: transparent; color: var(--muted-foreground);
+    font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .add-project:hover { color: var(--foreground); border-color: var(--muted-foreground); }
+  .add-project em { font-style: normal; color: var(--primary); font-weight: 600; }
+  .sidebar .grow { flex: 1; overflow-y: auto; }
+
+  /* env context header (variant B) */
+  .env-header {
+    margin: 0 8px 4px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: var(--background);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .env-header .st { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: 0 0 8px; }
+  .env-header .name { font-weight: 600; font-size: 13px; }
+  .env-header .meta { font-size: 11px; color: var(--muted-foreground); }
+  .env-header .kebab { margin-left: auto; }
+
+  /* top strip (variant C) */
+  .strip {
+    display: flex; gap: 6px; padding: 4px 12px 10px; align-items: center;
+    border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  }
+  .strip .env-btn { width: 32px; height: 32px; }
+  .strip .env-btn.selected::before { left: 4px; right: 4px; top: auto; bottom: -6px; width: auto; height: 3px; }
+  .strip .dot { border-color: var(--panel); }
+
+  /* ============ main area (fake) ============ */
+  .main {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: var(--muted-foreground); flex-direction: column; gap: 8px;
+    background: var(--background);
+  }
+  .main .hint { font-size: 13px; max-width: 420px; text-align: center; line-height: 1.5; }
+  .main .kbd { background: var(--chip); border-radius: 5px; padding: 1px 6px; font-size: 12px; }
+
+  /* ============ floating switcher ============ */
+  .switcher {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
+    background: var(--foreground); color: var(--background);
+    border-radius: 999px; padding: 8px 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    z-index: 100; font-size: 13px; font-weight: 600;
+    user-select: none;
+  }
+  .switcher button {
+    border: none; background: transparent; color: inherit; cursor: pointer;
+    font-size: 15px; padding: 2px 6px; border-radius: 6px; font-family: inherit;
+  }
+  .switcher button:hover { background: rgba(128,128,128,.25); }
+  .switcher .label { min-width: 210px; text-align: center; }
+  .variant { display: none; }
+  .variant.visible { display: flex; flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+
+<!-- ================= VARIANT A: minimal edge rail ================= -->
+<div class="variant" id="variant-A">
+  <div class="rail">
+    <button class="env-btn selected tip" data-tip="Local — this machine">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      <span class="dot on"></span>
+    </button>
+    <hr/>
+    <button class="env-btn tip" data-tip="AI-SERVER — Connected&#10;BiBCode v0.4.2 · Compatible">
+      <span class="avatar">AI</span><span class="dot on"></span>
+    </button>
+    <button class="env-btn tip" data-tip="staging-box — Disconnected">
+      <span class="avatar">ST</span><span class="dot off"></span>
+    </button>
+    <button class="env-btn tip" data-tip="build-farm — Update required">
+      <span class="avatar">BF</span><span class="dot warn"></span>
+    </button>
+    <div class="spacer"></div>
+    <button class="env-btn tip" data-tip="Add server…">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <button class="env-btn tip" data-tip="Manage remote servers…">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"/></svg>
+    </button>
+  </div>
+  <div class="sidebar">
+    <div class="brand"><span class="logo">B</span> BiBCode</div>
+    <div class="section-label">Projects <button class="icon-btn" title="Add project">＋</button></div>
+    <div class="grow">
+      <div class="proj">
+        <div class="proj-row"><span class="chev">▾</span> bibcode <span class="badge">3</span></div>
+        <div class="thread active">develop · fix updater gating</div>
+        <div class="thread">worktree: theme-tokens</div>
+        <div class="thread">worktree: right-panel</div>
+        <div class="proj-row"><span class="chev">▸</span> dotfiles</div>
+        <div class="proj-row"><span class="chev">▸</span> orca-tools <span class="badge">1</span></div>
+      </div>
+    </div>
+    <button class="add-project">＋ Add project</button>
+  </div>
+  <div class="main">
+    <div style="font-weight:600">Variant A — Minimal edge rail</div>
+    <div class="hint">A 52px rail on the far edge. Local on top, paired servers below the divider, add + manage pinned to the bottom. Status dots per server; tooltip shows version/compat. The projects panel is untouched.</div>
+  </div>
+</div>
+
+<!-- ================= VARIANT B: rail + env context header ================= -->
+<div class="variant" id="variant-B">
+  <div class="rail">
+    <button class="env-btn tip" data-tip="Local — this machine">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      <span class="dot on"></span>
+    </button>
+    <hr/>
+    <button class="env-btn selected tip" data-tip="AI-SERVER — Connected">
+      <span class="avatar">AI</span><span class="dot on"></span>
+    </button>
+    <button class="env-btn tip" data-tip="staging-box — Disconnected">
+      <span class="avatar">ST</span><span class="dot off"></span>
+    </button>
+    <button class="env-btn tip" data-tip="build-farm — Update required">
+      <span class="avatar">BF</span><span class="dot warn"></span>
+    </button>
+    <div class="spacer"></div>
+    <button class="env-btn tip" data-tip="Add server…">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+  </div>
+  <div class="sidebar">
+    <div class="brand"><span class="logo">B</span> BiBCode</div>
+    <div class="env-header">
+      <span class="st"></span>
+      <div>
+        <div class="name">AI-SERVER</div>
+        <div class="meta">Connected · BiBCode v0.4.2 · Up to date</div>
+      </div>
+      <button class="icon-btn kebab" title="Environment actions">⋯</button>
+    </div>
+    <div class="section-label">Projects on AI-SERVER <button class="icon-btn" title="Add project">＋</button></div>
+    <div class="grow">
+      <div class="proj">
+        <div class="proj-row"><span class="chev">▾</span> api-gateway <span class="badge">2</span></div>
+        <div class="thread active">main · rate-limit middleware</div>
+        <div class="thread">worktree: retry-policy</div>
+        <div class="proj-row"><span class="chev">▸</span> data-pipeline</div>
+      </div>
+    </div>
+    <button class="add-project">＋ Add project <em>on AI-SERVER</em></button>
+  </div>
+  <div class="main">
+    <div style="font-weight:600">Variant B — Rail + environment context header</div>
+    <div class="hint">Same rail, but the panel gains a context card: server name, status, version, and a ⋯ menu (Disconnect, Check for updates, Manage…). The "Add project" affordance says where the project will land. Costs ~52px of panel height.</div>
+  </div>
+</div>
+
+<!-- ================= VARIANT C: horizontal strip, no edge rail ================= -->
+<div class="variant" id="variant-C">
+  <div class="sidebar" style="flex-basis: 300px; width: 300px;">
+    <div class="brand"><span class="logo">B</span> BiBCode</div>
+    <div class="strip">
+      <button class="env-btn tip" data-tip="Local — this machine">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <span class="dot on"></span>
+      </button>
+      <button class="env-btn selected tip" data-tip="AI-SERVER — Connected">
+        <span class="avatar">AI</span><span class="dot on"></span>
+      </button>
+      <button class="env-btn tip" data-tip="staging-box — Disconnected">
+        <span class="avatar">ST</span><span class="dot off"></span>
+      </button>
+      <button class="env-btn tip" data-tip="build-farm — Update required">
+        <span class="avatar">BF</span><span class="dot warn"></span>
+      </button>
+      <button class="env-btn tip" data-tip="Add server…" style="width:28px;height:28px">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+    <div class="section-label">Projects on AI-SERVER <button class="icon-btn" title="Add project">＋</button></div>
+    <div class="grow">
+      <div class="proj">
+        <div class="proj-row"><span class="chev">▾</span> api-gateway <span class="badge">2</span></div>
+        <div class="thread active">main · rate-limit middleware</div>
+        <div class="thread">worktree: retry-policy</div>
+        <div class="proj-row"><span class="chev">▸</span> data-pipeline</div>
+      </div>
+    </div>
+    <button class="add-project">＋ Add project <em>on AI-SERVER</em></button>
+  </div>
+  <div class="main">
+    <div style="font-weight:600">Variant C — Horizontal strip inside the panel</div>
+    <div class="hint">No extra column: environment chips sit in a horizontal strip under the brand, selection underlined. Saves the 52px rail but caps how many servers fit before it scrolls, and the strip competes with panel content.</div>
+  </div>
+</div>
+
+<div class="switcher">
+  <button id="prev" title="Previous variant (←)">‹</button>
+  <span class="label" id="label"></span>
+  <button id="next" title="Next variant (→)">›</button>
+  <button id="theme" title="Toggle light/dark">◐</button>
+</div>
+
+<script>
+  const variants = [
+    ["A", "Minimal edge rail"],
+    ["B", "Rail + context header"],
+    ["C", "Horizontal strip"],
+  ];
+  let idx = 0;
+  function show(i) {
+    idx = (i + variants.length) % variants.length;
+    document.querySelectorAll(".variant").forEach(v => v.classList.remove("visible"));
+    document.getElementById("variant-" + variants[idx][0]).classList.add("visible");
+    document.getElementById("label").textContent = variants[idx][0] + " — " + variants[idx][1];
+    const app = document.querySelector(".app"); // no-op; layout is per-variant
+  }
+  document.getElementById("prev").onclick = () => show(idx - 1);
+  document.getElementById("next").onclick = () => show(idx + 1);
+  document.getElementById("theme").onclick = () =>
+    document.documentElement.classList.toggle("dark");
+  document.addEventListener("keydown", (e) => {
+    if (["INPUT","TEXTAREA"].includes(document.activeElement.tagName)) return;
+    if (e.key === "ArrowLeft") show(idx - 1);
+    if (e.key === "ArrowRight") show(idx + 1);
+  });
+  document.querySelectorAll(".variant").forEach(v => { v.style.height = "100vh"; });
+  show(0);
+</script>
+</body>
+</html>
