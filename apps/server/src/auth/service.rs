@@ -19,7 +19,7 @@ use super::{
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
         ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView,
-        PairingOfferResult, Principal, STANDARD_SCOPES,
+        PairingOfferResult, Principal, STANDARD_SCOPES, ShareExposureState,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -790,6 +790,53 @@ impl AuthService {
             },
         );
         Ok(())
+    }
+
+    pub async fn share_exposure_state(&self) -> ShareExposureState {
+        let now = now_ms();
+        let state = self.state.lock().await;
+        let link_grants = state
+            .pairings
+            .values()
+            .filter(|pairing| {
+                pairing.subject == "one-time-token"
+                    && pairing.consumed_at_ms.is_none()
+                    && pairing.revoked_at_ms.is_none()
+                    && pairing.expires_at_ms > now
+            })
+            .map(|pairing| pairing.off_host);
+        let session_grants = state
+            .sessions
+            .values()
+            .filter(|session| {
+                session.subject == "one-time-token"
+                    && session.revoked_at_ms.is_none()
+                    && session.expires_at_ms > now
+                    && matches!(
+                        session.method.as_str(),
+                        "bearer-access-token" | "dpop-access-token"
+                    )
+            })
+            .map(|session| session.off_host);
+        let mut off_host_grant_count = 0usize;
+        let mut legacy_grant_count = 0usize;
+        for off_host in link_grants.chain(session_grants) {
+            match off_host {
+                Some(true) => off_host_grant_count += 1,
+                Some(false) => {}
+                None => legacy_grant_count += 1,
+            }
+        }
+        ShareExposureState {
+            desired_exposure: if off_host_grant_count > 0 {
+                "wide"
+            } else {
+                "loopback"
+            }
+            .to_owned(),
+            off_host_grant_count,
+            legacy_grant_count,
+        }
     }
 
     pub async fn revoke_pairing(&self, id: &str) -> Result<bool, AuthError> {
@@ -1574,6 +1621,94 @@ mod tests {
             .await
             .expect_err("invalid reach");
         assert!(matches!(error, AuthError::InvalidCredential));
+    }
+
+    #[tokio::test]
+    async fn share_exposure_derives_wide_only_from_off_host_flags() {
+        let auth = service();
+        let state = auth.share_exposure_state().await;
+        assert_eq!(state.desired_exposure, "loopback");
+
+        auth.issue_share_pairing(
+            owned_scopes(STANDARD_SCOPES),
+            None,
+            "this-computer".to_owned(),
+            false,
+        )
+        .await
+        .expect("this-computer pairing");
+        assert_eq!(
+            auth.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+
+        auth.issue_share_pairing(
+            owned_scopes(STANDARD_SCOPES),
+            None,
+            "custom".to_owned(),
+            false,
+        )
+        .await
+        .expect("loopback custom pairing");
+        assert_eq!(
+            auth.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+
+        let off_host = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("off-host pairing");
+        let state = auth.share_exposure_state().await;
+        assert_eq!(state.desired_exposure, "wide");
+        assert_eq!(state.off_host_grant_count, 1);
+
+        let session = auth
+            .exchange_bootstrap(
+                &off_host.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("off-host session");
+        assert_eq!(auth.share_exposure_state().await.desired_exposure, "wide");
+
+        auth.revoke_client("administrator", &session.principal.session_id)
+            .await
+            .expect("revoke off-host session");
+        assert_eq!(
+            auth.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_null_reach_grants_count_separately_and_never_widen() {
+        let auth = service();
+        let legacy = auth
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), None)
+            .await
+            .expect("legacy pairing");
+        auth.exchange_bootstrap(
+            &legacy.credential,
+            None,
+            ClientMetadata::default(),
+            None,
+            SessionTransport::Plain,
+        )
+        .await
+        .expect("legacy session");
+
+        let state = auth.share_exposure_state().await;
+        assert_eq!(state.desired_exposure, "loopback");
+        assert_eq!(state.legacy_grant_count, 1);
     }
 
     #[tokio::test]

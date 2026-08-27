@@ -132,6 +132,14 @@ pub struct PairingOfferResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareExposureState {
+    pub desired_exposure: String,
+    pub off_host_grant_count: usize,
+    pub legacy_grant_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PairingLinkView {
     pub id: String,
     pub credential: String,

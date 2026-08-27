@@ -39,6 +39,7 @@ pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/api/auth/websocket-ticket", post(websocket_ticket))
         .route("/api/auth/pairing-token", post(pairing_token))
         .route("/api/auth/pairing-offer", post(create_pairing_offer))
+        .route("/api/auth/share-state", get(share_state))
         .route("/api/auth/pairing-links", get(pairing_links))
         .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
         .route("/api/auth/clients", get(clients))
@@ -442,6 +443,13 @@ async fn pairing_links(State(state): State<AppState>, headers: HeaderMap, uri: U
     match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_READ).await {
         Ok(_) => Json(state.auth.list_pairings().await).into_response(),
         Err(error) => auth_error_for_request(error, &headers, "pairing_links_load_failed"),
+    }
+}
+
+async fn share_state(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_READ).await {
+        Ok(_) => Json(state.auth.share_exposure_state().await).into_response(),
+        Err(error) => auth_error_for_request(error, &headers, "share_state_load_failed"),
     }
 }
 

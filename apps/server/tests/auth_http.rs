@@ -430,6 +430,55 @@ async fn pairing_links_and_client_sessions_can_be_listed_and_revoked() {
 }
 
 #[tokio::test]
+async fn share_state_reports_grant_derived_exposure() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+
+    let initial = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("share state"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(initial["desiredExposure"], "loopback");
+    assert_eq!(initial["offHostGrantCount"], 0);
+    assert_eq!(initial["legacyGrantCount"], 0);
+
+    let _offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(token)
+            .json(&json!({ "label": "Tablet" }))
+            .send()
+            .await
+            .expect("pairing token"),
+        StatusCode::OK,
+    )
+    .await;
+    let after_legacy = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("share state"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(after_legacy["desiredExposure"], "loopback");
+    assert_eq!(after_legacy["legacyGrantCount"], 1);
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn websocket_requires_a_short_lived_ticket_or_request_credential() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
