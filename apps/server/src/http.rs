@@ -38,6 +38,8 @@ use crate::{
 };
 
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
+pub(crate) const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1;
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
 pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
 
@@ -265,6 +267,8 @@ struct EnvironmentDescriptor {
     platform: PlatformDescriptor,
     server_version: String,
     storage_instance_id: String,
+    remote_protocol_version: u32,
+    min_compatible_remote_protocol: u32,
     capabilities: EnvironmentCapabilities,
 }
 
@@ -294,6 +298,8 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        remote_protocol_version: REMOTE_PROTOCOL_VERSION,
+        min_compatible_remote_protocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
         },
