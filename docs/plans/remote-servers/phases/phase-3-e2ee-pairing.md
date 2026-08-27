@@ -1146,7 +1146,7 @@ git commit -m "feat(server): transport-scoped auth sessions with no-downgrade en
 
 #### Cycle B — the route
 
-- [ ] **Step 1: Write the failing integration tests**
+- [x] **Step 1: Write the failing integration tests**
 
 `apps/server/tests/e2ee_ws.rs`. Boot pattern: `ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))` exactly as `cli_smoke.rs` does. The startup pairing credential from `handle.startup_access()` is a one-time pairing token — the e2ee tests authenticate with it **inside the channel** (`{"type":"e2ee_auth","pairing":"<startup credential>"}`); no `/oauth/token` or ticket HTTP round-trips on the e2ee path. (Plain-HTTP `admin_bearer_token` from `/oauth/token` remains a helper for the no-downgrade assertions and Task 8's mint calls only.) Test helper `noise_connect(addr, host_key, ) -> (WebSocketStream, snow::TransportState)`:
 
@@ -1197,12 +1197,12 @@ Tests (each with its own `TempDir` + runtime):
 11. `preauth_connection_cap_rejects_the_overflow_connection` — open `E2EE_MAX_PREAUTH_CONNECTIONS` sockets that stall before `e2ee_auth`, then open one more and expect an immediate close (code 1013); complete or drop one stalled socket and verify a new connection is admitted again.
 12. `text_frames_before_handshake_are_rejected` — send a Text frame first; expect close.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p bibcode-server --test e2ee_ws`
 Expected: FAIL — connecting to `/ws-e2ee` gets an HTTP 404/handshake failure (route absent).
 
-- [ ] **Step 3: Implement the route**
+- [x] **Step 3: Implement the route**
 
 In `apps/server/src/rpc/session.rs`, make `SOCKET_WRITE_TIMEOUT` `pub(crate)` (the pumps adopt the plain session's 5 s write policy) and add next to it `pub(crate) const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);` — verify the actual constant name/value in the file first and reuse whatever the plain writer task uses; do not invent a second write-timeout value.
 
@@ -1557,12 +1557,12 @@ and `.route(WS_E2EE_PATH, get(websocket_e2ee))` next to the `/ws` route in `buil
 
 4. `apps/server/tests/server_runtime.rs` `expected_routes()`: insert `("GET", "/ws-e2ee")` after `("GET", "/ws")`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-server --test e2ee_ws && cargo test -p bibcode-server --test auth_http && cargo test -p bibcode-server --test server_runtime route_inventory && cargo test -p bibcode-server --test production_maintenance && cargo clippy -p bibcode-server --all-targets -- -D warnings`
 Expected: PASS (including the maintenance-gap test — GET routes classify as reads automatically — and the no-downgrade cases from test 3).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/http.rs apps/server/src/rpc/e2ee.rs apps/server/src/rpc/mod.rs apps/server/src/rpc/session.rs apps/server/tests/e2ee_ws.rs apps/server/tests/server_runtime.rs

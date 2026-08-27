@@ -99,10 +99,6 @@ impl HostIdentity {
     }
 
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the E2EE responder is added in Phase 3 Task 4")
-    )]
     pub(crate) fn private_key_bytes(&self) -> &[u8; 32] {
         &self.private
     }

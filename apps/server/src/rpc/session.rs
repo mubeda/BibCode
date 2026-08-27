@@ -26,8 +26,8 @@ use crate::{
 const OUTBOUND_CAPACITY: usize = 64;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub type RpcResult = Result<Value, Value>;
 pub type RpcStreamChunk = Result<Vec<Value>, Value>;
@@ -457,7 +457,7 @@ pub(crate) async fn run_session_split<W, R>(
     }
     drop(outbound_sender);
     drop(completed_sender);
-    if timeout(WRITER_JOIN_TIMEOUT, &mut writer).await.is_err() {
+    if timeout(PUMP_JOIN_TIMEOUT, &mut writer).await.is_err() {
         writer.abort();
         let _ = writer.await;
     }
