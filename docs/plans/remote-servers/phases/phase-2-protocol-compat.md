@@ -548,7 +548,7 @@ git commit -m "feat(client-runtime): compute the protocol compatibility verdict"
   - `compatVerdictFromPrepared(prepared: Option.Option<Pick<PreparedConnection, "descriptor">>): CompatVerdict | null` — pure helper, exported for tests and non-atom callers.
   - `createEnvironmentSessionAtoms(runtime).compatVerdictAtom(environmentId)` — `Atom` of `CompatVerdict | null` (`null` = no prepared connection observed, i.e. the environment has not connected in this app session). **This is the selector later phases consume.** In `apps/web` it is already reachable with zero wiring as `environmentSession.compatVerdictAtom(environmentId)` (`apps/web/src/state/session.ts` exports `environmentSession = createEnvironmentSessionAtoms(connectionAtomRuntime)`). UI consumption (badges, settings rows, rail status) belongs to Phases 4 and 6, not this phase.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `packages/client-runtime/src/state/session.test.ts` (the file already imports `describe`, `expect`, `it` from `@effect/vitest` and `Option`; extend its imports):
 
@@ -605,12 +605,12 @@ describe("environment compatibility verdict selection", () => {
 
 Note: if `environmentId: "env-current"` fails typecheck because `EnvironmentId` is branded, use `EnvironmentId.make("env-current")` with `import { EnvironmentId } from "@bibcode/contracts";` (this is the pattern `apps/web/src/state/environments.ts` uses).
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `vp test run packages/client-runtime/src/state/session.test.ts`
 Expected: FAIL — `compatVerdictFromPrepared` is not exported from `./session.ts`.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 In `packages/client-runtime/src/state/session.ts`, extend the imports:
 
@@ -653,17 +653,17 @@ return {
 };
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run packages/client-runtime/src/state/session.test.ts`
 Expected: PASS (the pre-existing initial-config test plus the three new tests).
 
-- [ ] **Step 5: Typecheck the workspace**
+- [x] **Step 5: Typecheck the workspace**
 
 Run: `vp run typecheck`
 Expected: PASS (confirms `apps/web`'s existing `createEnvironmentSessionAtoms` call site absorbs the new return member with no change).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add packages/client-runtime/src/state/session.ts packages/client-runtime/src/state/session.test.ts
