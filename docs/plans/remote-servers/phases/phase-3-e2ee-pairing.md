@@ -2963,7 +2963,7 @@ export function decodeBase64UrlKey(encoded: string): Uint8Array; // throws Noise
 
 Tasks 10, 11, 14 consume these.
 
-- [ ] **Step 1: Obtain the official NK vector (fetch-select-embed; do not fabricate bytes)**
+- [x] **Step 1: Obtain the official NK vector (fetch-select-embed; do not fabricate bytes)**
 
 The snow crate vendors the cacophony vector corpus. Fetch it and extract the NK entry (URL current as of writing — verify at implementation time; the corpus also exists in the cacophony project itself):
 
@@ -2980,7 +2980,7 @@ node -e '
 
 Embed the printed vector verbatim as a `const OFFICIAL_NK_VECTOR = {...} as const;` in `noise.test.ts` with a comment naming the source URL and retrieval date. The vector supplies hex fields: `init_prologue`, `init_ephemeral`, `init_remote_static`, `resp_static`, `resp_ephemeral`, `handshake_hash`, and `messages: [{ payload, ciphertext }, ...]` (message 0 = A, message 1 = B, 2+ = transport, alternating initiator/responder). If the file layout differs from this description, adapt the test's field access to the actual layout — the assertions below are what matters.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 `packages/client-runtime/src/e2ee/noise.test.ts`:
 
@@ -3098,12 +3098,12 @@ describe("Noise NK self round-trip", () => {
 
 (Resolve `publicKeyOf` by exporting a small `derivePublicKey(privateKey: Uint8Array): Uint8Array` from `noise.ts` — it is also useful for diagnostics.)
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/noise.test.ts`
 Expected: FAIL — module missing.
 
-- [ ] **Step 4: Implement `noise.ts`**
+- [x] **Step 4: Implement `noise.ts`**
 
 Full implementation (Noise revision 34 semantics; HKDF is the Noise two-output construction):
 
@@ -3392,12 +3392,12 @@ export function decodeBase64UrlKey(encoded: string): Uint8Array {
 
 Note for the implementer: if the noble AEAD's `decrypt` error type or the x25519 helper names differ in the pinned versions (Task 1's verification), adapt the three call sites (`chacha20poly1305(...).decrypt`, `x25519.utils.randomSecretKey`, `x25519.getSharedSecret`) — the test vectors will catch any semantic slip.
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/noise.test.ts`
 Expected: PASS, including the official-vector suite. If the vector assertions fail while self-round-trip passes, the bug is real (padding, nonce layout, hash order) — do not weaken the vector test.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add packages/client-runtime/src/e2ee
