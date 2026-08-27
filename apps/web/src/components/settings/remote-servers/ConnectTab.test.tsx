@@ -62,6 +62,7 @@ const h = vi.hoisted(() => {
       getToken: vi.fn(),
     },
     environments: [] as unknown[],
+    compatVerdicts: new Map<string, unknown>(),
     primaryEnvironment: null as unknown,
     relayDiscovery: {
       environments: new Map<string, unknown>(),
@@ -168,6 +169,19 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("@clerk/react", () => ({
   useAuth: () => h.clerkAuth,
+}));
+
+vi.mock("@effect/atom-react", () => ({
+  useAtomValue: (atom: unknown) => {
+    const environmentId = (atom as { environmentId?: string }).environmentId;
+    return environmentId === undefined ? null : (h.compatVerdicts.get(environmentId) ?? null);
+  },
+}));
+
+vi.mock("~/state/session", () => ({
+  environmentSession: {
+    compatVerdictAtom: (environmentId: string) => ({ environmentId }),
+  },
 }));
 
 vi.mock("~/connection/currentEnvironmentPresentation", () => ({
@@ -916,6 +930,7 @@ beforeEach(() => {
   h.clerkAuth.getToken.mockReset();
   h.clerkAuth.getToken.mockResolvedValue("clerk-token");
   h.environments = [];
+  h.compatVerdicts.clear();
   h.primaryEnvironment = { environmentId: PRIMARY_ID, serverConfig: null };
   h.relayDiscovery = { environments: new Map(), refreshing: false };
   h.primarySessionState = { data: null };
@@ -2303,5 +2318,52 @@ describe("Remote Servers tabs", () => {
     const markup = render();
     expect(markup).toContain("No saved remote environments");
     expect(markup).toContain("connect one from BiBCode Connect");
+  });
+
+  it("shows version, compatibility, and transport metadata for a saved server", () => {
+    stubBrowserWindow();
+    const environmentId = EnvironmentId.make("env-presentation");
+    h.compatVerdicts.set(environmentId, { kind: "legacy" });
+    h.environments = [
+      {
+        environmentId,
+        label: "AI-SERVER",
+        relayManaged: false,
+        serverConfig: { environment: { serverVersion: "1.4.2" } },
+        connection: { phase: "connected", error: null, traceId: null },
+        entry: {
+          target: { _tag: "BearerConnectionTarget", connectionId: "bearer:env-presentation" },
+          profile: Option.some({ _tag: "BearerConnectionProfile", hostKey: null }),
+        },
+      },
+    ];
+
+    const markup = render();
+    expect(markup).toContain("AI-SERVER");
+    expect(markup).toContain("BiBCode v1.4.2");
+    expect(markup).toContain("Limited compatibility");
+    expect(markup).toContain("Unencrypted");
+  });
+
+  it("shows Status unavailable after a failed probe without a cached descriptor", () => {
+    stubBrowserWindow();
+    const environmentId = EnvironmentId.make("env-unavailable");
+    h.environments = [
+      {
+        environmentId,
+        label: "LAB",
+        relayManaged: false,
+        serverConfig: null,
+        connection: { phase: "error", error: "connect ECONNREFUSED", traceId: null },
+        entry: {
+          target: { _tag: "BearerConnectionTarget", connectionId: "bearer:env-unavailable" },
+          profile: Option.none(),
+        },
+      },
+    ];
+
+    const markup = render();
+    expect(markup).toContain("Status unavailable");
+    expect(markup).toContain("status:error");
   });
 });

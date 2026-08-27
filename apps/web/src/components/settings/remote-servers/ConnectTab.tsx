@@ -5,6 +5,7 @@ import {
   TerminalIcon,
   TriangleAlertIcon,
 } from "lucide-react";
+import { useAtomValue } from "@effect/atom-react";
 import { type ReactNode, memo, useCallback, useEffect, useMemo, useState } from "react";
 import type {
   DesktopDiscoveredSshHost,
@@ -13,6 +14,7 @@ import type {
 } from "@bibcode/contracts";
 import {
   connectionStatusText,
+  type CompatVerdict,
   RelayConnectionRegistration,
   RelayConnectionTarget,
 } from "@bibcode/client-runtime/connection";
@@ -44,8 +46,10 @@ import {
 import { relayEnvironmentDiscovery } from "~/state/relay";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "../../../state/use-atom-command";
+import { environmentSession } from "~/state/session";
 import { AnimatedHeight } from "../../AnimatedHeight";
 import { Button } from "../../ui/button";
+import { Badge } from "../../ui/badge";
 import {
   Dialog,
   DialogDescription,
@@ -73,20 +77,27 @@ import {
   parsePairingUrlFields,
   parseRemotePairingFields,
 } from "./shared";
+import {
+  describeCompatBadge,
+  formatServerVersionLabel,
+  resolveTransportBadge,
+} from "./connectPresentation";
 
-type SavedBackendListRowProps = {
+type RemoteServerRowProps = {
   environment: EnvironmentPresentation;
+  compat: CompatVerdict | null;
   removingEnvironmentId: EnvironmentId | null;
   onConnect: (environmentId: EnvironmentId) => void;
   onRemove: (environmentId: EnvironmentId) => void;
 };
 
-function SavedBackendListRow({
+function RemoteServerRow({
   environment,
+  compat,
   removingEnvironmentId,
   onConnect,
   onRemove,
-}: SavedBackendListRowProps) {
+}: RemoteServerRowProps) {
   const environmentId = environment.environmentId;
   const connectionState = environment.connection.phase;
   const isConnected = connectionState === "connected";
@@ -127,6 +138,13 @@ function SavedBackendListRow({
     [copyTraceIdToClipboard],
   );
   const versionMismatch = resolveServerConfigVersionMismatch(environment.serverConfig);
+  const versionLabel = formatServerVersionLabel(
+    environment.serverConfig?.environment?.serverVersion,
+  );
+  const compatBadge = describeCompatBadge(compat);
+  const transportBadge = resolveTransportBadge(environment);
+  const statusUnavailable =
+    versionLabel === null && compatBadge === null && environment.connection.error !== null;
   const sshTarget =
     environment.entry.target._tag === "SshConnectionTarget" &&
     Option.isSome(environment.entry.profile) &&
@@ -160,9 +178,34 @@ function SavedBackendListRow({
             />
             <h3 className="text-sm font-medium text-foreground">{environment.label}</h3>
           </div>
-          {metadataBits.length > 0 ? (
-            <p className="text-xs text-muted-foreground">{metadataBits.join(" · ")}</p>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {versionLabel ? (
+              <span className="text-xs text-muted-foreground">{versionLabel}</span>
+            ) : null}
+            {statusUnavailable ? (
+              <span className="text-xs text-muted-foreground/70">Status unavailable</span>
+            ) : null}
+            {compatBadge ? (
+              <Badge variant={compatBadge.tone === "destructive" ? "destructive" : "warning"}>
+                {compatBadge.label}
+              </Badge>
+            ) : null}
+            {transportBadge ? (
+              transportBadge.kind === "unencrypted" ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<Badge variant="warning">{transportBadge.label}</Badge>}
+                  />
+                  <TooltipPopup side="top">{transportBadge.guidance}</TooltipPopup>
+                </Tooltip>
+              ) : (
+                <Badge variant="outline">{transportBadge.label}</Badge>
+              )
+            ) : null}
+            {metadataBits.length > 0 ? (
+              <span className="text-xs text-muted-foreground">{metadataBits.join(" · ")}</span>
+            ) : null}
+          </div>
           {versionMismatch ? (
             <p className="flex items-center gap-1 text-warning text-xs">
               <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -221,6 +264,13 @@ function SavedBackendListRow({
       </div>
     </div>
   );
+}
+
+function RemoteServerRowFromSession(props: Omit<RemoteServerRowProps, "compat">) {
+  const compat = useAtomValue(
+    environmentSession.compatVerdictAtom(props.environment.environmentId),
+  );
+  return <RemoteServerRow {...props} compat={compat} />;
 }
 
 interface DesktopSshHostRowProps {
@@ -927,7 +977,7 @@ export function ConnectTab() {
   return (
     <>
       <SettingsSection
-        title="Remote environments"
+        title="Saved servers"
         headerAction={
           <Dialog
             open={addBackendDialogOpen}
@@ -947,16 +997,16 @@ export function ConnectTab() {
                         size="xs"
                         variant="ghost"
                         className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
-                        aria-label="Add environment"
+                        aria-label="Add Server"
                       >
                         <PlusIcon className="size-3" />
-                        <span>Add environment</span>
+                        <span>Add Server</span>
                       </Button>
                     }
                   />
                 }
               />
-              <TooltipPopup side="top">Add environment</TooltipPopup>
+              <TooltipPopup side="top">Add Server</TooltipPopup>
             </Tooltip>
             <DialogPopup className="max-h-[80dvh] sm:max-w-3xl">
               <DialogHeader>
@@ -991,7 +1041,7 @@ export function ConnectTab() {
         }
       >
         {savedEnvironments.map((environment) => (
-          <SavedBackendListRow
+          <RemoteServerRowFromSession
             key={environment.environmentId}
             environment={environment}
             removingEnvironmentId={removingSavedEnvironmentId}
