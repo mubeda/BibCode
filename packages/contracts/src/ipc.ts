@@ -1239,7 +1239,7 @@ export interface DesktopBridge {
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
-  setServerExposureMode: (mode: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
+  applyServerExposure: (desired: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {
     readonly enabled: boolean;
     readonly port?: number;
