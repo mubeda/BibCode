@@ -111,6 +111,7 @@ import {
 import {
   useProject,
   useProjects,
+  useActiveEnvironmentId,
   useServerConfigs,
   useThreadShells,
   useThreadShellsForProjectRefs,
@@ -157,6 +158,7 @@ import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
+import { selectRailVisibleEnvironmentIds } from "./sidebar/environmentRail.logic";
 import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
@@ -3959,11 +3961,39 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 });
 
 export default function Sidebar() {
-  const projects = useProjects();
+  const allProjects = useProjects();
   const { environments } = useEnvironments();
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const visibleEnvironmentIds = useMemo(
+    () =>
+      selectRailVisibleEnvironmentIds({
+        activeEnvironmentId,
+        candidates: environments.map((environment) => ({
+          environmentId: environment.environmentId,
+          isLocal:
+            environment.entry.target._tag === "PrimaryConnectionTarget" ||
+            isDesktopLocalConnectionTarget(environment.entry.target),
+        })),
+      }),
+    [activeEnvironmentId, environments],
+  );
+  const projects = useMemo(
+    () =>
+      visibleEnvironmentIds === null
+        ? allProjects
+        : allProjects.filter((project) => visibleEnvironmentIds.has(project.environmentId)),
+    [allProjects, visibleEnvironmentIds],
+  );
   const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const shellSummary = useEnvironmentShellSummary();
-  const sidebarThreads = useThreadShells();
+  const allSidebarThreads = useThreadShells();
+  const sidebarThreads = useMemo(
+    () =>
+      visibleEnvironmentIds === null
+        ? allSidebarThreads
+        : allSidebarThreads.filter((thread) => visibleEnvironmentIds.has(thread.environmentId)),
+    [allSidebarThreads, visibleEnvironmentIds],
+  );
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
