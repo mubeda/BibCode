@@ -98,6 +98,13 @@ struct StoredPairingOffer {
     expires_at_ms: i64,
 }
 
+#[derive(Default)]
+struct AuthGrantMetadata {
+    proof_key_thumbprint: Option<String>,
+    reach: Option<String>,
+    off_host: Option<bool>,
+}
+
 pub(crate) enum PairingOfferReplay {
     Original(PairingOfferResult),
     Conflict,
@@ -357,10 +364,12 @@ impl AuthService {
             grant.scopes,
             "browser-session-cookie",
             apply_grant_label(client, grant.label),
-            None,
             transport,
-            grant.reach,
-            grant.off_host,
+            AuthGrantMetadata {
+                reach: grant.reach,
+                off_host: grant.off_host,
+                ..AuthGrantMetadata::default()
+            },
         )
         .await
     }
@@ -393,10 +402,12 @@ impl AuthService {
             scopes,
             method,
             apply_grant_label(client, grant.label),
-            proof_key_thumbprint,
             transport,
-            grant.reach,
-            grant.off_host,
+            AuthGrantMetadata {
+                proof_key_thumbprint,
+                reach: grant.reach,
+                off_host: grant.off_host,
+            },
         )
         .await
     }
@@ -575,10 +586,8 @@ impl AuthService {
             scopes,
             label,
             "one-time-token",
-            None,
             PAIRING_TTL_MS,
-            None,
-            None,
+            AuthGrantMetadata::default(),
         )
         .await
     }
@@ -596,10 +605,11 @@ impl AuthService {
             scopes,
             label,
             "one-time-token",
-            Some(proof_key_thumbprint),
             PAIRING_TTL_MS,
-            None,
-            None,
+            AuthGrantMetadata {
+                proof_key_thumbprint: Some(proof_key_thumbprint),
+                ..AuthGrantMetadata::default()
+            },
         )
         .await
     }
@@ -615,10 +625,11 @@ impl AuthService {
             owned_scopes(STANDARD_SCOPES),
             Some("BiBCode Connect connect".to_owned()),
             "cloud-connect",
-            Some(proof_key_thumbprint),
             CLOUD_PAIRING_TTL_MS,
-            None,
-            None,
+            AuthGrantMetadata {
+                proof_key_thumbprint: Some(proof_key_thumbprint),
+                ..AuthGrantMetadata::default()
+            },
         )
         .await
     }
@@ -628,10 +639,8 @@ impl AuthService {
             owned_scopes(ADMINISTRATIVE_SCOPES),
             None,
             "administrative-bootstrap",
-            None,
             PAIRING_TTL_MS,
-            None,
-            None,
+            AuthGrantMetadata::default(),
         )
         .await
     }
@@ -650,10 +659,12 @@ impl AuthService {
             scopes,
             label,
             "one-time-token",
-            None,
             PAIRING_TTL_MS,
-            Some(reach),
-            Some(off_host),
+            AuthGrantMetadata {
+                reach: Some(reach),
+                off_host: Some(off_host),
+                ..AuthGrantMetadata::default()
+            },
         )
         .await
     }
@@ -663,11 +674,14 @@ impl AuthService {
         scopes: Vec<String>,
         label: Option<String>,
         subject: &str,
-        proof_key_thumbprint: Option<String>,
         ttl_ms: i64,
-        reach: Option<String>,
-        off_host: Option<bool>,
+        metadata: AuthGrantMetadata,
     ) -> Result<PairingCredentialResult, AuthError> {
+        let AuthGrantMetadata {
+            proof_key_thumbprint,
+            reach,
+            off_host,
+        } = metadata;
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
             || scopes.iter().any(|scope| !is_scope(scope))
@@ -1035,11 +1049,14 @@ impl AuthService {
         scopes: Vec<String>,
         method: &str,
         client: ClientMetadata,
-        proof_key_thumbprint: Option<String>,
         transport: SessionTransport,
-        reach: Option<String>,
-        off_host: Option<bool>,
+        metadata: AuthGrantMetadata,
     ) -> Result<IssuedSession, AuthError> {
+        let AuthGrantMetadata {
+            proof_key_thumbprint,
+            reach,
+            off_host,
+        } = metadata;
         let _issuance = self.issuance.lock().await;
         let issued_at = now_ms();
         let ttl = if proof_key_thumbprint.is_some() {
