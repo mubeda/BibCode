@@ -720,7 +720,7 @@ git commit -m "feat(cli): add bibcode pairing issue subcommand"
   (`bibcode_desktop_lib::ssh`), asserted by the public contract test. No behavior change
   to `SshEnvironmentManager`'s public API.
 
-- [ ] **Step 1: Write the failing contract test**
+- [x] **Step 1: Write the failing contract test**
 
 In `apps/desktop/src-tauri/tests/ssh_public_contract.rs`, add
 `REMOTE_PAIRING_ISSUE_COMMAND` to the existing `use bibcode_desktop_lib::ssh::{...}`
@@ -751,13 +751,13 @@ now exposes (and, by construction, retires the removed `auth pairing create` for
 second pins that the parser accepts the real `--json` output of Task 2 — same key
 casing, extra fields tolerated, last non-empty line wins over SSH banners.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p bibcode-desktop --test ssh_public_contract public_remote_pairing_command_targets_the_native_cli_and_parses_its_output`
 Expected: compile error — `REMOTE_PAIRING_ISSUE_COMMAND` is not exported by
 `bibcode_desktop_lib::ssh`.
 
-- [ ] **Step 3: Implement the constant and switch the invocation**
+- [x] **Step 3: Implement the constant and switch the invocation**
 
 In `apps/desktop/src-tauri/src/ssh.rs`, next to the other remote constants (after
 `REMOTE_REUSE_READY_TIMEOUT_MS`, ~line 38):
@@ -784,7 +784,7 @@ In `issue_remote_pairing_token` (~line 1374), replace the removed command string
 (The rest of `issue_remote_pairing_token` — spawn, status check, stderr surfacing,
 `parse_remote_pairing_credential` — is already correct and stays untouched.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-desktop --test ssh_public_contract`
 Expected: all PASS (the new test plus every pre-existing contract test).
@@ -792,7 +792,7 @@ Run: `cargo test -p bibcode-desktop --lib ssh::`
 Expected: all PASS (inline `ssh.rs` tests, including the parser and launch-script
 tests, are unaffected).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/tests/ssh_public_contract.rs

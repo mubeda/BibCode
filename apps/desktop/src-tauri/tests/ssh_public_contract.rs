@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, fs, time::Duration};
 
 use bibcode_desktop_lib::ssh::{
-    DiscoveredSshHost, RemoteLaunchResult, SshAuthOptions, SshEnvironmentBootstrap,
-    SshEnvironmentLaunchPlan, SshEnvironmentManager, SshEnvironmentTarget,
+    DiscoveredSshHost, REMOTE_PAIRING_ISSUE_COMMAND, RemoteLaunchResult, SshAuthOptions,
+    SshEnvironmentBootstrap, SshEnvironmentLaunchPlan, SshEnvironmentManager, SshEnvironmentTarget,
     SshPasswordPromptManager, SshPasswordPromptRequestError, SshPasswordPromptResolution,
     SshPasswordPromptResolveError, SshPasswordRequest, default_home_dir, discover_ssh_hosts,
     parse_known_hosts_hostnames, parse_remote_launch_result, parse_remote_pairing_credential,
@@ -201,6 +201,24 @@ fn public_remote_parsers_cover_success_defaults_and_validation_errors() {
             "git.example".to_string(),
             "github.com".to_string(),
         ])
+    );
+}
+
+#[test]
+fn public_remote_pairing_command_targets_the_native_cli_and_parses_its_output() {
+    assert_eq!(
+        REMOTE_PAIRING_ISSUE_COMMAND,
+        "bibcode pairing issue --base-dir \"$HOME/.bibcode\" --json"
+    );
+
+    assert_eq!(
+        parse_remote_pairing_credential(
+            "Warning: Permanently added 'devbox' to the list of known hosts.\n\
+             {\"id\":\"3f3c0f6e-8a0e-4f61-9d55-1af26cf54e21\",\
+             \"credential\":\"WXYZ23456789\",\"label\":\"SSH bootstrap\",\
+             \"expiresAt\":\"2026-08-27T12:05:00Z\"}\n",
+        ),
+        Ok("WXYZ23456789".to_string())
     );
 }
 
