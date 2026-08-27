@@ -1584,6 +1584,8 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         expires_at: FUTURE.to_owned(),
         consumed_at: None,
         revoked_at: None,
+        reach: None,
+        off_host: None,
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
@@ -1687,6 +1689,56 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
 }
 
 #[tokio::test]
+async fn auth_pairing_reach_round_trips_through_persistence() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .create_auth_pairing_link(AuthPairingLink {
+            id: "pairing-reach".to_owned(),
+            credential: "credential-reach".to_owned(),
+            method: "one-time-token".to_owned(),
+            scopes: json!(["orchestration:read"]),
+            subject: "one-time-token".to_owned(),
+            label: Some("Tablet".to_owned()),
+            proof_key_thumbprint: None,
+            created_at: T1.to_owned(),
+            expires_at: FUTURE.to_owned(),
+            consumed_at: None,
+            revoked_at: None,
+            reach: Some("another-device".to_owned()),
+            off_host: Some(true),
+        })
+        .await
+        .expect("pairing insert");
+    let links = repositories
+        .list_active_auth_pairing_links(T2.to_owned())
+        .await
+        .expect("active pairing listing");
+    assert_eq!(links[0].reach.as_deref(), Some("another-device"));
+    assert_eq!(links[0].off_host, Some(true));
+
+    repositories
+        .create_auth_session(NewAuthSession {
+            session_id: "session-reach".to_owned(),
+            subject: "one-time-token".to_owned(),
+            scopes: json!(["orchestration:read"]),
+            method: "bearer-access-token".to_owned(),
+            client: auth_client("Tablet"),
+            issued_at: T1.to_owned(),
+            expires_at: FUTURE.to_owned(),
+            reach: Some("this-computer".to_owned()),
+            off_host: Some(false),
+        })
+        .await
+        .expect("session insert");
+    let sessions = repositories
+        .list_active_auth_sessions(T2.to_owned())
+        .await
+        .expect("active session listing");
+    assert_eq!(sessions[0].reach.as_deref(), Some("this-computer"));
+    assert_eq!(sessions[0].off_host, Some(false));
+}
+
+#[tokio::test]
 async fn auth_sessions_round_trip_order_connect_and_revoke() {
     let repositories = migrated_repositories().await;
     let session_a = NewAuthSession {
@@ -1697,6 +1749,8 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         client: auth_client("Laptop"),
         issued_at: T1.to_owned(),
         expires_at: FUTURE.to_owned(),
+        reach: None,
+        off_host: None,
     };
     let session_b = NewAuthSession {
         session_id: "session-b".to_owned(),

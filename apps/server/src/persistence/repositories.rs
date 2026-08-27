@@ -1042,7 +1042,7 @@ impl Repositories {
     }
 
     pub async fn create_auth_pairing_link(&self, row: AuthPairingLink) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)", params![row.id,row.credential,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at])?; Ok(()) }).await
+        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)", params![row.id,row.credential,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at,row.reach,row.off_host])?; Ok(()) }).await
     }
     pub async fn consume_auth_pairing_link(
         &self,
@@ -1109,7 +1109,7 @@ impl Repositories {
     }
 
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at])?; Ok(()) }).await
+        self.database.call(move |connection| { connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host])?; Ok(()) }).await
     }
     pub async fn get_auth_session(&self, session_id: String) -> Result<Option<AuthSession>> {
         self.database
@@ -1451,6 +1451,8 @@ pub struct AuthPairingLink {
     pub expires_at: Timestamp,
     pub consumed_at: Option<Timestamp>,
     pub revoked_at: Option<Timestamp>,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSessionClient {
@@ -1470,6 +1472,8 @@ pub struct NewAuthSession {
     pub client: AuthSessionClient,
     pub issued_at: Timestamp,
     pub expires_at: Timestamp,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSession {
@@ -1482,6 +1486,8 @@ pub struct AuthSession {
     pub expires_at: Timestamp,
     pub last_connected_at: Option<Timestamp>,
     pub revoked_at: Option<Timestamp>,
+    pub reach: Option<String>,
+    pub off_host: Option<bool>,
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
@@ -1489,9 +1495,9 @@ const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text,
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
-const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at FROM auth_pairing_links";
-const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at FROM auth_sessions";
+const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host FROM auth_pairing_links";
+const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -1828,6 +1834,8 @@ fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
         expires_at: row.get(8)?,
         consumed_at: row.get(9)?,
         revoked_at: row.get(10)?,
+        reach: row.get(11)?,
+        off_host: row.get(12)?,
     })
 }
 fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
@@ -1848,5 +1856,7 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         expires_at: row.get(11)?,
         last_connected_at: row.get(12)?,
         revoked_at: row.get(13)?,
+        reach: row.get(14)?,
+        off_host: row.get(15)?,
     })
 }
