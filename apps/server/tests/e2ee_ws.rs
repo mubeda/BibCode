@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{ServerConfig, ServerHandle, ServerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};
@@ -586,4 +587,59 @@ async fn text_frames_before_handshake_are_rejected() {
         .await
         .expect("send plaintext frame");
     assert_eq!(next_close_code(&mut socket).await, None);
+}
+
+#[tokio::test]
+async fn minted_pairing_offer_pins_the_host_key_and_opens_the_e2ee_channel() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let admin = exchange_plain_token(&Client::new(), &handle, &startup.credential).await;
+    let response = Client::new()
+        .post(http_url(&handle, "/api/auth/pairing-offer"))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "endpoint": "http://127.0.0.1:3773",
+            "name": "Test Host",
+            "reach": "custom",
+        }))
+        .send()
+        .await
+        .expect("pairing offer request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let offer = response.json::<Value>().await.expect("pairing offer JSON");
+    let code = offer["code"].as_str().expect("pairing code");
+    let payload = bibcode_server::auth_pairing_code::decode_pairing_code(code).expect("decodes");
+    assert_eq!(payload.name, "Test Host");
+    assert_eq!(
+        payload.reach,
+        bibcode_server::auth_pairing_code::RemotePairingReach::Custom
+    );
+    let host_key = URL_SAFE_NO_PAD
+        .decode(&payload.host_key)
+        .expect("host key base64url");
+    assert_eq!(host_key, read_host_public_key(temp.path()));
+
+    let (mut socket, mut transport) = noise_connect(handle.local_addr(), &host_key).await;
+    send_encrypted(
+        &mut socket,
+        &mut transport,
+        json!({ "type": "e2ee_auth", "pairing": payload.token })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let authenticated = recv_encrypted_json(&mut socket, &mut transport).await;
+    assert_eq!(authenticated["type"], "e2ee_authenticated");
+    assert!(
+        authenticated["credential"]
+            .as_str()
+            .is_some_and(|credential| !credential.is_empty())
+    );
+    assert_eq!(
+        authenticated["storageInstanceId"].as_str(),
+        Some(payload.storage_instance_id.as_str())
+    );
+    assert_get_config(&mut socket, &mut transport).await;
 }

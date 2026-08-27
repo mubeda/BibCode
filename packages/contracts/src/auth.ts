@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
 
 import { AuthSessionId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { RemotePairingReach } from "./remotePairing.ts";
 
 /**
  * Declares the server's overall authentication posture.
@@ -207,6 +208,16 @@ export const AuthPairingCredentialResult = Schema.Struct({
 });
 export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Type;
 
+export const AuthPairingOfferResult = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  code: TrimmedNonEmptyString,
+  reach: RemotePairingReach,
+  endpoint: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type AuthPairingOfferResult = typeof AuthPairingOfferResult.Type;
+
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,
@@ -345,6 +356,15 @@ export const AuthCreatePairingCredentialInput = Schema.Struct({
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
 });
 export type AuthCreatePairingCredentialInput = typeof AuthCreatePairingCredentialInput.Type;
+
+export const AuthCreatePairingOfferInput = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  endpoint: TrimmedNonEmptyString,
+  reach: RemotePairingReach,
+  label: Schema.optionalKey(TrimmedNonEmptyString),
+  scopes: Schema.optionalKey(AuthEnvironmentScopes),
+});
+export type AuthCreatePairingOfferInput = typeof AuthCreatePairingOfferInput.Type;
 
 export const AuthSessionState = Schema.Struct({
   authenticated: Schema.Boolean,

@@ -10,7 +10,7 @@ use std::{
 
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
 use uuid::Uuid;
 
 use super::{
@@ -18,8 +18,8 @@ use super::{
     dpop::DpopVerifier,
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
-        ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView, Principal,
-        STANDARD_SCOPES,
+        ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView,
+        PairingOfferResult, Principal, STANDARD_SCOPES,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -63,6 +63,7 @@ pub struct AuthService {
     signer: TokenSigner,
     state: Arc<Mutex<AuthState>>,
     issuance: Arc<Mutex<()>>,
+    pairing_offer_issuance: Arc<Mutex<()>>,
     repositories: Option<Repositories>,
     access_events: broadcast::Sender<AuthAccessEvent>,
     access_revision: Arc<AtomicU64>,
@@ -79,6 +80,20 @@ struct DesktopBootstrap {
 struct AuthState {
     sessions: HashMap<String, SessionRecord>,
     pairings: HashMap<String, PairingRecord>,
+    pairing_offer_idempotency: HashMap<String, StoredPairingOffer>,
+}
+
+#[derive(Clone)]
+struct StoredPairingOffer {
+    input_fingerprint: String,
+    result: PairingOfferResult,
+    expires_at_ms: i64,
+}
+
+pub(crate) enum PairingOfferReplay {
+    Original(PairingOfferResult),
+    Conflict,
+    Fresh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,6 +235,7 @@ impl AuthService {
             signer: TokenSigner::new(signing_secret),
             state: Arc::new(Mutex::new(AuthState::default())),
             issuance: Arc::new(Mutex::new(())),
+            pairing_offer_issuance: Arc::new(Mutex::new(())),
             repositories,
             access_events,
             access_revision: Arc::new(AtomicU64::new(1)),
@@ -678,6 +694,47 @@ impl AuthService {
             .collect::<Vec<_>>();
         pairings.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         pairings
+    }
+
+    pub(crate) async fn lock_pairing_offer_issuance(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.pairing_offer_issuance).lock_owned().await
+    }
+
+    pub(crate) async fn replay_pairing_offer(
+        &self,
+        key: &str,
+        input_fingerprint: &str,
+    ) -> PairingOfferReplay {
+        let observed_at = now_ms();
+        let mut state = self.state.lock().await;
+        state
+            .pairing_offer_idempotency
+            .retain(|_, stored| stored.expires_at_ms > observed_at);
+        match state.pairing_offer_idempotency.get(key) {
+            Some(stored) if stored.input_fingerprint == input_fingerprint => {
+                PairingOfferReplay::Original(stored.result.clone())
+            }
+            Some(_) => PairingOfferReplay::Conflict,
+            None => PairingOfferReplay::Fresh,
+        }
+    }
+
+    pub(crate) async fn record_pairing_offer(
+        &self,
+        key: String,
+        input_fingerprint: String,
+        result: PairingOfferResult,
+    ) -> Result<(), AuthError> {
+        let expires_at_ms = parse_timestamp_ms(&result.expires_at)?;
+        self.state.lock().await.pairing_offer_idempotency.insert(
+            key,
+            StoredPairingOffer {
+                input_fingerprint,
+                result,
+                expires_at_ms,
+            },
+        );
+        Ok(())
     }
 
     pub async fn revoke_pairing(&self, id: &str) -> Result<bool, AuthError> {
@@ -1193,7 +1250,7 @@ fn is_scope(scope: &str) -> bool {
     ALL_SCOPES.contains(&scope)
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
     normalized == "localhost"
         || normalized
