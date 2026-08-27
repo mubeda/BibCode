@@ -284,3 +284,27 @@ describe("execution environment contracts", () => {
     }
   });
 });
+
+describe("remote update descriptor surface", () => {
+  it("defaults remoteUpdateControl to false and remoteUpdateSupport to null for older servers", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+    expect(decoded.capabilities.remoteUpdateControl).toBe(false);
+    expect(decoded.remoteUpdateSupport).toBeNull();
+  });
+
+  it("decodes an embedded remote update support block", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true, remoteUpdateControl: true },
+      remoteUpdateSupport: { installMode: "manual", reason: "manual-update-required" },
+    });
+    expect(decoded.capabilities.remoteUpdateControl).toBe(true);
+    expect(decoded.remoteUpdateSupport).toEqual({
+      installMode: "manual",
+      reason: "manual-update-required",
+    });
+  });
+});
