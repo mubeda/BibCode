@@ -1527,6 +1527,18 @@ describe("Remote Servers tabs", () => {
     });
   });
 
+  describe("Check for Server Updates placement", () => {
+    it("is hidden while the Phase 7 capability seam is off", () => {
+      stubBrowserWindow();
+      expect(render(<ConnectTab />)).not.toContain("Check for Server Updates");
+    });
+
+    it("renders in the Saved servers header when the seam is enabled", () => {
+      stubBrowserWindow();
+      expect(render(<ConnectTab showServerUpdateCheck />)).toContain("Check for Server Updates");
+    });
+  });
+
   it("manages pairing links and authorized clients for a remote-reachable browser admin", async () => {
     stubBrowserWindow();
     h.primarySessionState = {
