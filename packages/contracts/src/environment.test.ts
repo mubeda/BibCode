@@ -1,7 +1,11 @@
 import { Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import {
+  ExecutionEnvironmentDescriptor,
+  MIN_COMPATIBLE_REMOTE_PROTOCOL,
+  REMOTE_PROTOCOL_VERSION,
+} from "./environment.ts";
 import { OrchestrationRpcSchemas } from "./orchestration.ts";
 
 const decodeExecutionEnvironmentDescriptor = Schema.decodeUnknownSync(
@@ -41,6 +45,57 @@ const legacyClientDecoders = {
 } as const;
 
 describe("execution environment contracts", () => {
+  it("pins the remote protocol window constants", () => {
+    expect(REMOTE_PROTOCOL_VERSION).toBe(1);
+    expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);
+  });
+
+  it("defaults the protocol window to 0/0 for an old descriptor", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.remoteProtocolVersion).toBe(0);
+    expect(decoded.minCompatibleRemoteProtocol).toBe(0);
+  });
+
+  it("decodes an advertised protocol window", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.remoteProtocolVersion).toBe(1);
+    expect(decoded.minCompatibleRemoteProtocol).toBe(1);
+  });
+
+  it("rejects negative protocol window values", () => {
+    for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
+      expect(() =>
+        decodeExecutionEnvironmentDescriptor({
+          ...descriptor,
+          [field]: -1,
+          capabilities: { repositoryIdentity: true },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("rejects fractional protocol window values", () => {
+    for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
+      expect(() =>
+        decodeExecutionEnvironmentDescriptor({
+          ...descriptor,
+          [field]: 1.5,
+          capabilities: { repositoryIdentity: true },
+        }),
+      ).toThrow();
+    }
+  });
+
   it("defaults passive VCS summary support to false for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({

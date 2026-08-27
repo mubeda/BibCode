@@ -52,6 +52,8 @@ describe("known environment bootstrap helpers", () => {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -81,6 +83,8 @@ describe("known environment bootstrap helpers", () => {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
       storageInstanceId: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,

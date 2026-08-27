@@ -36,6 +36,8 @@ describe("versionSkew", () => {
           },
           serverVersion: "9.9.9",
           storageInstanceId: null,
+          remoteProtocolVersion: 1,
+          minCompatibleRemoteProtocol: 1,
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,

@@ -304,6 +304,8 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
@@ -1394,6 +1396,8 @@ describe("connectionStorageLayer", () => {
           platform: { os: "linux", arch: "x64" },
           serverVersion: "0.0.0-test",
           storageInstanceId,
+          remoteProtocolVersion: 1,
+          minCompatibleRemoteProtocol: 1,
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,

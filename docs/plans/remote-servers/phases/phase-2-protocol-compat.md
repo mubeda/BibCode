@@ -88,7 +88,7 @@
   - `export const MIN_COMPATIBLE_REMOTE_PROTOCOL = 1`
   - `ExecutionEnvironmentDescriptor` gains `remoteProtocolVersion: number` and `minCompatibleRemoteProtocol: number`, both decode-defaulted to `0` (0 = "legacy, pre-window") and **wire-constrained to non-negative integers** (amended spec §4.4) via the existing `NonNegativeInt` from `packages/contracts/src/baseSchemas.ts` (`Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))` — the same constraint `orchestration.ts` uses for `sequence`/`sizeBytes`). A negative or fractional value fails decoding; the Rust mirror side uses `u32`, which cannot produce either.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append inside the `describe("execution environment contracts", ...)` block of `packages/contracts/src/environment.test.ts` (this file's runner import is `vite-plus/test` — keep it), and extend the import from `./environment.ts`:
 
@@ -153,12 +153,12 @@ it("rejects fractional protocol window values", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run (repo root): `vp test run packages/contracts/src/environment.test.ts`
 Expected: FAIL — `REMOTE_PROTOCOL_VERSION` has no exported member / decoded object lacks `remoteProtocolVersion`.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 In `packages/contracts/src/environment.ts`, extend the `./baseSchemas.ts` import with `NonNegativeInt`, add the constants directly above `ExecutionEnvironmentDescriptor`, and add the two fields to the struct (after `storageInstanceId`, before `capabilities`), mirroring the existing decode-default style:
 
@@ -193,12 +193,12 @@ export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescript
 
 (`NonNegativeInt` already exists — `packages/contracts/src/baseSchemas.ts:16`, `export const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));` — and is already consumed by `orchestration.ts`; do not define a second one.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run packages/contracts/src/environment.test.ts`
 Expected: PASS (all pre-existing descriptor tests in the file must also still pass — the fields are additive and decode-defaulted).
 
-- [ ] **Step 5: Fix the typed-fixture ripple**
+- [x] **Step 5: Fix the typed-fixture ripple**
 
 The two new fields are required on the Type side, so every TS literal built _as_ an `ExecutionEnvironmentDescriptor` now fails typecheck. Enumerate:
 
@@ -217,14 +217,14 @@ Fix rule: fixtures modeling a **current** server add `remoteProtocolVersion: 1, 
 
 Untyped JSON payloads that go through `Schema.decodeUnknown*` need **no** change (defaults apply); only typed literals do.
 
-- [ ] **Step 6: Run the full typecheck and the touched packages' tests**
+- [x] **Step 6: Run the full typecheck and the touched packages' tests**
 
 Run: `vp run typecheck`
 Expected: PASS with zero errors.
 Run: `vp run --filter @bibcode/contracts test && vp run --filter @bibcode/client-runtime test`
 Expected: PASS (each package's `test` script is `vp test run`).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add packages/contracts/src/environment.ts packages/contracts/src/environment.test.ts
