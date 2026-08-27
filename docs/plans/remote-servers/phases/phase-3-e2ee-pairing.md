@@ -177,7 +177,7 @@ The server owns a static X25519 keypair, `host_identity`, generated on first use
 - Consumes: `SecretStore` (`apps/server/src/auth/secret_store.rs`) — `get`, `create` (create-new semantics with `is_already_exists()` race classification, exactly as `get_or_create_random` uses them).
 - Produces: `pub(crate) const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_SHA256";`, `pub struct HostIdentity` with `load_or_generate(&SecretStore) -> Result<Self, HostIdentityError>`, `generate_ephemeral() -> Self`, `public_key_base64url(&self) -> String`, `private_key_bytes(&self) -> &[u8; 32]`, `public_key_bytes(&self) -> &[u8; 32]`; `AuthService::host_identity(&self) -> &HostIdentity`. Tasks 5 and 8 consume these.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `apps/server/src/auth/host_identity.rs` (module skeleton with `#[cfg(test)] mod tests` at the bottom; the non-test code comes in Step 3):
 
@@ -248,12 +248,12 @@ mod tests {
 
 Add to `apps/server/src/auth/mod.rs`: `mod host_identity;` and `pub(crate) use host_identity::{HostIdentity, HostIdentityError, HOST_IDENTITY_SECRET_NAME, NOISE_NK_PARAMS};` (match the file's existing `pub(crate) use` style).
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p bibcode-server host_identity`
 Expected: compile error (types not defined) — that counts as the red state; proceed.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -378,12 +378,12 @@ pub fn host_identity(&self) -> &HostIdentity {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-server host_identity && cargo test -p bibcode-server auth`
 Expected: PASS (including all existing auth tests — the field addition must not disturb them).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth/host_identity.rs apps/server/src/auth/mod.rs apps/server/src/auth/service.rs
