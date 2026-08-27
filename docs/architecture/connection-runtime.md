@@ -286,6 +286,19 @@ publishing the new health status. Environment and project grouping in React is
 presentation only; it does not merge the scoped catalog sources or grant the
 browser authority over paths.
 
+**Environment rail selection.** The web client's left panel carries an
+environment rail (`apps/web/src/components/sidebar/EnvironmentRail.tsx`):
+Local (the primary environment plus host-managed `local:` desktop backends,
+grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
+per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
+scopes _presentation only_: the panel filters which environments' projects and
+threads it shows, and **Add project** targets the selected environment.
+Selection never changes supervisor desired state—connections to other
+environments stay live and streaming—and operations on an entity always route
+to the entity's own `environmentId` regardless of selection. When a remote
+environment is selected, a context card under the brand row shows its
+connection status, server version, and compatibility verdict.
+
 One client-runtime presentation selector governs workspace-action availability.
 A cold/no-status row, `present`, and retained `verification-unavailable` remain
 usable because none proves absence. Only authoritative `missing-registered`,

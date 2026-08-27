@@ -60,8 +60,9 @@ Select focused tests from affected source and verify at least:
   state;
 - independent runtimes cannot terminate each other's process roots;
 - local Windows and WSL presentation follows current environment capability;
-- remote device, SSH, Tailscale, relay, and connection actions do not mount in
-  ordinary desktop presentation; and
+- saved remote environments appear in the environment rail without exposing
+  privileged SSH, Tailscale, relay, or connection-lifecycle controls outside
+  their owning settings and desktop-bridge boundaries; and
 - update protection treats long-lived read subscriptions as reads, reports
   staged progress and active mutation counts while preparing, rejects a forged
   first-attempt bypass, and offers the acknowledged no-backup path only after a
@@ -214,8 +215,9 @@ wsl.exe --list --verbose
 When WSL and a supported distribution are usable:
 
 - Settings shows **Local environment** and WSL status/setup controls;
-- Add Project offers **This device** plus only WSL locations with a matching
-  usable bootstrap;
+- Add Project targets the selected environment; Local offers **This device**
+  plus only WSL locations with a matching usable bootstrap, while saved remote
+  rail selections remain valid remote hosts;
 - native and WSL paths do not collapse into one project identity;
 - a disposable WSL project can launch its supported session and terminal;
 - restart retains the correct environment identity; and
@@ -312,13 +314,16 @@ the E2E build in the current worktree, not an installed production copy.
 Use Codex Computer Use to operate the packaged executable. Capture normal,
 minimum-size, and relevant Windows DPI states. Verify:
 
-- Add Project shows **This device** and usable WSL locations only;
+- the environment rail groups **This device** and usable WSL locations under
+  Local, shows saved remote servers separately, and Add Project targets the
+  current rail selection;
 - **Local environment** is visible at `/settings/local-environment` and never
   empty;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present.
-  Add Project still has no remote Host selector beyond this-device WSL choices;
+  remote targeting is driven by the environment rail rather than mixing saved
+  servers into the Local WSL picker;
 - in **Settings → Remote Servers → Share this host**, generate an **Another
   device** offer. Confirm the local server restarts before the pairing offer is
   shown, and that the result contains the browser URL, `bibcode://` deep link,
