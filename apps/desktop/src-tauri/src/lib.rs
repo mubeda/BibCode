@@ -254,6 +254,7 @@ mod bridge;
 mod config;
 mod context_menu;
 mod data_safety;
+mod firewall;
 mod preview;
 mod security;
 mod shell_environment;
