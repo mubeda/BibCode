@@ -5,7 +5,7 @@ change the "Execution order" section to name only that phase.
 
 ---
 
-````text
+```text
 Implement the BiBCode "Remote Servers" feature by executing the approved plan set in
 docs/plans/remote-servers/. Work in /work/workspaces/orca/BibCode/develop (a git worktree —
 stay inside it; never cd to the original repo root).
@@ -115,4 +115,4 @@ than trusting the plan's snippets. Phase 4 splits a ~3,200-line settings file; k
 task mechanical and reviewable.
 
 Begin with Phase 1.
-````
+```

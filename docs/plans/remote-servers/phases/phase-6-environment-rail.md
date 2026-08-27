@@ -11,7 +11,7 @@ environment, and fix the primary-environment editor-list leak in sidebar rows.
 **Architecture:** Pure view-model modules (`*.logic.ts`) drive two new presentational
 components (`EnvironmentRail`, `EnvironmentContextCard`) mounted around the existing
 `Sidebar.tsx` mega-component. Selection is presentation-only: the rail writes the existing
-`activeEnvironmentIdAtom` and the panel filters what it *shows*; RPC routing continues to
+`activeEnvironmentIdAtom` and the panel filters what it _shows_; RPC routing continues to
 follow each entity's own `environmentId` (spec D3/D4). No new cross-phase types are
 introduced (master plan, "Cross-phase interfaces").
 
@@ -88,7 +88,7 @@ and 4; Phase 7 depends on this phase).
     `readActiveEnvironmentId` — `apps/web/src/state/entities.ts` (~line 59).
   - `useEnvironments`/`useEnvironment`/`usePrimaryEnvironmentId` —
     `apps/web/src/state/environments.ts`; presentation shape `{ entry, connection, serverConfig,
-    environmentId, label, displayUrl, relayManaged }` with
+environmentId, label, displayUrl, relayManaged }` with
     `connection.phase: "available" | "offline" | "connecting" | "reconnecting" | "connected" | "error"`
     (`packages/client-runtime/src/connection/presentation.ts`).
   - `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` (`"local:"`) and `isDesktopLocalConnectionTarget`
@@ -136,7 +136,7 @@ and 4; Phase 7 depends on this phase).
 3. **"Local" = the primary environment plus every desktop-local (`local:`-prefixed)
    backend** (D6: WSL is "this machine"). Selecting Local shows the union of local
    environments' projects/threads (preserving today's merged local view); the sub-picker
-   (shown only when desktop-local backends exist) sets which local environment is *active*
+   (shown only when desktop-local backends exist) sets which local environment is _active_
    (add-project default target). The rail highlights Local whenever the active environment
    is any local one. **A null/absent `activeEnvironmentId` means Local is selected AND the
    panel filters to Local** (amended §4.8) — "no selection" must never render as "show
@@ -151,7 +151,7 @@ and 4; Phase 7 depends on this phase).
    pin that selection does not rewire the editor-list/context-menu paths.
 5. **"Check for updates" is hidden-until-capable.** The menu item renders only when the
    server advertises the `remoteUpdateControl` capability (spec §4.5, default-false,
-   delivered by Phase 7) *and* Phase 7 has injected `onCheckForUpdates`. A disabled-but-visible
+   delivered by Phase 7) _and_ Phase 7 has injected `onCheckForUpdates`. A disabled-but-visible
    item would advertise an action no shipped server supports yet; hidden-until-capable also
    matches the repo's capability-downgrade convention (default-false booleans gate whole
    surfaces).
@@ -174,19 +174,19 @@ and 4; Phase 7 depends on this phase).
 
 ## File structure
 
-| File | Status | Responsibility |
-|---|---|---|
-| `apps/web/src/connection/environmentCompat.ts` (+`.test.ts`) | new | Adapter over Phase 2's verdict fn; `remoteUpdateControl` capability selector |
-| `apps/web/src/components/sidebar/environmentRail.logic.ts` (+`.test.ts`) | new | Pure rail view-model: status, avatar, model builder, visible-environment scoping, add-project label |
-| `apps/web/src/components/sidebar/EnvironmentRail.tsx` (+`.test.tsx`) | new | 52px rail component (§4.8), radiogroup semantics, WSL sub-picker, bottom actions, stale-selection reset |
-| `apps/web/src/components/sidebar/environmentContextCard.logic.ts` (+`.test.ts`) | new | Card view-model: visibility rule, status/version line, compat badge |
-| `apps/web/src/components/sidebar/EnvironmentContextCard.tsx` (+`.test.tsx`) | new | Context card (§4.8): name/status/version/badges + ⋯ menu |
-| `apps/web/src/components/AppSidebarLayout.tsx` | modify | Mount rail inside `<Sidebar>`; min-width bump |
-| `apps/web/src/components/Sidebar.tsx` | modify | Panel scoping by selection; card mount under brand row; editor-list leak fix; add-project label plumb |
-| `apps/web/src/components/CommandPalette.tsx` | modify | "Add project" action title gains "on \<name\>" |
-| `apps/web/src/components/add-project/useAddProjectWorkflow.ts` | modify | Default host = active environment; remote environments become hosts |
-| `apps/web/src/routes/settings.remote-servers.tsx` | modify | Accept `?action=add-server` deep link (coordinate with Phase 4) |
-| `docs/architecture/connection-runtime.md`, `docs/testing/cross-platform-validation.md` | modify | Living docs + packaged-visual-validation runbook |
+| File                                                                                   | Status | Responsibility                                                                                          |
+| -------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------- |
+| `apps/web/src/connection/environmentCompat.ts` (+`.test.ts`)                           | new    | Adapter over Phase 2's verdict fn; `remoteUpdateControl` capability selector                            |
+| `apps/web/src/components/sidebar/environmentRail.logic.ts` (+`.test.ts`)               | new    | Pure rail view-model: status, avatar, model builder, visible-environment scoping, add-project label     |
+| `apps/web/src/components/sidebar/EnvironmentRail.tsx` (+`.test.tsx`)                   | new    | 52px rail component (§4.8), radiogroup semantics, WSL sub-picker, bottom actions, stale-selection reset |
+| `apps/web/src/components/sidebar/environmentContextCard.logic.ts` (+`.test.ts`)        | new    | Card view-model: visibility rule, status/version line, compat badge                                     |
+| `apps/web/src/components/sidebar/EnvironmentContextCard.tsx` (+`.test.tsx`)            | new    | Context card (§4.8): name/status/version/badges + ⋯ menu                                                |
+| `apps/web/src/components/AppSidebarLayout.tsx`                                         | modify | Mount rail inside `<Sidebar>`; min-width bump                                                           |
+| `apps/web/src/components/Sidebar.tsx`                                                  | modify | Panel scoping by selection; card mount under brand row; editor-list leak fix; add-project label plumb   |
+| `apps/web/src/components/CommandPalette.tsx`                                           | modify | "Add project" action title gains "on \<name\>"                                                          |
+| `apps/web/src/components/add-project/useAddProjectWorkflow.ts`                         | modify | Default host = active environment; remote environments become hosts                                     |
+| `apps/web/src/routes/settings.remote-servers.tsx`                                      | modify | Accept `?action=add-server` deep link (coordinate with Phase 4)                                         |
+| `docs/architecture/connection-runtime.md`, `docs/testing/cross-platform-validation.md` | modify | Living docs + packaged-visual-validation runbook                                                        |
 
 Naming note: `apps/web/src/components/ui/sidebar.tsx` already exports a `SidebarRail`
 (the resize/collapse handle). The new component is `EnvironmentRail` — do not rename or
@@ -197,17 +197,19 @@ reuse `SidebarRail`.
 ### Task 1: Compat adapter and update-capability selector
 
 **Files:**
+
 - Create: `apps/web/src/connection/environmentCompat.ts`
 - Test: `apps/web/src/connection/environmentCompat.test.ts`
 
 **Interfaces:**
+
 - Consumes: Phase 2's `computeCompatVerdict(descriptor)` + `CompatVerdict` from
   `@bibcode/client-runtime/connection` (see Phase interfaces; a Phase 2 rename lands here
   and only here).
 - Produces:
   - `resolveEnvironmentCompatVerdict(serverConfig: ServerConfig | null): CompatVerdict | null`
   - `selectRemoteUpdateControlCapability(serverConfig: ServerConfig | null): boolean`
-  Both consumed by Tasks 2, 3, and 6.
+    Both consumed by Tasks 2, 3, and 6.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -250,9 +252,7 @@ describe("resolveEnvironmentCompatVerdict", () => {
 describe("selectRemoteUpdateControlCapability", () => {
   it("defaults to hidden for null config and for servers without the capability", () => {
     expect(selectRemoteUpdateControlCapability(null)).toBe(false);
-    expect(
-      selectRemoteUpdateControlCapability(serverConfigWith({ capabilities: {} })),
-    ).toBe(false);
+    expect(selectRemoteUpdateControlCapability(serverConfigWith({ capabilities: {} }))).toBe(false);
   });
 
   it("is true only for an explicit capability boolean", () => {
@@ -305,9 +305,7 @@ export function resolveEnvironmentCompatVerdict(
  * contract change. Phase 7 replaces the cast with the typed field — this
  * function is the only place that reads it.
  */
-export function selectRemoteUpdateControlCapability(
-  serverConfig: ServerConfig | null,
-): boolean {
+export function selectRemoteUpdateControlCapability(serverConfig: ServerConfig | null): boolean {
   if (serverConfig === null) {
     return false;
   }
@@ -339,10 +337,12 @@ git commit -m "feat(web): add environment compat + update-capability selectors"
 ### Task 2: Environment-rail view-model (pure logic)
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/environmentRail.logic.ts`
 - Test: `apps/web/src/components/sidebar/environmentRail.logic.test.ts`
 
 **Interfaces:**
+
 - Consumes: `isDesktopLocalConnectionTarget` (`apps/web/src/connection/desktopLocal.ts`),
   `compareSidebarDisplayText` (`apps/web/src/sidebarProjectGrouping.ts`), `CompatVerdict`
   type, `EnvironmentConnectionPhase` type.
@@ -454,9 +454,9 @@ describe("resolveEnvironmentRailStatus", () => {
     expect(status({ phase: "error" })).toBe("error");
     expect(status({ compat: { kind: "legacy" } })).toBe("attention");
     expect(status({ updateAvailable: true })).toBe("attention");
-    expect(
-      status({ compat: { kind: "server-too-old", serverVersion: 0, minSupported: 1 } }),
-    ).toBe("error");
+    expect(status({ compat: { kind: "server-too-old", serverVersion: 0, minSupported: 1 } })).toBe(
+      "error",
+    );
     expect(
       status({ compat: { kind: "client-too-old", serverMinCompatible: 2, clientVersion: 1 } }),
     ).toBe("error");
@@ -721,8 +721,7 @@ export function buildEnvironmentRailModel(input: {
 
   return {
     localSelected,
-    localStatus:
-      primary === null ? "disconnected" : resolveEnvironmentRailStatus(primary),
+    localStatus: primary === null ? "disconnected" : resolveEnvironmentRailStatus(primary),
     localSubEntries:
       desktopLocals.length === 0
         ? []
@@ -810,10 +809,12 @@ git commit -m "feat(web): environment rail view-model"
 ### Task 3: `EnvironmentRail` component
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/EnvironmentRail.tsx`
 - Test: `apps/web/src/components/sidebar/EnvironmentRail.test.tsx`
 
 **Interfaces:**
+
 - Consumes: Task 1 (`resolveEnvironmentCompatVerdict`), Task 2 (model builders),
   `useEnvironments` (`apps/web/src/state/environments.ts`),
   `useActiveEnvironmentId`/`setActiveEnvironmentId` (`apps/web/src/state/entities.ts`),
@@ -968,8 +969,16 @@ describe("EnvironmentRail", () => {
   it("renders Local plus sorted remote entries with radio semantics", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
-      environment({ environmentId: ENV_REMOTE, label: "AI-SERVER", target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
+      environment({
+        environmentId: ENV_REMOTE,
+        label: "AI-SERVER",
+        target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" },
+      }),
     ];
     h.activeEnvironmentId = ENV_PRIMARY;
     const markup = renderRail();
@@ -987,7 +996,11 @@ describe("EnvironmentRail", () => {
   it("still renders with zero saved remotes (discoverability surface)", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
     ];
     h.activeEnvironmentId = ENV_PRIMARY;
     const markup = renderRail();
@@ -1001,8 +1014,16 @@ describe("EnvironmentRail", () => {
   it("selection writes the active-environment atom and nothing else (D3)", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
-      environment({ environmentId: ENV_REMOTE, label: "AI-SERVER", target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
+      environment({
+        environmentId: ENV_REMOTE,
+        label: "AI-SERVER",
+        target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" },
+      }),
     ];
     h.activeEnvironmentId = ENV_PRIMARY;
     renderRail();
@@ -1017,8 +1038,16 @@ describe("EnvironmentRail", () => {
   it("groups WSL backends under a Local sub-picker keyed by the local: prefix (D6)", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
-      environment({ environmentId: ENV_WSL, label: "Ubuntu", target: { _tag: "BearerConnectionTarget", connectionId: "local:wsl-ubuntu" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
+      environment({
+        environmentId: ENV_WSL,
+        label: "Ubuntu",
+        target: { _tag: "BearerConnectionTarget", connectionId: "local:wsl-ubuntu" },
+      }),
     ];
     h.activeEnvironmentId = ENV_PRIMARY;
     renderRail();
@@ -1030,7 +1059,11 @@ describe("EnvironmentRail", () => {
   it("deep-links the bottom actions to the Remote Servers settings section", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
     ];
     renderRail();
     (buttonByTestId("environment-rail-add-server")?.onClick as () => void)();
@@ -1046,7 +1079,11 @@ describe("EnvironmentRail", () => {
   it("resets a stale selection back to Local once the catalog is ready", () => {
     h.reset();
     h.environments = [
-      environment({ environmentId: ENV_PRIMARY, label: "Local", target: { _tag: "PrimaryConnectionTarget" } }),
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
     ];
     h.activeEnvironmentId = ENV_REMOTE; // removed environment
     renderRail();
@@ -1297,11 +1334,7 @@ export function EnvironmentRail() {
           />
         ) : null}
         {model.remotes.map((entry) => (
-          <RemoteEntryButton
-            key={entry.environmentId}
-            entry={entry}
-            onSelect={selectEnvironment}
-          />
+          <RemoteEntryButton key={entry.environmentId} entry={entry} onSelect={selectEnvironment} />
         ))}
       </div>
       <div className="flex-1" />
@@ -1370,11 +1403,13 @@ git commit -m "feat(web): environment rail component"
 ### Task 4: Mount the rail in `AppSidebarLayout`
 
 **Files:**
+
 - Modify: `apps/web/src/components/AppSidebarLayout.tsx` (whole file is 97 lines; the layout
   return is at the bottom)
 - Test: `apps/web/src/components/AppSidebarLayout.test.tsx` (extend)
 
 **Interfaces:**
+
 - Consumes: `EnvironmentRail` (Task 3).
 - Produces: the rail is visible in every left-panel state (desktop fixed sidebar, mobile
   sheet); `THREAD_SIDEBAR_MIN_WIDTH` accounts for the rail column.
@@ -1437,25 +1472,25 @@ const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
    `<SidebarRail />`) with:
 
 ```tsx
-      <Sidebar
-        side="left"
-        collapsible="offcanvas"
-        className="border-r border-border bg-card text-foreground"
-        resizable={{
-          minWidth: THREAD_SIDEBAR_MIN_WIDTH,
-          shouldAcceptWidth: ({ nextWidth, wrapper }) =>
-            wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,
-          storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
-        }}
-      >
-        <div className="flex h-full min-h-0 flex-row">
-          <EnvironmentRail />
-          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-            <ThreadSidebar />
-          </div>
-        </div>
-        <SidebarRail />
-      </Sidebar>
+<Sidebar
+  side="left"
+  collapsible="offcanvas"
+  className="border-r border-border bg-card text-foreground"
+  resizable={{
+    minWidth: THREAD_SIDEBAR_MIN_WIDTH,
+    shouldAcceptWidth: ({ nextWidth, wrapper }) =>
+      wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,
+    storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
+  }}
+>
+  <div className="flex h-full min-h-0 flex-row">
+    <EnvironmentRail />
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+      <ThreadSidebar />
+    </div>
+  </div>
+  <SidebarRail />
+</Sidebar>
 ```
 
 (`SidebarRail` here is the pre-existing resize handle from `./ui/sidebar` — unchanged.)
@@ -1477,12 +1512,14 @@ git commit -m "feat(web): mount environment rail in the left panel"
 ### Task 5: Panel scoping by rail selection (D3/D4 pins)
 
 **Files:**
+
 - Modify: `apps/web/src/components/Sidebar.tsx` — main `Sidebar()` component (declared
   `export default function Sidebar()` at ~line 3961; data sources `useProjects()` /
   `useThreadShells()` at ~lines 3962–3966)
 - Test: `apps/web/src/components/Sidebar.test.tsx` (extend harness + cases)
 
 **Interfaces:**
+
 - Consumes: `selectRailVisibleEnvironmentIds` (Task 2), `useActiveEnvironmentId` (existing),
   `isDesktopLocalConnectionTarget` (already imported in `Sidebar.tsx`).
 - Produces: the panel presents only the selected environment's projects/threads (Local =
@@ -1615,56 +1652,58 @@ import { selectRailVisibleEnvironmentIds } from "./sidebar/environmentRail.logic
 2. Replace the two data-source lines at the top of `Sidebar()`:
 
 ```ts
-  const projects = useProjects();
+const projects = useProjects();
 ```
+
 and
+
 ```ts
-  const sidebarThreads = useThreadShells();
+const sidebarThreads = useThreadShells();
 ```
 
 with:
 
 ```ts
-  const allProjects = useProjects();
-  const { environments } = useEnvironments();
-  const activeEnvironmentId = useActiveEnvironmentId();
-  // D3: rail selection scopes presentation only. Filtering happens here at the
-  // panel's data edge; connections, supervisors, and per-entity RPC routing
-  // (D4) are untouched by selection.
-  const visibleEnvironmentIds = useMemo(
-    () =>
-      selectRailVisibleEnvironmentIds({
-        activeEnvironmentId,
-        candidates: environments.map((environment) => ({
-          environmentId: environment.environmentId,
-          isLocal:
-            environment.entry.target._tag === "PrimaryConnectionTarget" ||
-            isDesktopLocalConnectionTarget(environment.entry.target),
-        })),
-      }),
-    [activeEnvironmentId, environments],
-  );
-  const projects = useMemo(
-    () =>
-      visibleEnvironmentIds === null
-        ? allProjects
-        : allProjects.filter((project) => visibleEnvironmentIds.has(project.environmentId)),
-    [allProjects, visibleEnvironmentIds],
-  );
+const allProjects = useProjects();
+const { environments } = useEnvironments();
+const activeEnvironmentId = useActiveEnvironmentId();
+// D3: rail selection scopes presentation only. Filtering happens here at the
+// panel's data edge; connections, supervisors, and per-entity RPC routing
+// (D4) are untouched by selection.
+const visibleEnvironmentIds = useMemo(
+  () =>
+    selectRailVisibleEnvironmentIds({
+      activeEnvironmentId,
+      candidates: environments.map((environment) => ({
+        environmentId: environment.environmentId,
+        isLocal:
+          environment.entry.target._tag === "PrimaryConnectionTarget" ||
+          isDesktopLocalConnectionTarget(environment.entry.target),
+      })),
+    }),
+  [activeEnvironmentId, environments],
+);
+const projects = useMemo(
+  () =>
+    visibleEnvironmentIds === null
+      ? allProjects
+      : allProjects.filter((project) => visibleEnvironmentIds.has(project.environmentId)),
+  [allProjects, visibleEnvironmentIds],
+);
 ```
 
 (The component already calls `const { environments } = useEnvironments();` — keep the single
 existing call and place the new memos after it instead of adding a duplicate.)
 
 ```ts
-  const allSidebarThreads = useThreadShells();
-  const sidebarThreads = useMemo(
-    () =>
-      visibleEnvironmentIds === null
-        ? allSidebarThreads
-        : allSidebarThreads.filter((thread) => visibleEnvironmentIds.has(thread.environmentId)),
-    [allSidebarThreads, visibleEnvironmentIds],
-  );
+const allSidebarThreads = useThreadShells();
+const sidebarThreads = useMemo(
+  () =>
+    visibleEnvironmentIds === null
+      ? allSidebarThreads
+      : allSidebarThreads.filter((thread) => visibleEnvironmentIds.has(thread.environmentId)),
+  [allSidebarThreads, visibleEnvironmentIds],
+);
 ```
 
 Everything downstream keeps its current names (`projects`, `sidebarThreads`), so grouping,
@@ -1687,6 +1726,7 @@ git commit -m "feat(web): scope the projects panel to the selected environment"
 ### Task 6: `EnvironmentContextCard`
 
 **Files:**
+
 - Create: `apps/web/src/components/sidebar/environmentContextCard.logic.ts`
 - Create: `apps/web/src/components/sidebar/EnvironmentContextCard.tsx`
 - Test: `apps/web/src/components/sidebar/environmentContextCard.logic.test.ts`
@@ -1695,6 +1735,7 @@ git commit -m "feat(web): scope the projects panel to the selected environment"
 - Modify: `apps/web/src/components/Sidebar.test.tsx` (capture-mock for the card)
 
 **Interfaces:**
+
 - Consumes: Tasks 1–2; `connectionStatusText` (`@bibcode/client-runtime/connection`);
   `useEnvironment`/`useActiveEnvironmentId`; **Phase 4's** `environmentCatalog.disconnect`
   command atom (see Phase interfaces — if absent, stop and report).
@@ -1730,7 +1771,9 @@ function view(overrides: Partial<Parameters<typeof buildEnvironmentContextCardVi
     label: "AI-SERVER",
     target: remoteTarget,
     connection: { phase: "connected", error: null, traceId: null },
-    serverConfig: { environment: { serverVersion: "0.4.2", capabilities: {} } } as unknown as ServerConfig,
+    serverConfig: {
+      environment: { serverVersion: "0.4.2", capabilities: {} },
+    } as unknown as ServerConfig,
     ...overrides,
   });
 }
@@ -2025,7 +2068,7 @@ describe("EnvironmentContextCard", () => {
 ```
 
 Note on "Check for updates": `selectRemoteUpdateControlCapability` is mocked truthy here, so
-these cases pin that the *handler prop* is the second gate — without Phase 7's
+these cases pin that the _handler prop_ is the second gate — without Phase 7's
 `onCheckForUpdates` the item never renders even on a capable server.
 
 - [ ] **Step 6: Run it to verify it fails**
@@ -2209,12 +2252,12 @@ vi.mock("./sidebar/EnvironmentContextCard", () => ({
 and one assertion inside the Task 5 describe block:
 
 ```tsx
-  it("mounts the environment context card under the brand row", () => {
-    seedTwoEnvironments();
-    h.state.activeEnvironmentId = ENV_REMOTE;
-    const markup = renderSidebar();
-    expect(markup).toContain("environment-context-card-mock");
-  });
+it("mounts the environment context card under the brand row", () => {
+  seedTwoEnvironments();
+  h.state.activeEnvironmentId = ENV_REMOTE;
+  const markup = renderSidebar();
+  expect(markup).toContain("environment-context-card-mock");
+});
 ```
 
 - [ ] **Step 10: Run both suites to verify they pass**
@@ -2234,14 +2277,15 @@ git commit -m "feat(web): environment context card under the brand row"
 ### Task 7: Fix the primary-environment editor-list leak (D4)
 
 **Files:**
+
 - Modify: `apps/web/src/components/Sidebar.tsx` — `SidebarProjectItem` component:
   the `availableEditors` declaration at ~line 1538 (with a three-line TODO comment above
   it), its uses at ~line 2653 (`handleThreadContextMenu`) and ~line 2885
-  (`handlePrimaryRowContextMenu`), and both `useCallback` dependency arrays (~lines 2848,
-  2988)
+  (`handlePrimaryRowContextMenu`), and both `useCallback` dependency arrays (~lines 2848, 2988)
 - Test: `apps/web/src/components/Sidebar.test.tsx` (extend)
 
 **Interfaces:**
+
 - Consumes: `serverConfigs` (already `const serverConfigs = useServerConfigs()` at
   ~line 1502 in the same component; `Map<EnvironmentId, ServerConfig>` from
   `environmentServerConfigsAtom` in `apps/web/src/state/server.ts`).
@@ -2325,19 +2369,19 @@ In `apps/web/src/components/Sidebar.tsx`, `SidebarProjectItem`:
    the declaration
 
 ```ts
-  const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
+const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
 ```
 
 with a per-environment resolver (D4: rows resolve against their own backend):
 
 ```ts
-  // Editor lists are per-environment: a grouped row belonging to a remote
-  // environment resolves "Open in" against its own backend's editors (D4).
-  const availableEditorsFor = useCallback(
-    (environmentId: EnvironmentId): ReadonlyArray<EditorId> =>
-      serverConfigs.get(environmentId)?.availableEditors ?? EMPTY_EDITOR_IDS,
-    [serverConfigs],
-  );
+// Editor lists are per-environment: a grouped row belonging to a remote
+// environment resolves "Open in" against its own backend's editors (D4).
+const availableEditorsFor = useCallback(
+  (environmentId: EnvironmentId): ReadonlyArray<EditorId> =>
+    serverConfigs.get(environmentId)?.availableEditors ?? EMPTY_EDITOR_IDS,
+  [serverConfigs],
+);
 ```
 
 Add near the file's other module-level constants:
@@ -2353,9 +2397,9 @@ and add `EditorId` to the existing type imports from `@bibcode/contracts` (top o
    block above it stays as-is):
 
 ```ts
-      const openInEditorOptions = EDITORS.filter((editor) =>
-        availableEditorsFor(thread.environmentId).includes(editor.id),
-      );
+const openInEditorOptions = EDITORS.filter((editor) =>
+  availableEditorsFor(thread.environmentId).includes(editor.id),
+);
 ```
 
 and in its dependency array (~line 2848) replace the `availableEditors,` entry with
@@ -2364,9 +2408,9 @@ and in its dependency array (~line 2848) replace the `availableEditors,` entry w
 3. In `handlePrimaryRowContextMenu` (~line 2885):
 
 ```ts
-        const openInEditorOptions = EDITORS.filter((editor) =>
-          availableEditorsFor(project.environmentId).includes(editor.id),
-        );
+const openInEditorOptions = EDITORS.filter((editor) =>
+  availableEditorsFor(project.environmentId).includes(editor.id),
+);
 ```
 
 and in its dependency array (~line 2988) replace `availableEditors,` with
@@ -2393,6 +2437,7 @@ git commit -m "fix(web): resolve sidebar editor lists per row environment"
 ### Task 8: "Add project on \<name\>" and active-environment default host
 
 **Files:**
+
 - Modify: `apps/web/src/components/Sidebar.tsx` (add-project trigger, ~lines 3854–3869 in
   `SidebarProjectsContent`; plumb one new prop from `Sidebar()`)
 - Modify: `apps/web/src/components/CommandPalette.tsx` ("Add project" action item,
@@ -2403,6 +2448,7 @@ git commit -m "fix(web): resolve sidebar editor lists per row environment"
 - Test: `apps/web/src/components/Sidebar.test.tsx` (extend)
 
 **Interfaces:**
+
 - Consumes: `resolveAddProjectTargetLabel` (Task 2), `useActiveEnvironmentId`,
   `isDesktopLocalConnectionTarget`.
 - Produces: `AddProjectWorkflowStateInput.initialEnvironmentId: EnvironmentId | null` (new
@@ -2488,11 +2534,11 @@ function initialWorkflowHost(input: AddProjectWorkflowStateInput): AddProjectHos
      `presentedEnvironments` filter inside the `hosts` memo:
 
 ```ts
-    const presentedEnvironments = environments.filter(
-      (environment) =>
-        presentation.presentsTarget(environment.entry.target) ||
-        isRemoteEnvironmentTarget(environment.entry.target),
-    );
+const presentedEnvironments = environments.filter(
+  (environment) =>
+    presentation.presentsTarget(environment.entry.target) ||
+    isRemoteEnvironmentTarget(environment.entry.target),
+);
 ```
 
 with a local helper above the hook:
@@ -2511,26 +2557,26 @@ function isRemoteEnvironmentTarget(target: ConnectionTarget): boolean {
 }
 ```
 
-   - extend the `usableHosts` filter in the same memo so remote hosts survive on desktop:
+- extend the `usableHosts` filter in the same memo so remote hosts survive on desktop:
 
 ```ts
-    const usableHosts = catalogHosts.filter(
-      (host) =>
-        presentation.surface === "browser" ||
-        host.isPrimary ||
-        host.desktopInstanceId !== null ||
-        remoteEnvironmentIds.has(host.environmentId),
-    );
+const usableHosts = catalogHosts.filter(
+  (host) =>
+    presentation.surface === "browser" ||
+    host.isPrimary ||
+    host.desktopInstanceId !== null ||
+    remoteEnvironmentIds.has(host.environmentId),
+);
 ```
 
 where `remoteEnvironmentIds` is computed once at the top of the memo:
 
 ```ts
-    const remoteEnvironmentIds = new Set(
-      environments
-        .filter((environment) => isRemoteEnvironmentTarget(environment.entry.target))
-        .map((environment) => environment.environmentId),
-    );
+const remoteEnvironmentIds = new Set(
+  environments
+    .filter((environment) => isRemoteEnvironmentTarget(environment.entry.target))
+    .map((environment) => environment.environmentId),
+);
 ```
 
 - [ ] **Step 4: Run to verify the workflow tests pass**
@@ -2544,16 +2590,16 @@ Expected: PASS (update any existing case that constructs the input object to inc
 Test (add to the Task 5 describe in `apps/web/src/components/Sidebar.test.tsx`):
 
 ```tsx
-  it('labels the add-project trigger "Add project on <name>" for a remote selection', () => {
-    seedTwoEnvironments();
-    h.state.activeEnvironmentId = ENV_REMOTE;
-    const markup = renderSidebar();
-    expect(markup).toContain("Add project on AI-SERVER");
+it('labels the add-project trigger "Add project on <name>" for a remote selection', () => {
+  seedTwoEnvironments();
+  h.state.activeEnvironmentId = ENV_REMOTE;
+  const markup = renderSidebar();
+  expect(markup).toContain("Add project on AI-SERVER");
 
-    h.state.activeEnvironmentId = ENV_MAIN;
-    const localMarkup = renderSidebar();
-    expect(localMarkup).not.toContain("Add project on");
-  });
+  h.state.activeEnvironmentId = ENV_MAIN;
+  const localMarkup = renderSidebar();
+  expect(localMarkup).not.toContain("Add project on");
+});
 ```
 
 Run `vp test run --project unit apps/web/src/components/Sidebar.test.tsx` — expected FAIL.
@@ -2563,19 +2609,19 @@ Implementation:
 1. `apps/web/src/components/Sidebar.tsx`, main `Sidebar()` (after the Task 5 memos):
 
 ```ts
-  const addProjectLabel = useMemo(() => {
-    const remoteLabel = resolveAddProjectTargetLabel({
-      activeEnvironmentId,
-      candidates: environments.map((environment) => ({
-        environmentId: environment.environmentId,
-        label: environment.label,
-        isLocal:
-          environment.entry.target._tag === "PrimaryConnectionTarget" ||
-          isDesktopLocalConnectionTarget(environment.entry.target),
-      })),
-    });
-    return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
-  }, [activeEnvironmentId, environments]);
+const addProjectLabel = useMemo(() => {
+  const remoteLabel = resolveAddProjectTargetLabel({
+    activeEnvironmentId,
+    candidates: environments.map((environment) => ({
+      environmentId: environment.environmentId,
+      label: environment.label,
+      isLocal:
+        environment.entry.target._tag === "PrimaryConnectionTarget" ||
+        isDesktopLocalConnectionTarget(environment.entry.target),
+    })),
+  });
+  return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
+}, [activeEnvironmentId, environments]);
 ```
 
 (import `resolveAddProjectTargetLabel` alongside the Task 5 logic import). Add
@@ -2590,18 +2636,18 @@ Implementation:
    (~line 405), compute the same label. The component already has access to hooks — add:
 
 ```ts
-  const { environments } = useEnvironments();
-  const activeEnvironmentId = useActiveEnvironmentId();
-  const addProjectTargetLabel = resolveAddProjectTargetLabel({
-    activeEnvironmentId,
-    candidates: environments.map((environment) => ({
-      environmentId: environment.environmentId,
-      label: environment.label,
-      isLocal:
-        environment.entry.target._tag === "PrimaryConnectionTarget" ||
-        isDesktopLocalConnectionTarget(environment.entry.target),
-    })),
-  });
+const { environments } = useEnvironments();
+const activeEnvironmentId = useActiveEnvironmentId();
+const addProjectTargetLabel = resolveAddProjectTargetLabel({
+  activeEnvironmentId,
+  candidates: environments.map((environment) => ({
+    environmentId: environment.environmentId,
+    label: environment.label,
+    isLocal:
+      environment.entry.target._tag === "PrimaryConnectionTarget" ||
+      isDesktopLocalConnectionTarget(environment.entry.target),
+  })),
+});
 ```
 
 (imports: `useEnvironments` from `../state/environments`, `useActiveEnvironmentId` from
@@ -2633,6 +2679,7 @@ git commit -m "feat(web): environment-aware add-project target and copy"
 ### Task 9: `?action=add-server` deep link on the Remote Servers route
 
 **Files:**
+
 - Modify: `apps/web/src/routes/settings.remote-servers.tsx` (Phase 4's route file)
 - Test: colocated with the route's existing tests if Phase 4 created any; otherwise add the
   search-validation unit test below as
@@ -2675,9 +2722,7 @@ export interface RemoteServersSearch {
   readonly action?: "add-server";
 }
 
-export function validateRemoteServersSearch(
-  search: Record<string, unknown>,
-): RemoteServersSearch {
+export function validateRemoteServersSearch(search: Record<string, unknown>): RemoteServersSearch {
   return search["action"] === "add-server" ? { action: "add-server" } : {};
 }
 ```
@@ -2692,15 +2737,15 @@ and in the route component, open Phase 4's Add Server flow when the action arriv
 clear the param so refresh/back does not reopen it:
 
 ```tsx
-  const { action } = Route.useSearch();
-  const navigate = useNavigate();
-  useEffect(() => {
-    if (action !== "add-server") {
-      return;
-    }
-    openAddServerDialog(); // Phase 4's existing opener on the Connect tab
-    void navigate({ to: "/settings/remote-servers", replace: true, search: {} });
-  }, [action, navigate]);
+const { action } = Route.useSearch();
+const navigate = useNavigate();
+useEffect(() => {
+  if (action !== "add-server") {
+    return;
+  }
+  openAddServerDialog(); // Phase 4's existing opener on the Connect tab
+  void navigate({ to: "/settings/remote-servers", replace: true, search: {} });
+}, [action, navigate]);
 ```
 
 Adapt `openAddServerDialog` to Phase 4's actual opener (a `setState` or dialog-store call in
@@ -2724,6 +2769,7 @@ git commit -m "feat(web): add-server deep link into Remote Servers settings"
 ### Task 10: Living docs, runbooks, and the phase validation gate
 
 **Files:**
+
 - Modify: `docs/architecture/connection-runtime.md`
 - Modify: `docs/testing/cross-platform-validation.md`
 - Review only: `docs/testing/windows-desktop.md`, `docs/testing/linux-desktop.md`,
@@ -2739,7 +2785,7 @@ presentation-only) and add a paragraph:
 > (`apps/web/src/components/sidebar/EnvironmentRail.tsx`): Local (the primary environment
 > plus host-managed `local:` desktop backends, grouped per the
 > `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry per saved remote
-> environment. Selection writes `activeEnvironmentIdAtom` and scopes *presentation only*:
+> environment. Selection writes `activeEnvironmentIdAtom` and scopes _presentation only_:
 > the panel filters which environments' projects and threads it shows, and "Add project"
 > targets the selected environment. Selection never changes supervisor desired state —
 > connections to other environments stay live and streaming — and operations on an entity
@@ -2827,13 +2873,13 @@ if the Task 3 cast workaround was needed).
   `validateRemoteServersSearch` (Task 9) matches the rail's `search` object from Task 3.
 - **Deltas from the coordinator's external review (amended spec §4.8, "Selection
   semantics"):**
-  1. *Null selection = Local, filtered.* `selectRailVisibleEnvironmentIds` now scopes a
+  1. _Null selection = Local, filtered._ `selectRailVisibleEnvironmentIds` now scopes a
      null/absent — and a ghost/unresolvable — `activeEnvironmentId` to the local
      environment set instead of "no filtering"; "show everything" survives only in the
      degenerate no-local-environment catalog. Updated: Task 2 implementation + three scope
      tests (null → local set pinned explicitly), Task 5's null-selection Sidebar test and
      its expected-failure note, Design decisions 3 and 8.
-  2. *Amber update-dot wiring pinned for Phase 7.* `resolveEnvironmentRailStatus` accepts
+  2. _Amber update-dot wiring pinned for Phase 7._ `resolveEnvironmentRailStatus` accepts
      `updateAvailable` (already tested → `attention`); `toEnvironmentRailCandidate` now
      takes it as a required pass-through parameter (with a pass-through test), and the
      Phase 7 seam is pinned by name in "Phase interfaces / Produces" and at the single

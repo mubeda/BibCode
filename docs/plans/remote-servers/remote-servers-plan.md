@@ -51,15 +51,15 @@ Each phase produces working, independently shippable software and has its own de
 task file under `phases/`. Execute in order; Phase 1 and Phase 2 are independent of each
 other; Phase 6 may run in parallel with Phase 5 once Phase 4 lands.
 
-| Phase | File | Delivers | Depends on |
-|-------|------|----------|-----------|
-| 1 | `phases/phase-1-ssh-pairing-repair.md` | `bibcode pairing issue` CLI + fixed desktop SSH bootstrap (spec §4.7) | — |
-| 2 | `phases/phase-2-protocol-compat.md` | Protocol window on the descriptor + `CompatVerdict` in client-runtime (spec §4.4) | — |
-| 3 | `phases/phase-3-e2ee-pairing.md` | Host identity key, `/ws-e2ee` Noise NK channel, `bibcode://pair` code format, verify-then-add flow in client-runtime (spec §4.1–4.3) | 2 |
-| 4 | `phases/phase-4-settings-connect-tab.md` | "Remote Servers" section (rename + redirect), Connect tab: saved-server rows with status/version/compat, Add Server via pairing code, Advanced manual entry (spec §4.8) | 3 |
-| 5 | `phases/phase-5-share-tab-exposure.md` | Share tab: intent radio, address picker, browser URL + deep link + QR, paired-client revocation; grant-driven exposure state machine on desktop (spec §4.2, §4.6) | 3 |
-| 6 | `phases/phase-6-environment-rail.md` | Environment rail + context card in the left panel, add-project environment labeling, primary-environment leak fixes (spec §4.8) | 2, 4 |
-| 7 | `phases/phase-7-remote-updates.md` | `updater.status/check/install` RPC, desktop interactive install, headless manual path, "Check for Server Updates" + badges (spec §4.5) | 2, 4, 6 |
+| Phase | File                                     | Delivers                                                                                                                                                                | Depends on |
+| ----- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1     | `phases/phase-1-ssh-pairing-repair.md`   | `bibcode pairing issue` CLI + fixed desktop SSH bootstrap (spec §4.7)                                                                                                   | —          |
+| 2     | `phases/phase-2-protocol-compat.md`      | Protocol window on the descriptor + `CompatVerdict` in client-runtime (spec §4.4)                                                                                       | —          |
+| 3     | `phases/phase-3-e2ee-pairing.md`         | Host identity key, `/ws-e2ee` Noise NK channel, `bibcode://pair` code format, verify-then-add flow in client-runtime (spec §4.1–4.3)                                    | 2          |
+| 4     | `phases/phase-4-settings-connect-tab.md` | "Remote Servers" section (rename + redirect), Connect tab: saved-server rows with status/version/compat, Add Server via pairing code, Advanced manual entry (spec §4.8) | 3          |
+| 5     | `phases/phase-5-share-tab-exposure.md`   | Share tab: intent radio, address picker, browser URL + deep link + QR, paired-client revocation; grant-driven exposure state machine on desktop (spec §4.2, §4.6)       | 3          |
+| 6     | `phases/phase-6-environment-rail.md`     | Environment rail + context card in the left panel, add-project environment labeling, primary-environment leak fixes (spec §4.8)                                         | 2, 4       |
+| 7     | `phases/phase-7-remote-updates.md`       | `updater.status/check/install` RPC, desktop interactive install, headless manual path, "Check for Server Updates" + badges (spec §4.5)                                  | 2, 4, 6    |
 
 ## Cross-phase interfaces (summary — normative definitions in spec §4)
 
@@ -78,7 +78,7 @@ other; Phase 6 may run in parallel with Phase 5 once Phase 4 lands.
   (`unreachable | host-identity-mismatch | pairing-rejected | incompatible | duplicate-storage-identity`)
   plus `PairingLoopbackAcknowledgementRequiredError`; mint endpoint
   `POST /api/auth/pairing-offer` (scope `access:write`, accepts `reach` in the input and
-  embeds it in the payload — reach *persistence* arrives in Phase 5).
+  embeds it in the payload — reach _persistence_ arrives in Phase 5).
 - Phase 4 → 6: `EnvironmentRegistry.connect/disconnect(environmentId)` passthroughs and
   the web command atoms `environmentCatalog.connect/disconnect(environmentId)` — the
   non-destructive Disconnect latch of spec §6 (Phase 4 Task 5b), consumed by the

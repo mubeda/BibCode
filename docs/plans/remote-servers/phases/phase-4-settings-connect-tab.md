@@ -64,7 +64,7 @@ These are Phase 4 decisions; Phase 5/6/7 executors rely on them.
    Windows, and Linux. Today desktop macOS/Linux redirect Connections to General and Windows
    shows only the WSL page; those special cases are removed from
    `EnvironmentPresentationPolicy` (the `connectionsPresentation` field and its
-   `ConnectionsPresentation` type are deleted). Content degradation happens *inside* the page:
+   `ConnectionsPresentation` type are deleted). Content degradation happens _inside_ the page:
    SSH discovery and manual SSH entry render only when `window.desktopBridge` exists, exactly
    as the current code already branches. **Do not touch `presentsTarget` /
    `permitsConnectionAction`** — desktop-side environment-visibility widening is Phase 6's
@@ -83,12 +83,12 @@ These are Phase 4 decisions; Phase 5/6/7 executors rely on them.
    SSH host rows, desktop only). Relay (BiBCode Connect) environment rows
    (`CloudRemoteEnvironmentRows`) stay first-class rows in the saved-servers list, unchanged.
    The **Advanced expander holds only today's manual endpoint + pairing-token entry** (the
-   `connectPairing` → `ConnectionOnboarding.registerPairing` path) — it is *not* a dumping
+   `connectPairing` → `ConnectionOnboarding.registerPairing` path) — it is _not_ a dumping
    ground for SSH.
 5. **"Check for Server Updates" (spec §4.5, wired in Phase 7):** the button is **hidden behind
    a Phase 4-owned seam** (`SERVER_UPDATE_CHECK_ENABLED = false` constant that Phase 7 replaces
    with the `remoteUpdateControl`-capability predicate), not rendered disabled.
-   *Justification:* phases ship independently — a permanently disabled button in a shipped
+   _Justification:_ phases ship independently — a permanently disabled button in a shipped
    build is a dead control that looks broken and violates "predictable behavior"; and spec
    §4.5 already says the capability boolean gates "the whole surface", so hiding matches the
    final design. The placement, handler seam, and a test that renders it when the flag is
@@ -100,7 +100,7 @@ These are Phase 4 decisions; Phase 5/6/7 executors rely on them.
    unauthenticated device** is never gated on a pre-existing session (amended spec §4.2):
    the code itself carries the one-time credential, so the pairing route surface consumes
    the embedded `token` to establish the browser session with the serving host, then lands
-   at the root — no Add Server step, because the primary session it just established *is*
+   at the root — no Add Server step, because the primary session it just established _is_
    that server (saving it as a bearer entry too would duplicate the storage identity).
    One code path handles cold start, running instance, and plain browser.
    The desktop currently registers **no** deep-link handling (verified: no deep-link plugin in
@@ -113,29 +113,29 @@ These are Phase 4 decisions; Phase 5/6/7 executors rely on them.
 8. **Pinned badge copy** (this phase owns these strings; only "Limited compatibility" is
    spec-pinned):
 
-   | Source | Value | Rendered copy | Tone |
-   |---|---|---|---|
-   | `CompatVerdict` | `compatible` | *(no badge)* | — |
-   | `CompatVerdict` | `legacy` | `Limited compatibility` | warning |
-   | `CompatVerdict` | `server-too-old` | `Server update required` | destructive |
-   | `CompatVerdict` | `client-too-old` | `App update required` | destructive |
-   | Transport | bearer profile **with** `hostKey` | `End-to-end encrypted` | neutral |
-   | Transport | bearer profile **without** `hostKey` (legacy) | `Unencrypted` + tooltip `Re-pair with a new pairing code to secure this connection.` | warning |
-   | Transport | SSH target | `SSH tunnel` | neutral |
-   | Transport | relay-managed | `BiBCode Connect` | neutral |
-   | Probe failed, no cached descriptor | `Status unavailable` (underlying error preserved in the existing error line) | muted |
+   | Source                             | Value                                                                        | Rendered copy                                                                        | Tone        |
+   | ---------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ----------- |
+   | `CompatVerdict`                    | `compatible`                                                                 | _(no badge)_                                                                         | —           |
+   | `CompatVerdict`                    | `legacy`                                                                     | `Limited compatibility`                                                              | warning     |
+   | `CompatVerdict`                    | `server-too-old`                                                             | `Server update required`                                                             | destructive |
+   | `CompatVerdict`                    | `client-too-old`                                                             | `App update required`                                                                | destructive |
+   | Transport                          | bearer profile **with** `hostKey`                                            | `End-to-end encrypted`                                                               | neutral     |
+   | Transport                          | bearer profile **without** `hostKey` (legacy)                                | `Unencrypted` + tooltip `Re-pair with a new pairing code to secure this connection.` | warning     |
+   | Transport                          | SSH target                                                                   | `SSH tunnel`                                                                         | neutral     |
+   | Transport                          | relay-managed                                                                | `BiBCode Connect`                                                                    | neutral     |
+   | Probe failed, no cached descriptor | `Status unavailable` (underlying error preserved in the existing error line) | muted                                                                                |
 
 ## Interfaces consumed from Phases 2 and 3 (never redefine — align, don't duplicate)
 
 From the master plan's interface summary and spec §4. Where the spec pins a name it is used
-verbatim; the two names marked *(assumed)* come from the master-plan summary's descriptions —
+verbatim; the two names marked _(assumed)_ come from the master-plan summary's descriptions —
 if the earlier phase landed a different export name, **use the landed name and adjust only the
 Phase 4-owned wrappers**; never add a second definition.
 
 - **Phase 2:** `CompatVerdict` from `packages/client-runtime/src/connection/compat.ts`
   (spec §4.4 shape: `{ kind: "compatible" } | { kind: "legacy" } | { kind: "server-too-old";
-  serverVersion: number; minSupported: number } | { kind: "client-too-old";
-  serverMinCompatible: number; clientVersion: number }`). Phase 2's landed per-environment
+serverVersion: number; minSupported: number } | { kind: "client-too-old";
+serverMinCompatible: number; clientVersion: number }`). Phase 2's landed per-environment
   accessor is `environmentSession.compatVerdictAtom(environmentId)` (an `Atom` of
   `CompatVerdict | null`, exported via `createEnvironmentSessionAtoms`; `apps/web/src/state/session.ts`
   already re-exports `environmentSession`). Phase 4's row code reads that atom — there is no
@@ -152,7 +152,7 @@ Phase 4-owned wrappers**; never add a second definition.
   `packages/client-runtime/src/connection/catalog.ts` is **required-nullable**
   (`string | null`, decode-default `null` for legacy profiles — never `undefined`);
   `classifyPairingEndpoint(endpoint: string): "loopback" | "private-network" | "public" |
-  "unconnectable"` from `packages/shared/src/advertisedEndpoint.ts` (spec §4.2); and the
+"unconnectable"` from `packages/shared/src/advertisedEndpoint.ts` (spec §4.2); and the
   verify-then-add flow — `verifyAndAddPairingCode(input: VerifyPairingCodeInput)` on the
   `ConnectionOnboarding` service, where
   `VerifyPairingCodeInput = { readonly code: string; readonly allowLoopbackTunnel?: boolean }`
@@ -160,8 +160,8 @@ Phase 4-owned wrappers**; never add a second definition.
   loopback-endpoint code fails fast with the tagged
   `PairingLoopbackAcknowledgementRequiredError { endpoint }`). Classified failures arrive as
   `PairingAddError { reason, detail }` with `reason: PairingAddFailureReason =
-  "unreachable" | "host-identity-mismatch" | "pairing-rejected" | "incompatible" |
-  "duplicate-storage-identity"` (the five reasons are spec-pinned verbatim; the **field is
+"unreachable" | "host-identity-mismatch" | "pairing-rejected" | "incompatible" |
+"duplicate-storage-identity"` (the five reasons are spec-pinned verbatim; the **field is
   `reason`, not `kind`**). Malformed/future codes surface as `PairingCodeParseError` /
   `PairingCodeUnsupportedVersionError` (both carry user-facing `message`s). All four error
   classes and `PairingAddFailureReason` are defined in
@@ -228,10 +228,12 @@ Test invocation used throughout (run from the repository root):
 ### Task 1: Connect-tab presentation helpers (pure logic)
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/remote-servers/connectPresentation.ts`
 - Test: `apps/web/src/components/settings/remote-servers/connectPresentation.test.ts`
 
 **Interfaces:**
+
 - Consumes: `CompatVerdict` from `@bibcode/client-runtime/connection/compat` (Phase 2,
   spec §4.4); `PairingAddFailureReason` (type-only) from `@bibcode/client-runtime/connection`
   (Phase 3, `connection/pairingAdd.ts`); `EnvironmentPresentation` from `~/state/environments`
@@ -243,7 +245,7 @@ Test invocation used throughout (run from the repository root):
     `CompatBadge = { readonly tone: "warning" | "destructive"; readonly label: string } | null`
   - `resolveTransportBadge(environment: TransportBadgeInput): TransportBadge | null` where
     `TransportBadge = { readonly kind: "e2ee" | "ssh" | "relay"; readonly label: string } |
-    { readonly kind: "unencrypted"; readonly label: string; readonly guidance: string }`
+{ readonly kind: "unencrypted"; readonly label: string; readonly guidance: string }`
   - `ADD_SERVER_FAILURE_REASONS: ReadonlyArray<PairingAddFailureReason>` (the five
     spec-pinned reasons, typed against Phase 3's union so drift fails typecheck)
   - `describeAddServerFailure(reason: PairingAddFailureReason): { readonly title: string; readonly detail: string }`
@@ -323,7 +325,10 @@ describe("resolveTransportBadge", () => {
     ).toEqual({ kind: "ssh", label: "SSH tunnel" });
     expect(
       resolveTransportBadge(
-        bearer({ _tag: "BearerConnectionProfile", hostKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+        bearer({
+          _tag: "BearerConnectionProfile",
+          hostKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        }),
       ),
     ).toEqual({ kind: "e2ee", label: "End-to-end encrypted" });
     expect(
@@ -421,9 +426,7 @@ import type { CompatVerdict } from "@bibcode/client-runtime/connection/compat";
 import type { PairingAddFailureReason } from "@bibcode/client-runtime/connection";
 
 /** D16: version strings render as "BiBCode v<serverVersion>". */
-export function formatServerVersionLabel(
-  serverVersion: string | null | undefined,
-): string | null {
+export function formatServerVersionLabel(serverVersion: string | null | undefined): string | null {
   const trimmed = serverVersion?.trim() ?? "";
   return trimmed.length > 0 ? `BiBCode v${trimmed}` : null;
 }
@@ -471,9 +474,7 @@ export type TransportBadge =
   | { readonly kind: "e2ee" | "ssh" | "relay"; readonly label: string }
   | { readonly kind: "unencrypted"; readonly label: string; readonly guidance: string };
 
-export function resolveTransportBadge(
-  environment: TransportBadgeInput,
-): TransportBadge | null {
+export function resolveTransportBadge(environment: TransportBadgeInput): TransportBadge | null {
   if (environment.relayManaged) return { kind: "relay", label: "BiBCode Connect" };
   const target = environment.entry.target;
   if (target._tag === "SshConnectionTarget") return { kind: "ssh", label: "SSH tunnel" };
@@ -507,9 +508,7 @@ export const ADD_SERVER_FAILURE_REASONS: ReadonlyArray<PairingAddFailureReason> 
 ];
 
 /** Reads the classified reason off Phase 3's PairingAddError (field: `reason`). */
-export function resolvePairingAddFailureReason(
-  error: unknown,
-): PairingAddFailureReason | null {
+export function resolvePairingAddFailureReason(error: unknown): PairingAddFailureReason | null {
   if (error === null || typeof error !== "object") return null;
   if ((error as { _tag?: unknown })._tag !== "PairingAddError") return null;
   const reason = (error as { reason?: unknown }).reason;
@@ -605,10 +604,12 @@ git commit -m "feat(web): add Remote Servers connect-tab presentation helpers"
 ### Task 2: Tabs UI primitive
 
 **Files:**
+
 - Create: `apps/web/src/components/ui/tabs.tsx`
 - Test: `apps/web/src/components/ui/tabs.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `@base-ui/react/tabs` (repo already depends on `@base-ui/react@1.6.0` and wraps
   its primitives one file per component in `apps/web/src/components/ui/`; `dialog.tsx` is the
   pattern to imitate).
@@ -685,9 +686,7 @@ import type { ComponentProps } from "react";
 import { cn } from "~/lib/utils";
 
 function Tabs({ className, ...props }: ComponentProps<typeof TabsPrimitive.Root>) {
-  return (
-    <TabsPrimitive.Root className={cn("flex min-w-0 flex-col gap-6", className)} {...props} />
-  );
+  return <TabsPrimitive.Root className={cn("flex min-w-0 flex-col gap-6", className)} {...props} />;
 }
 
 function TabsList({ className, ...props }: ComponentProps<typeof TabsPrimitive.List>) {
@@ -747,6 +746,7 @@ unless an import path forces an edit. The old route keeps working at the end of 
 `apps/web/src/components/settings/ConnectionsSettings.tsx` at commit time of this plan.
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/remote-servers/shared.tsx`
 - Create: `apps/web/src/components/settings/remote-servers/ConnectTab.tsx`
 - Create: `apps/web/src/components/settings/remote-servers/ShareTab.tsx`
@@ -763,6 +763,7 @@ unless an import path forces an edit. The old route keeps working at the end of 
   importers, which are the moved share components themselves)
 
 **Interfaces:**
+
 - Consumes: everything the current `ConnectionsSettings.tsx` imports (unchanged).
 - Produces (relied on by Tasks 4–8):
   - `RemoteServersSettings(props: { initialTab?: "connect" | "share" })` from
@@ -774,13 +775,13 @@ unless an import path forces an edit. The old route keeps working at the end of 
 
 **Moved-symbol map** (source line → destination):
 
-| Symbols (current lines) | Destination |
-|---|---|
-| `DEFAULT_TAILSCALE_SERVE_PORT`, `EMPTY_ADVERTISED_ENDPOINTS`, `EMPTY_DISCOVERED_SSH_HOSTS` (146–148), `accessTimestampFormatter`/`formatAccessTimestamp` (150–209), `AccessScopeSummary` (210–253), `ConnectionStatusDot` + props (254–307), `formatDesktopSshTarget` (308), `parseManualDesktopSshTarget` (313), `parsePairingUrlFields` (371), `parseRemotePairingFields` (402), `formatDesktopSshConnectionError` (420), `AccessSectionPresentation`/`accessRowClassName`/`endpointRowClassName` (438–454), `ITEM_ROW_CLASSNAME` (432), `ITEM_ROW_INNER_CLASSNAME` (435), sort/record mappers (455–492), `selectPairingEndpoint` (493), `isTailscaleHttpsEndpoint` (514), `endpointDefaultPreferenceKey` (518), `resolveAdvertisedEndpointPairingUrl` (542), `resolveCurrentOriginPairingUrl` (555), `isHostedAppPairingUrl` (560), internals export (570–588, renamed `remoteServersSettingsInternals`) | `shared.tsx` |
-| `PairingLinkListRow` (589–973), `ConnectedClientListRow` (974–1053), `AuthorizedClientsHeaderAction` (1054–1227), `PairingClientsList` (1228–1288), `AdvertisedEndpointListRow` (1289–1374), `NetworkAccessDescription` (1375–1421), `CloudLinkSwitch` (1611), `ConfiguredCloudLinkRow` (1640), `CloudLinkRow` (1772) | `ShareTab.tsx` |
-| `SavedBackendListRow` (1422–1570), `DesktopSshHostRow` (1571–1609), `EmptyRemoteEnvironments` (1776), `RemoteEnvironmentRowsSkeleton` (1794), `ConfiguredCloudRemoteEnvironmentRows` (1808), `CloudRemoteEnvironmentRows` (1951) | `ConnectTab.tsx` |
-| `FullConnectionsSettings` (1968–3202) | split: see below |
-| `ConnectionsSettings` dispatch (3204–3213) | replaced by `RemoteServersSettings` + Task 4 routes |
+| Symbols (current lines)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Destination                                         |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `DEFAULT_TAILSCALE_SERVE_PORT`, `EMPTY_ADVERTISED_ENDPOINTS`, `EMPTY_DISCOVERED_SSH_HOSTS` (146–148), `accessTimestampFormatter`/`formatAccessTimestamp` (150–209), `AccessScopeSummary` (210–253), `ConnectionStatusDot` + props (254–307), `formatDesktopSshTarget` (308), `parseManualDesktopSshTarget` (313), `parsePairingUrlFields` (371), `parseRemotePairingFields` (402), `formatDesktopSshConnectionError` (420), `AccessSectionPresentation`/`accessRowClassName`/`endpointRowClassName` (438–454), `ITEM_ROW_CLASSNAME` (432), `ITEM_ROW_INNER_CLASSNAME` (435), sort/record mappers (455–492), `selectPairingEndpoint` (493), `isTailscaleHttpsEndpoint` (514), `endpointDefaultPreferenceKey` (518), `resolveAdvertisedEndpointPairingUrl` (542), `resolveCurrentOriginPairingUrl` (555), `isHostedAppPairingUrl` (560), internals export (570–588, renamed `remoteServersSettingsInternals`) | `shared.tsx`                                        |
+| `PairingLinkListRow` (589–973), `ConnectedClientListRow` (974–1053), `AuthorizedClientsHeaderAction` (1054–1227), `PairingClientsList` (1228–1288), `AdvertisedEndpointListRow` (1289–1374), `NetworkAccessDescription` (1375–1421), `CloudLinkSwitch` (1611), `ConfiguredCloudLinkRow` (1640), `CloudLinkRow` (1772)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `ShareTab.tsx`                                      |
+| `SavedBackendListRow` (1422–1570), `DesktopSshHostRow` (1571–1609), `EmptyRemoteEnvironments` (1776), `RemoteEnvironmentRowsSkeleton` (1794), `ConfiguredCloudRemoteEnvironmentRows` (1808), `CloudRemoteEnvironmentRows` (1951)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `ConnectTab.tsx`                                    |
+| `FullConnectionsSettings` (1968–3202)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | split: see below                                    |
+| `ConnectionsSettings` dispatch (3204–3213)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | replaced by `RemoteServersSettings` + Task 4 routes |
 
 **`FullConnectionsSettings` split** — move hooks/state/handlers to the tab that renders them:
 
@@ -834,9 +835,7 @@ async function render(element: React.ReactElement) {
 describe("RemoteServersSettings", () => {
   it("renders both spec-named tabs with Connect selected by default", async () => {
     const { container, cleanup } = await render(<RemoteServersSettings />);
-    const tabLabels = [...container.querySelectorAll('[role="tab"]')].map(
-      (tab) => tab.textContent,
-    );
+    const tabLabels = [...container.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
     expect(tabLabels).toEqual(["Connect to a host", "Share this host"]);
     expect(container.querySelector('[data-testid="connect-tab"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="share-tab"]')).toBeNull();
@@ -879,10 +878,7 @@ export function RemoteServersSettings({
   const [tab, setTab] = useState<RemoteServersTab>(initialTab);
   return (
     <SettingsPageContainer>
-      <Tabs
-        value={tab}
-        onValueChange={(value) => setTab(value === "share" ? "share" : "connect")}
-      >
+      <Tabs value={tab} onValueChange={(value) => setTab(value === "share" ? "share" : "connect")}>
         <TabsList>
           <TabsTab value="connect">Connect to a host</TabsTab>
           <TabsTab value="share">Share this host</TabsTab>
@@ -905,11 +901,7 @@ export function RemoteServersSettings({
 // apps/web/src/components/settings/remote-servers/ConnectTab.tsx (skeleton)
 export function ConnectTab() {
   // …moved hooks/state/handlers per the split table above…
-  return (
-    <>
-      {/* moved "Remote environments" SettingsSection, retitled in Task 5 */}
-    </>
-  );
+  return <>{/* moved "Remote environments" SettingsSection, retitled in Task 5 */}</>;
 }
 ```
 
@@ -918,9 +910,7 @@ export function ConnectTab() {
 export function ShareTab() {
   // …moved share-side hooks/state/handlers per the split table above…
   return (
-    <>
-      {/* moved "This environment" + "Authorized clients" sections and dialogs, verbatim */}
-    </>
+    <>{/* moved "This environment" + "Authorized clients" sections and dialogs, verbatim */}</>
   );
 }
 ```
@@ -966,6 +956,7 @@ function ConnectionsRouteComponent() {
 - [ ] **Step 4: Run the moved suites to verify they pass**
 
 Run:
+
 ```
 vp test run apps/web/src/components/settings/remote-servers/RemoteServersSettings.test.tsx \
   apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx \
@@ -973,6 +964,7 @@ vp test run apps/web/src/components/settings/remote-servers/RemoteServersSetting
   apps/web/src/components/settings/remote-servers/pairingUrls.test.ts \
   apps/web/src/routes/settings.connections.test.tsx
 ```
+
 Expected: PASS. Then `vp run typecheck` — expected clean (this is the guard against missed
 import-path fixes).
 
@@ -988,6 +980,7 @@ git commit -m "refactor(web): split Connections settings into remote-servers tab
 ### Task 4: Rename to Remote Servers — routes, redirect, nav, links, policy
 
 **Files:**
+
 - Create: `apps/web/src/routes/settings.remote-servers.tsx`
 - Create: `apps/web/src/routes/settings.remote-servers.test.tsx`
 - Create: `apps/web/src/routes/settings.local-environment.tsx`
@@ -1002,6 +995,7 @@ git commit -m "refactor(web): split Connections settings into remote-servers tab
 - Generated: `apps/web/src/routeTree.gen.ts` (commit the regenerated file)
 
 **Interfaces:**
+
 - Consumes: `RemoteServersSettings({ initialTab? })` (Task 3);
   `LocalEnvironmentSettings` (existing); `readCurrentEnvironmentPresentationPolicy` (existing).
 - Produces: routes `/settings/remote-servers` (search: `{ tab?: "share"; code?: string }` —
@@ -1097,12 +1091,14 @@ after Remote Servers; the browser/macOS policies still exclude "Local environmen
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run:
+
 ```
 vp test run apps/web/src/routes/settings.remote-servers.test.tsx \
   apps/web/src/routes/settings.local-environment.test.tsx \
   apps/web/src/routes/settings.connections.test.tsx \
   apps/web/src/components/settings/SettingsSidebarNav.test.tsx
 ```
+
 Expected: FAIL — new route modules missing; nav expectations unmet.
 
 - [ ] **Step 3: Implement routes, nav, policy, and link updates**
@@ -1116,9 +1112,7 @@ import { RemoteServersSettings } from "../components/settings/remote-servers/Rem
 export const Route = createFileRoute("/settings/remote-servers")({
   validateSearch: (search: Record<string, unknown>) => ({
     ...(search.tab === "share" ? { tab: "share" as const } : {}),
-    ...(typeof search.code === "string" && search.code.length > 0
-      ? { code: search.code }
-      : {}),
+    ...(typeof search.code === "string" && search.code.length > 0 ? { code: search.code } : {}),
   }),
   component: RemoteServersRouteView,
 });
@@ -1260,6 +1254,7 @@ vp test run apps/web/src/routes/settings.remote-servers.test.tsx \
   apps/web/src/routes/settings.connections.test.tsx \
   apps/web/src/components/settings/SettingsSidebarNav.test.tsx
 ```
+
 Expected: PASS. Confirm `git status --short` shows `apps/web/src/routeTree.gen.ts` modified;
 if it did not regenerate, run `vp run --filter @bibcode/web build` once. Then
 `vp run typecheck` — expected clean (catches any missed `/settings/connections` `Link`/
@@ -1285,10 +1280,12 @@ preserved; the row gains the D16 version label, the compat badge, the transport 
 "Status unavailable" state.
 
 **Files:**
+
 - Modify: `apps/web/src/components/settings/remote-servers/ConnectTab.tsx`
 - Test: `apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 
 **Interfaces:**
+
 - Consumes: Task 1 helpers (`formatServerVersionLabel`, `describeCompatBadge`,
   `resolveTransportBadge`); Phase 2's landed verdict accessor
   `environmentSession.compatVerdictAtom(environmentId)` (`Atom` of `CompatVerdict | null`;
@@ -1301,7 +1298,7 @@ preserved; the row gains the D16 version label, the compat badge, the transport 
   import it — Phase 6 consumes the same Task 1 helpers instead).
 
 - [ ] **Step 1: Write the failing tests** (append to `ConnectTab.test.tsx`, using the Task 3
-  harness; `h.environments` entries are plain objects shaped like `EnvironmentPresentation`)
+      harness; `h.environments` entries are plain objects shaped like `EnvironmentPresentation`)
 
 ```tsx
 describe("RemoteServerRow presentation", () => {
@@ -1374,9 +1371,7 @@ import {
 } from "./connectPresentation";
 
 // inside RemoteServerRow, after the existing versionMismatch/sshTarget derivations:
-const versionLabel = formatServerVersionLabel(
-  environment.serverConfig?.environment.serverVersion,
-);
+const versionLabel = formatServerVersionLabel(environment.serverConfig?.environment.serverVersion);
 const compatBadge = describeCompatBadge(environment.compat ?? null);
 const transportBadge = resolveTransportBadge(environment);
 const statusUnavailable =
@@ -1387,9 +1382,7 @@ and render, replacing the current `metadataBits` paragraph block:
 
 ```tsx
 <div className="flex flex-wrap items-center gap-1.5">
-  {versionLabel ? (
-    <span className="text-xs text-muted-foreground">{versionLabel}</span>
-  ) : null}
+  {versionLabel ? <span className="text-xs text-muted-foreground">{versionLabel}</span> : null}
   {statusUnavailable ? (
     <span className="text-xs text-muted-foreground/70">Status unavailable</span>
   ) : null}
@@ -1455,6 +1448,7 @@ across restarts is a deliberate non-goal of this task; if product feedback wants
 is a catalog-profile field decision to take back to the spec first.
 
 **Files:**
+
 - Modify: `packages/client-runtime/src/connection/registry.ts` (service interface ~line 65
   and implementation return block ~line 735)
 - Modify: `apps/web/src/components/settings/remote-servers/ConnectTab.tsx` (row actions +
@@ -1466,6 +1460,7 @@ is a catalog-profile field decision to take back to the spec first.
   `apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `EnvironmentSupervisor` `connect`/`disconnect` effects (existing, supervisor.ts
   ~690–705 — they flip the supervisor's `desired` intent flag); the registry's
   `acquireSupervisor` + `EnvironmentNotRegisteredError` pattern already used by `retryNow`
@@ -1496,7 +1491,7 @@ is a catalog-profile field decision to take back to the spec first.
   `connectPresentation.ts`.
 
 - [ ] **Step 1: Write the failing registry test** (append to `registry.test.ts`, using the
-  same harness as the existing `retryNow` case at ~line 809)
+      same harness as the existing `retryNow` case at ~line 809)
 
 ```ts
 it.effect("disconnect latches the supervisor without removing the entry", () =>
@@ -1647,10 +1642,12 @@ handler props rather than DOM clicks, assert the same way.)
 - [ ] **Step 6: Run to verify it fails**
 
 Run:
+
 ```
 vp test run apps/web/src/components/settings/remote-servers/connectPresentation.test.ts \
   apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx
 ```
+
 Expected: FAIL — helper missing; Disconnect still routes to remove; no confirmation dialog.
 
 - [ ] **Step 7: Implement the helper, rewire the row, add the confirmation dialog**
@@ -1667,8 +1664,7 @@ export function countRunningThreadsForEnvironment(
   environmentId: string,
 ): number {
   return shells.filter(
-    (shell) =>
-      shell.environmentId === environmentId && shell.session?.status === "running",
+    (shell) => shell.environmentId === environmentId && shell.session?.status === "running",
   ).length;
 }
 ```
@@ -1744,7 +1740,7 @@ const runningCount =
       </Button>
     </AlertDialogFooter>
   </AlertDialogPopup>
-</AlertDialog>
+</AlertDialog>;
 ```
 
 The menu item's handler is `setRemovalCandidate({ environmentId, label: environment.label })`;
@@ -1753,10 +1749,12 @@ The menu item's handler is `setRemovalCandidate({ environmentId, label: environm
 - [ ] **Step 8: Run to verify it passes**
 
 Run:
+
 ```
 vp test run apps/web/src/components/settings/remote-servers/connectPresentation.test.ts \
   apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx
 ```
+
 Expected: PASS. Update any pre-existing moved case that asserted immediate removal on the
 row button — removal now always flows through the menu item + confirmation dialog.
 
@@ -1780,17 +1778,19 @@ endpoint+token entry moves under an **Advanced** expander inside the pairing-cod
 **connection troubleshooting** expander renders the five classified failures' guidance.
 
 **Files:**
+
 - Modify: `apps/web/src/connection/onboarding.ts` (new atom command)
 - Modify: `apps/web/src/components/settings/remote-servers/ConnectTab.tsx`
 - Test: `apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 
 **Interfaces:**
+
 - Consumes (Phase 3 landed names — see the Interfaces-consumed section):
   `ConnectionOnboarding.verifyAndAddPairingCode(input: VerifyPairingCodeInput)` with
   `VerifyPairingCodeInput = { readonly code: string; readonly allowLoopbackTunnel?: boolean }`
   (the flow — live probe, E2EE handshake, authenticated `server.getConfig`, failure
   classification — is Phase 3's, spec §4.2); its tagged failures `PairingAddError { reason,
-  detail }` (the five spec-pinned reasons live on **`reason`**),
+detail }` (the five spec-pinned reasons live on **`reason`**),
   `PairingLoopbackAcknowledgementRequiredError { endpoint }`, `PairingCodeParseError`,
   `PairingCodeUnsupportedVersionError`; `parsePairingCode` from
   `@bibcode/shared/pairingCode` for the local pre-decode (accepts bare code + both URL
@@ -1807,8 +1807,8 @@ endpoint+token entry moves under an **Advanced** expander inside the pairing-cod
   `initialPairingCode?: string | null` (consumed by Task 8).
 
 - [ ] **Step 1: Write the failing tests** (in `ConnectTab.test.tsx`; extend the harness's
-  `~/connection/onboarding` mock with `connectRemoteServer: h.atoms.connectRemoteServer` and a
-  `h.commands.connectRemoteServer` mock, mirroring how `connectPairing` is mocked)
+      `~/connection/onboarding` mock with `connectRemoteServer: h.atoms.connectRemoteServer` and a
+      `h.commands.connectRemoteServer` mock, mirroring how `connectPairing` is mocked)
 
 ```tsx
 describe("Add Server flow", () => {
@@ -1953,9 +1953,7 @@ const [tunnelAcknowledged, setTunnelAcknowledged] = useState(false);
 // set when the flow itself failed with PairingLoopbackAcknowledgementRequiredError
 // even though the local pre-decode saw nothing loopback:
 const [flowDemandsAcknowledgement, setFlowDemandsAcknowledgement] = useState(false);
-const [addServerFailure, setAddServerFailure] = useState<PairingAddFailureReason | null>(
-  null,
-);
+const [addServerFailure, setAddServerFailure] = useState<PairingAddFailureReason | null>(null);
 const connectRemoteServerCommand = useAtomCommand(connectRemoteServerAtom, {
   reportFailure: false,
 });
@@ -2007,9 +2005,7 @@ const handleAddServer = useCallback(async () => {
     } else {
       // PairingCodeParseError / PairingCodeUnsupportedVersionError and anything
       // unclassified carry user-facing messages:
-      setSavedBackendError(
-        error instanceof Error ? error.message : "Failed to add the server.",
-      );
+      setSavedBackendError(error instanceof Error ? error.message : "Failed to add the server.");
     }
     return;
   }
@@ -2025,14 +2021,13 @@ const handleAddServer = useCallback(async () => {
 }, [connectRemoteServerCommand, normalizedCode, tunnelAcknowledged]);
 ```
 
-   JSX: a `Textarea` labeled **Pairing code** (placeholder `bibcode://pair?code=…`,
-   `spellCheck={false}`); when `requiresTunnelAcknowledgement`, a `Checkbox` row with the
-   copy `This address is only reachable on the server itself. I have set up a tunnel (SSH
+JSX: a `Textarea` labeled **Pairing code** (placeholder `bibcode://pair?code=…`,
+`spellCheck={false}`); when `requiresTunnelAcknowledgement`, a `Checkbox` row with the
+copy `This address is only reachable on the server itself. I have set up a tunnel (SSH
    port forward or similar) from this device.` gating the button
-   (`disabled={requiresTunnelAcknowledgement && !tunnelAcknowledged}`); a primary Button
-   labeled `Add Server` (busy label `Adding…`); on `addServerFailure` render the
-   `describeAddServerFailure` title/detail in the existing destructive error panel style.
-3. **Advanced expander** (inside pairing-code mode, below the primary button):
+(`disabled={requiresTunnelAcknowledgement && !tunnelAcknowledged}`); a primary Button
+labeled `Add Server` (busy label `Adding…`); on `addServerFailure` render the
+`describeAddServerFailure` title/detail in the existing destructive error panel style. 3. **Advanced expander** (inside pairing-code mode, below the primary button):
 
 ```tsx
 <Collapsible>
@@ -2043,13 +2038,12 @@ const handleAddServer = useCallback(async () => {
 </Collapsible>
 ```
 
-   `renderRemoteFields`/`renderRemoteModeBody`, `handleSavedBackendHostChange`,
-   `parseRemotePairingFields`, and the `connectPairing`-based `handleAddSavedBackend` branch
-   move under this expander **unchanged** (this is the preserved
-   `ConnectionOnboarding.registerPairing` manual path; its button label stays distinct:
-   `Add manually`). No Phase 3 dependency in this sub-path.
-4. **Troubleshooting expander** (below Advanced, same Collapsible pattern, trigger text
-   `Troubleshooting`), static list built from Task 1 copy:
+`renderRemoteFields`/`renderRemoteModeBody`, `handleSavedBackendHostChange`,
+`parseRemotePairingFields`, and the `connectPairing`-based `handleAddSavedBackend` branch
+move under this expander **unchanged** (this is the preserved
+`ConnectionOnboarding.registerPairing` manual path; its button label stays distinct:
+`Add manually`). No Phase 3 dependency in this sub-path. 4. **Troubleshooting expander** (below Advanced, same Collapsible pattern, trigger text
+`Troubleshooting`), static list built from Task 1 copy:
 
 ```tsx
 <ul className="space-y-2 text-xs text-muted-foreground">
@@ -2057,15 +2051,14 @@ const handleAddServer = useCallback(async () => {
     const described = describeAddServerFailure(reason);
     return (
       <li key={reason}>
-        <span className="font-medium text-foreground">{described.title}.</span>{" "}
-        {described.detail}
+        <span className="font-medium text-foreground">{described.title}.</span> {described.detail}
       </li>
     );
   })}
   <li>
-    <span className="font-medium text-foreground">Still stuck?</span> Confirm both devices
-    are on the same network or connected through a tunnel, then generate a fresh pairing
-    code on the server's Share tab.
+    <span className="font-medium text-foreground">Still stuck?</span> Confirm both devices are on
+    the same network or connected through a tunnel, then generate a fresh pairing code on the
+    server's Share tab.
   </li>
 </ul>
 ```
@@ -2094,10 +2087,12 @@ git commit -m "feat(web): add pairing-code Add Server flow with advanced manual 
 ### Task 7: "Check for Server Updates" placement seam (Phase 7 wires it)
 
 **Files:**
+
 - Modify: `apps/web/src/components/settings/remote-servers/ConnectTab.tsx`
 - Test: `apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 
 **Interfaces:**
+
 - Produces: `SERVER_UPDATE_CHECK_ENABLED` constant + `showServerUpdateCheck?: boolean` prop on
   `ConnectTab` (defaulting to the constant) + an `onCheckForServerUpdates` no-op seam. Phase 7
   replaces the constant with the `remoteUpdateControl`-capability predicate (spec §4.5) and
@@ -2195,12 +2190,13 @@ distinct outcomes pinned by amended spec §4.2:
   code itself carries the one-time credential (`token`, the existing `auth_pairing_links`
   token), so `PairingRouteSurface` — which already auto-submits a URL-carried token via
   `submitServerAuthCredential` (`apps/web/src/components/auth/PairingRouteSurface.tsx:50,
-  88–97`) — consumes the embedded token to establish the browser session with the serving
+88–97`) — consumes the embedded token to establish the browser session with the serving
   host, then lands at the root. It does **not** continue into Add Server: the primary
-  session it just established *is* that server, and saving it again as a bearer entry would
+  session it just established _is_ that server, and saving it again as a bearer entry would
   collide on the storage identity.
 
 **Files:**
+
 - Modify: `apps/web/src/routes/pair.tsx`
 - Modify: `apps/web/src/components/auth/PairingRouteSurface.tsx` (new optional
   `initialCredential` prop)
@@ -2210,6 +2206,7 @@ distinct outcomes pinned by amended spec §4.2:
   `apps/web/src/routes/settings.remote-servers.test.tsx`
 
 **Interfaces:**
+
 - Consumes: Task 4's `/settings/remote-servers` `validateSearch` (`code` param); Task 6's
   `initialPairingCode` prop chain; Phase 3's `parsePairingCode` (+ `encodePairingCode` in
   tests) from `@bibcode/shared/pairingCode`; existing `peekPairingTokenFromUrl` /
@@ -2346,9 +2343,7 @@ Expected: FAIL — `/pair` has no `validateSearch`; forwarding not implemented.
 ```tsx
 export const Route = createFileRoute("/pair")({
   validateSearch: (search: Record<string, unknown>) => ({
-    ...(typeof search.code === "string" && search.code.length > 0
-      ? { code: search.code }
-      : {}),
+    ...(typeof search.code === "string" && search.code.length > 0 ? { code: search.code } : {}),
   }),
   beforeLoad: async ({ context, search }) => {
     const { authGateState } = context;
@@ -2462,6 +2457,7 @@ function RemoteServersRouteView() {
 - [ ] **Step 4: Run to verify it passes**
 
 Run:
+
 ```
 vp test run apps/web/src/routes/pair.test.tsx \
   apps/web/src/components/auth/pairingCodeCredential.test.ts \
@@ -2469,6 +2465,7 @@ vp test run apps/web/src/routes/pair.test.tsx \
   apps/web/src/components/settings/remote-servers/RemoteServersSettings.test.tsx \
   apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx
 ```
+
 Expected: PASS. Route tree regenerates as in Task 4 (commit `routeTree.gen.ts` if changed).
 
 - [ ] **Step 5: Commit**
@@ -2489,6 +2486,7 @@ opening a second app), surface the URLs to the webview through the existing brid
 pattern, and navigate to `/pair?code=…` (Task 8 takes it from there).
 
 **Files:**
+
 - Modify: `Cargo.toml` (workspace deps), `apps/desktop/src-tauri/Cargo.toml`,
   `apps/desktop/src-tauri/src/lib.rs`, `apps/desktop/src-tauri/tauri.conf.json`,
   `apps/desktop/src-tauri/capabilities/default.json`
@@ -2498,13 +2496,14 @@ pattern, and navigate to `/pair?code=…` (Task 8 takes it from there).
 - Create: `apps/web/src/desktopDeepLink.ts`, `apps/web/src/desktopDeepLink.test.ts`
 
 **Interfaces:**
+
 - Consumes: `tauriInvoke`/`tauriListen` helpers in `apps/web/src/tauriDesktopBridge.ts`
   (existing pattern: see `onProjectDataStatusChanged`); the tauri-plugin-deep-link runtime
   event `deep-link://new-url` (payload: array of URL strings) and command
   `plugin:deep-link|get_current`.
 - Produces: `DesktopBridge` optional members `getPendingDeepLinks?: () =>
-  Promise<ReadonlyArray<string>>` and `onDeepLink?: (listener: (urls: ReadonlyArray<string>)
-  => void) => () => void`; `DESKTOP_DEEP_LINK_EVENT` constant in contracts;
+Promise<ReadonlyArray<string>>` and `onDeepLink?: (listener: (urls: ReadonlyArray<string>)
+=> void) => () => void`; `DESKTOP_DEEP_LINK_EVENT` constant in contracts;
   `resolvePairingDeepLink(rawUrl: string): { readonly code: string } | null` in
   `apps/web/src/desktopDeepLink.ts`.
 
@@ -2734,7 +2733,7 @@ export function DesktopDeepLinkRouter() {
 `<SlowRpcRequestToastCoordinator />`:
 
 ```tsx
-        <DesktopDeepLinkRouter />
+<DesktopDeepLinkRouter />
 ```
 
 (Browser mode is a no-op: `window.desktopBridge` is undefined.)
@@ -2764,9 +2763,10 @@ runtime they configure) while **client/UI settings stay on the device** (appeara
 keybindings). No task anywhere implements or verifies this; before this phase ships the
 renamed settings surface, audit that every settings panel reads/writes the data source D8
 assigns it. This is an audit with in-place fixes for trivial leaks only — environment
-*selection* scoping is Phase 6; do not add environment pickers or re-scope panels here.
+_selection_ scoping is Phase 6; do not add environment pickers or re-scope panels here.
 
 **Files:**
+
 - Read: every `apps/web/src/routes/settings.*.tsx` and the components they render
   (`apps/web/src/components/settings/`).
 - Modify: only files with trivial leaks (definition below), plus their closest existing
@@ -2774,6 +2774,7 @@ assigns it. This is an audit with in-place fixes for trivial leaks only — envi
 - Modify: this plan file's "Residual risks / follow-ups" section (append findings).
 
 **Interfaces:**
+
 - Consumes: `useClientSettings` (`apps/web/src/hooks/useSettings.ts` — device-local store),
   `usePrimaryEnvironment` / `primaryServerConfigAtom` and the environment-scoped query
   atoms (`useEnvironmentQuery` with `environmentId`-keyed inputs — server-owned per D8).
@@ -2791,7 +2792,7 @@ rg -n "useClientSettings|useEnvironmentQuery|usePrimaryEnvironment|primaryServer
 Build a table (final-report artifact, not a committed file): section → component →
 data source(s) → D8 classification (`device-local` / `server-owned:<which environment>` /
 `desktop-host`). Every row must name the concrete atom/hook, not a guess — open each
-component far enough to see its reads *and* writes.
+component far enough to see its reads _and_ writes.
 
 - [ ] **Step 2: Verify server-owned panels target the environment they claim**
 
@@ -2836,6 +2837,7 @@ git commit -m "chore(web): audit settings data sources against D8 and fix trivia
 ### Task 10: Living docs, testing runbooks, and the full validation gate
 
 **Files:**
+
 - Modify: `docs/architecture/remote.md`
 - Review (update only if they mention the Connections settings section):
   `docs/architecture/connection-runtime.md`, `docs/architecture/overview.md`

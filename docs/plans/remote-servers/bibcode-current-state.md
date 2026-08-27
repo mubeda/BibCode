@@ -57,7 +57,7 @@ Authoritative living docs read for this survey:
   `apps/web/src/environmentGrouping.test.ts`), and
   `@bibcode/client-runtime/state/projectGrouping`
   (`packages/client-runtime/src/state/projectGrouping.ts`). Projects from
-  different environments can be *grouped* for presentation; grouping is
+  different environments can be _grouped_ for presentation; grouping is
   presentation-only and never merges server-side catalogs
   (`docs/architecture/connection-runtime.md`, "Worktree catalog
   subscriptions").
@@ -103,7 +103,7 @@ environment-scoped session. Removal is the sibling `project.delete` command
 ## 2. Client connection architecture
 
 **Already multi-environment.** This is the single most important answer for
-Remote Servers: the server URL is *not* singular. The connection runtime
+Remote Servers: the server URL is _not_ singular. The connection runtime
 (`packages/client-runtime`, docs in
 `docs/architecture/connection-runtime.md`) is built around a catalog of
 environments, each with its own supervised connection:
@@ -165,7 +165,7 @@ environments, each with its own supervised connection:
   the renderer reads it through the bridge (`getLocalEnvironmentBootstraps`,
   see `apps/web/src/connection/desktopLocal.ts` and
   `useDesktopLocalBootstraps.ts`). Secondary desktop-local backends (e.g. a
-  parallel WSL server) are registered as *bearer* targets whose connection id
+  parallel WSL server) are registered as _bearer_ targets whose connection id
   carries the `local:` prefix (`DESKTOP_LOCAL_CONNECTION_ID_PREFIX` in
   `desktopLocal.ts`) — i.e. even the desktop's own extra backends already go
   through the generic remote-connection machinery.
@@ -183,7 +183,7 @@ with columns for `project_id`, `title`, `workspace_root`, model selection,
 scripts, and worktree discovery JSON, plus a separate
 `project_worktree_repository_pins` table (~line 2305). Reads/writes in
 `apps/server/src/persistence/repositories.rs` (`list_projects` ~line 331).
-There is **no environment column**: one server process *is* one environment
+There is **no environment column**: one server process _is_ one environment
 ("A BiBCode server represents one execution environment",
 `docs/architecture/remote.md`). Environment scoping is a purely client-side
 concept (the client keys everything by the `environmentId` the server
@@ -197,7 +197,7 @@ scope.rs, http.rs, rpc.rs, secret_store.rs):
 - Policy matrix in `AuthService::build`
   (`apps/server/src/auth/service.rs:151–162`), keyed by
   `(unsafe_no_auth, ServerMode, remote_reachable)` where `remote_reachable =
-  !is_loopback_host(config.host)`: `"unsafe-no-auth"`,
+!is_loopback_host(config.host)`: `"unsafe-no-auth"`,
   `"desktop-managed-local"`, `"loopback-browser"`, `"remote-reachable"`.
   Binding to a non-loopback host automatically selects the remote policy —
   auth is not merely "localhost-only trust".
@@ -248,7 +248,7 @@ scope.rs, http.rs, rpc.rs, secret_store.rs):
   `/.well-known/bibcode/environment` for the environment descriptor
   (`docs/architecture/overview.md`).
 
-So a remote client connecting to a `bibcode` server is a *supported* path
+So a remote client connecting to a `bibcode` server is a _supported_ path
 already (bearer pairing or Connect relay); the missing pieces are operator
 ergonomics (TLS/reverse-proxy guidance, first-class UI) rather than protocol.
 
@@ -326,7 +326,7 @@ panel from `settingsLayout.tsx` primitives.
 
 **Precedent — it already exists.**
 `apps/web/src/components/settings/ConnectionsSettings.tsx` (route
-`/settings/connections`) *is* a remote-servers manager today:
+`/settings/connections`) _is_ a remote-servers manager today:
 
 - an "Add backend" dialog with `savedBackendMode: "remote" | "ssh"`
   (~line 2049), taking an endpoint URL + pairing credential for remote, or a
@@ -387,7 +387,7 @@ exist.
   cleanup ownership (`docs/architecture/remote.md`, "Desktop-managed SSH");
 - `disconnect_environment` (~line 522) tears down forwarding.
 
-SSH is deliberately a *desktop* capability — browser clients cannot assume
+SSH is deliberately a _desktop_ capability — browser clients cannot assume
 it. `apps/desktop/src-tauri/src/tailscale.rs` contributes discovered
 Tailscale advertised endpoints. **Known break:** fresh SSH setup currently
 invokes the removed `bibcode auth pairing create` CLI command while the
@@ -438,9 +438,9 @@ global bits are deliberate singletons:
   the host-provided primary;
 - a few primary-environment conveniences leak across environments, e.g.
   `Sidebar.tsx` ~line 1536: `// TODO(orca-port): this reads the PRIMARY
-  server's available editors; rows belonging to a different (remote)
-  environment may see an editor list that doesn't match their actual
-  backend.`
+server's available editors; rows belonging to a different (remote)
+environment may see an editor list that doesn't match their actual
+backend.`
 
 ---
 
@@ -461,7 +461,7 @@ global bits are deliberate singletons:
    `docs/architecture/remote.md`). A "Remote Servers" UI must be honest about
    which endpoints a browser client can actually use.
 3. **Auth policy is bind-address-derived.** `remote_reachable =
-   !is_loopback_host(host)` (`apps/server/src/auth/service.rs:151`). Exposing
+!is_loopback_host(host)` (`apps/server/src/auth/service.rs:151`). Exposing
    a server means rebinding it (CLI `--host`), which changes its auth policy
    and, in desktop update-protection paths, is explicitly denied for
    ordinary native wildcard binds (`docs/architecture/overview.md`, "Desktop
@@ -499,7 +499,7 @@ global bits are deliberate singletons:
    assuming the bridge.
 9. **One server = one environment.** The server has no notion of serving
    multiple environments, and `projection_projects` has no environment
-   column. "Remote Servers" should therefore stay a *client-side catalog*
+   column. "Remote Servers" should therefore stay a _client-side catalog_
    feature (more `KnownEnvironment`s), not a server-side multiplexing
    feature — matching the existing design rule in
    `docs/architecture/remote.md`.

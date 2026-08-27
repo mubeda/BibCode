@@ -57,15 +57,15 @@ Copied from the master plan; every task's requirements implicitly include these.
 
 ## Consumed interfaces (from earlier phases — do not redefine)
 
-| Interface | Owner | This plan's usage |
-|---|---|---|
-| `packages/contracts/src/remotePairing.ts` — pairing-code payload schema, fields exactly `v`, `endpoint`, `name`, `token`, `hostKey`, `reach`, `storageInstanceId` (spec §4.2) | Phase 3 | Reach literals + payload shape. **Assumption:** the file exports `RemotePairingReach = Schema.Literals(["another-device", "this-computer", "custom"])`. If Phase 3 exported the literal under another name, use that name; if it exists only inline, add the named export to `remotePairing.ts` in Task 2 (schema-only, no behavior change). |
-| Rust mirror of the payload in `apps/server/src/auth/` (spec §4.2) | Phase 3 | Used inside the Phase 3-landed offer handler (payload composition + encoding); this phase never calls it directly. Verify with `rg "RemotePairingCodePayload|encode_pairing_code" apps/server/src` if Task 4's handler edit touches nearby code. |
-| Host identity public key accessor (spec §4.1) | Phase 3 | Used inside the Phase 3-landed offer handler; this phase never calls it directly. Verify with `rg "host_identity" apps/server/src/auth` if Task 4's handler edit touches nearby code. |
-| `POST /api/auth/pairing-offer` mint surface: handler `create_pairing_offer`, TS `AuthCreatePairingOfferInput` / `AuthPairingOfferResult` (input carries `reach`, payload embeds it), fixtures `requests/pairing-offer.json` / `responses/pairing-offer.json`, `ROUTE_INVENTORY` entry, scope `access:write`, endpoint/reach validation | Phase 3 | Task 4 modifies **only the handler's issuance call** so the minted grant persists `reach`; everything else is consumed as-is (no new fixtures, routes, or schemas here). |
-| Remote Servers settings section + tab shell (`/settings/remote-servers`, Connect tab) | Phase 4 | Task 10 mounts `ShareThisHostTab` as the "Share this host" tab. Locate the shell at execution time via `rg "Share this host\|remote-servers" apps/web/src/routes apps/web/src/components/settings`; the route file is `apps/web/src/routes/settings.remote-servers.tsx`. |
-| `classifyPairingEndpoint` in `packages/shared/src/advertisedEndpoint.ts`, signature `(endpoint: string) => "loopback" \| "private-network" \| "public" \| "unconnectable"` | Phase 3 | Task 5 wraps it in a Phase 5-local mapping (`shareClassForPairingEndpoint`); this phase never redefines or extends the shared export. |
-| `activeEnvironmentIdAtom`, `authEnvironment.accessChanges`, `PairingClientsList`, `QRCodeSvg`, `desktopNetworkAccessStateAtom` | existing code | Reused as-is (verified against current source in this plan). |
+| Interface                                                                                                                                                                                                                                                                                                                              | Owner         | This plan's usage                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/contracts/src/remotePairing.ts` — pairing-code payload schema, fields exactly `v`, `endpoint`, `name`, `token`, `hostKey`, `reach`, `storageInstanceId` (spec §4.2)                                                                                                                                                          | Phase 3       | Reach literals + payload shape. **Assumption:** the file exports `RemotePairingReach = Schema.Literals(["another-device", "this-computer", "custom"])`. If Phase 3 exported the literal under another name, use that name; if it exists only inline, add the named export to `remotePairing.ts` in Task 2 (schema-only, no behavior change). |
+| Rust mirror of the payload in `apps/server/src/auth/` (spec §4.2)                                                                                                                                                                                                                                                                      | Phase 3       | Used inside the Phase 3-landed offer handler (payload composition + encoding); this phase never calls it directly. Verify with `rg "RemotePairingCodePayload                                                                                                                                                                                 | encode_pairing_code" apps/server/src` if Task 4's handler edit touches nearby code. |
+| Host identity public key accessor (spec §4.1)                                                                                                                                                                                                                                                                                          | Phase 3       | Used inside the Phase 3-landed offer handler; this phase never calls it directly. Verify with `rg "host_identity" apps/server/src/auth` if Task 4's handler edit touches nearby code.                                                                                                                                                        |
+| `POST /api/auth/pairing-offer` mint surface: handler `create_pairing_offer`, TS `AuthCreatePairingOfferInput` / `AuthPairingOfferResult` (input carries `reach`, payload embeds it), fixtures `requests/pairing-offer.json` / `responses/pairing-offer.json`, `ROUTE_INVENTORY` entry, scope `access:write`, endpoint/reach validation | Phase 3       | Task 4 modifies **only the handler's issuance call** so the minted grant persists `reach`; everything else is consumed as-is (no new fixtures, routes, or schemas here).                                                                                                                                                                     |
+| Remote Servers settings section + tab shell (`/settings/remote-servers`, Connect tab)                                                                                                                                                                                                                                                  | Phase 4       | Task 10 mounts `ShareThisHostTab` as the "Share this host" tab. Locate the shell at execution time via `rg "Share this host\|remote-servers" apps/web/src/routes apps/web/src/components/settings`; the route file is `apps/web/src/routes/settings.remote-servers.tsx`.                                                                     |
+| `classifyPairingEndpoint` in `packages/shared/src/advertisedEndpoint.ts`, signature `(endpoint: string) => "loopback" \| "private-network" \| "public" \| "unconnectable"`                                                                                                                                                             | Phase 3       | Task 5 wraps it in a Phase 5-local mapping (`shareClassForPairingEndpoint`); this phase never redefines or extends the shared export.                                                                                                                                                                                                        |
+| `activeEnvironmentIdAtom`, `authEnvironment.accessChanges`, `PairingClientsList`, `QRCodeSvg`, `desktopNetworkAccessStateAtom`                                                                                                                                                                                                         | existing code | Reused as-is (verified against current source in this plan).                                                                                                                                                                                                                                                                                 |
 
 Interfaces this phase **produces** (consumed by Phase 3's add-flow and Phase 6/7 UI):
 
@@ -91,7 +91,7 @@ Interfaces this phase **produces** (consumed by Phase 3's add-flow and Phase 6/7
    again** (`apps/desktop/src-tauri/src/backend.rs:1153`). Live WebSocket connections
    drop, in-flight provider turns on local backends terminate, terminals close. Durable
    orchestration state persists and the renderer reconnects via the `backend-ready`
-   event. The new `applyServerExposure` command keeps this mechanism (it *is* the
+   event. The new `applyServerExposure` command keeps this mechanism (it _is_ the
    existing exposure machinery the spec requires) and adds verification + rollback. UI
    copy must warn before widening: "Enabling remote access restarts the local server.
    Running turns on this machine will stop."
@@ -125,7 +125,7 @@ Interfaces this phase **produces** (consumed by Phase 3's add-flow and Phase 6/7
    dynamically picked (`portpicker` fallback in `backend.rs`), so a port-scoped rule
    would silently go stale. The rule allows inbound TCP to the desktop executable
    (`netsh advfirewall firewall add rule name="BiBCode Remote Access" dir=in
-   action=allow program=<exe> protocol=TCP profile=domain,private enable=yes`), added on
+action=allow program=<exe> protocol=TCP profile=domain,private enable=yes`), added on
    widen, deleted on revert. Command construction is unit-tested on all platforms;
    execution is `#[cfg(windows)]` and validated per `docs/testing/windows-desktop.md`.
 6. **Narrow-only reconciler at app level.** A headless desktop-mode hook mounted in
@@ -160,11 +160,13 @@ Interfaces this phase **produces** (consumed by Phase 3's add-flow and Phase 6/7
 ### Task 1: Persist `reach` + `off_host` on pairing links and sessions (migration + repositories)
 
 **Files:**
+
 - Modify: `apps/server/src/persistence/migrations.rs` (registry ~line 617, add `migration_046`)
 - Modify: `apps/server/src/persistence/repositories.rs` (structs ~lines 1442–1494, SQL consts ~lines 1492–1494, `create_auth_pairing_link` ~line 1044, `create_auth_session` ~line 1111, decoders)
 - Test: repository round-trip tests inside `apps/server/src/persistence/repositories.rs` test module (follow the file's existing test placement; if auth repo tests live in `apps/server/tests/auth_http.rs`'s restart tests instead, put the round-trip test beside the existing auth persistence tests found via `rg "create_auth_pairing_link" apps/server --glob '*test*'`)
 
 **Interfaces:**
+
 - Consumes: existing `AuthPairingLink`, `NewAuthSession`, `AuthSession` row structs.
 - Produces: `reach: Option<String>` and `off_host: Option<bool>` fields on all three
   structs; migration id 46 (`AuthPairingReach`). Later tasks rely on the exact field
@@ -175,8 +177,8 @@ phase claimed 46 by the time this executes, take the next free id and keep the n
 `AuthPairingReach`.
 
 - [ ] **Step 1: Write the failing test** — round-trip a pairing link and a session with
-  `reach` through the repositories (place beside the existing repository tests; mirror
-  their store-construction helper):
+      `reach` through the repositories (place beside the existing repository tests; mirror
+      their store-construction helper):
 
 ```rust
 #[tokio::test]
@@ -261,6 +263,7 @@ literal; `off_host` is the **mint-time computed** flag the exposure derivation r
 `NULL` on legacy rows.
 
 In `repositories.rs`:
+
 - Add `pub reach: Option<String>` and `pub off_host: Option<bool>` to
   `AuthPairingLink`, `NewAuthSession`, `AuthSession` (last fields of each).
 - Append `reach, off_host` as the **last** columns of `PAIRING_SELECT`, the `RETURNING`
@@ -294,6 +297,7 @@ git commit -m "feat(server): persist pairing-grant reach and off-host flag on li
 ### Task 2: Thread `reach` through AuthService and the auth contracts
 
 **Files:**
+
 - Modify: `apps/server/src/auth/service.rs` (`PairingRecord` ~line 98, `SessionRecord`
   ~line 83, `Grant` ~line 111, `issue_pairing_for_subject` ~line 542,
   `exchange_bootstrap` ~line 299, `persisted_pairing_link` ~line 991,
@@ -307,6 +311,7 @@ git commit -m "feat(server): persist pairing-grant reach and off-host flag on li
   `packages/contracts/src/authRustParity.test.ts`
 
 **Interfaces:**
+
 - Consumes: Task 1's `reach` + `off_host` persistence fields; Phase 3's
   `RemotePairingReach` TS literal (assumption noted above — verify/align, adding the
   named export to `packages/contracts/src/remotePairing.ts` only if missing).
@@ -323,7 +328,7 @@ git commit -m "feat(server): persist pairing-grant reach and off-host flag on li
     `off_host`.
 
 - [ ] **Step 1: Write the failing service test** (in the `service.rs` test module,
-  mirroring `owned_scopes(STANDARD_SCOPES)` usage from existing tests):
+      mirroring `owned_scopes(STANDARD_SCOPES)` usage from existing tests):
 
 ```rust
 #[tokio::test]
@@ -376,6 +381,7 @@ Expected: FAIL — `issue_share_pairing` not defined.
 - [ ] **Step 3: Implement**
 
 In `service.rs`:
+
 - Add `reach: Option<String>` and `off_host: Option<bool>` to `PairingRecord`,
   `SessionRecord`, and `Grant`.
 - Add a validation helper + constant near the top of the file:
@@ -389,7 +395,7 @@ fn is_valid_pairing_reach(value: &str) -> bool {
 ```
 
 - `issue_pairing_for_subject` gains two trailing parameters `reach: Option<String>,
-  off_host: Option<bool>`; the four existing internal callers (`issue_pairing`,
+off_host: Option<bool>`; the four existing internal callers (`issue_pairing`,
   `issue_pairing_with_proof`, `issue_cloud_pairing`, `issue_startup_pairing`) pass
   `None, None`. Add:
 
@@ -456,12 +462,14 @@ add `reach?: RemotePairingReach`).
 - [ ] **Step 4: Regenerate auth fixtures and run parity + tests**
 
 Run:
+
 ```bash
 cargo test -p bibcode-server share_pairing_reach
 node packages/contracts/scripts/export-rust-auth-fixtures.ts
 vp test run packages/contracts/src/authRustParity.test.ts
 cargo test -p bibcode-server --test auth_http
 ```
+
 Expected: all PASS. If the export script embeds sample response bodies, extend the
 pairing-list and clients-list samples with `"reach": "another-device"` so the Rust side
 exercises the new field.
@@ -480,6 +488,7 @@ git commit -m "feat(server,contracts): thread pairing reach through auth service
 ### Task 3: Share-state derivation + `GET /api/auth/share-state`
 
 **Files:**
+
 - Modify: `apps/server/src/auth/service.rs` (new `share_exposure_state`), `apps/server/src/auth/model.rs` (new `ShareExposureState`), `apps/server/src/auth/http.rs` (route + handler)
 - Modify: `packages/contracts/src/auth.ts`, `packages/contracts/src/environmentHttp.ts`, `packages/contracts/src/authRustParity.test.ts`, `packages/contracts/scripts/export-rust-auth-fixtures.ts`
 - Create: `packages/contracts/fixtures/auth-http/responses/share-state.json`
@@ -488,6 +497,7 @@ git commit -m "feat(server,contracts): thread pairing reach through auth service
 - Test: `apps/server/src/auth/service.rs` unit tests; `apps/server/tests/auth_http.rs` integration test
 
 **Interfaces:**
+
 - Consumes: Task 2's reach/off-host-carrying records. The derivation reads the
   **persisted mint-time `off_host` flag**, never the `reach` literal (amended spec
   §4.6: a `custom` grant pointing at a loopback endpoint must not widen).
@@ -768,6 +778,7 @@ cargo test -p bibcode-server share_exposure
 cargo test -p bibcode-server --test auth_http
 vp test run packages/contracts/src/authRustParity.test.ts
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -783,11 +794,13 @@ git commit -m "feat(server,contracts): derive desired exposure from unrevoked of
 ### Task 4: Persist `reach` + mint-time `off_host` on grants minted by the pairing-offer endpoint
 
 **Files:**
+
 - Modify: `apps/server/src/auth/http.rs` (`create_pairing_offer` handler — **landed by
   Phase 3**; this task changes only its issuance call)
 - Test: `apps/server/tests/auth_http.rs`
 
 **Interfaces:**
+
 - Consumes:
   - Phase 3's landed pairing-offer surface — verify presence before starting
     (`rg "pairing-offer|pairingOffer" apps/server/src packages/contracts/src`):
@@ -815,7 +828,7 @@ endpoint's host is non-loopback) and (b) switching the handler's issuance call t
 `issue_share_pairing` so the grant row records both.
 
 - [ ] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
-  using the file's existing helpers):
+      using the file's existing helpers):
 
 ```rust
 #[tokio::test]
@@ -974,6 +987,7 @@ against its own literal list, unify it on Task 2's `PAIRING_REACH_VALUES` consta
 cargo test -p bibcode-server --test auth_http
 vp test run packages/contracts/src/authRustParity.test.ts
 ```
+
 Expected: PASS. No fixture changes: the response shape already carries `reach`
 (Phase 3), and the pairing-links response fixture already gained `reach` in Task 2.
 
@@ -989,11 +1003,12 @@ git commit -m "feat(server): persist reach and mint-time off-host flag on pairin
 ### Task 4b: Actively terminate live WebSocket sessions on revocation
 
 Amended spec §3 (Revocation): today `revoke_client` / `revoke_other_clients` only
-remove the session — per-request reauthorization rejects the *next* call
+remove the session — per-request reauthorization rejects the _next_ call
 (`apps/server/src/rpc/session.rs`), but already-open WebSocket streams keep flowing.
 This task adds active termination so a revoked device loses its streams immediately.
 
 **Files:**
+
 - Modify: `apps/server/src/auth/service.rs` (connection registry on the state struct
   behind `self.state`; `mark_connected` ~line 752 / `mark_disconnected` ~line 784;
   `revoke_client` ~line 679; `revoke_other_clients` ~line 716)
@@ -1003,6 +1018,7 @@ This task adds active termination so a revoked device loses its streams immediat
 - Test: `apps/server/tests/auth_http.rs`
 
 **Interfaces:**
+
 - Consumes: the existing per-connection `session_shutdown` token
   (`state.shutdown.child_token()`, `http.rs:205`) and the existing
   `mark_connected`/`mark_disconnected` bookkeeping.
@@ -1016,7 +1032,7 @@ This task adds active termination so a revoked device loses its streams immediat
     the revoked session ids, closing its live WebSockets server-side.
 
 - [ ] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
-  same helpers as the existing WebSocket tests):
+      same helpers as the existing WebSocket tests):
 
 ```rust
 #[tokio::test]
@@ -1188,6 +1204,7 @@ session changes needed.
 cargo test -p bibcode-server --test auth_http
 cargo test -p bibcode-server auth
 ```
+
 Expected: PASS, including the existing connected-count and revocation tests.
 
 - [ ] **Step 5: Commit**
@@ -1202,10 +1219,12 @@ git commit -m "feat(server): close live WebSocket sessions when a client is revo
 ### Task 5: Share-class mapping over Phase 3's `classifyPairingEndpoint`
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/remote-servers/endpointClass.ts`
 - Test: `apps/web/src/components/settings/remote-servers/endpointClass.test.ts`
 
 **Interfaces:**
+
 - Consumes: **Phase 3 owns** `classifyPairingEndpoint` in
   `packages/shared/src/advertisedEndpoint.ts` with signature
   `(endpoint: string) => "loopback" | "private-network" | "public" | "unconnectable"`.
@@ -1259,7 +1278,7 @@ Run: `vp test run apps/web/src/components/settings/remote-servers/endpointClass.
 Expected: FAIL — module missing.
 
 - [ ] **Step 3: Implement** (`endpointClass.ts`; check the exact subpath export for
-  the shared module in `packages/shared/package.json`):
+      the shared module in `packages/shared/package.json`):
 
 ```ts
 import { classifyPairingEndpoint } from "@bibcode/shared/advertisedEndpoint";
@@ -1296,10 +1315,12 @@ git commit -m "feat(web): map pairing-endpoint classification to share classes"
 ### Task 6: Windows firewall rule management (desktop)
 
 **Files:**
+
 - Create: `apps/desktop/src-tauri/src/firewall.rs`
 - Modify: `apps/desktop/src-tauri/src/lib.rs` (add `mod firewall;` beside the existing module declarations)
 
 **Interfaces:**
+
 - Produces:
   - `firewall::remote_access_rule_add_args(program: &str) -> Vec<String>`
   - `firewall::remote_access_rule_delete_args() -> Vec<String>`
@@ -1461,6 +1482,7 @@ git commit -m "feat(desktop): manage a program-scoped Windows firewall rule for 
 ### Task 7: `applyServerExposure` bridge command with verification + rollback
 
 **Files:**
+
 - Modify: `apps/desktop/src-tauri/src/bridge.rs` (replace
   `desktop_bridge_set_server_exposure_mode` ~line 1189 with
   `desktop_bridge_apply_server_exposure`; update the command registration test ~line 2837
@@ -1470,6 +1492,7 @@ git commit -m "feat(desktop): manage a program-scoped Windows firewall rule for 
 - Modify: `apps/web/src/tauriDesktopBridge.ts` (+ `apps/web/src/tauriDesktopBridge.test.ts`)
 
 **Interfaces:**
+
 - Consumes: `BackendSupervisor::restart_default_if_active`, `read_desktop_settings`,
   `update_desktop_settings`, `server_exposure_state`, Task 6
   `firewall::sync_remote_access_rule`.
@@ -1482,6 +1505,7 @@ git commit -m "feat(desktop): manage a program-scoped Windows firewall rule for 
     is the manual toggle this phase deletes; no compatibility alias).
 
 Rollback semantics (pinned, spec §4.6 "rollback to loopback on bind failure"):
+
 1. Snapshot the prior persisted mode.
 2. Persist the desired mode; restart the default backend set.
 3. Verify: for `network-accessible`, the achieved run config must report
@@ -1497,8 +1521,8 @@ Rollback semantics (pinned, spec §4.6 "rollback to loopback on bind failure"):
    bind.
 
 - [ ] **Step 1: Failing bridge test** — extend the existing invoke-based test module in
-  `bridge.rs` (mirror the harness used by the current
-  `desktop_bridge_set_server_exposure_mode` test at ~line 2969):
+      `bridge.rs` (mirror the harness used by the current
+      `desktop_bridge_set_server_exposure_mode` test at ~line 2969):
 
 ```rust
 #[tokio::test]
@@ -1714,6 +1738,7 @@ vp test run apps/web/src/tauriDesktopBridge.test.ts
 vp test run apps/web/src/components/settings/ConnectionsSettings.test.tsx
 vp run typecheck
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -1730,10 +1755,12 @@ git commit -m "feat(desktop): apply server exposure with verification, rollback,
 ### Task 8: Web API functions for share-state and pairing offers
 
 **Files:**
+
 - Modify: `apps/web/src/environments/primary/auth.ts` (beside
   `createServerPairingCredential` ~line 370), `apps/web/src/environments/primary/index.ts` (exports)
 
 **Interfaces:**
+
 - Consumes: Task 3's share-state contract and Phase 3's pairing-offer contract
   (`client.auth.pairingOffer`) via the existing `PrimaryEnvironmentHttpClient` /
   `runPrimaryHttp` pattern. **Assumption:** Phase 3's endpoint accepts an
@@ -1810,10 +1837,12 @@ git commit -m "feat(web): client wrappers for pairing offers and share state"
 ### Task 9: Share-offer logic module (links, address options, generate orchestration)
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/remote-servers/shareOffer.ts`
 - Test: `apps/web/src/components/settings/remote-servers/shareOffer.test.ts`
 
 **Interfaces:**
+
 - Consumes: `AdvertisedEndpoint` (`@bibcode/contracts`), `DesktopServerExposureState`,
   Task 5's `shareClassForPairingEndpoint` / `ShareEndpointClass`, Task 8 function
   signatures (injected), `applyServerExposure` (injected).
@@ -1856,7 +1885,8 @@ export interface GenerateShareOfferDeps {
   readonly selectedOption: ShareAddressOption;
   readonly hasDesktopBridge: boolean;
   readonly exposureState: DesktopServerExposureState | null;
-  readonly applyServerExposure: ((desired: "local-only" | "network-accessible") => Promise<DesktopServerExposureState>) | null;
+  readonly applyServerExposure:
+    ((desired: "local-only" | "network-accessible") => Promise<DesktopServerExposureState>) | null;
   readonly mintOffer: (input: {
     name: string;
     endpoint: string;
@@ -1869,10 +1899,13 @@ export interface GenerateShareOfferDeps {
 }
 export async function generateShareOffer(
   deps: GenerateShareOfferDeps,
-): Promise<{ ok: true; offer: GeneratedShareOffer } | { ok: false; failure: GenerateShareOfferFailure }>;
+): Promise<
+  { ok: true; offer: GeneratedShareOffer } | { ok: false; failure: GenerateShareOfferFailure }
+>;
 ```
 
 Pinned behavior of `generateShareOffer` (decision 2):
+
 1. Resolve the target endpoint: custom → validated `customAddress`
    (`normalizeHttpBaseUrl`; parse failure ⇒ `invalid-address`); this-computer →
    `primary` loopback option's URL; another-device → the selected option's URL, or, for
@@ -1922,7 +1955,12 @@ const wideState = {
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,
 };
-const loopbackState = { ...wideState, mode: "local-only" as const, endpointUrl: null, advertisedHost: null };
+const loopbackState = {
+  ...wideState,
+  mode: "local-only" as const,
+  endpointUrl: null,
+  advertisedHost: null,
+};
 const defaultDeps = {
   newIdempotencyKey: () => "key-1",
   classifyMintError: (): "retryable" | "fatal" => "retryable",
@@ -1947,7 +1985,12 @@ describe("generateShareOffer", () => {
     });
     const mintOffer = vi.fn(async (input: { endpoint: string }) => {
       calls.push("mint");
-      return { code: "c0de", endpoint: input.endpoint, name: "AI-SERVER", expiresAt: "2026-08-27T01:00:00.000Z" };
+      return {
+        code: "c0de",
+        endpoint: input.endpoint,
+        name: "AI-SERVER",
+        expiresAt: "2026-08-27T01:00:00.000Z",
+      };
     });
     const result = await generateShareOffer({
       intent: "another-device",
@@ -1992,7 +2035,11 @@ describe("generateShareOffer", () => {
       intent: "this-computer",
       name: "AI-SERVER",
       customAddress: null,
-      selectedOption: { id: "primary", label: "This computer", httpBaseUrl: "http://127.0.0.1:3773" },
+      selectedOption: {
+        id: "primary",
+        label: "This computer",
+        httpBaseUrl: "http://127.0.0.1:3773",
+      },
       hasDesktopBridge: true,
       exposureState: loopbackState,
       applyServerExposure,
@@ -2023,7 +2070,12 @@ describe("generateShareOffer", () => {
         attempts += 1;
         seenKeys.add(input.idempotencyKey);
         if (attempts < 3) throw new Error("connection re-establishing");
-        return { code: "c0de", endpoint: input.endpoint, name: input.name, expiresAt: "2026-08-27T01:00:00.000Z" };
+        return {
+          code: "c0de",
+          endpoint: input.endpoint,
+          name: input.name,
+          expiresAt: "2026-08-27T01:00:00.000Z",
+        };
       },
       ...defaultDeps,
     });
@@ -2091,7 +2143,10 @@ describe("generateShareOffer", () => {
     });
     // Loopback custom address (an SSH tunnel) must not widen the bind (amended §4.6).
     expect(applyServerExposure).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ ok: true, offer: { endpointClass: "loopback", reach: "custom" } });
+    expect(result).toMatchObject({
+      ok: true,
+      offer: { endpointClass: "loopback", reach: "custom" },
+    });
   });
 });
 
@@ -2116,7 +2171,9 @@ describe("resolveShareAddressOptions", () => {
       primaryHttpBaseUrl: "http://127.0.0.1:3773",
     });
     expect(options[0]).toMatchObject({ id: "auto-lan", httpBaseUrl: null });
-    expect(options.some((option) => option.httpBaseUrl === "https://machine.tailnet.ts.net/")).toBe(true);
+    expect(options.some((option) => option.httpBaseUrl === "https://machine.tailnet.ts.net/")).toBe(
+      true,
+    );
   });
 
   it("offers only the loopback primary endpoint for this-computer", () => {
@@ -2144,12 +2201,14 @@ Run: `vp test run apps/web/src/components/settings/remote-servers/shareOffer.tes
 Expected: FAIL — module missing.
 
 - [ ] **Step 3: Implement `shareOffer.ts`** exactly to the pinned behavior above.
-  Reference implementation of the core orchestration:
+      Reference implementation of the core orchestration:
 
 ```ts
 export async function generateShareOffer(
   deps: GenerateShareOfferDeps,
-): Promise<{ ok: true; offer: GeneratedShareOffer } | { ok: false; failure: GenerateShareOfferFailure }> {
+): Promise<
+  { ok: true; offer: GeneratedShareOffer } | { ok: false; failure: GenerateShareOfferFailure }
+> {
   let endpoint: string | null;
   try {
     endpoint = resolveOfferEndpoint(deps);
@@ -2241,7 +2300,8 @@ export async function generateShareOffer(
     failure: {
       kind: "mint-failed",
       widened,
-      message: lastError instanceof Error ? lastError.message : "Could not create the pairing offer.",
+      message:
+        lastError instanceof Error ? lastError.message : "Could not create the pairing offer.",
     },
   };
 }
@@ -2271,6 +2331,7 @@ git commit -m "feat(web): share-offer generation logic with widen-first ceremony
 ### Task 10: `ShareThisHostTab` component and settings integration
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/remote-servers/ShareThisHostTab.tsx`
 - Test: `apps/web/src/components/settings/remote-servers/ShareThisHostTab.test.tsx`
 - Modify: the Phase 4 Remote Servers tab shell (locate per "Consumed interfaces") to
@@ -2278,6 +2339,7 @@ git commit -m "feat(web): share-offer generation logic with widen-first ceremony
   the superseded manual-exposure surface
 
 **Interfaces:**
+
 - Consumes: Task 9 module; Task 8 API functions; `desktopNetworkAccessStateAtom` +
   `refreshDesktopNetworkAccessState` (`apps/web/src/state/desktopNetworkAccess.ts`);
   `authEnvironment.accessChanges` snapshot (pairing links + client sessions, as in
@@ -2291,6 +2353,7 @@ git commit -m "feat(web): share-offer generation logic with widen-first ceremony
   "Share this host" tab.
 
 UI contract (all copy pinned here; spec §3/§4.8):
+
 - **Offer generator** section:
   - Name input (defaults to the machine/host name from the primary server config when
     available, else "BiBCode Server").
@@ -2318,7 +2381,7 @@ UI contract (all copy pinned here; spec §3/§4.8):
     you trust"** with the sub-copy "This link and the page it loads travel over plain
     HTTP. Prefer the pairing code for BiBCode clients." (spec §3 case 3), and a
     `QRCodeSvg value={offer.deepLink} size={128} level="M" marginSize={2}
-    title="Pairing code — scan with a BiBCode client"`. For `this-computer` and
+title="Pairing code — scan with a BiBCode client"`. For `this-computer` and
     loopback-classified custom offers, add "Loopback offer: reachable only through a
     tunnel into this machine."
 - **Exposure** section:
@@ -2351,8 +2414,8 @@ remaining `applyServerExposure` direct call left by Task 7's mechanical rename. 
 Share tab is now the only exposure surface.
 
 - [ ] **Step 1: Failing component tests** — mock exactly like
-  `ConnectionsSettings.test.tsx` mocks `~/environments/primary` and the bridge (reuse
-  its harness helpers where exported). Cover at minimum:
+      `ConnectionsSettings.test.tsx` mocks `~/environments/primary` and the bridge (reuse
+      its harness helpers where exported). Cover at minimum:
 
 ```ts
 // ShareThisHostTab.test.tsx — assertions to implement with the harness:
@@ -2383,8 +2446,8 @@ Run: `vp test run apps/web/src/components/settings/remote-servers/ShareThisHostT
 Expected: FAIL — component missing.
 
 - [ ] **Step 3: Implement the component** per the UI contract above. Skeleton of the
-  generate wiring (state and layout follow the section list; use the imports and
-  patterns already present in `ConnectionsSettings.tsx`):
+      generate wiring (state and layout follow the section list; use the imports and
+      patterns already present in `ConnectionsSettings.tsx`):
 
 ```tsx
 const [intent, setIntent] = useState<ShareIntent>("another-device");
@@ -2438,9 +2501,7 @@ const handleGenerate = useCallback(async () => {
         typeof error === "object" && error !== null && "cause" in error
           ? (error as { cause?: { _tag?: string } }).cause
           : undefined;
-      return cause?._tag !== undefined && FATAL_CAUSE_TAGS.has(cause._tag)
-        ? "fatal"
-        : "retryable"; // incl. RequestError/ResponseError and 500-class internal errors
+      return cause?._tag !== undefined && FATAL_CAUSE_TAGS.has(cause._tag) ? "fatal" : "retryable"; // incl. RequestError/ResponseError and 500-class internal errors
     },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
@@ -2452,14 +2513,7 @@ const handleGenerate = useCallback(async () => {
     refreshDesktopNetworkAccessState();
   }
   setIsGenerating(false);
-}, [
-  customAddress,
-  desktopBridge,
-  desktopServerExposureState,
-  intent,
-  offerName,
-  selectedOption,
-]);
+}, [customAddress, desktopBridge, desktopServerExposureState, intent, offerName, selectedOption]);
 ```
 
 Mount the tab in the Phase 4 shell; move (not copy) `PairingClientsList` and its row
@@ -2475,6 +2529,7 @@ vp test run apps/web/src/components/settings/remote-servers/ShareThisHostTab.tes
 vp test run apps/web/src/components/settings/ConnectionsSettings.test.tsx
 vp run typecheck
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -2489,12 +2544,14 @@ git commit -m "feat(web): Share this host tab with grant-driven exposure ceremon
 ### Task 11: Narrow-only exposure reconciler (app level)
 
 **Files:**
+
 - Create: `apps/web/src/state/shareExposureReconciler.ts`
 - Test: `apps/web/src/state/shareExposureReconciler.test.ts`
 - Modify: `apps/web/src/AppRoot.tsx` (mount the hook — the file already hosts
   desktop-only effects and reads `window.desktopBridge`)
 
 **Interfaces:**
+
 - Consumes: `getServerShareState` (Task 8), `DesktopBridge.applyServerExposure`
   (Task 7), `authEnvironment.accessChanges` via `useEnvironmentQuery`
   (`apps/web/src/state/query`), `primaryEnvironmentIdAtom`
@@ -2505,6 +2562,7 @@ git commit -m "feat(web): Share this host tab with grant-driven exposure ceremon
   - Hook: `useShareExposureReconciler(): void`
 
 Pinned behavior:
+
 - Revert iff `exposureMode === "network-accessible"` and
   `shareState.desiredExposure === "loopback"` and `shareState.legacyGrantCount === 0`
   (decision 4). The reconciler **never** widens.
@@ -2521,7 +2579,7 @@ Pinned behavior:
   mode).
 
 - [ ] **Step 1: Failing tests** — test the pure function exhaustively and the hook's
-  trigger wiring with mocks:
+      trigger wiring with mocks:
 
 ```ts
 import { describe, expect, it } from "@effect/vitest";
@@ -2529,7 +2587,11 @@ import { describe, expect, it } from "@effect/vitest";
 import { shouldRevertExposure } from "./shareExposureReconciler.ts";
 
 describe("shouldRevertExposure", () => {
-  const loopbackDesired = { desiredExposure: "loopback", offHostGrantCount: 0, legacyGrantCount: 0 } as const;
+  const loopbackDesired = {
+    desiredExposure: "loopback",
+    offHostGrantCount: 0,
+    legacyGrantCount: 0,
+  } as const;
 
   it("reverts a wide bind with no off-host and no legacy grants", () => {
     expect(
@@ -2547,7 +2609,9 @@ describe("shouldRevertExposure", () => {
   });
 
   it("never acts on a loopback bind or a wide-desired state", () => {
-    expect(shouldRevertExposure({ shareState: loopbackDesired, exposureMode: "local-only" })).toBe(false);
+    expect(shouldRevertExposure({ shareState: loopbackDesired, exposureMode: "local-only" })).toBe(
+      false,
+    );
     expect(
       shouldRevertExposure({
         shareState: { desiredExposure: "wide", offHostGrantCount: 1, legacyGrantCount: 0 },
@@ -2569,9 +2633,9 @@ Run: `vp test run apps/web/src/state/shareExposureReconciler.test.ts`
 Expected: FAIL — module missing.
 
 - [ ] **Step 3: Implement** the module (pure function + hook per the pinned behavior)
-  and mount `useShareExposureReconciler()` inside the component in `AppRoot.tsx` that
-  already runs per-app desktop effects (top of the component that reads
-  `window.desktopBridge`, ~line 28).
+      and mount `useShareExposureReconciler()` inside the component in `AppRoot.tsx` that
+      already runs per-app desktop effects (top of the component that reads
+      `window.desktopBridge`, ~line 28).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -2579,6 +2643,7 @@ Expected: FAIL — module missing.
 vp test run apps/web/src/state/shareExposureReconciler.test.ts
 vp test run apps/web/src/AppRoot.test.tsx apps/web/src/AppRoot.lifecycle.test.tsx
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -2593,6 +2658,7 @@ git commit -m "feat(web): revert server exposure when the last off-host grant is
 ### Task 12: Living documentation and testing runbooks
 
 **Files:**
+
 - Modify: `docs/architecture/remote.md`, `docs/architecture/overview.md`
 - Modify: `docs/testing/windows-desktop.md`
 - Review (state outcome explicitly): `docs/testing/linux-desktop.md`,
@@ -2600,7 +2666,7 @@ git commit -m "feat(web): revert server exposure when the last off-host grant is
   `docs/testing/README.md`
 
 - [ ] **Step 1: `docs/architecture/remote.md`** — add/extend a "Share ceremony and
-  exposure" section covering, in prose consistent with the file's voice:
+      exposure" section covering, in prose consistent with the file's voice:
   - pairing offers: extend whatever Phase 3 documented for
     `POST /api/auth/pairing-offer` (it mints the §4.2 payload server-side) with this
     phase's addition — grants minted there record `reach` plus the mint-time
@@ -2620,20 +2686,20 @@ git commit -m "feat(web): revert server exposure when the last off-host grant is
   - the honest restart consequence (live connections drop; durable state persists) and
     the maintenance-API degradation while wide (decision 8).
 - [ ] **Step 2: `docs/architecture/overview.md`** — in the "Desktop update protection"
-  /exposure vicinity, one paragraph: exposure changes now flow exclusively through the
-  grant-driven ceremony; the manual toggle is gone; wildcard native binds still occur
-  only via this machinery.
+      /exposure vicinity, one paragraph: exposure changes now flow exclusively through the
+      grant-driven ceremony; the manual toggle is gone; wildcard native binds still occur
+      only via this machinery.
 - [ ] **Step 3: `docs/testing/windows-desktop.md`** — add a validation procedure to the
-  packaged-UI flow section: generate an "Another device" offer from Settings → Remote
-  Servers → Share this host; verify (a) the server restarts and the offer renders
-  URL + deep link + QR, (b) `netsh advfirewall firewall show rule name="BiBCode Remote
-  Access"` lists the program-scoped rule, (c) revoking the offer/paired client reverts
-  exposure and (d) the rule is removed. Keep execution-specific evidence out of the
-  runbook (it belongs in reports from the template).
+      packaged-UI flow section: generate an "Another device" offer from Settings → Remote
+      Servers → Share this host; verify (a) the server restarts and the offer renders
+      URL + deep link + QR, (b) `netsh advfirewall firewall show rule name="BiBCode Remote
+Access"` lists the program-scoped rule, (c) revoking the offer/paired client reverts
+      exposure and (d) the rule is removed. Keep execution-specific evidence out of the
+      runbook (it belongs in reports from the template).
 - [ ] **Step 4: Review the remaining runbooks.** Linux/macOS packaged flows gain the
-  Share tab generation + revert check **without** the firewall step — add that flow if
-  the runbooks enumerate settings surfaces; otherwise record in the final report:
-  "reviewed and remain accurate". `cross-platform-validation.md` likewise.
+      Share tab generation + revert check **without** the firewall step — add that flow if
+      the runbooks enumerate settings surfaces; otherwise record in the final report:
+      "reviewed and remain accurate". `cross-platform-validation.md` likewise.
 - [ ] **Step 5: Commit**
 
 ```bash
