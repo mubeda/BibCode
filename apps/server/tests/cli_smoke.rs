@@ -190,6 +190,97 @@ async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
     handle.join().await.expect("stop active storage owner");
 }
 
+#[tokio::test]
+async fn pairing_issue_prints_a_credential_the_running_server_exchanges() {
+    let root = TempDir::new().expect("temporary storage root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start pairing storage owner");
+    let http_base_url = format!("http://{}", handle.local_addr());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "issue", "--base-dir"])
+        .arg(root.path())
+        .args(["--label", "SSH bootstrap", "--json"])
+        .output()
+        .expect("run pairing issue");
+    assert!(
+        output.status.success(),
+        "pairing issue failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 pairing output");
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .expect("pairing JSON line");
+    let value: Value = serde_json::from_str(line).expect("pairing JSON document");
+    let credential = value["credential"].as_str().expect("credential string");
+    assert!(!credential.trim().is_empty());
+    assert_eq!(value["label"], "SSH bootstrap");
+    assert!(value["expiresAt"].as_str().is_some());
+
+    let exchange = reqwest::Client::new()
+        .post(format!("{http_base_url}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", credential),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            ("client_label", "CLI pairing smoke"),
+            ("client_device_type", "desktop"),
+        ])
+        .send()
+        .await
+        .expect("token exchange request");
+    assert_eq!(exchange.status(), reqwest::StatusCode::OK);
+    let token: Value = exchange.json().await.expect("token exchange JSON");
+    assert!(
+        token["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
+    assert_eq!(token["token_type"], "Bearer");
+    assert!(
+        token["scope"]
+            .as_str()
+            .is_some_and(|scope| scope.contains("access:write"))
+    );
+
+    handle.shutdown();
+    handle.join().await.expect("stop pairing storage owner");
+}
+
+#[test]
+fn pairing_issue_fails_closed_without_a_data_store() {
+    let root = TempDir::new().expect("temporary empty root");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["pairing", "issue", "--base-dir"])
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .expect("run pairing issue without a store");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no BiBCode data store"), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "no credential may be printed on failure"
+    );
+}
+
 #[test]
 #[cfg(windows)]
 fn headless_binary_reports_invalid_bootstrap_descriptors_without_panicking() {
