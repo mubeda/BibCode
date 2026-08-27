@@ -97,11 +97,15 @@ describe("EnvironmentContextCard", () => {
     const labels = h.menuItems.map((item) => item.children);
     expect(labels).toContain("Disconnect");
     expect(labels).toContain("Manage…");
-    (h.menuItems.find((item) => item.children === "Disconnect")?.onClick as () => void)();
+    const disconnect = h.menuItems.find((item) => item.children === "Disconnect");
+    expect(disconnect).toBeDefined();
+    (disconnect!.onClick as () => void)();
     expect(h.commandCalls).toEqual([
       { label: "environment-catalog:disconnect", input: ENV_REMOTE },
     ]);
-    (h.menuItems.find((item) => item.children === "Manage…")?.onClick as () => void)();
+    const manage = h.menuItems.find((item) => item.children === "Manage…");
+    expect(manage).toBeDefined();
+    (manage!.onClick as () => void)();
     expect(h.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
   });
 
@@ -119,7 +123,7 @@ describe("EnvironmentContextCard", () => {
     renderToStaticMarkup(<EnvironmentContextCard onCheckForUpdates={onCheckForUpdates} />);
     const item = h.menuItems.find((entry) => entry.children === "Check for updates");
     expect(item).toBeDefined();
-    (item?.onClick as () => void)();
+    (item!.onClick as () => void)();
     expect(onCheckForUpdates).toHaveBeenCalledWith(ENV_REMOTE);
   });
 

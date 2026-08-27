@@ -33,9 +33,7 @@ export function RemoteServersSettings({
             initialPairingCode={initialPairingCode}
             {...(initialAddServerOpen ? { initialAddServerOpen: true } : {})}
             {...(onPairingCodeConsumed === undefined ? {} : { onPairingCodeConsumed })}
-            {...(onAddServerActionConsumed === undefined
-              ? {}
-              : { onAddServerActionConsumed })}
+            {...(onAddServerActionConsumed === undefined ? {} : { onAddServerActionConsumed })}
           />
         </TabsPanel>
         <TabsPanel value="share">

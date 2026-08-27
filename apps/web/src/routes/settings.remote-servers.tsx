@@ -8,9 +8,7 @@ export interface RemoteServersSearch {
   readonly action?: "add-server";
 }
 
-export function validateRemoteServersSearch(
-  search: Record<string, unknown>,
-): RemoteServersSearch {
+export function validateRemoteServersSearch(search: Record<string, unknown>): RemoteServersSearch {
   return {
     ...(search.tab === "share" ? { tab: "share" as const } : {}),
     ...(typeof search.code === "string" && search.code.length > 0 ? { code: search.code } : {}),
@@ -35,9 +33,7 @@ function RemoteServersRouteView() {
         void navigate({
           search: (previous) => ({
             ...(previous.tab === "share" ? { tab: "share" as const } : {}),
-            ...(previous.action === "add-server"
-              ? { action: "add-server" as const }
-              : {}),
+            ...(previous.action === "add-server" ? { action: "add-server" as const } : {}),
           }),
           replace: true,
         });
