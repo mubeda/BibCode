@@ -1,5 +1,6 @@
 "use client";
 
+import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
   isAtomCommandInterrupted,
@@ -26,7 +27,12 @@ import { useCenterPanelStore } from "~/centerPanelStore";
 import { readLocalApi } from "~/localApi";
 import { newThreadId } from "~/lib/utils";
 import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
-import { readEnvironmentThreadRefs, readThreadShell, useProjects } from "~/state/entities";
+import {
+  readEnvironmentThreadRefs,
+  readThreadShell,
+  useActiveEnvironmentId,
+  useProjects,
+} from "~/state/entities";
 import { projectEnvironment } from "~/state/projects";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -94,6 +100,8 @@ export interface AddProjectWorkflowStateInput {
   readonly hosts: ReadonlyArray<AddProjectHostOption>;
   readonly locationLabel: AddProjectLocationLabel;
   readonly primaryEnvironmentId: EnvironmentId;
+  /** Rail-selected environment; wins over the primary host when it is a listed host. */
+  readonly initialEnvironmentId: EnvironmentId | null;
   readonly operations: Pick<
     ReturnType<typeof createAddProjectOperations>,
     "addFolder" | "clone" | "create"
@@ -119,8 +127,11 @@ function fallbackHost(primaryEnvironmentId: EnvironmentId): AddProjectHostOption
   };
 }
 
-function primaryHost(input: AddProjectWorkflowStateInput): AddProjectHostOption {
+function initialWorkflowHost(input: AddProjectWorkflowStateInput): AddProjectHostOption {
   return (
+    (input.initialEnvironmentId !== null
+      ? input.hosts.find((host) => host.environmentId === input.initialEnvironmentId)
+      : undefined) ??
     input.hosts.find((host) => host.environmentId === input.primaryEnvironmentId) ??
     input.hosts[0] ??
     fallbackHost(input.primaryEnvironmentId)
@@ -136,7 +147,10 @@ function unexpectedErrorMessage(error: unknown): string {
 export function useAddProjectWorkflowState(
   input: AddProjectWorkflowStateInput,
 ): AddProjectWorkflow {
-  const initialHost = useMemo(() => primaryHost(input), [input.hosts, input.primaryEnvironmentId]);
+  const initialHost = useMemo(
+    () => initialWorkflowHost(input),
+    [input.hosts, input.initialEnvironmentId, input.primaryEnvironmentId],
+  );
   const [selectedEnvironmentId, setSelectedEnvironmentId] = useState(initialHost.environmentId);
   const [step, setStep] = useState<AddProjectStep>("start");
   const [busy, setBusy] = useState(false);
@@ -547,12 +561,23 @@ function adaptAtomResult<T, E>(result: AtomCommandResult<T, E>): AddProjectComma
   };
 }
 
+/** Saved remote environments (SSH, direct, relay) are add-project hosts. */
+function isRemoteEnvironmentTarget(target: ConnectionTarget): boolean {
+  return (
+    (target._tag === "BearerConnectionTarget" ||
+      target._tag === "RelayConnectionTarget" ||
+      target._tag === "SshConnectionTarget") &&
+    !isDesktopLocalConnectionTarget(target)
+  );
+}
+
 export function useAddProjectWorkflow(input: {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
 }): AddProjectWorkflow {
   const { environments } = useEnvironments();
   const primaryEnvironment = usePrimaryEnvironment();
+  const activeEnvironmentId = useActiveEnvironmentId();
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const projects = useProjects();
   const projectsRef = useRef(projects);
@@ -566,8 +591,15 @@ export function useAddProjectWorkflow(input: {
   const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
 
   const hosts = useMemo((): ReadonlyArray<AddProjectHostOption> => {
-    const presentedEnvironments = environments.filter((environment) =>
-      presentation.presentsTarget(environment.entry.target),
+    const remoteEnvironmentIds = new Set(
+      environments
+        .filter((environment) => isRemoteEnvironmentTarget(environment.entry.target))
+        .map((environment) => environment.environmentId),
+    );
+    const presentedEnvironments = environments.filter(
+      (environment) =>
+        presentation.presentsTarget(environment.entry.target) ||
+        isRemoteEnvironmentTarget(environment.entry.target),
     );
     const catalogHosts = presentedEnvironments.map((environment): AddProjectHostOption => {
       const isPrimary = environment.environmentId === primaryEnvironment?.environmentId;
@@ -594,7 +626,10 @@ export function useAddProjectWorkflow(input: {
     });
     const usableHosts = catalogHosts.filter(
       (host) =>
-        presentation.surface === "browser" || host.isPrimary || host.desktopInstanceId !== null,
+        presentation.surface === "browser" ||
+        host.isPrimary ||
+        host.desktopInstanceId !== null ||
+        remoteEnvironmentIds.has(host.environmentId),
     );
     return usableHosts.length > 0 ? usableHosts : [fallbackHost(primaryEnvironmentId)];
   }, [
@@ -800,6 +835,7 @@ export function useAddProjectWorkflow(input: {
     hosts,
     locationLabel,
     primaryEnvironmentId,
+    initialEnvironmentId: activeEnvironmentId,
     operations,
     pickFolder,
   });

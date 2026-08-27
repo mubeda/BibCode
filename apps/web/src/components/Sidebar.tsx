@@ -160,7 +160,10 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
-import { selectRailVisibleEnvironmentIds } from "./sidebar/environmentRail.logic";
+import {
+  resolveAddProjectTargetLabel,
+  selectRailVisibleEnvironmentIds,
+} from "./sidebar/environmentRail.logic";
 import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
@@ -3688,6 +3691,7 @@ interface SidebarProjectsContentProps {
   threadPreviewCount: SidebarThreadPreviewCount;
   updateSettings: ReturnType<typeof useUpdateClientSettings>;
   openAddProject: () => void;
+  addProjectLabel: string;
   isManualProjectSorting: boolean;
   projectDnDSensors: ReturnType<typeof useSensors>;
   projectCollisionDetection: CollisionDetection;
@@ -3736,6 +3740,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     threadPreviewCount,
     updateSettings,
     openAddProject,
+    addProjectLabel,
     isManualProjectSorting,
     projectDnDSensors,
     projectCollisionDetection,
@@ -3864,7 +3869,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 render={
                   <button
                     type="button"
-                    aria-label="Add project"
+                    aria-label={addProjectLabel}
                     data-testid="sidebar-add-project-trigger"
                     className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     onClick={openAddProject}
@@ -3873,7 +3878,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
               >
                 <FolderPlusIcon className="size-3.5" />
               </TooltipTrigger>
-              <TooltipPopup side="right">Add project</TooltipPopup>
+              <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
             </Tooltip>
           </div>
         </div>
@@ -3983,6 +3988,19 @@ export default function Sidebar() {
       }),
     [activeEnvironmentId, environments],
   );
+  const addProjectLabel = useMemo(() => {
+    const remoteLabel = resolveAddProjectTargetLabel({
+      activeEnvironmentId,
+      candidates: environments.map((environment) => ({
+        environmentId: environment.environmentId,
+        label: environment.label,
+        isLocal:
+          environment.entry.target._tag === "PrimaryConnectionTarget" ||
+          isDesktopLocalConnectionTarget(environment.entry.target),
+      })),
+    });
+    return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
+  }, [activeEnvironmentId, environments]);
   const projects = useMemo(
     () =>
       visibleEnvironmentIds === null
@@ -4709,6 +4727,7 @@ export default function Sidebar() {
             threadPreviewCount={sidebarThreadPreviewCount}
             updateSettings={updateSettings}
             openAddProject={openAddProjectCommandPalette}
+            addProjectLabel={addProjectLabel}
             isManualProjectSorting={isManualProjectSorting}
             projectDnDSensors={projectDnDSensors}
             projectCollisionDetection={projectCollisionDetection}

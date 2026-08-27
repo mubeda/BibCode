@@ -28,9 +28,11 @@ import {
 } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { OpenAddProjectCommandPaletteProvider } from "../commandPaletteContext";
+import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useClientSettings } from "../hooks/useSettings";
-import { useProjects, useThreadShells } from "../state/entities";
+import { useActiveEnvironmentId, useProjects, useThreadShells } from "../state/entities";
+import { useEnvironments } from "../state/environments";
 import {
   startNewThreadInProjectFromContext,
   startNewThreadFromContext,
@@ -72,6 +74,7 @@ import { Kbd, KbdGroup } from "./ui/kbd";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
+import { resolveAddProjectTargetLabel } from "./sidebar/environmentRail.logic";
 
 interface CommandPaletteOpenIntent {
   readonly kind: "add-project";
@@ -214,6 +217,18 @@ function OpenCommandPaletteDialog(props: {
     useHandleNewThread();
   const projects = useProjects();
   const threads = useThreadShells();
+  const { environments } = useEnvironments();
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const addProjectTargetLabel = resolveAddProjectTargetLabel({
+    activeEnvironmentId,
+    candidates: environments.map((environment) => ({
+      environmentId: environment.environmentId,
+      label: environment.label,
+      isLocal:
+        environment.entry.target._tag === "PrimaryConnectionTarget" ||
+        isDesktopLocalConnectionTarget(environment.entry.target),
+    })),
+  });
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const [viewStack, setViewStack] = useState<CommandPaletteView[]>([]);
   const currentView = viewStack.at(-1) ?? null;
@@ -406,7 +421,10 @@ function OpenCommandPaletteDialog(props: {
     kind: "action",
     value: "action:add-project",
     searchTerms: ["add project", "folder", "directory", "browse", "clone", "repository", "git"],
-    title: "Add project",
+    title:
+      addProjectTargetLabel === null
+        ? "Add project"
+        : `Add project on ${addProjectTargetLabel}`,
     icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
     keepOpen: true,
     run: async () => {
