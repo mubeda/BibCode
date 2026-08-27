@@ -8,6 +8,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { RemoteUpdateSupport } from "./remoteUpdate.ts";
 
 export const ExecutionEnvironmentPlatformOs = Schema.Literals([
   "darwin",
@@ -36,6 +37,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  remoteUpdateControl: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
@@ -48,6 +50,9 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,
   storageInstanceId: Schema.NullOr(TrimmedNonEmptyString).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  remoteUpdateSupport: Schema.NullOr(RemoteUpdateSupport).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   remoteProtocolVersion: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
