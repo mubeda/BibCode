@@ -3356,7 +3356,7 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const toggleRightPanel = useCallback(() => {
     if (!activeThreadRef) return;
-    if (rightPanelOpen) {
+    if (effectiveRightPanelOpen) {
       if (planSidebarOpen) {
         closePlanSidebar();
       } else {
@@ -3364,8 +3364,20 @@ function ChatViewContent(props: ChatViewProps) {
       }
       return;
     }
+    if (hostActivitySurfaceSuppressed) {
+      addFilesSurface();
+      return;
+    }
     useRightPanelStore.getState().toggleVisibility(activeThreadRef);
-  }, [activeThreadRef, closePlanSidebar, closePreviewPanel, planSidebarOpen, rightPanelOpen]);
+  }, [
+    activeThreadRef,
+    addFilesSurface,
+    closePlanSidebar,
+    closePreviewPanel,
+    effectiveRightPanelOpen,
+    hostActivitySurfaceSuppressed,
+    planSidebarOpen,
+  ]);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!canMaximizeRightPanel) return;
     setMaximizedRightPanelThreadKey((threadKey) =>
