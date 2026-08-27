@@ -11,6 +11,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -86,6 +87,8 @@ struct AuthState {
     sessions: HashMap<String, SessionRecord>,
     pairings: HashMap<String, PairingRecord>,
     pairing_offer_idempotency: HashMap<String, StoredPairingOffer>,
+    live_connections: HashMap<String, HashMap<u64, CancellationToken>>,
+    next_connection_id: u64,
 }
 
 #[derive(Clone)]
@@ -899,7 +902,10 @@ impl AuthService {
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
             if revoked {
-                self.state.lock().await.sessions.remove(target_session_id);
+                let mut state = self.state.lock().await;
+                state.sessions.remove(target_session_id);
+                cancel_live_connections(&mut state, target_session_id);
+                drop(state);
                 self.emit_access_change(AuthAccessChange::ClientRemoved {
                     session_id: target_session_id.to_owned(),
                 });
@@ -916,6 +922,7 @@ impl AuthService {
         session.revoked_at_ms = Some(revoked_at);
         let session_id = session.session_id.clone();
         state.sessions.remove(&session_id);
+        cancel_live_connections(&mut state, &session_id);
         drop(state);
         self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
         Ok(true)
@@ -931,6 +938,7 @@ impl AuthService {
             let mut state = self.state.lock().await;
             for session_id in &removed_session_ids {
                 state.sessions.remove(session_id);
+                cancel_live_connections(&mut state, session_id);
             }
             drop(state);
             for session_id in &removed_session_ids {
@@ -950,6 +958,9 @@ impl AuthService {
                 revoked += 1;
             }
         }
+        for session_id in &removed_session_ids {
+            cancel_live_connections(&mut state, session_id);
+        }
         drop(state);
         for session_id in removed_session_ids {
             self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
@@ -957,8 +968,10 @@ impl AuthService {
         Ok(revoked)
     }
 
-    pub async fn mark_connected(&self, session_id: &str) {
+    pub async fn mark_connected(&self, session_id: &str, shutdown: CancellationToken) -> u64 {
         let mut state = self.state.lock().await;
+        state.next_connection_id = state.next_connection_id.wrapping_add(1);
+        let connection_id = state.next_connection_id;
         let view = if let Some(session) = state.sessions.get_mut(session_id) {
             if session.connected_count == 0 {
                 session.last_connected_at_ms = Some(now_ms());
@@ -968,6 +981,15 @@ impl AuthService {
         } else {
             None
         };
+        if view.is_some() {
+            state
+                .live_connections
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(connection_id, shutdown);
+        } else {
+            shutdown.cancel();
+        }
         drop(state);
         if let Some(view) = view {
             if let Some(repositories) = &self.repositories
@@ -984,10 +1006,17 @@ impl AuthService {
             }
             self.emit_access_change(AuthAccessChange::ClientUpserted(view));
         }
+        connection_id
     }
 
-    pub async fn mark_disconnected(&self, session_id: &str) {
+    pub async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
         let mut state = self.state.lock().await;
+        if let Some(connections) = state.live_connections.get_mut(session_id) {
+            connections.remove(&connection_id);
+            if connections.is_empty() {
+                state.live_connections.remove(session_id);
+            }
+        }
         let view = if let Some(session) = state.sessions.get_mut(session_id) {
             session.connected_count = session.connected_count.saturating_sub(1);
             Some(session.view(false))
@@ -1207,6 +1236,14 @@ impl PairingRecord {
             created_at: format_iso(self.created_at_ms),
             expires_at: format_iso(self.expires_at_ms),
             reach: self.reach.clone(),
+        }
+    }
+}
+
+fn cancel_live_connections(state: &mut AuthState, session_id: &str) {
+    if let Some(connections) = state.live_connections.remove(session_id) {
+        for shutdown in connections.into_values() {
+            shutdown.cancel();
         }
     }
 }
@@ -1565,6 +1602,69 @@ mod tests {
                 .expect("revoke session")
         );
         assert!(!context.is_currently_authorized("orchestration:read").await);
+    }
+
+    #[tokio::test]
+    async fn revoking_other_clients_cancels_every_registered_connection() {
+        let auth = service();
+        let current = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("current session");
+        let first = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("first other session");
+        let second = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("second other session");
+
+        let current_shutdown = CancellationToken::new();
+        let first_shutdown_a = CancellationToken::new();
+        let first_shutdown_b = CancellationToken::new();
+        let second_shutdown = CancellationToken::new();
+        let current_connection = auth
+            .mark_connected(&current.principal.session_id, current_shutdown.clone())
+            .await;
+        auth.mark_connected(&first.principal.session_id, first_shutdown_a.clone())
+            .await;
+        auth.mark_connected(&first.principal.session_id, first_shutdown_b.clone())
+            .await;
+        auth.mark_connected(&second.principal.session_id, second_shutdown.clone())
+            .await;
+
+        assert_eq!(
+            auth.revoke_other_clients(&current.principal.session_id)
+                .await
+                .expect("revoke other clients"),
+            2
+        );
+        assert!(!current_shutdown.is_cancelled());
+        assert!(first_shutdown_a.is_cancelled());
+        assert!(first_shutdown_b.is_cancelled());
+        assert!(second_shutdown.is_cancelled());
+
+        auth.mark_disconnected(&current.principal.session_id, current_connection)
+            .await;
     }
 
     fn service() -> AuthService {
@@ -1994,7 +2094,9 @@ mod tests {
             )
             .await
             .expect("other session should issue");
-        service.mark_connected(&current.principal.session_id).await;
+        let connection_id = service
+            .mark_connected(&current.principal.session_id, CancellationToken::new())
+            .await;
         let clients = service.list_clients(&current.principal.session_id).await;
         assert_eq!(clients.len(), 3);
         assert!(clients[0].current);
@@ -2005,7 +2107,7 @@ mod tests {
         assert!(pairings.is_empty());
         assert_eq!(snapshot_clients.len(), 3);
         service
-            .mark_disconnected(&current.principal.session_id)
+            .mark_disconnected(&current.principal.session_id, connection_id)
             .await;
 
         assert!(matches!(
@@ -2187,7 +2289,8 @@ mod tests {
                 .await
                 .unwrap()
         );
-        auth.mark_connected("missing-session").await;
+        auth.mark_connected("missing-session", CancellationToken::new())
+            .await;
 
         let mut expired_service = service();
         expired_service

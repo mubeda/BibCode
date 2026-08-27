@@ -634,6 +634,86 @@ async fn websocket_requires_a_short_lived_ticket_or_request_credential() {
 }
 
 #[tokio::test]
+async fn revoking_a_client_terminates_its_live_websocket() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator);
+
+    let pairing = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(administrator_token)
+            .json(&json!({ "label": "Tablet" }))
+            .send()
+            .await
+            .expect("pairing"),
+        StatusCode::OK,
+    )
+    .await;
+    let paired = exchange_token(
+        &client,
+        &handle,
+        pairing["credential"].as_str().expect("credential"),
+        None,
+    )
+    .await;
+    let paired_token = access_token(&paired);
+    let paired_ticket = websocket_ticket(&client, &handle, paired_token).await;
+    let (mut paired_socket, _) = connect_async(format!(
+        "ws://{}/ws?wsTicket={paired_ticket}",
+        handle.local_addr()
+    ))
+    .await
+    .expect("paired WebSocket");
+
+    let clients_list = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/clients"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("clients"),
+        StatusCode::OK,
+    )
+    .await;
+    let target = clients_list
+        .as_array()
+        .expect("clients array")
+        .iter()
+        .find(|session| session["current"] == false && session["connected"] == true)
+        .expect("paired connected session")["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let revoke = client
+        .post(http_url(&handle, "/api/auth/clients/revoke"))
+        .bearer_auth(administrator_token)
+        .json(&json!({ "sessionId": target }))
+        .send()
+        .await
+        .expect("revoke");
+    assert_eq!(revoke.status(), StatusCode::OK);
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match paired_socket.next().await {
+                None => break true,
+                Some(Ok(tungstenite::Message::Close(_))) => break true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => break true,
+            }
+        }
+    })
+    .await
+    .expect("revoked socket must close within 5s");
+    assert!(closed);
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
@@ -985,28 +1065,16 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     )
     .await;
     assert_eq!(revoked["revoked"], true);
-    send_ws_json(
-        &mut restricted_socket,
-        json!({
-            "_tag": "Request",
-            "id": "103",
-            "tag": "server.getConfig",
-            "payload": {},
-            "headers": []
-        }),
-    )
-    .await;
-    let revoked_session = next_ws_json(&mut restricted_socket).await;
-    assert_eq!(revoked_session["_tag"], "Defect");
-    assert_eq!(
-        revoked_session["defect"],
-        "Authenticated session is no longer valid"
-    );
-
-    restricted_socket
-        .close(None)
-        .await
-        .expect("close restricted WebSocket");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match restricted_socket.next().await {
+                None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_)) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("revoked restricted WebSocket closes");
     shutdown(handle).await;
 }
 
