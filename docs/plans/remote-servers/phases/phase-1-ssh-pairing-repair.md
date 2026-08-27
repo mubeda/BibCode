@@ -817,7 +817,7 @@ git commit -m "fix(desktop): mint SSH bootstrap pairing via bibcode pairing issu
 - Produces: `docs/architecture/remote.md` with the SSH-pairing limitation removed and
   the repaired bootstrap described; an explicit runbook statement in the phase report.
 
-- [ ] **Step 1: Remove the resolved limitation**
+- [x] **Step 1: Remove the resolved limitation**
 
 In `docs/architecture/remote.md`, under `## Current limitations`, delete exactly this
 bullet (the surrounding bullets stay):
@@ -829,7 +829,7 @@ bullet (the surrounding bullets stay):
   `start` and `serve`.
 ```
 
-- [ ] **Step 2: Document the repaired bootstrap**
+- [x] **Step 2: Document the repaired bootstrap**
 
 In the `### Desktop-managed SSH` section of `docs/architecture/remote.md`, extend the
 first paragraph. Replace:
@@ -861,7 +861,7 @@ is shared, the command works beside the already-running remote server without
 a restart.
 ```
 
-- [ ] **Step 3: Review the testing runbooks**
+- [x] **Step 3: Review the testing runbooks**
 
 Per AGENTS.md, this phase must review `docs/testing/` because it changes a desktop
 bootstrap procedure and adds test targets. Verify there is nothing to update:
@@ -878,7 +878,7 @@ accurate."** If the search surfaces a runbook line that names the removed
 `auth pairing create` command or otherwise contradicts the new behavior, update that
 line in this same commit instead.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/architecture/remote.md
