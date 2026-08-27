@@ -3037,9 +3037,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 29);
+        assert_eq!(second.len(), 30);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[28].id, 45);
+        assert_eq!(second[29].id, 46);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3146,7 +3146,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45]
+            [40, 41, 42, 43, 44, 45, 46]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3183,7 +3183,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45]
+            [41, 42, 43, 44, 45, 46]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3211,7 +3211,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45]
+            [42, 43, 44, 45, 46]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3261,6 +3261,43 @@ mod tests {
                 )
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_46_adds_nullable_reach_metadata_to_existing_auth_tables() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(45))?;
+
+        let has_column = |connection: &rusqlite::Connection,
+                          table: &str,
+                          column: &str|
+         -> rusqlite::Result<bool> {
+            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(columns.iter().any(|candidate| candidate == column))
+        };
+
+        for table in ["auth_pairing_links", "auth_sessions"] {
+            assert!(!has_column(&connection, table, "reach")?);
+            assert!(!has_column(&connection, table, "off_host")?);
+        }
+
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [46]
+        );
+        for table in ["auth_pairing_links", "auth_sessions"] {
+            assert!(has_column(&connection, table, "reach")?);
+            assert!(has_column(&connection, table, "off_host")?);
+        }
+
         Ok(())
     }
 
