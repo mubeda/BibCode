@@ -2397,6 +2397,9 @@ fn migration_045(transaction: &Transaction<'_>) -> Result<()> {
 
 fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
     for table in ["auth_pairing_links", "auth_sessions"] {
+        if !table_exists(transaction, table)? {
+            continue;
+        }
         for (column, definition) in [("reach", "reach TEXT"), ("off_host", "off_host INTEGER")] {
             if !table_has_column(transaction, table, column)? {
                 transaction
@@ -2927,7 +2930,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=45).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=46).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2942,6 +2945,9 @@ mod tests {
         );
         assert_eq!(MIGRATIONS[41].name, "ProjectWorktreeRepositoryPins");
         assert_eq!(MIGRATIONS[42].name, "DurableWorktreeRemovalReceipts");
+        assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
+        assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
+        assert_eq!(MIGRATIONS[45].name, "AuthPairingReach");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -3274,7 +3280,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 12);
+        assert_eq!(applied.len(), 13);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3287,6 +3293,7 @@ mod tests {
         assert_eq!(applied[9].id, 43);
         assert_eq!(applied[10].id, 44);
         assert_eq!(applied[11].id, 45);
+        assert_eq!(applied[12].id, 46);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;
