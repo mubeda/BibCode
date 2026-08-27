@@ -99,6 +99,19 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Grant-driven remote sharing
+
+When pairing-offer generation, grant reach metadata, desktop exposure, or
+client revocation changes, validate the complete ceremony on every supported
+native desktop: **Another device** widens before minting and shows one pairing
+code as a deep link, browser URL, and QR code; **This computer only** and a
+loopback custom address never widen; a bind or firewall failure mints nothing;
+and revoking the final off-host offer or client returns the server to loopback.
+Also verify browser/headless presentation remains read-only for exposure while
+server-side mint and revocation stay available. Windows additionally owns the
+program-scoped firewall evidence in its platform runbook; Linux and macOS do
+not substitute a firewall assertion.
+
 ### Direct E2EE interop gate
 
 When direct pairing, host identity, `/ws-e2ee`, Noise framing, or client E2EE

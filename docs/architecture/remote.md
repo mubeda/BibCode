@@ -129,8 +129,7 @@ authenticated caller with `access:write` mints it through
 the original offer and rejects reuse with different input. The server validates
 that `this-computer` uses loopback, `another-device` does not use loopback, and
 that no offered endpoint is wildcard or port zero. Reach is embedded in the
-code; it is not persisted as connection policy until the Phase 5 sharing UI
-owns that state.
+code and persisted with the grant as described below.
 
 The add flow parses and classifies the endpoint, fetches the public descriptor,
 performs the pinned handshake and in-channel pairing, and calls authenticated
@@ -153,6 +152,49 @@ pairing code first, keeps manual endpoint-and-token entry under **Advanced**,
 and presents SSH as a first-class desktop option. BiBCode Connect relay rows
 remain part of the same tab. The **Share this host** tab owns exposure and
 pairing-code generation for the primary environment.
+
+### Share ceremony and exposure
+
+The Share tab mints the complete pairing payload on the server through
+`POST /api/auth/pairing-offer`. Each minted grant records its `reach` intent and
+a mint-time `off_host` classification. The classification comes from the
+validated offered endpoint, so a loopback custom address used through an SSH
+tunnel remains loopback while a custom LAN or public address is off-host. A
+session created by consuming the grant inherits both fields.
+
+The server is the source of truth for desired exposure.
+`GET /api/auth/share-state` derives `wide` only while at least one unrevoked
+pairing link or client session has `off_host = true`; it otherwise derives
+`loopback`. The desktop widens only as part of generating an off-host offer.
+`desktop_bridge_apply_server_exposure` persists the desired launch mode,
+restart-rebinds the backend, verifies the effective bind, and synchronizes the
+program-scoped `BiBCode Remote Access` Windows Firewall rule. A failed wide bind,
+verification, or firewall update restores the previous setting, restarts the
+previous topology, and removes the rule. Narrowing commits even if firewall-rule
+cleanup reports a warning because restoring the loopback bind is the safer
+state. The persisted desktop setting is only a launch-time cache of this
+ceremony; creating a **This computer only** or loopback-custom grant never
+widens a later launch. There is no independent manual exposure toggle.
+
+Compatibility grants whose persisted reach and off-host fields are `NULL`
+never cause an automatic widen. While any unrevoked legacy one-time-token grant
+remains, they do block automatic reversion from an already-wide bind. The Share
+tab identifies that condition and tells the user to revoke or re-pair those
+clients. Otherwise, the renderer checks share state at startup and after every
+auth-access revision and switches a wide desktop backend back to loopback when
+the last off-host grant is revoked. This reconciler is narrow-only.
+
+Revoking a client invalidates its credential and actively cancels every live
+plain or E2EE WebSocket registered to that session. Revoking all other clients
+does the same for each affected session. Exposure changes still use a backend
+restart: live local connections and running turns drop, while committed SQLite
+state and other durable server state survive. A failed post-restart mint leaves
+no grant, and the startup/revision reconciler restores loopback exposure.
+
+A wide-bound native primary does not expose the desktop-only maintenance API.
+Update protection therefore degrades while sharing until exposure returns to
+loopback; update preparation must not assume maintenance routes exist in that
+state.
 
 Pairing links converge on that Add Server flow. Web clients accept
 `/pair?code=...`; desktop bundles register `bibcode://pair?code=...` with the
