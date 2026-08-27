@@ -2957,4 +2957,11 @@ Running list — the final report repeats it; Task 9b appends to it.
   testable unbundled.
 - The disconnect latch is session-scoped by design (Task 5b scope note); persisting it
   across restarts would be a catalog-profile/spec change.
-- (Task 9b appends D8 audit findings here.)
+- D8 audit: Keybindings — the panel reads `primaryServerKeybindingsAtom` and writes through
+  `serverEnvironment.upsertKeybinding` / `serverEnvironment.removeKeybinding`, so bindings follow
+  the primary server instead of the client device — follow up with a contracts and persistence
+  migration (audited 2026-08-27).
+- D8 audit: Terminal — the WebGL renderer preference is `ServerSettings.terminal.webglEnabled`
+  and therefore persists through the primary server RPC even though renderer presentation is a
+  client/UI concern — follow up with a settings-schema and persistence migration (audited
+  2026-08-27).
