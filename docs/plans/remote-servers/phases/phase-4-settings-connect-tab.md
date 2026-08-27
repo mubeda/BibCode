@@ -2781,7 +2781,7 @@ _selection_ scoping is Phase 6; do not add environment pickers or re-scope panel
 - Produces: an audit table in the final report + appended residual-risk entries. No new
   exports.
 
-- [ ] **Step 1: Enumerate every section's data sources**
+- [x] **Step 1: Enumerate every section's data sources**
 
 ```bash
 ls apps/web/src/routes/settings.*.tsx
@@ -2794,7 +2794,7 @@ data source(s) → D8 classification (`device-local` / `server-owned:<which envi
 `desktop-host`). Every row must name the concrete atom/hook, not a guess — open each
 component far enough to see its reads _and_ writes.
 
-- [ ] **Step 2: Verify server-owned panels target the environment they claim**
+- [x] **Step 2: Verify server-owned panels target the environment they claim**
 
 For each row classified server-owned, confirm both directions (read and mutation) are
 keyed by the environment the UI presents. Two known-shape checks to perform explicitly:
@@ -2807,7 +2807,7 @@ keyed by the environment the UI presents. Two known-shape checks to perform expl
    moving a persistence home is **not** trivial (it changes a persisted shape; spec
    amendment territory).
 
-- [ ] **Step 3: Fix trivial leaks in place**
+- [x] **Step 3: Fix trivial leaks in place**
 
 Trivial means all of: single file, no contract/schema/persistence change, no new
 cross-package dependency, and an existing test file that can gain the covering assertion.
@@ -2815,13 +2815,13 @@ Example shape: a panel deriving copy from a global/unscoped atom where the
 environment-scoped equivalent already exists — swap the read, extend the component's test.
 Anything bigger: do **not** fix; record it.
 
-- [ ] **Step 4: Record non-trivial findings**
+- [x] **Step 4: Record non-trivial findings**
 
 Append each to "Residual risks / follow-ups" below as
 `D8 audit: <section> — <finding> — <suggested owner phase or follow-up>`. If the audit
 finds nothing, append `D8 audit: no violations found (audited <date>)`.
 
-- [ ] **Step 5: Validate and commit**
+- [x] **Step 5: Validate and commit**
 
 Run the extended tests from Step 3 plus `vp run typecheck`. Expected: PASS.
 
@@ -2844,7 +2844,7 @@ git commit -m "chore(web): audit settings data sources against D8 and fix trivia
 - Modify: `docs/testing/macos-desktop.md`, `docs/testing/windows-desktop.md`,
   `docs/testing/linux-desktop.md`
 
-- [ ] **Step 1: Update `docs/architecture/remote.md`**
+- [x] **Step 1: Update `docs/architecture/remote.md`**
 
 Add a short section (placed near the pairing-code material Phase 3 documented) covering, in
 present tense: the settings section is **Remote Servers** at `/settings/remote-servers`
@@ -2855,13 +2855,13 @@ rows unchanged); deep-link entry points (`bibcode://pair?code=…` registered vi
 deep-link + single-instance plugins; web `/pair?code=…`; both converge on the Add Server
 flow); and the macOS dev-mode limitation (scheme registration is bundle-time only there).
 
-- [ ] **Step 2: Review the other two architecture docs**
+- [x] **Step 2: Review the other two architecture docs**
 
 `rg -n -i "connections" docs/architecture/connection-runtime.md docs/architecture/overview.md`
 — update any reference to the Connections settings section/route to Remote Servers; if none
 exist, record "reviewed and remain accurate" in the final report.
 
-- [ ] **Step 3: Update the three desktop runbooks**
+- [x] **Step 3: Update the three desktop runbooks**
 
 Each currently asserts (macos-desktop.md:189, windows-desktop.md:317, linux-desktop.md:149)
 that Connections/SSH/pairing/relay/exposure UI is **absent** from ordinary desktop
@@ -2884,7 +2884,7 @@ opening `bibcode://pair?code=<any well-formed code>` from the OS while the app r
 the running instance (Windows/Linux) and lands on the Add Server dialog with the code
 prefilled. Keep runbooks free of execution-specific data (versions, timings, screenshots).
 
-- [ ] **Step 4: Full validation gate (report exact commands + outcomes)**
+- [x] **Step 4: Full validation gate (report exact commands + outcomes)**
 
 ```bash
 vp check
@@ -2900,7 +2900,7 @@ Review the diff for unintended edits (especially: no changes under `.codegraph/`
 restoration of the pending deletions under `docs/plans/2026-08-24-environment-project-management/`,
 no stray debug output, `Cargo.lock` changes limited to the two new plugins).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/architecture docs/testing

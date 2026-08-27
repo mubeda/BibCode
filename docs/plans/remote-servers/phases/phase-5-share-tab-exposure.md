@@ -176,7 +176,7 @@ Note: migration ids up to 45 exist today (`migration_045`). If an earlier remote
 phase claimed 46 by the time this executes, take the next free id and keep the name
 `AuthPairingReach`.
 
-- [ ] **Step 1: Write the failing test** — round-trip a pairing link and a session with
+- [x] **Step 1: Write the failing test** — round-trip a pairing link and a session with
       `reach` through the repositories (place beside the existing repository tests; mirror
       their store-construction helper):
 
@@ -231,12 +231,12 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p bibcode-server auth_pairing_reach_round_trips`
 Expected: FAIL — `reach` field does not exist on `AuthPairingLink` / `NewAuthSession`.
 
-- [ ] **Step 3: Implement the migration and plumbing**
+- [x] **Step 3: Implement the migration and plumbing**
 
 In `migrations.rs`, after `migration_045`:
 
@@ -276,7 +276,7 @@ In `repositories.rs`:
   0–13). Verify the decoders are positional before editing
   (`rg "fn decode_pairing_link" -A 20 apps/server/src/persistence/repositories.rs`).
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p bibcode-server auth_pairing_reach_round_trips`
 Expected: PASS. Also run `cargo test -p bibcode-server --test persistence_compat` — the
@@ -285,7 +285,7 @@ snapshots; adding an additive migration must not require fixture changes — if 
 manifest's ledger assertions fail, follow the failure message, do not regenerate
 fixtures by hand).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/persistence/migrations.rs apps/server/src/persistence/repositories.rs
@@ -327,7 +327,7 @@ git commit -m "feat(server): persist pairing-grant reach and off-host flag on li
   - Sessions minted from a reach-carrying pairing link inherit its `reach` **and**
     `off_host`.
 
-- [ ] **Step 1: Write the failing service test** (in the `service.rs` test module,
+- [x] **Step 1: Write the failing service test** (in the `service.rs` test module,
       mirroring `owned_scopes(STANDARD_SCOPES)` usage from existing tests):
 
 ```rust
@@ -373,12 +373,12 @@ async fn share_pairing_rejects_unknown_reach() {
 of the helper name, bind as `let auth = service();` and adjust the calls — keep the
 helper name exactly as the module defines it.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p bibcode-server share_pairing_reach`
 Expected: FAIL — `issue_share_pairing` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `service.rs`:
 
@@ -459,7 +459,7 @@ Update the TS records derived from these in
 explicit (`rg "ServerPairingLinkRecord" apps/web/src` to find the type definition and
 add `reach?: RemotePairingReach`).
 
-- [ ] **Step 4: Regenerate auth fixtures and run parity + tests**
+- [x] **Step 4: Regenerate auth fixtures and run parity + tests**
 
 Run:
 
@@ -474,7 +474,7 @@ Expected: all PASS. If the export script embeds sample response bodies, extend t
 pairing-list and clients-list samples with `"reach": "another-device"` so the Rust side
 exercises the new field.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth packages/contracts/src/auth.ts packages/contracts/src/remotePairing.ts \
@@ -507,7 +507,7 @@ git commit -m "feat(server,contracts): thread pairing reach through auth service
   - TS `AuthShareStateResult = Schema.Struct({ desiredExposure: Schema.Literals(["wide", "loopback"]), offHostGrantCount: Schema.Number, legacyGrantCount: Schema.Number })`
   - `GET /api/auth/share-state`, scope `access:read`.
 
-- [ ] **Step 1: Write the failing derivation tests** (service.rs test module):
+- [x] **Step 1: Write the failing derivation tests** (service.rs test module):
 
 ```rust
 #[tokio::test]
@@ -580,12 +580,12 @@ async fn legacy_null_reach_grants_count_separately_and_never_widen() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-server share_exposure`
 Expected: FAIL — `share_exposure_state` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `model.rs`:
 
@@ -771,7 +771,7 @@ offer endpoint persists `reach`. Note: until Task 4, offers minted through that
 endpoint decode as `NULL`-reach and therefore count as **legacy** grants here — the
 derivation stays loopback, which is the safe direction.)
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 cargo test -p bibcode-server share_exposure
@@ -781,7 +781,7 @@ vp test run packages/contracts/src/authRustParity.test.ts
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth packages/contracts/src packages/contracts/fixtures/auth-http \
@@ -827,7 +827,7 @@ here is (a) computing the grant's off-host flag from the validated intent + endp
 endpoint's host is non-loopback) and (b) switching the handler's issuance call to
 `issue_share_pairing` so the grant row records both.
 
-- [ ] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
+- [x] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
       using the file's existing helpers):
 
 ```rust
@@ -936,14 +936,14 @@ async fn loopback_custom_offers_never_flip_desired_exposure_wide() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-server --test auth_http pairing_offer_persists_reach`
 Expected: FAIL — the minted link has no `reach` field (Phase 3 mints reach-less), so
 `minted["reach"]` is `Value::Null` and share-state reports `"loopback"` with
 `legacyGrantCount == 1`.
 
-- [ ] **Step 3: Minimal implementation**
+- [x] **Step 3: Minimal implementation**
 
 In `create_pairing_offer` (`apps/server/src/auth/http.rs`), after Phase 3's existing
 endpoint/reach validation (which already parses the endpoint URL — reuse its parsed
@@ -981,7 +981,7 @@ post-issuance failure cleanup — untouched. If Phase 3's handler validates `rea
 against its own literal list, unify it on Task 2's `PAIRING_REACH_VALUES` constant
 (single source of truth) without changing the accepted values.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 cargo test -p bibcode-server --test auth_http
@@ -991,7 +991,7 @@ vp test run packages/contracts/src/authRustParity.test.ts
 Expected: PASS. No fixture changes: the response shape already carries `reach`
 (Phase 3), and the pairing-links response fixture already gained `reach` in Task 2.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth/http.rs apps/server/tests/auth_http.rs
@@ -1031,7 +1031,7 @@ This task adds active termination so a revoked device loses its streams immediat
   - Revoking a session (single or revoke-others) cancels every registered token for
     the revoked session ids, closing its live WebSockets server-side.
 
-- [ ] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
+- [x] **Step 1: Write the failing integration test** (`apps/server/tests/auth_http.rs`,
       same helpers as the existing WebSocket tests):
 
 ```rust
@@ -1123,13 +1123,13 @@ async fn revoking_a_client_terminates_its_live_websocket() {
 `one_time_pairing_credentials_are_atomic_and_scope_constrained` test at ~line 187
 shows how a pairing credential goes through `/oauth/token`.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-server --test auth_http revoking_a_client_terminates`
 Expected: FAIL — the socket stays open and the 5s timeout elapses (today nothing
 cancels the connection's shutdown token on revocation).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `service.rs` — on the state struct behind `self.state` (the one holding `pairings` /
 `sessions`), add:
@@ -1198,7 +1198,7 @@ Cancelling `session_shutdown` is exactly what the existing expiration guard does
 (`http.rs:236–241`), so `run_session` already treats it as a terminate signal — no RPC
 session changes needed.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 cargo test -p bibcode-server --test auth_http
@@ -1207,7 +1207,7 @@ cargo test -p bibcode-server auth
 
 Expected: PASS, including the existing connected-count and revocation tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth/service.rs apps/server/src/http.rs apps/server/tests/auth_http.rs
@@ -1243,7 +1243,7 @@ Mapping (pinned): `"loopback"` → `"loopback"`; `"private-network"` and `"publi
 `invalid-address` failure). The share flow never needs the private/public
 distinction — only whether a grant reaches beyond this host.
 
-- [ ] **Step 1: Failing test**
+- [x] **Step 1: Failing test**
 
 ```ts
 import { describe, expect, it } from "@effect/vitest";
@@ -1272,12 +1272,12 @@ describe("shareClassForPairingEndpoint", () => {
 classify a bare hostname as `"unconnectable"` until probed — align the test inputs
 with its documented behavior rather than changing the mapping.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/endpointClass.test.ts`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement** (`endpointClass.ts`; check the exact subpath export for
+- [x] **Step 3: Implement** (`endpointClass.ts`; check the exact subpath export for
       the shared module in `packages/shared/package.json`):
 
 ```ts
@@ -1298,11 +1298,11 @@ export function shareClassForPairingEndpoint(endpoint: string): ShareEndpointCla
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/endpointClass.test.ts` — PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings/remote-servers/endpointClass.ts \
@@ -1330,7 +1330,7 @@ git commit -m "feat(web): map pairing-endpoint classification to share classes"
 - Rule identity: `BiBCode Remote Access` — program-scoped (decision 5), so the
   dynamically picked backend port never strands the rule.
 
-- [ ] **Step 1: Failing construction tests** (in `firewall.rs`, run on all platforms):
+- [x] **Step 1: Failing construction tests** (in `firewall.rs`, run on all platforms):
 
 ```rust
 #[cfg(test)]
@@ -1374,12 +1374,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-desktop --lib firewall`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! Windows Defender Firewall integration for grant-driven server exposure.
@@ -1462,7 +1462,7 @@ pub(crate) async fn sync_remote_access_rule(_enabled: bool) -> Result<(), String
 (Verify `configure_background_command` accepts `tokio::process::Command` —
 `backend.rs` line 2 imports both variants; use the matching one.)
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test -p bibcode-desktop --lib firewall` — PASS.
 Note: `sync_remote_access_rule`'s Windows execution path cannot be exercised on this
@@ -1470,7 +1470,7 @@ Linux workspace; it is validated on native Windows per Task 12's runbook update
 (evidence: rule present in `netsh advfirewall firewall show rule name="BiBCode Remote
 Access"` after widening, absent after revert).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/src-tauri/src/firewall.rs apps/desktop/src-tauri/src/lib.rs
@@ -1520,7 +1520,7 @@ Rollback semantics (pinned, spec §4.6 "rollback to loopback on bind failure"):
    narrow succeeded and a stale program-scoped allow rule is inert against a loopback
    bind.
 
-- [ ] **Step 1: Failing bridge test** — extend the existing invoke-based test module in
+- [x] **Step 1: Failing bridge test** — extend the existing invoke-based test module in
       `bridge.rs` (mirror the harness used by the current
       `desktop_bridge_set_server_exposure_mode` test at ~line 2969):
 
@@ -1579,12 +1579,12 @@ fn exposure_outcomes_cover_bind_and_firewall_failures() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-desktop --lib apply_server_exposure`
 Expected: FAIL — command not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `bridge.rs`, replacing `desktop_bridge_set_server_exposure_mode`:
 
@@ -1730,7 +1730,7 @@ fake bridge object plus any exposure-toggle expectations in
 `apps/web/src/components/settings/ConnectionsSettings.test.tsx` to the new method
 name.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 cargo test -p bibcode-desktop --lib
@@ -1741,7 +1741,7 @@ vp run typecheck
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/src-tauri/src apps/web/src/tauriDesktopBridge.ts \
@@ -1774,7 +1774,7 @@ git commit -m "feat(desktop): apply server exposure with verification, rollback,
     double-mint a grant.
   - `getServerShareState(): Promise<AuthShareStateResult>`
 
-- [ ] **Step 1: Implement (mirroring the file's existing wrappers)**
+- [x] **Step 1: Implement (mirroring the file's existing wrappers)**
 
 ```ts
 export async function createServerPairingOffer(
@@ -1821,11 +1821,11 @@ Export both from `apps/web/src/environments/primary/index.ts` beside
 Task 9/10 tests (which mock this module exactly as `ConnectionsSettings.test.tsx` mocks
 its siblings) — no dedicated unit test file.
 
-- [ ] **Step 2: Typecheck**
+- [x] **Step 2: Typecheck**
 
 Run: `vp run typecheck` — PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add apps/web/src/environments/primary/auth.ts apps/web/src/environments/primary/index.ts
@@ -1936,7 +1936,7 @@ Pinned behavior of `generateShareOffer` (decision 2):
 5. `this-computer` never calls `applyServerExposure` (spec §4.6). Browser mode
    (`hasDesktopBridge: false`) never calls it either — mint only.
 
-- [ ] **Step 1: Failing tests** (representative set — write all of these):
+- [x] **Step 1: Failing tests** (representative set — write all of these):
 
 ```ts
 import { describe, expect, it, vi } from "@effect/vitest";
@@ -2195,12 +2195,12 @@ describe("resolveShareAddressOptions", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/shareOffer.test.ts`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement `shareOffer.ts`** exactly to the pinned behavior above.
+- [x] **Step 3: Implement `shareOffer.ts`** exactly to the pinned behavior above.
       Reference implementation of the core orchestration:
 
 ```ts
@@ -2315,11 +2315,11 @@ and `searchParams.set("code", code)` — matching the existing
 `resolveDesktopPairingUrl` idiom in `apps/web/src/components/settings/pairingUrls.ts`
 but with the `code` parameter of spec §4.2 instead of the legacy token parameter.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/shareOffer.test.ts` — PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings/remote-servers
@@ -2413,7 +2413,7 @@ Deletions in the same patch: the manual "Network access" toggle
 remaining `applyServerExposure` direct call left by Task 7's mechanical rename. The
 Share tab is now the only exposure surface.
 
-- [ ] **Step 1: Failing component tests** — mock exactly like
+- [x] **Step 1: Failing component tests** — mock exactly like
       `ConnectionsSettings.test.tsx` mocks `~/environments/primary` and the bridge (reuse
       its harness helpers where exported). Cover at minimum:
 
@@ -2440,12 +2440,12 @@ of `ConnectionsSettings.test.tsx` (same providers, same `vi.mock` module paths, 
 `window.desktopBridge` object carrying `applyServerExposure`,
 `getServerExposureState`, `getAdvertisedEndpoints`).
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ShareThisHostTab.test.tsx`
 Expected: FAIL — component missing.
 
-- [ ] **Step 3: Implement the component** per the UI contract above. Skeleton of the
+- [x] **Step 3: Implement the component** per the UI contract above. Skeleton of the
       generate wiring (state and layout follow the section list; use the imports and
       patterns already present in `ConnectionsSettings.tsx`):
 
@@ -2522,7 +2522,7 @@ components if extracting them from `ConnectionsSettings.tsx` keeps that file com
 `ConnectionsSettings.test.tsx` accordingly (its exposure-toggle tests are replaced by
 this file's tests).
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 vp test run apps/web/src/components/settings/remote-servers/ShareThisHostTab.test.tsx
@@ -2532,7 +2532,7 @@ vp run typecheck
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings
@@ -2578,7 +2578,7 @@ Pinned behavior:
 - No-op entirely when `window.desktopBridge?.applyServerExposure` is absent (browser
   mode).
 
-- [ ] **Step 1: Failing tests** — test the pure function exhaustively and the hook's
+- [x] **Step 1: Failing tests** — test the pure function exhaustively and the hook's
       trigger wiring with mocks:
 
 ```ts
@@ -2627,17 +2627,17 @@ Add a hook test (React Testing Library `renderHook` with mocked
 `getServerShareState` called → `applyServerExposure("local-only")` called exactly once
 when `shouldRevertExposure` is true, never called when the bridge is absent.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `vp test run apps/web/src/state/shareExposureReconciler.test.ts`
 Expected: FAIL — module missing.
 
-- [ ] **Step 3: Implement** the module (pure function + hook per the pinned behavior)
+- [x] **Step 3: Implement** the module (pure function + hook per the pinned behavior)
       and mount `useShareExposureReconciler()` inside the component in `AppRoot.tsx` that
       already runs per-app desktop effects (top of the component that reads
       `window.desktopBridge`, ~line 28).
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 ```bash
 vp test run apps/web/src/state/shareExposureReconciler.test.ts
@@ -2646,7 +2646,7 @@ vp test run apps/web/src/AppRoot.test.tsx apps/web/src/AppRoot.lifecycle.test.ts
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/state/shareExposureReconciler.ts apps/web/src/state/shareExposureReconciler.test.ts apps/web/src/AppRoot.tsx
@@ -2665,7 +2665,7 @@ git commit -m "feat(web): revert server exposure when the last off-host grant is
   `docs/testing/macos-desktop.md`, `docs/testing/cross-platform-validation.md`,
   `docs/testing/README.md`
 
-- [ ] **Step 1: `docs/architecture/remote.md`** — add/extend a "Share ceremony and
+- [x] **Step 1: `docs/architecture/remote.md`** — add/extend a "Share ceremony and
       exposure" section covering, in prose consistent with the file's voice:
   - pairing offers: extend whatever Phase 3 documented for
     `POST /api/auth/pairing-offer` (it mints the §4.2 payload server-side) with this
@@ -2685,22 +2685,22 @@ git commit -m "feat(web): revert server exposure when the last off-host grant is
     sessions (amended spec §3; Task 4b) — align the file's revocation wording;
   - the honest restart consequence (live connections drop; durable state persists) and
     the maintenance-API degradation while wide (decision 8).
-- [ ] **Step 2: `docs/architecture/overview.md`** — in the "Desktop update protection"
+- [x] **Step 2: `docs/architecture/overview.md`** — in the "Desktop update protection"
       /exposure vicinity, one paragraph: exposure changes now flow exclusively through the
       grant-driven ceremony; the manual toggle is gone; wildcard native binds still occur
       only via this machinery.
-- [ ] **Step 3: `docs/testing/windows-desktop.md`** — add a validation procedure to the
+- [x] **Step 3: `docs/testing/windows-desktop.md`** — add a validation procedure to the
       packaged-UI flow section: generate an "Another device" offer from Settings → Remote
       Servers → Share this host; verify (a) the server restarts and the offer renders
       URL + deep link + QR, (b) `netsh advfirewall firewall show rule name="BiBCode Remote
 Access"` lists the program-scoped rule, (c) revoking the offer/paired client reverts
       exposure and (d) the rule is removed. Keep execution-specific evidence out of the
       runbook (it belongs in reports from the template).
-- [ ] **Step 4: Review the remaining runbooks.** Linux/macOS packaged flows gain the
+- [x] **Step 4: Review the remaining runbooks.** Linux/macOS packaged flows gain the
       Share tab generation + revert check **without** the firewall step — add that flow if
       the runbooks enumerate settings surfaces; otherwise record in the final report:
       "reviewed and remain accurate". `cross-platform-validation.md` likewise.
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/architecture/remote.md docs/architecture/overview.md docs/testing
@@ -2711,7 +2711,7 @@ git commit -m "docs: share ceremony, grant-driven exposure, and Windows validati
 
 ### Task 13: Full validation gate and self-review
 
-- [ ] **Step 1: Run the complete gate** (master-plan validation gate):
+- [x] **Step 1: Run the complete gate** (master-plan validation gate):
 
 ```bash
 vp check
@@ -2730,7 +2730,7 @@ Record every command and its result for the final report; anything that cannot r
 this machine (Windows firewall execution, packaged desktop flows) must be listed as
 Windows-only evidence owed per `docs/testing/windows-desktop.md`.
 
-- [ ] **Step 2: Diff review**
+- [x] **Step 2: Diff review**
 
 ```bash
 git status --short
@@ -2741,7 +2741,7 @@ Check: no `.codegraph/` or generated files staged, no dependency drift, the pend
 deletions under `docs/plans/2026-08-24-environment-project-management/` untouched, no
 debug output.
 
-- [ ] **Step 3: Self-review checklist**
+- [x] **Step 3: Self-review checklist**
   - Spec coverage: §4.2 generation side (intent radio ✓ Task 10, address picker ✓
     Tasks 9–10, browser URL + deep link + QR ✓ Tasks 9–10, server-side mint ✓ Phase 3
     endpoint + Task 4 reach/off-host persistence);
@@ -2762,7 +2762,7 @@ debug output.
     `mark_connected`/`mark_disconnected` connection-id signatures identical across Rust
     serde renames, TS schemas, fixtures, and web call sites.
 
-- [ ] **Step 4: Final commit** (only if the gate produced fixes)
+- [x] **Step 4: Final commit** (only if the gate produced fixes)
 
 ```bash
 git add -A -- ':!docs/plans/2026-08-24-environment-project-management'
