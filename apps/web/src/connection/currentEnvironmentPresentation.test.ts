@@ -19,7 +19,8 @@ describe("current environment presentation", () => {
     expect(readCurrentEnvironmentPresentationPolicy()).toMatchObject({
       surface: "desktop",
       platform: "windows",
-      connectionsPresentation: "local-wsl",
+      showLocalEnvironmentSettings: true,
+      showRemoteDeviceControls: false,
     });
   });
 });
