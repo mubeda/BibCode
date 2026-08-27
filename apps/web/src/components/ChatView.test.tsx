@@ -770,6 +770,7 @@ interface TestEnvironmentPresentation {
     readonly environment: {
       readonly label: string;
       readonly serverVersion?: string;
+      readonly platform?: { readonly os: "linux"; readonly arch: "x64" };
       readonly capabilities?: {
         readonly activityProtocolVersion: 2 | null;
         readonly worktreeCatalog?: boolean;
@@ -781,20 +782,33 @@ interface TestEnvironmentPresentation {
 function makeEnvironmentPresentation(
   overrides: Partial<TestEnvironmentPresentation> = {},
 ): TestEnvironmentPresentation {
+  const defaultServerConfig = {
+    providers: [codexProvider],
+    environment: {
+      label: "Local",
+      platform: { os: "linux" as const, arch: "x64" as const },
+      capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+    },
+  };
   return {
     environmentId,
     label: "Local",
     displayUrl: null,
     relayManaged: false,
     connection: { phase: "connected", error: null, traceId: null },
-    serverConfig: {
-      providers: [codexProvider],
-      environment: {
-        label: "Local",
-        capabilities: { activityProtocolVersion: 2, worktreeCatalog: true },
-      },
-    },
     ...overrides,
+    serverConfig:
+      overrides.serverConfig === undefined
+        ? defaultServerConfig
+        : overrides.serverConfig === null
+          ? null
+          : {
+              ...overrides.serverConfig,
+              environment: {
+                platform: defaultServerConfig.environment.platform,
+                ...overrides.serverConfig.environment,
+              },
+            },
   };
 }
 
