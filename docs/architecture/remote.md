@@ -91,6 +91,15 @@ and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
 runtime. The resulting `SshConnectionTarget` enters the same authorization and
 RPC pipeline as other targets.
 
+Fresh setup mints its bootstrap credential by running
+`bibcode pairing issue --base-dir "$HOME/.bibcode" --json` on the remote host
+(the same data root the launched `serve` uses). The command writes a one-time
+administrative pairing link into that root's auth store and prints one JSON
+line whose `credential` field the desktop exchanges at `/oauth/token`. Because
+the server consumes pairing links from the database and the store runtime lock
+is shared, the command works beside the already-running remote server without
+a restart.
+
 SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
 process supervision, or access to the user's SSH configuration.
 
@@ -154,10 +163,6 @@ performed on the machine that owns that server and filesystem.
 
 - OS-backed protection for the desktop connection catalog is implemented on
   Windows; other platforms currently use renderer storage fallback.
-- The desktop SSH launcher and forwarding implementation exist, but fresh SSH
-  setup is currently blocked: its pairing step invokes the removed
-  `bibcode auth pairing create` command while the native CLI exposes only
-  `start` and `serve`.
 - Desktop SSH and some advertised endpoint providers are host capabilities and
   are unavailable in an ordinary browser.
 - Endpoint availability is advisory. The connection supervisor still verifies
