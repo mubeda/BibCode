@@ -558,11 +558,15 @@ export const SERVER_UPDATE_CHECK_ENABLED = false;
 
 export function ConnectTab({
   initialPairingCode = null,
+  initialAddServerOpen = false,
   onPairingCodeConsumed,
+  onAddServerActionConsumed,
   showServerUpdateCheck = SERVER_UPDATE_CHECK_ENABLED,
 }: {
   readonly initialPairingCode?: string | null;
+  readonly initialAddServerOpen?: boolean;
   readonly onPairingCodeConsumed?: () => void;
+  readonly onAddServerActionConsumed?: () => void;
   readonly showServerUpdateCheck?: boolean;
 }) {
   const desktopBridge = window.desktopBridge;
@@ -631,6 +635,7 @@ export function ConnectTab({
 
   const [addBackendDialogOpen, setAddBackendDialogOpen] = useState(false);
   const initialPairingCodeConsumedRef = useRef(false);
+  const initialAddServerActionConsumedRef = useRef(false);
   const [savedBackendMode, setSavedBackendMode] = useState<"pairing-code" | "manual" | "ssh">(
     "pairing-code",
   );
@@ -686,6 +691,17 @@ export function ConnectTab({
     setSavedBackendError(null);
     setAddBackendDialogOpen(true);
   }, [initialPairingCode]);
+  useEffect(() => {
+    if (!initialAddServerOpen || initialAddServerActionConsumedRef.current) return;
+    initialAddServerActionConsumedRef.current = true;
+    setSavedBackendMode("pairing-code");
+    setTunnelAcknowledged(false);
+    setFlowDemandsAcknowledgement(false);
+    setAddServerFailure(null);
+    setSavedBackendError(null);
+    setAddBackendDialogOpen(true);
+    onAddServerActionConsumed?.();
+  }, [initialAddServerOpen, onAddServerActionConsumed]);
   const desktopSshHosts = useEnvironmentQuery(
     desktopBridge && addBackendDialogOpen && savedBackendMode === "ssh"
       ? desktopSshHostsStateAtom

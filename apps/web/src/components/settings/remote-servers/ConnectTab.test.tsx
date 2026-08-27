@@ -1533,6 +1533,21 @@ describe("Remote Servers tabs", () => {
       });
       expect(onPairingCodeConsumed).toHaveBeenCalledTimes(1);
     });
+
+    it("opens and consumes the one-shot add-server action", async () => {
+      stubBrowserWindow();
+      const onAddServerActionConsumed = vi.fn();
+
+      await mountConnections(
+        <ConnectTab
+          initialAddServerOpen
+          onAddServerActionConsumed={onAddServerActionConsumed}
+        />,
+      );
+
+      expect(findControls("dialog", "true")).not.toHaveLength(0);
+      expect(onAddServerActionConsumed).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("Check for Server Updates placement", () => {

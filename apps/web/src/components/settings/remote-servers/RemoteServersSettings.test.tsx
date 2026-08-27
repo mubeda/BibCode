@@ -58,4 +58,21 @@ describe("RemoteServersSettings", () => {
     });
     await cleanup();
   });
+
+  it("forwards the one-shot add-server opener to the Connect tab", async () => {
+    connectTabProps.mockClear();
+    const onAddServerActionConsumed = vi.fn();
+    const { cleanup } = await render(
+      <RemoteServersSettings
+        initialAddServerOpen
+        onAddServerActionConsumed={onAddServerActionConsumed}
+      />,
+    );
+    expect(connectTabProps).toHaveBeenCalledWith({
+      initialPairingCode: null,
+      initialAddServerOpen: true,
+      onAddServerActionConsumed,
+    });
+    await cleanup();
+  });
 });

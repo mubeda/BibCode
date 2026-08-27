@@ -227,7 +227,7 @@ export function EnvironmentRail() {
               onClick={() =>
                 void navigate({
                   to: "/settings/remote-servers",
-                  search: { action: "add-server" } as never,
+                  search: { action: "add-server" },
                 })
               }
             />
