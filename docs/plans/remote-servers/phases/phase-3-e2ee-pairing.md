@@ -1592,7 +1592,7 @@ git commit -m "feat(server): serve the RPC session over an in-channel-authentica
 - Produces (TS): `RemotePairingReach`, `REMOTE_PAIRING_CODE_VERSION`, `RemotePairingCodePayload`, `E2eeAuthPairingMessage`, `E2eeAuthBearerMessage`, `E2eeAuthMessage` (their union), `E2eeAuthenticatedMessage` (optional `credential`/`environmentId`/`storageInstanceId`), `E2eeErrorCode`, `E2eeErrorMessage`. (The mint endpoint's request/response schemas are Task 8's, in `auth.ts`.)
 - Produces (Rust): `RemotePairingReach`, `RemotePairingCodePayload`, `REMOTE_PAIRING_CODE_VERSION`, `PairingCodeError`, `encode_pairing_code`, `decode_pairing_code`, `pairing_deep_link`, `browser_pair_url`. Tasks 7, 8, 13, 14 consume these.
 
-- [ ] **Step 1: Write the failing TS test**
+- [x] **Step 1: Write the failing TS test**
 
 `packages/contracts/src/remotePairing.test.ts` (parity style follows `persistenceRustParity.test.ts`: a checked-in fixture corpus decoded by both languages; the Rust half comes in Step 5):
 
@@ -1710,12 +1710,12 @@ Fixtures (write them now; the `token` value is a syntactically plausible sample,
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run (from `packages/contracts`): `vp test run src/remotePairing.test.ts`
 Expected: FAIL — module `./remotePairing.ts` does not exist.
 
-- [ ] **Step 3: Write the TS schema**
+- [x] **Step 3: Write the TS schema**
 
 `packages/contracts/src/remotePairing.ts` (schema-only — no runtime logic; the codec lives in `packages/shared`, Task 7):
 
@@ -1793,12 +1793,12 @@ export type E2eeErrorMessage = typeof E2eeErrorMessage.Type;
 
 Add `export * from "./remotePairing.ts";` to `packages/contracts/src/index.ts` (after the `remoteAccess.ts` line).
 
-- [ ] **Step 4: Run TS test to verify it passes**
+- [x] **Step 4: Run TS test to verify it passes**
 
 Run (from `packages/contracts`): `vp test run src/remotePairing.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Write the failing Rust parity test, then the Rust mirror**
+- [x] **Step 5: Write the failing Rust parity test, then the Rust mirror**
 
 `apps/server/tests/remote_pairing.rs`:
 
@@ -1943,12 +1943,12 @@ pub fn browser_pair_url(endpoint: &str, code: &str) -> Result<String, PairingCod
 
 In `apps/server/src/auth/mod.rs`: `pub mod pairing_code;`. In `apps/server/src/lib.rs`, re-export it for the integration test the way other test-visible modules are exported (add `pub use auth::pairing_code as auth_pairing_code;` — or match the crate's existing re-export idiom; check how `ROUTE_INVENTORY` etc. are surfaced at `lib.rs:52` and follow it).
 
-- [ ] **Step 6: Run all tests to verify they pass**
+- [x] **Step 6: Run all tests to verify they pass**
 
 Run: `cargo test -p bibcode-server --test remote_pairing` and (from `packages/contracts`) `vp test run src/remotePairing.test.ts`
 Expected: PASS both. If the string-equality assertion fails on the re-serialization, fix the _fixture_ to the Rust serializer's output and re-run the TS test — both sides must agree on one canonical byte sequence.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add packages/contracts/src/remotePairing.ts packages/contracts/src/remotePairing.test.ts packages/contracts/src/index.ts packages/contracts/fixtures/remote-pairing apps/server/src/auth/pairing_code.rs apps/server/src/auth/mod.rs apps/server/src/lib.rs apps/server/tests/remote_pairing.rs

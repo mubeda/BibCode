@@ -44,6 +44,7 @@ use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 
+pub use auth::pairing_code as auth_pairing_code;
 pub use config::{
     Cli, CliAction, ConfigError, PairingCommand, ServerConfig, ServerMode, StorageCommand,
 };

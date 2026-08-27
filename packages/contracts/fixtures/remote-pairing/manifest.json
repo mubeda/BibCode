@@ -1,0 +1,4 @@
+{
+  "formatVersion": 1,
+  "fixtures": ["code.txt", "payload.json", "unsupported-version.json"]
+}

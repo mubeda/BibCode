@@ -2,6 +2,7 @@ mod dpop;
 mod host_identity;
 mod http;
 mod model;
+pub mod pairing_code;
 mod rpc;
 mod scope;
 mod secret_store;
