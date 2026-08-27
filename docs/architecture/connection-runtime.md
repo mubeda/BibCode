@@ -320,3 +320,21 @@ inferred by the bootstrap helper or authorization token cache.
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and
 [Worktree catalog](./worktree-catalog.md) for discovery and lifecycle rules.
+
+## Protocol compatibility verdict
+
+`packages/client-runtime/src/connection/compat.ts` computes a `CompatVerdict`
+(`compatible`, `legacy`, `server-too-old`, or `client-too-old`) from the
+`remoteProtocolVersion` / `minCompatibleRemoteProtocol` pair on the
+environment descriptor. The rule is a two-way window: compatible iff the
+server's version meets this client's floor and this client's version meets
+the server's floor; a descriptor with both fields decode-defaulted to `0`
+predates the window and is `legacy` ("Limited compatibility"), with the
+existing default-false capability booleans still governing behavior. The
+verdict rides the descriptor the resolver fetches on every connection
+attempt: `createEnvironmentSessionAtoms(...).compatVerdictAtom(environmentId)`
+derives it from the supervisor's prepared connection and is `null` until an
+attempt has produced a descriptor. Failed descriptor probes have no separate
+cache: retry pacing is the supervisor's existing 1/2/4/8/16 s reconnection
+backoff, so a startup burst against an unreachable environment is already
+throttled to one attempt per backoff step.
