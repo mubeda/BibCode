@@ -40,9 +40,9 @@
 ```ts
 export type CompatVerdict =
   | { kind: "compatible" }
-  | { kind: "legacy" }            // server predates the window (both fields 0)
+  | { kind: "legacy" } // server predates the window (both fields 0)
   | { kind: "server-too-old"; serverVersion: number; minSupported: number }
-  | { kind: "client-too-old"; serverMinCompatible: number; clientVersion: number }
+  | { kind: "client-too-old"; serverMinCompatible: number; clientVersion: number };
 ```
 
 This plan calls the verdict-computing export `computeCompatVerdict(descriptor): CompatVerdict`. At implementation time, open `packages/client-runtime/src/connection/compat.ts` and use whatever export name Phase 2 actually landed for that computation; only the `CompatVerdict` shape above is normative.
@@ -58,27 +58,27 @@ This plan calls the verdict-computing export `computeCompatVerdict(descriptor): 
 - `ConnectionOnboarding.verifyAndAddPairingCode` with failure classification `unreachable | host-identity-mismatch | pairing-rejected | incompatible | duplicate-storage-identity` plus the distinct `PairingLoopbackAcknowledgementRequiredError` for the tunnel-acknowledgement UI.
 - `connectionTransportSecurity(entry)` presentation helper (`"local" | "e2ee" | "channel-secured" | "unencrypted"`) for the "unencrypted" badge.
 
-**Known spec deviation (resolved in Task 15).** Spec §4.3 says each WS binary message's plaintext is "exactly the bytes the plain `/ws` socket would carry". Noise caps one message at 65,535 bytes (ciphertext, including the 16-byte AEAD tag), while RPC messages (e.g. `projects.readFile` responses) routinely exceed that. This plan therefore uses a 1-byte record header inside every Noise transport plaintext (`0x00` final / `0x01` continuation) and preserves the invariant in concatenated form: *the concatenation of a logical message's record chunks is exactly the bytes the plain `/ws` socket would carry*. One WS binary message is still exactly one Noise message. Spec §4.3 was already amended to this record framing during plan review (2026-08-27); Task 15 verifies the spec text matches rather than amending it. Both handshake messages and the empty-prologue choice are unaffected.
+**Known spec deviation (resolved in Task 15).** Spec §4.3 says each WS binary message's plaintext is "exactly the bytes the plain `/ws` socket would carry". Noise caps one message at 65,535 bytes (ciphertext, including the 16-byte AEAD tag), while RPC messages (e.g. `projects.readFile` responses) routinely exceed that. This plan therefore uses a 1-byte record header inside every Noise transport plaintext (`0x00` final / `0x01` continuation) and preserves the invariant in concatenated form: _the concatenation of a logical message's record chunks is exactly the bytes the plain `/ws` socket would carry_. One WS binary message is still exactly one Noise message. Spec §4.3 was already amended to this record framing during plan review (2026-08-27); Task 15 verifies the spec text matches rather than amending it. Both handshake messages and the empty-prologue choice are unaffected.
 
 **Wire summary (both sides must match; constants are asserted in tests):**
 
-| item | value |
-|---|---|
-| Noise protocol | `Noise_NK_25519_ChaChaPoly_SHA256`, empty prologue, pre-message `<- s` = host identity public key |
-| Message 1 (client→server) | NK `-> e, es`, **empty handshake payload enforced** (non-empty → protocol violation, close), one WS binary frame |
-| Message 2 (server→client) | NK `<- e, ee`, **empty handshake payload enforced** (non-empty → protocol violation, close), one WS binary frame |
-| Wrong pinned key | responder cannot decrypt Message 1 → closes with **WS close code 4403**, never sends Message 2; initiator maps close-4403 or an AEAD failure on Message 2 to `host-identity-mismatch` |
-| Transport frame | one WS binary frame = one Noise transport ciphertext, ≤ 65535 bytes |
-| Record plaintext | `flag byte (0x00 final / 0x01 continuation)` ++ chunk (chunk ≤ 65518 bytes) |
-| Logical message cap | pre-auth (`e2ee_auth`): **64 KiB** reassembled; post-auth: 64 MiB reassembled; violation → close |
-| First transport message | client→server, one of `{"type":"e2ee_auth","pairing":"<one-time pairing token>"}` (first connect; server performs the bootstrap exchange **inside the channel**) or `{"type":"e2ee_auth","bearer":"<stored access credential>"}` (subsequent connects). **No `/oauth/token` or WebSocket-ticket HTTP round-trips for hostKey targets**; the only pre-auth HTTP is the unauthenticated descriptor fetch (routing hint, re-verified in-channel) |
-| Server replies | pairing form: `{"type":"e2ee_authenticated","credential":"<bearer>","environmentId":…,"storageInstanceId":…}`; bearer form: `{"type":"e2ee_authenticated"}`; failure: `{"type":"e2ee_error","code":"unauthorized"|"protocol"}` then close. The one-time token is consumed only by a successful in-channel exchange (pre-auth failures leave it retryable) |
-| No-downgrade rule | sessions minted through `/ws-e2ee` are recorded `transport: "e2ee"` and rejected by the plain `/ws` route and plain-HTTP bearer surfaces |
-| Handshake+auth deadline | **one combined 10 s deadline** from upgrade to `e2ee_authenticated`; exceeded → close |
-| Pre-auth connection cap | unauthenticated in-flight `/ws-e2ee` connections capped (32); over cap → immediate close 1013 |
-| Outbound writer policy | mirrors the plain RPC session: 5 s per-write timeout, 1 s pump-join timeout then abort |
-| Nonce policy | no rekey in v1; connection-lifetime bound is the Noise 2^64−1 counter (unreachable in practice: >584,000 years at 1M msgs/s); counter overflow or any AEAD failure closes the connection |
-| hostKey encoding | base64url, unpadded, of the raw 32 public-key bytes (spec §4.1) |
+| item                      | value                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Noise protocol            | `Noise_NK_25519_ChaChaPoly_SHA256`, empty prologue, pre-message `<- s` = host identity public key                                                                                                                                                                                                                                                                                                                                             |
+| Message 1 (client→server) | NK `-> e, es`, **empty handshake payload enforced** (non-empty → protocol violation, close), one WS binary frame                                                                                                                                                                                                                                                                                                                              |
+| Message 2 (server→client) | NK `<- e, ee`, **empty handshake payload enforced** (non-empty → protocol violation, close), one WS binary frame                                                                                                                                                                                                                                                                                                                              |
+| Wrong pinned key          | responder cannot decrypt Message 1 → closes with **WS close code 4403**, never sends Message 2; initiator maps close-4403 or an AEAD failure on Message 2 to `host-identity-mismatch`                                                                                                                                                                                                                                                         |
+| Transport frame           | one WS binary frame = one Noise transport ciphertext, ≤ 65535 bytes                                                                                                                                                                                                                                                                                                                                                                           |
+| Record plaintext          | `flag byte (0x00 final / 0x01 continuation)` ++ chunk (chunk ≤ 65518 bytes)                                                                                                                                                                                                                                                                                                                                                                   |
+| Logical message cap       | pre-auth (`e2ee_auth`): **64 KiB** reassembled; post-auth: 64 MiB reassembled; violation → close                                                                                                                                                                                                                                                                                                                                              |
+| First transport message   | client→server, one of `{"type":"e2ee_auth","pairing":"<one-time pairing token>"}` (first connect; server performs the bootstrap exchange **inside the channel**) or `{"type":"e2ee_auth","bearer":"<stored access credential>"}` (subsequent connects). **No `/oauth/token` or WebSocket-ticket HTTP round-trips for hostKey targets**; the only pre-auth HTTP is the unauthenticated descriptor fetch (routing hint, re-verified in-channel) |
+| Server replies            | pairing form: `{"type":"e2ee_authenticated","credential":"<bearer>","environmentId":…,"storageInstanceId":…}`; bearer form: `{"type":"e2ee_authenticated"}`; failure: `{"type":"e2ee_error","code":"unauthorized"                                                                                                                                                                                                                             | "protocol"}` then close. The one-time token is consumed only by a successful in-channel exchange (pre-auth failures leave it retryable) |
+| No-downgrade rule         | sessions minted through `/ws-e2ee` are recorded `transport: "e2ee"` and rejected by the plain `/ws` route and plain-HTTP bearer surfaces                                                                                                                                                                                                                                                                                                      |
+| Handshake+auth deadline   | **one combined 10 s deadline** from upgrade to `e2ee_authenticated`; exceeded → close                                                                                                                                                                                                                                                                                                                                                         |
+| Pre-auth connection cap   | unauthenticated in-flight `/ws-e2ee` connections capped (32); over cap → immediate close 1013                                                                                                                                                                                                                                                                                                                                                 |
+| Outbound writer policy    | mirrors the plain RPC session: 5 s per-write timeout, 1 s pump-join timeout then abort                                                                                                                                                                                                                                                                                                                                                        |
+| Nonce policy              | no rekey in v1; connection-lifetime bound is the Noise 2^64−1 counter (unreachable in practice: >584,000 years at 1M msgs/s); counter overflow or any AEAD failure closes the connection                                                                                                                                                                                                                                                      |
+| hostKey encoding          | base64url, unpadded, of the raw 32 public-key bytes (spec §4.1)                                                                                                                                                                                                                                                                                                                                                                               |
 
 ---
 
@@ -87,12 +87,14 @@ This plan calls the verdict-computing export `computeCompatVerdict(descriptor): 
 The spec mandates `snow` (Rust) and the noble stack (TS) but requires re-verifying current library status before locking versions. Do that first so every later task compiles against known-good APIs.
 
 **Files:**
+
 - Modify: `Cargo.toml` (workspace `[workspace.dependencies]`)
 - Modify: `apps/server/Cargo.toml` (`[dependencies]`)
 - Modify: `pnpm-workspace.yaml` (catalog)
 - Modify: `packages/client-runtime/package.json` (`dependencies`)
 
 **Interfaces:**
+
 - Consumes: nothing.
 - Produces: `snow` available to `bibcode-server`; `@noble/curves`, `@noble/ciphers`, `@noble/hashes` available to `@bibcode/client-runtime`. Later tasks import `snow::Builder`, `x25519` from `@noble/curves/ed25519.js`, `chacha20poly1305` from `@noble/ciphers/chacha.js`, `sha256` from `@noble/hashes/sha2.js`, `hmac` from `@noble/hashes/hmac.js`.
 
@@ -135,7 +137,7 @@ snow.workspace = true
 `pnpm-workspace.yaml` catalog (next to the existing noble pins, using the version verified in Step 1):
 
 ```yaml
-  "@noble/ciphers": <verified 2.x version>
+"@noble/ciphers": <verified 2.x version>
 ```
 
 `packages/client-runtime/package.json` dependencies:
@@ -165,11 +167,13 @@ git commit -m "build(e2ee): pin snow and noble crypto dependencies"
 The server owns a static X25519 keypair, `host_identity`, generated on first use and stored via the existing secret store. Public key encoding everywhere: base64url, unpadded, of the raw 32 bytes. Distributed only inside pairing codes.
 
 **Files:**
+
 - Create: `apps/server/src/auth/host_identity.rs`
 - Modify: `apps/server/src/auth/mod.rs` (declare + re-export module)
 - Modify: `apps/server/src/auth/service.rs` (field + accessor + load in `new_with_persistence`)
 
 **Interfaces:**
+
 - Consumes: `SecretStore` (`apps/server/src/auth/secret_store.rs`) — `get`, `create` (create-new semantics with `is_already_exists()` race classification, exactly as `get_or_create_random` uses them).
 - Produces: `pub(crate) const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_SHA256";`, `pub struct HostIdentity` with `load_or_generate(&SecretStore) -> Result<Self, HostIdentityError>`, `generate_ephemeral() -> Self`, `public_key_base64url(&self) -> String`, `private_key_bytes(&self) -> &[u8; 32]`, `public_key_bytes(&self) -> &[u8; 32]`; `AuthService::host_identity(&self) -> &HostIdentity`. Tasks 5 and 8 consume these.
 
@@ -393,10 +397,12 @@ git commit -m "feat(server): persist a static X25519 host identity keypair"
 `run_session` (`apps/server/src/rpc/session.rs:314`) takes a concrete `axum::extract::ws::WebSocket` and immediately `.split()`s it. The E2EE route needs to feed the same session loop through an encrypt/decrypt pump. Refactor first, behind existing tests, so Task 5 builds on a proven seam.
 
 **Files:**
+
 - Modify: `apps/server/src/rpc/session.rs` (`run_session` → thin wrapper over new `run_session_split`)
 - Modify: `apps/server/src/rpc/mod.rs` (export `run_session_split`)
 
 **Interfaces:**
+
 - Consumes: existing `run_session(socket, registry, context, session_shutdown)` call sites in `apps/server/src/http.rs:209,243` (unchanged).
 - Produces:
 
@@ -476,14 +482,16 @@ git commit -m "refactor(server): run the RPC session over generic transport halv
 
 ### Task 4: E2EE record layer and Noise responder session (server)
 
-The encrypted-channel engine: record framing (flag byte + chunk), the snow responder handshake, transport encrypt/decrypt with limits, and the control-message types. Pure module, unit-tested against a snow *initiator* in the same tests (snow↔snow), so Task 5 only wires it to Axum.
+The encrypted-channel engine: record framing (flag byte + chunk), the snow responder handshake, transport encrypt/decrypt with limits, and the control-message types. Pure module, unit-tested against a snow _initiator_ in the same tests (snow↔snow), so Task 5 only wires it to Axum.
 
 **Files:**
+
 - Create: `apps/server/src/rpc/e2ee.rs`
 - Modify: `apps/server/src/rpc/mod.rs` (`mod e2ee;` + re-exports used by http.rs)
 - Modify: `Cargo.toml` / `apps/server/Cargo.toml` only if `tokio-util` needs the `sync` feature (Task 5 uses `PollSender`; add `"sync"` to the workspace `tokio-util` features list now: `tokio-util = { version = "0.7.18", features = ["io", "rt", "sync"] }`)
 
 **Interfaces:**
+
 - Consumes: `NOISE_NK_PARAMS`, `HostIdentity` (Task 2).
 - Produces (consumed by Task 5):
 
@@ -993,6 +1001,7 @@ git commit -m "feat(server): Noise NK responder channel with record framing"
 Mount the route; run handshake → in-channel `e2ee_auth` (pairing form performs the bootstrap exchange and mints the device session **inside** the channel; bearer form authenticates a stored credential) → `run_session_split` with encrypt/decrypt pumps, mirroring every side effect of the plain `/ws` handler (`mark_connected`/`mark_disconnected`, expiration guard, unsafe-no-auth behavior). Two red-green cycles: **Cycle A** adds the session `transport` marker and the no-downgrade rejections to `AuthService`; **Cycle B** builds the route with pre-auth hardening (4403 wrong-key close, 64 KiB pre-auth cap, single combined deadline, pre-auth connection cap, plain-session write/join pump timeouts).
 
 **Files:**
+
 - Modify: `apps/server/src/auth/token.rs` (`SessionClaims` gains a `tr` transport claim, decode-defaulted `"plain"`)
 - Modify: `apps/server/src/auth/service.rs` (`SessionTransport`, transport-aware issuance + authentication checks)
 - Modify: `apps/server/src/auth/http.rs` + `apps/server/src/rpc/mod.rs`/callers (plain surfaces pass `SessionTransport::Plain`)
@@ -1002,6 +1011,7 @@ Mount the route; run handshake → in-channel `e2ee_auth` (pairing form performs
 - Modify: `apps/server/tests/server_runtime.rs` (`expected_routes()` gains `("GET", "/ws-e2ee")`)
 
 **Interfaces:**
+
 - Consumes: `E2eeChannel`, control-message helpers, constants (Task 4); `run_session_split` (Task 3); `AuthService::{exchange_bootstrap, authenticate_token, mark_connected, mark_disconnected, host_identity}`; `RpcSessionContext::{authenticated, unauthenticated}`; `AppState.config.{environment_id, storage_instance_id}`.
 - Produces: `pub(crate) const WS_E2EE_PATH: &str = "/ws-e2ee";` in `http.rs`; the running route; `pub(crate) enum SessionTransport { Plain, E2ee }` in `auth/service.rs` with transport-aware `exchange_bootstrap` / `authenticate_token` (existing call sites pass `Plain`); the no-downgrade guarantee (e2ee-minted credentials rejected on `/ws` and plain-HTTP bearer surfaces). `GET /ws-e2ee` classifies as `RpcMutability::Read` automatically (`http_mutability` in `apps/server/src/maintenance.rs:49` treats all GETs as reads — no change there).
 
@@ -1564,6 +1574,7 @@ git commit -m "feat(server): serve the RPC session over an in-channel-authentica
 ### Task 6: Pairing-code contract schema, Rust mirror, parity fixtures (spec §4.2)
 
 **Files:**
+
 - Create: `packages/contracts/src/remotePairing.ts`
 - Create: `packages/contracts/src/remotePairing.test.ts`
 - Create: `packages/contracts/fixtures/remote-pairing/manifest.json`
@@ -1576,6 +1587,7 @@ git commit -m "feat(server): serve the RPC session over an in-channel-authentica
 - Test: `apps/server/tests/remote_pairing.rs`
 
 **Interfaces:**
+
 - Consumes: `TrimmedNonEmptyString` from `packages/contracts/src/baseSchemas.ts`.
 - Produces (TS): `RemotePairingReach`, `REMOTE_PAIRING_CODE_VERSION`, `RemotePairingCodePayload`, `E2eeAuthPairingMessage`, `E2eeAuthBearerMessage`, `E2eeAuthMessage` (their union), `E2eeAuthenticatedMessage` (optional `credential`/`environmentId`/`storageInstanceId`), `E2eeErrorCode`, `E2eeErrorMessage`. (The mint endpoint's request/response schemas are Task 8's, in `auth.ts`.)
 - Produces (Rust): `RemotePairingReach`, `RemotePairingCodePayload`, `REMOTE_PAIRING_CODE_VERSION`, `PairingCodeError`, `encode_pairing_code`, `decode_pairing_code`, `pairing_deep_link`, `browser_pair_url`. Tasks 7, 8, 13, 14 consume these.
@@ -1630,11 +1642,7 @@ describe("remote pairing contract", () => {
   });
 
   it("covers all reach values", () => {
-    expect([...RemotePairingReach.literals]).toEqual([
-      "another-device",
-      "this-computer",
-      "custom",
-    ]);
+    expect([...RemotePairingReach.literals]).toEqual(["another-device", "this-computer", "custom"]);
   });
 
   it("round-trips the channel control messages", () => {
@@ -1666,7 +1674,15 @@ Fixtures (write them now; the `token` value is a syntactically plausible sample,
 `payload.json` — **single canonical JSON encoding, key order exactly as below** (the Rust test re-serializes and compares strings, so the field order must match the Rust struct declaration order):
 
 ```json
-{"v":1,"endpoint":"http://192.168.1.20:3773","name":"AI-SERVER","token":"BCDFGHJKMNPQ","hostKey":"HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM","reach":"another-device","storageInstanceId":"3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11"}
+{
+  "v": 1,
+  "endpoint": "http://192.168.1.20:3773",
+  "name": "AI-SERVER",
+  "token": "BCDFGHJKMNPQ",
+  "hostKey": "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM",
+  "reach": "another-device",
+  "storageInstanceId": "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11"
+}
 ```
 
 `code.txt` — the base64url (unpadded) of the exact bytes of `payload.json` (without trailing newline). Generate it during implementation with `node -e 'console.log(Buffer.from(require("fs").readFileSync("packages/contracts/fixtures/remote-pairing/payload.json","utf8").trim()).toString("base64url"))'` and commit the output.
@@ -1674,7 +1690,15 @@ Fixtures (write them now; the `token` value is a syntactically plausible sample,
 `unsupported-version.json`:
 
 ```json
-{"v":2,"endpoint":"http://192.168.1.20:3773","name":"AI-SERVER","token":"BCDFGHJKMNPQ","hostKey":"HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM","reach":"another-device","storageInstanceId":"3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11"}
+{
+  "v": 2,
+  "endpoint": "http://192.168.1.20:3773",
+  "name": "AI-SERVER",
+  "token": "BCDFGHJKMNPQ",
+  "hostKey": "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM",
+  "reach": "another-device",
+  "storageInstanceId": "3f2f6a52-6f5f-4f4e-9d38-0a1e2ac21d11"
+}
 ```
 
 `manifest.json`:
@@ -1922,7 +1946,7 @@ In `apps/server/src/auth/mod.rs`: `pub mod pairing_code;`. In `apps/server/src/l
 - [ ] **Step 6: Run all tests to verify they pass**
 
 Run: `cargo test -p bibcode-server --test remote_pairing` and (from `packages/contracts`) `vp test run src/remotePairing.test.ts`
-Expected: PASS both. If the string-equality assertion fails on the re-serialization, fix the *fixture* to the Rust serializer's output and re-run the TS test — both sides must agree on one canonical byte sequence.
+Expected: PASS both. If the string-equality assertion fails on the re-serialization, fix the _fixture_ to the Rust serializer's output and re-run the TS test — both sides must agree on one canonical byte sequence.
 
 - [ ] **Step 7: Commit**
 
@@ -1938,6 +1962,7 @@ git commit -m "feat(contracts): bibcode://pair payload schema with Rust parity"
 Runtime helpers live in `packages/shared` (contracts stays schema-only): encode/parse the code and its two URL forms, and classify pairing endpoints for the loopback/tunnel rule.
 
 **Files:**
+
 - Create: `packages/shared/src/pairingCode.ts`
 - Create: `packages/shared/src/pairingCode.test.ts`
 - Modify: `packages/shared/src/advertisedEndpoint.ts` (add `classifyPairingEndpoint`)
@@ -1945,26 +1970,29 @@ Runtime helpers live in `packages/shared` (contracts stays schema-only): encode/
 - Modify: `packages/shared/package.json` (add `"./pairingCode"` export entry, matching the existing per-file export style)
 
 **Interfaces:**
+
 - Consumes: `RemotePairingCodePayload`, `REMOTE_PAIRING_CODE_VERSION` from `@bibcode/contracts` (Task 6).
 - Produces:
 
 ```ts
 // pairingCode.ts
 export class PairingCodeParseError extends Schema.TaggedErrorClass<PairingCodeParseError>()(
-  "PairingCodeParseError", { detail: Schema.String },
+  "PairingCodeParseError",
+  { detail: Schema.String },
 ) {}
 export class PairingCodeUnsupportedVersionError extends Schema.TaggedErrorClass<PairingCodeUnsupportedVersionError>()(
-  "PairingCodeUnsupportedVersionError", { version: Schema.Number },
+  "PairingCodeUnsupportedVersionError",
+  { version: Schema.Number },
 ) {}
 export function encodePairingCode(payload: RemotePairingCodePayload): string;
 /** Accepts the bare base64url code, `bibcode://pair?code=...`, or `http(s)://.../pair?code=...`. */
 export function parsePairingCode(raw: string): RemotePairingCodePayload; // throws the two errors above
-export function buildPairingDeepLink(code: string): string;   // bibcode://pair?code=<code>
+export function buildPairingDeepLink(code: string): string; // bibcode://pair?code=<code>
 export function buildBrowserPairUrl(endpoint: string, code: string): string; // <endpoint>/pair?code=<code>
 
 // advertisedEndpoint.ts
 export type PairingEndpointClassification =
-  | "loopback" | "private-network" | "public" | "unconnectable";
+  "loopback" | "private-network" | "public" | "unconnectable";
 export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassification;
 ```
 
@@ -2148,7 +2176,9 @@ export function parsePairingCode(raw: string): RemotePairingCodePayload {
     throw new PairingCodeParseError({ detail: `not base64url JSON (${String(cause)})` });
   }
   const version =
-    typeof parsed === "object" && parsed !== null && "v" in parsed ? (parsed as { v: unknown }).v : null;
+    typeof parsed === "object" && parsed !== null && "v" in parsed
+      ? (parsed as { v: unknown }).v
+      : null;
   if (typeof version !== "number" || !Number.isInteger(version)) {
     throw new PairingCodeParseError({ detail: "the payload has no integer version" });
   }
@@ -2179,10 +2209,7 @@ export function buildBrowserPairUrl(endpoint: string, code: string): string {
 
 ```ts
 export type PairingEndpointClassification =
-  | "loopback"
-  | "private-network"
-  | "public"
-  | "unconnectable";
+  "loopback" | "private-network" | "public" | "unconnectable";
 
 function isPrivateIpv4(host: string): boolean {
   const octets = host.split(".").map(Number);
@@ -2250,6 +2277,7 @@ Authenticated, `access:write`-scoped minting of complete pairing codes over HTTP
 Phase 5 later **modifies** this endpoint — its Tasks 1–3 add reach persistence (`issue_share_pairing` + migration) and exposure derivation, then its Task 4 swaps the issuance call here. All names below (`AuthPairingOfferResult`, `pairingOffer`, `create_pairing_offer`, fixture paths, `invalid_pairing_offer`) are pinned jointly with Phase 5's Task 4 so that phase edits, never re-creates, this surface.
 
 **Files:**
+
 - Modify: `packages/contracts/src/auth.ts` (`AuthCreatePairingOfferInput`, `AuthPairingOfferResult`)
 - Modify: `packages/contracts/src/environmentHttp.ts` (`pairingOffer` endpoint; `"invalid_pairing_offer"` reason literal)
 - Modify: `packages/contracts/src/authRustParity.test.ts` (route contract, samples, fixtures, decoders, route count)
@@ -2262,11 +2290,13 @@ Phase 5 later **modifies** this endpoint — its Tasks 1–3 add reach persisten
 - Test: `apps/server/tests/e2ee_ws.rs` (full mint → pair → encrypted-session round trip)
 
 **Interfaces:**
+
 - Consumes: `RemotePairingReach` (Task 6 TS), `RemotePairingCodePayload` + `encode_pairing_code` (Task 6 Rust), `AuthService::{issue_pairing, host_identity}`, `is_loopback_host` (`apps/server/src/auth/service.rs:1143` — raise visibility to `pub(crate)`), `owned_scopes(STANDARD_SCOPES)` idiom from `service.rs`, `AppState.config.storage_instance_id`.
 - Produces: `POST /api/auth/pairing-offer`, scope `access:write`. Request `{ name, endpoint, reach, label?, scopes? }` (`AuthCreatePairingOfferInput`); response `{ id, code, reach, endpoint, name, expiresAt }` (`AuthPairingOfferResult`) where `code` is the base64url-unpadded §4.2 JSON payload. New additive `EnvironmentRequestInvalidReason` literal `"invalid_pairing_offer"`. Phase 5's Share tab and Task 14's interop test consume the endpoint.
 - **Boundary (explicit):** this endpoint accepts `reach`, validates it against the endpoint (rules below), and embeds it in the §4.2 payload — but it does **not** persist `reach` on the pairing link. Reach persistence (schema migration, `issue_share_pairing`, exposure desired-state derivation, spec §4.6) is Phase 5's Tasks 1–3; until then the grant is issued through the existing `issue_pairing`.
 
 Validation rules (pinned jointly with Phase 5):
+
 - `endpoint` must parse as an `http:`/`https:` URL; anything else → `invalid_pairing_offer`.
 - Wildcard hosts (`0.0.0.0`, `::`) and port 0 are unconnectable → `invalid_pairing_offer`.
 - `reach: "this-computer"` requires a loopback endpoint host; `reach: "another-device"` requires a non-loopback host; `reach: "custom"` accepts either.
@@ -2857,6 +2887,7 @@ and read the fixture diff: only `pairing-offer` entries, the route addition, and
 - [ ] **Step 5: Run everything to verify green**
 
 Run:
+
 ```bash
 cargo test -p bibcode-server --test auth_http
 cargo test -p bibcode-server --test e2ee_ws
@@ -2864,6 +2895,7 @@ cargo test -p bibcode-server --test server_runtime
 cargo test -p bibcode-server --test production_maintenance
 cd packages/contracts && vp test run src/authRustParity.test.ts src/auth.test.ts src/environmentHttp.test.ts
 ```
+
 Expected: PASS. `auth_http.rs`'s own fixture-inventory test (`language_neutral_auth_fixtures_match_the_rust_http_inventory`) and the TS parity manifest both cover the new route — if either fails, the endpoint declaration, exporter, and fixtures are out of sync.
 
 - [ ] **Step 6: Commit**
@@ -2880,11 +2912,13 @@ git commit -m "feat(server,contracts): mint bibcode://pair offers over POST /api
 Pure crypto module: NK initiator (production) and responder (used by unit tests and available to future work), validated against official Noise test vectors so the primitives are proven independently of our own responder.
 
 **Files:**
+
 - Create: `packages/client-runtime/src/e2ee/noise.ts`
 - Create: `packages/client-runtime/src/e2ee/noise.test.ts`
 - Create: `packages/client-runtime/src/e2ee/index.ts` (re-export the module surface for in-package use)
 
 **Interfaces:**
+
 - Consumes: noble packages pinned in Task 1.
 - Produces:
 
@@ -2892,15 +2926,15 @@ Pure crypto module: NK initiator (production) and responder (used by unit tests 
 export const NOISE_NK_PROTOCOL_NAME = "Noise_NK_25519_ChaChaPoly_SHA256"; // exactly 32 bytes
 export const MAX_NOISE_MESSAGE_BYTES = 65535;
 export const NOISE_TAG_BYTES = 16;
-export class NoiseAuthenticationError extends Error {}  // AEAD failure
+export class NoiseAuthenticationError extends Error {} // AEAD failure
 export class NonceExhaustedError extends Error {}
-export class NoiseProtocolError extends Error {}        // wrong-length keys/messages, wrong phase
+export class NoiseProtocolError extends Error {} // wrong-length keys/messages, wrong phase
 export interface NoiseCipherState {
   encryptWithAd(ad: Uint8Array, plaintext: Uint8Array): Uint8Array; // throws NonceExhaustedError
   decryptWithAd(ad: Uint8Array, ciphertext: Uint8Array): Uint8Array; // throws NoiseAuthenticationError
 }
 export interface NkTransport {
-  readonly send: NoiseCipherState;    // this side -> peer
+  readonly send: NoiseCipherState; // this side -> peer
   readonly receive: NoiseCipherState; // peer -> this side
   readonly handshakeHash: Uint8Array;
 }
@@ -2915,9 +2949,9 @@ export interface NkResponder {
   split(): NkTransport; // send = responder->initiator, receive = initiator->responder
 }
 export function createNkInitiator(options: {
-  responderStaticPublicKey: Uint8Array;   // 32 bytes
-  prologue?: Uint8Array;                  // default empty
-  ephemeralPrivateKey?: Uint8Array;       // test injection only
+  responderStaticPublicKey: Uint8Array; // 32 bytes
+  prologue?: Uint8Array; // default empty
+  ephemeralPrivateKey?: Uint8Array; // test injection only
 }): NkInitiator;
 export function createNkResponder(options: {
   staticPrivateKey: Uint8Array;
@@ -3375,10 +3409,12 @@ git commit -m "feat(client-runtime): Noise NK initiator and responder over the n
 ### Task 10: TypeScript record layer (fragmentation)
 
 **Files:**
+
 - Create: `packages/client-runtime/src/e2ee/frame.ts`
 - Create: `packages/client-runtime/src/e2ee/frame.test.ts`
 
 **Interfaces:**
+
 - Consumes: `NOISE_TAG_BYTES`, `MAX_NOISE_MESSAGE_BYTES` (Task 9).
 - Produces (constants mirror `apps/server/src/rpc/e2ee.rs` exactly; the interop test in Task 14 exercises both sides):
 
@@ -3486,9 +3522,7 @@ export class E2eeFrameError extends Error {}
 
 export function splitIntoRecords(plaintext: Uint8Array): Array<Uint8Array> {
   if (plaintext.length > MAX_E2EE_LOGICAL_MESSAGE_BYTES) {
-    throw new E2eeFrameError(
-      `outbound message of ${plaintext.length} bytes exceeds the E2EE cap`,
-    );
+    throw new E2eeFrameError(`outbound message of ${plaintext.length} bytes exceeds the E2EE cap`);
   }
   const records: Array<Uint8Array> = [];
   if (plaintext.length === 0) {
@@ -3559,25 +3593,29 @@ git commit -m "feat(client-runtime): E2EE record fragmentation layer"
 Wrap an inner effect `Socket.Socket` (the raw WebSocket) so the RPC protocol layer sees a plain socket: handshake + `e2ee_auth` run before the outer `onOpen` fires; writes latch until authenticated; every failure carries a typed `E2eeProtocolError` cause for Task 13's classification.
 
 **Files:**
+
 - Create: `packages/client-runtime/src/e2ee/socket.ts`
 - Create: `packages/client-runtime/src/e2ee/socket.test.ts`
 - Modify: `packages/client-runtime/src/e2ee/index.ts`
 
 **Interfaces:**
+
 - Consumes: Task 9 (`createNkInitiator`, `decodeBase64UrlKey`, errors), Task 10 (`splitIntoRecords`, `RecordAssembler`), `Socket` from `effect/unstable/socket/Socket` (interface: `run/runString/runRaw/writer`, constructor `Socket.make({ runRaw, writer })`, error types `Socket.SocketError` + `Socket.SocketReadError` / `SocketCloseError` — verify exact exported names in `node_modules/effect/src/unstable/socket/Socket.ts` before coding; the vendored reference copy is `.repos/effect-smol/packages/effect/src/unstable/socket/Socket.ts`).
 - Produces:
 
 ```ts
 export type E2eeFailureReason = "host-identity-mismatch" | "unauthorized" | "protocol" | "timeout";
-export class E2eeProtocolError extends Error { readonly reason: E2eeFailureReason; }
+export class E2eeProtocolError extends Error {
+  readonly reason: E2eeFailureReason;
+}
 export const E2EE_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const E2EE_HOST_IDENTITY_CLOSE_CODE = 4403; // mirrors the server constant
 export type E2eeAuthRequest =
-  | { readonly kind: "pairing"; readonly token: string }   // first connect: in-channel bootstrap
+  | { readonly kind: "pairing"; readonly token: string } // first connect: in-channel bootstrap
   | { readonly kind: "bearer"; readonly credential: string }; // subsequent connects
 export interface E2eeSocketOptions {
-  readonly hostKey: string;             // base64url host identity public key
-  readonly auth: E2eeAuthRequest;       // sent inside the channel as e2ee_auth
+  readonly hostKey: string; // base64url host identity public key
+  readonly auth: E2eeAuthRequest; // sent inside the channel as e2ee_auth
   readonly handshakeTimeoutMs?: number;
   /** Fires exactly once, on e2ee_authenticated, before the outer onOpen runs. */
   readonly onAuthenticated?: (message: E2eeAuthenticatedMessage) => void;
@@ -3769,9 +3807,12 @@ describe("makeE2eeSocket", () => {
           Effect.gen(function* () {
             const write = yield* socket.writer;
             yield* Effect.fork(
-              socket.runString((text) => {
-                delivered.push(text);
-              }, { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) }),
+              socket.runString(
+                (text) => {
+                  delivered.push(text);
+                },
+                { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) },
+              ),
             );
             yield* Deferred.await(opened); // onOpen must NOT fire before e2ee_authenticated
             expect(authenticated).toHaveLength(1); // onAuthenticated fired first
@@ -3821,7 +3862,9 @@ describe("makeE2eeSocket", () => {
         close(4403);
       };
       const socket = makeE2eeSocket(makeScriptedInnerSocket(script), {
-        hostKey: Buffer.from(derivePublicKey(crypto.getRandomValues(new Uint8Array(32)))).toString("base64url"),
+        hostKey: Buffer.from(derivePublicKey(crypto.getRandomValues(new Uint8Array(32)))).toString(
+          "base64url",
+        ),
         auth: { kind: "pairing", token: "t" },
       });
       const exit = yield* socket.runString(() => {}).pipe(Effect.exit);
@@ -3834,10 +3877,7 @@ describe("makeE2eeSocket", () => {
       // A MITM that answers with garbage of message-B shape instead of closing:
       // the ee/es-keyed AEAD check fails.
       const pinnedKey = derivePublicKey(crypto.getRandomValues(new Uint8Array(32)));
-      const script = (
-        _frame: Uint8Array,
-        emit: (frame: Uint8Array) => void,
-      ): void => {
+      const script = (_frame: Uint8Array, emit: (frame: Uint8Array) => void): void => {
         const forged = new Uint8Array(48); // e (32) + tag (16) of garbage
         crypto.getRandomValues(forged);
         emit(forged);
@@ -3880,7 +3920,9 @@ describe("makeE2eeSocket", () => {
       const socket = makeE2eeSocket(
         makeScriptedInnerSocket(() => {}), // black-holes message A
         {
-          hostKey: Buffer.from(derivePublicKey(crypto.getRandomValues(new Uint8Array(32)))).toString("base64url"),
+          hostKey: Buffer.from(
+            derivePublicKey(crypto.getRandomValues(new Uint8Array(32))),
+          ).toString("base64url"),
           auth: { kind: "bearer", credential: "t" },
           handshakeTimeoutMs: 100,
         },
@@ -3905,9 +3947,12 @@ describe("makeE2eeSocket", () => {
           Effect.gen(function* () {
             const write = yield* socket.writer;
             yield* Effect.fork(
-              socket.runString((text) => {
-                delivered.push(text);
-              }, { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) }),
+              socket.runString(
+                (text) => {
+                  delivered.push(text);
+                },
+                { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) },
+              ),
             );
             yield* Deferred.await(opened);
             yield* write(large);
@@ -4128,35 +4173,33 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
             }
           };
 
-          const sendMessageA = Effect.suspend(() =>
-            innerWrite(initiator.writeMessageA(EMPTY)),
-          );
+          const sendMessageA = Effect.suspend(() => innerWrite(initiator.writeMessageA(EMPTY)));
 
           // Spec section 4.3: a responder that cannot decrypt message A closes
           // with 4403 and never sends message B — map that close (pre-open) to
           // host-identity-mismatch so verify-then-add classifies the real path.
-          const runInner = inner.runRaw(innerHandler, { onOpen: sendMessageA }).pipe(
-            Effect.mapError((error) =>
-              phase !== "open" &&
-              error instanceof Socket.SocketError &&
-              error.reason instanceof Socket.SocketCloseError &&
-              error.reason.code === E2EE_HOST_IDENTITY_CLOSE_CODE
-                ? socketFailure(
-                    new E2eeProtocolError(
-                      "host-identity-mismatch",
-                      "the host closed the handshake with code 4403 (pinned key mismatch)",
-                    ),
-                  )
-                : error,
-            ),
-          );
+          const runInner = inner
+            .runRaw(innerHandler, { onOpen: sendMessageA })
+            .pipe(
+              Effect.mapError((error) =>
+                phase !== "open" &&
+                error instanceof Socket.SocketError &&
+                error.reason instanceof Socket.SocketCloseError &&
+                error.reason.code === E2EE_HOST_IDENTITY_CLOSE_CODE
+                  ? socketFailure(
+                      new E2eeProtocolError(
+                        "host-identity-mismatch",
+                        "the host closed the handshake with code 4403 (pinned key mismatch)",
+                      ),
+                    )
+                  : error,
+              ),
+            );
           const deadline = Deferred.await(authenticated).pipe(
             Effect.timeoutOrElse({
               duration: `${timeoutMs} millis`,
               orElse: () =>
-                Effect.suspend(() =>
-                  fail("timeout", "E2EE handshake did not complete in time"),
-                ),
+                Effect.suspend(() => fail("timeout", "E2EE handshake did not complete in time")),
             }),
             // After authentication, hold the race open forever so runInner decides.
             Effect.andThen(
@@ -4192,6 +4235,7 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
 ```
 
 Implementer notes (resolve while coding, guided by the failing tests):
+
 - If `Scope.provide(inner.writer, scope)` does not typecheck against the installed effect version, use the exact combinator `fromWebSocket` itself uses in `node_modules/effect/src/unstable/socket/Socket.ts` to bind a scoped effect to an explicit scope.
 - On any run failure or completion, settle `transportDeferred` and `authenticated` with the failure (an `Effect.onExit` around the raced run) so a writer blocked on `Deferred.await(transportDeferred)` cannot hang after the socket dies.
 - Verify `Socket.SocketCloseError`'s constructor/field names (`code`, `closeReason`) against the installed effect version when writing the 4403 mapping and the test double.
@@ -4218,6 +4262,7 @@ git commit -m "feat(client-runtime): E2EE socket wrapper with in-channel auth"
 The spec §4.3 rule: a saved direct (Bearer) connection **with** a stored `hostKey` must use `/ws-e2ee`; one **without** (legacy) uses `/ws` and surfaces an `unencrypted` transport badge state. Relay/SSH/Primary unchanged.
 
 **Files:**
+
 - Modify: `packages/client-runtime/src/connection/model.ts` (`PreparedE2eeChannel`, `PreparedConnection.e2ee`, `ConnectionBlockedReason` + `"host-identity"`)
 - Modify: `packages/client-runtime/src/connection/catalog.ts` (`BearerConnectionProfile.hostKey`)
 - Modify: `packages/client-runtime/src/authorization/remote.ts` (`e2eeSocketUrl` pure helper — no HTTP)
@@ -4229,6 +4274,7 @@ The spec §4.3 rule: a saved direct (Bearer) connection **with** a stored `hostK
 - Tests: `packages/client-runtime/src/connection/resolver.test.ts`, `packages/client-runtime/src/rpc/session.test.ts`, `packages/client-runtime/src/connection/presentation.test.ts`, plus the existing catalog/storage decode tests in `apps/web/src/connection/storage.test.ts` (decode-default case)
 
 **Interfaces:**
+
 - Consumes: Task 11 (`makeE2eeSocket`, `e2eeFailureOf`, `E2eeAuthRequest`), `E2eeAuthenticatedMessage` (Task 6).
 - Produces:
 
@@ -4238,13 +4284,17 @@ export interface PreparedE2eeChannel {
   readonly hostKey: string;
   readonly auth: E2eeAuthRequest; // steady state: { kind: "bearer", credential }
 }
-export interface PreparedConnection { /* existing fields */ readonly e2ee: PreparedE2eeChannel | null; }
+export interface PreparedConnection {
+  /* existing fields */ readonly e2ee: PreparedE2eeChannel | null;
+}
 // ConnectionBlockedReason gains the literal "host-identity"
 // catalog.ts — BearerConnectionProfile gains:
 //   hostKey: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null)))
 // presentation.ts
 export type ConnectionTransportSecurity = "local" | "e2ee" | "channel-secured" | "unencrypted";
-export function connectionTransportSecurity(entry: ConnectionCatalogEntry): ConnectionTransportSecurity;
+export function connectionTransportSecurity(
+  entry: ConnectionCatalogEntry,
+): ConnectionTransportSecurity;
 // authorization/remote.ts
 export function e2eeSocketUrl(wsBaseUrl: string): string; // pure: pathname -> /ws-e2ee, no params
 // authorization/service.ts — authorizeBearer input gains `hostKey?: string | null`;
@@ -4366,7 +4416,7 @@ import type { E2eeAuthenticatedMessage } from "@bibcode/contracts";
 import { makeE2eeSocket } from "../e2ee/index.ts";
 
 // inside connect(), before the layers are built:
-const e2eeAuthenticated = yield* Deferred.make<E2eeAuthenticatedMessage | null>();
+const e2eeAuthenticated = yield * Deferred.make<E2eeAuthenticatedMessage | null>();
 
 const socketLayer = Layer.effect(
   Socket.Socket,
@@ -4456,14 +4506,16 @@ git commit -m "feat(client-runtime): route hostKey-bearing connections over /ws-
 Generalizes the manual bearer add flow (`onboarding.ts` `preparePairingRegistration`, ~line 87) to the amended spec §4.3: parse the code, classify the endpoint, then live-probe with **no plaintext credential exchange** — the unauthenticated descriptor fetch is a routing hint only; the one-time pairing token rides `e2ee_auth`'s pairing form and the bearer credential is minted **inside** the channel. Before anything is persisted, the authenticated identity (`environmentId`/`storageInstanceId` from the `e2ee_authenticated` reply and the authenticated `server.getConfig`) is compared against the pairing payload and the descriptor hint, mirroring the two checks the normal driver performs (`driver.ts:46` region: `verifyPreparedStorageIdentity` + the post-`initialConfig` re-check). Failures classify as `unreachable | host-identity-mismatch | pairing-rejected | incompatible | duplicate-storage-identity`; persistence stores `hostKey` plus the in-channel-minted credential.
 
 **Files:**
+
 - Create: `packages/client-runtime/src/connection/pairingAdd.ts`
 - Create: `packages/client-runtime/src/connection/pairingAdd.test.ts`
 - Modify: `packages/client-runtime/src/connection/onboarding.ts` (expose `verifyAndAddPairingCode` on `ConnectionOnboarding`)
 - Modify: `packages/client-runtime/src/connection/layer.ts` (provide the new dependencies to the onboarding layer)
 
 **Interfaces:**
+
 - Consumes: `parsePairingCode` + errors (Task 7), `classifyPairingEndpoint` (Task 7), `fetchRemoteEnvironmentDescriptor` (routing hint only), `computeCompatVerdict` (Phase 2 — see the consumption note in the header), `RpcSessionFactory` + `RpcSession.e2eeAuthenticated` + `e2eeSocketUrl` (Task 12), `EnvironmentRegistry`, `AcceptedStorageIdentityStore.{get, accept}` + `storageIdentityTargetKey`, `deriveWsBaseUrl`/`normalizeHttpBaseUrl`. **Not consumed:** `bootstrapRemoteBearerSession` — the amended spec forbids the plaintext `/oauth/token` exchange for hostKey targets.
-- **Identity-mismatch classification (pinned here):** an authenticated `storageInstanceId` that differs from `payload.storageInstanceId`, or an authenticated `environmentId` that differs from the descriptor hint, classifies as `host-identity-mismatch` (detail: "the server behind this endpoint does not match the pairing code") — the Noise key proved *a* host, but not the one that minted the code.
+- **Identity-mismatch classification (pinned here):** an authenticated `storageInstanceId` that differs from `payload.storageInstanceId`, or an authenticated `environmentId` that differs from the descriptor hint, classifies as `host-identity-mismatch` (detail: "the server behind this endpoint does not match the pairing code") — the Noise key proved _a_ host, but not the one that minted the code.
 - Produces:
 
 ```ts
@@ -4485,13 +4537,14 @@ export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()(
   detail: Schema.String,
 }) {}
 
-export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<
-  PairingLoopbackAcknowledgementRequiredError
->()("PairingLoopbackAcknowledgementRequiredError", { endpoint: Schema.String }) {}
+export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<PairingLoopbackAcknowledgementRequiredError>()(
+  "PairingLoopbackAcknowledgementRequiredError",
+  { endpoint: Schema.String },
+) {}
 
 export interface VerifyPairingCodeInput {
-  readonly code: string;                    // bare code, deep link, or browser URL
-  readonly allowLoopbackTunnel?: boolean;   // the explicit tunnel acknowledgement
+  readonly code: string; // bare code, deep link, or browser URL
+  readonly allowLoopbackTunnel?: boolean; // the explicit tunnel acknowledgement
 }
 
 export const verifyAndAddPairingCode: (input: VerifyPairingCodeInput) => Effect.Effect<
@@ -4501,7 +4554,7 @@ export const verifyAndAddPairingCode: (input: VerifyPairingCodeInput) => Effect.
   | PairingCodeParseError
   | PairingCodeUnsupportedVersionError
   | ConnectionAttemptError
-  | Persistence.ConnectionPersistenceError,
+  | Persistence.ConnectionPersistenceError
   /* services: registry, presentation, http, sessions, credentials, identities */
 >;
 ```
@@ -4608,11 +4661,12 @@ export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()(
   }
 }
 
-export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<
-  PairingLoopbackAcknowledgementRequiredError
->()("PairingLoopbackAcknowledgementRequiredError", {
-  endpoint: Schema.String,
-}) {
+export class PairingLoopbackAcknowledgementRequiredError extends Schema.TaggedErrorClass<PairingLoopbackAcknowledgementRequiredError>()(
+  "PairingLoopbackAcknowledgementRequiredError",
+  {
+    endpoint: Schema.String,
+  },
+) {
   override get message(): string {
     return "This pairing code points at the host itself. Confirm you reach it through a tunnel (e.g. SSH port forwarding), then try again.";
   }
@@ -4689,11 +4743,12 @@ export const verifyAndAddPairingCode = Effect.fn(
 
   // Live probe 1: descriptor fetch.
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({ httpBaseUrl }).pipe(
-    Effect.mapError((error) =>
-      new PairingAddError({
-        reason: "unreachable",
-        detail: mapRemoteEnvironmentError(error).message,
-      }),
+    Effect.mapError(
+      (error) =>
+        new PairingAddError({
+          reason: "unreachable",
+          detail: mapRemoteEnvironmentError(error).message,
+        }),
     ),
   );
 
@@ -4828,9 +4883,11 @@ git commit -m "feat(client-runtime): verify-then-add pairing flow with classifie
 The repo has no existing TS test that spawns the server binary (verified: no `bibcode serve`/`CARGO_BIN` usage under `packages/`), so this task introduces an opt-in vitest suite driving the real `bibcode serve` with the TS Noise modules directly (Node's global `WebSocket` + `fetch`; no effect Socket machinery — the crypto interop is the subject). The snow↔snow route tests (Task 5) and the noble↔noble socket tests (Task 11) already cover each side alone; this test is the cross-language proof, plus the official vectors (Task 9) anchor both to the standard.
 
 **Files:**
+
 - Create: `packages/client-runtime/src/e2ee/serverInterop.test.ts`
 
 **Interfaces:**
+
 - Consumes: `createNkInitiator`, `decodeBase64UrlKey` (Task 9); `splitIntoRecords`, `RecordAssembler` (Task 10); `parsePairingCode` (Task 7); the running server's `/oauth/token`, `/api/auth/websocket-ticket`, `POST /api/auth/pairing-offer` (Task 8), `/ws-e2ee` (Task 5), and the secret-file layout (Task 2, cross-check only).
 - Produces: the executable interop proof, gated on `BIBCODE_E2EE_SERVER_BIN`. The pairing code is obtained through the real mint endpoint, so the suite also proves the full mint → parse → pin → pair loop across languages.
 
@@ -5058,9 +5115,7 @@ describe.skipIf(serverBinary === undefined)("TS initiator against the Rust respo
 
     // Reconnect with the in-channel-minted credential (bearer form).
     const second = await openEncrypted(server, hostKey);
-    second.sendMessage(
-      JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }),
-    );
+    second.sendMessage(JSON.stringify({ type: "e2ee_auth", bearer: authenticated.credential }));
     expect(JSON.parse(await second.nextMessage())).toEqual({ type: "e2ee_authenticated" });
     second.close();
   }, 30_000);
@@ -5108,6 +5163,7 @@ cargo build -p bibcode-server
 cd packages/client-runtime
 BIBCODE_E2EE_SERVER_BIN=$(git rev-parse --show-toplevel)/target/debug/bibcode vp test run src/e2ee/serverInterop.test.ts
 ```
+
 Expected: 3 passing tests. Without the env var: the suite reports skipped (verify that too — plain `vp test run src/e2ee/serverInterop.test.ts` must not fail CI).
 
 - [ ] **Step 3: Commit**
@@ -5124,6 +5180,7 @@ git commit -m "test(e2ee): cross-language Noise NK interop against bibcode serve
 The amended spec §4.3 pins the in-channel bootstrap: for hostKey targets the **only** pre-auth HTTP is the unauthenticated descriptor fetch (`/.well-known/bibcode/environment`). Any other HTTP call against such a target must move to the RPC channel or be documented as an exception in `docs/architecture/remote.md`. Note additionally that the spec's trailing "HTTP calls for hostKey-bearing targets" bullet still lists `/oauth/token` + `/api/auth/websocket-ticket` as allowed bootstrap — leftover pre-amendment text that now contradicts the in-channel-bootstrap bullet above it; Step 2 aligns it and the final report flags the edit for the spec owner.
 
 **Files:**
+
 - Modify: `docs/architecture/remote.md`
 - Modify: `docs/architecture/connection-runtime.md`
 - Modify: `docs/plans/remote-servers/remote-servers-spec.md` (§4.3 record-layer amendment)
@@ -5138,9 +5195,10 @@ rg -n "createUrl|logs.zip|/api/" packages/client-runtime/src apps/web/src --type
 ```
 
 For each hit that can execute against a Bearer target with a stored `hostKey` (candidates found in recon: the diagnostics log download `POST /api/diagnostics/logs.zip`, asset URLs from `assets.createUrl`, and any `rpc/http.ts` consumer outside the descriptor fetch): decide per call —
-  - already rides the WS RPC → nothing to do;
-  - authenticated plain HTTP → **now non-functional by design** for hostKey targets: the no-downgrade rule (Task 5, Cycle A) rejects e2ee-minted bearers on plain-HTTP surfaces. Either move the call onto the RPC channel or document the feature as unavailable for hostKey targets in `remote.md` (an "exception" can no longer mean "send the bearer over plain HTTP" — that hole is exactly what the amendment closed);
-  - unauthenticated by nature (descriptor) → fine.
+
+- already rides the WS RPC → nothing to do;
+- authenticated plain HTTP → **now non-functional by design** for hostKey targets: the no-downgrade rule (Task 5, Cycle A) rejects e2ee-minted bearers on plain-HTTP surfaces. Either move the call onto the RPC channel or document the feature as unavailable for hostKey targets in `remote.md` (an "exception" can no longer mean "send the bearer over plain HTTP" — that hole is exactly what the amendment closed);
+- unauthenticated by nature (descriptor) → fine.
 
 Record the complete audit table (call site → verdict) in `remote.md`; do not silently skip any hit.
 
@@ -5195,4 +5253,3 @@ git commit -m "docs(remote): document the E2EE channel, pairing codes, and recor
 3. **Name consistency across tasks (and with Phase 5's Task 4):** `HostIdentity`, `NOISE_NK_PARAMS`, `RemotePairingCodePayload`, `/api/auth/pairing-offer` + `pairingOffer` + `create_pairing_offer` + `AuthPairingOfferResult` + `invalid_pairing_offer`, `makeE2eeSocket`, `PreparedE2eeChannel`, `hostKey`, `verifyAndAddPairingCode`, `connectionTransportSecurity` — grep the diff for drift.
 4. **Reference-product strings:** `git diff | grep -i` for the banned reference-product name must return nothing; also grep this plan's own file before finishing.
 5. **No placeholder text** (`TBD`, `TODO`, "implement later") survives into committed code.
-

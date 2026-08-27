@@ -16,7 +16,7 @@ Date: 2026-08-27. Line numbers refer to the working tree at research time.
   explicitly mobile-only (`src/shared/mobile-relay-pairing-offer.ts:82-91` rejects `relay` on
   `scope: 'runtime'` offers). Reachability is direct TCP: LAN, Tailscale, a reverse proxy, or a
   user-managed SSH local port-forward (loopback links are tagged `connectionDependency:
-  'ssh-tunnel'`).
+'ssh-tunnel'`).
 - **Security.** Every connection runs an application-layer E2EE handshake regardless of TLS:
   the client generates an ephemeral Curve25519 keypair, derives a shared key against the host's
   **static public key pinned in the pairing offer**, then sends an encrypted auth frame carrying
@@ -154,7 +154,7 @@ Main-process verification (`src/main/ipc/runtime-environment-pairing-verificatio
 3. **Live probe**: `status.get` over a real E2EE connection with a 15s timeout, then
    `verifyRemotePairingRuntimeStatus`. Failures are classified into
    `access-link-invalid | host-unreachable | host-identity-mismatch | connection-interrupted |
-   environment-save-failed` (`runtime-environment-pairing-verification.ts:38-127`) — note
+environment-save-failed` (`runtime-environment-pairing-verification.ts:38-127`) — note
    `host-identity-mismatch` fires when the reached host's key does not match the pinned
    `publicKeyB64` (`pairingStage === 'host-identity'`).
 4. Persist via `addEnvironmentFromPairingCode`.
@@ -213,7 +213,7 @@ Two socket kinds per environment, both E2EE and keyed by the environment's pairi
   `src/shared/remote-runtime-shared-control-connection.ts`) — long-lived multiplexed channel
   for subscriptions/events (terminal streams, session-tab sync, file watches). It owns
   **reconnect**: edge-triggered on close with backoff `[250, 500, 1000, 2000, 4000, 8000,
-  15000, 30000] ms`, reset after 30s of stable readiness
+15000, 30000] ms`, reset after 30s of stable readiness
   (`src/shared/remote-runtime-shared-control-reconnect.ts:40-47`,
   `-stability.ts`); capability gated behind
   `remote-runtime.shared-control.v1` (`src/shared/protocol-version.ts:43`).
@@ -298,13 +298,14 @@ app's real electron-updater. The shared contract
 (`src/shared/remote-server-update.ts`):
 
 ```ts
-REMOTE_SERVER_UPDATE_CAPABILITY = 'updater.remote-control.v1'
+REMOTE_SERVER_UPDATE_CAPABILITY = "updater.remote-control.v1";
 RemoteServerUpdateSupport = {
-  installMode: 'interactive' | 'supervised-headless-serve' | 'unsupported-headless-serve',
+  installMode: "interactive" | "supervised-headless-serve" | "unsupported-headless-serve",
   automatic: boolean,
-  reason: 'available' | 'manual-service-update-required' | 'unpackaged-build' | 'updater-unavailable'
-}
-RemoteServerUpdaterSnapshot = { appVersion, runtimeId, support, status: UpdateStatus }
+  reason:
+    "available" | "manual-service-update-required" | "unpackaged-build" | "updater-unavailable",
+};
+RemoteServerUpdaterSnapshot = { appVersion, runtimeId, support, status: UpdateStatus };
 ```
 
 `status.get` itself embeds `appVersion` + `remoteUpdateSupport` so the client knows before
@@ -314,7 +315,7 @@ actually installs:
 - **interactive** — a desktop host installs like a normal app update.
 - **supervised-headless-serve** — a headless `orca serve` under a supervisor: `updater.install`
   writes a handoff file (`{phase: 'install-requested', fromVersion, targetVersion,
-  servingPid}`) that an external supervisor watches to restart into the new build; currently
+servingPid}`) that an external supervisor watches to restart into the new build; currently
   macOS-gated (`src/main/serve-update-handoff.ts:22-38`; behavioral spec in
   `src/main/updater.headless-serve-install.test.ts`).
 - **unsupported-headless-serve** — e.g. a Linux system package or orcad: `updater.check/install`
@@ -405,7 +406,7 @@ UI: workflow `'cloud-vm'` renders `EphemeralVmRuntimesSection` + `CloudVmSetupGu
 - `buildExecutionHostRegistry` (`src/shared/execution-host-registry.ts:180-291`) merges: the
   fixed local entry, every saved runtime environment (label = user name), every referenced
   SSH target — each with `health: 'local' | 'available' | 'connecting' | 'blocked' |
-  'disconnected' | 'error'` derived from live status + compat verdict + shared-control state.
+'disconnected' | 'error'` derived from live status + compat verdict + shared-control state.
   This one registry feeds sidebar host pickers, new-workspace host selection, port scanner,
   task preflight, etc.
 
@@ -421,7 +422,7 @@ params)` branches (`runtime-rpc-client.ts:82-93`):
 
 - local → `window.api.runtime.call(...)` (IPC into the in-process runtime dispatcher);
 - environment → `window.api.runtimeEnvironments.call({selector, method, params, timeoutMs,
-  expectedEnvironmentPairingRevision})` → main-process transport routing
+expectedEnvironmentPairingRevision})` → main-process transport routing
   (`src/main/ipc/runtime-environment-transport-routing.ts`,
   `runtime-environment-connectivity-handlers.ts:189-228`) → E2EE WebSocket.
 
@@ -453,19 +454,19 @@ declared with `defineMethod({name, params: zodSchema | null, handler})`
 
 Counted from `rg "name: '" src/main/runtime/rpc/methods` (non-test):
 
-| namespace | n | | namespace | n |
-|---|---|---|---|---|
-| browser | 88 | | projectGroup / automation / artifacts | 7 each |
-| github | 49 | | projectHostSetup / plugins | 6 each |
-| linear | 41 | | ssh / settings / preflight / host / folderWorkspace / clipboard | 5 each |
-| orchestration | 38 | | updater / hostedReview | 4 each |
-| git | 35 | | ui / notifications / nativeChat / aiVault | 3 each |
-| terminal | 34 | | workspacePorts / runtime / project / pairing / markdown / agentTeams | 2 each |
-| files | 29 | | status / stats / network / diagnostics / windows-audit | 1 each |
-| jira | 23 | | gitlab | 21 |
-| repo / emulator | 19 each | | worktree | 17 |
-| skills / computer | 15 each | | session | 13 |
-| accounts | 11 | | speech | 8 |
+| namespace         | n       |     | namespace                                                            | n      |
+| ----------------- | ------- | --- | -------------------------------------------------------------------- | ------ |
+| browser           | 88      |     | projectGroup / automation / artifacts                                | 7 each |
+| github            | 49      |     | projectHostSetup / plugins                                           | 6 each |
+| linear            | 41      |     | ssh / settings / preflight / host / folderWorkspace / clipboard      | 5 each |
+| orchestration     | 38      |     | updater / hostedReview                                               | 4 each |
+| git               | 35      |     | ui / notifications / nativeChat / aiVault                            | 3 each |
+| terminal          | 34      |     | workspacePorts / runtime / project / pairing / markdown / agentTeams | 2 each |
+| files             | 29      |     | status / stats / network / diagnostics / windows-audit               | 1 each |
+| jira              | 23      |     | gitlab                                                               | 21     |
+| repo / emulator   | 19 each |     | worktree                                                             | 17     |
+| skills / computer | 15 each |     | session                                                              | 13     |
+| accounts          | 11      |     | speech                                                               | 8      |
 
 Representative names: `status.get`; `worktree.create/rm/list…`; `git.status/branchDiff/
 bulkStage/abortMerge…`; `files.read/write/watch/search…`; `terminal.create/send/show…` (plus a
@@ -573,7 +574,7 @@ operations scoped to the selected environment.
 - **Pairing offer shape.** `{endpoint, per-device token, pinned host public key}` encoded as
   a paste-able URL, verified by a live `status.get` before saving, is transport-agnostic and
   small. BiBCode's server is already a network server (Axum + WS), so the "Share this host"
-  side is *simpler* than Orca's: no listener-widening ceremony is needed if the server
+  side is _simpler_ than Orca's: no listener-widening ceremony is needed if the server
   already binds deliberately; keep the per-device token registry + pending/rotate/revoke
   semantics (`device-registry.ts` is a good, small spec).
 - **Version/compat policy.** The three-number window (`RUNTIME_PROTOCOL_VERSION`,
@@ -608,7 +609,7 @@ operations scoped to the selected environment.
   so the equivalent seam is in Axum: the local `bibcode` server should store paired-server
   credentials, own the outbound connections, and proxy/scope RPCs, keeping tokens out of the
   web client entirely. In pure-browser mode (no local server) this proxying is impossible —
-  note Orca's web client is *served by the remote host itself* (`webClientUrl`), which is a
+  note Orca's web client is _served by the remote host itself_ (`webClientUrl`), which is a
   clean answer BiBCode could reuse: the remote server serves the web UI directly instead of
   being proxied.
 - **App-layer E2EE.** Orca needs Curve25519-over-plaintext-WS largely because its default
@@ -618,8 +619,8 @@ operations scoped to the selected environment.
   authenticated pairing.
 - **The 575-method monolith.** Orca serves its entire runtime API remotely because desktop
   and server are the same process; location transparency falls out for free. BiBCode's
-  server is already the API boundary, so the equivalent move is different: make the *web
-  client's existing RPC* connectable to N servers (connection manager keyed by environment in
+  server is already the API boundary, so the equivalent move is different: make the _web
+  client's existing RPC_ connectable to N servers (connection manager keyed by environment in
   `packages/client-runtime`) rather than tunneling one server through another. Orca's
   per-request `selector` + `_meta.runtimeId` envelope is still the right wire pattern for
   attribution.
@@ -635,7 +636,7 @@ operations scoped to the selected environment.
 ### Suggested minimal concept set for BiBCode
 
 1. `RemoteEnvironment {id, name, endpoint, deviceToken, hostPublicKey, pairingRevision,
-   source}` persisted server-side (secure file or existing DB), redacted toward the UI.
+source}` persisted server-side (secure file or existing DB), redacted toward the UI.
 2. Host: device registry (mint/pending/rotate/revoke), pairing-link generation, `status.get`
    with `{serverVersion, protocolVersion, minCompatibleClient, capabilities[]}`.
 3. Client: verify-then-add flow with classified failures; per-environment connection manager

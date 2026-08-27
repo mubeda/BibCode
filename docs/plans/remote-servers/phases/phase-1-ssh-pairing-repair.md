@@ -45,7 +45,7 @@ still run in the final gate.)
    named `credential` (it trims the value; every other field is ignored):
 
    ```json
-   {"credential":"WXYZ23456789"}
+   { "credential": "WXYZ23456789" }
    ```
 
    The new CLI therefore prints exactly one JSON line to stdout whose `credential` key
@@ -118,11 +118,13 @@ still run in the final gate.)
 ### Task 1: Administrative pairing issuance seam in the auth package
 
 **Files:**
+
 - Modify: `apps/server/src/auth/service.rs` (new free function after
   `generate_pairing_credential`, ~line 1184; new test in the existing `mod tests`)
 - Modify: `apps/server/src/auth/mod.rs:19` (extend the `service` re-export)
 
 **Interfaces:**
+
 - Consumes: existing private items in `service.rs` — `PairingRecord`,
   `persisted_pairing_link`, `generate_pairing_credential`, `PAIRING_TTL_MS`,
   `MAX_ACTIVE_PAIRINGS`, `owned_scopes`, `ADMINISTRATIVE_SCOPES`, `format_iso`,
@@ -261,6 +263,7 @@ pub(crate) async fn issue_administrative_pairing_link(
 ```
 
 Notes for the implementer:
+
 - The capacity check races benignly with a running server (no shared transaction); the
   cap is a soft guard and the database `UNIQUE` constraint on `credential` fails closed
   on the astronomically unlikely collision. Do not add a transaction for this.
@@ -295,6 +298,7 @@ git commit -m "feat(server): issue administrative pairing links against a data r
 ### Task 2: `bibcode pairing issue` CLI subcommand
 
 **Files:**
+
 - Modify: `apps/server/src/config.rs` (subcommand enums ~line 241, `CliAction` ~line
   282, `ConfigError` ~line 331, `into_action`/`into_server_config` ~lines 372-466, test
   in the existing `mod tests`)
@@ -303,6 +307,7 @@ git commit -m "feat(server): issue administrative pairing links against a data r
 - Test: `apps/server/tests/cli_smoke.rs`
 
 **Interfaces:**
+
 - Consumes: `issue_administrative_pairing_link` from Task 1;
   `persistence::{StoreRuntimeGuard, StatePaths, Database, Repositories}`;
   `select_data_root_request` + `resolve_data_root` (existing, `apps/server/src/config.rs`
@@ -314,7 +319,12 @@ git commit -m "feat(server): issue administrative pairing links against a data r
   - `--json` stdout contract (exactly one line, nothing else on stdout):
 
     ```json
-    {"id":"<uuid>","credential":"<12 chars>","label":"<label if given>","expiresAt":"<RFC3339>"}
+    {
+      "id": "<uuid>",
+      "credential": "<12 chars>",
+      "label": "<label if given>",
+      "expiresAt": "<RFC3339>"
+    }
     ```
 
   - `pub enum PairingCommand { Issue { root: ResolvedDataRoot, label: Option<String>, json: bool } }`
@@ -678,6 +688,7 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
 ```
 
 Implementation notes:
+
 - `database.close()` is `pub(crate)`; calling it from `lib.rs` (same crate) is fine and
   guarantees the CLI's WAL writes are flushed and its connection is gone before exit.
   The error from issuance is intentionally held (`let issued = ...;` then `close`, then
@@ -709,13 +720,15 @@ git commit -m "feat(cli): add bibcode pairing issue subcommand"
 ### Task 3: Point the desktop SSH launcher at the new command
 
 **Files:**
+
 - Modify: `apps/desktop/src-tauri/src/ssh.rs` (new `pub const` near the other constants
   ~line 38; use it in `issue_remote_pairing_token` ~line 1377)
 - Test: `apps/desktop/src-tauri/tests/ssh_public_contract.rs`
 
 **Interfaces:**
+
 - Consumes: the CLI surface from Task 2 (`bibcode pairing issue --base-dir <path>
-  --json`) and its stdout contract (Pinned fact 1).
+--json`) and its stdout contract (Pinned fact 1).
 - Produces: `pub const REMOTE_PAIRING_ISSUE_COMMAND: &str` on the public `ssh` module
   (`bibcode_desktop_lib::ssh`), asserted by the public contract test. No behavior change
   to `SshEnvironmentManager`'s public API.
@@ -804,6 +817,7 @@ git commit -m "fix(desktop): mint SSH bootstrap pairing via bibcode pairing issu
 ### Task 4: Living documentation and runbook review
 
 **Files:**
+
 - Modify: `docs/architecture/remote.md` (limitation entry ~lines 153-164; the
   "Desktop-managed SSH" section ~lines 86-104)
 - Review only (no expected change): `docs/testing/README.md`,
@@ -812,6 +826,7 @@ git commit -m "fix(desktop): mint SSH bootstrap pairing via bibcode pairing issu
   `docs/testing/execution-report-template.md`
 
 **Interfaces:**
+
 - Consumes: the shipped behavior of Tasks 1-3 (documentation must describe exactly what
   landed, per AGENTS.md same-patch rule).
 - Produces: `docs/architecture/remote.md` with the SSH-pairing limitation removed and
@@ -987,7 +1002,7 @@ residual risks below.
   Step 5, Task 3 test); `ssh.rs` updated to invoke it ✓ (Task 3); limitation entry
   removed from `docs/architecture/remote.md` in the same change ✓ (Task 4).
 - Type consistency: `issue_administrative_pairing_link(&Repositories, Option<String>)
-  -> Result<PairingCredentialResult, AuthError>` is defined in Task 1 and consumed with
+-> Result<PairingCredentialResult, AuthError>` is defined in Task 1 and consumed with
   that exact signature in Task 2; `PairingCommand::Issue { root, label, json }` is
   defined and consumed identically in Task 2's config and lib code and tests;
   `REMOTE_PAIRING_ISSUE_COMMAND` is defined in Task 3 Step 3 and asserted verbatim in

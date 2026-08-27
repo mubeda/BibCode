@@ -53,7 +53,7 @@ Tasks below implement them; do not silently revisit them.
    `apps/server/src/lifecycle.rs:107`; manual `Pin<Box<dyn Future>>`, no `async_trait`
    crate). There is no existing server→host push channel — the d8daae10 maintenance seam
    (`/api/maintenance/update/*` + `x-bibcode-desktop-bootstrap-token`,
-   `apps/server/src/maintenance.rs`) runs desktop→server only and is reused *unchanged*:
+   `apps/server/src/maintenance.rs`) runs desktop→server only and is reused _unchanged_:
    when the delegate triggers the desktop install flow, `DesktopUpdateManager::install_update`
    already drains the in-process backend through it. Only the InProcess primary desktop
    backend gets a delegate; WSL/external backends and headless `bibcode serve` are
@@ -64,7 +64,7 @@ Tasks below implement them; do not silently revisit them.
    does not apply to this seam.
 3. **`RemoteUpdateSupport` lives on `ServerConfig`** (`apps/server/src/config.rs`,
    headless default `manual`/`manual-update-required`). The desktop host derives the
-   value from the *same* `app.updater()` availability check the delegate flow uses, so
+   value from the _same_ `app.updater()` availability check the delegate flow uses, so
    the descriptor and the RPC behavior cannot drift. Amended spec §4.5: **all three**
    descriptor producers read it — editing fewer is a latent bug:
    `apps/server/src/http.rs` (`/.well-known/bibcode/environment`),
@@ -75,7 +75,7 @@ Tasks below implement them; do not silently revisit them.
    the desktop release config (`apps/desktop/src-tauri/tauri.release.conf.json` —
    GitHub `latest.json`; the dev config has empty endpoints), and `apps/server` has no
    feed knowledge or updater dependency. So for `installMode: "manual"` servers,
-   `updater.check` performs a *self* version lookup: it returns a fresh snapshot with
+   `updater.check` performs a _self_ version lookup: it returns a fresh snapshot with
    `serverVersion` (so a client can confirm a manual update landed), `latestVersion: null`,
    `state: "idle"`. It never fabricates knowledge of the newest release. `updater.install`
    fails with `remote_update_manual_required` and the UI shows copy-paste instructions.
@@ -84,7 +84,7 @@ Tasks below implement them; do not silently revisit them.
 5. **Update state is server-owned.** The snapshot is held by `DesktopUpdateManager`
    (desktop) or is statically derivable (manual mode); the client re-queries
    `updater.status` to restore it. Spec §6's "update state survives navigation
-   (atom-held snapshot)" means the *query atom family* keeps the last snapshot per
+   (atom-held snapshot)" means the _query atom family_ keeps the last snapshot per
    environment — no client-side persistence is built.
 6. **Check/status failures ride inside the snapshot** (`state: "error"`, `error` string).
    RPC-level typed errors exist only for `updater.install`
@@ -93,40 +93,42 @@ Tasks below implement them; do not silently revisit them.
 
 ## File map
 
-| File | Responsibility |
-|------|----------------|
-| `packages/contracts/src/remoteUpdate.ts` (new) | Schema-only remote-update contract (spec §4.5 verbatim) |
-| `packages/contracts/src/remoteUpdate.test.ts` (new) | Decode tests incl. Rust wire-shape parity samples |
-| `packages/contracts/src/environment.ts` | `remoteUpdateControl` capability + embedded `remoteUpdateSupport` |
-| `packages/contracts/src/rpc.ts` | `WS_METHODS` entries + three `Rpc.make` defs + `WsRpcGroup` |
-| `packages/contracts/fixtures/rpc-wire/*` | Regenerated manifest + typed-failure fixtures (generated) |
-| `apps/server/src/remote_update.rs` (new) | Rust contract mirror, `RemoteUpdateDelegate` trait, `RemoteUpdateService`, manual-required error |
-| `apps/server/src/production/remote_update_rpc.rs` (new) | `register_remote_update_rpc` |
-| `apps/server/src/rpc/methods.rs`, `apps/server/src/auth/scope.rs` | Method inventory + scope declarations |
-| `apps/server/src/config.rs` | `remote_update_support` field + builder |
-| `apps/server/src/http.rs`, `apps/server/src/production/control.rs`, `apps/server/src/lifecycle.rs` (Connect descriptor) | All three descriptor producers |
-| `apps/server/src/lifecycle.rs`, `apps/server/src/production/runtime.rs` | Delegate threading into the registry |
-| `apps/server/tests/remote_update_rpc.rs` (new) | End-to-end WS tests (manual + delegate paths) |
-| `apps/desktop/src-tauri/src/remote_update_delegate.rs` (new) | Desktop delegate, support derivation, state mapping |
-| `apps/desktop/src-tauri/src/backend.rs`, `lib.rs` | Delegate installation + `start_with_desktop_integration` call |
-| `packages/client-runtime/src/state/remoteUpdates.ts` (new) | Snapshot/check/install atoms + max-2 fan-out helper |
-| `packages/client-runtime/src/state/remoteUpdates.test.ts` (new) | Fan-out concurrency + failure-isolation tests |
-| `apps/web/src/state/remoteUpdates.ts` (new) | App-level atom instantiation |
-| `apps/web/src/components/settings/ServerUpdateBadge.tsx` (new) | Badge + manual-instructions copy + check-all hook |
-| `apps/web/src/components/settings/ServerUpdateBadge.test.tsx` (new) | Badge/copy logic tests |
-| Settings Connect tab + `EnvironmentContextCard` props + `environmentRail.logic.ts` `updateAvailable` + `environmentCompat.ts` selector (Phase 4/6 deliverables) | Interface-level wiring incl. rail amber dot (Task 8) |
-| `docs/architecture/overview.md`, `docs/architecture/remote.md`, `docs/testing/*-desktop.md` | Living docs + runbooks (Task 9) |
+| File                                                                                                                                                            | Responsibility                                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `packages/contracts/src/remoteUpdate.ts` (new)                                                                                                                  | Schema-only remote-update contract (spec §4.5 verbatim)                                          |
+| `packages/contracts/src/remoteUpdate.test.ts` (new)                                                                                                             | Decode tests incl. Rust wire-shape parity samples                                                |
+| `packages/contracts/src/environment.ts`                                                                                                                         | `remoteUpdateControl` capability + embedded `remoteUpdateSupport`                                |
+| `packages/contracts/src/rpc.ts`                                                                                                                                 | `WS_METHODS` entries + three `Rpc.make` defs + `WsRpcGroup`                                      |
+| `packages/contracts/fixtures/rpc-wire/*`                                                                                                                        | Regenerated manifest + typed-failure fixtures (generated)                                        |
+| `apps/server/src/remote_update.rs` (new)                                                                                                                        | Rust contract mirror, `RemoteUpdateDelegate` trait, `RemoteUpdateService`, manual-required error |
+| `apps/server/src/production/remote_update_rpc.rs` (new)                                                                                                         | `register_remote_update_rpc`                                                                     |
+| `apps/server/src/rpc/methods.rs`, `apps/server/src/auth/scope.rs`                                                                                               | Method inventory + scope declarations                                                            |
+| `apps/server/src/config.rs`                                                                                                                                     | `remote_update_support` field + builder                                                          |
+| `apps/server/src/http.rs`, `apps/server/src/production/control.rs`, `apps/server/src/lifecycle.rs` (Connect descriptor)                                         | All three descriptor producers                                                                   |
+| `apps/server/src/lifecycle.rs`, `apps/server/src/production/runtime.rs`                                                                                         | Delegate threading into the registry                                                             |
+| `apps/server/tests/remote_update_rpc.rs` (new)                                                                                                                  | End-to-end WS tests (manual + delegate paths)                                                    |
+| `apps/desktop/src-tauri/src/remote_update_delegate.rs` (new)                                                                                                    | Desktop delegate, support derivation, state mapping                                              |
+| `apps/desktop/src-tauri/src/backend.rs`, `lib.rs`                                                                                                               | Delegate installation + `start_with_desktop_integration` call                                    |
+| `packages/client-runtime/src/state/remoteUpdates.ts` (new)                                                                                                      | Snapshot/check/install atoms + max-2 fan-out helper                                              |
+| `packages/client-runtime/src/state/remoteUpdates.test.ts` (new)                                                                                                 | Fan-out concurrency + failure-isolation tests                                                    |
+| `apps/web/src/state/remoteUpdates.ts` (new)                                                                                                                     | App-level atom instantiation                                                                     |
+| `apps/web/src/components/settings/ServerUpdateBadge.tsx` (new)                                                                                                  | Badge + manual-instructions copy + check-all hook                                                |
+| `apps/web/src/components/settings/ServerUpdateBadge.test.tsx` (new)                                                                                             | Badge/copy logic tests                                                                           |
+| Settings Connect tab + `EnvironmentContextCard` props + `environmentRail.logic.ts` `updateAvailable` + `environmentCompat.ts` selector (Phase 4/6 deliverables) | Interface-level wiring incl. rail amber dot (Task 8)                                             |
+| `docs/architecture/overview.md`, `docs/architecture/remote.md`, `docs/testing/*-desktop.md`                                                                     | Living docs + runbooks (Task 9)                                                                  |
 
 ---
 
 ### Task 1: Remote update contract schemas
 
 **Files:**
+
 - Create: `packages/contracts/src/remoteUpdate.ts`
 - Create: `packages/contracts/src/remoteUpdate.test.ts`
 - Modify: `packages/contracts/src/index.ts` (add one export line)
 
 **Interfaces:**
+
 - Consumes: `TrimmedNonEmptyString` from `packages/contracts/src/baseSchemas.ts`.
 - Produces (later tasks import these exact names from `@bibcode/contracts`):
   `RemoteUpdateInstallMode`, `RemoteUpdateSupportReason`, `RemoteUpdateSupport`,
@@ -303,10 +305,12 @@ git commit -m "feat(contracts): add remote update contract (spec 4.5)"
 ### Task 2: Embed remote update support in the environment descriptor (TS)
 
 **Files:**
+
 - Modify: `packages/contracts/src/environment.ts`
 - Modify: `packages/contracts/src/environment.test.ts`
 
 **Interfaces:**
+
 - Consumes: `RemoteUpdateSupport` from `./remoteUpdate.ts` (Task 1).
 - Produces: `ExecutionEnvironmentCapabilities.remoteUpdateControl: boolean`
   (decode-default `false`) and
@@ -392,20 +396,22 @@ git commit -m "feat(contracts): embed remote update support in the environment d
 ### Task 3: Rust contract mirror, delegate trait, and RemoteUpdateService
 
 **Files:**
+
 - Create: `apps/server/src/remote_update.rs`
 - Modify: `apps/server/src/lib.rs` (declare `pub mod remote_update;` and re-export the
   public types alongside the existing re-exports)
 - Modify: `apps/server/src/config.rs` (`remote_update_support` field + builder + test)
 
 **Interfaces:**
+
 - Consumes: nothing new.
 - Produces (exact names later tasks use):
   - `bibcode_server::remote_update::{RemoteUpdateInstallMode, RemoteUpdateSupportReason,
-    RemoteUpdateSupport, RemoteUpdateState, RemoteUpdateSnapshot, HostUpdaterStatus,
-    HostUpdaterFuture, RemoteUpdateDelegate, RemoteUpdateService,
-    remote_update_manual_required_error}`
+RemoteUpdateSupport, RemoteUpdateState, RemoteUpdateSnapshot, HostUpdaterStatus,
+HostUpdaterFuture, RemoteUpdateDelegate, RemoteUpdateService,
+remote_update_manual_required_error}`
   - `RemoteUpdateService::new(server_version: String, support: RemoteUpdateSupport,
-    delegate: Option<Arc<dyn RemoteUpdateDelegate>>) -> RemoteUpdateService` with
+delegate: Option<Arc<dyn RemoteUpdateDelegate>>) -> RemoteUpdateService` with
     `pub async fn status(&self) -> RemoteUpdateSnapshot`,
     `pub async fn check(&self) -> RemoteUpdateSnapshot`,
     `pub async fn install(&self) -> Result<RemoteUpdateSnapshot, serde_json::Value>`.
@@ -793,6 +799,7 @@ descriptor all publish `remoteUpdateSupport` + `remoteUpdateControl` — editing
 a latent bug.
 
 **Files:**
+
 - Modify: `apps/server/src/production/control.rs` (`environment_descriptor`, ~line 2139,
   plus its tests around line 4996)
 - Modify: `apps/server/src/http.rs` (`EnvironmentDescriptor` / `EnvironmentCapabilities`
@@ -801,6 +808,7 @@ a latent bug.
   ~line 270 — extract to a testable helper — plus a unit test in its tests module)
 
 **Interfaces:**
+
 - Consumes: `ServerConfig.remote_update_support` (Task 3).
 - Produces: `server.getConfig`'s `environment`, `/.well-known/bibcode/environment`, and
   the Connect/relay descriptor all carry `"remoteUpdateSupport": {...}` and
@@ -975,6 +983,7 @@ regenerated fixtures, Rust inventory, scopes, and handler registration must land
 together to stay green.
 
 **Files:**
+
 - Modify: `packages/contracts/src/rpc.ts` (`WS_METHODS` ~line 304; `Rpc.make` defs after
   the server-meta block ~line 520; `WsRpcGroup` ~line 1258)
 - Regenerate: `packages/contracts/fixtures/rpc-wire/` (manifest + new
@@ -988,6 +997,7 @@ together to stay green.
 - Create: `apps/server/tests/remote_update_rpc.rs`
 
 **Interfaces:**
+
 - Consumes: `RemoteUpdateSnapshot`, `RemoteUpdateInstallError` (Task 1);
   `RemoteUpdateService` (Task 3); `ServerConfig.remote_update_support` (Task 3).
 - Produces: wire methods `"updater.status"`, `"updater.check"`, `"updater.install"`
@@ -1182,7 +1192,7 @@ export const WsUpdaterInstallRpc = Rpc.make(WS_METHODS.updaterInstall, {
 ```
 
 4. Add the three to `RpcGroup.make(...)` (`WsRpcGroup`), after
-`WsServerConsumeCodexRateLimitResetRpc`:
+   `WsServerConsumeCodexRateLimitResetRpc`:
 
 ```ts
   WsUpdaterStatusRpc,
@@ -1208,7 +1218,7 @@ Expected: PASS (`rpcRustParity.test.ts` reads the regenerated manifest).
 - [ ] **Step 5: Add the Rust method inventory + scopes**
 
 `apps/server/src/rpc/methods.rs` — `ACTIVE_RPC_METHODS` is name-sorted and the
-`rpc_wire` test compares it *ordered* against the generated manifest. Insert between
+`rpc_wire` test compares it _ordered_ against the generated manifest. Insert between
 `mutation_unary("terminal.write"),` and `mutation_unary("vcs.clone"),`:
 
 ```rust
@@ -1320,7 +1330,7 @@ pins literals. Update:
 (`typed_failure_fixtures.len()`, shape counts) must be synced to the values in the
 **regenerated** `packages/contracts/fixtures/rpc-wire/manifest.json` — read them from
 the manifest, do not guess. The pins exist to force conscious review of generated-fixture
-drift; syncing them here *is* that review.
+drift; syncing them here _is_ that review.
 
 - [ ] **Step 8: Run tests to verify everything passes**
 
@@ -1353,6 +1363,7 @@ git commit -m "feat(rpc): ship updater.status/check/install with scopes and pari
 ### Task 6: Desktop delegate — interactive install through the host updater
 
 **Files:**
+
 - Modify: `apps/server/src/lifecycle.rs` (`start_with_desktop_integration`, thread the
   delegate through `start_internal`)
 - Modify: `apps/server/src/production/runtime.rs` (accept the delegate parameter;
@@ -1367,6 +1378,7 @@ git commit -m "feat(rpc): ship updater.status/check/install with scopes and pari
   `server_config.remote_update_support`)
 
 **Interfaces:**
+
 - Consumes: `RemoteUpdateDelegate`, `HostUpdaterStatus`, `HostUpdaterFuture`,
   `RemoteUpdateState`, `RemoteUpdateSupport`, `RemoteUpdateInstallMode`,
   `RemoteUpdateSupportReason` from `bibcode_server::remote_update` (Task 3);
@@ -1375,7 +1387,7 @@ git commit -m "feat(rpc): ship updater.status/check/install with scopes and pari
   `BackendSupervisor` from `apps/desktop/src-tauri/src/backend.rs`.
 - Produces:
   - `ServerRuntime::start_with_desktop_integration(config, ui_process_observer,
-    update_delegate: Arc<dyn RemoteUpdateDelegate>) -> Result<ServerHandle, ServerError>`
+update_delegate: Arc<dyn RemoteUpdateDelegate>) -> Result<ServerHandle, ServerError>`
   - `DesktopRemoteUpdateDelegate::<R>::new(app: AppHandle<R>) -> Arc<DesktopRemoteUpdateDelegate<R>>`
   - `derive_remote_update_support(updater_enabled: bool) -> RemoteUpdateSupport`
   - `map_desktop_update_state(state: &serde_json::Value) -> HostUpdaterStatus`
@@ -1867,11 +1879,13 @@ git commit -m "feat(desktop): route remote updater.install through the host upda
 ### Task 7: Client-runtime update atoms and the max-2-concurrent fan-out
 
 **Files:**
+
 - Create: `packages/client-runtime/src/state/remoteUpdates.ts`
 - Create: `packages/client-runtime/src/state/remoteUpdates.test.ts`
 - Modify: `packages/client-runtime/package.json` (add the subpath export)
 
 **Interfaces:**
+
 - Consumes: `WS_METHODS.updaterStatus/updaterCheck/updaterInstall` (Task 5);
   `createEnvironmentRpcQueryAtomFamily` / `createEnvironmentRpcCommand` and
   `type AtomCommandResult` from `packages/client-runtime/src/state/runtime.ts`;
@@ -1879,14 +1893,14 @@ git commit -m "feat(desktop): route remote updater.install through the host upda
 - Produces (imported as `@bibcode/client-runtime/state/remoteUpdates`):
   - `MAX_CONCURRENT_REMOTE_UPDATE_CHECKS = 2`
   - `fanOutRemoteUpdateChecks<A, E>(environmentIds, check, maxConcurrent?) =>
-    Promise<ReadonlyArray<RemoteUpdateFanOutResult<A, E>>>` where `check` returns
+Promise<ReadonlyArray<RemoteUpdateFanOutResult<A, E>>>` where `check` returns
     `Promise<AtomCommandResult<A, E>>` (the **settled** result a `useAtomCommand`
     dispatcher resolves with — typed failures are VALUES with `_tag: "Failure"`, they
     do not reject; see `apps/web/src/state/use-atom-command.ts` and
     `runAtomCommand` in `packages/client-runtime/src/state/runtime.ts`) and
     `RemoteUpdateFanOutResult<A, E> = { environmentId, outcome:
-    { kind: "success"; result: AtomCommandResult<A, E> } |
-    { kind: "failure"; result: AtomCommandResult<A, E> | null; error: unknown } }` —
+{ kind: "success"; result: AtomCommandResult<A, E> } |
+{ kind: "failure"; result: AtomCommandResult<A, E> | null; error: unknown } }` —
     classification inspects `result._tag`, mirroring the Phase 4 plan's
     `result._tag === "Failure"` handling.
   - `isRemoteUpdateAvailable(snapshot: RemoteUpdateSnapshot | null): boolean` —
@@ -1972,11 +1986,7 @@ describe("fanOutRemoteUpdateChecks", () => {
         ? Promise.resolve(settledFailure("unreachable"))
         : Promise.resolve(settledSuccess("ok")),
     );
-    expect(results.map((result) => result.outcome.kind)).toEqual([
-      "success",
-      "failure",
-      "success",
-    ]);
+    expect(results.map((result) => result.outcome.kind)).toEqual(["success", "failure", "success"]);
     const failure = results[1]!.outcome;
     expect(failure.kind === "failure" && failure.result?._tag).toBe("Failure");
   });
@@ -2035,11 +2045,7 @@ Expected: FAIL — cannot resolve `./remoteUpdates.ts`.
 Create `packages/client-runtime/src/state/remoteUpdates.ts`:
 
 ```ts
-import {
-  type EnvironmentId,
-  type RemoteUpdateSnapshot,
-  WS_METHODS,
-} from "@bibcode/contracts";
+import { type EnvironmentId, type RemoteUpdateSnapshot, WS_METHODS } from "@bibcode/contracts";
 import type { Atom } from "effect/unstable/reactivity";
 
 import {
@@ -2195,6 +2201,7 @@ If any name drifted, re-read `phases/phase-6-environment-rail.md`'s Interfaces b
 and the landed source before wiring.
 
 **Files:**
+
 - Create: `apps/web/src/state/remoteUpdates.ts`
 - Create: `apps/web/src/components/settings/ServerUpdateBadge.tsx`
 - Create: `apps/web/src/components/settings/ServerUpdateBadge.test.tsx`
@@ -2208,6 +2215,7 @@ and the landed source before wiring.
   `apps/web/src/components/sidebar/EnvironmentRail.tsx` — feed `updateAvailable`
 
 **Interfaces:**
+
 - Consumes: `createRemoteUpdateEnvironmentAtoms`, `fanOutRemoteUpdateChecks`,
   `isRemoteUpdateAvailable`, `MAX_CONCURRENT_REMOTE_UPDATE_CHECKS` (Task 7);
   `RemoteUpdateSnapshot` from `@bibcode/contracts` (Task 1); `connectionAtomRuntime`
@@ -2255,19 +2263,11 @@ describe("serverUpdateBadgeVariant", () => {
   it("maps every snapshot state onto a badge variant", () => {
     expect(serverUpdateBadgeVariant(null)).toBe("unknown");
     expect(serverUpdateBadgeVariant(manualSnapshot)).toBe("manual");
-    expect(serverUpdateBadgeVariant({ ...manualSnapshot, state: "up-to-date" })).toBe(
-      "up-to-date",
-    );
+    expect(serverUpdateBadgeVariant({ ...manualSnapshot, state: "up-to-date" })).toBe("up-to-date");
     expect(serverUpdateBadgeVariant(interactiveSnapshot)).toBe("update-available");
-    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "checking" })).toBe(
-      "busy",
-    );
-    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "downloading" })).toBe(
-      "busy",
-    );
-    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "installing" })).toBe(
-      "busy",
-    );
+    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "checking" })).toBe("busy");
+    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "downloading" })).toBe("busy");
+    expect(serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "installing" })).toBe("busy");
     expect(
       serverUpdateBadgeVariant({ ...interactiveSnapshot, state: "error", error: "boom" }),
     ).toBe("error");
@@ -2319,12 +2319,7 @@ Create `apps/web/src/components/settings/ServerUpdateBadge.tsx`:
 import type { RemoteUpdateSnapshot } from "@bibcode/contracts";
 
 export type ServerUpdateBadgeVariant =
-  | "up-to-date"
-  | "update-available"
-  | "busy"
-  | "manual"
-  | "error"
-  | "unknown";
+  "up-to-date" | "update-available" | "busy" | "manual" | "error" | "unknown";
 
 export function serverUpdateBadgeVariant(
   snapshot: RemoteUpdateSnapshot | null,
@@ -2410,9 +2405,7 @@ its defensive read with the typed field this phase introduced
 (`apps/web/src/connection/environmentCompat.ts`):
 
 ```ts
-export function selectRemoteUpdateControlCapability(
-  serverConfig: ServerConfig | null,
-): boolean {
+export function selectRemoteUpdateControlCapability(serverConfig: ServerConfig | null): boolean {
   return serverConfig?.environment.capabilities.remoteUpdateControl === true;
 }
 ```
@@ -2452,37 +2445,31 @@ const checkAll = async () => {
 };
 ```
 
-   where `runCheck` is the `useAtomCommand(remoteUpdateEnvironment.check, …)` dispatcher
-   — it RESOLVES with `AtomCommandResult` (typed failures are `_tag: "Failure"` values);
-   the Task 7 fan-out classifies on that tag and caps concurrency at 2. Row badges
-   update reactively as each check result lands in the snapshot family
-   (invalidate/refresh the row's snapshot atom after its check settles successfully,
-   following the file's existing refresh idiom).
-3. **Context card** (Phase 6's `EnvironmentContextCard`): pass the two props Phase 6
-   exposed for exactly this purpose — do not add new menu plumbing:
+where `runCheck` is the `useAtomCommand(remoteUpdateEnvironment.check, …)` dispatcher
+— it RESOLVES with `AtomCommandResult` (typed failures are `_tag: "Failure"` values);
+the Task 7 fan-out classifies on that tag and caps concurrency at 2. Row badges
+update reactively as each check result lands in the snapshot family
+(invalidate/refresh the row's snapshot atom after its check settles successfully,
+following the file's existing refresh idiom). 3. **Context card** (Phase 6's `EnvironmentContextCard`): pass the two props Phase 6
+exposed for exactly this purpose — do not add new menu plumbing:
 
 ```tsx
 <EnvironmentContextCard
   {...existingProps}
-  updateBadge={
-    remoteUpdateControl ? <ServerUpdateBadge snapshot={snapshot} /> : undefined
-  }
+  updateBadge={remoteUpdateControl ? <ServerUpdateBadge snapshot={snapshot} /> : undefined}
   onCheckForUpdates={
-    remoteUpdateControl
-      ? (environmentId) => void runCheck({ environmentId, input: {} })
-      : undefined
+    remoteUpdateControl ? (environmentId) => void runCheck({ environmentId, input: {} }) : undefined
   }
 />
 ```
 
-   (at the mount site in `Sidebar.tsx`; `remoteUpdateControl` comes from
-   `selectRemoteUpdateControlCapability(serverConfig)`. Phase 6 keeps the "Check for
-   updates" menu item hidden while `onCheckForUpdates` is undefined —
-   hidden-until-capable.)
-4. Extend the nearest existing test file for the row component (or
-   `SettingsPanels.test.tsx` if the rows are exercised there) with one focused case:
-   capability-off renders no badge; capability-on renders the badge markup. Follow that
-   file's existing harness idioms.
+(at the mount site in `Sidebar.tsx`; `remoteUpdateControl` comes from
+`selectRemoteUpdateControlCapability(serverConfig)`. Phase 6 keeps the "Check for
+updates" menu item hidden while `onCheckForUpdates` is undefined —
+hidden-until-capable.) 4. Extend the nearest existing test file for the row component (or
+`SettingsPanels.test.tsx` if the rows are exercised there) with one focused case:
+capability-off renders no badge; capability-on renders the badge markup. Follow that
+file's existing harness idioms.
 
 - [ ] **Step 6: Wire update-available into the Phase 6 rail dot (amended spec §4.8)**
 
@@ -2512,8 +2499,8 @@ it("passes updateAvailable through to the candidate", () => {
 });
 ```
 
-   Run: `vp test apps/web/src/components/sidebar/environmentRail.logic.test.ts` —
-   FAIL (the input type has no `updateAvailable` member).
+Run: `vp test apps/web/src/components/sidebar/environmentRail.logic.test.ts` —
+FAIL (the input type has no `updateAvailable` member).
 
 2. Extend `toEnvironmentRailCandidate`'s input with
    `readonly updateAvailable: boolean;` and replace the hardcoded
@@ -2531,17 +2518,15 @@ toEnvironmentRailCandidate({
   target: environment.entry.target,
   phase: environment.connection.phase,
   compat: resolveEnvironmentCompatVerdict(environment.serverConfig),
-  updateAvailable: isRemoteUpdateAvailable(
-    updateSnapshotFor(environment.environmentId),
-  ),
+  updateAvailable: isRemoteUpdateAvailable(updateSnapshotFor(environment.environmentId)),
 });
 ```
 
-   where `updateSnapshotFor` reads
-   `remoteUpdateEnvironment.snapshot({ environmentId, input: {} })` through the
-   component's atom hooks and yields the last-known `RemoteUpdateSnapshot | null`
-   (null while loading/failed/capability-off — the dot then depends on compat only).
-   Follow the component's existing per-environment atom-read idiom for the map.
+where `updateSnapshotFor` reads
+`remoteUpdateEnvironment.snapshot({ environmentId, input: {} })` through the
+component's atom hooks and yields the last-known `RemoteUpdateSnapshot | null`
+(null while loading/failed/capability-off — the dot then depends on compat only).
+Follow the component's existing per-environment atom-read idiom for the map.
 
 4. Re-run: `vp test apps/web/src/components/sidebar/` — PASS, including Phase 6's
    pre-existing rail tests (updated fixtures included).
@@ -2575,12 +2560,14 @@ This phase changes packaged UI flows (settings update surface) and adds an RPC s
 so runbooks get a real edit — not a "reviewed and remain accurate" statement.
 
 **Files:**
+
 - Modify: `docs/architecture/overview.md` (updater surface)
 - Modify: `docs/architecture/remote.md` (remote update contract + headless decision)
 - Modify: `docs/testing/linux-desktop.md`, `docs/testing/macos-desktop.md`,
   `docs/testing/windows-desktop.md` (one validation step each)
 
 **Interfaces:**
+
 - Consumes: everything shipped in Tasks 1–8 (documents must describe the code as
   landed, not as planned).
 
@@ -2693,6 +2680,7 @@ pending deletions under `docs/plans/2026-08-24-environment-project-management/` 
 untouched.
 
 **Residual risks to carry into the report:**
+
 - The desktop interactive install restarts the whole desktop app; remote clients
   observe a disconnect and rely on the existing supervisor backoff to reconnect. This
   is by design (update protection ran first) but should be stated in the report.
@@ -2702,4 +2690,3 @@ untouched.
 - Effect/atom API drift: if `createEnvironmentRpcQueryAtomFamily`'s option names moved,
   follow `packages/client-runtime/src/state/server.ts`, and consult
   `.repos/effect-smol/LLMS.md` before adjusting any Effect usage.
-

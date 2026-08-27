@@ -37,24 +37,24 @@ pairing bootstrap).
 
 Every decision below was put to the user with alternatives and confirmed on 2026-08-27.
 
-| # | Decision | Alternatives considered | Rationale |
-|---|----------|------------------------|-----------|
-| D1 | v1 scope = **Connect to a host + Share this host**; no Cloud VM tab at all | Connect only; all three incl. Cloud VM | Connect alone is untestable without Share; Cloud VM drags in provisioning infra unrelated to core value |
-| D2 | Feature exists in **both desktop and browser** modes; browser "Share" manages the server the web client is attached to; desktop-only mechanics (bind widening, firewall, SSH) cross `DesktopBridge` | Desktop-only; Connect-everywhere/Share-desktop-only | Client-runtime is shared; the server — not the client — owns share state |
-| D3 | **Soft switch**: connections to paired servers stay alive in the background; running sessions keep streaming; rail selection scopes the view only | Hard switch (one live connection); connect-on-select | Long-running agent sessions are the point of a remote runtime |
-| D4 | **Entity-ownership routing**: an operation on an entity owned by environment X targets X regardless of rail selection | Global-mode routing | Matches the reference implementation and BiBCode's existing `environmentId`-scoped state |
-| D5 | UI = **icon rail, mockup Variant B**: 52px edge rail + environment context card in the panel; card collapses when Local is selected | Compact dropdown; horizontal strip; minimal rail (tooltips only) | Full update/version parity (D9) needs a visible status surface |
-| D6 | Rail lists **Local (WSL backends grouped under it via sub-picker)** + each SSH/direct/relay remote as its own entry | Every backend flat; remotes only | WSL is "this machine" to the user; remotes are not |
-| D7 | Settings: **evolve `/settings/connections` in place** into "Remote Servers" with Connect/Share tabs | New section alongside; dismantle-and-rebuild | One source of truth for the saved-connection catalog (AGENTS.md: no duplicate sources of truth) |
-| D8 | Server-owned settings are **per-environment** (served by the selected runtime); client/UI settings stay on the device | Everything remote; operational-only | Appearance/keybindings belong to the device; providers/orchestration belong to the runtime |
-| D9 | **Full version/update capability** (the reference's surface adapted, not method-for-method parity — see §4.5 scope note): protocol window + compat verdict + "Check for Server Updates" | Handshake only; nothing | User decision (Q6=a) |
-| D10 | Update install: **two modes** — desktop-hosted servers one-click; headless `bibcode serve` reports manual instructions. Schema reserves a third `supervised` mode | Three modes incl. supervised handoff; check-only | Supervised handoff is real infrastructure the reference ships only partially; the contract reserves it without a wire change |
-| D11 | **App-layer E2EE with pinned host identity key** for direct connections (Noise NK); existing auth rides inside the channel | Reuse plain `ws://` with warning; TLS with pinned self-signed cert | User decision (Q12=b), conceptually derived from the reference design (which uses a NaCl-box scheme; Noise NK is a strengthening); makes direct LAN first-class and safe without cert lifecycle |
-| D12 | **Direct connection via pairing code is the first-class Add Server path**; SSH stays first-class; BiBCode Connect relay remains available as-is | Relay-first with direct demoted to "Advanced" | Confirmed after research showed the reference uses no relay for server pairing; E2EE (D11) removes the plaintext objection |
-| D13 | Pairing UX modeled on the reference (QR is a BiBCode addition — the reference's runtime pairing has none): **intent radio** (Another device / This computer only / Custom address), address picker, generating an open-in-browser URL and a `bibcode://pair?code=…` deep link + QR | Single link; keep today's UX relocated | The intent radio drives the exposure-safety rule (D14) |
-| D14 | **Grant-driven bind widening**: generating an off-host offer rebinds loopback→wide (with rollback + Windows firewall); a "this computer only" grant never widens on later launches; revoking the last off-host grant reverts | Manual "Allow remote connections" toggle | Server never listens wide without a live reason |
-| D15 | **SSH pairing repair is in scope** (restores the bootstrap the desktop SSH launcher invokes) | Leave broken | Shipping a remote-servers feature on a known-broken SSH bootstrap makes a flagship path a dead end |
-| D16 | Naming: settings section **"Remote Servers"**; entities are **environments**; the local one is **"Local"**; product strings "BiBCode"/"bibcode" by context; zero reference-product strings | — | User decision |
+| #   | Decision                                                                                                                                                                                                                                                                           | Alternatives considered                                            | Rationale                                                                                                                                                                                       |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | v1 scope = **Connect to a host + Share this host**; no Cloud VM tab at all                                                                                                                                                                                                         | Connect only; all three incl. Cloud VM                             | Connect alone is untestable without Share; Cloud VM drags in provisioning infra unrelated to core value                                                                                         |
+| D2  | Feature exists in **both desktop and browser** modes; browser "Share" manages the server the web client is attached to; desktop-only mechanics (bind widening, firewall, SSH) cross `DesktopBridge`                                                                                | Desktop-only; Connect-everywhere/Share-desktop-only                | Client-runtime is shared; the server — not the client — owns share state                                                                                                                        |
+| D3  | **Soft switch**: connections to paired servers stay alive in the background; running sessions keep streaming; rail selection scopes the view only                                                                                                                                  | Hard switch (one live connection); connect-on-select               | Long-running agent sessions are the point of a remote runtime                                                                                                                                   |
+| D4  | **Entity-ownership routing**: an operation on an entity owned by environment X targets X regardless of rail selection                                                                                                                                                              | Global-mode routing                                                | Matches the reference implementation and BiBCode's existing `environmentId`-scoped state                                                                                                        |
+| D5  | UI = **icon rail, mockup Variant B**: 52px edge rail + environment context card in the panel; card collapses when Local is selected                                                                                                                                                | Compact dropdown; horizontal strip; minimal rail (tooltips only)   | Full update/version parity (D9) needs a visible status surface                                                                                                                                  |
+| D6  | Rail lists **Local (WSL backends grouped under it via sub-picker)** + each SSH/direct/relay remote as its own entry                                                                                                                                                                | Every backend flat; remotes only                                   | WSL is "this machine" to the user; remotes are not                                                                                                                                              |
+| D7  | Settings: **evolve `/settings/connections` in place** into "Remote Servers" with Connect/Share tabs                                                                                                                                                                                | New section alongside; dismantle-and-rebuild                       | One source of truth for the saved-connection catalog (AGENTS.md: no duplicate sources of truth)                                                                                                 |
+| D8  | Server-owned settings are **per-environment** (served by the selected runtime); client/UI settings stay on the device                                                                                                                                                              | Everything remote; operational-only                                | Appearance/keybindings belong to the device; providers/orchestration belong to the runtime                                                                                                      |
+| D9  | **Full version/update capability** (the reference's surface adapted, not method-for-method parity — see §4.5 scope note): protocol window + compat verdict + "Check for Server Updates"                                                                                            | Handshake only; nothing                                            | User decision (Q6=a)                                                                                                                                                                            |
+| D10 | Update install: **two modes** — desktop-hosted servers one-click; headless `bibcode serve` reports manual instructions. Schema reserves a third `supervised` mode                                                                                                                  | Three modes incl. supervised handoff; check-only                   | Supervised handoff is real infrastructure the reference ships only partially; the contract reserves it without a wire change                                                                    |
+| D11 | **App-layer E2EE with pinned host identity key** for direct connections (Noise NK); existing auth rides inside the channel                                                                                                                                                         | Reuse plain `ws://` with warning; TLS with pinned self-signed cert | User decision (Q12=b), conceptually derived from the reference design (which uses a NaCl-box scheme; Noise NK is a strengthening); makes direct LAN first-class and safe without cert lifecycle |
+| D12 | **Direct connection via pairing code is the first-class Add Server path**; SSH stays first-class; BiBCode Connect relay remains available as-is                                                                                                                                    | Relay-first with direct demoted to "Advanced"                      | Confirmed after research showed the reference uses no relay for server pairing; E2EE (D11) removes the plaintext objection                                                                      |
+| D13 | Pairing UX modeled on the reference (QR is a BiBCode addition — the reference's runtime pairing has none): **intent radio** (Another device / This computer only / Custom address), address picker, generating an open-in-browser URL and a `bibcode://pair?code=…` deep link + QR | Single link; keep today's UX relocated                             | The intent radio drives the exposure-safety rule (D14)                                                                                                                                          |
+| D14 | **Grant-driven bind widening**: generating an off-host offer rebinds loopback→wide (with rollback + Windows firewall); a "this computer only" grant never widens on later launches; revoking the last off-host grant reverts                                                       | Manual "Allow remote connections" toggle                           | Server never listens wide without a live reason                                                                                                                                                 |
+| D15 | **SSH pairing repair is in scope** (restores the bootstrap the desktop SSH launcher invokes)                                                                                                                                                                                       | Leave broken                                                       | Shipping a remote-servers feature on a known-broken SSH bootstrap makes a flagship path a dead end                                                                                              |
+| D16 | Naming: settings section **"Remote Servers"**; entities are **environments**; the local one is **"Local"**; product strings "BiBCode"/"bibcode" by context; zero reference-product strings                                                                                         | —                                                                  | User decision                                                                                                                                                                                   |
 
 ## 3. Threat model and security boundaries
 
@@ -69,9 +69,9 @@ Three client cases with different guarantees (this distinction is load-bearing):
    the host (key pinning → `host-identity-mismatch` on change) and encrypts everything;
    the device token authenticates the client inside the channel.
 2. **Browser client loaded from a trusted origin (e.g. `http://127.0.0.1:3773` local
-   server) connecting *out* to a remote.** Same guarantee as case 1: the page is served by
+   server) connecting _out_ to a remote.** Same guarantee as case 1: the page is served by
    a host the user already trusts; pinning holds.
-3. **Browser client loaded *from the remote host itself* over plain HTTP (the
+3. **Browser client loaded _from the remote host itself_ over plain HTTP (the
    "Open in browser" URL).** E2EE cannot protect page integrity here: the page — including
    the E2EE code — traveled over the same unprotected channel it is meant to secure. This
    path is only as safe as its load channel (LAN you trust, SSH tunnel, Tailscale, relay
@@ -92,9 +92,9 @@ Other boundaries (all existing, preserved):
   listings. This is the repo's existing custody model, kept deliberately (the reference
   implementation's main-process custody has no analogue for a browser client); the
   residual browser XSS exposure is bounded by the existing CSP/session model and is
-  documented in `docs/architecture/connection-runtime.md`. *(Corrected 2026-08-27 after
+  documented in `docs/architecture/connection-runtime.md`. _(Corrected 2026-08-27 after
   external review — the earlier "renderer never sees credentials" claim overstated
-  current behavior.)*
+  current behavior.)_
 - Storage-identity gating (`storageInstanceId` adoption) is unchanged and must be surfaced
   in every new add/connect flow.
 - Exposure minimization: loopback bind by default; widening only via D14's grant ceremony
@@ -104,9 +104,9 @@ Other boundaries (all existing, preserved):
   reauthorization rejects subsequent calls (`apps/server/src/rpc/session.rs`) — live
   connections are **not** actively terminated. This feature adds active termination:
   revoking a paired client also closes its live WebSocket sessions (Phase 5), so a
-  revoked device loses streams immediately, not at its next request. *(Corrected
+  revoked device loses streams immediately, not at its next request. _(Corrected
   2026-08-27 after external review — the earlier wording claimed termination already
-  existed.)*
+  existed.)_
 
 ## 4. Pinned cross-phase contracts
 
@@ -128,8 +128,8 @@ Deep link: `bibcode://pair?code=<base64url(JSON)>`. Browser form: the server's o
 client at `<endpoint>/pair?code=<same>` — this route must work for a **fresh,
 unauthenticated device**: the code itself carries the one-time credential, so the flow
 consumes it to establish the browser session (integrating with the existing pairing
-route surface), never gating on a pre-existing session. *(Pinned 2026-08-27 after
-external review.)* JSON payload (schema lives in
+route surface), never gating on a pre-existing session. _(Pinned 2026-08-27 after
+external review.)_ JSON payload (schema lives in
 `packages/contracts/src/remotePairing.ts`, new file; Rust mirror in
 `apps/server/src/auth/` with a TS↔Rust parity test following
 `packages/contracts/src/authRustParity.test.ts`):
@@ -171,25 +171,25 @@ external review.)* JSON payload (schema lives in
   record sequence are **exactly the bytes the plain `/ws` socket would carry**
   (the RPC protocol is unchanged and unaware of the wrapper). Records exist because
   Noise caps one message at 65,535 ciphertext bytes; a logical message is capped at
-  64 MiB reassembled, and violations close the connection. *(Amended 2026-08-27 during
+  64 MiB reassembled, and violations close the connection. _(Amended 2026-08-27 during
   plan review from the original one-message-per-RPC-frame wording, which the Noise cap
-  makes unsatisfiable.)*
+  makes unsatisfiable.)_
 - Credential bootstrap happens **inside the channel** — no plaintext-HTTP credential
   exchange for hostKey targets. First client transport message: `e2ee_auth`, in one of two
   forms. First connect: `{"type":"e2ee_auth","pairing":"<one-time pairing token>"}` — the
-  server performs the bootstrap exchange and mints the device session *inside the
-  channel*, replying `{"type":"e2ee_authenticated","credential":{…bearer…},
-  "environmentId":…,"storageInstanceId":…}`; the one-time token is consumed only by this
+  server performs the bootstrap exchange and mints the device session _inside the
+  channel_, replying `{"type":"e2ee_authenticated","credential":{…bearer…},
+"environmentId":…,"storageInstanceId":…}`; the one-time token is consumed only by this
   successful in-channel exchange, so pre-auth failures (wrong host, transport loss) leave
   it retryable. Subsequent connects: `{"type":"e2ee_auth","bearer":"<stored access
-  credential>"}`. No `/oauth/token` or WebSocket-ticket HTTP round-trips occur for
+credential>"}`. No `/oauth/token` or WebSocket-ticket HTTP round-trips occur for
   hostKey targets — the only pre-auth HTTP is the unauthenticated descriptor fetch, used
   as a routing hint only and **re-verified inside the channel** (authenticated
   `server.getConfig` compared against the pairing payload's `environmentId`/
   `storageInstanceId` before anything is persisted). Failure replies:
   `{"type":"e2ee_error","code":"unauthorized"|"protocol"}` then close.
-  *(Amended 2026-08-27 after external review: the original ticket-over-HTTP bootstrap
-  leaked credentials on the plaintext hop the channel exists to protect.)*
+  _(Amended 2026-08-27 after external review: the original ticket-over-HTTP bootstrap
+  leaked credentials on the plaintext hop the channel exists to protect.)_
 - No-downgrade rule: sessions minted through `/ws-e2ee` are recorded with
   `transport: "e2ee"` and are **rejected by the plain `/ws` route and plain-HTTP bearer
   surfaces** — an intercepted or exfiltrated credential cannot be replayed onto an
@@ -225,8 +225,8 @@ New in `packages/contracts/src/environment.ts` (additive, decode-defaulted — o
 servers keep working):
 
 ```ts
-export const REMOTE_PROTOCOL_VERSION = 1
-export const MIN_COMPATIBLE_REMOTE_PROTOCOL = 1
+export const REMOTE_PROTOCOL_VERSION = 1;
+export const MIN_COMPATIBLE_REMOTE_PROTOCOL = 1;
 // ExecutionEnvironmentDescriptor gains (decode-default 0 = "legacy, pre-window"):
 //   remoteProtocolVersion: number
 //   minCompatibleRemoteProtocol: number
@@ -237,9 +237,9 @@ Verdict, computed in `packages/client-runtime/src/connection/compat.ts` (new):
 ```ts
 export type CompatVerdict =
   | { kind: "compatible" }
-  | { kind: "legacy" }            // server predates the window (both fields 0)
+  | { kind: "legacy" } // server predates the window (both fields 0)
   | { kind: "server-too-old"; serverVersion: number; minSupported: number }
-  | { kind: "client-too-old"; serverMinCompatible: number; clientVersion: number }
+  | { kind: "client-too-old"; serverMinCompatible: number; clientVersion: number };
 ```
 
 Rules (two-way window, mirroring the reference): compatible iff
@@ -255,7 +255,7 @@ non-negative integers on the wire. Deliberate divergences from the reference
 implementation, kept by design: a single two-way minimum (not separate client/server
 floors), and a usable `legacy` verdict with capability-boolean downgrade instead of
 failing closed on absent version fields — capability downgrade is BiBCode's existing
-documented compatibility invariant. *(Amended 2026-08-27 after external review.)*
+documented compatibility invariant. _(Amended 2026-08-27 after external review.)_
 
 ### 4.5 Remote update contract
 
@@ -263,17 +263,24 @@ New `packages/contracts/src/remoteUpdate.ts` + WS methods in
 `packages/contracts/src/rpc.ts` (+ Rust mirrors and parity-manifest entries):
 
 ```ts
-export type RemoteUpdateInstallMode = "interactive" | "manual" | "supervised" // v1 ships the first two
+export type RemoteUpdateInstallMode = "interactive" | "manual" | "supervised"; // v1 ships the first two
 export interface RemoteUpdateSupport {
-  installMode: RemoteUpdateInstallMode
-  reason: "available" | "manual-update-required" | "unpackaged-build" | "updater-unavailable"
+  installMode: RemoteUpdateInstallMode;
+  reason: "available" | "manual-update-required" | "unpackaged-build" | "updater-unavailable";
 }
 export interface RemoteUpdateSnapshot {
-  serverVersion: string
-  latestVersion: string | null
-  state: "idle" | "checking" | "update-available" | "downloading" | "installing" | "up-to-date" | "error"
-  error: string | null
-  support: RemoteUpdateSupport
+  serverVersion: string;
+  latestVersion: string | null;
+  state:
+    | "idle"
+    | "checking"
+    | "update-available"
+    | "downloading"
+    | "installing"
+    | "up-to-date"
+    | "error";
+  error: string | null;
+  support: RemoteUpdateSupport;
 }
 // WS methods (per-method scope in apps/server/src/auth/scope.rs):
 //   "updater.status"  → RemoteUpdateSnapshot        (scope: server:read — or the closest existing read scope)
@@ -286,21 +293,21 @@ export interface RemoteUpdateSnapshot {
   injected at server construction** (following the repo's existing host-observer
   injection pattern) — not `DesktopBridge`, which is the renderer↔host seam and cannot
   carry a request originating from a remote client's RPC. The remote request reuses the
-  updater's existing protection-drain path unchanged. *(Seam wording corrected
-  2026-08-27 after external review.)*
+  updater's existing protection-drain path unchanged. _(Seam wording corrected
+  2026-08-27 after external review.)_
 - Headless `bibcode serve` (`installMode: "manual"`): `updater.check` refreshes the
   server's self-reported version but returns `latestVersion: null` — the server crate has
   no update-feed access (the feed URL lives only in the desktop release config), so
   headless servers cannot discover newer versions in v1; `updater.install` fails with
   `remote_update_manual_required` and the UI shows copy-paste update instructions.
-  *(Clarified 2026-08-27 during plan review.)*
+  _(Clarified 2026-08-27 during plan review.)_
 - `supervised` is schema-reserved; no v1 implementation.
 - `RemoteUpdateSupport` is also embedded in the environment descriptor so the client knows
   before asking; the capability boolean `remoteUpdateControl` (default-false) gates the
   whole surface for older servers. **All three** descriptor producers publish these
   fields (well-known route, `server.getConfig`, and the Connect/relay descriptor in
   `lifecycle.rs`) — editing fewer is a latent bug.
-- Scope note (D9): this surface is the reference's update capability *adapted*, not
+- Scope note (D9): this surface is the reference's update capability _adapted_, not
   method-for-method parity — there is no separate `download` method (install downloads),
   and headless check semantics are as clarified above.
 - "Check for Server Updates" (settings) fans `updater.check` across saved environments
@@ -309,20 +316,20 @@ export interface RemoteUpdateSnapshot {
 ### 4.6 Exposure (bind widening) state machine
 
 Owned by the desktop host. There is no server→host command channel today, so exposure
-*transitions* require the desktop bridge: in browser mode without `window.desktopBridge`
+_transitions_ require the desktop bridge: in browser mode without `window.desktopBridge`
 (and against headless servers, where exposure is whatever the operator bound) the Share
 tab still mints offers and revokes clients, but shows exposure state **read-only** with
-CLI/desktop guidance instead of widening. *(Clarified 2026-08-27 after external review —
+CLI/desktop guidance instead of widening. _(Clarified 2026-08-27 after external review —
 D2's "browser manages the server" means the pairing-grant surface, not remote bind
-control.)*
+control.)_
 
 - Persisted per pairing grant: `reach` (from §4.2). Derived desired exposure:
   `wide` iff ≥1 unrevoked **off-host** grant exists, else `loopback`. Off-host means:
   `reach = "another-device"`, or `reach = "custom"` whose endpoint classified off-host
   **at mint time** (a `custom` grant pointing at a loopback endpoint — an SSH tunnel or
   reverse proxy — must not widen; the mint persists the computed off-host flag per grant
-  so derivation and generator agree). *(Rule pinned 2026-08-27 after external review
-  found the generator and server derivation disagreed on `custom`.)*
+  so derivation and generator agree). _(Rule pinned 2026-08-27 after external review
+  found the generator and server derivation disagreed on `custom`.)_
 - Transitions (through the existing `DesktopServerExposureState` machinery, never a bare
   config edit): generating the first off-host offer → widen (rebind, Windows firewall
   scope update), with **rollback to loopback on bind failure** and the offer generation
@@ -333,8 +340,8 @@ control.)*
 - Legacy grants (pairing links/sessions issued before `reach` existed decode as
   `reach = null`): they never cause auto-widening, but they **block auto-revert** — a
   server exposed via today's manual toggle stays exposed until its null-reach grants are
-  revoked or the operator narrows explicitly. *(Added 2026-08-27 during plan review to
-  protect existing manual-exposure users.)*
+  revoked or the operator narrows explicitly. _(Added 2026-08-27 during plan review to
+  protect existing manual-exposure users.)_
 
 ### 4.7 SSH pairing bootstrap (repair)
 
@@ -369,7 +376,7 @@ root and prints the pairing credential JSON in the exact shape
   code + QR, paired-clients list with revocation, exposure state). Sections degrade per
   `EnvironmentPresentationPolicy` (no desktop bridge ⇒ no SSH discovery, no
   exposure-widening controls).
-- Selection semantics (D3/D4): the rail scopes *presentation* (which environment's
+- Selection semantics (D3/D4): the rail scopes _presentation_ (which environment's
   projects/threads the panel shows and where "Add project" lands); RPC routing continues
   to follow each entity's `environmentId`. A null/absent `activeEnvironmentId` means
   **Local is selected and the panel filters to Local** — "no selection" must never render

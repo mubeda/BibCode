@@ -36,7 +36,7 @@
 ## Phase-specific notes for the implementer
 
 - **This phase adds no WS methods**, so there is no parity-manifest entry to add. The
-  TS↔Rust parity mechanism for two integer constants is *pinned literals on both sides*:
+  TS↔Rust parity mechanism for two integer constants is _pinned literals on both sides_:
   the TS tests assert the constants equal `1` and the decode defaults equal `0`; the Rust
   tests assert every descriptor producer serializes `"remoteProtocolVersion": 1` and
   `"minCompatibleRemoteProtocol": 1` under exactly those camelCase keys. If either side
@@ -55,7 +55,7 @@
   (`apps/desktop/src-tauri/src/bridge.rs` ~line 1114) passes the descriptor JSON through
   as an untyped `serde_json::Value` — verified: no typed struct, no `deny_unknown_fields`
   — so **no desktop change is needed**.
-- `Schema.withDecodingDefault` makes a field *required on the Type side*. Adding the two
+- `Schema.withDecodingDefault` makes a field _required on the Type side_. Adding the two
   fields to `ExecutionEnvironmentDescriptor` breaks every TS object literal that
   constructs a descriptor value (mostly test fixtures). Task 1 includes the enumeration
   and fix step — do not skip it or `vp run typecheck` fails.
@@ -67,6 +67,7 @@
 ### Task 1: Contracts — window constants and descriptor fields (TypeScript)
 
 **Files:**
+
 - Modify: `packages/contracts/src/environment.ts` (constants + two fields on `ExecutionEnvironmentDescriptor`, currently lines 36–46)
 - Test: `packages/contracts/src/environment.test.ts` (append to the existing `describe("execution environment contracts", ...)` block)
 - Modify (fixture ripple, enumerated by typecheck in Step 5): known typed descriptor literals include
@@ -80,6 +81,7 @@
   `packages/client-runtime/src/rpc/session.test.ts`
 
 **Interfaces:**
+
 - Consumes: existing `ExecutionEnvironmentDescriptor` schema and its decode-default style (`Schema.withDecodingDefault(Effect.succeed(...))`, see `storageInstanceId` in the same struct).
 - Produces (spec §4.4 names, verbatim — Tasks 2–4 and Phases 3/4/6/7 rely on these):
   - `export const REMOTE_PROTOCOL_VERSION = 1` (from `packages/contracts/src/environment.ts`, re-exported by the `@bibcode/contracts` root barrel via the existing `export * from "./environment.ts"` in `packages/contracts/src/index.ts` — no barrel change needed)
@@ -99,56 +101,56 @@ import {
 ```
 
 ```ts
-  it("pins the remote protocol window constants", () => {
-    expect(REMOTE_PROTOCOL_VERSION).toBe(1);
-    expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);
+it("pins the remote protocol window constants", () => {
+  expect(REMOTE_PROTOCOL_VERSION).toBe(1);
+  expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);
+});
+
+it("defaults the protocol window to 0/0 for an old descriptor", () => {
+  const decoded = decodeExecutionEnvironmentDescriptor({
+    ...descriptor,
+    capabilities: { repositoryIdentity: true },
   });
 
-  it("defaults the protocol window to 0/0 for an old descriptor", () => {
-    const decoded = decodeExecutionEnvironmentDescriptor({
-      ...descriptor,
-      capabilities: { repositoryIdentity: true },
-    });
+  expect(decoded.remoteProtocolVersion).toBe(0);
+  expect(decoded.minCompatibleRemoteProtocol).toBe(0);
+});
 
-    expect(decoded.remoteProtocolVersion).toBe(0);
-    expect(decoded.minCompatibleRemoteProtocol).toBe(0);
+it("decodes an advertised protocol window", () => {
+  const decoded = decodeExecutionEnvironmentDescriptor({
+    ...descriptor,
+    remoteProtocolVersion: 1,
+    minCompatibleRemoteProtocol: 1,
+    capabilities: { repositoryIdentity: true },
   });
 
-  it("decodes an advertised protocol window", () => {
-    const decoded = decodeExecutionEnvironmentDescriptor({
-      ...descriptor,
-      remoteProtocolVersion: 1,
-      minCompatibleRemoteProtocol: 1,
-      capabilities: { repositoryIdentity: true },
-    });
+  expect(decoded.remoteProtocolVersion).toBe(1);
+  expect(decoded.minCompatibleRemoteProtocol).toBe(1);
+});
 
-    expect(decoded.remoteProtocolVersion).toBe(1);
-    expect(decoded.minCompatibleRemoteProtocol).toBe(1);
-  });
+it("rejects negative protocol window values", () => {
+  for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        [field]: -1,
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
+  }
+});
 
-  it("rejects negative protocol window values", () => {
-    for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
-      expect(() =>
-        decodeExecutionEnvironmentDescriptor({
-          ...descriptor,
-          [field]: -1,
-          capabilities: { repositoryIdentity: true },
-        }),
-      ).toThrow();
-    }
-  });
-
-  it("rejects fractional protocol window values", () => {
-    for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
-      expect(() =>
-        decodeExecutionEnvironmentDescriptor({
-          ...descriptor,
-          [field]: 1.5,
-          capabilities: { repositoryIdentity: true },
-        }),
-      ).toThrow();
-    }
-  });
+it("rejects fractional protocol window values", () => {
+  for (const field of ["remoteProtocolVersion", "minCompatibleRemoteProtocol"] as const) {
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        [field]: 1.5,
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
+  }
+});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -198,7 +200,7 @@ Expected: PASS (all pre-existing descriptor tests in the file must also still pa
 
 - [ ] **Step 5: Fix the typed-fixture ripple**
 
-The two new fields are required on the Type side, so every TS literal built *as* an `ExecutionEnvironmentDescriptor` now fails typecheck. Enumerate:
+The two new fields are required on the Type side, so every TS literal built _as_ an `ExecutionEnvironmentDescriptor` now fails typecheck. Enumerate:
 
 Run: `rg -ln "satisfies ExecutionEnvironmentDescriptor" packages apps`
 Run: `vp run typecheck` (the authoritative enumeration — fix every error it reports)
@@ -235,6 +237,7 @@ git commit -m "feat(contracts): add remote protocol compatibility window to the 
 ### Task 2: Server — publish the window on every descriptor surface (Rust)
 
 **Files:**
+
 - Modify: `apps/server/src/http.rs` (constants next to `ENVIRONMENT_DESCRIPTOR_PATH` ~line 40; `EnvironmentDescriptor` struct + handler, lines 260–301)
 - Modify: `apps/server/src/production/control.rs` (`fn environment_descriptor`, ~line 2139)
 - Modify: `apps/server/src/lifecycle.rs` (Connect descriptor `json!`, ~line 270)
@@ -242,6 +245,7 @@ git commit -m "feat(contracts): add remote protocol compatibility window to the 
 - Test: `apps/server/tests/server_runtime.rs` (`binds_an_ephemeral_port_and_serves_the_environment_descriptor`, ~line 259)
 
 **Interfaces:**
+
 - Consumes: the wire keys pinned by Task 1 — `remoteProtocolVersion`, `minCompatibleRemoteProtocol`, both serialized as `1` by a current server.
 - Produces: `pub(crate) const REMOTE_PROTOCOL_VERSION: u32 = 1` and `pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1` in `apps/server/src/http.rs`, referenced by the other two producers as `crate::http::REMOTE_PROTOCOL_VERSION` / `crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL` (precedent: `apps/server/src/auth/http.rs` already imports `crate::http::AppState`).
 
@@ -371,11 +375,13 @@ git commit -m "feat(server): publish the remote protocol compatibility window on
 ### Task 3: `CompatVerdict` — verdict module in client-runtime
 
 **Files:**
+
 - Create: `packages/client-runtime/src/connection/compat.ts`
 - Create: `packages/client-runtime/src/connection/compat.test.ts`
 - Modify: `packages/client-runtime/src/connection/index.ts` (add `export * from "./compat.ts";` in alphabetical position, after the `./catalog.ts` export)
 
 **Interfaces:**
+
 - Consumes: `REMOTE_PROTOCOL_VERSION`, `MIN_COMPATIBLE_REMOTE_PROTOCOL`, `ExecutionEnvironmentDescriptor` from `@bibcode/contracts` (Task 1).
 - Produces (spec §4.4, verbatim — Task 4 and Phases 3/4/6/7 rely on these exact names, importable from `@bibcode/client-runtime/connection`):
   - `type CompatVerdict = { kind: "compatible" } | { kind: "legacy" } | { kind: "server-too-old"; serverVersion: number; minSupported: number } | { kind: "client-too-old"; serverMinCompatible: number; clientVersion: number }`
@@ -531,10 +537,12 @@ git commit -m "feat(client-runtime): compute the protocol compatibility verdict"
 ### Task 4: Per-environment verdict exposure — `compatVerdictAtom`
 
 **Files:**
+
 - Modify: `packages/client-runtime/src/state/session.ts` (helper + atom family inside `createEnvironmentSessionAtoms`, currently lines 28–95)
 - Test: `packages/client-runtime/src/state/session.test.ts` (append to the existing `describe("environment session state", ...)` block)
 
 **Interfaces:**
+
 - Consumes: `computeCompatVerdict` / `CompatVerdict` from `../connection/compat.ts` (Task 3); the existing `preparedConnectionValueAtom` family and `PreparedConnection.descriptor` (the resolver attaches the descriptor it fetches on every connection attempt, so the verdict updates on every reconnect).
 - Produces (pinned names for later phases):
   - `compatVerdictFromPrepared(prepared: Option.Option<Pick<PreparedConnection, "descriptor">>): CompatVerdict | null` — pure helper, exported for tests and non-atom callers.
@@ -574,9 +582,9 @@ describe("environment compatibility verdict selection", () => {
   });
 
   it("derives the verdict from the prepared connection descriptor", () => {
-    expect(
-      compatVerdictFromPrepared(Option.some({ descriptor: currentDescriptor })),
-    ).toEqual({ kind: "compatible" });
+    expect(compatVerdictFromPrepared(Option.some({ descriptor: currentDescriptor }))).toEqual({
+      kind: "compatible",
+    });
   });
 
   it("classifies a pre-window prepared descriptor as legacy", () => {
@@ -626,23 +634,23 @@ export function compatVerdictFromPrepared(
 Inside `createEnvironmentSessionAtoms`, after `preparedConnectionValueAtom`, add the family (naming and labels mirror the file's existing `environment-prepared-connection:${environmentId}` convention):
 
 ```ts
-  const compatVerdictAtom = Atom.family((environmentId: EnvironmentId) =>
-    Atom.make((get): CompatVerdict | null =>
-      compatVerdictFromPrepared(get(preparedConnectionValueAtom(environmentId))),
-    ).pipe(Atom.withLabel(`environment-compat-verdict:${environmentId}`)),
-  );
+const compatVerdictAtom = Atom.family((environmentId: EnvironmentId) =>
+  Atom.make((get): CompatVerdict | null =>
+    compatVerdictFromPrepared(get(preparedConnectionValueAtom(environmentId))),
+  ).pipe(Atom.withLabel(`environment-compat-verdict:${environmentId}`)),
+);
 ```
 
 and extend the return value:
 
 ```ts
-  return {
-    initialConfigAtom,
-    initialConfigValueAtom,
-    preparedConnectionAtom,
-    preparedConnectionValueAtom,
-    compatVerdictAtom,
-  };
+return {
+  initialConfigAtom,
+  initialConfigValueAtom,
+  preparedConnectionAtom,
+  preparedConnectionValueAtom,
+  compatVerdictAtom,
+};
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -667,11 +675,13 @@ git commit -m "feat(client-runtime): expose a per-environment protocol compatibi
 ### Task 5: Living documentation, runbook review, and the phase validation gate
 
 **Files:**
+
 - Modify: `docs/architecture/overview.md` (descriptor-surfaces paragraph, ~lines 255–264)
 - Modify: `docs/architecture/connection-runtime.md` (new section after "Data boundary")
 - Review only (no expected change): `docs/testing/README.md`, `docs/testing/cross-platform-validation.md`, `docs/testing/linux-desktop.md`, `docs/testing/macos-desktop.md`, `docs/testing/windows-desktop.md`
 
 **Interfaces:**
+
 - Consumes: everything shipped by Tasks 1–4.
 - Produces: living-doc coverage of the window and verdict, and the phase's completion evidence.
 
