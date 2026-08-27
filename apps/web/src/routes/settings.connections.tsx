@@ -1,6 +1,7 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 
-import { ConnectionsSettings } from "../components/settings/ConnectionsSettings";
+import { LocalEnvironmentSettings } from "../components/settings/LocalEnvironmentSettings";
+import { RemoteServersSettings } from "../components/settings/remote-servers/RemoteServersSettings";
 import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
 import type { EnvironmentPresentationPolicy } from "~/connection/environmentPresentationPolicy";
 
@@ -21,5 +22,12 @@ export const Route = createFileRoute("/settings/connections")({
       throw redirect({ to: "/settings/general", replace: true });
     }
   },
-  component: ConnectionsSettings,
+  component: ConnectionsRouteComponent,
 });
+
+function ConnectionsRouteComponent() {
+  const policy = readCurrentEnvironmentPresentationPolicy();
+  if (policy.connectionsPresentation === "local-wsl") return <LocalEnvironmentSettings />;
+  if (policy.connectionsPresentation === "redirect-general") return null;
+  return <RemoteServersSettings />;
+}
