@@ -10,11 +10,15 @@ export type RemoteServersTab = "connect" | "share";
 export function RemoteServersSettings({
   initialTab = "connect",
   initialPairingCode = null,
+  initialAddServerOpen = false,
   onPairingCodeConsumed,
+  onAddServerActionConsumed,
 }: {
   readonly initialTab?: RemoteServersTab;
   readonly initialPairingCode?: string | null;
+  readonly initialAddServerOpen?: boolean;
   readonly onPairingCodeConsumed?: () => void;
+  readonly onAddServerActionConsumed?: () => void;
 }) {
   const [tab, setTab] = useState<RemoteServersTab>(initialTab);
   return (
@@ -27,7 +31,11 @@ export function RemoteServersSettings({
         <TabsPanel value="connect">
           <ConnectTab
             initialPairingCode={initialPairingCode}
+            {...(initialAddServerOpen ? { initialAddServerOpen: true } : {})}
             {...(onPairingCodeConsumed === undefined ? {} : { onPairingCodeConsumed })}
+            {...(onAddServerActionConsumed === undefined
+              ? {}
+              : { onAddServerActionConsumed })}
           />
         </TabsPanel>
         <TabsPanel value="share">
