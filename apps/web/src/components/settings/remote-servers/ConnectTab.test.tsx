@@ -740,7 +740,7 @@ function stubBrowserWindow(options?: {
 }
 
 interface DesktopBridgeStub {
-  setServerExposureMode: ReturnType<typeof vi.fn>;
+  applyServerExposure: ReturnType<typeof vi.fn>;
   setTailscaleServeEnabled: ReturnType<typeof vi.fn>;
   setWslBackendEnabled: ReturnType<typeof vi.fn>;
   setWslDistro: ReturnType<typeof vi.fn>;
@@ -760,7 +760,7 @@ function createDesktopBridgeStub(): DesktopBridgeStub {
     preflightError: null,
   };
   return {
-    setServerExposureMode: vi.fn(async () => ({})),
+    applyServerExposure: vi.fn(async () => ({})),
     setTailscaleServeEnabled: vi.fn(async () => ({})),
     setWslBackendEnabled: vi.fn(async () => wslState),
     setWslDistro: vi.fn(async () => wslState),
@@ -1866,7 +1866,7 @@ describe("Remote Servers tabs", () => {
     // Only the tailscale-disable confirmation reaches the bridge.
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledTimes(1);
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: false, port: 443 });
-    expect(bridge.setServerExposureMode).not.toHaveBeenCalled();
+    expect(bridge.applyServerExposure).not.toHaveBeenCalled();
     expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
 
     // Disabling tailscale can fail with a toast.
@@ -1970,12 +1970,12 @@ describe("Remote Servers tabs", () => {
       }
     }
     await flush();
-    expect(bridge.setServerExposureMode).toHaveBeenCalledWith("network-accessible");
+    expect(bridge.applyServerExposure).toHaveBeenCalledWith("network-accessible");
     expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
 
     // Exposure change failures surface a toast.
     h.toastAdd.mockClear();
-    bridge.setServerExposureMode.mockRejectedValueOnce(new Error("exposure failed"));
+    bridge.applyServerExposure.mockRejectedValueOnce(new Error("exposure failed"));
     for (const entry of findControls("button", "Restart and enable")) {
       if (typeof entry.props.onClick === "function") {
         invoke(entry, "onClick");

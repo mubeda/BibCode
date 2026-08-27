@@ -1130,7 +1130,7 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.disconnectSshEnvironment(sshTarget)).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toBeNull();
+    await expect(bridge.applyServerExposure("network-accessible")).resolves.toBeNull();
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toBeNull();
@@ -1167,6 +1167,9 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_discover_ssh_hosts", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_disconnect_ssh_environment", {
       target: sshTarget,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_apply_server_exposure", {
+      desired: "network-accessible",
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_set_wsl_backend_enabled", {
       enabled: true,
@@ -1317,9 +1320,9 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.openExternal("not a URL")).resolves.toBe(false);
 
     await expect(bridge.getServerExposureState()).resolves.toMatchObject({ mode: "local-only" });
-    await expect(bridge.setServerExposureMode("network-accessible")).resolves.toMatchObject({
-      mode: "local-only",
-    });
+    await expect(bridge.applyServerExposure("network-accessible")).rejects.toThrow(
+      "unsupported fallback command: desktop_bridge_apply_server_exposure",
+    );
     await expect(
       bridge.setTailscaleServeEnabled({ enabled: true, port: 8443 }),
     ).resolves.toMatchObject({ tailscaleServeEnabled: false });

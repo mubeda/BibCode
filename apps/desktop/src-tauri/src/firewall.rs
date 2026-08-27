@@ -5,14 +5,14 @@
 //! firewall here and every call is a successful no-op.
 
 #[cfg_attr(
-    not(windows),
+    all(not(windows), not(test)),
     expect(dead_code, reason = "Windows-only firewall command")
 )]
 const REMOTE_ACCESS_RULE_NAME: &str = "BiBCode Remote Access";
 
 #[must_use]
 #[cfg_attr(
-    not(windows),
+    all(not(windows), not(test)),
     expect(dead_code, reason = "Windows-only firewall command")
 )]
 pub(crate) fn remote_access_rule_add_args(program: &str) -> Vec<String> {
@@ -33,7 +33,7 @@ pub(crate) fn remote_access_rule_add_args(program: &str) -> Vec<String> {
 
 #[must_use]
 #[cfg_attr(
-    not(windows),
+    all(not(windows), not(test)),
     expect(dead_code, reason = "Windows-only firewall command")
 )]
 pub(crate) fn remote_access_rule_delete_args() -> Vec<String> {
@@ -47,10 +47,6 @@ pub(crate) fn remote_access_rule_delete_args() -> Vec<String> {
 }
 
 #[cfg(windows)]
-#[expect(
-    dead_code,
-    reason = "used by the exposure bridge in the next implementation task"
-)]
 pub(crate) async fn sync_remote_access_rule(enabled: bool) -> Result<(), String> {
     let _ = run_netsh(remote_access_rule_delete_args()).await;
     if !enabled {
@@ -83,10 +79,6 @@ async fn run_netsh(args: Vec<String>) -> Result<std::process::Output, String> {
 }
 
 #[cfg(not(windows))]
-#[expect(
-    dead_code,
-    reason = "used by the exposure bridge in the next implementation task"
-)]
 pub(crate) async fn sync_remote_access_rule(_enabled: bool) -> Result<(), String> {
     Ok(())
 }

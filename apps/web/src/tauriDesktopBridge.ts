@@ -540,12 +540,10 @@ function createTauriDesktopBridge(
         undefined,
         defaultServerExposureState,
       ),
-    setServerExposureMode: (mode) =>
-      tauriInvokeOr<DesktopServerExposureState>(
-        "desktop_bridge_set_server_exposure_mode",
-        { mode },
-        defaultServerExposureState,
-      ),
+    applyServerExposure: (desired) =>
+      tauriInvokeDesktop<DesktopServerExposureState>("desktop_bridge_apply_server_exposure", {
+        desired,
+      }),
     setTailscaleServeEnabled: (input) =>
       tauriInvokeOr<DesktopServerExposureState>(
         "desktop_bridge_set_tailscale_serve_enabled",

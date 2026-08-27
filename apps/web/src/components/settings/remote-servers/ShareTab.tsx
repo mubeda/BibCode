@@ -1231,7 +1231,7 @@ export function ShareTab() {
       setIsUpdatingDesktopServerExposure(true);
       setDesktopServerExposureMutationError(null);
       try {
-        await desktopBridge.setServerExposureMode(checked ? "network-accessible" : "local-only");
+        await desktopBridge.applyServerExposure(checked ? "network-accessible" : "local-only");
         refreshDesktopNetworkAccessState();
         setIsDesktopServerExposureDialogOpen(false);
         setIsUpdatingDesktopServerExposure(false);
