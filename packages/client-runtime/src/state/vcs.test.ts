@@ -61,6 +61,7 @@ function session(client: WsRpcProtocolClient, summaryCapability: boolean | undef
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
   };
 }
 

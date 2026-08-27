@@ -74,6 +74,7 @@ const PREPARED_CONNECTION: PreparedConnection = {
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws",
   httpAuthorization: null,
+  e2ee: null,
   target: TARGET,
 };
 
@@ -182,6 +183,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
         ready: options?.ready?.(attempt) ?? Effect.void,
         probe: options?.probe?.(attempt) ?? Effect.void,
         closed: Deferred.await(closed),
+        e2eeAuthenticated: Effect.succeed(null),
       } satisfies RpcSession.RpcSession),
       () => Ref.update(releaseCount, (count) => count + 1),
     );
@@ -286,6 +288,7 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
               ready: Effect.void,
               probe: Effect.void,
               closed: Effect.never,
+              e2eeAuthenticated: Effect.succeed(null),
             } satisfies RpcSession.RpcSession),
             () => Ref.update(sessionReleaseCount, (count) => count + 1),
           ),

@@ -62,6 +62,7 @@ function prepared(
     httpBaseUrl: connectionTarget.httpBaseUrl,
     socketUrl: `${connectionTarget.wsBaseUrl}/ws`,
     httpAuthorization: null,
+    e2ee: null,
     target: connectionTarget,
   };
 }
@@ -187,6 +188,7 @@ const makeDriver = Effect.fn("TestConnectionDriver.make")(function* (
             ready: Effect.void,
             probe: Effect.void,
             closed: Effect.never,
+            e2eeAuthenticated: Effect.succeed(null),
           } satisfies RpcSession),
         ),
         () => Ref.update(sessionReleaseCount, (count) => count + 1),

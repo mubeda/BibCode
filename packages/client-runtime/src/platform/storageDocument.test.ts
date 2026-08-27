@@ -36,6 +36,7 @@ const BEARER_PROFILE = new BearerConnectionProfile({
   label: BEARER_TARGET.label,
   httpBaseUrl: "https://remote.example.test",
   wsBaseUrl: "wss://remote.example.test",
+  hostKey: null,
 });
 const BEARER_CREDENTIAL = new BearerConnectionCredential({
   token: "bearer-token",
@@ -53,8 +54,22 @@ const REMOTE_TOKEN = new TokenStore.RemoteDpopAccessToken({
   dpopThumbprint: "thumbprint",
 });
 const decodeConnectionCatalogDocument = Schema.decodeUnknownSync(ConnectionCatalogDocument);
+const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 describe("ConnectionCatalogDocument", () => {
+  it("decodes legacy bearer profiles without hostKey to null", () => {
+    const decoded = decodeBearerConnectionProfile({
+      _tag: "BearerConnectionProfile",
+      connectionId: "bearer:env-1",
+      environmentId: "env-1",
+      label: "Legacy",
+      httpBaseUrl: "http://192.168.1.20:3773/",
+      wsBaseUrl: "ws://192.168.1.20:3773/",
+    });
+
+    expect(decoded.hostKey).toBeNull();
+  });
+
   it("decodes a schema-v1 document without accepted storage identities", () => {
     const oldDocument = {
       schemaVersion: 1,

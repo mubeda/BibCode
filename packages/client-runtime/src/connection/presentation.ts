@@ -30,6 +30,34 @@ export interface EnvironmentPresentation {
   readonly serverConfig: ServerConfig | null;
 }
 
+export type ConnectionTransportSecurity = "local" | "e2ee" | "channel-secured" | "unencrypted";
+
+// Mirrors DESKTOP_LOCAL_CONNECTION_ID_PREFIX in apps/web/src/connection/desktopLocal.ts.
+const DESKTOP_LOCAL_CONNECTION_ID_PREFIX = "local:";
+
+export function connectionTransportSecurity(
+  entry: ConnectionCatalogEntry,
+): ConnectionTransportSecurity {
+  switch (entry.target._tag) {
+    case "PrimaryConnectionTarget":
+    case "UnavailableConnectionTarget":
+      return "local";
+    case "RelayConnectionTarget":
+    case "SshConnectionTarget":
+      return "channel-secured";
+    case "BearerConnectionTarget": {
+      if (entry.target.connectionId.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX)) {
+        return "local";
+      }
+      const profile =
+        Option.isSome(entry.profile) && entry.profile.value._tag === "BearerConnectionProfile"
+          ? entry.profile.value
+          : null;
+      return profile?.hostKey != null ? "e2ee" : "unencrypted";
+    }
+  }
+}
+
 export function presentConnectionState(
   state: SupervisorConnectionState,
 ): EnvironmentConnectionPresentation {

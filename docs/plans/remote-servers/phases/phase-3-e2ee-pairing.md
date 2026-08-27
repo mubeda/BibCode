@@ -4305,7 +4305,7 @@ export function e2eeSocketUrl(wsBaseUrl: string): string; // pure: pathname -> /
 
 **No plaintext credential round-trips for hostKey targets (amended spec §4.3):** when `hostKey` is present, `authorizeBearer` performs **only** the unauthenticated descriptor fetch (routing hint); it must NOT call `/oauth/token` or `/api/auth/websocket-ticket`. The stored bearer credential rides inside the channel as `e2ee_auth`'s bearer form. Phase 4 renders `connectionTransportSecurity`; Task 13 consumes everything.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 1. **Profile decode-default** (find the existing decode assertions for `BearerConnectionProfile`/catalog documents — `packages/client-runtime/src/platform/storageDocument.test.ts` and/or `apps/web/src/connection/storage.test.ts` — and add):
 
@@ -4344,12 +4344,12 @@ describe("connectionTransportSecurity", () => {
 
 (Local desktop-managed bearer targets — connection ids with the `local:` prefix, `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` — classify as `"local"`, not `"unencrypted"`: they are loopback by construction. Import the prefix constant or match on the id prefix string; check `apps/web/src/connection/desktopLocal.ts` for the exported name and, since that constant lives in the web app, hard-code the `"local:"` prefix in client-runtime with a comment pointing at the desktop-local module.)
 
-- [ ] **Step 2: Run to verify failures**
+- [x] **Step 2: Run to verify failures**
 
 Run (from `packages/client-runtime`): `vp test run src/connection/resolver.test.ts src/rpc/session.test.ts src/connection/presentation.test.ts`
 Expected: FAIL (missing fields/exports).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `model.ts`:
 
@@ -4487,12 +4487,12 @@ export function connectionTransportSecurity(
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run (from `packages/client-runtime`): `vp test run src/connection src/rpc src/authorization` and (from `apps/web`) `vp test run src/connection/storage.test.ts`
 Expected: PASS, including all pre-existing suites (the `e2ee: null` additions must not disturb them).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src apps/web/src/connection/storage.test.ts

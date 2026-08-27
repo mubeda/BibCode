@@ -137,6 +137,7 @@ function registryLayer(options?: {
         ready: Effect.void,
         probe: Effect.void,
         closed: Effect.never,
+        e2eeAuthenticated: Effect.succeed(null),
       };
       const target = new PrimaryConnectionTarget({
         environmentId: EnvironmentId.make(TARGET.environmentId),

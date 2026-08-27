@@ -133,6 +133,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
             _tag: "Bearer" as const,
             token: input.bearerToken,
           },
+          e2ee: null,
         })),
     authorizeDpop:
       options?.authorizeDpop ??
@@ -148,6 +149,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
               _tag: "Dpop" as const,
               accessToken: "dpop-access-token",
             },
+            e2ee: null,
           }),
         )),
   });
@@ -243,6 +245,7 @@ describe("ConnectionResolver", () => {
         httpBaseUrl: "http://127.0.0.1:3777",
         socketUrl: "ws://127.0.0.1:3777/ws",
         httpAuthorization: null,
+        e2ee: null,
         target,
       });
     }),
@@ -265,6 +268,7 @@ describe("ConnectionResolver", () => {
                 _tag: "Bearer" as const,
                 token: input.bearerToken,
               },
+              e2ee: null,
             }),
           ),
       });
@@ -300,6 +304,7 @@ describe("ConnectionResolver", () => {
         label: "Saved",
         httpBaseUrl: ENDPOINT.httpBaseUrl,
         wsBaseUrl: ENDPOINT.wsBaseUrl,
+        hostKey: null,
       });
       const brokerLayer = yield* makeDependencies({
         credentials: [["saved-1", new BearerConnectionCredential({ token: "secret-bearer" })]],
@@ -315,6 +320,7 @@ describe("ConnectionResolver", () => {
                 _tag: "Bearer" as const,
                 token: input.bearerToken,
               },
+              e2ee: null,
             }),
           ),
       });
@@ -322,8 +328,59 @@ describe("ConnectionResolver", () => {
 
       const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
       expect(prepared.socketUrl).toContain("wsTicket=ticket");
+      expect(prepared.e2ee).toBeNull();
       expect(prepared.descriptor).toEqual(DESCRIPTOR);
       expect(yield* Ref.get(bearerInputs)).toEqual(["secret-bearer"]);
+    }),
+  );
+
+  it.effect("selects the E2EE channel for a host-key bearer profile", () =>
+    Effect.gen(function* () {
+      const hostKey = "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM";
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Pinned",
+        connectionId: "saved-e2ee",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: target.connectionId,
+        environmentId: ENVIRONMENT_ID,
+        label: target.label,
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+        hostKey,
+      });
+      const brokerLayer = yield* makeDependencies({
+        credentials: [
+          [target.connectionId, new BearerConnectionCredential({ token: "stored-secret" })],
+        ],
+        authorizeBearer: (input) =>
+          Effect.succeed({
+            descriptor: DESCRIPTOR,
+            environmentId: input.expectedEnvironmentId,
+            label: target.label,
+            httpBaseUrl: input.httpBaseUrl,
+            socketUrl: "wss://environment.example.test/ws-e2ee",
+            httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            e2ee:
+              input.hostKey === null || input.hostKey === undefined
+                ? null
+                : {
+                    hostKey: input.hostKey,
+                    auth: { kind: "bearer" as const, credential: input.bearerToken },
+                  },
+          }),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+      expect(prepared.socketUrl).toBe("wss://environment.example.test/ws-e2ee");
+      expect(new URL(prepared.socketUrl).search).toBe("");
+      expect(prepared.e2ee).toEqual({
+        hostKey,
+        auth: { kind: "bearer", credential: "stored-secret" },
+      });
     }),
   );
 
@@ -371,6 +428,7 @@ describe("ConnectionResolver", () => {
                 _tag: "Dpop" as const,
                 accessToken: "dpop-access-token",
               },
+              e2ee: null,
             }),
           ),
       });

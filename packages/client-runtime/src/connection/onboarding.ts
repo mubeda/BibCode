@@ -111,6 +111,7 @@ export const preparePairingRegistration = Effect.fn(
       label: descriptor.label,
       httpBaseUrl: target.httpBaseUrl,
       wsBaseUrl: target.wsBaseUrl,
+      hostKey: null,
     }),
     credential: new BearerConnectionCredential({
       token: access.access_token,
@@ -205,6 +206,7 @@ export const prepareBearerConnectionUpdate = Effect.fn(
       label,
       httpBaseUrl,
       wsBaseUrl: deriveWsBaseUrl(httpBaseUrl),
+      hostKey: entry.profile.value.hostKey,
     }),
     credential: credential.value,
   });

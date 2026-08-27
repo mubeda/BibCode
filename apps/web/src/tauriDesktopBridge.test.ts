@@ -316,6 +316,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
     httpBaseUrl: "https://private.example.test/secret-path",
     socketUrl: "wss://private.example.test/secret-path/ws",
     httpAuthorization: null,
+    e2ee: null,
     target,
   };
 }

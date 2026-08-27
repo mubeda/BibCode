@@ -1,6 +1,8 @@
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
+import type { E2eeAuthRequest } from "../e2ee/socket.ts";
+
 const ConnectionTargetBase = {
   environmentId: EnvironmentId,
   label: Schema.String,
@@ -86,6 +88,7 @@ export type ConnectionTransientReason = typeof ConnectionTransientReason.Type;
 export const ConnectionBlockedReason = Schema.Literals([
   "authentication",
   "configuration",
+  "host-identity",
   "permission",
   "recovery-required",
   "storage-changed",
@@ -149,6 +152,11 @@ export type PreparedHttpAuthorization =
       readonly accessToken: string;
     };
 
+export interface PreparedE2eeChannel {
+  readonly hostKey: string;
+  readonly auth: E2eeAuthRequest;
+}
+
 export interface PreparedConnection {
   readonly environmentId: EnvironmentId;
   readonly label: string;
@@ -156,6 +164,7 @@ export interface PreparedConnection {
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;
+  readonly e2ee: PreparedE2eeChannel | null;
   readonly target: ConnectionTarget;
 }
 
