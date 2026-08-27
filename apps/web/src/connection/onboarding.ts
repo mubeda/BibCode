@@ -26,6 +26,20 @@ export const connectPairing = createRuntimeCommand(connectionAtomRuntime, {
     ConnectionOnboarding.pipe(Effect.flatMap((onboarding) => onboarding.registerPairing(input))),
 });
 
+export const connectRemoteServer = createRuntimeCommand(connectionAtomRuntime, {
+  label: "web:connection:connect-remote-server",
+  scheduler: onboardingScheduler,
+  concurrency: {
+    mode: "singleFlight",
+    key: (input: { readonly code: string; readonly allowLoopbackTunnel?: boolean }) =>
+      `${input.allowLoopbackTunnel === true ? "ack" : "raw"}:${input.code}`,
+  },
+  execute: (input: { readonly code: string; readonly allowLoopbackTunnel?: boolean }) =>
+    ConnectionOnboarding.pipe(
+      Effect.flatMap((onboarding) => onboarding.verifyAndAddPairingCode(input)),
+    ),
+});
+
 export const connectSshEnvironment = createRuntimeCommand(connectionAtomRuntime, {
   label: "web:connection:connect-ssh",
   scheduler: onboardingScheduler,

@@ -1806,7 +1806,7 @@ detail }` (the five spec-pinned reasons live on **`reason`**),
   Phase 6's "Add server…" rail entry reuse it); ConnectTab props gain
   `initialPairingCode?: string | null` (consumed by Task 8).
 
-- [ ] **Step 1: Write the failing tests** (in `ConnectTab.test.tsx`; extend the harness's
+- [x] **Step 1: Write the failing tests** (in `ConnectTab.test.tsx`; extend the harness's
       `~/connection/onboarding` mock with `connectRemoteServer: h.atoms.connectRemoteServer` and a
       `h.commands.connectRemoteServer` mock, mirroring how `connectPairing` is mocked)
 
@@ -1906,12 +1906,12 @@ old suite; `h.decodedPairingCode` backs a harness `vi.mock` of
 `@bibcode/shared/pairingCode` whose `parsePairingCode` returns the value (or throws when it
 is `null`) so the loopback case does not need a real base64url payload.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 Expected: FAIL — `connectRemoteServer` mock unused, new dialog strings absent.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Atom command (mirrors the existing `connectPairing` shape exactly):
 
@@ -2069,13 +2069,13 @@ move under this expander **unchanged** (this is the preserved
    `RemoteServersSettings` forwards it (`<ConnectTab initialPairingCode={initialPairingCode} />`,
    new optional prop on the shell, default `null`).
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx apps/web/src/components/settings/remote-servers/RemoteServersSettings.test.tsx`
 Expected: PASS (existing SSH-mode and manual-path cases still green — the manual path's
 assertions now go through the Advanced expander's pinned open state via the harness override).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/connection/onboarding.ts apps/web/src/components/settings/remote-servers

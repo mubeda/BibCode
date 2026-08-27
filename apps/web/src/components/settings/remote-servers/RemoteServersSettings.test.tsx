@@ -3,7 +3,14 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-vi.mock("./ConnectTab", () => ({ ConnectTab: () => <div data-testid="connect-tab" /> }));
+const connectTabProps = vi.hoisted(() => vi.fn());
+
+vi.mock("./ConnectTab", () => ({
+  ConnectTab: (props: unknown) => {
+    connectTabProps(props);
+    return <div data-testid="connect-tab" />;
+  },
+}));
 vi.mock("./ShareTab", () => ({ ShareTab: () => <div data-testid="share-tab" /> }));
 
 import { RemoteServersSettings } from "./RemoteServersSettings";
@@ -31,6 +38,13 @@ describe("RemoteServersSettings", () => {
   it("honors initialTab=share so deep links can land on the Share tab", async () => {
     const { container, cleanup } = await render(<RemoteServersSettings initialTab="share" />);
     expect(container.querySelector('[data-testid="share-tab"]')).not.toBeNull();
+    await cleanup();
+  });
+
+  it("forwards an initial pairing code to the Connect tab", async () => {
+    connectTabProps.mockClear();
+    const { cleanup } = await render(<RemoteServersSettings initialPairingCode="abc123" />);
+    expect(connectTabProps).toHaveBeenCalledWith({ initialPairingCode: "abc123" });
     await cleanup();
   });
 });
