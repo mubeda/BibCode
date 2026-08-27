@@ -377,7 +377,12 @@ profile.
 Capture original-resolution screenshots at normal and minimum supported window
 sizes. Cover relevant:
 
-- Add Project and environment presentation;
+- Add Project and environment presentation, including the left-panel environment
+  rail (Local entry with its WSL sub-picker where applicable, saved-server
+  entries with status dots, the add/manage affordances) and the environment
+  context card with its ⋯ menu when a remote environment is selected—verifying
+  that switching rail selection filters the projects panel without interrupting
+  running sessions on other environments;
 - provider settings and provider/terminal action menus;
 - discovered and adopted external worktrees;
 - Create Worktree exact local and remote ref selection: the exact value appears

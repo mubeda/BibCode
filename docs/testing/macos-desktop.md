@@ -45,7 +45,9 @@ Select focused tests from affected source and verify at least:
 - Unix process-group ownership survives cancellation and natural leader exit,
   reaps late descendants, does not signal peer-runtime roots, and remains
   independent of the Windows-only Job implementation;
-- local-only desktop presentation omits WSL and remote-device controls;
+- Local desktop presentation omits WSL controls while saved remote environments
+  remain selectable in the environment rail without bypassing desktop-owned
+  connection controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
 - Activity observation timestamps and keyboard navigation remain correct; and
 - update protection treats long-lived read subscriptions as reads, reports
@@ -186,14 +188,17 @@ Use Codex Computer Use to operate the packaged executable. Confirm the
 executable path and PID before using any frame as evidence. At normal and
 minimum sizes verify:
 
-- Add Project has no Host selector or remote-device choice for the local Mac;
+- when only the local Mac environment is configured, the rail shows Local and
+  Add Project has no remote target; saved remote environments appear as separate
+  rail entries and become the Add Project target when selected;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
   an **Another device** offer, verify the restart completes before the browser
   URL, deep link, pairing code, and QR code appear, then revoke the last
   off-host offer or client and verify exposure returns to loopback.
-  Add Project still has no Host selector for the local machine;
+  the local-machine flow still has no Host selector; remote targeting is driven
+  by the environment rail;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running lands on Add Server with the code prefilled. The
   custom scheme is bundle-time-only on macOS and is not an unbundled dev-mode

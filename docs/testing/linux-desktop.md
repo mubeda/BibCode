@@ -47,7 +47,9 @@ Select focused tests from affected source and verify at least:
   natural root exit, and late descendants, independently of the Windows-only
   Job implementation;
 - independent runtimes cannot terminate each other's process roots;
-- local-only desktop presentation omits WSL and remote-device controls;
+- Local desktop presentation omits WSL controls while saved remote environments
+  remain selectable in the environment rail without bypassing desktop-owned
+  connection controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
 - update protection treats long-lived read subscriptions as reads, reports
   staged progress and active mutation counts while preparing, rejects a forged
@@ -145,15 +147,17 @@ Use Codex Computer Use to operate the packaged executable. Capture the actual
 X11/Wayland and desktop environment in the report. At normal and minimum sizes
 verify:
 
-- Add Project has no Host selector or remote-device choice when only the local
-  Linux environment is supported;
+- when only the local Linux environment is configured, the rail shows Local and
+  Add Project has no remote target; saved remote environments appear as separate
+  rail entries and become the Add Project target when selected;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
   grant-driven sharing appears because the desktop bridge is present. Generate
   an **Another device** offer, verify the restart completes before the browser
   URL, deep link, pairing code, and QR code appear, then revoke the last
   off-host offer or client and verify exposure returns to loopback.
-  Add Project still has no Host selector for the local machine;
+  the local-machine flow still has no Host selector; remote targeting is driven
+  by the environment rail;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
   the code prefilled;
