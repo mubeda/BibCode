@@ -443,6 +443,16 @@ the resolver rejects connection attempts before creating a transport or
 session. Explicit disable or distro replacement is what removes that desired
 identity and clears its environment cache.
 
+## Grant-driven desktop exposure
+
+Native wildcard binds now occur exclusively through the **Share this host**
+offer ceremony. The renderer widens through the verified
+`desktop_bridge_apply_server_exposure` operation only when minting an off-host
+grant, and a narrow-only app-level reconciler restores loopback after the final
+off-host grant is revoked. The previous manual network-access toggle is gone;
+the server's persisted grant metadata is the policy source of truth and the
+desktop exposure setting is its restart-time cache.
+
 ## Desktop update protection
 
 The Tauri host coordinates update installation across the complete local

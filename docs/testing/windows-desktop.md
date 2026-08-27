@@ -317,8 +317,23 @@ Windows DPI states. Verify:
   empty;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
-  share-side exposure controls appear because the desktop bridge is present.
+  grant-driven sharing appears because the desktop bridge is present.
   Add Project still has no remote Host selector beyond this-device WSL choices;
+- in **Settings → Remote Servers → Share this host**, generate an **Another
+  device** offer. Confirm the local server restarts before the pairing offer is
+  shown, and that the result contains the browser URL, `bibcode://` deep link,
+  pairing code, and QR code. Then inspect the firewall rule:
+
+  ```powershell
+  netsh advfirewall firewall show rule name="BiBCode Remote Access"
+  ```
+
+  Confirm it is enabled, program-scoped to the exact packaged executable,
+  TCP-only, and limited to Domain/Private profiles. Revoke the last off-host
+  offer or paired client, verify exposure returns to loopback, and confirm the
+  named rule is absent. Record an elevation or policy denial as failed native
+  evidence; do not substitute a manually created rule;
+
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
   the code prefilled;

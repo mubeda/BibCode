@@ -188,7 +188,10 @@ using any frame as evidence. At normal and minimum sizes verify:
 - Add Project has no Host selector or remote-device choice for the local Mac;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this
   host** tabs; `/settings/connections` redirects there. SSH discovery and
-  share-side exposure controls appear because the desktop bridge is present.
+  grant-driven sharing appears because the desktop bridge is present. Generate
+  an **Another device** offer, verify the restart completes before the browser
+  URL, deep link, pairing code, and QR code appear, then revoke the last
+  off-host offer or client and verify exposure returns to loopback.
   Add Project still has no Host selector for the local machine;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running lands on Add Server with the code prefilled. The
