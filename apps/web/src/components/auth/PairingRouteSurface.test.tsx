@@ -287,6 +287,22 @@ describe("PairingRouteSurface markup", () => {
 });
 
 describe("PairingRouteSurface auto-submit effect", () => {
+  it("auto-submits an embedded pairing-code credential", async () => {
+    const onAuthenticated = vi.fn();
+    render(
+      <PairingRouteSurface
+        auth={auth([])}
+        initialCredential="embedded-token"
+        onAuthenticated={onAuthenticated}
+      />,
+    );
+
+    harness.runEffects();
+    expect(testState.submit).toHaveBeenCalledWith("embedded-token");
+    await flush();
+    expect(onAuthenticated).toHaveBeenCalledTimes(1);
+  });
+
   it("auto-submits a peeked token and authenticates on success", async () => {
     testState.pairingToken = "auto-token";
     const onAuthenticated = vi.fn();

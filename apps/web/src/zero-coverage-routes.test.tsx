@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
   restore: vi.fn(),
   restoreLabels: [] as string[],
   routeContext: {} as Record<string, unknown>,
+  routeSearch: {} as Record<string, unknown>,
   serverThread: null as Record<string, unknown> | null,
 }));
 
@@ -35,6 +36,7 @@ vi.mock("@tanstack/react-router", () => ({
     ...options,
     path,
     useRouteContext: () => h.routeContext,
+    useSearch: () => h.routeSearch,
   }),
   redirect: (options: unknown) => ({ _tag: "Redirect", options }),
   useCanGoBack: () => h.canGoBack,
@@ -206,6 +208,7 @@ beforeEach(() => {
   h.restore.mockReset();
   h.restoreLabels = [];
   h.routeContext = {};
+  h.routeSearch = {};
   h.serverThread = null;
   h.lease.present.mockReset();
   h.lease.release.mockReset();

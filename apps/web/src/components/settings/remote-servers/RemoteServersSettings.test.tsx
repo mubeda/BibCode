@@ -43,8 +43,17 @@ describe("RemoteServersSettings", () => {
 
   it("forwards an initial pairing code to the Connect tab", async () => {
     connectTabProps.mockClear();
-    const { cleanup } = await render(<RemoteServersSettings initialPairingCode="abc123" />);
-    expect(connectTabProps).toHaveBeenCalledWith({ initialPairingCode: "abc123" });
+    const onPairingCodeConsumed = vi.fn();
+    const { cleanup } = await render(
+      <RemoteServersSettings
+        initialPairingCode="abc123"
+        onPairingCodeConsumed={onPairingCodeConsumed}
+      />,
+    );
+    expect(connectTabProps).toHaveBeenCalledWith({
+      initialPairingCode: "abc123",
+      onPairingCodeConsumed,
+    });
     await cleanup();
   });
 });

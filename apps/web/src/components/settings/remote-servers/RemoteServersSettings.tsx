@@ -10,9 +10,11 @@ export type RemoteServersTab = "connect" | "share";
 export function RemoteServersSettings({
   initialTab = "connect",
   initialPairingCode = null,
+  onPairingCodeConsumed,
 }: {
   readonly initialTab?: RemoteServersTab;
   readonly initialPairingCode?: string | null;
+  readonly onPairingCodeConsumed?: () => void;
 }) {
   const [tab, setTab] = useState<RemoteServersTab>(initialTab);
   return (
@@ -23,7 +25,10 @@ export function RemoteServersSettings({
           <TabsTab value="share">Share this host</TabsTab>
         </TabsList>
         <TabsPanel value="connect">
-          <ConnectTab initialPairingCode={initialPairingCode} />
+          <ConnectTab
+            initialPairingCode={initialPairingCode}
+            {...(onPairingCodeConsumed === undefined ? {} : { onPairingCodeConsumed })}
+          />
         </TabsPanel>
         <TabsPanel value="share">
           <ShareTab />

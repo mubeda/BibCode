@@ -655,20 +655,20 @@ function render(
   return renderToStaticMarkup(node);
 }
 
-async function mountConnections(): Promise<HTMLDivElement> {
+async function mountConnections(
+  node: ReactElement = (
+    <>
+      <ConnectTab />
+      <ShareTab />
+    </>
+  ),
+): Promise<HTMLDivElement> {
   clearRegistries();
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   mountedTrees.push({ container, root });
-  await act(async () =>
-    root.render(
-      <>
-        <ConnectTab />
-        <ShareTab />
-      </>,
-    ),
-  );
+  await act(async () => root.render(node));
   return container;
 }
 
@@ -1524,6 +1524,18 @@ describe("Remote Servers tabs", () => {
       expect(markup).toContain("SSH");
       expect(markup).toContain("Advanced");
       expect(markup).toContain("Troubleshooting");
+    });
+
+    it("consumes an initial pairing code when its prefilled dialog closes", async () => {
+      stubBrowserWindow();
+      const onPairingCodeConsumed = vi.fn();
+      await mountConnections(
+        <ConnectTab initialPairingCode="abc123" onPairingCodeConsumed={onPairingCodeConsumed} />,
+      );
+      await act(async () => {
+        invoke(findControls("dialog", "true").at(-1)!, "onOpenChange", false);
+      });
+      expect(onPairingCodeConsumed).toHaveBeenCalledTimes(1);
     });
   });
 

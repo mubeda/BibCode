@@ -2216,7 +2216,7 @@ distinct outcomes pinned by amended spec §4.2:
   `apps/web/src/components/auth/pairingCodeCredential.ts`;
   `PairingRouteSurface` prop `initialCredential?: string`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```tsx
 // apps/web/src/routes/pair.test.tsx
@@ -2331,12 +2331,12 @@ it("forwards the code search param as the initial pairing code", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `vp test run apps/web/src/routes/pair.test.tsx apps/web/src/routes/settings.remote-servers.test.tsx`
 Expected: FAIL — `/pair` has no `validateSearch`; forwarding not implemented.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `pair.tsx` changes:
 
@@ -2454,7 +2454,7 @@ function RemoteServersRouteView() {
 `onPairingCodeConsumed?: () => void`, forwarding both to `ConnectTab`; `ConnectTab` calls
 `onPairingCodeConsumed` when the prefilled dialog closes (add-success or cancel).
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run:
 
@@ -2468,7 +2468,7 @@ vp test run apps/web/src/routes/pair.test.tsx \
 
 Expected: PASS. Route tree regenerates as in Task 4 (commit `routeTree.gen.ts` if changed).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/routes apps/web/src/components/auth \

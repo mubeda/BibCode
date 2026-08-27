@@ -40,14 +40,18 @@ export function PairingPendingSurface() {
 
 export function PairingRouteSurface({
   auth,
+  initialCredential,
   initialErrorMessage,
   onAuthenticated,
 }: {
   auth: AuthSessionState["auth"];
+  initialCredential?: string;
   initialErrorMessage?: string;
   onAuthenticated: () => void;
 }) {
-  const autoPairTokenRef = useRef<string | null>(peekPairingTokenFromUrl());
+  const autoPairTokenRef = useRef<string | null>(
+    peekPairingTokenFromUrl() ?? initialCredential ?? null,
+  );
   const [credential, setCredential] = useState(() => autoPairTokenRef.current ?? "");
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
