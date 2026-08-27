@@ -17,6 +17,7 @@ import {
   AuthCreatePairingOfferInput,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -85,6 +86,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "websocket_ticket_issuance_failed",
   "pairing_credential_issuance_failed",
   "pairing_offer_issuance_failed",
+  "share_state_load_failed",
   "pairing_links_load_failed",
   "pairing_link_revoke_failed",
   "client_sessions_load_failed",
@@ -394,6 +396,13 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       payload: AuthCreatePairingOfferInput,
       success: AuthPairingOfferResult,
       error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("shareState", "/api/auth/share-state", {
+      headers: OptionalBearerHeaders,
+      success: AuthShareStateResult,
+      error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(

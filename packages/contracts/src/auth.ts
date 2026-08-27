@@ -218,6 +218,13 @@ export const AuthPairingOfferResult = Schema.Struct({
 });
 export type AuthPairingOfferResult = typeof AuthPairingOfferResult.Type;
 
+export const AuthShareStateResult = Schema.Struct({
+  desiredExposure: Schema.Literals(["wide", "loopback"]),
+  offHostGrantCount: Schema.Number,
+  legacyGrantCount: Schema.Number,
+});
+export type AuthShareStateResult = typeof AuthShareStateResult.Type;
+
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,

@@ -24,6 +24,7 @@ import {
   AuthAccessTokenType,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -60,6 +61,7 @@ const authRouteNames = [
   "webSocketTicket",
   "pairingCredential",
   "pairingOffer",
+  "shareState",
   "pairingLinks",
   "revokePairingLink",
   "clients",
@@ -196,6 +198,7 @@ const namedSchemas = {
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
@@ -339,6 +342,11 @@ addJsonFixture("responses/pairing-offer.json", AuthPairingOfferResult, {
   name: "AI-SERVER",
   expiresAt: "2026-08-27T01:00:00.000Z",
 });
+addJsonFixture("responses/share-state.json", AuthShareStateResult, {
+  desiredExposure: "loopback",
+  offHostGrantCount: 0,
+  legacyGrantCount: 1,
+});
 addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
   {
     id: pairingId,
@@ -461,6 +469,7 @@ const samples = {
     request: "requests/pairing-offer.json",
     success: "responses/pairing-offer.json",
   },
+  shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {
     request: "requests/pairing-revoke.json",

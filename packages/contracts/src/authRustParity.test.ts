@@ -22,6 +22,7 @@ import {
   AuthEnvironmentScopes,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -98,6 +99,14 @@ const authRouteContract = [
     requestContentTypes: ["application/json"],
     successStatuses: [200],
     errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "shareState",
+    method: "GET",
+    path: "/api/auth/share-state",
+    requestContentTypes: [],
+    successStatuses: [200],
+    errorStatuses: [401, 403, 500],
   },
   {
     name: "pairingLinks",
@@ -317,6 +326,7 @@ const namedSchemas = {
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
@@ -375,6 +385,7 @@ const expectedSamples = {
     request: "requests/pairing-offer.json",
     success: "responses/pairing-offer.json",
   },
+  shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {
     request: "requests/pairing-revoke.json",
@@ -409,6 +420,7 @@ const expectedFixtures = [
   "responses/pairing-offer.json",
   "responses/pairing-revoke.json",
   "responses/session.json",
+  "responses/share-state.json",
   "responses/token.json",
   "responses/websocket-ticket.json",
   "scopes.json",
@@ -468,6 +480,10 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLinkRevokeResult)),
   ],
   ["responses/session.json", Schema.decodeUnknownSync(Schema.toCodecJson(AuthSessionState))],
+  [
+    "responses/share-state.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthShareStateResult)),
+  ],
   ["responses/token.json", Schema.decodeUnknownSync(Schema.toCodecJson(AuthAccessTokenResult))],
   [
     "responses/websocket-ticket.json",
@@ -514,7 +530,7 @@ describe("Rust auth HTTP fixture parity", () => {
     const manifest = JSON.parse(NodeFS.readFileSync(manifestPath, "utf8")) as Manifest;
     expect(manifest.formatVersion).toBe(1);
     expect(manifest.routes).toEqual(currentRoutes());
-    expect(manifest.routes).toHaveLength(11);
+    expect(manifest.routes).toHaveLength(12);
     expect(
       manifest.routes.map(({ name, method, path, requestContentTypes, successes, errors }) => ({
         name,
