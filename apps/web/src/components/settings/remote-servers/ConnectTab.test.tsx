@@ -63,6 +63,7 @@ const h = vi.hoisted(() => {
     },
     environments: [] as unknown[],
     threadShells: [] as unknown[],
+    decodedPairingCode: null as null | Record<string, unknown>,
     compatVerdicts: new Map<string, unknown>(),
     primaryEnvironment: null as unknown,
     relayDiscovery: {
@@ -116,6 +117,7 @@ const h = vi.hoisted(() => {
       desktopSshHosts: Symbol("desktopSshHostsStateAtom"),
       desktopWsl: Symbol("desktopWslStateAtom"),
       connectPairing: Symbol("connectPairing"),
+      connectRemoteServer: Symbol("connectRemoteServer"),
       connectSsh: Symbol("connectSshEnvironment"),
       catalogRegister: Symbol("environmentCatalog.register"),
       catalogConnect: Symbol("environmentCatalog.connect"),
@@ -128,6 +130,7 @@ const h = vi.hoisted(() => {
     },
     commands: {
       connectPairing: vi.fn(),
+      connectRemoteServer: vi.fn(),
       connectSsh: vi.fn(),
       register: vi.fn(),
       connect: vi.fn(),
@@ -306,7 +309,20 @@ vi.mock("~/connection/catalog", () => ({
 
 vi.mock("~/connection/onboarding", () => ({
   connectPairing: h.atoms.connectPairing,
+  connectRemoteServer: h.atoms.connectRemoteServer,
   connectSshEnvironment: h.atoms.connectSsh,
+}));
+
+vi.mock("@bibcode/shared/pairingCode", () => ({
+  parsePairingCode: () => {
+    if (h.decodedPairingCode === null) throw new Error("invalid pairing code");
+    return h.decodedPairingCode;
+  },
+}));
+
+vi.mock("@bibcode/shared/advertisedEndpoint", () => ({
+  classifyPairingEndpoint: (endpoint: string) =>
+    endpoint.includes("127.0.0.1") || endpoint.includes("localhost") ? "loopback" : "public",
 }));
 
 vi.mock("~/state/query", () => ({
@@ -351,6 +367,7 @@ vi.mock("~/state/relay", () => ({
 vi.mock("../../../state/use-atom-command", () => ({
   useAtomCommand: (atom: unknown) => {
     if (atom === h.atoms.connectPairing) return h.commands.connectPairing;
+    if (atom === h.atoms.connectRemoteServer) return h.commands.connectRemoteServer;
     if (atom === h.atoms.connectSsh) return h.commands.connectSsh;
     if (atom === h.atoms.catalogRegister) return h.commands.register;
     if (atom === h.atoms.catalogConnect) return h.commands.connect;
@@ -544,7 +561,11 @@ vi.mock("../../ui/tooltip", () => ({
 
 vi.mock("../../ui/textarea", () => ({
   Textarea: (props: AnyProps) => {
-    h.controls.push({ kind: "textarea", label: String(props.value), props });
+    h.controls.push({
+      kind: "textarea",
+      label: (props.placeholder as string | undefined) ?? String(props.value),
+      props,
+    });
     return <textarea readOnly defaultValue={props.value as string | undefined} />;
   },
 }));
@@ -580,6 +601,12 @@ vi.mock("../../ui/group", () => ({
 
 vi.mock("../../AnimatedHeight", () => ({
   AnimatedHeight: (props: AnyProps) => <div data-animated>{props.children as ReactNode}</div>,
+}));
+
+vi.mock("../../ui/collapsible", () => ({
+  Collapsible: (props: AnyProps) => <div data-collapsible>{props.children as ReactNode}</div>,
+  CollapsibleTrigger: (props: AnyProps) => <button>{props.children as ReactNode}</button>,
+  CollapsibleContent: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
 }));
 
 import { ConnectTab } from "./ConnectTab";
@@ -673,9 +700,9 @@ function invoke(entry: CapturedControl, handlerName: string, ...args: unknown[])
 
 /** Click the first button with the given label that actually has an onClick handler. */
 function clickButton(label: string): void {
-  const target = findControls("button", label).find(
-    (entry) => typeof entry.props.onClick === "function",
-  );
+  const target = [...findControls("button", label)]
+    .toReversed()
+    .find((entry) => typeof entry.props.onClick === "function");
   if (!target) {
     throw new Error(`No clickable button labelled ${label}`);
   }
@@ -944,6 +971,7 @@ beforeEach(() => {
   h.clerkAuth.getToken.mockResolvedValue("clerk-token");
   h.environments = [];
   h.threadShells = [];
+  h.decodedPairingCode = null;
   h.compatVerdicts.clear();
   h.primaryEnvironment = { environmentId: PRIMARY_ID, serverConfig: null };
   h.relayDiscovery = { environments: new Map(), refreshing: false };
@@ -1386,6 +1414,119 @@ describe("Remote Servers tabs", () => {
     expect(h.commands.remove).not.toHaveBeenCalled();
   });
 
+  describe("Add Server flow", () => {
+    async function enterPairingCode(value: string): Promise<void> {
+      await act(async () => {
+        invoke(control("textarea", "bibcode://pair?code=…"), "onChange", {
+          target: { value },
+        });
+      });
+    }
+
+    function latestAddServerButton(): CapturedControl {
+      const button = [...findControls("button", "Add Server")]
+        .toReversed()
+        .find((entry) => typeof entry.props.onClick === "function");
+      if (!button) throw new Error("No Add Server submit button");
+      return button;
+    }
+
+    async function submitAddServer(): Promise<void> {
+      await act(async () => {
+        invoke(latestAddServerButton(), "onClick");
+        await flush();
+      });
+    }
+
+    async function acknowledgeTunnel(): Promise<void> {
+      await act(async () => {
+        invoke(findControls("checkbox", "false").at(-1)!, "onCheckedChange", true);
+      });
+    }
+
+    it("submits a normalized pairing code through connectRemoteServer", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      await mountConnections();
+      await enterPairingCode("bibcode://pair?code=abc123");
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: false,
+      });
+    });
+
+    it("renders classified failure copy for a rejected pairing", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.commands.connectRemoteServer.mockResolvedValueOnce(
+        failure({ _tag: "PairingAddError", reason: "pairing-rejected", detail: "expired" }),
+      );
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      await submitAddServer();
+      expect(container.textContent).toContain("Pairing rejected");
+      expect(container.textContent).toContain("Codes are single-use and expire");
+    });
+
+    it("requires tunnel acknowledgement for a this-computer code", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.decodedPairingCode = {
+        v: 1,
+        endpoint: "http://127.0.0.1:3773",
+        name: "LOCAL-ONLY",
+        token: "t",
+        hostKey: "k",
+        reach: "this-computer",
+        storageInstanceId: "s",
+      };
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      expect(container.textContent).toContain("only reachable on the server itself");
+      expect(latestAddServerButton().props.disabled).toBe(true);
+      await acknowledgeTunnel();
+      expect(latestAddServerButton().props.disabled).toBe(false);
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: true,
+      });
+    });
+
+    it("reveals acknowledgement when the flow demands it, then retries with it", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      h.commands.connectRemoteServer
+        .mockResolvedValueOnce(
+          failure({
+            _tag: "PairingLoopbackAcknowledgementRequiredError",
+            endpoint: "http://127.0.0.1:3773",
+          }),
+        )
+        .mockResolvedValueOnce(success(EnvironmentId.make("env-9")));
+      const container = await mountConnections();
+      await enterPairingCode("abc123");
+      await submitAddServer();
+      expect(container.textContent).toContain("only reachable on the server itself");
+      await acknowledgeTunnel();
+      await submitAddServer();
+      expect(h.commands.connectRemoteServer).toHaveBeenLastCalledWith({
+        code: "abc123",
+        allowLoopbackTunnel: true,
+      });
+    });
+
+    it("keeps manual entry under Advanced and SSH as a first-class mode", () => {
+      stubDesktopWindow();
+      const markup = render(<ConnectTab />);
+      expect(markup).toContain("Pairing code");
+      expect(markup).toContain("SSH");
+      expect(markup).toContain("Advanced");
+      expect(markup).toContain("Troubleshooting");
+    });
+  });
+
   it("manages pairing links and authorized clients for a remote-reachable browser admin", async () => {
     stubBrowserWindow();
     h.primarySessionState = {
@@ -1473,7 +1614,9 @@ describe("Remote Servers tabs", () => {
 
     // The reveal textarea selects its content on focus/click.
     const selectSpy = vi.fn();
-    const textarea = h.controls.find((entry) => entry.kind === "textarea");
+    const textarea = h.controls.find(
+      (entry) => entry.kind === "textarea" && typeof entry.props.onFocus === "function",
+    );
     invoke(textarea!, "onFocus", { currentTarget: { select: selectSpy } });
     invoke(textarea!, "onClick", { currentTarget: { select: selectSpy } });
     expect(selectSpy).toHaveBeenCalledTimes(2);
@@ -1744,7 +1887,7 @@ describe("Remote Servers tabs", () => {
       invoke(dialog, "onOpenChange", false);
     }
 
-    // Add-environment dialog (remote mode by default on desktop).
+    // Add-environment dialog (manual fields live under Advanced).
     const hostInput = control("input", "backend.example.com");
     invoke(hostInput, "onChange", {
       target: { value: "https://pairhost.example.com/pair?token=abc123" },
@@ -1760,7 +1903,7 @@ describe("Remote Servers tabs", () => {
 
     // Adding with empty fields fails fast with a toast.
     h.toastAdd.mockClear();
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1823,7 +1966,7 @@ describe("Remote Servers tabs", () => {
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {
     stubDesktopWindow();
     h.stateOverrides.set(false, true);
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("443", "0");
     h.networkAccessQuery.data = {
       serverExposureState: {
@@ -1939,7 +2082,7 @@ describe("Remote Servers tabs", () => {
 
     render();
 
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.commands.connectPairing).toHaveBeenCalledWith({
       host: "pairhost.example.com",
@@ -1950,7 +2093,7 @@ describe("Remote Servers tabs", () => {
     // Failure path.
     h.toastAdd.mockClear();
     h.commands.connectPairing.mockResolvedValueOnce(failure(new Error("pairing rejected")));
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not add backend", description: "pairing rejected" }),
@@ -1959,14 +2102,14 @@ describe("Remote Servers tabs", () => {
     // Interrupted commands stay silent.
     h.toastAdd.mockClear();
     h.commands.connectPairing.mockResolvedValueOnce(failure(new Error("interrupted"), true));
-    clickButton("Add environment");
+    clickButton("Add manually");
     await flush();
     expect(h.toastAdd).not.toHaveBeenCalled();
   });
 
   it("adds SSH backends with parsed manual targets", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "10.0.0.5:2222");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];
@@ -2004,7 +2147,7 @@ describe("Remote Servers tabs", () => {
 
   it("rejects manual SSH targets with invalid ports", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "user@wsl-box");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];
@@ -2018,7 +2161,7 @@ describe("Remote Servers tabs", () => {
 
   it("parses bracketed IPv6 SSH hosts", async () => {
     stubDesktopWindow();
-    h.stateOverrides.set("remote", "ssh");
+    h.stateOverrides.set("pairing-code", "ssh");
     h.stateOverrides.set("", "[2001:db8::1]:8443");
     h.wslQuery.data = null;
     h.sshHostsQuery.data = [];

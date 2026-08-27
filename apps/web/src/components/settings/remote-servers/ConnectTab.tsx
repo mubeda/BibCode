@@ -2,6 +2,7 @@ import {
   ChevronsLeftRightEllipsisIcon,
   EllipsisIcon,
   PlusIcon,
+  QrCodeIcon,
   RefreshCwIcon,
   TerminalIcon,
   TriangleAlertIcon,
@@ -16,9 +17,12 @@ import type {
 import {
   connectionStatusText,
   type CompatVerdict,
+  type PairingAddFailureReason,
   RelayConnectionRegistration,
   RelayConnectionTarget,
 } from "@bibcode/client-runtime/connection";
+import { classifyPairingEndpoint } from "@bibcode/shared/advertisedEndpoint";
+import { parsePairingCode } from "@bibcode/shared/pairingCode";
 import { findErrorTraceId } from "@bibcode/client-runtime/errors";
 import {
   isAtomCommandInterrupted,
@@ -35,6 +39,7 @@ import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { environmentCatalog } from "~/connection/catalog";
 import {
   connectPairing as connectPairingAtom,
+  connectRemoteServer as connectRemoteServerAtom,
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
@@ -52,6 +57,8 @@ import { useThreadShells } from "~/state/entities";
 import { AnimatedHeight } from "../../AnimatedHeight";
 import { Button } from "../../ui/button";
 import { Badge } from "../../ui/badge";
+import { Checkbox } from "../../ui/checkbox";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import {
   Dialog,
   DialogDescription,
@@ -75,6 +82,7 @@ import { Input } from "../../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
 import { ScrollArea } from "../../ui/scroll-area";
 import { Skeleton } from "../../ui/skeleton";
+import { Textarea } from "../../ui/textarea";
 import { stackedThreadToast, toastManager } from "../../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import { SettingsSection } from "../settingsLayout";
@@ -90,9 +98,14 @@ import {
   parseRemotePairingFields,
 } from "./shared";
 import {
+  ADD_SERVER_FAILURE_REASONS,
   countRunningThreadsForEnvironment,
+  describeAddServerFailure,
   describeCompatBadge,
   formatServerVersionLabel,
+  isLoopbackAcknowledgementRequired,
+  normalizePairingCodeInput,
+  resolvePairingAddFailureReason,
   resolveTransportBadge,
 } from "./connectPresentation";
 
@@ -541,12 +554,13 @@ function CloudRemoteEnvironmentRows({
   ) : null;
 }
 
-export function ConnectTab() {
+export function ConnectTab({ initialPairingCode = null }: { initialPairingCode?: string | null }) {
   const desktopBridge = window.desktopBridge;
   const { environments } = useEnvironments();
   const threadShells = useThreadShells();
   const primaryEnvironment = usePrimaryEnvironment();
   const connectPairing = useAtomCommand(connectPairingAtom, { reportFailure: false });
+  const connectRemoteServer = useAtomCommand(connectRemoteServerAtom, { reportFailure: false });
   const connectSshEnvironment = useAtomCommand(connectSshEnvironmentAtom, {
     reportFailure: false,
   });
@@ -606,7 +620,13 @@ export function ConnectTab() {
   const [connectingSshHostAlias, setConnectingSshHostAlias] = useState<string | null>(null);
 
   const [addBackendDialogOpen, setAddBackendDialogOpen] = useState(false);
-  const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh">("remote");
+  const [savedBackendMode, setSavedBackendMode] = useState<"pairing-code" | "manual" | "ssh">(
+    "pairing-code",
+  );
+  const [pairingCodeInput, setPairingCodeInput] = useState("");
+  const [tunnelAcknowledged, setTunnelAcknowledged] = useState(false);
+  const [flowDemandsAcknowledgement, setFlowDemandsAcknowledgement] = useState(false);
+  const [addServerFailure, setAddServerFailure] = useState<PairingAddFailureReason | null>(null);
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
@@ -624,6 +644,30 @@ export function ConnectTab() {
     removalCandidate === null
       ? 0
       : countRunningThreadsForEnvironment(threadShells, removalCandidate.environmentId);
+  const normalizedPairingCode = normalizePairingCodeInput(pairingCodeInput);
+  const decodedPairingCode = useMemo(() => {
+    if (normalizedPairingCode === null) return null;
+    try {
+      return parsePairingCode(normalizedPairingCode);
+    } catch {
+      return null;
+    }
+  }, [normalizedPairingCode]);
+  const requiresTunnelAcknowledgement =
+    flowDemandsAcknowledgement ||
+    (decodedPairingCode !== null &&
+      (decodedPairingCode.reach === "this-computer" ||
+        classifyPairingEndpoint(decodedPairingCode.endpoint) === "loopback"));
+  useEffect(() => {
+    if (initialPairingCode === null) return;
+    setPairingCodeInput(initialPairingCode);
+    setSavedBackendMode("pairing-code");
+    setTunnelAcknowledged(false);
+    setFlowDemandsAcknowledgement(false);
+    setAddServerFailure(null);
+    setSavedBackendError(null);
+    setAddBackendDialogOpen(true);
+  }, [initialPairingCode]);
   const desktopSshHosts = useEnvironmentQuery(
     desktopBridge && addBackendDialogOpen && savedBackendMode === "ssh"
       ? desktopSshHostsStateAtom
@@ -645,6 +689,50 @@ export function ConnectTab() {
     desktopSshHosts.data !== null || desktopSshHosts.error !== null;
   const isLoadingDiscoveredSshHosts = desktopSshHosts.isPending;
   const discoveredSshHostsError = sshConnectionError ?? desktopSshHosts.error;
+  const handleAddServer = useCallback(async () => {
+    if (normalizedPairingCode === null) {
+      setSavedBackendError("Enter a pairing code.");
+      return;
+    }
+    if (requiresTunnelAcknowledgement && !tunnelAcknowledged) return;
+    setIsAddingSavedBackend(true);
+    setSavedBackendError(null);
+    setAddServerFailure(null);
+    const result = await connectRemoteServer({
+      code: normalizedPairingCode,
+      allowLoopbackTunnel: tunnelAcknowledged,
+    });
+    setIsAddingSavedBackend(false);
+    if (result._tag === "Failure") {
+      if (isAtomCommandInterrupted(result)) return;
+      const error = squashAtomCommandFailure(result);
+      if (isLoopbackAcknowledgementRequired(error)) {
+        setFlowDemandsAcknowledgement(true);
+        return;
+      }
+      const reason = resolvePairingAddFailureReason(error);
+      if (reason !== null) {
+        setAddServerFailure(reason);
+      } else {
+        setSavedBackendError(error instanceof Error ? error.message : "Failed to add the server.");
+      }
+      return;
+    }
+    setPairingCodeInput("");
+    setTunnelAcknowledged(false);
+    setFlowDemandsAcknowledgement(false);
+    setAddBackendDialogOpen(false);
+    toastManager.add({
+      type: "success",
+      title: "Server added",
+      description: "The server is saved and will reconnect on app startup.",
+    });
+  }, [
+    connectRemoteServer,
+    normalizedPairingCode,
+    requiresTunnelAcknowledgement,
+    tunnelAcknowledged,
+  ]);
   const handleAddSavedBackend = useCallback(async () => {
     if (savedBackendMode === "ssh") {
       setIsAddingSavedBackend(true);
@@ -861,7 +949,7 @@ export function ConnectTab() {
   }, []);
 
   const renderConnectionModeCard = (input: {
-    readonly mode: "remote" | "ssh";
+    readonly mode: "pairing-code" | "ssh";
     readonly title: string;
     readonly description: string;
     readonly icon?: ReactNode;
@@ -944,10 +1032,92 @@ export function ConnectTab() {
         onClick={() => void handleAddSavedBackend()}
       >
         <PlusIcon className="size-3.5" />
-        {isAddingSavedBackend ? "Adding…" : "Add environment"}
+        {isAddingSavedBackend ? "Adding…" : "Add manually"}
       </Button>
     </div>
   );
+  const renderPairingCodeModeBody = () => {
+    const describedFailure =
+      addServerFailure === null ? null : describeAddServerFailure(addServerFailure);
+    return (
+      <div className="space-y-4">
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium text-foreground">Pairing code</span>
+          <Textarea
+            value={pairingCodeInput}
+            onChange={(event) => {
+              setPairingCodeInput(event.target.value);
+              setTunnelAcknowledged(false);
+              setFlowDemandsAcknowledgement(false);
+              setAddServerFailure(null);
+              setSavedBackendError(null);
+            }}
+            placeholder="bibcode://pair?code=…"
+            disabled={isAddingSavedBackend}
+            spellCheck={false}
+          />
+        </label>
+        {requiresTunnelAcknowledgement ? (
+          <label className="flex items-start gap-3 rounded-md border border-warning/30 bg-warning/5 px-3 py-2.5 text-xs text-foreground">
+            <Checkbox
+              checked={tunnelAcknowledged}
+              onCheckedChange={(checked) => setTunnelAcknowledged(checked === true)}
+              disabled={isAddingSavedBackend}
+            />
+            <span>
+              This address is only reachable on the server itself. I have set up a tunnel (SSH port
+              forward or similar) from this device.
+            </span>
+          </label>
+        ) : null}
+        {describedFailure ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <p className="font-medium">{describedFailure.title}</p>
+            <p className="mt-1">{describedFailure.detail}</p>
+          </div>
+        ) : savedBackendError ? (
+          <p className="text-xs text-destructive">{savedBackendError}</p>
+        ) : null}
+        <Button
+          className="w-full"
+          disabled={isAddingSavedBackend || (requiresTunnelAcknowledgement && !tunnelAcknowledged)}
+          onClick={() => void handleAddServer()}
+        >
+          <PlusIcon className="size-3.5" />
+          {isAddingSavedBackend ? "Adding…" : "Add Server"}
+        </Button>
+        <Collapsible>
+          <CollapsibleTrigger className="text-xs text-muted-foreground underline underline-offset-2">
+            Advanced: manual endpoint and token
+          </CollapsibleTrigger>
+          <CollapsibleContent className="pt-3">{renderRemoteModeBody()}</CollapsibleContent>
+        </Collapsible>
+        <Collapsible>
+          <CollapsibleTrigger className="text-xs text-muted-foreground underline underline-offset-2">
+            Troubleshooting
+          </CollapsibleTrigger>
+          <CollapsibleContent className="pt-3">
+            <ul className="space-y-2 text-xs text-muted-foreground">
+              {ADD_SERVER_FAILURE_REASONS.map((reason) => {
+                const described = describeAddServerFailure(reason);
+                return (
+                  <li key={reason}>
+                    <span className="font-medium text-foreground">{described.title}.</span>{" "}
+                    {described.detail}
+                  </li>
+                );
+              })}
+              <li>
+                <span className="font-medium text-foreground">Still stuck?</span> Confirm both
+                devices are on the same network or connected through a tunnel, then generate a fresh
+                pairing code on the server&apos;s Share tab.
+              </li>
+            </ul>
+          </CollapsibleContent>
+        </Collapsible>
+      </div>
+    );
+  };
   const renderSshFields = () => (
     <div className="space-y-4">
       <div className="space-y-3">
@@ -1079,17 +1249,19 @@ export function ConnectTab() {
             </Tooltip>
             <DialogPopup className="max-h-[80dvh] sm:max-w-3xl">
               <DialogHeader>
-                <DialogTitle>Add Environment</DialogTitle>
-                <DialogDescription>Pair another environment to this client.</DialogDescription>
+                <DialogTitle>Add Server</DialogTitle>
+                <DialogDescription>
+                  Connect this device to another BiBCode server.
+                </DialogDescription>
               </DialogHeader>
               <DialogPanel>
                 <div className="space-y-4">
                   <div className="grid gap-3 sm:grid-cols-2">
                     {renderConnectionModeCard({
-                      mode: "remote",
-                      title: "Remote link",
-                      description: "Enter a backend host and pairing code.",
-                      icon: <ChevronsLeftRightEllipsisIcon aria-hidden className="size-4" />,
+                      mode: "pairing-code",
+                      title: "Pairing code",
+                      description: "Paste a pairing code from the server's Share tab.",
+                      icon: <QrCodeIcon aria-hidden className="size-4" />,
                     })}
                     {desktopBridge
                       ? renderConnectionModeCard({
@@ -1101,7 +1273,7 @@ export function ConnectTab() {
                       : null}
                   </div>
                   <AnimatedHeight>
-                    {savedBackendMode === "ssh" ? renderSshFields() : renderRemoteModeBody()}
+                    {savedBackendMode === "ssh" ? renderSshFields() : renderPairingCodeModeBody()}
                   </AnimatedHeight>
                 </div>
               </DialogPanel>
