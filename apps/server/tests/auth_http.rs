@@ -479,6 +479,108 @@ async fn share_state_reports_grant_derived_exposure() {
 }
 
 #[tokio::test]
+async fn pairing_offer_persists_reach_onto_the_minted_grant() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+
+    let offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .json(&json!({
+                "name": "AI-SERVER",
+                "endpoint": "http://192.168.1.20:3773",
+                "reach": "another-device",
+            }))
+            .send()
+            .await
+            .expect("pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    let offer_id = offer["id"].as_str().expect("offer id").to_owned();
+
+    let links = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/pairing-links"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("pairing links"),
+        StatusCode::OK,
+    )
+    .await;
+    let minted = links
+        .as_array()
+        .expect("links array")
+        .iter()
+        .find(|link| link["id"] == offer_id.as_str())
+        .expect("minted link");
+    assert_eq!(minted["reach"], "another-device");
+
+    let state = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("share state"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(state["desiredExposure"], "wide");
+    assert_eq!(state["offHostGrantCount"], 1);
+    assert_eq!(state["legacyGrantCount"], 0);
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn loopback_custom_offers_never_flip_desired_exposure_wide() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+
+    let offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .json(&json!({
+                "name": "AI-SERVER",
+                "endpoint": "http://127.0.0.1:9022",
+                "reach": "custom",
+            }))
+            .send()
+            .await
+            .expect("custom loopback offer"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(offer["reach"], "custom");
+
+    let state = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("share state"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(state["desiredExposure"], "loopback");
+    assert_eq!(state["offHostGrantCount"], 0);
+    assert_eq!(state["legacyGrantCount"], 0);
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn websocket_requires_a_short_lived_ticket_or_request_credential() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
