@@ -59,6 +59,7 @@ const h = vi.hoisted(() => {
     threads: [],
     environments: [],
     primaryEnvironmentId: null,
+    activeEnvironmentId: null,
     serverConfigs: new Map(),
     clientSettings: null,
     atomValues: {},
@@ -340,6 +341,10 @@ vi.mock("../connection/currentEnvironmentPresentation", () => ({
 vi.mock("../state/entities", () => ({
   useProjects: () => h.state.projects,
   useThreadShells: () => h.state.threads,
+  useActiveEnvironmentId: () => h.state.activeEnvironmentId,
+  setActiveEnvironmentId: (environmentId: unknown) => {
+    h.state.activeEnvironmentId = environmentId;
+  },
   useThreadShellsForProjectRefs: (
     refs: ReadonlyArray<{ environmentId: string; projectId: string }>,
   ) =>
@@ -1039,6 +1044,7 @@ beforeEach(() => {
   h.state.threads = [];
   h.state.environments = [];
   h.state.primaryEnvironmentId = ENV_MAIN;
+  h.state.activeEnvironmentId = null;
   h.state.serverConfigs = new Map();
   h.state.clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
   h.state.atomValues = {
@@ -1916,6 +1922,80 @@ staticDescribe("Sidebar full render", () => {
     invoke(footerButton!.props, "onClick", mouseEvent());
     expect(h.spies.setOpenMobile).toHaveBeenCalledWith(false);
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings" });
+  });
+});
+
+staticDescribe("Sidebar environment scoping", () => {
+  function seedTwoEnvironments() {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Local", primary: true }),
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "AI-SERVER",
+        connectionId: "paired-1",
+      }),
+    ];
+    h.state.primaryEnvironmentId = ENV_MAIN;
+    h.state.projects = [
+      makeProject("project-a"),
+      makeProject("project-b", {
+        environmentId: ENV_REMOTE,
+        title: "Remote Repo",
+        workspaceRoot: "/srv/remote-repo",
+      }),
+    ];
+    h.state.threads = [
+      makeThread("thread-local"),
+      makeThread("thread-remote", {
+        environmentId: ENV_REMOTE,
+        projectId: ProjectId.make("project-b"),
+      }),
+    ];
+  }
+
+  it("filters a null selection to local environments", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = null;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Repo A");
+    expect(markup).not.toContain("Remote Repo");
+  });
+
+  it("filters projects and threads to the selected remote without lifecycle commands", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    h.state.commandCalls = [];
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Remote Repo");
+    expect(markup).not.toContain("Repo A");
+    expect(
+      h.state.commandCalls.filter((call: { label?: string }) =>
+        String(call.label ?? "").startsWith("environment."),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps local environments merged when a local environment is selected", () => {
+    seedTwoEnvironments();
+    h.state.environments.push(
+      environmentFixture({
+        environmentId: ENV_WSL,
+        label: "Ubuntu",
+        connectionId: "local:wsl-ubuntu",
+      }),
+    );
+    h.state.projects.push(
+      makeProject("project-wsl", {
+        environmentId: ENV_WSL,
+        title: "WSL Repo",
+        workspaceRoot: "/home/user/wsl-repo",
+      }),
+    );
+    h.state.activeEnvironmentId = ENV_MAIN;
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Repo A");
+    expect(markup).toContain("WSL Repo");
+    expect(markup).not.toContain("Remote Repo");
   });
 });
 
