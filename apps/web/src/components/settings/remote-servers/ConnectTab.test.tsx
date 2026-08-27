@@ -672,10 +672,6 @@ async function mountConnections(
   return container;
 }
 
-async function click(element: HTMLElement): Promise<void> {
-  await act(async () => element.click());
-}
-
 function findControls(kind: string, label: string): CapturedControl[] {
   const exact = h.controls.filter((entry) => entry.kind === kind && entry.label === label);
   if (exact.length > 0) return exact;
@@ -1551,7 +1547,7 @@ describe("Remote Servers tabs", () => {
     });
   });
 
-  it("manages pairing links and authorized clients for a remote-reachable browser admin", async () => {
+  it("manages pairing links and paired clients for a browser admin", async () => {
     stubBrowserWindow();
     h.primarySessionState = {
       data: { authenticated: true, scopes: ADMIN_SCOPES, auth: { policy: "remote-reachable" } },
@@ -1593,16 +1589,16 @@ describe("Remote Servers tabs", () => {
       ],
     });
 
-    const markup = render();
+    const onAccessRevoked = vi.fn();
+    const markup = render(<ShareTab onAccessRevoked={onAccessRevoked} />);
 
-    expect(markup).toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
     expect(markup).toContain("Living room iPad");
     expect(markup).toContain("1 scope");
     expect(markup).toContain("Pairing link");
     expect(markup).not.toContain("credential-pl-expired");
     expect(markup).toContain("This device");
     expect(markup).toContain("macOS · Safari");
-    expect(markup).toContain("This backend is already configured for remote access.");
 
     // Copy the shareable pairing URL (current-origin fallback: no endpoints).
     invoke(control("button", "Copy pairing URL for: URL"), "onClick");
@@ -1661,6 +1657,7 @@ describe("Remote Servers tabs", () => {
     invoke(findControls("button", "Revoke").at(-1)!, "onClick");
     await flush();
     expect(h.revokeServerClientSession).toHaveBeenCalled();
+    expect(onAccessRevoked).toHaveBeenCalledTimes(2);
     h.toastAdd.mockClear();
     h.revokeServerClientSession.mockRejectedValueOnce(new Error("session revoke failed"));
     invoke(findControls("button", "Revoke").at(-1)!, "onClick");
@@ -1692,28 +1689,6 @@ describe("Remote Servers tabs", () => {
       expect.objectContaining({ title: "Could not revoke other clients" }),
     );
 
-    // Create-link dialog: scope presets, checkbox toggles, create + cancel.
-    invoke(findControls("checkbox", "true")[0]!, "onCheckedChange", false);
-    invoke(findControls("checkbox", "false")[0]!, "onCheckedChange", true);
-    invoke(control("button", "Read only"), "onClick");
-    invoke(control("button", "Standard"), "onClick");
-    const labelInput = control("input", "e.g. Living room iPad");
-    invoke(labelInput, "onChange", { target: { value: "Kitchen tablet" } });
-
-    h.toastAdd.mockClear();
-    clickButton("Create link");
-    await flush();
-    expect(h.createServerPairingCredential).toHaveBeenCalled();
-    expect(h.toastAdd).not.toHaveBeenCalled();
-
-    h.createServerPairingCredential.mockRejectedValueOnce(new Error("create failed"));
-    clickButton("Create link");
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not create pairing URL" }),
-    );
-
-    clickButton("Cancel");
     for (const dialog of findControls("dialog", "false")) {
       invoke(dialog, "onOpenChange", false);
       invoke(dialog, "onOpenChange", true);
@@ -1740,7 +1715,7 @@ describe("Remote Servers tabs", () => {
     expect(markup).toContain("Clipboard copy is unavailable here.");
   });
 
-  it("shows the local-only network notice for non-remote browser admins", () => {
+  it("keeps paired-client management available for local-only browser admins", () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;
     h.primarySessionState = {
@@ -1749,8 +1724,8 @@ describe("Remote Servers tabs", () => {
 
     const markup = render();
 
-    expect(markup).toContain("This backend is only reachable on this machine.");
-    expect(markup).not.toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
+    expect(markup).not.toContain("Enable network access");
   });
 
   it("renders the full desktop backend surface and drives its handlers", async () => {
@@ -1827,12 +1802,10 @@ describe("Remote Servers tabs", () => {
     const markup = render();
 
     expect(markup).toContain("Version drift");
-    expect(markup).toContain("Network access");
-    expect(markup).toContain("Reachable at");
     expect(markup).toContain("http://192.168.1.20:5133");
     expect(markup).toContain("Tailscale HTTPS");
     expect(markup).toContain("BiBCode Connect");
-    expect(markup).toContain("Authorized clients");
+    expect(markup).toContain("Paired clients");
 
     // The pairing link resolves URLs against the advertised endpoints.
     expect(markup).toContain("Copy pairing URL for: LAN");
@@ -1854,16 +1827,11 @@ describe("Remote Servers tabs", () => {
     );
     h.copyBehavior = "copy";
 
-    // Network exposure switch stages a confirmation.
-    invoke(control("switch", "Enable network access"), "onCheckedChange", false);
-    invoke(control("switch", "Enable network access"), "onCheckedChange", true);
-
-    // The exposure confirm button is a no-op until a change is pending.
+    // Only the Tailscale confirmation owns a restart control here.
     for (const entry of findControls("button", "Restart and disable")) {
       invoke(entry, "onClick");
     }
     await flush();
-    // Only the tailscale-disable confirmation reaches the bridge.
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledTimes(1);
     expect(bridge.setTailscaleServeEnabled).toHaveBeenCalledWith({ enabled: false, port: 443 });
     expect(bridge.applyServerExposure).not.toHaveBeenCalled();
@@ -1941,11 +1909,8 @@ describe("Remote Servers tabs", () => {
     expect(control("switch", "Enable BiBCode Connect")).toBeDefined();
   });
 
-  it("confirms staged desktop exposure changes", async () => {
+  it("does not expose a manual desktop network-access control", () => {
     const bridge = stubDesktopWindow();
-    // Pin every null-initialised piece of dialog state to a pending value so
-    // the confirmation handlers run their apply paths.
-    h.stateOverrides.set(null, "network-accessible");
     h.networkAccessQuery.data = {
       serverExposureState: {
         mode: "local-only",
@@ -1957,34 +1922,9 @@ describe("Remote Servers tabs", () => {
       advertisedEndpoints: [],
     };
     const markup = render();
-    expect(markup).toContain("Enable network access?");
-
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    for (const entry of findControls("button", "Restart and disable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(bridge.applyServerExposure).toHaveBeenCalledWith("network-accessible");
-    expect(h.refreshDesktopNetworkAccessState).toHaveBeenCalled();
-
-    // Exposure change failures surface a toast.
-    h.toastAdd.mockClear();
-    bridge.applyServerExposure.mockRejectedValueOnce(new Error("exposure failed"));
-    for (const entry of findControls("button", "Restart and enable")) {
-      if (typeof entry.props.onClick === "function") {
-        invoke(entry, "onClick");
-      }
-    }
-    await flush();
-    expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not update network access" }),
-    );
+    expect(markup).not.toContain("Enable network access");
+    expect(markup).not.toContain("Enable network access?");
+    expect(bridge.applyServerExposure).not.toHaveBeenCalled();
   });
 
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {
@@ -2056,7 +1996,6 @@ describe("Remote Servers tabs", () => {
     expect(markup).toContain("Restarting…");
     expect(markup).toContain("Adding…");
     expect(markup).toContain("Revoking…");
-    expect(markup).toContain("Creating…");
 
     // The endpoint rail is expanded and renders per-endpoint actions.
     expect(markup).toContain("LAN");
@@ -2479,7 +2418,7 @@ describe("Remote Servers tabs", () => {
     expect(control("switch", "Enable BiBCode Connect").props.disabled).toBe(true);
   });
 
-  it("renders each network reachability fallback and toggles endpoint details", async () => {
+  it("renders every available network endpoint row", () => {
     installMountedDesktopWindow();
     const exposureState = {
       mode: "network-accessible",
@@ -2488,36 +2427,6 @@ describe("Remote Servers tabs", () => {
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,
     };
-    h.networkAccessQuery.data = {
-      serverExposureState: exposureState,
-      advertisedEndpoints: [],
-    };
-
-    let markup = render();
-    expect(markup).toContain("Reachable at https://desktop.example.com");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: "desktop.lan",
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Pairing links use desktop.lan");
-
-    h.networkAccessQuery.data = {
-      serverExposureState: {
-        ...exposureState,
-        endpointUrl: null,
-        advertisedHost: null,
-      },
-      advertisedEndpoints: [],
-    };
-    markup = render();
-    expect(markup).toContain("Exposed on all interfaces.");
-
     h.networkAccessQuery.data = {
       serverExposureState: exposureState,
       advertisedEndpoints: [
@@ -2534,24 +2443,9 @@ describe("Remote Servers tabs", () => {
         }),
       ],
     };
-    const container = await mountConnections();
-    const detailsToggle = Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent?.includes("+1") === true,
-    );
-    expect(detailsToggle).toBeDefined();
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(container.textContent).toContain("http://192.168.1.20:5133");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("true");
-    expect(detailsToggle?.textContent).toContain("Hide");
-    expect(container.textContent).toContain("http://192.168.1.21:5133");
-
-    await click(detailsToggle!);
-    expect(detailsToggle?.getAttribute("aria-expanded")).toBe("false");
-    expect(detailsToggle?.textContent).toContain("+1");
-    expect(container.textContent).not.toContain("http://192.168.1.21:5133");
+    const markup = render();
+    expect(markup).toContain("http://192.168.1.20:5133");
+    expect(markup).toContain("http://192.168.1.21:5133");
   });
 
   it("shows a skeleton while the first relay refresh is in flight", () => {

@@ -52,7 +52,7 @@ export function resolveShareAddressOptions(input: {
     {
       id: "auto-lan",
       label: "Automatic (LAN)",
-      httpBaseUrl: null,
+      httpBaseUrl: input.exposureState === null ? input.primaryHttpBaseUrl : null,
       description:
         input.exposureState?.endpointUrl === null
           ? "BiBCode will enable remote access and choose a LAN address."

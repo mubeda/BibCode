@@ -1,17 +1,13 @@
-import { ChevronDownIcon, PlusIcon, QrCodeIcon, TriangleAlertIcon } from "lucide-react";
+import { ChevronDownIcon, QrCodeIcon, TriangleAlertIcon } from "lucide-react";
 import { useAuth } from "@clerk/react";
-import { type ReactNode, memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import {
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
-  AuthOrchestrationReadScope,
   AuthRelayWriteScope,
-  AuthStandardClientScopes,
   type AuthClientSession,
-  type AuthEnvironmentScope,
   type AuthPairingLink,
   type AdvertisedEndpoint,
-  type DesktopServerExposureState,
 } from "@bibcode/contracts";
 import { findErrorTraceId } from "@bibcode/client-runtime/errors";
 import {
@@ -25,7 +21,6 @@ import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../../times
 import { resolveRelayClerkTokenOptions } from "../../../cloud/publicConfig";
 import { SettingsRow, SettingsSection, useRelativeTimeTick } from "../settingsLayout";
 import { Input } from "../../ui/input";
-import { Checkbox } from "../../ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -66,7 +61,6 @@ import {
 } from "../../ui/menu";
 import { Textarea } from "../../ui/textarea";
 import {
-  createServerPairingCredential,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
@@ -106,7 +100,6 @@ import {
   isHostedAppPairingUrl,
   isTailscaleHttpsEndpoint,
   ITEM_ROW_INNER_CLASSNAME,
-  PAIRING_SCOPE_OPTIONS,
   resolveAdvertisedEndpointPairingUrl,
   resolveCurrentOriginPairingUrl,
   selectPairingEndpoint,
@@ -592,166 +585,17 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
   isRevokingOtherClients,
   onRevokeOtherClients,
 }: AuthorizedClientsHeaderActionProps) {
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [pairingLabel, setPairingLabel] = useState("");
-  const [pairingScopes, setPairingScopes] = useState<ReadonlyArray<AuthEnvironmentScope>>([
-    ...AuthStandardClientScopes,
-  ]);
-  const [isCreatingPairingLink, setIsCreatingPairingLink] = useState(false);
-
-  const handleCreatePairingLink = useCallback(async () => {
-    setIsCreatingPairingLink(true);
-    try {
-      await createServerPairingCredential({ label: pairingLabel, scopes: pairingScopes });
-      setPairingLabel("");
-      setPairingScopes([...AuthStandardClientScopes]);
-      setDialogOpen(false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to create pairing URL.";
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Could not create pairing URL",
-          description: message,
-        }),
-      );
-    } finally {
-      setIsCreatingPairingLink(false);
-    }
-  }, [pairingLabel, pairingScopes]);
-
-  const togglePairingScope = useCallback((scope: AuthEnvironmentScope, checked: boolean) => {
-    setPairingScopes((current) =>
-      checked ? [...current, scope] : current.filter((currentScope) => currentScope !== scope),
-    );
-  }, []);
-
   return (
-    <div className="flex items-center gap-2">
-      <Button
-        size="xs"
-        variant="destructive-outline"
-        disabled={
-          isRevokingOtherClients || clientSessions.every((clientSession) => clientSession.current)
-        }
-        onClick={() => void onRevokeOtherClients()}
-      >
-        {isRevokingOtherClients ? "Revoking…" : "Revoke others"}
-      </Button>
-      <Dialog
-        open={dialogOpen}
-        onOpenChange={(open) => {
-          setDialogOpen(open);
-          if (!open) {
-            setPairingLabel("");
-            setPairingScopes([...AuthStandardClientScopes]);
-          }
-        }}
-      >
-        <DialogTrigger
-          render={
-            <Button size="xs" variant="default">
-              <PlusIcon className="size-3" />
-              Create link
-            </Button>
-          }
-        />
-        <DialogPopup className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Create pairing link</DialogTitle>
-            <DialogDescription>
-              Generate a one-time link that another device can use to pair with this backend as an
-              authorized client.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogPanel className="space-y-5">
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-foreground">
-                Client label (optional)
-              </span>
-              <Input
-                value={pairingLabel}
-                onChange={(event) => setPairingLabel(event.target.value)}
-                placeholder="e.g. Living room iPad"
-                disabled={isCreatingPairingLink}
-                autoFocus
-              />
-            </label>
-            <section className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-xs font-medium text-foreground">Permissions</h3>
-                  <p className="text-xs text-muted-foreground">
-                    Limit what the paired client can do.
-                  </p>
-                </div>
-                <div className="flex gap-1">
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={isCreatingPairingLink}
-                    onClick={() => setPairingScopes([AuthOrchestrationReadScope])}
-                  >
-                    Read only
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={isCreatingPairingLink}
-                    onClick={() => setPairingScopes([...AuthStandardClientScopes])}
-                  >
-                    Standard
-                  </Button>
-                </div>
-              </div>
-              <div className="divide-y divide-border/60 rounded-lg border border-input bg-muted/25">
-                {PAIRING_SCOPE_OPTIONS.map(({ scope, title, description }) => (
-                  <label
-                    key={scope}
-                    className="flex cursor-pointer items-start gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40"
-                  >
-                    <Checkbox
-                      className="mt-0.5"
-                      checked={pairingScopes.includes(scope)}
-                      disabled={isCreatingPairingLink}
-                      onCheckedChange={(checked) => togglePairingScope(scope, checked === true)}
-                    />
-                    <span className="min-w-0">
-                      <span className="block text-xs font-medium text-foreground">{title}</span>
-                      <span className="block text-xs leading-snug text-muted-foreground">
-                        {description}
-                      </span>
-                    </span>
-                  </label>
-                ))}
-              </div>
-              {pairingScopes.length === 0 ? (
-                <p className="text-xs text-destructive">Select at least one permission.</p>
-              ) : pairingScopes.includes(AuthAccessWriteScope) ? (
-                <p className="text-xs text-warning">
-                  This client can create or revoke access for other devices.
-                </p>
-              ) : null}
-            </section>
-          </DialogPanel>
-          <DialogFooter variant="bare">
-            <Button
-              variant="outline"
-              disabled={isCreatingPairingLink}
-              onClick={() => setDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              disabled={isCreatingPairingLink || pairingScopes.length === 0}
-              onClick={() => void handleCreatePairingLink()}
-            >
-              {isCreatingPairingLink ? "Creating…" : "Create link"}
-            </Button>
-          </DialogFooter>
-        </DialogPopup>
-      </Dialog>
-    </div>
+    <Button
+      size="xs"
+      variant="destructive-outline"
+      disabled={
+        isRevokingOtherClients || clientSessions.every((clientSession) => clientSession.current)
+      }
+      onClick={() => void onRevokeOtherClients()}
+    >
+      {isRevokingOtherClients ? "Revoking…" : "Revoke others"}
+    </Button>
   );
 });
 
@@ -901,53 +745,6 @@ const AdvertisedEndpointListRow = memo(function AdvertisedEndpointListRow({
     </div>
   );
 });
-
-function NetworkAccessDescription({
-  endpoint,
-  hiddenEndpointCount,
-  expanded,
-  onToggleExpanded,
-  fallback,
-}: {
-  endpoint: AdvertisedEndpoint | null;
-  hiddenEndpointCount: number;
-  expanded: boolean;
-  onToggleExpanded: () => void;
-  fallback: ReactNode;
-}) {
-  if (!endpoint) {
-    return fallback;
-  }
-
-  const summary = (
-    <>
-      <span className="min-w-0 truncate">{endpoint.httpBaseUrl}</span>
-      {hiddenEndpointCount > 0 ? (
-        <span className="shrink-0 text-xs font-medium">
-          {expanded ? "Hide" : `+${hiddenEndpointCount}`}
-        </span>
-      ) : null}
-    </>
-  );
-
-  return (
-    <span className="inline-flex min-w-0 max-w-full items-baseline gap-1">
-      <span className="shrink-0">Reachable at</span>
-      {hiddenEndpointCount > 0 ? (
-        <button
-          type="button"
-          className="inline-flex min-w-0 max-w-full items-baseline gap-2 border-b border-dotted border-muted-foreground/60 text-left text-muted-foreground underline-offset-4 hover:border-foreground hover:text-foreground"
-          onClick={onToggleExpanded}
-          aria-expanded={expanded}
-        >
-          {summary}
-        </button>
-      ) : (
-        <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">{summary}</span>
-      )}
-    </span>
-  );
-}
 
 function CloudLinkSwitch({
   checked,
@@ -1114,7 +911,11 @@ function CloudLinkRow({ canManageRelay }: { readonly canManageRelay: boolean }) 
   return hasCloudPublicConfig() ? <ConfiguredCloudLinkRow canManageRelay={canManageRelay} /> : null;
 }
 
-export function ShareTab() {
+export function ShareTab({
+  onAccessRevoked,
+}: {
+  readonly onAccessRevoked?: () => void;
+} = {}) {
   const desktopBridge = window.desktopBridge;
   const primaryEnvironment = usePrimaryEnvironment();
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
@@ -1124,7 +925,6 @@ export function ShareTab() {
     : primarySessionState.data?.authenticated
       ? (primarySessionState.data.scopes ?? null)
       : null;
-  const currentAuthPolicy = desktopBridge ? null : (primarySessionState.data?.auth.policy ?? null);
   const [desktopServerExposureMutationError, setDesktopServerExposureMutationError] = useState<
     string | null
   >(null);
@@ -1138,8 +938,6 @@ export function ShareTab() {
     string | null
   >(null);
   const [isRevokingOtherDesktopClients, setIsRevokingOtherDesktopClients] = useState(false);
-  const [isUpdatingDesktopServerExposure, setIsUpdatingDesktopServerExposure] = useState(false);
-  const [isDesktopServerExposureDialogOpen, setIsDesktopServerExposureDialogOpen] = useState(false);
   const [isUpdatingTailscaleServe, setIsUpdatingTailscaleServe] = useState(false);
   const [pendingTailscaleServeEndpoint, setPendingTailscaleServeEndpoint] =
     useState<AdvertisedEndpoint | null>(null);
@@ -1147,12 +945,8 @@ export function ShareTab() {
   const [tailscaleServePortInput, setTailscaleServePortInput] = useState(
     String(DEFAULT_TAILSCALE_SERVE_PORT),
   );
-  const [pendingDesktopServerExposureMode, setPendingDesktopServerExposureMode] = useState<
-    DesktopServerExposureState["mode"] | null
-  >(null);
   const primaryServerConfig = primaryEnvironment?.serverConfig ?? null;
   const primaryVersionMismatch = resolveServerConfigVersionMismatch(primaryServerConfig);
-  const [isAdvertisedEndpointListExpanded, setIsAdvertisedEndpointListExpanded] = useState(false);
   const defaultAdvertisedEndpointKey = useUiStateStore(
     (state) => state.defaultAdvertisedEndpointKey,
   );
@@ -1199,9 +993,7 @@ export function ShareTab() {
       ),
     );
   }, [authAccessChanges.data]);
-  const isLocalBackendNetworkAccessible = desktopBridge
-    ? desktopServerExposureState?.mode === "network-accessible"
-    : currentAuthPolicy === "remote-reachable";
+  const isLocalBackendNetworkAccessible = desktopServerExposureState?.mode === "network-accessible";
   const trimmedTailscaleServePortInput = tailscaleServePortInput.trim();
   const parsedTailscaleServePort = Number(trimmedTailscaleServePortInput);
   const isTailscaleServePortValid =
@@ -1224,40 +1016,6 @@ export function ShareTab() {
       return pendingTailscaleServeEndpoint.httpBaseUrl;
     }
   }, [isTailscaleServePortValid, parsedTailscaleServePort, pendingTailscaleServeEndpoint]);
-
-  const handleDesktopServerExposureChange = useCallback(
-    async (checked: boolean) => {
-      if (!desktopBridge) return;
-      setIsUpdatingDesktopServerExposure(true);
-      setDesktopServerExposureMutationError(null);
-      try {
-        await desktopBridge.applyServerExposure(checked ? "network-accessible" : "local-only");
-        refreshDesktopNetworkAccessState();
-        setIsDesktopServerExposureDialogOpen(false);
-        setIsUpdatingDesktopServerExposure(false);
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Failed to update network exposure.";
-        setIsDesktopServerExposureDialogOpen(false);
-        setDesktopServerExposureMutationError(message);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not update network access",
-            description: message,
-          }),
-        );
-        setIsUpdatingDesktopServerExposure(false);
-      }
-    },
-    [desktopBridge],
-  );
-
-  const handleConfirmDesktopServerExposureChange = useCallback(() => {
-    if (pendingDesktopServerExposureMode === null) return;
-    const checked = pendingDesktopServerExposureMode === "network-accessible";
-    void handleDesktopServerExposureChange(checked);
-  }, [handleDesktopServerExposureChange, pendingDesktopServerExposureMode]);
 
   const handleConfirmTailscaleServeSetup = useCallback(async () => {
     if (!desktopBridge) return;
@@ -1327,25 +1085,29 @@ export function ShareTab() {
     setDisableTailscaleServeDialogOpen(true);
   }, []);
 
-  const handleRevokeDesktopPairingLink = useCallback(async (id: string) => {
-    setRevokingDesktopPairingLinkId(id);
-    setDesktopAccessManagementMutationError(null);
-    try {
-      await revokeServerPairingLink(id);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to revoke pairing link.";
-      setDesktopAccessManagementMutationError(message);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Could not revoke pairing link",
-          description: message,
-        }),
-      );
-    } finally {
-      setRevokingDesktopPairingLinkId(null);
-    }
-  }, []);
+  const handleRevokeDesktopPairingLink = useCallback(
+    async (id: string) => {
+      setRevokingDesktopPairingLinkId(id);
+      setDesktopAccessManagementMutationError(null);
+      try {
+        await revokeServerPairingLink(id);
+        onAccessRevoked?.();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to revoke pairing link.";
+        setDesktopAccessManagementMutationError(message);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not revoke pairing link",
+            description: message,
+          }),
+        );
+      } finally {
+        setRevokingDesktopPairingLinkId(null);
+      }
+    },
+    [onAccessRevoked],
+  );
 
   const handleRevokeDesktopClientSession = useCallback(
     async (sessionId: ServerClientSessionRecord["sessionId"]) => {
@@ -1353,6 +1115,7 @@ export function ShareTab() {
       setDesktopAccessManagementMutationError(null);
       try {
         await revokeServerClientSession(sessionId);
+        onAccessRevoked?.();
       } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to revoke client access.";
         setDesktopAccessManagementMutationError(message);
@@ -1367,7 +1130,7 @@ export function ShareTab() {
         setRevokingDesktopClientSessionId(null);
       }
     },
-    [],
+    [onAccessRevoked],
   );
 
   const handleRevokeOtherDesktopClients = useCallback(async () => {
@@ -1375,6 +1138,7 @@ export function ShareTab() {
     setDesktopAccessManagementMutationError(null);
     try {
       const revokedCount = await revokeOtherServerClientSessions();
+      onAccessRevoked?.();
       toastManager.add({
         type: "success",
         title: revokedCount === 1 ? "Revoked 1 other client" : `Revoked ${revokedCount} clients`,
@@ -1393,7 +1157,7 @@ export function ShareTab() {
     } finally {
       setIsRevokingOtherDesktopClients(false);
     }
-  }, []);
+  }, [onAccessRevoked]);
   const visibleDesktopPairingLinks = desktopPairingLinks;
   const tailscaleHttpsEndpoint = useMemo(
     () => desktopAdvertisedEndpoints.find(isTailscaleHttpsEndpoint) ?? null,
@@ -1413,8 +1177,6 @@ export function ShareTab() {
         : visibleDesktopNetworkAdvertisedEndpoints,
     [tailscaleHttpsEndpoint, visibleDesktopNetworkAdvertisedEndpoints],
   );
-  const isLocalBackendRemotelyReachable =
-    isLocalBackendNetworkAccessible || tailscaleHttpsEndpoint?.status === "available";
   const defaultDesktopNetworkAdvertisedEndpoint = useMemo(
     () =>
       selectPairingEndpoint(visibleDesktopNetworkAdvertisedEndpoints, defaultAdvertisedEndpointKey),
@@ -1438,35 +1200,22 @@ export function ShareTab() {
     },
     [setDefaultAdvertisedEndpointKey],
   );
-  const renderNetworkAccessToggle = () => (
-    <Switch
-      checked={desktopServerExposureState?.mode === "network-accessible"}
-      disabled={!desktopServerExposureState || isUpdatingDesktopServerExposure}
-      onCheckedChange={(checked) => {
-        setPendingDesktopServerExposureMode(checked ? "network-accessible" : "local-only");
-        setIsDesktopServerExposureDialogOpen(true);
-      }}
-      aria-label="Enable network access"
-    />
-  );
   const renderEndpointRows = (presentation: AccessSectionPresentation) =>
-    isAdvertisedEndpointListExpanded
-      ? visibleDesktopNetworkAdvertisedEndpoints.map((endpoint) => {
-          const endpointKey = endpointDefaultPreferenceKey(endpoint);
-          return (
-            <AdvertisedEndpointListRow
-              key={endpoint.id}
-              endpoint={endpoint}
-              isDefault={endpointKey === defaultDesktopAdvertisedEndpointKey}
-              presentation={presentation}
-              onSetDefault={handleSetDefaultAdvertisedEndpoint}
-              onSetupTailscaleServe={handleStartTailscaleServeSetup}
-              onDisableTailscaleServe={handleStartTailscaleServeDisable}
-              isUpdatingTailscaleServe={isUpdatingTailscaleServe}
-            />
-          );
-        })
-      : null;
+    visibleDesktopNetworkAdvertisedEndpoints.map((endpoint) => {
+      const endpointKey = endpointDefaultPreferenceKey(endpoint);
+      return (
+        <AdvertisedEndpointListRow
+          key={endpoint.id}
+          endpoint={endpoint}
+          isDefault={endpointKey === defaultDesktopAdvertisedEndpointKey}
+          presentation={presentation}
+          onSetDefault={handleSetDefaultAdvertisedEndpoint}
+          onSetupTailscaleServe={handleStartTailscaleServeSetup}
+          onDisableTailscaleServe={handleStartTailscaleServeDisable}
+          isUpdatingTailscaleServe={isUpdatingTailscaleServe}
+        />
+      );
+    });
   const renderTailscaleRow = () => (
     <SettingsRow
       title="Tailscale HTTPS"
@@ -1476,6 +1225,11 @@ export function ShareTab() {
             ? tailscaleHttpsEndpoint.httpBaseUrl
             : "Use Tailscale Serve to expose this backend through a MagicDNS HTTPS URL."
           : "Start Tailscale to set up HTTPS access through MagicDNS."
+      }
+      status={
+        desktopServerExposureError ? (
+          <span className="block text-destructive">{desktopServerExposureError}</span>
+        ) : null
       }
       control={
         tailscaleHttpsEndpoint ? (
@@ -1517,67 +1271,6 @@ export function ShareTab() {
       />
     </>
   );
-  const renderNetworkAccessRow = () => (
-    <SettingsRow
-      title="Network access"
-      description={
-        isLocalBackendNetworkAccessible ? (
-          <NetworkAccessDescription
-            endpoint={defaultDesktopNetworkAdvertisedEndpoint}
-            hiddenEndpointCount={Math.max(visibleDesktopNetworkAdvertisedEndpoints.length - 1, 0)}
-            expanded={isAdvertisedEndpointListExpanded}
-            onToggleExpanded={() => setIsAdvertisedEndpointListExpanded((expanded) => !expanded)}
-            fallback={
-              desktopServerExposureState?.endpointUrl
-                ? `Reachable at ${desktopServerExposureState.endpointUrl}`
-                : desktopServerExposureState?.advertisedHost
-                  ? `Exposed on all interfaces. Pairing links use ${desktopServerExposureState.advertisedHost}.`
-                  : "Exposed on all interfaces."
-            }
-          />
-        ) : desktopServerExposureState ? (
-          "Limited to this machine."
-        ) : (
-          "Loading…"
-        )
-      }
-      status={
-        desktopServerExposureError ? (
-          <span className="block text-destructive">{desktopServerExposureError}</span>
-        ) : null
-      }
-      control={renderNetworkAccessToggle()}
-    />
-  );
-  const renderDisabledNetworkAccessRow = () => (
-    <SettingsRow
-      title="Network access"
-      description={
-        currentAuthPolicy === "remote-reachable"
-          ? "This backend is already configured for remote access. Network exposure changes must be made where the server is launched."
-          : "This backend is only reachable on this machine. Restart it with a non-loopback host to enable remote pairing."
-      }
-      control={
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <span className="inline-flex">
-                <Switch
-                  checked={isLocalBackendNetworkAccessible}
-                  disabled
-                  aria-label="Enable network access"
-                />
-              </span>
-            }
-          />
-          <TooltipPopup side="top">
-            Network exposure changes restart the backend and must be controlled where the server
-            process is launched.
-          </TooltipPopup>
-        </Tooltip>
-      }
-    />
-  );
 
   return (
     <>
@@ -1599,92 +1292,33 @@ export function ShareTab() {
             ) : null}
             {desktopBridge ? (
               <>
-                {renderNetworkAccessRow()}
                 {renderEndpointRows("endpoint-rail")}
                 {renderTailscaleRow()}
                 <CloudLinkRow canManageRelay={canManageRelay} />
               </>
             ) : (
-              <>
-                {renderDisabledNetworkAccessRow()}
-                <CloudLinkRow canManageRelay={canManageRelay} />
-              </>
+              <CloudLinkRow canManageRelay={canManageRelay} />
             )}
           </SettingsSection>
 
-          {isLocalBackendRemotelyReachable ? (
-            <SettingsSection
-              title="Authorized clients"
-              headerAction={
-                <AuthorizedClientsHeaderAction
-                  clientSessions={desktopClientSessions}
-                  isRevokingOtherClients={isRevokingOtherDesktopClients}
-                  onRevokeOtherClients={handleRevokeOtherDesktopClients}
-                />
-              }
-            >
-              <ScrollArea
-                scrollFade
-                className="max-h-[22.5rem]"
-                data-testid="authorized-clients-scroll-area"
-              >
-                {renderAuthorizedClients("current")}
-              </ScrollArea>
-            </SettingsSection>
-          ) : null}
-          <AlertDialog
-            open={isDesktopServerExposureDialogOpen}
-            onOpenChange={(open) => {
-              if (isUpdatingDesktopServerExposure) return;
-              setIsDesktopServerExposureDialogOpen(open);
-            }}
-            onOpenChangeComplete={(open) => {
-              if (!open) setPendingDesktopServerExposureMode(null);
-            }}
+          <SettingsSection
+            title="Paired clients"
+            headerAction={
+              <AuthorizedClientsHeaderAction
+                clientSessions={desktopClientSessions}
+                isRevokingOtherClients={isRevokingOtherDesktopClients}
+                onRevokeOtherClients={handleRevokeOtherDesktopClients}
+              />
+            }
           >
-            <AlertDialogPopup>
-              <AlertDialogHeader>
-                <AlertDialogTitle>
-                  {pendingDesktopServerExposureMode === "network-accessible"
-                    ? "Enable network access?"
-                    : "Disable network access?"}
-                </AlertDialogTitle>
-                <AlertDialogDescription>
-                  {pendingDesktopServerExposureMode === "network-accessible"
-                    ? "BiBCode will restart to expose this environment over the network."
-                    : "BiBCode will restart and limit this environment back to this machine."}
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogClose
-                  disabled={isUpdatingDesktopServerExposure}
-                  render={<Button variant="outline" disabled={isUpdatingDesktopServerExposure} />}
-                >
-                  Cancel
-                </AlertDialogClose>
-                <Button
-                  variant={
-                    pendingDesktopServerExposureMode === "local-only" ? "destructive" : "default"
-                  }
-                  onClick={handleConfirmDesktopServerExposureChange}
-                  disabled={
-                    pendingDesktopServerExposureMode === null || isUpdatingDesktopServerExposure
-                  }
-                >
-                  {isUpdatingDesktopServerExposure ? (
-                    <>
-                      <Spinner className="size-3.5" />
-                      Restarting…
-                    </>
-                  ) : pendingDesktopServerExposureMode === "network-accessible" ? (
-                    "Restart and enable"
-                  ) : (
-                    "Restart and disable"
-                  )}
-                </Button>
-              </AlertDialogFooter>
-            </AlertDialogPopup>
-          </AlertDialog>
+            <ScrollArea
+              scrollFade
+              className="max-h-[22.5rem]"
+              data-testid="authorized-clients-scroll-area"
+            >
+              {renderAuthorizedClients("current")}
+            </ScrollArea>
+          </SettingsSection>
           <AlertDialog
             open={disableTailscaleServeDialogOpen}
             onOpenChange={(open) => {
