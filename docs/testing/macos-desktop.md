@@ -182,8 +182,9 @@ report the residual instead of attempting a destructive repair.
 
 ## Packaged UI scenarios
 
-Use Codex Computer Use, not Orca. Confirm the executable path and PID before
-using any frame as evidence. At normal and minimum sizes verify:
+Use Codex Computer Use to operate the packaged executable. Confirm the
+executable path and PID before using any frame as evidence. At normal and
+minimum sizes verify:
 
 - Add Project has no Host selector or remote-device choice for the local Mac;
 - Settings shows **Remote Servers** with **Connect to a host** and **Share this

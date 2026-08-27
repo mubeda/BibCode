@@ -141,8 +141,9 @@ user profile globally.
 
 ## Packaged UI scenarios
 
-Use Codex Computer Use, not Orca. Capture the actual X11/Wayland and desktop
-environment in the report. At normal and minimum sizes verify:
+Use Codex Computer Use to operate the packaged executable. Capture the actual
+X11/Wayland and desktop environment in the report. At normal and minimum sizes
+verify:
 
 - Add Project has no Host selector or remote-device choice when only the local
   Linux environment is supported;
