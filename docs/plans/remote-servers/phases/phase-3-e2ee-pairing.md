@@ -1019,7 +1019,7 @@ Mount the route; run handshake → in-channel `e2ee_auth` (pairing form performs
 
 #### Cycle A — session transport marker and no-downgrade checks
 
-- [ ] **Step A1: Write the failing unit tests** (in `apps/server/src/auth/service.rs` `mod tests`, following its existing `AuthService::new` fixtures):
+- [x] **Step A1: Write the failing unit tests** (in `apps/server/src/auth/service.rs` `mod tests`, following its existing `AuthService::new` fixtures):
 
 ```rust
 #[tokio::test]
@@ -1091,12 +1091,12 @@ async fn legacy_tokens_without_a_transport_claim_decode_as_plain() {
 
 (Write the third test for real by constructing `SessionClaims` without the new field — e.g. via a serde-json round trip that strips `tr` — and signing with the service's signer through a test seam; if no such seam exists, sign a claims JSON built by hand with the same `TokenSigner`.)
 
-- [ ] **Step A2: Run to verify failure**
+- [x] **Step A2: Run to verify failure**
 
 Run: `cargo test -p bibcode-server auth::service`
 Expected: compile failure (no `SessionTransport`, wrong arities) — red.
 
-- [ ] **Step A3: Implement**
+- [x] **Step A3: Implement**
 
 `auth/token.rs`: add to `SessionClaims`:
 
@@ -1132,12 +1132,12 @@ impl SessionTransport {
 - `verify_websocket_ticket` is used only by the plain `/ws` route; tickets are minted from an authenticated principal, and principals from e2ee sessions can only try to fetch tickets over plain HTTP where their bearer is already rejected — no ticket change needed. State this in a comment on the function.
 - Update every existing caller (`auth/http.rs` handlers, `authenticate_request_for_method`, rpc context re-auth if any) to pass `SessionTransport::Plain`. `rg -n "authenticate_token|exchange_bootstrap|create_browser_session" apps/server/src` and fix all sites; the compiler enforces completeness.
 
-- [ ] **Step A4: Run to verify pass**
+- [x] **Step A4: Run to verify pass**
 
 Run: `cargo test -p bibcode-server auth && cargo test -p bibcode-server --test auth_http`
 Expected: PASS (existing HTTP behavior unchanged — all plain surfaces still authenticate plain-minted tokens).
 
-- [ ] **Step A5: Commit**
+- [x] **Step A5: Commit**
 
 ```bash
 git add apps/server/src/auth/token.rs apps/server/src/auth/service.rs apps/server/src/auth/http.rs

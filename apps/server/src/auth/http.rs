@@ -69,7 +69,11 @@ async fn browser_session(
 ) -> Response {
     let response = match state
         .auth
-        .create_browser_session(payload.credential.trim(), client_metadata(&headers, None))
+        .create_browser_session(
+            payload.credential.trim(),
+            client_metadata(&headers, None),
+            super::SessionTransport::Plain,
+        )
         .await
     {
         Ok(issued) => {
@@ -174,6 +178,7 @@ async fn token_inner(
             requested_scopes,
             presented,
             proof_key_thumbprint,
+            super::SessionTransport::Plain,
         )
         .await?;
     let expires_in = ((issued.principal.expires_at_ms - now_ms()) / 1_000).max(0);
@@ -393,7 +398,9 @@ async fn authenticate_request_for_method(
         .map(str::trim);
     let token = cookie.or(bearer).or(dpop).filter(|value| !value.is_empty());
     let token = token.ok_or(AuthError::MissingCredential)?;
-    let principal = auth.authenticate_token(token).await?;
+    let principal = auth
+        .authenticate_token(token, super::SessionTransport::Plain)
+        .await?;
     if let Some(expected_thumbprint) = principal.proof_key_thumbprint.as_deref() {
         let dpop_token = dpop.filter(|candidate| *candidate == token);
         let dpop_token = dpop_token.ok_or(AuthError::InvalidCredential)?;
