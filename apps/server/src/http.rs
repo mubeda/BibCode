@@ -38,6 +38,7 @@ use crate::{
 };
 
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
+pub(crate) const WS_E2EE_PATH: &str = "/ws-e2ee";
 pub(crate) const REMOTE_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1;
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
@@ -99,6 +100,7 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/connect/mint-credential"),
     route(RouteMethod::Post, "/api/bibcode-connect/mint-credential"),
     route(RouteMethod::Get, "/ws"),
+    route(RouteMethod::Get, WS_E2EE_PATH),
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
     route(RouteMethod::Post, DESKTOP_SHUTDOWN_PATH),
@@ -139,6 +141,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(MAINTENANCE_UPDATE_CANCEL_PATH, post(update_cancel))
         .route(MAINTENANCE_UPDATE_STATUS_PATH, get(update_status))
         .route("/ws", get(websocket))
+        .route(WS_E2EE_PATH, get(websocket_e2ee))
         .fallback(static_or_dev)
         .layer(middleware::from_fn_with_state(
             state.admission_gate.clone(),
@@ -226,22 +229,8 @@ async fn websocket(
             auth.mark_connected(&session_id).await;
             upgrade
                 .on_upgrade(move |socket| async move {
-                    let expiration_shutdown = session_shutdown.clone();
-                    let expiration_guard = tokio::spawn(async move {
-                        let remaining_ms = expires_at_ms.saturating_sub(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-                                .unwrap_or(i64::MAX),
-                        );
-                        tokio::select! {
-                            () = expiration_shutdown.cancelled() => {}
-                            () = tokio::time::sleep(std::time::Duration::from_millis(
-                                u64::try_from(remaining_ms.max(0)).unwrap_or_default(),
-                            )) => expiration_shutdown.cancel(),
-                        }
-                    });
+                    let expiration_guard =
+                        spawn_session_expiration_guard(expires_at_ms, session_shutdown.clone());
                     run_session(
                         socket,
                         state.rpc_registry,
@@ -257,6 +246,42 @@ async fn websocket(
         }
         Err(error) => auth::auth_error_response(error),
     }
+}
+
+async fn websocket_e2ee(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+    let session_shutdown = state.shutdown.child_token();
+    upgrade
+        .on_upgrade(move |socket| {
+            crate::rpc::run_e2ee_session(
+                socket,
+                state.auth,
+                state.rpc_registry,
+                state.config,
+                session_shutdown,
+            )
+        })
+        .into_response()
+}
+
+pub(crate) fn spawn_session_expiration_guard(
+    expires_at_ms: i64,
+    session_shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let remaining_ms = expires_at_ms.saturating_sub(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                .unwrap_or(i64::MAX),
+        );
+        tokio::select! {
+            () = session_shutdown.cancelled() => {}
+            () = tokio::time::sleep(std::time::Duration::from_millis(
+                u64::try_from(remaining_ms.max(0)).unwrap_or_default(),
+            )) => session_shutdown.cancel(),
+        }
+    })
 }
 
 #[derive(Serialize)]

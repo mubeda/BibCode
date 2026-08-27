@@ -1,14 +1,28 @@
-#![expect(
-    dead_code,
-    reason = "the /ws-e2ee route consumes this channel in Phase 3 Task 5"
-)]
+use std::{
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 
-use std::{ops::AsyncFnMut, time::Duration};
+#[cfg(test)]
+use std::ops::AsyncFnMut;
 
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use futures_util::{SinkExt, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
+use thiserror::Error;
+use tokio::{sync::Semaphore, time::timeout};
+use tokio_util::sync::{CancellationToken, PollSender};
 
-use crate::auth::{HostIdentity, NOISE_NK_PARAMS};
+use super::{
+    RpcRegistry, RpcSessionContext,
+    session::{PUMP_JOIN_TIMEOUT, SOCKET_WRITE_TIMEOUT, run_session_split},
+};
+use crate::{
+    auth::{AuthService, HostIdentity, NOISE_NK_PARAMS, Principal, SessionTransport},
+    config::ServerConfig,
+    http::spawn_session_expiration_guard,
+};
 
 pub(crate) const MAX_E2EE_CIPHERTEXT_BYTES: usize = 65_535;
 const NOISE_TAG_BYTES: usize = 16;
@@ -23,12 +37,20 @@ pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
 
-#[derive(Debug)]
+static E2EE_PREAUTH_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)));
+
+#[derive(Debug, Error)]
 pub(crate) enum E2eeSessionError {
+    #[error("Noise handshake rejected")]
     Handshake,
+    #[error("E2EE protocol violation: {0}")]
     Protocol(String),
+    #[error("E2EE cryptographic operation failed: {0}")]
     Crypto(String),
+    #[error("E2EE transport closed")]
     Closed,
+    #[error("E2EE transport operation timed out")]
     Timeout,
 }
 
@@ -38,6 +60,7 @@ pub(crate) struct E2eeChannel {
 }
 
 impl E2eeChannel {
+    #[cfg(test)]
     pub(crate) async fn respond<Rx, Tx>(
         host_identity: &HostIdentity,
         mut recv_binary_frame: Rx,
@@ -47,6 +70,21 @@ impl E2eeChannel {
         Rx: AsyncFnMut() -> Option<Vec<u8>>,
         Tx: AsyncFnMut(Vec<u8>) -> Result<(), E2eeSessionError>,
     {
+        let message_a = recv_binary_frame().await.ok_or(E2eeSessionError::Closed)?;
+        let (channel, message_b) = Self::respond_to_message_a(host_identity, &message_a)?;
+        send_binary_frame(message_b).await?;
+        Ok(channel)
+    }
+
+    fn respond_to_message_a(
+        host_identity: &HostIdentity,
+        message_a: &[u8],
+    ) -> Result<(Self, Vec<u8>), E2eeSessionError> {
+        if message_a.len() > MAX_E2EE_CIPHERTEXT_BYTES {
+            return Err(E2eeSessionError::Protocol(
+                "oversized handshake frame".into(),
+            ));
+        }
         let params = NOISE_NK_PARAMS
             .parse()
             .map_err(|error| E2eeSessionError::Protocol(format!("noise params: {error:?}")))?;
@@ -56,15 +94,9 @@ impl E2eeChannel {
             .build_responder()
             .map_err(|error| E2eeSessionError::Protocol(format!("responder: {error:?}")))?;
 
-        let message_a = recv_binary_frame().await.ok_or(E2eeSessionError::Closed)?;
-        if message_a.len() > MAX_E2EE_CIPHERTEXT_BYTES {
-            return Err(E2eeSessionError::Protocol(
-                "oversized handshake frame".into(),
-            ));
-        }
         let mut payload = vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES];
         let payload_len = responder
-            .read_message(&message_a, &mut payload)
+            .read_message(message_a, &mut payload)
             .map_err(|_| E2eeSessionError::Handshake)?;
         if payload_len != 0 {
             return Err(E2eeSessionError::Protocol(
@@ -77,15 +109,17 @@ impl E2eeChannel {
             .write_message(&[], &mut message_b)
             .map_err(|error| E2eeSessionError::Crypto(format!("message B: {error:?}")))?;
         message_b.truncate(len);
-        send_binary_frame(message_b).await?;
 
         let transport = responder
             .into_transport_mode()
             .map_err(|error| E2eeSessionError::Crypto(format!("transport: {error:?}")))?;
-        Ok(Self {
-            transport,
-            assembling: Vec::new(),
-        })
+        Ok((
+            Self {
+                transport,
+                assembling: Vec::new(),
+            },
+            message_b,
+        ))
     }
 
     pub(crate) fn encrypt_message(
@@ -194,6 +228,357 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
 
 pub(crate) fn e2ee_error_json(code: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({ "type": "e2ee_error", "code": code })).expect("static JSON")
+}
+
+pub(crate) enum E2eeAccept {
+    Authenticated {
+        principal: Principal,
+        minted: Option<MintedE2eeSession>,
+    },
+    Unauthenticated,
+}
+
+pub(crate) struct MintedE2eeSession {
+    pub credential: String,
+}
+
+enum EstablishOutcome {
+    Accepted {
+        channel: E2eeChannel,
+        accept: E2eeAccept,
+    },
+    Rejected {
+        channel: E2eeChannel,
+        code: &'static str,
+    },
+}
+
+/// Runs the complete `/ws-e2ee` lifecycle: Noise NK, encrypted credential
+/// bootstrap, then the unchanged RPC protocol over encrypted records.
+pub(crate) async fn run_e2ee_session(
+    socket: WebSocket,
+    auth: AuthService,
+    registry: RpcRegistry,
+    config: Arc<ServerConfig>,
+    session_shutdown: CancellationToken,
+) {
+    let Ok(preauth_permit) = Arc::clone(&E2EE_PREAUTH_PERMITS).try_acquire_owned() else {
+        let mut socket = socket;
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "busy".into(),
+            })))
+            .await;
+        return;
+    };
+
+    let (mut ws_writer, mut ws_reader) = socket.split();
+    let established = timeout(E2EE_HANDSHAKE_TIMEOUT, async {
+        let message_a = next_binary_frame(&mut ws_reader)
+            .await
+            .ok_or(E2eeSessionError::Closed)?;
+        let (mut channel, message_b) =
+            E2eeChannel::respond_to_message_a(auth.host_identity(), &message_a)?;
+        timeout(
+            SOCKET_WRITE_TIMEOUT,
+            ws_writer.send(Message::Binary(message_b.into())),
+        )
+        .await
+        .map_err(|_| E2eeSessionError::Timeout)?
+        .map_err(|_| E2eeSessionError::Closed)?;
+
+        let auth_bytes = loop {
+            let frame = next_binary_frame(&mut ws_reader)
+                .await
+                .ok_or(E2eeSessionError::Closed)?;
+            if let Some(message) = channel.decrypt_frame(&frame, MAX_E2EE_PREAUTH_MESSAGE_BYTES)? {
+                break message;
+            }
+        };
+        let Ok(message) = serde_json::from_slice::<E2eeAuthMessage>(&auth_bytes) else {
+            return Ok(EstablishOutcome::Rejected {
+                channel,
+                code: "protocol",
+            });
+        };
+        if message.r#type != "e2ee_auth" {
+            return Ok(EstablishOutcome::Rejected {
+                channel,
+                code: "protocol",
+            });
+        }
+
+        let accept = if config.unsafe_no_auth {
+            E2eeAccept::Unauthenticated
+        } else {
+            match (message.pairing, message.bearer) {
+                (Some(pairing), None) => {
+                    let Ok(issued) = auth
+                        .exchange_bootstrap(
+                            &pairing,
+                            None,
+                            e2ee_client_metadata(),
+                            None,
+                            SessionTransport::E2ee,
+                        )
+                        .await
+                    else {
+                        return Ok(EstablishOutcome::Rejected {
+                            channel,
+                            code: "unauthorized",
+                        });
+                    };
+                    E2eeAccept::Authenticated {
+                        principal: issued.principal,
+                        minted: Some(MintedE2eeSession {
+                            credential: issued.token,
+                        }),
+                    }
+                }
+                (None, Some(bearer)) => {
+                    let Ok(principal) = auth
+                        .authenticate_token(&bearer, SessionTransport::E2ee)
+                        .await
+                    else {
+                        return Ok(EstablishOutcome::Rejected {
+                            channel,
+                            code: "unauthorized",
+                        });
+                    };
+                    E2eeAccept::Authenticated {
+                        principal,
+                        minted: None,
+                    }
+                }
+                _ => {
+                    return Ok(EstablishOutcome::Rejected {
+                        channel,
+                        code: "protocol",
+                    });
+                }
+            }
+        };
+
+        let reply = match &accept {
+            E2eeAccept::Authenticated {
+                minted: Some(minted),
+                ..
+            } => e2ee_authenticated_with_credential_json(
+                &minted.credential,
+                &config.environment_id,
+                &config
+                    .storage_instance_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+            ),
+            E2eeAccept::Authenticated { minted: None, .. } | E2eeAccept::Unauthenticated => {
+                e2ee_authenticated_json()
+            }
+        };
+        send_encrypted_frames(&mut ws_writer, &mut channel, &reply).await?;
+        Ok::<_, E2eeSessionError>(EstablishOutcome::Accepted { channel, accept })
+    })
+    .await;
+    drop(preauth_permit);
+
+    let (channel, accept) = match established {
+        Ok(Ok(EstablishOutcome::Accepted { channel, accept })) => (channel, accept),
+        Ok(Ok(EstablishOutcome::Rejected { mut channel, code })) => {
+            let _ =
+                send_encrypted_frames(&mut ws_writer, &mut channel, &e2ee_error_json(code)).await;
+            let _ = ws_writer.close().await;
+            return;
+        }
+        Ok(Err(E2eeSessionError::Handshake)) => {
+            let _ = ws_writer
+                .send(Message::Close(Some(CloseFrame {
+                    code: E2EE_HOST_IDENTITY_CLOSE_CODE,
+                    reason: "host-identity".into(),
+                })))
+                .await;
+            return;
+        }
+        Ok(Err(_)) | Err(_) => {
+            let _ = ws_writer.close().await;
+            return;
+        }
+    };
+
+    run_established_e2ee(
+        ws_writer,
+        ws_reader,
+        channel,
+        accept,
+        auth,
+        registry,
+        session_shutdown,
+    )
+    .await;
+}
+
+async fn next_binary_frame(
+    reader: &mut futures_util::stream::SplitStream<WebSocket>,
+) -> Option<Vec<u8>> {
+    loop {
+        match reader.next().await? {
+            Ok(Message::Binary(frame)) => return Some(frame.to_vec()),
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Ok(Message::Text(_) | Message::Close(_)) | Err(_) => return None,
+        }
+    }
+}
+
+async fn send_encrypted_frames(
+    writer: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    channel: &mut E2eeChannel,
+    plaintext: &[u8],
+) -> Result<(), E2eeSessionError> {
+    for frame in channel.encrypt_message(plaintext)? {
+        timeout(
+            SOCKET_WRITE_TIMEOUT,
+            writer.send(Message::Binary(frame.into())),
+        )
+        .await
+        .map_err(|_| E2eeSessionError::Timeout)?
+        .map_err(|_| E2eeSessionError::Closed)?;
+    }
+    Ok(())
+}
+
+async fn run_established_e2ee(
+    mut ws_writer: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut ws_reader: futures_util::stream::SplitStream<WebSocket>,
+    channel: E2eeChannel,
+    accept: E2eeAccept,
+    auth: AuthService,
+    registry: RpcRegistry,
+    session_shutdown: CancellationToken,
+) {
+    let channel = Arc::new(Mutex::new(channel));
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Result<Message, axum::Error>>(64);
+
+    let outbound_shutdown = session_shutdown.clone();
+    let outbound_channel = Arc::clone(&channel);
+    let outbound_pump = tokio::spawn(async move {
+        while let Some(message) = outbound_rx.recv().await {
+            let frames = match &message {
+                Message::Text(text) => outbound_channel
+                    .lock()
+                    .expect("E2EE channel lock")
+                    .encrypt_message(text.as_bytes()),
+                Message::Binary(bytes) => outbound_channel
+                    .lock()
+                    .expect("E2EE channel lock")
+                    .encrypt_message(bytes),
+                Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) => continue,
+            };
+            let Ok(frames) = frames else { break };
+            let mut failed = false;
+            for frame in frames {
+                if !matches!(
+                    timeout(
+                        SOCKET_WRITE_TIMEOUT,
+                        ws_writer.send(Message::Binary(frame.into())),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+        let _ = timeout(SOCKET_WRITE_TIMEOUT, ws_writer.close()).await;
+        outbound_shutdown.cancel();
+    });
+
+    let inbound_shutdown = session_shutdown.clone();
+    let inbound_channel = Arc::clone(&channel);
+    let inbound_pump = tokio::spawn(async move {
+        while let Some(frame) = ws_reader.next().await {
+            let message = match frame {
+                Ok(Message::Binary(bytes)) => match inbound_channel
+                    .lock()
+                    .expect("E2EE channel lock")
+                    .decrypt_frame(&bytes, MAX_E2EE_LOGICAL_MESSAGE_BYTES)
+                {
+                    Ok(Some(plaintext)) => Message::Binary(plaintext.into()),
+                    Ok(None) => continue,
+                    Err(_) => break,
+                },
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Ok(Message::Close(_)) | Err(_) | Ok(Message::Text(_)) => break,
+            };
+            if inbound_tx.send(Ok(message)).await.is_err() {
+                break;
+            }
+        }
+        inbound_shutdown.cancel();
+    });
+
+    let (context, expiration_guard, connected_session_id) = match accept {
+        E2eeAccept::Authenticated { principal, .. } => {
+            auth.mark_connected(&principal.session_id).await;
+            let session_id = principal.session_id.clone();
+            let expires_at_ms = principal.expires_at_ms;
+            (
+                RpcSessionContext::authenticated(principal, auth.clone()),
+                Some(spawn_session_expiration_guard(
+                    expires_at_ms,
+                    session_shutdown.clone(),
+                )),
+                Some(session_id),
+            )
+        }
+        E2eeAccept::Unauthenticated => (RpcSessionContext::unauthenticated(), None, None),
+    };
+
+    let writer_sink = PollSender::new(outbound_tx);
+    let reader_stream = stream::unfold(inbound_rx, |mut receiver| async {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    run_session_split(
+        writer_sink,
+        reader_stream,
+        registry,
+        context,
+        session_shutdown.clone(),
+    )
+    .await;
+
+    session_shutdown.cancel();
+    if let Some(expiration_guard) = expiration_guard {
+        let _ = expiration_guard.await;
+    }
+    reap_pump(outbound_pump).await;
+    reap_pump(inbound_pump).await;
+    if let Some(session_id) = connected_session_id {
+        auth.mark_disconnected(&session_id).await;
+    }
+}
+
+async fn reap_pump(mut pump: tokio::task::JoinHandle<()>) {
+    if timeout(PUMP_JOIN_TIMEOUT, &mut pump).await.is_err() {
+        pump.abort();
+        let _ = pump.await;
+    }
+}
+
+fn e2ee_client_metadata() -> crate::auth::ClientMetadata {
+    crate::auth::ClientMetadata {
+        label: None,
+        ip_address: None,
+        user_agent: None,
+        device_type: "unknown".to_owned(),
+        os: None,
+        browser: None,
+    }
 }
 
 #[cfg(test)]
