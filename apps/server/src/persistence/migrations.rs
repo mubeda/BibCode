@@ -672,6 +672,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(43, "DurableWorktreeRemovalReceipts", migration_043),
     Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
+    Migration::new(46, "AuthPairingReach", migration_046),
 ];
 
 impl Migration {
@@ -2389,6 +2390,18 @@ fn migration_045(transaction: &Transaction<'_>) -> Result<()> {
             transaction.execute_batch(
                 "ALTER TABLE projection_threads ADD COLUMN unresolved_delivery_detail TEXT",
             )?;
+        }
+    }
+    Ok(())
+}
+
+fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
+    for table in ["auth_pairing_links", "auth_sessions"] {
+        for (column, definition) in [("reach", "reach TEXT"), ("off_host", "off_host INTEGER")] {
+            if !table_has_column(transaction, table, column)? {
+                transaction
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
+            }
         }
     }
     Ok(())

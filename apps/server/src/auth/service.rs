@@ -1110,6 +1110,8 @@ fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
         expires_at: format_iso(record.expires_at_ms),
         consumed_at: record.consumed_at_ms.map(format_iso),
         revoked_at: record.revoked_at_ms.map(format_iso),
+        reach: None,
+        off_host: None,
     }
 }
 
@@ -1129,6 +1131,8 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
         },
         issued_at: format_iso(record.issued_at_ms),
         expires_at: format_iso(record.expires_at_ms),
+        reach: None,
+        off_host: None,
     }
 }
 
