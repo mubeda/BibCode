@@ -3430,7 +3430,7 @@ export class RecordAssembler {
 }
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 import { describe, expect, it } from "@effect/vitest";
@@ -3503,12 +3503,12 @@ describe("e2ee record layer", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/frame.test.ts`
 Expected: FAIL (module missing).
 
-- [ ] **Step 3: Implement `frame.ts`**
+- [x] **Step 3: Implement `frame.ts`**
 
 ```ts
 import { MAX_NOISE_MESSAGE_BYTES, NOISE_TAG_BYTES } from "./noise.ts";
@@ -3574,12 +3574,12 @@ export class RecordAssembler {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/frame.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src/e2ee/frame.ts packages/client-runtime/src/e2ee/frame.test.ts
