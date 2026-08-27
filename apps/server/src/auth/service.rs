@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use super::{
+    HostIdentity,
     dpop::DpopVerifier,
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
@@ -57,6 +58,7 @@ pub enum AuthError {
 #[derive(Clone)]
 pub struct AuthService {
     descriptor: AuthDescriptor,
+    host_identity: HostIdentity,
     desktop_bootstrap: Option<DesktopBootstrap>,
     signer: TokenSigner,
     state: Arc<Mutex<AuthState>>,
@@ -123,7 +125,13 @@ impl AuthService {
     #[must_use]
     #[cfg(test)]
     pub fn new(config: &ServerConfig, signing_secret: Vec<u8>) -> Self {
-        Self::build(config, signing_secret, None, None)
+        Self::build(
+            config,
+            signing_secret,
+            HostIdentity::generate_ephemeral(),
+            None,
+            None,
+        )
     }
 
     pub(crate) async fn new_with_persistence(
@@ -132,9 +140,13 @@ impl AuthService {
         secret_store: SecretStore,
         repositories: Repositories,
     ) -> Result<Self, AuthError> {
+        let host_identity = HostIdentity::load_or_generate(&secret_store)
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
         let service = Self::build(
             config,
             signing_secret,
+            host_identity,
             Some(secret_store),
             Some(repositories),
         );
@@ -145,6 +157,7 @@ impl AuthService {
     fn build(
         config: &ServerConfig,
         signing_secret: Vec<u8>,
+        host_identity: HostIdentity,
         secret_store: Option<SecretStore>,
         repositories: Option<Repositories>,
     ) -> Self {
@@ -186,6 +199,7 @@ impl AuthService {
                 ],
                 session_cookie_name,
             },
+            host_identity,
             desktop_bootstrap,
             signer: TokenSigner::new(signing_secret),
             state: Arc::new(Mutex::new(AuthState::default())),
@@ -233,6 +247,11 @@ impl AuthService {
     #[must_use]
     pub fn descriptor(&self) -> AuthDescriptor {
         self.descriptor.clone()
+    }
+
+    #[must_use]
+    pub fn host_identity(&self) -> &HostIdentity {
+        &self.host_identity
     }
 
     #[must_use]
