@@ -276,6 +276,8 @@ impl ServerRuntime {
                         .storage_instance_id
                         .expect("a running server has a prepared persistent store")
                         .to_string(),
+                    "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
+                    "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
                     "capabilities": { "repositoryIdentity": true },
                 });
                 let connect = Arc::new(

@@ -249,7 +249,7 @@ git commit -m "feat(contracts): add remote protocol compatibility window to the 
 - Consumes: the wire keys pinned by Task 1 — `remoteProtocolVersion`, `minCompatibleRemoteProtocol`, both serialized as `1` by a current server.
 - Produces: `pub(crate) const REMOTE_PROTOCOL_VERSION: u32 = 1` and `pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1` in `apps/server/src/http.rs`, referenced by the other two producers as `crate::http::REMOTE_PROTOCOL_VERSION` / `crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL` (precedent: `apps/server/src/auth/http.rs` already imports `crate::http::AppState`).
 
-- [ ] **Step 1: Write the failing Rust tests**
+- [x] **Step 1: Write the failing Rust tests**
 
 In the `#[cfg(test)] mod tests` of `apps/server/src/production/control.rs`, next to `environment_descriptor_advertises_complete_worktree_catalog_surface`, add:
 
@@ -271,14 +271,14 @@ In `apps/server/tests/server_runtime.rs`, inside `binds_an_ephemeral_port_and_se
     assert_eq!(descriptor["minCompatibleRemoteProtocol"], 1);
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p bibcode-server --lib environment_descriptor_advertises_the_protocol_compatibility_window`
 Expected: FAIL — `descriptor["remoteProtocolVersion"]` is `null`, not `1`.
 Run: `cargo test -p bibcode-server --test server_runtime binds_an_ephemeral_port_and_serves_the_environment_descriptor`
 Expected: FAIL on the new assertion.
 
-- [ ] **Step 3: Write the minimal implementation (all three producers)**
+- [x] **Step 3: Write the minimal implementation (all three producers)**
 
 `apps/server/src/http.rs` — constants next to the route path, and the two struct fields (serde is already `rename_all = "camelCase"`, so the snake_case field names serialize to the pinned wire keys):
 
@@ -349,21 +349,21 @@ and in the `environment_descriptor` handler:
                 });
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-server --lib environment_descriptor`
 Expected: PASS (the new window test plus the two pre-existing `environment_descriptor_*` tests).
 Run: `cargo test -p bibcode-server --test server_runtime binds_an_ephemeral_port_and_serves_the_environment_descriptor`
 Expected: PASS.
 
-- [ ] **Step 5: Rust gate for the touched crate**
+- [x] **Step 5: Rust gate for the touched crate**
 
 Run: `cargo fmt --all --check`
 Expected: no diff.
 Run: `cargo clippy -p bibcode-server --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add apps/server/src/http.rs apps/server/src/production/control.rs apps/server/src/lifecycle.rs apps/server/tests/server_runtime.rs
