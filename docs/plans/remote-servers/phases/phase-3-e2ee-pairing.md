@@ -421,12 +421,12 @@ pub(crate) async fn run_session_split<W, R>(
 
 Task 5 consumes `run_session_split` with channel-backed halves.
 
-- [ ] **Step 1: Establish the green baseline**
+- [x] **Step 1: Establish the green baseline**
 
 Run: `cargo test -p bibcode-server --test activity_rpc && cargo test -p bibcode-server rpc`
 Expected: PASS. Record the passing test names — they are the safety net for this refactor (no new tests are added here; a pure refactor is proven by existing coverage).
 
-- [ ] **Step 2: Refactor**
+- [x] **Step 2: Refactor**
 
 In `apps/server/src/rpc/session.rs`:
 
@@ -466,12 +466,12 @@ pub(crate) async fn run_session_split<W, R>(
 
 Move the entire existing body (writer task, in-flight map, dispatch loop, drain) into `run_session_split` unchanged. Do not alter behavior: same `OUTBOUND_CAPACITY`, same `SOCKET_WRITE_TIMEOUT`, same `matches!(timeout(...), Ok(Ok(())))` write checks (these compile unchanged under the generic `W`).
 
-- [ ] **Step 3: Run the baseline tests again**
+- [x] **Step 3: Run the baseline tests again**
 
 Run: `cargo test -p bibcode-server --test activity_rpc && cargo test -p bibcode-server rpc && cargo clippy -p bibcode-server --all-targets -- -D warnings`
 Expected: PASS with zero behavior diffs.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add apps/server/src/rpc/session.rs apps/server/src/rpc/mod.rs

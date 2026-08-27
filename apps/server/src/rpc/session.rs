@@ -4,7 +4,7 @@ use std::{
 };
 
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
     sync::{mpsc, watch},
@@ -317,7 +317,31 @@ pub(crate) async fn run_session(
     context: RpcSessionContext,
     session_shutdown: CancellationToken,
 ) {
-    let (mut socket_writer, mut socket_reader) = socket.split();
+    let (socket_writer, socket_reader) = socket.split();
+    run_session_split(
+        socket_writer,
+        socket_reader,
+        registry,
+        context,
+        session_shutdown,
+    )
+    .await;
+}
+
+pub(crate) async fn run_session_split<W, R>(
+    socket_writer: W,
+    socket_reader: R,
+    registry: RpcRegistry,
+    context: RpcSessionContext,
+    session_shutdown: CancellationToken,
+) where
+    W: Sink<Message> + Unpin + Send + 'static,
+    W::Error: Send,
+    R: Stream<Item = Result<Message, axum::Error>> + Send,
+{
+    let mut socket_writer = socket_writer;
+    let socket_reader = socket_reader;
+    let mut socket_reader = std::pin::pin!(socket_reader);
     let (outbound_sender, mut outbound_receiver) =
         mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
     let writer_shutdown = session_shutdown.clone();
