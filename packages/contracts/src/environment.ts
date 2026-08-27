@@ -51,9 +51,7 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   remoteProtocolVersion: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
-  minCompatibleRemoteProtocol: NonNegativeInt.pipe(
-    Schema.withDecodingDefault(Effect.succeed(0)),
-  ),
+  minCompatibleRemoteProtocol: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   capabilities: ExecutionEnvironmentCapabilities,
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;
