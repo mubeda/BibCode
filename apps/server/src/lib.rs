@@ -26,6 +26,7 @@ pub mod project;
 pub mod provider;
 pub mod provider_terminal;
 pub mod provider_usage;
+pub mod remote_update;
 pub mod review;
 mod rpc;
 pub mod server_settings;
@@ -61,6 +62,11 @@ pub use maintenance::{
     MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
     MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult, RpcAdmissionGate, RpcMutability,
     http_mutability, rpc_mutability,
+};
+pub use remote_update::{
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
+    RemoteUpdateService, RemoteUpdateSnapshot, RemoteUpdateState, RemoteUpdateSupport,
+    RemoteUpdateSupportReason, remote_update_manual_required_error,
 };
 pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,

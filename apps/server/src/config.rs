@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::StorageInstanceId;
+use crate::remote_update::RemoteUpdateSupport;
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -54,6 +55,9 @@ pub struct ServerConfig {
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    /// How this server can be updated remotely (spec section 4.5). Headless
+    /// default is manual; the desktop host overrides at launch.
+    pub remote_update_support: RemoteUpdateSupport,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
 }
@@ -82,6 +86,7 @@ impl ServerConfig {
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
         }
@@ -91,6 +96,12 @@ impl ServerConfig {
     pub fn with_bind(mut self, host: impl Into<String>, port: u16) -> Self {
         self.host = host.into();
         self.port = port;
+        self
+    }
+
+    #[must_use]
+    pub fn with_remote_update_support(mut self, support: RemoteUpdateSupport) -> Self {
+        self.remote_update_support = support;
         self
     }
 
@@ -175,6 +186,18 @@ mod tests {
             ServerConfig::new("state")
                 .with_desktop(String::new())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn server_config_defaults_to_manual_remote_update_support() {
+        let config = ServerConfig::new("/tmp/bibcode-test");
+        assert_eq!(
+            config.remote_update_support,
+            crate::remote_update::RemoteUpdateSupport {
+                install_mode: crate::remote_update::RemoteUpdateInstallMode::Manual,
+                reason: crate::remote_update::RemoteUpdateSupportReason::ManualUpdateRequired,
+            }
         );
     }
 
