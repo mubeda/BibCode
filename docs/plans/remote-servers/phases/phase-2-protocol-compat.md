@@ -389,7 +389,7 @@ git commit -m "feat(server): publish the remote protocol compatibility window on
 - Evaluation order is normative: legacy (both fields 0) → server-too-old → client-too-old → compatible.
 - Per amended spec §4.4 there is **no separate probe-failure cache**: failed descriptor probes are throttled by the supervisor's existing 1/2/4/8/16 s reconnection backoff (`packages/client-runtime/src/connection/supervisor.ts`), which this phase does not touch. Do not introduce a cache constant or caching logic.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `packages/client-runtime/src/connection/compat.test.ts` (runner style follows the neighboring `presentation.test.ts`: `@effect/vitest`):
 
@@ -443,12 +443,12 @@ describe("protocol compatibility verdict", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `vp test run packages/client-runtime/src/connection/compat.test.ts`
 Expected: FAIL — module `./compat.ts` does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 Create `packages/client-runtime/src/connection/compat.ts`:
 
@@ -520,12 +520,12 @@ export * from "./catalog.ts";
 export * from "./compat.ts";
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run packages/client-runtime/src/connection/compat.test.ts`
 Expected: PASS (7 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src/connection/compat.ts packages/client-runtime/src/connection/compat.test.ts packages/client-runtime/src/connection/index.ts
