@@ -8,7 +8,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { type ReactNode, memo, useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   DesktopDiscoveredSshHost,
   DesktopSshEnvironmentTarget,
@@ -558,9 +558,11 @@ export const SERVER_UPDATE_CHECK_ENABLED = false;
 
 export function ConnectTab({
   initialPairingCode = null,
+  onPairingCodeConsumed,
   showServerUpdateCheck = SERVER_UPDATE_CHECK_ENABLED,
 }: {
   readonly initialPairingCode?: string | null;
+  readonly onPairingCodeConsumed?: () => void;
   readonly showServerUpdateCheck?: boolean;
 }) {
   const desktopBridge = window.desktopBridge;
@@ -628,6 +630,7 @@ export function ConnectTab({
   const [connectingSshHostAlias, setConnectingSshHostAlias] = useState<string | null>(null);
 
   const [addBackendDialogOpen, setAddBackendDialogOpen] = useState(false);
+  const initialPairingCodeConsumedRef = useRef(false);
   const [savedBackendMode, setSavedBackendMode] = useState<"pairing-code" | "manual" | "ssh">(
     "pairing-code",
   );
@@ -653,6 +656,11 @@ export function ConnectTab({
       ? 0
       : countRunningThreadsForEnvironment(threadShells, removalCandidate.environmentId);
   const onCheckForServerUpdates = useCallback(() => undefined, []);
+  const consumeInitialPairingCode = useCallback(() => {
+    if (initialPairingCode === null || initialPairingCodeConsumedRef.current) return;
+    initialPairingCodeConsumedRef.current = true;
+    onPairingCodeConsumed?.();
+  }, [initialPairingCode, onPairingCodeConsumed]);
   const normalizedPairingCode = normalizePairingCodeInput(pairingCodeInput);
   const decodedPairingCode = useMemo(() => {
     if (normalizedPairingCode === null) return null;
@@ -669,6 +677,7 @@ export function ConnectTab({
         classifyPairingEndpoint(decodedPairingCode.endpoint) === "loopback"));
   useEffect(() => {
     if (initialPairingCode === null) return;
+    initialPairingCodeConsumedRef.current = false;
     setPairingCodeInput(initialPairingCode);
     setSavedBackendMode("pairing-code");
     setTunnelAcknowledged(false);
@@ -731,6 +740,7 @@ export function ConnectTab({
     setTunnelAcknowledged(false);
     setFlowDemandsAcknowledgement(false);
     setAddBackendDialogOpen(false);
+    consumeInitialPairingCode();
     toastManager.add({
       type: "success",
       title: "Server added",
@@ -738,6 +748,7 @@ export function ConnectTab({
     });
   }, [
     connectRemoteServer,
+    consumeInitialPairingCode,
     normalizedPairingCode,
     requiresTunnelAcknowledgement,
     tunnelAcknowledged,
@@ -774,6 +785,7 @@ export function ConnectTab({
       setSavedBackendSshUsername("");
       setSavedBackendSshPort("");
       setAddBackendDialogOpen(false);
+      consumeInitialPairingCode();
       toastManager.add({
         type: "success",
         title: "Environment connected",
@@ -829,6 +841,7 @@ export function ConnectTab({
     setSavedBackendSshUsername("");
     setSavedBackendSshPort("");
     setAddBackendDialogOpen(false);
+    consumeInitialPairingCode();
     toastManager.add({
       type: "success",
       title: "Backend added",
@@ -838,6 +851,7 @@ export function ConnectTab({
   }, [
     connectPairing,
     connectSshEnvironment,
+    consumeInitialPairingCode,
     savedBackendHost,
     savedBackendMode,
     savedBackendPairingCode,
@@ -926,6 +940,7 @@ export function ConnectTab({
         setSavedBackendSshUsername("");
         setSavedBackendSshPort("");
         setAddBackendDialogOpen(false);
+        consumeInitialPairingCode();
         toastManager.add({
           type: "success",
           title: savedDesktopSshEnvironmentsByAlias[target.alias]
@@ -945,7 +960,12 @@ export function ConnectTab({
         }
       }
     },
-    [connectSshEnvironment, savedBackendMode, savedDesktopSshEnvironmentsByAlias],
+    [
+      connectSshEnvironment,
+      consumeInitialPairingCode,
+      savedBackendMode,
+      savedDesktopSshEnvironmentsByAlias,
+    ],
   );
   const handleSavedBackendHostChange = useCallback((value: string) => {
     const parsedPairingUrl = parsePairingUrlFields(value);
@@ -1245,6 +1265,7 @@ export function ConnectTab({
                 setAddBackendDialogOpen(open);
                 if (!open) {
                   setSavedBackendError(null);
+                  consumeInitialPairingCode();
                 }
               }}
             >

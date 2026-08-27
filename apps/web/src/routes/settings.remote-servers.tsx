@@ -11,6 +11,18 @@ export const Route = createFileRoute("/settings/remote-servers")({
 });
 
 function RemoteServersRouteView() {
-  const { tab } = Route.useSearch();
-  return <RemoteServersSettings initialTab={tab === "share" ? "share" : "connect"} />;
+  const { tab, code } = Route.useSearch();
+  const navigate = Route.useNavigate();
+  return (
+    <RemoteServersSettings
+      initialTab={tab === "share" ? "share" : "connect"}
+      initialPairingCode={code ?? null}
+      onPairingCodeConsumed={() => {
+        void navigate({
+          search: (previous) => (previous.tab === "share" ? { tab: "share" as const } : {}),
+          replace: true,
+        });
+      }}
+    />
+  );
 }
