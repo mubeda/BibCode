@@ -1,8 +1,11 @@
 import type {
   AuthBrowserSessionResult,
   AuthClientMetadata,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
+  AuthShareStateResult,
   RemotePairingReach,
   ServerAuthSessionMethod,
   AuthSessionId,
@@ -28,6 +31,8 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "exchange-bootstrap-credential",
   "fetch-environment-descriptor",
   "create-pairing-credential",
+  "create-pairing-offer",
+  "get-share-state",
   "list-pairing-links",
   "revoke-pairing-link",
   "list-client-sessions",
@@ -389,6 +394,44 @@ export async function createServerPairingCredential(input?: {
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "create-pairing-credential",
+      cause: error,
+    });
+  }
+}
+
+export async function createServerPairingOffer(
+  input: AuthCreatePairingOfferInput,
+  idempotencyKey: string,
+): Promise<AuthPairingOfferResult> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.auth.pairingOffer({
+            headers: { "idempotency-key": idempotencyKey },
+            payload: input,
+          }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "create-pairing-offer",
+      cause: error,
+    });
+  }
+}
+
+export async function getServerShareState(): Promise<AuthShareStateResult> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.auth.shareState({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "get-share-state",
       cause: error,
     });
   }
