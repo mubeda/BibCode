@@ -32,6 +32,11 @@
     "updater": {
       "pubkey": "",
       "endpoints": []
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["bibcode"]
+      }
     }
   },
   "bundle": {

@@ -83,6 +83,7 @@ macro_rules! bridge_command_names {
 pub fn run() {
     let shell_path_hydration = shell_environment::hydrate_process_path();
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .manage(backend::BackendSupervisor::new())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(context_menu::NativeContextMenuManager::new())
@@ -90,6 +91,7 @@ pub fn run() {
         .manage(ssh::SshPasswordPromptManager::new())
         .manage(updates::DesktopUpdateManager::new())
         .manage(preview::PreviewHostState::new())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
@@ -102,6 +104,14 @@ pub fn run() {
         shell_path_hydration.record();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            use tauri_plugin_deep_link::DeepLinkExt;
+            if let Err(error) = app.deep_link().register_all() {
+                tracing::warn!("failed to register bibcode:// deep-link handler: {error}");
+            }
+        }
 
         let update_app = app.handle().clone();
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
