@@ -1539,10 +1539,7 @@ describe("Remote Servers tabs", () => {
       const onAddServerActionConsumed = vi.fn();
 
       await mountConnections(
-        <ConnectTab
-          initialAddServerOpen
-          onAddServerActionConsumed={onAddServerActionConsumed}
-        />,
+        <ConnectTab initialAddServerOpen onAddServerActionConsumed={onAddServerActionConsumed} />,
       );
 
       expect(findControls("dialog", "true")).not.toHaveLength(0);

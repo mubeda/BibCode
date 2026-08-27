@@ -177,7 +177,8 @@ describe("EnvironmentRail", () => {
     h.activeEnvironmentId = ENV_PRIMARY;
     renderRail();
     const remote = buttonByTestId(`environment-rail-entry-${ENV_REMOTE}`);
-    (remote?.onClick as () => void)();
+    expect(remote).toBeDefined();
+    (remote!.onClick as () => void)();
     expect(h.setActiveEnvironmentId).toHaveBeenCalledExactlyOnceWith(ENV_REMOTE);
     expect(h.navigate).not.toHaveBeenCalled();
     expect(h.catalogCommandCalls).toEqual([]);
@@ -200,7 +201,9 @@ describe("EnvironmentRail", () => {
     h.activeEnvironmentId = ENV_PRIMARY;
     renderRail();
     expect(h.menuItems.map((item) => item.children)).toEqual(["This device", "Ubuntu"]);
-    (h.menuItems[1]?.onClick as () => void)();
+    const ubuntu = h.menuItems[1];
+    expect(ubuntu).toBeDefined();
+    (ubuntu!.onClick as () => void)();
     expect(h.setActiveEnvironmentId).toHaveBeenCalledExactlyOnceWith(ENV_WSL);
   });
 
@@ -214,12 +217,16 @@ describe("EnvironmentRail", () => {
       }),
     ];
     renderRail();
-    (buttonByTestId("environment-rail-add-server")?.onClick as () => void)();
+    const addServer = buttonByTestId("environment-rail-add-server");
+    expect(addServer).toBeDefined();
+    (addServer!.onClick as () => void)();
     expect(h.navigate).toHaveBeenCalledWith({
       to: "/settings/remote-servers",
       search: { action: "add-server" },
     });
-    (buttonByTestId("environment-rail-manage")?.onClick as () => void)();
+    const manage = buttonByTestId("environment-rail-manage");
+    expect(manage).toBeDefined();
+    (manage!.onClick as () => void)();
     expect(h.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
     expect(h.setActiveEnvironmentId).not.toHaveBeenCalled();
   });

@@ -3013,9 +3013,9 @@ staticDescribe("thread context menu", () => {
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
 
-    const childIds = menuItems.find((item) => item.id === "open-in")?.children?.map(
-      (item) => item.id,
-    );
+    const childIds = menuItems
+      .find((item) => item.id === "open-in")
+      ?.children?.map((item) => item.id);
     expect(childIds).toContain("open-in:cursor");
     expect(childIds).not.toContain("open-in:vscode");
   });

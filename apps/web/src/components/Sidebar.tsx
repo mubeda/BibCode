@@ -642,7 +642,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const isThreadRunning =
     thread.session?.status === "running" && thread.session.activeTurnId != null;
-  // Orca-parity nested agent sub-row ("Claude Code – Running · 1h") — shown
+  // Nested agent sub-row ("Claude Code – Running · 1h") — shown
   // for any workspace row with an active/connecting session, broader than
   // `isThreadRunning` above (which additionally requires an active turn and
   // only gates the archive-button swap).
@@ -1248,7 +1248,7 @@ interface SidebarProjectThreadListProps {
 }
 
 /**
- * Orca-parity primary workspace row: the project checkout itself (not a
+ * Primary workspace row: the project checkout itself (not a
  * worktree). Title/subtitle track the checkout's LIVE current branch (not
  * `thread.branch`, which the default thread always carries as `null`). The
  * passive summary keeps this label fresh without mounting full status.
@@ -1528,7 +1528,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const togglePinnedThreadKey = useSidebarWorkspaceMetaStore((state) => state.togglePinned);
   const markThreadRowUnread = useSidebarWorkspaceMetaStore((state) => state.markUnread);
   const markThreadRowRead = useSidebarWorkspaceMetaStore((state) => state.markRead);
-  // Orca-parity context menu (item 2): "Update" runs vcs.pull for the row's
+  // "Update" runs vcs.pull for the row's
   // cwd (worktree path or project checkout), same atom-command pattern as
   // `useVcsPullAction` in sourceControlActions.ts -- that hook can't be used
   // here directly because its scope is fixed at mount, while the row clicked
@@ -1709,7 +1709,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           },
         });
       };
-      // Orca-parity workspace-row model: the project's `kind: "default"`
+      // Workspace-row model: the project's `kind: "default"`
       // thread is the primary row (rendered separately, see
       // `SidebarPrimaryRow`) — everything else is a worktree/ad-hoc
       // workspace row, ordered pinned-first (sidebarWorkspaceMetaStore) then
@@ -1746,7 +1746,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       ) ?? null
     );
   }, [activeRouteThreadKey, projectExpanded, visibleProjectThreads]);
-  // Orca-parity fix (w3-progress.md KNOWN BUG): the primary row's thread was
+  // The primary row's thread was
   // split out of `visibleProjectThreads`, so `pinnedCollapsedThread` (which
   // only searches that array) never matched it — collapsing a project while
   // routed to its own default thread hid the primary row entirely, unlike
@@ -2257,7 +2257,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     // Server backfill (pinned interface 1) may not have run yet for this
     // project — create the default thread on demand, then navigate.
     const threadId = newThreadId();
-    // TODO(orca-port): this fallback-provider selection is a client-side
+    // This fallback-provider selection is a client-side
     // safety net for the rare pre-backfill case; revisit once every project
     // is guaranteed a default thread server-side.
     const serverConfig = serverConfigs.get(project.environmentId);
@@ -2654,7 +2654,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           : selectWorktreeCatalogCapabilityPolicy(threadServerConfig.environment).removal;
       const isPinned = pinnedThreadKeys.includes(threadKey);
       const isUnread = unreadThreadKeys.includes(threadKey);
-      // Orca-parity "Open in" submenu (item 2): built from the same EDITORS
+      // The "Open in" submenu is built from the same EDITORS
       // list + availableEditors filter as OpenInPicker.tsx, adapted to the
       // native-style {id,label,children} shape `api.contextMenu.show` expects
       // (that component renders its own React menu, so it can't be reused
@@ -2878,7 +2878,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
-  // Orca-parity context menu for the primary (project checkout) row. The
+  // Context menu for the primary (project checkout) row. The
   // primary checkout is read-only in the project tree, so destructive project
   // removal stays on the project header menu instead of this branch row.
   const handlePrimaryRowContextMenu = useCallback(
@@ -4037,7 +4037,7 @@ export default function Sidebar() {
   const sidebarThreadPreviewCount = useClientSettings((s) => s.sidebarThreadPreviewCount);
   const updateSettings = useUpdateClientSettings();
   const handleNewThread = useNewThreadHandler();
-  // Orca port item 5/6: "new workspace" entry points open CreateWorktreeDialog
+  // "New workspace" entry points open CreateWorktreeDialog
   // instead of seeding a draft thread. `createWorktreeDialogProjectRef` is the
   // project the dialog's "Project" select defaults to (null = the global "+"
   // entry point, no preselection) — kept separate from the dialog's open

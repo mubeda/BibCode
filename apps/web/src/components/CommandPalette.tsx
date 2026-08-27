@@ -119,7 +119,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   const toggleOpen = useCallback(() => dispatch({ _tag: "Toggle" }), []);
   const openAddProject = useCallback(() => dispatch({ _tag: "OpenAddProject" }), []);
   const clearOpenIntent = useCallback(() => dispatch({ _tag: "ClearOpenIntent" }), []);
-  // Orca port (00-port-plan.md item 7 / W2): AddProjectDialog must be mounted
+  // AddProjectDialog must be mounted
   // here, at the always-rendered top level, NOT inside `CommandPaletteDialog`
   // (which unmounts -- returns null -- the instant the palette closes). Its
   // own state closes the palette then opens this dialog; wiring it inside the
@@ -422,9 +422,7 @@ function OpenCommandPaletteDialog(props: {
     value: "action:add-project",
     searchTerms: ["add project", "folder", "directory", "browse", "clone", "repository", "git"],
     title:
-      addProjectTargetLabel === null
-        ? "Add project"
-        : `Add project on ${addProjectTargetLabel}`,
+      addProjectTargetLabel === null ? "Add project" : `Add project on ${addProjectTargetLabel}`,
     icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
     keepOpen: true,
     run: async () => {
