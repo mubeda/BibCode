@@ -30,6 +30,7 @@ const DESCRIPTOR = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: "store-current",
+  remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
   capabilities: {
@@ -38,6 +39,7 @@ const DESCRIPTOR = {
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,
     activityProtocolVersion: null,
+    remoteUpdateControl: false,
   },
 } satisfies ExecutionEnvironmentDescriptor;
 const BOOTSTRAP: RemoteEnvironmentAuthorization.RelayEnvironmentAuthorization = {

@@ -38,6 +38,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getProviderUsage"
         | "server.getSettings"
         | "server.getTraceDiagnostics"
+        | "updater.status"
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
         | "subscribePreviewEvents"
@@ -80,6 +81,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.updateProvider"
         | "server.updateSettings"
         | "server.upsertKeybinding"
+        | "updater.check"
+        | "updater.install"
         | "shell.openInEditor"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
@@ -156,6 +159,17 @@ mod tests {
             required_scope("subscribeAuthAccess"),
             Some(SCOPE_ACCESS_READ)
         );
+        assert_eq!(
+            required_scope("updater.status"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        for method in ["updater.check", "updater.install"] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_OPERATE),
+                "wrong updater scope for {method}"
+            );
+        }
         for method in [
             "activity.getSnapshot",
             "activity.listDetail",

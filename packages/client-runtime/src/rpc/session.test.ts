@@ -101,6 +101,7 @@ const PREPARED: PreparedConnection = {
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
     storageInstanceId: "store-test",
+    remoteUpdateSupport: null,
     remoteProtocolVersion: 1,
     minCompatibleRemoteProtocol: 1,
     capabilities: {
@@ -109,6 +110,7 @@ const PREPARED: PreparedConnection = {
       worktreeCatalogRefreshReason: false,
       vcsStatusSummary: false,
       activityProtocolVersion: null,
+      remoteUpdateControl: false,
     },
   },
   httpBaseUrl: TARGET.httpBaseUrl,
@@ -128,6 +130,7 @@ const SERVER_CONFIG: ServerConfigType = {
     },
     serverVersion: "0.0.0-test",
     storageInstanceId: null,
+    remoteUpdateSupport: null,
     remoteProtocolVersion: 1,
     minCompatibleRemoteProtocol: 1,
     capabilities: {
@@ -136,6 +139,7 @@ const SERVER_CONFIG: ServerConfigType = {
       worktreeCatalogRefreshReason: false,
       vcsStatusSummary: false,
       activityProtocolVersion: null,
+      remoteUpdateControl: false,
     },
   },
   auth: {

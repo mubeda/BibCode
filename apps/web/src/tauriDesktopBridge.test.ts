@@ -303,6 +303,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       platform: { os: "windows", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
       capabilities: {
@@ -311,6 +312,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     },
     httpBaseUrl: "https://private.example.test/secret-path",

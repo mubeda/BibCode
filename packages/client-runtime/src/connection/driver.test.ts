@@ -49,6 +49,7 @@ function prepared(
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
       capabilities: {
@@ -57,6 +58,7 @@ function prepared(
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     },
     httpBaseUrl: connectionTarget.httpBaseUrl,

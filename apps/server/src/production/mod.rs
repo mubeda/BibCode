@@ -15,6 +15,7 @@ mod provider_inventory;
 mod provider_maintenance;
 pub mod provider_runtime;
 pub mod relay;
+pub mod remote_update_rpc;
 pub mod runtime;
 pub mod server_terminal;
 pub mod turn_delivery;

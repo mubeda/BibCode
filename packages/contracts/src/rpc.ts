@@ -85,6 +85,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { RemoteUpdateInstallError, RemoteUpdateSnapshot } from "./remoteUpdate.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -399,6 +400,11 @@ export const WS_METHODS = {
   serverRefreshProviderUsage: "server.refreshProviderUsage",
   serverConsumeCodexRateLimitReset: "server.consumeCodexRateLimitReset",
 
+  // Remote updater methods
+  updaterStatus: "updater.status",
+  updaterCheck: "updater.check",
+  updaterInstall: "updater.install",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -525,6 +531,24 @@ export const WsServerConsumeCodexRateLimitResetRpc = Rpc.make(
     error: Schema.Union([ServerProviderUsageResetError, EnvironmentRpcError]),
   },
 );
+
+export const WsUpdaterStatusRpc = Rpc.make(WS_METHODS.updaterStatus, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: EnvironmentRpcError,
+});
+
+export const WsUpdaterCheckRpc = Rpc.make(WS_METHODS.updaterCheck, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: EnvironmentRpcError,
+});
+
+export const WsUpdaterInstallRpc = Rpc.make(WS_METHODS.updaterInstall, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateSnapshot,
+  error: Schema.Union([RemoteUpdateInstallError, EnvironmentRpcError]),
+});
 
 export const WsCloudGetRelayClientStatusRpc = Rpc.make(WS_METHODS.cloudGetRelayClientStatus, {
   payload: Schema.Struct({}),
@@ -1270,6 +1294,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProviderUsageRpc,
   WsServerRefreshProviderUsageRpc,
   WsServerConsumeCodexRateLimitResetRpc,
+  WsUpdaterStatusRpc,
+  WsUpdaterCheckRpc,
+  WsUpdaterInstallRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,
