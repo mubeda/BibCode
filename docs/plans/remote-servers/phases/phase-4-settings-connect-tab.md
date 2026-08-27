@@ -1297,7 +1297,7 @@ preserved; the row gains the D16 version label, the compat badge, the transport 
 - Produces: `RemoteServerRow` (internal to ConnectTab; Phase 6's context card does **not**
   import it — Phase 6 consumes the same Task 1 helpers instead).
 
-- [ ] **Step 1: Write the failing tests** (append to `ConnectTab.test.tsx`, using the Task 3
+- [x] **Step 1: Write the failing tests** (append to `ConnectTab.test.tsx`, using the Task 3
       harness; `h.environments` entries are plain objects shaped like `EnvironmentPresentation`)
 
 ```tsx
@@ -1352,12 +1352,12 @@ describe("RemoteServerRow presentation", () => {
 (`renderConnectTab` is the harness's render helper from Task 3 — the same
 static-markup/mount helper the old suite used for `ConnectionsSettings`.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 Expected: FAIL — version/compat/transport strings absent.
 
-- [ ] **Step 3: Implement the row upgrade**
+- [x] **Step 3: Implement the row upgrade**
 
 In `ConnectTab.tsx`, rename `SavedBackendListRow` → `RemoteServerRow`
 (`SavedBackendListRowProps` → `RemoteServerRowProps`) and inside it add:
@@ -1415,13 +1415,13 @@ Section copy in the same file: `SettingsSection title="Remote environments"` →
 `title="Saved servers"`; the header action button label `Add environment` → `Add Server`
 (aria-label and tooltip text included). Keep every other string as-is until Task 6.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 Expected: PASS, including the pre-existing moved cases (update any that asserted the old
 "Remote environments"/"Add environment" strings).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings/remote-servers
