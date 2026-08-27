@@ -309,8 +309,8 @@ the E2E build in the current worktree, not an installed production copy.
 
 ## Packaged UI scenarios
 
-Use Codex Computer Use, not Orca. Capture normal, minimum-size, and relevant
-Windows DPI states. Verify:
+Use Codex Computer Use to operate the packaged executable. Capture normal,
+minimum-size, and relevant Windows DPI states. Verify:
 
 - Add Project shows **This device** and usable WSL locations only;
 - **Local environment** is visible at `/settings/local-environment` and never

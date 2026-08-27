@@ -369,10 +369,10 @@ Do not run destructive worktree scenarios against a user repository.
 
 ## Packaged visual validation
 
-Use Codex Computer Use, not Orca, to operate the exact packaged executable.
-Before launch, prove no conflicting BiBCode instance is running. Use disposable
-application data and platform-specific renderer isolation without overwriting a
-user profile.
+Use Codex Computer Use to operate the exact packaged executable. Before launch,
+prove no conflicting BiBCode instance is running. Use disposable application
+data and platform-specific renderer isolation without overwriting a user
+profile.
 
 Capture original-resolution screenshots at normal and minimum supported window
 sizes. Cover relevant:
