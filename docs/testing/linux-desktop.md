@@ -146,8 +146,13 @@ environment in the report. At normal and minimum sizes verify:
 
 - Add Project has no Host selector or remote-device choice when only the local
   Linux environment is supported;
-- WSL, Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry
-  UI is absent from ordinary desktop presentation;
+- Settings shows **Remote Servers** with **Connect to a host** and **Share this
+  host** tabs; `/settings/connections` redirects there. SSH discovery and
+  share-side exposure controls appear because the desktop bridge is present.
+  Add Project still has no Host selector for the local machine;
+- from the OS, opening a well-formed `bibcode://pair?code=...` link while the
+  packaged app is running focuses that instance and lands on Add Server with
+  the code prefilled;
 - provider settings and action menus show Claude, Codex, Cursor, and OpenCode
   without Early Access labels and omit Grok/Grok Terminal;
 - AppImage window identity, icon, launcher, and taskbar grouping are correct;

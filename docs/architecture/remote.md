@@ -140,6 +140,28 @@ Failures are classified as `unreachable`, `host-identity-mismatch`,
 `pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. Only the
 verified credential, profile, and accepted storage identity are then persisted.
 
+### Remote Servers settings and pairing entry points
+
+Settings exposes remote connectivity at `/settings/remote-servers` as **Remote
+Servers**. `/settings/connections` redirects there. On Windows desktop, WSL
+backend controls remain in **Local environment** at
+`/settings/local-environment`.
+
+The **Connect to a host** tab lists saved servers with connection status,
+version, compatibility, and transport security. **Add Server** accepts a
+pairing code first, keeps manual endpoint-and-token entry under **Advanced**,
+and presents SSH as a first-class desktop option. BiBCode Connect relay rows
+remain part of the same tab. The **Share this host** tab owns exposure and
+pairing-code generation for the primary environment.
+
+Pairing links converge on that Add Server flow. Web clients accept
+`/pair?code=...`; desktop bundles register `bibcode://pair?code=...` with the
+Tauri deep-link plugin and use the single-instance plugin to route links to the
+running application. Both entry points open Remote Servers with the code
+prefilled. macOS scheme registration happens when the application bundle is
+created, so custom-scheme links cannot be validated against an unbundled dev
+process.
+
 A saved direct bearer profile with a non-null `hostKey` always selects
 `/ws-e2ee`; no `/oauth/token` or `/api/auth/websocket-ticket` request is made.
 A profile whose additively decoded `hostKey` is null is a legacy `/ws` profile.

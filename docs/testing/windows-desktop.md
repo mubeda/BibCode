@@ -230,8 +230,8 @@ When WSL is unavailable:
 - local Windows projects remain usable.
 
 Do not install a distribution or change system WSL configuration without
-permission. SSH, Tailscale, relay, and remote-device targets remain absent in
-both branches of the matrix.
+permission. Remote-server targets and exposure controls are validated in the
+packaged UI scenarios independently of the WSL branch.
 
 For update validation, use an isolated `BIBCODE_HOME` and disposable native
 project; include a disposable WSL project when WSL is usable. Keep a read
@@ -313,9 +313,15 @@ Use Codex Computer Use, not Orca. Capture normal, minimum-size, and relevant
 Windows DPI states. Verify:
 
 - Add Project shows **This device** and usable WSL locations only;
-- Local Environment is visible and never empty;
-- Connections, SSH, pairing, Tailscale, relay, exposure, and remote retry UI is
-  absent from ordinary desktop presentation;
+- **Local environment** is visible at `/settings/local-environment` and never
+  empty;
+- Settings shows **Remote Servers** with **Connect to a host** and **Share this
+  host** tabs; `/settings/connections` redirects there. SSH discovery and
+  share-side exposure controls appear because the desktop bridge is present.
+  Add Project still has no remote Host selector beyond this-device WSL choices;
+- from the OS, opening a well-formed `bibcode://pair?code=...` link while the
+  packaged app is running focuses that instance and lands on Add Server with
+  the code prefilled;
 - provider settings and action menus contain Claude, Codex, Cursor, and
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt
