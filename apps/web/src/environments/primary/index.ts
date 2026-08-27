@@ -15,9 +15,11 @@ export {
 
 export {
   createServerPairingCredential,
+  createServerPairingOffer,
   fetchSessionState,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,
+  getServerShareState,
   listServerClientSessions,
   listServerPairingLinks,
   peekPairingTokenFromUrl,
