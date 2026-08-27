@@ -5220,7 +5220,7 @@ owner in the final report. Amend nothing else.
 
 Read the five `docs/testing/` documents. This phase adds one opt-in test command (the Task 14 interop suite) and new always-on suites that run under the existing `vp test` umbrella. If a runbook enumerates test commands or validation evidence for the affected areas, add the interop command with its `BIBCODE_E2EE_SERVER_BIN` prerequisite; if none does, the final report must state the runbooks were **reviewed and remain accurate**.
 
-- [ ] **Step 4: Full validation gate (master plan)**
+- [x] **Step 4: Full validation gate (master plan)**
 
 ```bash
 vp check

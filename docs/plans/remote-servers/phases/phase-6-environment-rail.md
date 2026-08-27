@@ -211,7 +211,7 @@ reuse `SidebarRail`.
   - `selectRemoteUpdateControlCapability(serverConfig: ServerConfig | null): boolean`
     Both consumed by Tasks 2, 3, and 6.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 // apps/web/src/connection/environmentCompat.test.ts
@@ -270,12 +270,12 @@ describe("selectRemoteUpdateControlCapability", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/connection/environmentCompat.test.ts`
 Expected: FAIL — module `./environmentCompat` not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```ts
 // apps/web/src/connection/environmentCompat.ts
@@ -320,12 +320,12 @@ If Phase 2's export is not named `computeCompatVerdict`, adjust the import line 
 test's mock key) to the name Phase 2 shipped — verify with
 `rg "export (function|const)" packages/client-runtime/src/connection/compat.ts`.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `vp test run --project unit apps/web/src/connection/environmentCompat.test.ts`
 Expected: PASS (4 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/connection/environmentCompat.ts apps/web/src/connection/environmentCompat.test.ts
@@ -357,7 +357,7 @@ git commit -m "feat(web): add environment compat + update-capability selectors"
   - `selectRailVisibleEnvironmentIds(input): ReadonlySet<EnvironmentId> | null`
   - `resolveAddProjectTargetLabel(input): string | null`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 // apps/web/src/components/sidebar/environmentRail.logic.test.ts
@@ -586,12 +586,12 @@ describe("resolveAddProjectTargetLabel", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/environmentRail.logic.test.ts`
 Expected: FAIL — module `./environmentRail.logic` not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```ts
 // apps/web/src/components/sidebar/environmentRail.logic.ts
@@ -792,12 +792,12 @@ export function resolveAddProjectTargetLabel(input: {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/environmentRail.logic.test.ts`
 Expected: PASS (all describes green).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/sidebar/environmentRail.logic.ts apps/web/src/components/sidebar/environmentRail.logic.test.ts
@@ -832,7 +832,7 @@ git commit -m "feat(web): environment rail view-model"
 **Behavior pinned by tests (D3):** clicking an entry calls `setActiveEnvironmentId` and
 performs no navigation and no catalog/registry command; a vanished active id resets to Local.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The web app's component tests run SSR (`renderToStaticMarkup`) with capture-mocks (see the
 header comments of `apps/web/src/components/Sidebar.test.tsx` and
@@ -1103,12 +1103,12 @@ describe("EnvironmentRail", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/EnvironmentRail.test.tsx`
 Expected: FAIL — module `./EnvironmentRail` not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```tsx
 // apps/web/src/components/sidebar/EnvironmentRail.tsx
@@ -1386,12 +1386,12 @@ first in that case, or temporarily cast `search: { action: "add-server" } as nev
 remove the cast in Task 9 (leave a `// Task 9 removes this cast` comment only if the interim
 state must compile).
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/EnvironmentRail.test.tsx`
 Expected: PASS (7 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/sidebar/EnvironmentRail.tsx apps/web/src/components/sidebar/EnvironmentRail.test.tsx
@@ -1418,7 +1418,7 @@ Mounting rationale: see Design decision 2 (the desktop sidebar is `position: fix
 rail must live inside `<Sidebar>`; it collapses with the offcanvas panel, which is the
 intended toggle behavior for the whole left panel).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Open `apps/web/src/components/AppSidebarLayout.test.tsx`, follow its existing mock setup
 (add a mock for the rail module alongside the existing `./Sidebar` mock), and add:
@@ -1445,12 +1445,12 @@ in place of `thread-sidebar-mock`; if it has no render helper, render
 `<AppSidebarLayout>content</AppSidebarLayout>` with `renderToStaticMarkup` under the file's
 existing mocks.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/AppSidebarLayout.test.tsx`
 Expected: FAIL — `environment-rail-mock` not found in markup.
 
-- [ ] **Step 3: Implement the mount**
+- [x] **Step 3: Implement the mount**
 
 In `apps/web/src/components/AppSidebarLayout.tsx`:
 
@@ -1495,12 +1495,12 @@ const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
 
 (`SidebarRail` here is the pre-existing resize handle from `./ui/sidebar` — unchanged.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run --project unit apps/web/src/components/AppSidebarLayout.test.tsx`
 Expected: PASS, including the pre-existing cases.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/AppSidebarLayout.tsx apps/web/src/components/AppSidebarLayout.test.tsx
@@ -1526,7 +1526,7 @@ git commit -m "feat(web): mount environment rail in the left panel"
   union of local environments). Everything downstream (`sidebarProjects`, grouping,
   `sortedProjects`, `threadsByProjectKey`) consumes the filtered arrays unchanged.
 
-- [ ] **Step 1: Extend the test harness and write the failing tests**
+- [x] **Step 1: Extend the test harness and write the failing tests**
 
 In `apps/web/src/components/Sidebar.test.tsx`:
 
@@ -1630,13 +1630,13 @@ Note: if the existing file names its render helper differently (search it for
 `renderToStaticMarkup(<Sidebar`), use that helper/name; `h.state.commandCalls` is the file's
 existing atom-command capture (`h.runCommand` pushes into it).
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `vp test run --project unit apps/web/src/components/Sidebar.test.tsx`
 Expected: all three new cases FAIL — without the scoping code both environments always
 render, including in the null-selection case.
 
-- [ ] **Step 3: Implement the scoping**
+- [x] **Step 3: Implement the scoping**
 
 In `apps/web/src/components/Sidebar.tsx`, main `Sidebar()` component:
 
@@ -1709,12 +1709,12 @@ const sidebarThreads = useMemo(
 Everything downstream keeps its current names (`projects`, `sidebarThreads`), so grouping,
 sorting, and rendering are untouched.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run --project unit apps/web/src/components/Sidebar.test.tsx`
 Expected: PASS — the new describe and all pre-existing Sidebar cases.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx
@@ -1742,7 +1742,7 @@ git commit -m "feat(web): scope the projects panel to the selected environment"
 - Produces (Phase 7 contract): `EnvironmentContextCardProps` with optional
   `updateBadge?: React.ReactNode` and `onCheckForUpdates?: (environmentId: EnvironmentId) => void`.
 
-- [ ] **Step 1: Write the failing logic test**
+- [x] **Step 1: Write the failing logic test**
 
 ```ts
 // apps/web/src/components/sidebar/environmentContextCard.logic.test.ts
@@ -1832,12 +1832,12 @@ describe("resolveCompatBadge", () => {
 });
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/environmentContextCard.logic.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Implement the logic module**
+- [x] **Step 3: Implement the logic module**
 
 ```ts
 // apps/web/src/components/sidebar/environmentContextCard.logic.ts
@@ -1918,12 +1918,12 @@ export function buildEnvironmentContextCardView(input: {
 }
 ```
 
-- [ ] **Step 4: Run the logic test to verify it passes**
+- [x] **Step 4: Run the logic test to verify it passes**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/environmentContextCard.logic.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Write the failing component test**
+- [x] **Step 5: Write the failing component test**
 
 ```tsx
 // apps/web/src/components/sidebar/EnvironmentContextCard.test.tsx
@@ -2071,12 +2071,12 @@ Note on "Check for updates": `selectRemoteUpdateControlCapability` is mocked tru
 these cases pin that the _handler prop_ is the second gate — without Phase 7's
 `onCheckForUpdates` the item never renders even on a capable server.
 
-- [ ] **Step 6: Run it to verify it fails**
+- [x] **Step 6: Run it to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/EnvironmentContextCard.test.tsx`
 Expected: FAIL — module not found.
 
-- [ ] **Step 7: Implement the component**
+- [x] **Step 7: Implement the component**
 
 ```tsx
 // apps/web/src/components/sidebar/EnvironmentContextCard.tsx
@@ -2210,12 +2210,12 @@ and the `environmentCatalog.disconnect` reference to Phase 4's shipped name (see
 interfaces; if the command does not exist, **stop and report** — do not substitute
 `remove`, which deletes credentials).
 
-- [ ] **Step 8: Run the component test to verify it passes**
+- [x] **Step 8: Run the component test to verify it passes**
 
 Run: `vp test run --project unit apps/web/src/components/sidebar/EnvironmentContextCard.test.tsx`
 Expected: PASS (5 tests).
 
-- [ ] **Step 9: Mount the card in `Sidebar.tsx` and pin it in `Sidebar.test.tsx`**
+- [x] **Step 9: Mount the card in `Sidebar.tsx` and pin it in `Sidebar.test.tsx`**
 
 In `apps/web/src/components/Sidebar.tsx` add the import:
 
@@ -2260,12 +2260,12 @@ it("mounts the environment context card under the brand row", () => {
 });
 ```
 
-- [ ] **Step 10: Run both suites to verify they pass**
+- [x] **Step 10: Run both suites to verify they pass**
 
 Run: `vp test run --project unit apps/web/src/components/Sidebar.test.tsx apps/web/src/components/sidebar/EnvironmentContextCard.test.tsx`
 Expected: PASS.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add apps/web/src/components/sidebar/environmentContextCard.logic.ts apps/web/src/components/sidebar/environmentContextCard.logic.test.ts apps/web/src/components/sidebar/EnvironmentContextCard.tsx apps/web/src/components/sidebar/EnvironmentContextCard.test.tsx apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx
@@ -2292,7 +2292,7 @@ git commit -m "feat(web): environment context card under the brand row"
 - Produces: per-row editor lists keyed by the row's own `environmentId` — grouped sidebar
   rows belonging to a remote environment see that environment's editors.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `apps/web/src/components/Sidebar.test.tsx` (same describe conventions; the harness
 already captures `api.contextMenu.show` via `h.spies.contextMenuShow` and exposes
@@ -2354,13 +2354,13 @@ helper those tests use (search the file for `contextMenuShow.mockImplementation`
 argument must satisfy `selectWorktreeWorkspaceActionsAvailable` (copy the shape from the
 neighboring "open-in" test) so the submenu is populated.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/components/Sidebar.test.tsx`
 Expected: the new case FAILS — the submenu is built from the primary server's editors
 (`open-in:vscode` present, `open-in:cursor` absent).
 
-- [ ] **Step 3: Implement the fix**
+- [x] **Step 3: Implement the fix**
 
 In `apps/web/src/components/Sidebar.tsx`, `SidebarProjectItem`:
 
@@ -2419,13 +2419,13 @@ and in its dependency array (~line 2988) replace `availableEditors,` with
 (Other comments in the file carrying the same reference-port TODO tag — e.g. the
 fallback-provider note at ~line 2251 — are out of scope; leave them.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `vp test run --project unit apps/web/src/components/Sidebar.test.tsx`
 Expected: PASS — the new case and every pre-existing "open-in" case (those seed only the
 primary environment, whose editors now resolve through the map to the same values).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx
@@ -2460,7 +2460,7 @@ manual-path flow: `canUseNativeHostFolderPicker` (`apps/web/src/components/hostF
 already returns false for non-primary hosts without a `desktopInstanceId`, so `browse()`
 falls back to the host-path step — no picker change is needed.
 
-- [ ] **Step 1: Write the failing workflow tests**
+- [x] **Step 1: Write the failing workflow tests**
 
 In `apps/web/src/components/add-project/useAddProjectWorkflow.public.test.tsx`, follow the
 file's existing setup (it exercises `useAddProjectWorkflowState` with an explicit `input`
@@ -2493,13 +2493,13 @@ describe("active-environment defaulting", () => {
 Every existing call site of the state hook in the test file gains
 `initialEnvironmentId: null`.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `vp test run --project unit apps/web/src/components/add-project/useAddProjectWorkflow.public.test.tsx`
 Expected: FAIL — `initialEnvironmentId` is not part of `AddProjectWorkflowStateInput` /
 selected host ignores it.
 
-- [ ] **Step 3: Implement the workflow changes**
+- [x] **Step 3: Implement the workflow changes**
 
 In `apps/web/src/components/add-project/useAddProjectWorkflow.ts`:
 
@@ -2579,13 +2579,13 @@ const remoteEnvironmentIds = new Set(
 );
 ```
 
-- [ ] **Step 4: Run to verify the workflow tests pass**
+- [x] **Step 4: Run to verify the workflow tests pass**
 
 Run: `vp test run --project unit apps/web/src/components/add-project/useAddProjectWorkflow.public.test.tsx apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx`
 Expected: PASS (update any existing case that constructs the input object to include
 `initialEnvironmentId: null`).
 
-- [ ] **Step 5: Write the failing copy tests, then implement the copy**
+- [x] **Step 5: Write the failing copy tests, then implement the copy**
 
 Test (add to the Task 5 describe in `apps/web/src/components/Sidebar.test.tsx`):
 
@@ -2667,7 +2667,7 @@ Run `vp test run --project unit apps/web/src/components/Sidebar.test.tsx` — ex
 If `apps/web/src/components/CommandPalette.test.tsx` exists (check with `ls`), run it too
 and update its expectations only if it pins the old constant title.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx apps/web/src/components/CommandPalette.tsx apps/web/src/components/add-project/useAddProjectWorkflow.ts apps/web/src/components/add-project/useAddProjectWorkflow.public.test.tsx apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx
@@ -2689,7 +2689,7 @@ Coordination note: Phase 4 owns this route. If Phase 4 already implemented searc
 for its Add Server flow, verify the rail's `search: { action: "add-server" }` (Task 3)
 matches it, adapt the rail if the key differs, and skip the rest of this task.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 // apps/web/src/routes/settingsRemoteServersSearch.test.ts
@@ -2708,12 +2708,12 @@ describe("validateRemoteServersSearch", () => {
 });
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `vp test run --project unit apps/web/src/routes/settingsRemoteServersSearch.test.ts`
 Expected: FAIL — `validateRemoteServersSearch` is not exported.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `apps/web/src/routes/settings.remote-servers.tsx`:
 
@@ -2752,12 +2752,12 @@ Adapt `openAddServerDialog` to Phase 4's actual opener (a `setState` or dialog-s
 the Connect tab component — locate it with `rg -i "add server" apps/web/src/components/settings`).
 If Task 3 left a `search … as never` cast in `EnvironmentRail.tsx`, remove it now.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `vp test run --project unit apps/web/src/routes/settingsRemoteServersSearch.test.ts apps/web/src/components/sidebar/EnvironmentRail.test.tsx`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/routes/settings.remote-servers.tsx apps/web/src/routes/settingsRemoteServersSearch.test.ts apps/web/src/components/sidebar/EnvironmentRail.tsx
@@ -2776,7 +2776,7 @@ git commit -m "feat(web): add-server deep link into Remote Servers settings"
   `docs/testing/macos-desktop.md`, `docs/testing/README.md`, `docs/architecture/remote.md`,
   `docs/architecture/overview.md`
 
-- [ ] **Step 1: Update `docs/architecture/connection-runtime.md`**
+- [x] **Step 1: Update `docs/architecture/connection-runtime.md`**
 
 Locate the client-presentation discussion (the section describing that project grouping is
 presentation-only) and add a paragraph:
@@ -2793,7 +2793,7 @@ presentation-only) and add a paragraph:
 > environment is selected, a context card under the brand row shows its connection status,
 > server version, and compatibility verdict.
 
-- [ ] **Step 2: Update the packaged visual-validation runbook**
+- [x] **Step 2: Update the packaged visual-validation runbook**
 
 In `docs/testing/cross-platform-validation.md`, section "Packaged visual validation", extend
 the first coverage bullet from "Add Project and environment presentation;" to:
@@ -2807,7 +2807,7 @@ the first coverage bullet from "Add Project and environment presentation;" to:
   interrupting running sessions on other environments;
 ```
 
-- [ ] **Step 3: Review the remaining runbooks and living docs**
+- [x] **Step 3: Review the remaining runbooks and living docs**
 
 Read `docs/testing/windows-desktop.md`, `linux-desktop.md`, `macos-desktop.md`,
 `docs/testing/README.md`, `docs/architecture/remote.md`, and
@@ -2816,7 +2816,7 @@ commands, package scripts, provider visibility, worktree lifecycle, or process b
 they are expected to need no edits — the final report must state they were **reviewed and
 remain accurate** (or update them if drift is found).
 
-- [ ] **Step 4: Run the full phase validation gate**
+- [x] **Step 4: Run the full phase validation gate**
 
 From the repo root:
 
@@ -2837,14 +2837,14 @@ Confirm: no `.codegraph/` changes staged, no edits outside the files this plan n
 the user's pending deletions under `docs/plans/2026-08-24-environment-project-management/`
 are untouched.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/architecture/connection-runtime.md docs/testing/cross-platform-validation.md
 git commit -m "docs: environment rail selection semantics and visual-validation coverage"
 ```
 
-- [ ] **Step 6: Report**
+- [x] **Step 6: Report**
 
 Report the exact commands run (including any that could not run and why), the runbook
 review statement, and residual risk (at minimum: Phase 4 disconnect-latch dependency if it
