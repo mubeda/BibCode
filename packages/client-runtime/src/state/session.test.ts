@@ -27,6 +27,7 @@ const currentDescriptor: ExecutionEnvironmentDescriptor = {
   platform: { os: "linux", arch: "x64" },
   serverVersion: "0.0.0-test",
   storageInstanceId: null,
+  remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
   capabilities: {
@@ -35,6 +36,7 @@ const currentDescriptor: ExecutionEnvironmentDescriptor = {
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,
     activityProtocolVersion: null,
+    remoteUpdateControl: false,
   },
 };
 

@@ -52,6 +52,7 @@ describe("known environment bootstrap helpers", () => {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
       capabilities: {
@@ -60,6 +61,7 @@ describe("known environment bootstrap helpers", () => {
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: 2,
+        remoteUpdateControl: false,
       },
     } satisfies ExecutionEnvironmentDescriptor;
 
@@ -83,6 +85,7 @@ describe("known environment bootstrap helpers", () => {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.3.8",
       storageInstanceId: null,
+      remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
       capabilities: {
@@ -91,6 +94,7 @@ describe("known environment bootstrap helpers", () => {
         worktreeCatalogRefreshReason: false,
         vcsStatusSummary: false,
         activityProtocolVersion: null,
+        remoteUpdateControl: false,
       },
     } satisfies ExecutionEnvironmentDescriptor;
 

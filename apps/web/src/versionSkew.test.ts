@@ -36,6 +36,7 @@ describe("versionSkew", () => {
           },
           serverVersion: "9.9.9",
           storageInstanceId: null,
+          remoteUpdateSupport: null,
           remoteProtocolVersion: 1,
           minCompatibleRemoteProtocol: 1,
           capabilities: {
@@ -44,6 +45,7 @@ describe("versionSkew", () => {
             worktreeCatalogRefreshReason: false,
             vcsStatusSummary: false,
             activityProtocolVersion: null,
+            remoteUpdateControl: false,
           },
         },
       }),

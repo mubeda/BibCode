@@ -392,6 +392,17 @@ impl ProductionRuntime {
         let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
+        let remote_update_delegate: Option<
+            std::sync::Arc<dyn crate::remote_update::RemoteUpdateDelegate>,
+        > = None;
+        crate::production::remote_update_rpc::register_remote_update_rpc(
+            &mut registry,
+            crate::remote_update::RemoteUpdateService::new(
+                config.server_version.clone(),
+                config.remote_update_support,
+                remote_update_delegate.clone(),
+            ),
+        );
         finalize_rpc_registry(&registry, &control)?;
 
         Ok(Self {

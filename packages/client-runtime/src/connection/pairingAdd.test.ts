@@ -64,6 +64,7 @@ const descriptor = (
   platform: { os: "linux", arch: "x64" },
   serverVersion: "0.0.0-test",
   storageInstanceId: STORAGE_IDENTITY,
+  remoteUpdateSupport: null,
   remoteProtocolVersion: REMOTE_PROTOCOL_VERSION,
   minCompatibleRemoteProtocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
   capabilities: {
@@ -72,6 +73,7 @@ const descriptor = (
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,
     activityProtocolVersion: null,
+    remoteUpdateControl: false,
   },
   ...overrides,
 });

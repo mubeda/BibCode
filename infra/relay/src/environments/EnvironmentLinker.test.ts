@@ -79,6 +79,7 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
         platform: { os: "darwin", arch: "arm64" },
         serverVersion: "0.0.0-test",
         storageInstanceId: "019c18d0-26b2-7a35-9e06-8568e640f44f",
+        remoteUpdateSupport: null,
         remoteProtocolVersion: 1,
         minCompatibleRemoteProtocol: 1,
         capabilities: {
@@ -87,6 +88,7 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
           worktreeCatalogRefreshReason: false,
           vcsStatusSummary: false,
           activityProtocolVersion: null,
+          remoteUpdateControl: false,
         },
       },
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
