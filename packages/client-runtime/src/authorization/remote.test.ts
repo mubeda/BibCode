@@ -9,6 +9,7 @@ import { EnvironmentAuthInvalidError } from "@bibcode/contracts";
 import {
   bootstrapRemoteBearerSession,
   exchangeRemoteDpopAccessToken,
+  e2eeSocketUrl,
   fetchRemoteDpopSessionState,
   fetchRemoteSessionState,
   issueRemoteDpopWebSocketTicket,
@@ -89,6 +90,12 @@ const expectFetchCall = (
 };
 
 describe("remote environment authorization", () => {
+  it("builds a query-free E2EE websocket URL without making a request", () => {
+    expect(e2eeSocketUrl("ws://host:3773/?wsTicket=legacy#fragment")).toBe(
+      "ws://host:3773/ws-e2ee",
+    );
+  });
+
   it.effect("bootstraps bearer auth against a remote backend", () =>
     Effect.gen(function* () {
       const fetch = recordedFetch(

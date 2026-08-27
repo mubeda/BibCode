@@ -269,6 +269,7 @@ const projectId = ProjectId.make("project-1");
 const connectionId = "connection-1";
 const now = "2026-03-29T00:00:00.000Z";
 const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" } as const;
+const decodeBearerConnectionProfile = Schema.decodeUnknownSync(BearerConnectionProfile);
 
 function bearerRegistration(): BearerConnectionRegistration {
   return new BearerConnectionRegistration({
@@ -283,6 +284,7 @@ function bearerRegistration(): BearerConnectionRegistration {
       label: "Bearer backend",
       httpBaseUrl: "http://127.0.0.1:3201/",
       wsBaseUrl: "ws://127.0.0.1:3201/",
+      hostKey: null,
     }),
     credential: new BearerConnectionCredential({ token: "bearer-token" }),
   });
@@ -317,6 +319,7 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
     httpBaseUrl: target.httpBaseUrl,
     socketUrl: `${target.wsBaseUrl}/ws`,
     httpAuthorization: null,
+    e2ee: null,
     target,
   };
 }
@@ -364,6 +367,19 @@ const remoteToken = new TokenStore.RemoteDpopAccessToken({
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+it("decodes persisted legacy bearer profiles with no host key", () => {
+  const decoded = decodeBearerConnectionProfile({
+    _tag: "BearerConnectionProfile",
+    connectionId: "bearer:legacy",
+    environmentId: "environment-legacy",
+    label: "Legacy",
+    httpBaseUrl: "http://192.168.1.20:3773/",
+    wsBaseUrl: "ws://192.168.1.20:3773/",
+  });
+
+  expect(decoded.hostKey).toBeNull();
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1409,6 +1425,7 @@ describe("connectionStorageLayer", () => {
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: `${target.wsBaseUrl}/ws`,
         httpAuthorization: null,
+        e2ee: null,
         target,
       };
     };

@@ -90,6 +90,7 @@ const PREPARED: PreparedConnection = {
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws",
   httpAuthorization: null,
+  e2ee: null,
   target: TARGET,
 };
 
@@ -113,6 +114,7 @@ const BEARER_PROFILE = new BearerConnectionProfile({
   label: BEARER_TARGET.label,
   httpBaseUrl: "https://bearer.example.test",
   wsBaseUrl: "wss://bearer.example.test",
+  hostKey: null,
 });
 const BEARER_CREDENTIAL = new BearerConnectionCredential({
   token: "bearer-token",
@@ -500,6 +502,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
             ready: Effect.void,
             probe: Effect.void,
             closed: Deferred.await(closed),
+            e2eeAuthenticated: Effect.succeed(null),
           } satisfies RpcSession.RpcSession),
           () => Ref.update(releasedSessions, (count) => count + 1),
         );

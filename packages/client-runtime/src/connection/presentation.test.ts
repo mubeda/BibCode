@@ -2,16 +2,24 @@ import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Option from "effect/Option";
 
-import { BearerConnectionProfile, type ConnectionCatalogEntry } from "./catalog.ts";
+import {
+  BearerConnectionProfile,
+  type ConnectionCatalogEntry,
+  type ConnectionProfile,
+} from "./catalog.ts";
 import {
   BearerConnectionTarget,
   ConnectionTransientError,
+  PrimaryConnectionTarget,
+  RelayConnectionTarget,
+  SshConnectionTarget,
   type SupervisorConnectionState,
 } from "./model.ts";
 import {
   connectionCatalogDisplayUrl,
   connectionPhaseMessage,
   connectionStatusText,
+  connectionTransportSecurity,
   presentEnvironmentConnection,
   presentConnectionState,
 } from "./presentation.ts";
@@ -31,6 +39,7 @@ const ENTRY: ConnectionCatalogEntry = {
       label: TARGET.label,
       httpBaseUrl: "https://environment.example.test",
       wsBaseUrl: "wss://environment.example.test",
+      hostKey: null,
     }),
   ),
 };
@@ -50,6 +59,53 @@ function supervisorState(overrides: Partial<SupervisorConnectionState>): Supervi
 }
 
 describe("connection presentation", () => {
+  it("classifies local, authenticated-channel, and legacy plaintext transports", () => {
+    const entry = (
+      target: ConnectionCatalogEntry["target"],
+      profile: Option.Option<ConnectionProfile> = Option.none(),
+    ) => ({ target, profile }) satisfies ConnectionCatalogEntry;
+    const primary = new PrimaryConnectionTarget({
+      environmentId: TARGET.environmentId,
+      label: "Primary",
+      httpBaseUrl: "http://127.0.0.1:3773",
+      wsBaseUrl: "ws://127.0.0.1:3773",
+    });
+    const relay = new RelayConnectionTarget({
+      environmentId: TARGET.environmentId,
+      label: "Relay",
+    });
+    const ssh = new SshConnectionTarget({
+      environmentId: TARGET.environmentId,
+      label: "SSH",
+      connectionId: "ssh:one",
+    });
+    const pinned = new BearerConnectionProfile({
+      connectionId: TARGET.connectionId,
+      environmentId: TARGET.environmentId,
+      label: TARGET.label,
+      httpBaseUrl: "https://environment.example.test",
+      wsBaseUrl: "wss://environment.example.test",
+      hostKey: "host-key",
+    });
+
+    expect(connectionTransportSecurity(entry(primary))).toBe("local");
+    expect(connectionTransportSecurity(entry(TARGET, Option.some(pinned)))).toBe("e2ee");
+    expect(connectionTransportSecurity(ENTRY)).toBe("unencrypted");
+    expect(connectionTransportSecurity(entry(relay))).toBe("channel-secured");
+    expect(connectionTransportSecurity(entry(ssh))).toBe("channel-secured");
+    expect(
+      connectionTransportSecurity(
+        entry(
+          new BearerConnectionTarget({
+            environmentId: TARGET.environmentId,
+            label: "Desktop WSL",
+            connectionId: "local:wsl:Ubuntu",
+          }),
+        ),
+      ),
+    ).toBe("local");
+  });
+
   it("preserves profile display information without exposing credentials", () => {
     expect(connectionCatalogDisplayUrl(ENTRY)).toBe("https://environment.example.test");
   });

@@ -166,6 +166,34 @@ const makeHarness = Effect.fn("TestRemoteAuthorization.makeHarness")(function* (
 });
 
 describe("RemoteEnvironmentAuthorization", () => {
+  it.effect("keeps host-key bearer credentials inside the E2EE channel", () =>
+    Effect.gen(function* () {
+      const hostKey = "HcMLXPPBHFNvcbHrCVMH-DMh49rd5AGCzSCqAVJ49hM";
+      const harness = yield* makeHarness({ responses: [Response.json(DESCRIPTOR)] });
+
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeBearer({
+          expectedEnvironmentId: ENVIRONMENT_ID,
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+          bearerToken: "stored-bearer",
+          hostKey,
+        });
+      }).pipe(Effect.provide(harness.layer));
+
+      expect(authorized.socketUrl).toBe("wss://environment.example.test/ws-e2ee");
+      expect(authorized.e2ee).toEqual({
+        hostKey,
+        auth: { kind: "bearer", credential: "stored-bearer" },
+      });
+      expect(harness.fetch.calls).toHaveLength(1);
+      expect(String(harness.fetch.calls[0]?.[0])).toBe(
+        "https://environment.example.test/.well-known/bibcode/environment",
+      );
+    }),
+  );
+
   it.effect("returns the descriptor fetched while authorizing a bearer connection", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({

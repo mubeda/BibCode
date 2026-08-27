@@ -13,7 +13,7 @@ minimumReleaseAgeExclude:
   - "@cloudflare/workers-types@5.20260718.1"
   - "@tanstack/router-generator@1.167.21"
   - "@tanstack/router-plugin@1.168.22"
-  - '@noble/ciphers@2.4.0'
+  - "@noble/ciphers@2.4.0"
 
 catalog:
   "@clerk/backend": 3.11.7
