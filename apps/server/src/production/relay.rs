@@ -457,7 +457,13 @@ impl NativeRelayClient {
                 "write_failed",
                 format!("could not flush relay client download: {error}"),
             )
-        })
+        })?;
+        // Tokio file writes may still own a blocking-task clone after the async
+        // wrapper is dropped. Wait for every in-flight operation, then close the
+        // writable OS handle before checksum validation or execution (Linux
+        // rejects execution with ETXTBSY while that handle remains open).
+        drop(file.into_std().await);
+        Ok(())
     }
 
     fn available(&self, path: &Path, source: &str) -> RelayClientStatus {

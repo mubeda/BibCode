@@ -7,11 +7,11 @@
 // @effect-diagnostics nodeBuiltinImport:off
 // @effect-diagnostics globalFetch:off - This opt-in harness probes a real loopback server process.
 // @effect-diagnostics globalTimers:off - The process and WebSocket harness owns bounded watchdogs.
-import { spawn, type ChildProcess } from "node:child_process";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { createInterface } from "node:readline";
+import * as NodeReadline from "node:readline";
 
 import {
   AuthAccessTokenType,
@@ -23,7 +23,7 @@ import { parsePairingCode } from "@bibcode/shared/pairingCode";
 import { afterAll, beforeAll, describe, expect, it } from "@effect/vitest";
 
 import { RecordAssembler, splitIntoRecords } from "./frame.ts";
-import { createNkInitiator, decodeBase64UrlKey, type NkTransport } from "./noise.ts";
+import { createNkInitiator, decodeBase64UrlKey } from "./noise.ts";
 
 const serverBinary = process.env["BIBCODE_E2EE_SERVER_BIN"];
 const EMPTY = new Uint8Array(0);
@@ -35,7 +35,7 @@ function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 interface RunningServer {
-  process: ChildProcess;
+  process: NodeChildProcess.ChildProcess;
   httpBaseUrl: string;
   token: string;
   dataRoot: string;
@@ -44,7 +44,7 @@ interface RunningServer {
 
 async function startServer(): Promise<RunningServer> {
   const dataRoot = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-e2ee-"));
-  const child = spawn(serverBinary!, [
+  const child = NodeChildProcess.spawn(serverBinary!, [
     "serve",
     "--host",
     "127.0.0.1",
@@ -62,7 +62,7 @@ async function startServer(): Promise<RunningServer> {
       30_000,
     );
     let ready = false;
-    createInterface({ input: child.stdout! }).on("line", (line) => {
+    NodeReadline.createInterface({ input: child.stdout! }).on("line", (line) => {
       try {
         const parsed = JSON.parse(line) as { httpBaseUrl?: string; token?: string };
         if (parsed.httpBaseUrl && parsed.token) {

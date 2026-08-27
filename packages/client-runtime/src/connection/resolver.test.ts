@@ -381,6 +381,7 @@ describe("ConnectionResolver", () => {
         hostKey,
         auth: { kind: "bearer", credential: "stored-secret" },
       });
+      expect(prepared.httpAuthorization).toBeNull();
     }),
   );
 

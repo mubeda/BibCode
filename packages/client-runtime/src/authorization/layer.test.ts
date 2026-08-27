@@ -187,6 +187,7 @@ describe("RemoteEnvironmentAuthorization", () => {
         hostKey,
         auth: { kind: "bearer", credential: "stored-bearer" },
       });
+      expect(authorized.httpAuthorization).toBeNull();
       expect(harness.fetch.calls).toHaveLength(1);
       expect(String(harness.fetch.calls[0]?.[0])).toBe(
         "https://environment.example.test/.well-known/bibcode/environment",
