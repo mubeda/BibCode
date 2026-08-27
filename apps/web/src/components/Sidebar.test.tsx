@@ -2554,7 +2554,13 @@ staticDescribe("worktree discovery integration", () => {
   it("keeps retained verification-unavailable rows usable for workspace actions", async () => {
     baseScenario();
     h.state.serverConfigs = new Map([
-      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [
+        ENV_MAIN,
+        {
+          availableEditors: ["vscode"],
+          environment: { capabilities: { worktreeCatalog: true } },
+        },
+      ],
     ]);
     h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
       repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
@@ -2838,6 +2844,10 @@ staticDescribe("thread rows in the full sidebar", () => {
 staticDescribe("thread context menu", () => {
   function setupMenu(clickedId: string | null) {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     if (clickedId !== null) {
@@ -2888,6 +2898,10 @@ staticDescribe("thread context menu", () => {
 
   it("opens a local worktree path in File Explorer", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -2941,6 +2955,10 @@ staticDescribe("thread context menu", () => {
 
   it("omits File Explorer for a remote row", async () => {
     const { remoteThread } = groupedScenario();
+    h.state.serverConfigs.set(ENV_REMOTE, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: {} },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -2964,8 +2982,39 @@ staticDescribe("thread context menu", () => {
     expect(openInFileManager).not.toHaveBeenCalled();
   });
 
+  it("builds Open in from the row's own environment editors", async () => {
+    const { remoteThread } = groupedScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: {} }, availableEditors: ["vscode"] }],
+      [ENV_REMOTE, { environment: { capabilities: {} }, availableEditors: ["cursor"] }],
+    ]);
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; children?: Array<{ id: string }> }>) => {
+        menuItems = items;
+        return null;
+      },
+    );
+    const row = mustFindProps(byTestId(`thread-row-${remoteThread.id}`), "remote row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    const childIds = menuItems.find((item) => item.id === "open-in")?.children?.map(
+      (item) => item.id,
+    );
+    expect(childIds).toContain("open-in:cursor");
+    expect(childIds).not.toContain("open-in:vscode");
+  });
+
   it("omits File Explorer when the desktop bridge capability is unavailable", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
@@ -3332,6 +3381,10 @@ staticDescribe("primary row", () => {
 
   it("shows the primary-row context menu and handles update / copy / pin actions", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     const primaryRow = captured("SidebarMenuSubButton").find(
@@ -3375,10 +3428,10 @@ staticDescribe("primary row", () => {
 
   it("opens the local primary checkout in File Explorer even when no editor is available", async () => {
     baseScenario();
-    h.state.atomValues.primaryServerConfig = {
+    h.state.serverConfigs.set(ENV_MAIN, {
       availableEditors: [],
-      environment: { serverVersion: "0.1.0" },
-    };
+      environment: { capabilities: {}, serverVersion: "0.1.0" },
+    });
     const openInFileManager = vi.fn(async () => {});
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       openInFileManager,
@@ -3428,6 +3481,10 @@ staticDescribe("primary row", () => {
 
   it("suppresses interrupted primary-row actions and reports opaque failures", async () => {
     baseScenario();
+    h.state.serverConfigs.set(ENV_MAIN, {
+      availableEditors: ["vscode"],
+      environment: { capabilities: { worktreeCatalog: true } },
+    });
     render(<Sidebar />);
     fakeLocalApi();
     const primaryRow = captured("SidebarMenuSubButton").find(

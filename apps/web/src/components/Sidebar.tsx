@@ -59,6 +59,7 @@ import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_SERVER_SETTINGS,
   EDITORS,
+  type EditorId,
   type EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -287,6 +288,7 @@ const SIDEBAR_LIST_ANIMATION_OPTIONS = {
   easing: "ease-out",
 } as const;
 const EMPTY_THREAD_JUMP_LABELS = new Map<string, string>();
+const EMPTY_EDITOR_IDS: ReadonlyArray<EditorId> = [];
 const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
   repository: "Group by repository",
   repository_path: "Group by repository path",
@@ -1535,10 +1537,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const openInEditorMutation = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
   });
-  // TODO(orca-port): this reads the PRIMARY server's available editors; rows
-  // belonging to a different (remote) environment may see an editor list that
-  // doesn't match their actual backend. Acceptable simplification for now.
-  const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
+  const availableEditorsFor = useCallback(
+    (environmentId: EnvironmentId): ReadonlyArray<EditorId> =>
+      serverConfigs.get(environmentId)?.availableEditors ?? EMPTY_EDITOR_IDS,
+    [serverConfigs],
+  );
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const supportedWorktreeDiscoveryMembers = useMemo(
     () => getSupportedWorktreeDiscoveryMembers(project.memberProjects, serverConfigs),
@@ -2653,7 +2656,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       // native-style {id,label,children} shape `api.contextMenu.show` expects
       // (that component renders its own React menu, so it can't be reused
       // as-is here).
-      const openInEditorOptions = EDITORS.filter((editor) => availableEditors.includes(editor.id));
+      const openInEditorOptions = EDITORS.filter((editor) =>
+        availableEditorsFor(thread.environmentId).includes(editor.id),
+      );
       const canOpenInFileExplorer =
         thread.environmentId === primaryEnvironmentId && typeof window !== "undefined"
           ? window.desktopBridge?.openInFileManager !== undefined
@@ -2848,7 +2853,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     },
     [
       appSettingsConfirmThreadDelete,
-      availableEditors,
+      availableEditorsFor,
       copyPathToClipboard,
       copyThreadIdToClipboard,
       deleteThread,
@@ -2886,7 +2891,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         const isPinned = primaryThreadKey !== null && pinnedThreadKeys.includes(primaryThreadKey);
         const isUnread = primaryThreadKey !== null && unreadThreadKeys.includes(primaryThreadKey);
         const openInEditorOptions = EDITORS.filter((editor) =>
-          availableEditors.includes(editor.id),
+          availableEditorsFor(project.environmentId).includes(editor.id),
         );
         const canOpenInFileExplorer =
           project.environmentId === primaryEnvironmentId && typeof window !== "undefined"
@@ -2988,7 +2993,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       })();
     },
     [
-      availableEditors,
+      availableEditorsFor,
       copyPathToClipboard,
       markThreadRowRead,
       markThreadRowUnread,
