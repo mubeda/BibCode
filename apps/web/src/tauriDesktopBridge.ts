@@ -19,6 +19,7 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  DESKTOP_DEEP_LINK_EVENT,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@bibcode/contracts";
 import { invoke as importedTauriInvoke, isTauri as isImportedTauri } from "@tauri-apps/api/core";
@@ -502,6 +503,10 @@ function createTauriDesktopBridge(
       tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
     onProjectDataStatusChanged: (listener: (event: DesktopProjectDataStatusChangedEvent) => void) =>
       tauriListen(PROJECT_DATA_STATUS_CHANGED_EVENT, listener),
+    getPendingDeepLinks: async () =>
+      (await tauriInvoke<ReadonlyArray<string> | null>("plugin:deep-link|get_current")) ?? [],
+    onDeepLink: (listener: (urls: ReadonlyArray<string>) => void) =>
+      tauriListen(DESKTOP_DEEP_LINK_EVENT, listener),
     restoreProjectData: (environmentId, backupId) =>
       tauriInvokeDesktop("desktop_bridge_restore_project_data", { environmentId, backupId }),
     startEmptyProjectData: (environmentId) =>

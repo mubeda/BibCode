@@ -1183,6 +1183,9 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
   input: PreviewAutomationWaitForInput,
 });
 
+/** Tauri deep-link plugin runtime event carrying the opened URLs. */
+export const DESKTOP_DEEP_LINK_EVENT = "deep-link://new-url";
+
 export interface DesktopBridge {
   getHostMetadata?: () => Promise<DesktopBridgeHostMetadata>;
   getAppBranding: () => DesktopAppBranding | null;
@@ -1205,6 +1208,10 @@ export interface DesktopBridge {
   onProjectDataStatusChanged?: (
     listener: (event: DesktopProjectDataStatusChangedEvent) => void,
   ) => () => void;
+  /** URLs the OS handed to the app before the webview subscribed. */
+  getPendingDeepLinks?: () => Promise<ReadonlyArray<string>>;
+  /** Subscribe to bibcode:// URLs opened while the app is running. */
+  onDeepLink?: (listener: (urls: ReadonlyArray<string>) => void) => () => void;
   restoreProjectData?: (
     environmentId: string,
     backupId: string,

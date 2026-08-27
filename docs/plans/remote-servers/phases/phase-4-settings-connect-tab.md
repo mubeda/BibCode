@@ -2507,7 +2507,7 @@ Promise<ReadonlyArray<string>>` and `onDeepLink?: (listener: (urls: ReadonlyArra
   `resolvePairingDeepLink(rawUrl: string): { readonly code: string } | null` in
   `apps/web/src/desktopDeepLink.ts`.
 
-- [ ] **Step 1: Write the failing Rust config test**
+- [x] **Step 1: Write the failing Rust config test**
 
 ```rust
 // apps/desktop/src-tauri/tests/deep_link_config.rs
@@ -2550,12 +2550,12 @@ fn default_capability_grants_deep_link_permission() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p bibcode-desktop --test deep_link_config`
 Expected: FAIL — `plugins.deep-link` pointer is absent.
 
-- [ ] **Step 3: Implement the Rust/config side**
+- [x] **Step 3: Implement the Rust/config side**
 
 Root `Cargo.toml` `[workspace.dependencies]` (next to the existing tauri-plugin entries; let
 cargo resolve the current 2.x):
@@ -2627,7 +2627,7 @@ Run: `cargo test -p bibcode-desktop --test deep_link_config` — Expected: PASS.
 Then `cargo fmt --all --check` and
 `cargo clippy -p bibcode-desktop --all-targets -- -D warnings`.
 
-- [ ] **Step 4: Write the failing web test for URL parsing**
+- [x] **Step 4: Write the failing web test for URL parsing**
 
 ```ts
 // apps/web/src/desktopDeepLink.test.ts
@@ -2653,7 +2653,7 @@ describe("resolvePairingDeepLink", () => {
 
 Run: `vp test run apps/web/src/desktopDeepLink.test.ts` — Expected: FAIL (module missing).
 
-- [ ] **Step 5: Implement the web side**
+- [x] **Step 5: Implement the web side**
 
 `packages/contracts/src/ipc.ts` (contracts stay schema/type-only — a constant and two
 optional function types match the existing `DesktopBridge` style):
@@ -2738,14 +2738,14 @@ export function DesktopDeepLinkRouter() {
 
 (Browser mode is a no-op: `window.desktopBridge` is undefined.)
 
-- [ ] **Step 6: Run to verify it passes**
+- [x] **Step 6: Run to verify it passes**
 
 Run: `vp test run apps/web/src/desktopDeepLink.test.ts` — Expected: PASS.
 Then `vp run typecheck` (contracts + web + bridge additions compile together) and re-run
 `cargo test -p bibcode-desktop --test deep_link_config`,
 `cargo fmt --all --check`, `cargo clippy -p bibcode-desktop --all-targets -- -D warnings`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock apps/desktop/src-tauri packages/contracts/src/ipc.ts \
