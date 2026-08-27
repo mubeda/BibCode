@@ -263,6 +263,19 @@ contract decoding maps the omitted field from an older or third-party remote
 server to `null`. Normal environment descriptors never include the requested
 or effective data root, alias diagnostics, or any other local filesystem path.
 
+Every current-server descriptor surface also publishes the remote protocol
+compatibility window: `remoteProtocolVersion` and
+`minCompatibleRemoteProtocol` (both `1` today). The numbers are defined once
+per language — TypeScript in `packages/contracts/src/environment.ts`
+(`REMOTE_PROTOCOL_VERSION`, `MIN_COMPATIBLE_REMOTE_PROTOCOL`) and Rust in
+`apps/server/src/http.rs` — and serialized by the well-known descriptor
+route, `server.getConfig`, the initial `subscribeServerConfig` snapshot,
+lifecycle welcome and ready events, and BiBCode Connect descriptors. Contract
+decoding maps both fields to `0` for an older or third-party server, which
+clients classify as legacy limited compatibility. The window supplements —
+never replaces — the default-false capability booleans that continue to gate
+optional behavior.
+
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
 with an atomic no-replace hard link. Platform file identity checks bind cleanup

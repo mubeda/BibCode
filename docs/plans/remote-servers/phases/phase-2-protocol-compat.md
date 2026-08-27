@@ -685,7 +685,7 @@ git commit -m "feat(client-runtime): expose a per-environment protocol compatibi
 - Consumes: everything shipped by Tasks 1–4.
 - Produces: living-doc coverage of the window and verdict, and the phase's completion evidence.
 
-- [ ] **Step 1: Update `docs/architecture/overview.md`**
+- [x] **Step 1: Update `docs/architecture/overview.md`**
 
 In the "Project-data ownership and identity" area, directly after the paragraph ending "…any other local filesystem path." (~line 264), insert:
 
@@ -704,7 +704,7 @@ never replaces — the default-false capability booleans that continue to gate
 optional behavior.
 ```
 
-- [ ] **Step 2: Update `docs/architecture/connection-runtime.md`**
+- [x] **Step 2: Update `docs/architecture/connection-runtime.md`**
 
 Insert a new section at the true end of the "Data boundary" section — i.e. **after** its closing `See [Remote architecture](./remote.md) …` cross-reference paragraph, so that cross-reference stays with Data boundary:
 
@@ -728,11 +728,11 @@ backoff, so a startup burst against an unreachable environment is already
 throttled to one attempt per backoff step.
 ```
 
-- [ ] **Step 3: Review the testing runbooks**
+- [x] **Step 3: Review the testing runbooks**
 
 Read `docs/testing/README.md`, `docs/testing/cross-platform-validation.md`, `docs/testing/linux-desktop.md`, `docs/testing/macos-desktop.md`, and `docs/testing/windows-desktop.md`. This phase changes no test commands, package scripts, CI gates, packaging steps, OS presentation, provider visibility, worktree lifecycle, process lifecycle, packaged UI flows, or validation-evidence schema — confirm that against the diff, make no edits, and state in the final report that all five runbooks were **reviewed and remain accurate**.
 
-- [ ] **Step 4: Run the full phase validation gate**
+- [x] **Step 4: Run the full phase validation gate**
 
 Run, in order, and record exact commands and outcomes for the final report:
 
@@ -749,12 +749,12 @@ cargo clippy -p bibcode-server --all-targets -- -D warnings
 
 Expected: all pass with no warnings.
 
-- [ ] **Step 5: Final diff review**
+- [x] **Step 5: Final diff review**
 
 Run: `git diff` and `git status --short`
 Check: no unintended edits, no generated `.codegraph/` data staged, no debug output, no dependency drift, and the pending user deletions under `docs/plans/2026-08-24-environment-project-management/` remain untouched (neither restored nor committed).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/architecture/overview.md docs/architecture/connection-runtime.md
