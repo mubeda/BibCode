@@ -346,6 +346,7 @@ addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
     scopes: standardClientScopes,
     subject: "fixture-client",
     label: "Fixture pairing link",
+    reach: "another-device",
     createdAt: issuedAt,
     expiresAt: pairingExpiresAt,
   },
@@ -391,6 +392,7 @@ addJsonFixture("responses/client-list.json", AuthClientSessionList, [
     lastConnectedAt: null,
     connected: false,
     current: false,
+    reach: "another-device",
   },
 ]);
 addJsonFixture("requests/client-revoke.json", AuthRevokeClientSessionInput, {
