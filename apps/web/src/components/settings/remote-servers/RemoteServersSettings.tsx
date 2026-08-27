@@ -3,7 +3,7 @@ import { useState } from "react";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { SettingsPageContainer } from "../settingsLayout";
 import { ConnectTab } from "./ConnectTab";
-import { ShareTab } from "./ShareTab";
+import { ShareThisHostTab } from "./ShareThisHostTab";
 
 export type RemoteServersTab = "connect" | "share";
 
@@ -31,7 +31,7 @@ export function RemoteServersSettings({
           />
         </TabsPanel>
         <TabsPanel value="share">
-          <ShareTab />
+          <ShareThisHostTab />
         </TabsPanel>
       </Tabs>
     </SettingsPageContainer>

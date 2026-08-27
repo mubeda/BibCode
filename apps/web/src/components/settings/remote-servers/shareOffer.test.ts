@@ -279,4 +279,17 @@ describe("resolveShareAddressOptions", () => {
       },
     ]);
   });
+
+  it("uses the current server URL as the automatic browser-mode address", () => {
+    const options = resolveShareAddressOptions({
+      intent: "another-device",
+      advertisedEndpoints: [],
+      exposureState: null,
+      primaryHttpBaseUrl: "https://server.example.com/",
+    });
+    expect(options[0]).toMatchObject({
+      id: "auto-lan",
+      httpBaseUrl: "https://server.example.com/",
+    });
+  });
 });

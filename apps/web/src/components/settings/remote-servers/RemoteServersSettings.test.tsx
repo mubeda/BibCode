@@ -11,7 +11,9 @@ vi.mock("./ConnectTab", () => ({
     return <div data-testid="connect-tab" />;
   },
 }));
-vi.mock("./ShareTab", () => ({ ShareTab: () => <div data-testid="share-tab" /> }));
+vi.mock("./ShareThisHostTab", () => ({
+  ShareThisHostTab: () => <div data-testid="share-tab" />,
+}));
 
 import { RemoteServersSettings } from "./RemoteServersSettings";
 
