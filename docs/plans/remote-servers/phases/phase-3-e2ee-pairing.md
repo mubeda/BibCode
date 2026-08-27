@@ -1998,7 +1998,7 @@ export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassi
 
 Tasks 8 (Rust equivalent validation), 13, 14 and Phase 5 consume these.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `packages/shared/src/pairingCode.test.ts`:
 
@@ -2081,12 +2081,12 @@ describe("classifyPairingEndpoint", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `packages/shared`): `vp test run src/pairingCode.test.ts src/advertisedEndpoint.test.ts`
 Expected: FAIL (missing module / missing export).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `packages/shared/src/pairingCode.ts`:
 
@@ -2256,12 +2256,12 @@ export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassi
 
 Add the `"./pairingCode"` entry to `packages/shared/package.json` `exports` (same shape as `"./advertisedEndpoint"`). Verify `@bibcode/shared` declares `@bibcode/contracts` in its dependencies (it already imports it; if the manifest lacks it, add `"@bibcode/contracts": "workspace:*"`).
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run (from `packages/shared`): `vp test run src/pairingCode.test.ts src/advertisedEndpoint.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/shared/src/pairingCode.ts packages/shared/src/pairingCode.test.ts packages/shared/src/advertisedEndpoint.ts packages/shared/src/advertisedEndpoint.test.ts packages/shared/package.json pnpm-lock.yaml
