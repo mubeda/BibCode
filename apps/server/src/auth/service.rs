@@ -81,6 +81,21 @@ struct AuthState {
     pairings: HashMap<String, PairingRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTransport {
+    Plain,
+    E2ee,
+}
+
+impl SessionTransport {
+    const fn claim(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::E2ee => "e2ee",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SessionRecord {
     session_id: String,
@@ -94,6 +109,7 @@ struct SessionRecord {
     last_connected_at_ms: Option<i64>,
     connected_count: usize,
     proof_key_thumbprint: Option<String>,
+    transport: SessionTransport,
 }
 
 #[derive(Clone)]
@@ -299,10 +315,11 @@ impl AuthService {
             .send(AuthAccessEvent { revision, change });
     }
 
-    pub async fn create_browser_session(
+    pub(crate) async fn create_browser_session(
         &self,
         credential: &str,
         client: ClientMetadata,
+        transport: SessionTransport,
     ) -> Result<IssuedSession, AuthError> {
         let grant = self.consume_grant(credential, None).await?;
         self.issue_session(
@@ -311,16 +328,18 @@ impl AuthService {
             "browser-session-cookie",
             apply_grant_label(client, grant.label),
             None,
+            transport,
         )
         .await
     }
 
-    pub async fn exchange_bootstrap(
+    pub(crate) async fn exchange_bootstrap(
         &self,
         credential: &str,
         requested_scopes: Option<Vec<String>>,
         client: ClientMetadata,
         proof_key_thumbprint: Option<String>,
+        transport: SessionTransport,
     ) -> Result<IssuedSession, AuthError> {
         let grant = self
             .consume_grant(credential, proof_key_thumbprint.as_deref())
@@ -343,11 +362,16 @@ impl AuthService {
             method,
             apply_grant_label(client, grant.label),
             proof_key_thumbprint,
+            transport,
         )
         .await
     }
 
-    pub async fn authenticate_token(&self, token: &str) -> Result<Principal, AuthError> {
+    pub(crate) async fn authenticate_token(
+        &self,
+        token: &str,
+        surface: SessionTransport,
+    ) -> Result<Principal, AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -357,6 +381,8 @@ impl AuthService {
             || claims.kind != "session"
             || claims.exp <= observed_at
             || claims.scopes.iter().any(|scope| !is_scope(scope))
+            || !matches!(claims.tr.as_str(), "plain" | "e2ee")
+            || (claims.tr == "e2ee" && surface == SessionTransport::Plain)
         {
             return Err(AuthError::InvalidCredential);
         }
@@ -373,6 +399,7 @@ impl AuthService {
             || record.subject != claims.sub
             || record.method != claims.method
             || record.scopes != claims.scopes
+            || (record.transport == SessionTransport::E2ee && claims.tr != "e2ee")
         {
             return Err(AuthError::InvalidCredential);
         }
@@ -425,6 +452,9 @@ impl AuthService {
             .map_err(|error| AuthError::Internal(error.to_string()))
     }
 
+    // Tickets are only accepted by the plain `/ws` route. An E2EE session cannot
+    // obtain one because the preceding plain HTTP authentication rejects its
+    // transport-scoped bearer credential.
     pub async fn verify_websocket_ticket(&self, token: &str) -> Result<Principal, AuthError> {
         let claims: WebSocketClaims = self
             .signer
@@ -818,6 +848,7 @@ impl AuthService {
         method: &str,
         client: ClientMetadata,
         proof_key_thumbprint: Option<String>,
+        transport: SessionTransport,
     ) -> Result<IssuedSession, AuthError> {
         let _issuance = self.issuance.lock().await;
         let issued_at = now_ms();
@@ -836,6 +867,7 @@ impl AuthService {
             scopes: scopes.clone(),
             method: method.to_owned(),
             jkt: proof_key_thumbprint.clone(),
+            tr: transport.claim().to_owned(),
             iat: issued_at,
             exp: expires_at,
         };
@@ -855,6 +887,7 @@ impl AuthService {
             last_connected_at_ms: None,
             connected_count: 0,
             proof_key_thumbprint: proof_key_thumbprint.clone(),
+            transport,
         };
         {
             let mut state = self.state.lock().await;
@@ -1095,6 +1128,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
             .transpose()?,
         connected_count: 0,
         proof_key_thumbprint: None,
+        transport: SessionTransport::Plain,
     })
 }
 
@@ -1299,7 +1333,13 @@ mod tests {
         .expect("service hydrates over the same repositories");
 
         let session = service
-            .exchange_bootstrap(&issued.credential, None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("credential exchanges once");
         assert_eq!(
@@ -1309,7 +1349,13 @@ mod tests {
         assert_eq!(session.principal.subject, "administrative-bootstrap");
         assert!(matches!(
             service
-                .exchange_bootstrap(&issued.credential, None, ClientMetadata::default(), None)
+                .exchange_bootstrap(
+                    &issued.credential,
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::Plain,
+                )
                 .await,
             Err(AuthError::InvalidCredential)
         ));
@@ -1319,7 +1365,13 @@ mod tests {
     async fn authorization_context_rechecks_a_revoked_session() {
         let service = service();
         let issued = service
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("session");
         let context = RpcSessionContext::authenticated(issued.principal.clone(), service.clone());
@@ -1343,6 +1395,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2ee_minted_tokens_are_rejected_on_plain_surfaces() {
+        let auth = service();
+        let pairing = auth
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("device".to_owned()))
+            .await
+            .expect("pairing issues");
+        let issued = auth
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::E2ee,
+            )
+            .await
+            .expect("e2ee session issues");
+
+        assert!(
+            auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            auth.authenticate_token(&issued.token, SessionTransport::Plain)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_minted_tokens_still_work_on_both_surfaces() {
+        let auth = service();
+        let pairing = auth
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("device".to_owned()))
+            .await
+            .expect("pairing issues");
+        let issued = auth
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("plain session issues");
+
+        assert!(
+            auth.authenticate_token(&issued.token, SessionTransport::Plain)
+                .await
+                .is_ok()
+        );
+        assert!(
+            auth.authenticate_token(&issued.token, SessionTransport::E2ee)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_tokens_without_a_transport_claim_decode_as_plain() {
+        let auth = service();
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("plain session issues");
+        let mut claims = auth
+            .signer
+            .verify::<serde_json::Value>(&issued.token)
+            .expect("issued claims decode");
+        claims
+            .as_object_mut()
+            .expect("claims are an object")
+            .remove("tr");
+        let legacy_token = auth.signer.issue(&claims).expect("legacy token signs");
+
+        assert!(
+            auth.authenticate_token(&legacy_token, SessionTransport::Plain)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_expired_session_claims_and_parent_sessions_for_websocket_tickets() {
         let service = service();
         let expired = SessionClaims {
@@ -1353,17 +1495,26 @@ mod tests {
             scopes: owned_scopes(STANDARD_SCOPES),
             method: "bearer-access-token".to_owned(),
             jkt: None,
+            tr: SessionTransport::Plain.claim().to_owned(),
             iat: now_ms() - 2_000,
             exp: now_ms() - 1_000,
         };
         let token = service.signer.issue(&expired).expect("expired token");
         assert!(matches!(
-            service.authenticate_token(&token).await,
+            service
+                .authenticate_token(&token, SessionTransport::Plain)
+                .await,
             Err(AuthError::InvalidCredential)
         ));
 
         let issued = service
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("session");
         let (ticket, _) = service
@@ -1390,10 +1541,20 @@ mod tests {
             .issue_pairing(owned_scopes(STANDARD_SCOPES), None)
             .await
             .expect("pairing");
-        let first =
-            service.exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None);
-        let second =
-            service.exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None);
+        let first = service.exchange_bootstrap(
+            &pairing.credential,
+            None,
+            ClientMetadata::default(),
+            None,
+            SessionTransport::Plain,
+        );
+        let second = service.exchange_bootstrap(
+            &pairing.credential,
+            None,
+            ClientMetadata::default(),
+            None,
+            SessionTransport::Plain,
+        );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     }
@@ -1416,7 +1577,13 @@ mod tests {
 
         assert!(matches!(
             service
-                .exchange_bootstrap(&pairing.credential, None, ClientMetadata::default(), None)
+                .exchange_bootstrap(
+                    &pairing.credential,
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::Plain,
+                )
                 .await,
             Err(AuthError::InvalidCredential)
         ));
@@ -1455,6 +1622,7 @@ mod tests {
                     None,
                     ClientMetadata::default(),
                     Some("wrong-thumbprint".to_owned()),
+                    SessionTransport::Plain,
                 )
                 .await,
             Err(AuthError::InvalidCredential)
@@ -1465,6 +1633,7 @@ mod tests {
                 None,
                 ClientMetadata::default(),
                 Some("proof-thumbprint".to_owned()),
+                SessionTransport::Plain,
             )
             .await
             .expect("proof pairing should exchange");
@@ -1489,11 +1658,23 @@ mod tests {
         assert!(!service.revoke_pairing(&cloud_pairing.id).await.unwrap());
 
         let current = service
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("current session should issue");
         let other = service
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("other session should issue");
         service.mark_connected(&current.principal.session_id).await;
@@ -1537,7 +1718,9 @@ mod tests {
             1
         );
         assert!(matches!(
-            service.authenticate_token(&other.token).await,
+            service
+                .authenticate_token(&other.token, SessionTransport::Plain)
+                .await,
             Err(AuthError::InvalidCredential)
         ));
     }
@@ -1578,13 +1761,20 @@ mod tests {
                 Some(vec!["access:write".to_owned()]),
                 ClientMetadata::default(),
                 None,
+                SessionTransport::Plain,
             )
             .await,
             Err(AuthError::ScopeNotGranted)
         ));
 
         let issued = auth
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("session should issue");
         assert!(matches!(
@@ -1607,7 +1797,13 @@ mod tests {
         ));
 
         let mismatched = auth
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("mismatched session should issue");
         auth.state
@@ -1618,7 +1814,8 @@ mod tests {
             .expect("mismatched session record")
             .subject = "changed-subject".to_owned();
         assert!(matches!(
-            auth.authenticate_token(&mismatched.token).await,
+            auth.authenticate_token(&mismatched.token, SessionTransport::Plain)
+                .await,
             Err(AuthError::InvalidCredential)
         ));
 
@@ -1636,7 +1833,13 @@ mod tests {
         assert!(!auth.revoke_pairing(&revoked_pairing.id).await.unwrap());
 
         let revoked_client = auth
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("revoked client should issue");
         auth.state
@@ -1653,7 +1856,13 @@ mod tests {
                 .unwrap()
         );
         let removable = auth
-            .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None)
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
             .await
             .expect("removable client should issue");
         assert!(
@@ -1671,7 +1880,13 @@ mod tests {
             .expires_at_ms = now_ms() - 1;
         assert!(matches!(
             expired_service
-                .exchange_bootstrap("desktop-test-seed", None, ClientMetadata::default(), None,)
+                .exchange_bootstrap(
+                    "desktop-test-seed",
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::Plain,
+                )
                 .await,
             Err(AuthError::InvalidCredential)
         ));
@@ -1762,6 +1977,7 @@ mod tests {
                         last_connected_at_ms: None,
                         connected_count: 0,
                         proof_key_thumbprint: None,
+                        transport: SessionTransport::Plain,
                     },
                 );
             }
@@ -1773,6 +1989,7 @@ mod tests {
                     None,
                     ClientMetadata::default(),
                     None,
+                    SessionTransport::Plain,
                 )
                 .await,
             Err(AuthError::Internal(message)) if message == "active session capacity exceeded"

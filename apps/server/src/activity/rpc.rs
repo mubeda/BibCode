@@ -758,7 +758,7 @@ mod tests {
             ActivityScopeSeed, ActivityTargetDispatchDisposition, ProviderActivityControlUpdate,
             ProviderActivityMutation, ProviderActivityNativeTarget,
         },
-        auth::{AuthService, ClientMetadata},
+        auth::{AuthService, ClientMetadata, SessionTransport},
         persistence::{Database, run_migrations},
         rpc::RequestId,
     };
@@ -1624,6 +1624,7 @@ mod tests {
                 None,
                 ClientMetadata::default(),
                 None,
+                SessionTransport::Plain,
             )
             .await
             .expect("authorized session");
