@@ -261,6 +261,8 @@ describe("web cloud link environment client", () => {
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
       storageInstanceId: null,
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,

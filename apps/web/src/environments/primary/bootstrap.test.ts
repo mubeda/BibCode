@@ -24,6 +24,8 @@ const BASE_ENVIRONMENT = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: null,
+  remoteProtocolVersion: 1,
+  minCompatibleRemoteProtocol: 1,
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
@@ -94,6 +96,8 @@ describe("environmentBootstrap", () => {
       },
       serverVersion: "0.0.0-test",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      remoteProtocolVersion: 1,
+      minCompatibleRemoteProtocol: 1,
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
