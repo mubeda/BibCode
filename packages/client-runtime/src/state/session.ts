@@ -5,8 +5,9 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
-import { EnvironmentRegistry } from "../connection/registry.ts";
+import { computeCompatVerdict, type CompatVerdict } from "../connection/compat.ts";
 import type { PreparedConnection } from "../connection/model.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -23,6 +24,15 @@ export function initialConfigOption<E>(
       ),
     ),
   );
+}
+
+export function compatVerdictFromPrepared(
+  prepared: Option.Option<Pick<PreparedConnection, "descriptor">>,
+): CompatVerdict | null {
+  return Option.match(prepared, {
+    onNone: () => null,
+    onSome: (connection) => computeCompatVerdict(connection.descriptor),
+  });
 }
 
 export function createEnvironmentSessionAtoms<R, E>(
@@ -86,10 +96,17 @@ export function createEnvironmentSessionAtoms<R, E>(
     ).pipe(Atom.withLabel(`environment-prepared-connection:${environmentId}`)),
   );
 
+  const compatVerdictAtom = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make((get): CompatVerdict | null =>
+      compatVerdictFromPrepared(get(preparedConnectionValueAtom(environmentId))),
+    ).pipe(Atom.withLabel(`environment-compat-verdict:${environmentId}`)),
+  );
+
   return {
     initialConfigAtom,
     initialConfigValueAtom,
     preparedConnectionAtom,
     preparedConnectionValueAtom,
+    compatVerdictAtom,
   };
 }
