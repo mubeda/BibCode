@@ -16,4 +16,4 @@ pub(crate) use model::Principal;
 pub(crate) use rpc::register_rpc_handlers;
 pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope};
 pub(crate) use secret_store::SecretStore;
-pub(crate) use service::{AuthError, AuthService};
+pub(crate) use service::{AuthError, AuthService, issue_administrative_pairing_link};

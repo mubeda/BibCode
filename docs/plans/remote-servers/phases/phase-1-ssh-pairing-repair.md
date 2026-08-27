@@ -320,7 +320,7 @@ git commit -m "feat(server): issue administrative pairing links against a data r
   - `pub enum PairingCommand { Issue { root: ResolvedDataRoot, label: Option<String>, json: bool } }`
     exported from the crate root alongside `StorageCommand`.
 
-- [ ] **Step 1: Write the failing parse test**
+- [x] **Step 1: Write the failing parse test**
 
 Append inside the existing `#[cfg(test)] mod tests` in `apps/server/src/config.rs`:
 
@@ -368,7 +368,7 @@ Append inside the existing `#[cfg(test)] mod tests` in `apps/server/src/config.r
 from `tests/`. Add `use tempfile;` only if the compiler asks — the `mod tests` block
 resolves dev-dependencies directly.)
 
-- [ ] **Step 2: Write the failing end-to-end tests**
+- [x] **Step 2: Write the failing end-to-end tests**
 
 Append to `apps/server/tests/cli_smoke.rs` (imports at the top of the file already
 include `Command`, `TempDir`, `Value`, `ServerConfig`, `ServerRuntime`, and `reqwest` is
@@ -472,7 +472,7 @@ the link while a live server owns the store, and that server accepts the credent
 `POST /oauth/token`. The wire strings are hardcoded deliberately (black-box contract;
 the `urn:` constants live in the private `auth::model` module).
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p bibcode-server --lib pairing_issue_resolves_the_cli_data_root_and_is_not_a_server_command`
 Expected: compile error — `PairingCommand` / `CliAction::Pairing` /
@@ -484,7 +484,7 @@ Expected: both new tests FAIL — the binary exits with a clap "unrecognized sub
 message shows the clap stderr) and the second test fails on the stderr-content
 assertion.
 
-- [ ] **Step 4: Implement the CLI parsing in `apps/server/src/config.rs`**
+- [x] **Step 4: Implement the CLI parsing in `apps/server/src/config.rs`**
 
 Extend `CliCommand` (~line 241):
 
@@ -583,7 +583,7 @@ In `Cli::into_action` (~line 385), add a `Pairing` arm directly after the
             }
 ```
 
-- [ ] **Step 5: Implement the runner in `apps/server/src/lib.rs`**
+- [x] **Step 5: Implement the runner in `apps/server/src/lib.rs`**
 
 Update the config re-export (~line 46):
 
@@ -689,7 +689,7 @@ Implementation notes:
 - No migrations run here. `auth_pairing_links` has existed since migration 20 and the
   insert touches only stable columns.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-server --lib pairing_issue_resolves_the_cli_data_root_and_is_not_a_server_command`
 Expected: PASS.
@@ -697,7 +697,7 @@ Run: `cargo test -p bibcode-server --test cli_smoke`
 Expected: all PASS, including both new `pairing_issue_*` tests and every pre-existing
 test (the `--help` and flag-position tests must not regress).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add apps/server/src/config.rs apps/server/src/lib.rs apps/server/tests/cli_smoke.rs
