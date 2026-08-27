@@ -3,6 +3,7 @@ import type {
   AuthClientMetadata,
   AuthEnvironmentScope,
   AuthPairingCredentialResult,
+  RemotePairingReach,
   ServerAuthSessionMethod,
   AuthSessionId,
   AuthSessionState,
@@ -125,6 +126,7 @@ export interface ServerPairingLinkRecord {
   readonly label?: string;
   readonly createdAt: string;
   readonly expiresAt: string;
+  readonly reach?: RemotePairingReach;
 }
 
 export interface ServerClientSessionRecord {
@@ -138,6 +140,7 @@ export interface ServerClientSessionRecord {
   readonly lastConnectedAt: string | null;
   readonly connected: boolean;
   readonly current: boolean;
+  readonly reach?: RemotePairingReach;
 }
 
 type ServerAuthGateState =
@@ -411,6 +414,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
           subject: pairingLink.subject,
           createdAt: timestamps.createdAt,
           expiresAt: timestamps.expiresAt,
+          ...(pairingLink.reach === undefined ? {} : { reach: pairingLink.reach }),
         };
       }
       return {
@@ -421,6 +425,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
         label: pairingLink.label,
         createdAt: timestamps.createdAt,
         expiresAt: timestamps.expiresAt,
+        ...(pairingLink.reach === undefined ? {} : { reach: pairingLink.reach }),
       };
     });
   } catch (error) {
@@ -470,6 +475,7 @@ export async function listServerClientSessions(): Promise<
           : DateTime.formatIso(clientSession.lastConnectedAt),
       connected: clientSession.connected,
       current: clientSession.current,
+      ...(clientSession.reach === undefined ? {} : { reach: clientSession.reach }),
     }));
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({

@@ -43,6 +43,11 @@ const PAIRING_REJECTION_LIMIT: u8 =
 const ACCESS_EVENT_CAPACITY: usize = 64;
 const MAX_ACTIVE_PAIRINGS: usize = 4_096;
 const MAX_ACTIVE_SESSIONS: usize = 4_096;
+pub(crate) const PAIRING_REACH_VALUES: [&str; 3] = ["another-device", "this-computer", "custom"];
+
+fn is_valid_pairing_reach(value: &str) -> bool {
+    PAIRING_REACH_VALUES.contains(&value)
+}
 
 #[derive(Clone, Debug)]
 pub enum AuthError {
@@ -125,6 +130,8 @@ struct SessionRecord {
     connected_count: usize,
     proof_key_thumbprint: Option<String>,
     transport: SessionTransport,
+    reach: Option<String>,
+    off_host: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -139,12 +146,16 @@ struct PairingRecord {
     expires_at_ms: i64,
     consumed_at_ms: Option<i64>,
     revoked_at_ms: Option<i64>,
+    reach: Option<String>,
+    off_host: Option<bool>,
 }
 
 struct Grant {
     scopes: Vec<String>,
     subject: String,
     label: Option<String>,
+    reach: Option<String>,
+    off_host: Option<bool>,
 }
 
 pub struct IssuedSession {
@@ -345,6 +356,8 @@ impl AuthService {
             apply_grant_label(client, grant.label),
             None,
             transport,
+            grant.reach,
+            grant.off_host,
         )
         .await
     }
@@ -379,6 +392,8 @@ impl AuthService {
             apply_grant_label(client, grant.label),
             proof_key_thumbprint,
             transport,
+            grant.reach,
+            grant.off_host,
         )
         .await
     }
@@ -553,8 +568,16 @@ impl AuthService {
         scopes: Vec<String>,
         label: Option<String>,
     ) -> Result<PairingCredentialResult, AuthError> {
-        self.issue_pairing_for_subject(scopes, label, "one-time-token", None, PAIRING_TTL_MS)
-            .await
+        self.issue_pairing_for_subject(
+            scopes,
+            label,
+            "one-time-token",
+            None,
+            PAIRING_TTL_MS,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn issue_pairing_with_proof(
@@ -572,6 +595,8 @@ impl AuthService {
             "one-time-token",
             Some(proof_key_thumbprint),
             PAIRING_TTL_MS,
+            None,
+            None,
         )
         .await
     }
@@ -589,6 +614,8 @@ impl AuthService {
             "cloud-connect",
             Some(proof_key_thumbprint),
             CLOUD_PAIRING_TTL_MS,
+            None,
+            None,
         )
         .await
     }
@@ -600,6 +627,30 @@ impl AuthService {
             "administrative-bootstrap",
             None,
             PAIRING_TTL_MS,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn issue_share_pairing(
+        &self,
+        scopes: Vec<String>,
+        label: Option<String>,
+        reach: String,
+        off_host: bool,
+    ) -> Result<PairingCredentialResult, AuthError> {
+        if !is_valid_pairing_reach(&reach) {
+            return Err(AuthError::InvalidCredential);
+        }
+        self.issue_pairing_for_subject(
+            scopes,
+            label,
+            "one-time-token",
+            None,
+            PAIRING_TTL_MS,
+            Some(reach),
+            Some(off_host),
         )
         .await
     }
@@ -611,6 +662,8 @@ impl AuthService {
         subject: &str,
         proof_key_thumbprint: Option<String>,
         ttl_ms: i64,
+        reach: Option<String>,
+        off_host: Option<bool>,
     ) -> Result<PairingCredentialResult, AuthError> {
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
@@ -656,6 +709,8 @@ impl AuthService {
             expires_at_ms: expires_at,
             consumed_at_ms: None,
             revoked_at_ms: None,
+            reach,
+            off_host,
         };
         let view = record.view();
         if let Some(repositories) = &self.repositories {
@@ -906,6 +961,8 @@ impl AuthService {
         client: ClientMetadata,
         proof_key_thumbprint: Option<String>,
         transport: SessionTransport,
+        reach: Option<String>,
+        off_host: Option<bool>,
     ) -> Result<IssuedSession, AuthError> {
         let _issuance = self.issuance.lock().await;
         let issued_at = now_ms();
@@ -945,6 +1002,8 @@ impl AuthService {
             connected_count: 0,
             proof_key_thumbprint: proof_key_thumbprint.clone(),
             transport,
+            reach,
+            off_host,
         };
         {
             let mut state = self.state.lock().await;
@@ -997,6 +1056,8 @@ impl AuthService {
                     scopes: owned_scopes(ADMINISTRATIVE_SCOPES),
                     subject: "desktop-bootstrap".to_owned(),
                     label: None,
+                    reach: None,
+                    off_host: None,
                 })
             } else {
                 Err(AuthError::InvalidCredential)
@@ -1023,6 +1084,8 @@ impl AuthService {
                 scopes: pairing.scopes,
                 subject: pairing.subject,
                 label: pairing.label,
+                reach: pairing.reach,
+                off_host: pairing.off_host,
             });
         }
 
@@ -1048,6 +1111,8 @@ impl AuthService {
             scopes: pairing.scopes.clone(),
             subject: pairing.subject.clone(),
             label: pairing.label.clone(),
+            reach: pairing.reach.clone(),
+            off_host: pairing.off_host,
         };
         drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
@@ -1079,6 +1144,7 @@ impl SessionRecord {
             last_connected_at: self.last_connected_at_ms.map(format_iso),
             connected: self.connected_count > 0,
             current,
+            reach: self.reach.clone(),
         }
     }
 }
@@ -1093,6 +1159,7 @@ impl PairingRecord {
             label: self.label.clone(),
             created_at: format_iso(self.created_at_ms),
             expires_at: format_iso(self.expires_at_ms),
+            reach: self.reach.clone(),
         }
     }
 }
@@ -1110,8 +1177,8 @@ fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
         expires_at: format_iso(record.expires_at_ms),
         consumed_at: record.consumed_at_ms.map(format_iso),
         revoked_at: record.revoked_at_ms.map(format_iso),
-        reach: None,
-        off_host: None,
+        reach: record.reach.clone(),
+        off_host: record.off_host,
     }
 }
 
@@ -1131,8 +1198,8 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
         },
         issued_at: format_iso(record.issued_at_ms),
         expires_at: format_iso(record.expires_at_ms),
-        reach: None,
-        off_host: None,
+        reach: record.reach.clone(),
+        off_host: record.off_host,
     }
 }
 
@@ -1157,6 +1224,8 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
             .as_deref()
             .map(parse_timestamp_ms)
             .transpose()?,
+        reach: row.reach,
+        off_host: row.off_host,
     })
 }
 
@@ -1190,6 +1259,8 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         connected_count: 0,
         proof_key_thumbprint: None,
         transport: SessionTransport::Plain,
+        reach: row.reach,
+        off_host: row.off_host,
     })
 }
 
@@ -1328,6 +1399,8 @@ pub(crate) async fn issue_administrative_pairing_link(
         expires_at_ms: now.saturating_add(PAIRING_TTL_MS),
         consumed_at_ms: None,
         revoked_at_ms: None,
+        reach: None,
+        off_host: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -1453,6 +1526,54 @@ mod tests {
             .with_desktop("desktop-test-seed")
             .expect("desktop config");
         AuthService::new(&config, vec![7_u8; 32])
+    }
+
+    #[tokio::test]
+    async fn share_pairing_reach_is_recorded_and_inherited_by_sessions() {
+        let auth = service();
+        let issued = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+            )
+            .await
+            .expect("share pairing");
+        let listed = auth.list_pairings().await;
+        assert_eq!(listed[0].reach.as_deref(), Some("another-device"));
+
+        let session = auth
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        let clients = auth.list_clients(&session.principal.session_id).await;
+        let paired = clients
+            .iter()
+            .find(|client| client.session_id == session.principal.session_id)
+            .expect("paired client");
+        assert_eq!(paired.reach.as_deref(), Some("another-device"));
+    }
+
+    #[tokio::test]
+    async fn share_pairing_rejects_unknown_reach() {
+        let auth = service();
+        let error = auth
+            .issue_share_pairing(
+                owned_scopes(STANDARD_SCOPES),
+                None,
+                "everywhere".to_owned(),
+                true,
+            )
+            .await
+            .expect_err("invalid reach");
+        assert!(matches!(error, AuthError::InvalidCredential));
     }
 
     #[tokio::test]
@@ -1993,6 +2114,8 @@ mod tests {
                         expires_at_ms: now + PAIRING_TTL_MS,
                         consumed_at_ms: None,
                         revoked_at_ms: None,
+                        reach: None,
+                        off_host: None,
                     },
                 );
             }
@@ -2039,6 +2162,8 @@ mod tests {
                         connected_count: 0,
                         proof_key_thumbprint: None,
                         transport: SessionTransport::Plain,
+                        reach: None,
+                        off_host: None,
                     },
                 );
             }

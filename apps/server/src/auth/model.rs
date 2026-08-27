@@ -141,6 +141,8 @@ pub struct PairingLinkView {
     pub label: Option<String>,
     pub created_at: String,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -196,6 +198,8 @@ pub struct ClientSessionView {
     pub last_connected_at: Option<String>,
     pub connected: bool,
     pub current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 #[derive(Clone, Debug)]

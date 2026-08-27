@@ -226,6 +226,7 @@ export const AuthPairingLink = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
   expiresAt: Schema.DateTimeUtc,
+  reach: Schema.optionalKey(RemotePairingReach),
 });
 export type AuthPairingLink = typeof AuthPairingLink.Type;
 
@@ -250,6 +251,7 @@ export const AuthClientSession = Schema.Struct({
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),
   connected: Schema.Boolean,
   current: Schema.Boolean,
+  reach: Schema.optionalKey(RemotePairingReach),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
