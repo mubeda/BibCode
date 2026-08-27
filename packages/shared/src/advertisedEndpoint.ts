@@ -56,6 +56,53 @@ export function classifyHostedHttpsCompatibility(
   return fallback === "mixed-content-blocked" ? "unknown" : fallback;
 }
 
+export type PairingEndpointClassification =
+  | "loopback"
+  | "private-network"
+  | "public"
+  | "unconnectable";
+
+function isPrivateIpv4(host: string): boolean {
+  const octets = host.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet))) {
+    return false;
+  }
+  const [a, b] = octets as [number, number, number, number];
+  return (
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254)
+  );
+}
+
+export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassification {
+  let url: URL;
+  try {
+    url = new URL(normalizeHttpBaseUrl(endpoint));
+  } catch {
+    return "unconnectable";
+  }
+  if (/:0(?:[/?#]|$)/.test(endpoint.trim())) {
+    return "unconnectable";
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "0.0.0.0" || host === "::" || host === "") {
+    return "unconnectable";
+  }
+  if (host === "localhost" || host === "::1" || host.startsWith("127.")) {
+    return "loopback";
+  }
+  if (isPrivateIpv4(host)) {
+    return "private-network";
+  }
+  if (host.startsWith("fd") || host.startsWith("fc") || host.startsWith("fe80")) {
+    return "private-network";
+  }
+  return "public";
+}
+
 export function createAdvertisedEndpoint(input: CreateAdvertisedEndpointInput): AdvertisedEndpoint {
   const httpBaseUrl = normalizeHttpBaseUrl(input.httpBaseUrl);
   return {

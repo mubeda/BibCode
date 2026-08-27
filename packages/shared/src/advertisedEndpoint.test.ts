@@ -1,11 +1,33 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  classifyPairingEndpoint,
   classifyHostedHttpsCompatibility,
   createAdvertisedEndpoint,
   deriveWsBaseUrl,
   normalizeHttpBaseUrl,
 } from "./advertisedEndpoint.ts";
+
+describe("classifyPairingEndpoint", () => {
+  it.each([
+    ["http://127.0.0.1:3773", "loopback"],
+    ["http://[::1]:3773", "loopback"],
+    ["http://localhost:3773", "loopback"],
+    ["http://192.168.1.20:3773", "private-network"],
+    ["http://10.0.0.5:3773", "private-network"],
+    ["http://172.16.0.9:3773", "private-network"],
+    ["http://100.64.12.1:3773", "private-network"],
+    ["http://[fd00::1]:3773", "private-network"],
+    ["http://203.0.113.7:3773", "public"],
+    ["https://server.example.com", "public"],
+    ["http://0.0.0.0:3773", "unconnectable"],
+    ["http://[::]:3773", "unconnectable"],
+    ["http://192.168.1.20:0", "unconnectable"],
+    ["not a url", "unconnectable"],
+  ])("classifies %s as %s", (endpoint, expected) => {
+    expect(classifyPairingEndpoint(endpoint)).toBe(expected);
+  });
+});
 
 const provider = {
   id: "desktop-core",
