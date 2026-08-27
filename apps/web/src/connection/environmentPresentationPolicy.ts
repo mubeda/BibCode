@@ -5,12 +5,10 @@ import { isLinuxPlatform, isMacPlatform, isWindowsPlatform } from "../lib/utils"
 
 export type ClientPresentationSurface = "browser" | "desktop";
 export type DesktopHostPlatform = "macos" | "windows" | "linux" | "unknown";
-export type ConnectionsPresentation = "full" | "local-wsl" | "redirect-general";
 
 export interface EnvironmentPresentationPolicy {
   readonly surface: ClientPresentationSurface;
   readonly platform: DesktopHostPlatform;
-  readonly connectionsPresentation: ConnectionsPresentation;
   readonly showRemoteDeviceControls: boolean;
   readonly showLocalEnvironmentSettings: boolean;
   readonly presentsTarget: (target: ConnectionTarget) => boolean;
@@ -49,19 +47,13 @@ export function createEnvironmentPresentationPolicy(input: {
   readonly platform: DesktopHostPlatform;
 }): EnvironmentPresentationPolicy {
   const browser = input.surface === "browser";
-  const connectionsPresentation = browser
-    ? "full"
-    : input.platform === "windows"
-      ? "local-wsl"
-      : "redirect-general";
   const presentsTarget = (target: ConnectionTarget) =>
     browser || isLocalDesktopTarget(input, target);
 
   return {
     ...input,
-    connectionsPresentation,
     showRemoteDeviceControls: browser,
-    showLocalEnvironmentSettings: connectionsPresentation === "local-wsl",
+    showLocalEnvironmentSettings: input.surface === "desktop" && input.platform === "windows",
     presentsTarget,
     permitsConnectionAction: presentsTarget,
   };

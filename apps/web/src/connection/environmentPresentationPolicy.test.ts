@@ -64,15 +64,15 @@ const allTargetKinds: readonly ConnectionTarget[] = [
 
 describe("environment presentation policy", () => {
   it.each([
-    ["browser", "macos", "full", true],
-    ["desktop", "macos", "redirect-general", false],
-    ["desktop", "linux", "redirect-general", false],
-    ["desktop", "windows", "local-wsl", false],
-    ["desktop", "unknown", "redirect-general", false],
-  ] as const)("derives %s/%s presentation", (surface, platform, connections, remote) => {
+    ["browser", "macos", false, true],
+    ["desktop", "macos", false, false],
+    ["desktop", "linux", false, false],
+    ["desktop", "windows", true, false],
+    ["desktop", "unknown", false, false],
+  ] as const)("derives %s/%s presentation", (surface, platform, localSettings, remote) => {
     const policy = createEnvironmentPresentationPolicy({ surface, platform });
 
-    expect(policy.connectionsPresentation).toBe(connections);
+    expect(policy.showLocalEnvironmentSettings).toBe(localSettings);
     expect(policy.showRemoteDeviceControls).toBe(remote);
   });
 

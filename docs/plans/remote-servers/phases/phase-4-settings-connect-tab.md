@@ -1002,7 +1002,7 @@ git commit -m "refactor(web): split Connections settings into remote-servers tab
   `code` consumed in Task 8), `/settings/local-environment`; policy without
   `connectionsPresentation`; nav item `{ label: "Remote Servers", to: "/settings/remote-servers" }`.
 
-- [ ] **Step 1: Write the failing route tests**
+- [x] **Step 1: Write the failing route tests**
 
 ```tsx
 // apps/web/src/routes/settings.remote-servers.test.tsx
@@ -1088,7 +1088,7 @@ Update `SettingsSidebarNav.test.tsx` expectations: the base list gains
 Windows-only item becomes `["Local environment", "/settings/local-environment"]` inserted
 after Remote Servers; the browser/macOS policies still exclude "Local environment".
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -1101,7 +1101,7 @@ vp test run apps/web/src/routes/settings.remote-servers.test.tsx \
 
 Expected: FAIL — new route modules missing; nav expectations unmet.
 
-- [ ] **Step 3: Implement routes, nav, policy, and link updates**
+- [x] **Step 3: Implement routes, nav, policy, and link updates**
 
 ```tsx
 // apps/web/src/routes/settings.remote-servers.tsx
@@ -1243,7 +1243,7 @@ In-app links (D16 copy — "backend"/"Connections" wording updates only where to
 Also grep for stragglers before finishing: `rg -n "settings/connections" apps/web/src`
 must return only `routeTree.gen.ts` (until regenerated) and the redirect route file.
 
-- [ ] **Step 4: Regenerate the route tree and run tests**
+- [x] **Step 4: Regenerate the route tree and run tests**
 
 Run the focused tests (this loads the apps/web Vite config, which regenerates
 `apps/web/src/routeTree.gen.ts` via `@tanstack/router-plugin`):
@@ -1260,7 +1260,7 @@ if it did not regenerate, run `vp run --filter @bibcode/web build` once. Then
 `vp run typecheck` — expected clean (catches any missed `/settings/connections` `Link`/
 `navigate` literals, which are type-checked against the generated tree).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A apps/web/src/routes apps/web/src/components/settings/SettingsSidebarNav.tsx \

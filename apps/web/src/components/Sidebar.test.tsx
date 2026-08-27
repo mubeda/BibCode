@@ -1513,7 +1513,7 @@ staticDescribe("Sidebar full render", () => {
       { label: "environment.retry", input: ENV_MAIN },
       { label: "environment.adoptStorage", input: ENV_MAIN },
     ]);
-    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
     expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
     expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
