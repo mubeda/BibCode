@@ -4561,7 +4561,7 @@ export const verifyAndAddPairingCode: (input: VerifyPairingCodeInput) => Effect.
 
 Phase 4's Add Server dialog consumes `ConnectionOnboarding.verifyAndAddPairingCode` and switches copy on the tagged errors.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `pairingAdd.test.ts`, following `onboarding.test.ts`'s service-stub idiom (stub `HttpClient` for the descriptor fetch, `RpcSessionFactory` — whose session stub exposes `e2eeAuthenticated`/`initialConfig`/`ready`/`probe` — `EnvironmentRegistry`, and `AcceptedStorageIdentityStore`). One helper builds a valid code via `encodePairingCode`. Cases (each asserts the exact tagged error / reason):
 
@@ -4598,12 +4598,12 @@ const validPayload = (overrides?: Partial<RemotePairingCodePayload>): RemotePair
     - the accepted storage identity for the new target key was recorded (`AcceptedStorageIdentityStore.accept`) with the authenticated `storageInstanceId`,
     - the probe's `PreparedConnection.e2ee.auth` was `{ kind: "pairing", token: payload.token }`.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `packages/client-runtime`): `vp test run src/connection/pairingAdd.test.ts`
 Expected: FAIL (module missing).
 
-- [ ] **Step 3: Implement `pairingAdd.ts`**
+- [x] **Step 3: Implement `pairingAdd.ts`**
 
 ```ts
 import { type EnvironmentId, type RemotePairingCodePayload } from "@bibcode/contracts";
@@ -4864,12 +4864,12 @@ export const verifyAndAddPairingCode = Effect.fn(
 
 Wire into `ConnectionOnboarding` (`onboarding.ts`): add `verifyAndAddPairingCode` to the service interface and `make` (providing `EnvironmentRegistry`, `HttpClient`, `RpcSessionFactory`, `AcceptedStorageIdentityStore` — mirror how `registerPairing` provides its services). Update `layer.ts` so the onboarding layer receives the two new services (`RpcSessionFactory` is already built there for the driver; reuse that layer value, and provide `AcceptedStorageIdentityStore` from the persistence context).
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run (from `packages/client-runtime`): `vp test run src/connection/pairingAdd.test.ts src/connection/onboarding.test.ts`
 Expected: PASS (existing onboarding tests untouched).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src/connection/pairingAdd.ts packages/client-runtime/src/connection/pairingAdd.test.ts packages/client-runtime/src/connection/onboarding.ts packages/client-runtime/src/connection/layer.ts

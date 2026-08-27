@@ -1,5 +1,9 @@
 import type { DesktopSshEnvironmentTarget, EnvironmentId } from "@bibcode/contracts";
 import { resolveRemotePairingTarget } from "@bibcode/shared/remote";
+import {
+  PairingCodeParseError,
+  PairingCodeUnsupportedVersionError,
+} from "@bibcode/shared/pairingCode";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -31,6 +35,13 @@ import {
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import {
+  PairingAddError,
+  PairingLoopbackAcknowledgementRequiredError,
+  type VerifyPairingCodeInput,
+  verifyAndAddPairingCode,
+} from "./pairingAdd.ts";
+import * as RpcSession from "../rpc/session.ts";
 
 export interface PairingConnectionInput {
   readonly pairingUrl?: string;
@@ -57,6 +68,17 @@ export class ConnectionOnboarding extends Context.Service<
     ) => Effect.Effect<
       EnvironmentId,
       ConnectionAttemptError | Persistence.ConnectionPersistenceError
+    >;
+    readonly verifyAndAddPairingCode: (
+      input: VerifyPairingCodeInput,
+    ) => Effect.Effect<
+      EnvironmentId,
+      | PairingAddError
+      | PairingLoopbackAcknowledgementRequiredError
+      | PairingCodeParseError
+      | PairingCodeUnsupportedVersionError
+      | ConnectionAttemptError
+      | Persistence.ConnectionPersistenceError
     >;
     readonly registerSsh: (
       input: SshConnectionInput,
@@ -250,6 +272,8 @@ export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
+  const sessions = yield* RpcSession.RpcSessionFactory;
+  const identities = yield* Persistence.AcceptedStorageIdentityStore;
 
   return ConnectionOnboarding.of({
     registerPairing: (input) =>
@@ -257,6 +281,13 @@ export const make = Effect.gen(function* () {
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),
         Effect.provideService(ClientCapabilities.ClientPresentation, presentation),
         Effect.provideService(HttpClient.HttpClient, httpClient),
+      ),
+    verifyAndAddPairingCode: (input) =>
+      verifyAndAddPairingCode(input).pipe(
+        Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(RpcSession.RpcSessionFactory, sessions),
+        Effect.provideService(Persistence.AcceptedStorageIdentityStore, identities),
       ),
     registerSsh: (input) =>
       registerSshConnection(input).pipe(
