@@ -968,6 +968,180 @@ async fn invalid_scope_and_missing_credentials_use_stable_error_shapes() {
 }
 
 #[tokio::test]
+async fn pairing_offer_mints_the_spec_payload_with_pinned_host_identity() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+
+    let offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .json(&json!({
+                "name": "AI-SERVER",
+                "endpoint": "http://192.168.1.20:3773",
+                "reach": "another-device",
+            }))
+            .send()
+            .await
+            .expect("pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(offer["name"], "AI-SERVER");
+    assert_eq!(offer["reach"], "another-device");
+    assert_eq!(offer["endpoint"], "http://192.168.1.20:3773");
+    assert!(offer["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(offer["expiresAt"].as_str().is_some_and(|at| !at.is_empty()));
+
+    let code = offer["code"].as_str().expect("offer code");
+    let payload = bibcode_server::auth_pairing_code::decode_pairing_code(code).expect("decodes");
+    assert_eq!(payload.v, 1);
+    assert_eq!(payload.name, "AI-SERVER");
+    assert_eq!(payload.endpoint, "http://192.168.1.20:3773");
+    assert_eq!(
+        payload.reach,
+        bibcode_server::auth_pairing_code::RemotePairingReach::AnotherDevice
+    );
+    assert!(!payload.token.is_empty());
+    assert_eq!(payload.host_key.len(), 43);
+    uuid::Uuid::parse_str(&payload.storage_instance_id).expect("storage id is a UUID");
+
+    let links = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/pairing-links"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("pairing links"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        links
+            .as_array()
+            .expect("link list")
+            .iter()
+            .any(|link| link["id"] == offer["id"])
+    );
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_rejects_invalid_endpoint_and_reach_combinations() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+
+    for (endpoint, reach) in [
+        ("ftp://192.168.1.20:3773", "custom"),
+        ("http://0.0.0.0:3773", "custom"),
+        ("http://127.0.0.1:0", "custom"),
+        ("http://127.0.0.1:3773", "another-device"),
+        ("http://192.168.1.20:3773", "this-computer"),
+    ] {
+        let response = client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .json(&json!({ "name": "X", "endpoint": endpoint, "reach": reach }))
+            .send()
+            .await
+            .expect("invalid offer");
+        let body = get_json(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["code"], "invalid_request", "{endpoint} {reach}");
+        assert_eq!(
+            body["reason"], "invalid_pairing_offer",
+            "{endpoint} {reach}"
+        );
+    }
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_replays_are_idempotent_per_key() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+    let body = json!({
+        "name": "AI-SERVER",
+        "endpoint": "http://192.168.1.20:3773",
+        "reach": "another-device",
+    });
+    let mint = |body: Value| {
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .header("idempotency-key", "retry-key-1")
+            .json(&body)
+            .send()
+    };
+    let (first_response, second_response) = tokio::join!(mint(body.clone()), mint(body.clone()));
+    let first = get_json(first_response.expect("first mint"), StatusCode::OK).await;
+    let second = get_json(second_response.expect("replay"), StatusCode::OK).await;
+    assert_eq!(first, second);
+
+    let links = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/pairing-links"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("pairing links"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(links.as_array().expect("link list").len(), 1);
+
+    let conflicting = mint(json!({
+        "name": "OTHER",
+        "endpoint": "http://192.168.1.20:3773",
+        "reach": "another-device",
+    }))
+    .await
+    .expect("conflicting mint");
+    let conflict_body = get_json(conflicting, StatusCode::BAD_REQUEST).await;
+    assert_eq!(conflict_body["reason"], "invalid_pairing_offer");
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_requires_the_access_write_scope() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let limited_response = exchange_token(
+        &client,
+        &handle,
+        DESKTOP_BOOTSTRAP,
+        Some("orchestration:read orchestration:operate terminal:operate review:write relay:read"),
+    )
+    .await;
+    let limited = access_token(&limited_response);
+
+    let response = client
+        .post(http_url(&handle, "/api/auth/pairing-offer"))
+        .bearer_auth(limited)
+        .json(&json!({
+            "name": "X",
+            "endpoint": "http://192.168.1.20:3773",
+            "reach": "another-device",
+        }))
+        .send()
+        .await
+        .expect("scope-limited offer");
+    let body = get_json(response, StatusCode::FORBIDDEN).await;
+    assert_eq!(body["_tag"], "EnvironmentScopeRequiredError");
+    assert_eq!(body["requiredScope"], "access:write");
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn dpop_tokens_validate_proof_binding_time_and_replay() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;

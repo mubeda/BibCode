@@ -2304,7 +2304,7 @@ Validation rules (pinned jointly with Phase 5):
 - `scopes` defaults to the standard client scopes and is subset-checked against the caller's scopes exactly like `create_pairing_credential` does.
 - **Idempotency:** the endpoint accepts an optional `Idempotency-Key` request header. A repeated request with the same key **and byte-identical input** returns the original offer (no second grant is minted); the same key with a different input is refused with `invalid_pairing_offer`. Records expire with the offer's `expiresAt` (the 5-minute pairing TTL). Phase 5's client retry policy sends this header on every mint.
 
-- [ ] **Step 1: Write the failing Rust integration tests**
+- [x] **Step 1: Write the failing Rust integration tests**
 
 Two files. **(a)** `apps/server/tests/auth_http.rs` — the HTTP contract cases, using that file's existing helpers (`start_desktop_server`, `exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, <requested scopes>)`, `access_token`, `http_url`, `get_json` — read them before writing; they already exist at the top of the file). **(b)** `apps/server/tests/e2ee_ws.rs` — the full mint → pair → encrypted-session round trip, reusing Task 5's helpers (`boot()`, `admin_bearer_token`, `ws_ticket`, `read_host_public_key`, `noise_connect`) plus a small reqwest call for the mint.
 
@@ -2571,12 +2571,12 @@ async fn minted_pairing_offer_pins_the_host_key_and_opens_the_e2ee_channel() {
 
 `send_encrypted` (record-split + `transport.write_message` + Binary frame) and `recv_encrypted_json` (Binary frames → `transport.read_message` → record reassembly → `serde_json::Value`) are small helpers alongside Task 5's; write them once in the file and reuse. The encrypted reply envelope is the `ServerMessage` JSON from `apps/server/src/rpc/message.rs` (`{"_tag":"Exit","requestId":...}`) — match whatever the plain-`/ws` tests in `activity_rpc.rs` destructure.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p bibcode-server --test auth_http pairing_offer && cargo test -p bibcode-server --test e2ee_ws minted_pairing_offer`
 Expected: FAIL — 404 responses (route missing).
 
-- [ ] **Step 3: Implement server side**
+- [x] **Step 3: Implement server side**
 
 `apps/server/src/auth/service.rs`: change `fn is_loopback_host` (line 1143) to `pub(crate) fn is_loopback_host` so the handler can reuse it.
 
@@ -2790,7 +2790,7 @@ Match this file's existing imports and idioms exactly (`owned_scopes`, `STANDARD
 
 Note: the 5-minute pairing TTL (`PAIRING_TTL_MS`, `service.rs:35`) applies unchanged — `expiresAt` in the result is what Phase 5 uses for its regenerate UX.
 
-- [ ] **Step 4: Implement the contracts side and regenerate parity fixtures**
+- [x] **Step 4: Implement the contracts side and regenerate parity fixtures**
 
 `packages/contracts/src/auth.ts` (import `RemotePairingReach` from `./remotePairing.ts`; place next to `AuthCreatePairingCredentialInput` / `AuthPairingCredentialResult`):
 
@@ -2884,7 +2884,7 @@ pnpm --filter @bibcode/contracts run generate:rust-auth-fixtures
 
 and read the fixture diff: only `pairing-offer` entries, the route addition, and the changed `EnvironmentRequestInvalidError` fingerprint (the new reason literal) may appear.
 
-- [ ] **Step 5: Run everything to verify green**
+- [x] **Step 5: Run everything to verify green**
 
 Run:
 
@@ -2898,7 +2898,7 @@ cd packages/contracts && vp test run src/authRustParity.test.ts src/auth.test.ts
 
 Expected: PASS. `auth_http.rs`'s own fixture-inventory test (`language_neutral_auth_fixtures_match_the_rust_http_inventory`) and the TS parity manifest both cover the new route — if either fails, the endpoint declaration, exporter, and fixtures are out of sync.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add packages/contracts/src/auth.ts packages/contracts/src/environmentHttp.ts packages/contracts/src/authRustParity.test.ts packages/contracts/scripts/export-rust-auth-fixtures.ts packages/contracts/fixtures/auth-http apps/server/src/auth/model.rs apps/server/src/auth/http.rs apps/server/src/auth/service.rs apps/server/src/http.rs apps/server/tests/auth_http.rs apps/server/tests/server_runtime.rs apps/server/tests/e2ee_ws.rs

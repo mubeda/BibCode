@@ -110,6 +110,26 @@ pub struct PairingCredentialResult {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreatePairingOfferRequest {
+    pub name: String,
+    pub endpoint: String,
+    pub reach: String,
+    pub label: Option<String>,
+    pub scopes: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingOfferResult {
+    pub id: String,
+    pub code: String,
+    pub reach: String,
+    pub endpoint: String,
+    pub name: String,
+    pub expires_at: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingLinkView {

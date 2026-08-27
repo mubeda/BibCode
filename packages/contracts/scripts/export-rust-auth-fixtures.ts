@@ -17,11 +17,13 @@ import {
   AuthBrowserSessionResult,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentBootstrapTokenType,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthAccessTokenType,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -57,6 +59,7 @@ const authRouteNames = [
   "token",
   "webSocketTicket",
   "pairingCredential",
+  "pairingOffer",
   "pairingLinks",
   "revokePairingLink",
   "clients",
@@ -187,10 +190,12 @@ const namedSchemas = {
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthEnvironmentScopes,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
   AuthPairingLink,
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
@@ -320,6 +325,20 @@ addJsonFixture("responses/pairing-create.json", AuthPairingCredentialResult, {
   label: "Fixture pairing link",
   expiresAt: pairingExpiresAt,
 });
+addJsonFixture("requests/pairing-offer.json", AuthCreatePairingOfferInput, {
+  name: "AI-SERVER",
+  endpoint: "http://192.168.1.20:3773",
+  reach: "another-device",
+  label: "Tablet",
+});
+addJsonFixture("responses/pairing-offer.json", AuthPairingOfferResult, {
+  id: "4f8f2f2e-0000-4000-8000-000000000000",
+  code: "eyJ2IjoxfQ",
+  reach: "another-device",
+  endpoint: "http://192.168.1.20:3773",
+  name: "AI-SERVER",
+  expiresAt: "2026-08-27T01:00:00.000Z",
+});
 addJsonFixture("responses/pairing-list.json", AuthPairingLinkList, [
   {
     id: pairingId,
@@ -435,6 +454,10 @@ const samples = {
   pairingCredential: {
     request: "requests/pairing-create.json",
     success: "responses/pairing-create.json",
+  },
+  pairingOffer: {
+    request: "requests/pairing-offer.json",
+    success: "responses/pairing-offer.json",
   },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {

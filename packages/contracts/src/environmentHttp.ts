@@ -14,7 +14,9 @@ import {
   AuthBrowserSessionResult,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthCreatePairingOfferInput,
   AuthPairingCredentialResult,
+  AuthPairingOfferResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
@@ -50,10 +52,17 @@ const OptionalDpopProofHeaders = Schema.Struct({
   dpop: Schema.optionalKey(Schema.String),
 });
 
+const PairingOfferHeaders = Schema.Struct({
+  authorization: Schema.optionalKey(Schema.String),
+  dpop: Schema.optionalKey(Schema.String),
+  "idempotency-key": Schema.optionalKey(Schema.String),
+});
+
 export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "invalid_pairing_offer",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -75,6 +84,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "access_token_issuance_failed",
   "websocket_ticket_issuance_failed",
   "pairing_credential_issuance_failed",
+  "pairing_offer_issuance_failed",
   "pairing_links_load_failed",
   "pairing_link_revoke_failed",
   "client_sessions_load_failed",
@@ -375,6 +385,14 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       headers: OptionalBearerHeaders,
       payload: AuthCreatePairingCredentialInput,
       success: AuthPairingCredentialResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("pairingOffer", "/api/auth/pairing-offer", {
+      headers: PairingOfferHeaders,
+      payload: AuthCreatePairingOfferInput,
+      success: AuthPairingOfferResult,
       error: EnvironmentPairingCredentialErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
