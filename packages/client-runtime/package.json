@@ -143,6 +143,9 @@
   "dependencies": {
     "@bibcode/contracts": "workspace:*",
     "@bibcode/shared": "workspace:*",
+    "@noble/ciphers": "catalog:",
+    "@noble/curves": "catalog:",
+    "@noble/hashes": "catalog:",
     "effect": "catalog:"
   },
   "devDependencies": {

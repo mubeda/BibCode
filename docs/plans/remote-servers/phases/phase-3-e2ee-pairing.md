@@ -98,7 +98,7 @@ The spec mandates `snow` (Rust) and the noble stack (TS) but requires re-verifyi
 - Consumes: nothing.
 - Produces: `snow` available to `bibcode-server`; `@noble/curves`, `@noble/ciphers`, `@noble/hashes` available to `@bibcode/client-runtime`. Later tasks import `snow::Builder`, `x25519` from `@noble/curves/ed25519.js`, `chacha20poly1305` from `@noble/ciphers/chacha.js`, `sha256` from `@noble/hashes/sha2.js`, `hmac` from `@noble/hashes/hmac.js`.
 
-- [ ] **Step 1: Verify current library versions and APIs (do not trust memory)**
+- [x] **Step 1: Verify current library versions and APIs (do not trust memory)**
 
 Run and record the outputs:
 
@@ -120,7 +120,7 @@ Then verify the exact import paths and call signatures against the installed pac
 
 If any import path or signature differs, adjust the code in Tasks 2, 4, 5, 9 accordingly when you reach them — the shapes in this plan reflect the noble 2.x / snow 0.10 line.
 
-- [ ] **Step 2: Add the dependencies**
+- [x] **Step 2: Add the dependencies**
 
 `Cargo.toml` (workspace deps, alphabetical position near `sha2`/`subtle`):
 
@@ -148,12 +148,12 @@ snow.workspace = true
     "@noble/hashes": "catalog:",
 ```
 
-- [ ] **Step 3: Install and compile**
+- [x] **Step 3: Install and compile**
 
 Run: `pnpm install` then `cargo check -p bibcode-server`
 Expected: both succeed; lockfiles update; no unused-dependency warnings yet (snow is unused until Task 2 — if the workspace lint denies unused deps, note it and fold this step's Cargo edits into Task 2's commit instead).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock apps/server/Cargo.toml pnpm-workspace.yaml pnpm-lock.yaml packages/client-runtime/package.json
