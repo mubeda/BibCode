@@ -3625,7 +3625,7 @@ export function makeE2eeSocket(inner: Socket.Socket, options: E2eeSocketOptions)
 
 (`E2eeAuthenticatedMessage` is the contracts type from Task 6.) Failure mapping is part of the contract: an inner-socket close with code 4403 **or** an AEAD failure on message B maps to `E2eeProtocolError` reason `"host-identity-mismatch"`; a non-empty message-B handshake payload is a `"protocol"` violation (spec §4.3's empty-payload rule, enforced here because the vector-driven `noise.ts` must keep accepting payload-bearing messages). Task 12 wires it into `RpcSessionFactory`; Task 13 classifies its failures.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `packages/client-runtime/src/e2ee/socket.test.ts` builds an in-memory inner `Socket` pair and a scripted responder using `createNkResponder` + the record layer (this is exactly what the server does, in TS, so the socket state machine is tested hermetically; cross-language equivalence is Task 14's job):
 
@@ -3971,12 +3971,12 @@ describe("makeE2eeSocket", () => {
 
 Additional imports for the test file: `import * as Cause from "effect/Cause";` and `import * as Exit from "effect/Exit";`. Timing-based `sleep` synchronization is acceptable here because the scripted socket is fully synchronous — if flakiness appears, replace the sleeps with a Deferred completed by the delivery handler.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/socket.test.ts`
 Expected: FAIL (module missing).
 
-- [ ] **Step 3: Implement `socket.ts`**
+- [x] **Step 3: Implement `socket.ts`**
 
 ```ts
 import { E2eeAuthenticatedMessage } from "@bibcode/contracts";
@@ -4243,12 +4243,12 @@ Implementer notes (resolve while coding, guided by the failing tests):
 - `CloseEvent` detection: use the `Socket.isCloseEvent` guard if exported; otherwise a structural `"code" in chunk` check.
 - Delivered plaintext is decoded as UTF-8 text (the plain `/ws` server sends Text frames), preserving byte-for-byte parity for the RPC layer.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run (from `packages/client-runtime`): `vp test run src/e2ee/socket.test.ts src/e2ee/noise.test.ts src/e2ee/frame.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src/e2ee
