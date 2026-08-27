@@ -14,6 +14,12 @@ import { environmentAvailabilityCommands, useEnvironmentShellSummary } from "./s
 import { useAtomCommand } from "./state/use-atom-command";
 import { useEnvironments } from "./state/environments";
 import { isDesktopLocalConnectionTarget } from "./connection/desktopLocal";
+import { useShareExposureReconciler } from "./state/shareExposureReconciler";
+
+export function ShareExposureReconciler() {
+  useShareExposureReconciler();
+  return null;
+}
 
 export function ProjectDataRecoveryCoordinator() {
   const summary = useEnvironmentShellSummary();
@@ -143,6 +149,7 @@ export function ProjectDataRecoveryCoordinator() {
 export function AppRoot({ router }: { readonly router: AppRouter }) {
   return (
     <AppAtomRegistryProvider>
+      <ShareExposureReconciler />
       <ThreadLifecycleReconciler />
       <ProjectDataRecoveryCoordinator />
       <RouterProvider router={router} />

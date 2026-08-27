@@ -113,6 +113,10 @@ vi.mock("./state/projectDataSafety", () => ({
   }),
 }));
 
+vi.mock("./state/shareExposureReconciler", () => ({
+  useShareExposureReconciler: () => undefined,
+}));
+
 vi.mock("./components/desktop/ProjectDataRecoveryDialog", () => ({
   ProjectDataRecoveryDialog: () => null,
 }));
