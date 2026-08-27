@@ -34,6 +34,7 @@ use crate::{
         http_mutability,
     },
     production::http_routes::{self, HttpRoutesState},
+    remote_update::RemoteUpdateSupport,
     rpc::{RpcRegistry, RpcSessionContext, run_session},
 };
 
@@ -296,6 +297,7 @@ struct EnvironmentDescriptor {
     platform: PlatformDescriptor,
     server_version: String,
     storage_instance_id: String,
+    remote_update_support: RemoteUpdateSupport,
     remote_protocol_version: u32,
     min_compatible_remote_protocol: u32,
     capabilities: EnvironmentCapabilities,
@@ -311,6 +313,7 @@ struct PlatformDescriptor {
 #[serde(rename_all = "camelCase")]
 struct EnvironmentCapabilities {
     repository_identity: bool,
+    remote_update_control: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -327,10 +330,12 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        remote_update_support: config.remote_update_support,
         remote_protocol_version: REMOTE_PROTOCOL_VERSION,
         min_compatible_remote_protocol: MIN_COMPATIBLE_REMOTE_PROTOCOL,
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
+            remote_update_control: true,
         },
     })
 }

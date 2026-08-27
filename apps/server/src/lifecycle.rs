@@ -34,6 +34,23 @@ const ASSET_KEY_BYTES: usize = 32;
 
 pub struct ServerRuntime;
 
+fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
+    serde_json::json!({
+        "environmentId": config.environment_id,
+        "label": config.environment_label,
+        "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+        "serverVersion": config.server_version,
+        "storageInstanceId": config
+            .storage_instance_id
+            .expect("a running server has a prepared persistent store")
+            .to_string(),
+        "remoteUpdateSupport": config.remote_update_support,
+        "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
+        "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
+        "capabilities": { "repositoryIdentity": true, "remoteUpdateControl": true },
+    })
+}
+
 pub struct ServerHandle {
     local_addr: SocketAddr,
     data_root: ResolvedDataRoot,
@@ -267,19 +284,7 @@ impl ServerRuntime {
                         }
                     },
                 );
-                let descriptor = serde_json::json!({
-                    "environmentId": config.environment_id,
-                    "label": config.environment_label,
-                    "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
-                    "serverVersion": config.server_version,
-                    "storageInstanceId": config
-                        .storage_instance_id
-                        .expect("a running server has a prepared persistent store")
-                        .to_string(),
-                    "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
-                    "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
-                    "capabilities": { "repositoryIdentity": true },
-                });
+                let descriptor = connect_environment_descriptor(&config);
                 let connect = Arc::new(
                     ConnectMcpService::open(
                         config.database_path(),
@@ -555,6 +560,21 @@ impl Drop for ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_descriptor_advertises_remote_update_support() {
+        let mut config = ServerConfig::new("/tmp/bibcode-connect-descriptor-test");
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            uuid::Uuid::nil(),
+        ));
+        let descriptor = connect_environment_descriptor(&config);
+        assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(
+            descriptor["remoteUpdateSupport"],
+            serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })
+        );
+    }
 
     #[tokio::test]
     async fn rejects_relative_programmatic_data_roots_before_creating_state() {
