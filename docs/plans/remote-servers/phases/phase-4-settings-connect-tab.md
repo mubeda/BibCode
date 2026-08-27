@@ -258,7 +258,7 @@ Test invocation used throughout (run from the repository root):
     canonical parser is Phase 3's `parsePairingCode` in `@bibcode/shared/pairingCode` — the
     accepted forms here must stay a subset of what it accepts)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 // apps/web/src/components/settings/remote-servers/connectPresentation.test.ts
@@ -413,12 +413,12 @@ describe("normalizePairingCodeInput", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/connectPresentation.test.ts`
 Expected: FAIL — module `./connectPresentation` does not exist.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```ts
 // apps/web/src/components/settings/remote-servers/connectPresentation.ts
@@ -586,12 +586,12 @@ Note: if Phase 2 exported `CompatVerdict` from a different subpath than
 `@bibcode/client-runtime/connection/compat`, import from the landed subpath — check
 `packages/client-runtime/package.json` `exports` (it uses explicit subpath exports).
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/connectPresentation.test.ts`
 Expected: PASS (all suites).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings/remote-servers/connectPresentation.ts \
