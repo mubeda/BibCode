@@ -1183,6 +1183,50 @@ fn generate_pairing_credential() -> Result<String, AuthError> {
     Ok(credential)
 }
 
+/// Issues a one-time administrative pairing link directly against a data
+/// root's repositories, without a full [`AuthService`]. Used by the native CLI
+/// (`bibcode pairing issue`) beside a running server: credential consumption
+/// reads `auth_pairing_links` from the database, so the running server honors
+/// links inserted here. Mirrors `issue_startup_pairing` (administrative
+/// scopes, `administrative-bootstrap` subject, five-minute TTL).
+pub(crate) async fn issue_administrative_pairing_link(
+    repositories: &Repositories,
+    label: Option<String>,
+) -> Result<PairingCredentialResult, AuthError> {
+    let now = now_ms();
+    let active = repositories
+        .list_active_auth_pairing_links(format_iso(now))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    if active.len() >= MAX_ACTIVE_PAIRINGS {
+        return Err(AuthError::Internal(
+            "active pairing capacity exceeded".to_owned(),
+        ));
+    }
+    let record = PairingRecord {
+        id: Uuid::new_v4().to_string(),
+        credential: generate_pairing_credential()?,
+        scopes: owned_scopes(ADMINISTRATIVE_SCOPES),
+        subject: "administrative-bootstrap".to_owned(),
+        label: label.clone(),
+        proof_key_thumbprint: None,
+        created_at_ms: now,
+        expires_at_ms: now.saturating_add(PAIRING_TTL_MS),
+        consumed_at_ms: None,
+        revoked_at_ms: None,
+    };
+    repositories
+        .create_auth_pairing_link(persisted_pairing_link(&record))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    Ok(PairingCredentialResult {
+        id: record.id,
+        credential: record.credential,
+        label,
+        expires_at: format_iso(record.expires_at_ms),
+    })
+}
+
 #[must_use]
 pub fn default_standard_scopes() -> Vec<String> {
     owned_scopes(STANDARD_SCOPES)
@@ -1193,6 +1237,64 @@ mod tests {
     use crate::rpc::RpcSessionContext;
 
     use super::*;
+
+    #[tokio::test]
+    async fn issues_a_persisted_administrative_pairing_a_running_service_exchanges_once() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+
+        let issued =
+            issue_administrative_pairing_link(&repositories, Some("SSH bootstrap".to_owned()))
+                .await
+                .expect("pairing link issues");
+        assert_eq!(issued.credential.len(), PAIRING_LENGTH);
+        assert!(
+            issued
+                .credential
+                .bytes()
+                .all(|byte| PAIRING_ALPHABET.contains(&byte))
+        );
+        assert_eq!(issued.label.as_deref(), Some("SSH bootstrap"));
+
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("service hydrates over the same repositories");
+
+        let session = service
+            .exchange_bootstrap(&issued.credential, None, ClientMetadata::default(), None)
+            .await
+            .expect("credential exchanges once");
+        assert_eq!(
+            session.principal.scopes,
+            owned_scopes(ADMINISTRATIVE_SCOPES)
+        );
+        assert_eq!(session.principal.subject, "administrative-bootstrap");
+        assert!(matches!(
+            service
+                .exchange_bootstrap(&issued.credential, None, ClientMetadata::default(), None)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+    }
 
     #[tokio::test]
     async fn authorization_context_rechecks_a_revoked_session() {

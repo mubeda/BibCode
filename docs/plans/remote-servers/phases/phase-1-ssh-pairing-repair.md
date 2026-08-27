@@ -141,7 +141,7 @@ still run in the final gate.)
   (fields `id: String`, `credential: String`, `label: Option<String>`,
   `expires_at: String`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append inside the existing `#[cfg(test)] mod tests` in
 `apps/server/src/auth/service.rs` (it already has `use super::*;` and imports
@@ -204,13 +204,13 @@ Append inside the existing `#[cfg(test)] mod tests` in
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run (repository root):
 `cargo test -p bibcode-server --lib auth::service::tests::issues_a_persisted_administrative_pairing_a_running_service_exchanges_once -- --exact`
 Expected: compile error — `issue_administrative_pairing_link` not found.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 In `apps/server/src/auth/service.rs`, after `generate_pairing_credential` (~line 1184):
 
@@ -273,7 +273,7 @@ In `apps/server/src/auth/mod.rs`, change line 19:
 pub(crate) use service::{AuthError, AuthService, issue_administrative_pairing_link};
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p bibcode-server --lib auth::service::tests::issues_a_persisted_administrative_pairing_a_running_service_exchanges_once -- --exact`
 Expected: PASS. Also run the whole auth module to catch regressions:
@@ -283,7 +283,7 @@ only until Task 2 wires the CLI; if `cargo build` warns, silence is NOT the fix 
 consumes it. If Clippy in CI blocks on the temporarily unused re-export, land Task 1 and
 Task 2 in sequence before running the full gate, which is the plan's order anyway.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/auth/service.rs apps/server/src/auth/mod.rs
