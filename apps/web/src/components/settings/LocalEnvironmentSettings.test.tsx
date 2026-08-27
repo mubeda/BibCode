@@ -213,7 +213,7 @@ async function flush(): Promise<void> {
 }
 
 beforeEach(() => {
-  domWindow = new Window({ url: "https://desktop.localhost/settings/connections" });
+  domWindow = new Window({ url: "https://desktop.localhost/settings/local-environment" });
   vi.stubGlobal("window", domWindow);
   vi.stubGlobal("document", domWindow.document);
   vi.stubGlobal("navigator", domWindow.navigator);

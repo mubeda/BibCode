@@ -4074,7 +4074,7 @@ export default function Sidebar() {
     [retryProjectEnvironment],
   );
   const handleOpenProjectSettings = useCallback(() => {
-    void navigate({ to: "/settings/connections" });
+    void navigate({ to: "/settings/remote-servers" });
   }, [navigate]);
   const handleViewProjectDiagnostics = useCallback(() => {
     void navigate({ to: "/settings/diagnostics" });
