@@ -647,6 +647,9 @@ vi.mock("./CreateWorktreeDialog", () => ({
 vi.mock("./settings/SettingsSidebarNav", () => ({
   SettingsSidebarNav: h.mk("SettingsSidebarNav"),
 }));
+vi.mock("./sidebar/EnvironmentContextCard", () => ({
+  EnvironmentContextCard: h.mk("EnvironmentContextCard"),
+}));
 vi.mock("./sidebar/SidebarUpdatePill", () => ({
   SidebarUpdatePill: h.mk("SidebarUpdatePill", "span"),
 }));
@@ -1996,6 +1999,13 @@ staticDescribe("Sidebar environment scoping", () => {
     expect(markup).toContain("Repo A");
     expect(markup).toContain("WSL Repo");
     expect(markup).not.toContain("Remote Repo");
+  });
+
+  it("mounts the environment context card under the brand row", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    render(<Sidebar />);
+    expect(captured("EnvironmentContextCard")).toHaveLength(1);
   });
 });
 

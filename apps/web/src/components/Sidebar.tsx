@@ -158,6 +158,7 @@ import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
+import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import { selectRailVisibleEnvironmentIds } from "./sidebar/environmentRail.logic";
 import { Kbd } from "./ui/kbd";
 import {
@@ -4690,6 +4691,7 @@ export default function Sidebar() {
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
+          <EnvironmentContextCard />
           <SidebarProjectsContent
             showArm64IntelBuildWarning={showArm64IntelBuildWarning}
             arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
