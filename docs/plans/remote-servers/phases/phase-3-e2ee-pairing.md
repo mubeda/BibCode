@@ -545,7 +545,7 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
 pub(crate) fn e2ee_error_json(code: &str) -> Vec<u8>; // {"type":"e2ee_error","code":code}
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 At the bottom of `apps/server/src/rpc/e2ee.rs`:
 
@@ -764,12 +764,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p bibcode-server e2ee`
 Expected: compile failure (module absent) — red.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 use std::{future::Future, time::Duration};
@@ -982,12 +982,12 @@ Add `mod e2ee;` to `apps/server/src/rpc/mod.rs` and re-export what Task 5 needs 
 
 Note on nonce exhaustion: snow's `TransportState` fails a `write_message`/`read_message` once its u64 nonce is exhausted; that surfaces here as `E2eeSessionError::Crypto`, which Task 5 turns into a connection close. No rekey in v1 (documented in Task 15); the counter bound is unreachable in practice.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p bibcode-server e2ee && cargo clippy -p bibcode-server --all-targets -- -D warnings`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/server/src/rpc/e2ee.rs apps/server/src/rpc/mod.rs Cargo.toml Cargo.lock
