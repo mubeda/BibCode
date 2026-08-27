@@ -1490,7 +1490,7 @@ is a catalog-profile field decision to take back to the spec first.
   `countRunningThreadsForEnvironment(shells, environmentId): number` in
   `connectPresentation.ts`.
 
-- [ ] **Step 1: Write the failing registry test** (append to `registry.test.ts`, using the
+- [x] **Step 1: Write the failing registry test** (append to `registry.test.ts`, using the
       same harness as the existing `retryNow` case at ~line 809)
 
 ```ts
@@ -1528,12 +1528,12 @@ it.effect("disconnect on an unregistered environment is a no-op", () =>
 If the harness's supervisor needs a settle step before the phase assertion, follow the
 existing `retryNow` case's synchronization approach rather than sleeping.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `vp test run packages/client-runtime/src/connection/registry.test.ts`
 Expected: FAIL — `registry.disconnect is not a function`.
 
-- [ ] **Step 3: Implement the registry passthroughs**
+- [x] **Step 3: Implement the registry passthroughs**
 
 In `registry.ts`, extend the service interface next to `retryNow` (~line 92):
 
@@ -1562,12 +1562,12 @@ const disconnect = (environmentId: EnvironmentId) =>
 then add `connect,` and `disconnect,` to the `EnvironmentRegistry.of({ ... })` return
 block (~line 735).
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `vp test run packages/client-runtime/src/connection/registry.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Write the failing row and confirmation tests**
+- [x] **Step 5: Write the failing row and confirmation tests**
 
 First the pure helper (append to `connectPresentation.test.ts`):
 
@@ -1639,7 +1639,7 @@ it("escalates the remove confirmation when the environment owns running work", a
 `[]`). Keep to the harness's actual interaction style — if the old suite asserts via
 handler props rather than DOM clicks, assert the same way.)
 
-- [ ] **Step 6: Run to verify it fails**
+- [x] **Step 6: Run to verify it fails**
 
 Run:
 
@@ -1650,7 +1650,7 @@ vp test run apps/web/src/components/settings/remote-servers/connectPresentation.
 
 Expected: FAIL — helper missing; Disconnect still routes to remove; no confirmation dialog.
 
-- [ ] **Step 7: Implement the helper, rewire the row, add the confirmation dialog**
+- [x] **Step 7: Implement the helper, rewire the row, add the confirmation dialog**
 
 Pure helper in `connectPresentation.ts` (structural input so it stays testable without
 constructing full `EnvironmentThreadShell`s):
@@ -1746,7 +1746,7 @@ const runningCount =
 The menu item's handler is `setRemovalCandidate({ environmentId, label: environment.label })`;
 `onRemove` itself (catalog removal via `environmentCatalog.remove`) is unchanged.
 
-- [ ] **Step 8: Run to verify it passes**
+- [x] **Step 8: Run to verify it passes**
 
 Run:
 
@@ -1758,7 +1758,7 @@ vp test run apps/web/src/components/settings/remote-servers/connectPresentation.
 Expected: PASS. Update any pre-existing moved case that asserted immediate removal on the
 row button — removal now always flows through the menu item + confirmation dialog.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add packages/client-runtime/src/connection/registry.ts \

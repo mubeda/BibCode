@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   ADD_SERVER_FAILURE_REASONS,
+  countRunningThreadsForEnvironment,
   describeAddServerFailure,
   describeCompatBadge,
   formatServerVersionLabel,
@@ -148,5 +149,18 @@ describe("normalizePairingCodeInput", () => {
     expect(normalizePairingCodeInput("")).toBeNull();
     expect(normalizePairingCodeInput("bibcode://pair")).toBeNull();
     expect(normalizePairingCodeInput("http://example.com/other?code=x")).toBe("x");
+  });
+});
+
+describe("countRunningThreadsForEnvironment", () => {
+  it("counts only running sessions belonging to the environment", () => {
+    const shells = [
+      { environmentId: "env-1", session: { status: "running" } },
+      { environmentId: "env-1", session: { status: "idle" } },
+      { environmentId: "env-1", session: null },
+      { environmentId: "env-2", session: { status: "running" } },
+    ];
+    expect(countRunningThreadsForEnvironment(shells, "env-1")).toBe(1);
+    expect(countRunningThreadsForEnvironment(shells, "env-3")).toBe(0);
   });
 });

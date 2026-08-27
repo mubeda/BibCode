@@ -143,3 +143,15 @@ export function normalizePairingCodeInput(value: string): string | null {
     return null;
   }
 }
+
+export function countRunningThreadsForEnvironment(
+  shells: ReadonlyArray<{
+    readonly environmentId: string;
+    readonly session?: { readonly status?: string } | null;
+  }>,
+  environmentId: string,
+): number {
+  return shells.filter(
+    (shell) => shell.environmentId === environmentId && shell.session?.status === "running",
+  ).length;
+}
