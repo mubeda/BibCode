@@ -213,7 +213,7 @@ vi.mock("@bibcode/client-runtime/state/runtime", () => ({
   },
 }));
 
-vi.mock("../../hooks/useCopyToClipboard", () => ({
+vi.mock("../../../hooks/useCopyToClipboard", () => ({
   useCopyToClipboard: (options?: {
     onCopy?: (context: unknown) => void;
     onError?: (error: Error, context: unknown) => void;
@@ -230,7 +230,7 @@ vi.mock("../../hooks/useCopyToClipboard", () => ({
   }),
 }));
 
-vi.mock("../../cloud/publicConfig", () => ({
+vi.mock("../../../cloud/publicConfig", () => ({
   hasCloudPublicConfig: () => h.hasCloudConfig,
   resolveRelayClerkTokenOptions: () => ({ template: "relay" }),
 }));
@@ -323,7 +323,7 @@ vi.mock("~/state/relay", () => ({
   relayEnvironmentDiscovery: { refresh: h.atoms.relayRefresh },
 }));
 
-vi.mock("../../state/use-atom-command", () => ({
+vi.mock("../../../state/use-atom-command", () => ({
   useAtomCommand: (atom: unknown) => {
     if (atom === h.atoms.connectPairing) return h.commands.connectPairing;
     if (atom === h.atoms.connectSsh) return h.commands.connectSsh;
@@ -337,7 +337,7 @@ vi.mock("../../state/use-atom-command", () => ({
   },
 }));
 
-vi.mock("./settingsLayout", () => ({
+vi.mock("../settingsLayout", () => ({
   useRelativeTimeTick: () => Date.now(),
   SettingsPageContainer: (props: AnyProps) => (
     <div data-testid="settings-page">{props.children as ReactNode}</div>
@@ -377,7 +377,7 @@ function renderSlot(render: unknown, children: unknown): ReactNode {
   );
 }
 
-vi.mock("../ui/button", () => ({
+vi.mock("../../ui/button", () => ({
   Button: (props: AnyProps) => {
     h.controls.push({
       kind: "button",
@@ -392,7 +392,7 @@ vi.mock("../ui/button", () => ({
   },
 }));
 
-vi.mock("../ui/input", () => ({
+vi.mock("../../ui/input", () => ({
   Input: (props: AnyProps) => {
     h.controls.push({
       kind: "input",
@@ -409,14 +409,14 @@ vi.mock("../ui/input", () => ({
   },
 }));
 
-vi.mock("../ui/checkbox", () => ({
+vi.mock("../../ui/checkbox", () => ({
   Checkbox: (props: AnyProps) => {
     h.controls.push({ kind: "checkbox", label: String(props.checked), props });
     return <span data-checkbox data-checked={String(props.checked)} />;
   },
 }));
 
-vi.mock("../ui/dialog", () => ({
+vi.mock("../../ui/dialog", () => ({
   Dialog: (props: AnyProps) => {
     h.controls.push({ kind: "dialog", label: String(props.open), props });
     return <div data-dialog>{props.children as ReactNode}</div>;
@@ -431,7 +431,7 @@ vi.mock("../ui/dialog", () => ({
   DialogClose: (props: AnyProps) => renderSlot(props.render, props.children),
 }));
 
-vi.mock("../ui/alert-dialog", () => ({
+vi.mock("../../ui/alert-dialog", () => ({
   AlertDialog: (props: AnyProps) => {
     h.controls.push({ kind: "alert-dialog", label: String(props.open), props });
     return <div data-alert-dialog>{props.children as ReactNode}</div>;
@@ -444,13 +444,13 @@ vi.mock("../ui/alert-dialog", () => ({
   AlertDialogClose: (props: AnyProps) => renderSlot(props.render, props.children),
 }));
 
-vi.mock("../ui/popover", () => ({
+vi.mock("../../ui/popover", () => ({
   Popover: (props: AnyProps) => <span data-popover>{props.children as ReactNode}</span>,
   PopoverTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   PopoverPopup: (props: AnyProps) => <div data-popover-popup>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/menu", () => ({
+vi.mock("../../ui/menu", () => ({
   Menu: (props: AnyProps) => <span data-menu>{props.children as ReactNode}</span>,
   MenuTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   MenuPopup: (props: AnyProps) => <div data-menu-popup>{props.children as ReactNode}</div>,
@@ -463,7 +463,7 @@ vi.mock("../ui/menu", () => ({
   MenuSeparator: () => <hr />,
 }));
 
-vi.mock("../ui/select", () => ({
+vi.mock("../../ui/select", () => ({
   Select: (props: AnyProps) => {
     h.controls.push({ kind: "select", label: String(props.value), props });
     return (
@@ -486,7 +486,7 @@ vi.mock("../ui/select", () => ({
   ),
 }));
 
-vi.mock("../ui/switch", () => ({
+vi.mock("../../ui/switch", () => ({
   Switch: (props: AnyProps) => {
     h.controls.push({
       kind: "switch",
@@ -504,41 +504,41 @@ vi.mock("../ui/switch", () => ({
   },
 }));
 
-vi.mock("../ui/toast", () => ({
+vi.mock("../../ui/toast", () => ({
   toastManager: { add: h.toastAdd },
   stackedThreadToast: (options: unknown) => options,
 }));
 
-vi.mock("../ui/tooltip", () => ({
+vi.mock("../../ui/tooltip", () => ({
   Tooltip: (props: AnyProps) => <>{props.children as ReactNode}</>,
   TooltipTrigger: (props: AnyProps) => renderSlot(props.render, props.children),
   TooltipPopup: (props: AnyProps) => <div data-tooltip-popup>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/textarea", () => ({
+vi.mock("../../ui/textarea", () => ({
   Textarea: (props: AnyProps) => {
     h.controls.push({ kind: "textarea", label: String(props.value), props });
     return <textarea readOnly defaultValue={props.value as string | undefined} />;
   },
 }));
 
-vi.mock("../ui/qr-code", () => ({
+vi.mock("../../ui/qr-code", () => ({
   QRCodeSvg: (props: AnyProps) => <svg data-qr data-value={String(props.value)} />,
 }));
 
-vi.mock("../ui/skeleton", () => ({
+vi.mock("../../ui/skeleton", () => ({
   Skeleton: () => <div data-skeleton />,
 }));
 
-vi.mock("../ui/spinner", () => ({
+vi.mock("../../ui/spinner", () => ({
   Spinner: () => <span data-spinner />,
 }));
 
-vi.mock("../ui/scroll-area", () => ({
+vi.mock("../../ui/scroll-area", () => ({
   ScrollArea: (props: AnyProps) => <div data-scroll-area>{props.children as ReactNode}</div>,
 }));
 
-vi.mock("../ui/empty", () => ({
+vi.mock("../../ui/empty", () => ({
   Empty: (props: AnyProps) => <div data-empty>{props.children as ReactNode}</div>,
   EmptyDescription: (props: AnyProps) => <p>{props.children as ReactNode}</p>,
   EmptyHeader: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
@@ -546,16 +546,18 @@ vi.mock("../ui/empty", () => ({
   EmptyTitle: (props: AnyProps) => <h3>{props.children as ReactNode}</h3>,
 }));
 
-vi.mock("../ui/group", () => ({
+vi.mock("../../ui/group", () => ({
   Group: (props: AnyProps) => <div data-group>{props.children as ReactNode}</div>,
   GroupSeparator: () => <span data-group-separator />,
 }));
 
-vi.mock("../AnimatedHeight", () => ({
+vi.mock("../../AnimatedHeight", () => ({
   AnimatedHeight: (props: AnyProps) => <div data-animated>{props.children as ReactNode}</div>,
 }));
 
-import { ConnectionsSettings, connectionsSettingsInternals } from "./ConnectionsSettings";
+import { ConnectTab } from "./ConnectTab";
+import { ShareTab } from "./ShareTab";
+import { remoteServersSettingsInternals } from "./shared";
 
 const PRIMARY_ID = EnvironmentId.make("environment-primary");
 const FUTURE = DateTime.makeUnsafe("2099-01-01T00:00:00.000Z");
@@ -587,7 +589,14 @@ function clearRegistries(): void {
   h.copies.length = 0;
 }
 
-function render(node: ReactElement = <ConnectionsSettings />): string {
+function render(
+  node: ReactElement = (
+    <>
+      <ConnectTab />
+      <ShareTab />
+    </>
+  ),
+): string {
   clearRegistries();
   return renderToStaticMarkup(node);
 }
@@ -598,7 +607,14 @@ async function mountConnections(): Promise<HTMLDivElement> {
   document.body.append(container);
   const root = createRoot(container);
   mountedTrees.push({ container, root });
-  await act(async () => root.render(<ConnectionsSettings />));
+  await act(async () =>
+    root.render(
+      <>
+        <ConnectTab />
+        <ShareTab />
+      </>,
+    ),
+  );
   return container;
 }
 
@@ -949,9 +965,9 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-describe("ConnectionsSettings deterministic helpers", () => {
+describe("Remote Servers deterministic helpers", () => {
   it("parses manual SSH targets and rejects every invalid boundary", () => {
-    const { formatDesktopSshTarget, parseManualDesktopSshTarget } = connectionsSettingsInternals;
+    const { formatDesktopSshTarget, parseManualDesktopSshTarget } = remoteServersSettingsInternals;
 
     expect(() => parseManualDesktopSshTarget({ host: " ", username: "", port: "" })).toThrow(
       "SSH host or alias is required.",
@@ -997,7 +1013,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
   });
 
   it("parses pairing URLs and validates separate remote pairing fields", () => {
-    const { parsePairingUrlFields, parseRemotePairingFields } = connectionsSettingsInternals;
+    const { parsePairingUrlFields, parseRemotePairingFields } = remoteServersSettingsInternals;
     expect(parsePairingUrlFields(" ")).toBeNull();
     expect(parsePairingUrlFields("not a valid host")).toBeNull();
     expect(parsePairingUrlFields("https://backend.test/pair")).toBeNull();
@@ -1035,7 +1051,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
       formatDesktopSshConnectionError,
       isHostedAppPairingUrl,
       isTailscaleHttpsEndpoint,
-    } = connectionsSettingsInternals;
+    } = remoteServersSettingsInternals;
     expect(formatAccessTimestamp("not-a-date")).toBe("not-a-date");
     expect(formatAccessTimestamp("2025-01-01T12:00:00.000Z")).not.toBe("2025-01-01T12:00:00.000Z");
     expect(formatDesktopSshConnectionError("opaque")).toBe("Failed to connect SSH host.");
@@ -1114,7 +1130,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
       sortDesktopPairingLinks,
       toDesktopClientSessionRecord,
       toDesktopPairingLinkRecord,
-    } = connectionsSettingsInternals;
+    } = remoteServersSettingsInternals;
     const loopback = endpoint({
       id: "desktop-loopback:1",
       label: "Loopback",
@@ -1179,38 +1195,7 @@ describe("ConnectionsSettings deterministic helpers", () => {
   });
 });
 
-describe("ConnectionsSettings", () => {
-  it("dispatches Windows to local settings and other desktops away from remote controls", () => {
-    stubDesktopWindow();
-    h.wslQuery.data = {
-      enabled: true,
-      distro: "Ubuntu",
-      available: true,
-      wslOnly: false,
-      distros: [{ name: "Ubuntu", isDefault: true, version: 2 }],
-      preflightError: null,
-    } satisfies DesktopWslState;
-    h.connectionsPresentation = "local-wsl";
-
-    const localMarkup = render();
-    expect(localMarkup).toContain("Local environment");
-    expect(localMarkup).toContain("WSL backend");
-    for (const hiddenText of [
-      "Network access",
-      "Tailscale HTTPS",
-      "Authorized clients",
-      "BiBCode Connect",
-      "Remote environments",
-      "Add environment",
-      "SSH",
-    ]) {
-      expect(localMarkup).not.toContain(hiddenText);
-    }
-
-    h.connectionsPresentation = "redirect-general";
-    expect(render()).toBe("");
-  });
-
+describe("Remote Servers tabs", () => {
   it("shows the administrative-access notice for non-admin browser sessions", () => {
     stubBrowserWindow();
     h.hasCloudConfig = false;

@@ -808,7 +808,7 @@ unless an import path forces an edit. The old route keeps working at the end of 
 - The Share tab keeps the section title "This environment" and all existing copy verbatim —
   Phase 5 owns its evolution.
 
-- [ ] **Step 1: Write the failing shell test**
+- [x] **Step 1: Write the failing shell test**
 
 ```tsx
 // apps/web/src/components/settings/remote-servers/RemoteServersSettings.test.tsx
@@ -850,12 +850,12 @@ describe("RemoteServersSettings", () => {
 });
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/RemoteServersSettings.test.tsx`
 Expected: FAIL — modules do not exist.
 
-- [ ] **Step 3: Create the shell and perform the mechanical split**
+- [x] **Step 3: Create the shell and perform the mechanical split**
 
 Shell (new code):
 
@@ -953,7 +953,7 @@ function ConnectionsRouteComponent() {
    `connectionsSettingsInternals` into `ConnectTab.test.tsx`/`ShareTab.test.tsx` as
    appropriate. Delete `ConnectionsSettings.test.tsx`.
 
-- [ ] **Step 4: Run the moved suites to verify they pass**
+- [x] **Step 4: Run the moved suites to verify they pass**
 
 Run:
 
@@ -968,7 +968,7 @@ vp test run apps/web/src/components/settings/remote-servers/RemoteServersSetting
 Expected: PASS. Then `vp run typecheck` — expected clean (this is the guard against missed
 import-path fixes).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A apps/web/src/components/settings apps/web/src/routes/settings.connections.tsx

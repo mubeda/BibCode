@@ -38,7 +38,7 @@ describe("describeCompatBadge", () => {
 });
 
 describe("resolveTransportBadge", () => {
-  const bearer = (profile: unknown) => ({
+  const bearer = (profile: { readonly _tag: string; readonly hostKey?: string | null } | null) => ({
     relayManaged: false,
     entry: {
       target: { _tag: "BearerConnectionTarget", connectionId: "bearer:x" },
