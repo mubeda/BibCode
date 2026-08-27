@@ -4891,7 +4891,7 @@ The repo has no existing TS test that spawns the server binary (verified: no `bi
 - Consumes: `createNkInitiator`, `decodeBase64UrlKey` (Task 9); `splitIntoRecords`, `RecordAssembler` (Task 10); `parsePairingCode` (Task 7); the running server's `/oauth/token`, `/api/auth/websocket-ticket`, `POST /api/auth/pairing-offer` (Task 8), `/ws-e2ee` (Task 5), and the secret-file layout (Task 2, cross-check only).
 - Produces: the executable interop proof, gated on `BIBCODE_E2EE_SERVER_BIN`. The pairing code is obtained through the real mint endpoint, so the suite also proves the full mint → parse → pin → pair loop across languages.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```ts
 // Cross-language E2EE interop: TS Noise NK initiator against the real Rust
@@ -5156,7 +5156,7 @@ describe.skipIf(serverBinary === undefined)("TS initiator against the Rust respo
 
 Adjust the response-envelope assertions to the actual `ServerMessage` JSON shapes in `apps/server/src/rpc/message.rs` (`_tag` variants) while implementing — the load-bearing assertions are: `e2ee_authenticated` arrives, the request id round-trips, no `ClientProtocolError`, and fragmentation survives the boundary. If `server.getConfig` responds with an `exit`/`chunk` pair, drain messages until the id appears.
 
-- [ ] **Step 2: Run against a freshly built server**
+- [x] **Step 2: Run against a freshly built server**
 
 ```bash
 cargo build -p bibcode-server
@@ -5166,7 +5166,7 @@ BIBCODE_E2EE_SERVER_BIN=$(git rev-parse --show-toplevel)/target/debug/bibcode vp
 
 Expected: 3 passing tests. Without the env var: the suite reports skipped (verify that too — plain `vp test run src/e2ee/serverInterop.test.ts` must not fail CI).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add packages/client-runtime/src/e2ee/serverInterop.test.ts
