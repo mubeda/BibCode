@@ -1,5 +1,6 @@
 import {
   ChevronsLeftRightEllipsisIcon,
+  EllipsisIcon,
   PlusIcon,
   RefreshCwIcon,
   TerminalIcon,
@@ -47,6 +48,7 @@ import { relayEnvironmentDiscovery } from "~/state/relay";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { environmentSession } from "~/state/session";
+import { useThreadShells } from "~/state/entities";
 import { AnimatedHeight } from "../../AnimatedHeight";
 import { Button } from "../../ui/button";
 import { Badge } from "../../ui/badge";
@@ -59,8 +61,18 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "../../ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../../ui/alert-dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../../ui/empty";
 import { Input } from "../../ui/input";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
 import { ScrollArea } from "../../ui/scroll-area";
 import { Skeleton } from "../../ui/skeleton";
 import { stackedThreadToast, toastManager } from "../../ui/toast";
@@ -78,6 +90,7 @@ import {
   parseRemotePairingFields,
 } from "./shared";
 import {
+  countRunningThreadsForEnvironment,
   describeCompatBadge,
   formatServerVersionLabel,
   resolveTransportBadge,
@@ -88,7 +101,8 @@ type RemoteServerRowProps = {
   compat: CompatVerdict | null;
   removingEnvironmentId: EnvironmentId | null;
   onConnect: (environmentId: EnvironmentId) => void;
-  onRemove: (environmentId: EnvironmentId) => void;
+  onDisconnect: (environmentId: EnvironmentId) => void;
+  onRequestRemove: (environmentId: EnvironmentId, label: string) => void;
 };
 
 function RemoteServerRow({
@@ -96,11 +110,13 @@ function RemoteServerRow({
   compat,
   removingEnvironmentId,
   onConnect,
-  onRemove,
+  onDisconnect,
+  onRequestRemove,
 }: RemoteServerRowProps) {
   const environmentId = environment.environmentId;
   const connectionState = environment.connection.phase;
   const isConnected = connectionState === "connected";
+  const isDisconnected = connectionState === "available" || connectionState === "offline";
   const isConnecting = connectionState === "connecting" || connectionState === "reconnecting";
   const stateDotClassName =
     connectionState === "connected"
@@ -177,6 +193,9 @@ function RemoteServerRow({
               }
             />
             <h3 className="text-sm font-medium text-foreground">{environment.label}</h3>
+            {isDisconnected ? (
+              <span className="text-xs text-muted-foreground/70">Disconnected</span>
+            ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {versionLabel ? (
@@ -243,22 +262,40 @@ function RemoteServerRow({
               </TooltipPopup>
             </Tooltip>
           ) : (
-            <Button
-              size="xs"
-              variant="outline"
-              disabled={isConnecting || removingEnvironmentId === environmentId}
-              onClick={() =>
-                void (isConnected ? onRemove(environmentId) : onConnect(environmentId))
-              }
-            >
-              {isConnected
-                ? removingEnvironmentId === environmentId
-                  ? "Disconnecting…"
-                  : "Disconnect"
-                : isConnecting
-                  ? "Connecting…"
-                  : "Connect"}
-            </Button>
+            <>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isConnecting || removingEnvironmentId === environmentId}
+                onClick={() =>
+                  void (isConnected ? onDisconnect(environmentId) : onConnect(environmentId))
+                }
+              >
+                {isConnected ? "Disconnect" : isConnecting ? "Connecting…" : "Connect"}
+              </Button>
+              <Menu>
+                <MenuTrigger
+                  render={
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={`More actions for ${environment.label}`}
+                      disabled={removingEnvironmentId === environmentId}
+                    >
+                      <EllipsisIcon aria-hidden />
+                    </Button>
+                  }
+                />
+                <MenuPopup align="end">
+                  <MenuItem
+                    variant="destructive"
+                    onClick={() => onRequestRemove(environmentId, environment.label)}
+                  >
+                    Remove server…
+                  </MenuItem>
+                </MenuPopup>
+              </Menu>
+            </>
           )}
         </div>
       </div>
@@ -507,13 +544,17 @@ function CloudRemoteEnvironmentRows({
 export function ConnectTab() {
   const desktopBridge = window.desktopBridge;
   const { environments } = useEnvironments();
+  const threadShells = useThreadShells();
   const primaryEnvironment = usePrimaryEnvironment();
   const connectPairing = useAtomCommand(connectPairingAtom, { reportFailure: false });
   const connectSshEnvironment = useAtomCommand(connectSshEnvironmentAtom, {
     reportFailure: false,
   });
+  const connectEnvironment = useAtomCommand(environmentCatalog.connect, { reportFailure: false });
+  const disconnectEnvironment = useAtomCommand(environmentCatalog.disconnect, {
+    reportFailure: false,
+  });
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
-  const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
   const savedEnvironments = useMemo(
     () =>
@@ -575,6 +616,14 @@ export function ConnectTab() {
   const [isAddingSavedBackend, setIsAddingSavedBackend] = useState(false);
   const [removingSavedEnvironmentId, setRemovingSavedEnvironmentId] =
     useState<EnvironmentId | null>(null);
+  const [removalCandidate, setRemovalCandidate] = useState<{
+    readonly environmentId: EnvironmentId;
+    readonly label: string;
+  } | null>(null);
+  const runningRemovalCount =
+    removalCandidate === null
+      ? 0
+      : countRunningThreadsForEnvironment(threadShells, removalCandidate.environmentId);
   const desktopSshHosts = useEnvironmentQuery(
     desktopBridge && addBackendDialogOpen && savedBackendMode === "ssh"
       ? desktopSshHostsStateAtom
@@ -703,7 +752,7 @@ export function ConnectTab() {
   const handleConnectSavedBackend = useCallback(
     async (environmentId: EnvironmentId) => {
       setSavedBackendError(null);
-      const result = await retryEnvironment(environmentId);
+      const result = await connectEnvironment(environmentId);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         const message = error instanceof Error ? error.message : "Failed to connect backend.";
@@ -717,7 +766,27 @@ export function ConnectTab() {
         );
       }
     },
-    [retryEnvironment],
+    [connectEnvironment],
+  );
+
+  const handleDisconnectSavedBackend = useCallback(
+    async (environmentId: EnvironmentId) => {
+      setSavedBackendError(null);
+      const result = await disconnectEnvironment(environmentId);
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        const message = error instanceof Error ? error.message : "Failed to disconnect backend.";
+        setSavedBackendError(message);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not disconnect backend",
+            description: message,
+          }),
+        );
+      }
+    },
+    [disconnectEnvironment],
   );
 
   const handleRemoveSavedBackend = useCallback(
@@ -1046,7 +1115,10 @@ export function ConnectTab() {
             environment={environment}
             removingEnvironmentId={removingSavedEnvironmentId}
             onConnect={handleConnectSavedBackend}
-            onRemove={handleRemoveSavedBackend}
+            onDisconnect={handleDisconnectSavedBackend}
+            onRequestRemove={(environmentId, label) =>
+              setRemovalCandidate({ environmentId, label })
+            }
           />
         ))}
         <CloudRemoteEnvironmentRows
@@ -1054,6 +1126,40 @@ export function ConnectTab() {
           savedEnvironmentIds={savedEnvironmentIds}
         />
       </SettingsSection>
+      <AlertDialog
+        open={removalCandidate !== null}
+        onOpenChange={(open) => {
+          if (!open) setRemovalCandidate(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {removalCandidate ? `Remove ${removalCandidate.label}?` : ""}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {runningRemovalCount > 0
+                ? `${runningRemovalCount} running ${runningRemovalCount === 1 ? "session" : "sessions"} on ${removalCandidate?.label} will keep running on the server but disappear from this device until you pair again. Removing deletes the saved server and its credentials from this device.`
+                : "This deletes the saved server and its credentials from this device. The server itself is not affected."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={removingSavedEnvironmentId !== null}
+              onClick={() => {
+                if (removalCandidate === null) return;
+                const environmentId = removalCandidate.environmentId;
+                setRemovalCandidate(null);
+                void handleRemoveSavedBackend(environmentId);
+              }}
+            >
+              Remove server
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </>
   );
 }

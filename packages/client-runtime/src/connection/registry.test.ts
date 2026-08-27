@@ -816,6 +816,50 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("disconnect latches the supervisor without removing the entry", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        yield* registry.disconnect(TARGET.environmentId);
+        const disconnected = yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.desired === false,
+        );
+        expect(disconnected.desired).toBe(false);
+        expect(disconnected.phase).not.toBe("connected");
+        expect((yield* SubscriptionRef.get(registry.entries)).has(TARGET.environmentId)).toBe(true);
+
+        yield* registry.connect(TARGET.environmentId);
+        const reconnected = yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.desired === true,
+        );
+        expect(reconnected.desired).toBe(true);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("disconnect on an unregistered environment is a no-op", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.disconnect(EnvironmentId.make("missing-environment"));
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("adopts the current structured storage change and retries exactly once", () =>
     Effect.gen(function* () {
       const connectionAttempts = yield* Ref.make(0);

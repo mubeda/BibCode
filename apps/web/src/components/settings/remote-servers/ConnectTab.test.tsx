@@ -62,6 +62,7 @@ const h = vi.hoisted(() => {
       getToken: vi.fn(),
     },
     environments: [] as unknown[],
+    threadShells: [] as unknown[],
     compatVerdicts: new Map<string, unknown>(),
     primaryEnvironment: null as unknown,
     relayDiscovery: {
@@ -117,6 +118,8 @@ const h = vi.hoisted(() => {
       connectPairing: Symbol("connectPairing"),
       connectSsh: Symbol("connectSshEnvironment"),
       catalogRegister: Symbol("environmentCatalog.register"),
+      catalogConnect: Symbol("environmentCatalog.connect"),
+      catalogDisconnect: Symbol("environmentCatalog.disconnect"),
       catalogRemove: Symbol("environmentCatalog.remove"),
       catalogRetryNow: Symbol("environmentCatalog.retryNow"),
       relayRefresh: Symbol("relayEnvironmentDiscovery.refresh"),
@@ -127,6 +130,8 @@ const h = vi.hoisted(() => {
       connectPairing: vi.fn(),
       connectSsh: vi.fn(),
       register: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
       remove: vi.fn(),
       retryNow: vi.fn(),
       relayRefresh: vi.fn(),
@@ -292,6 +297,8 @@ vi.mock("~/state/auth", () => ({
 vi.mock("~/connection/catalog", () => ({
   environmentCatalog: {
     register: h.atoms.catalogRegister,
+    connect: h.atoms.catalogConnect,
+    disconnect: h.atoms.catalogDisconnect,
     remove: h.atoms.catalogRemove,
     retryNow: h.atoms.catalogRetryNow,
   },
@@ -333,6 +340,10 @@ vi.mock("~/state/environments", () => ({
   useRelayEnvironmentDiscovery: () => h.relayDiscovery,
 }));
 
+vi.mock("~/state/entities", () => ({
+  useThreadShells: () => h.threadShells,
+}));
+
 vi.mock("~/state/relay", () => ({
   relayEnvironmentDiscovery: { refresh: h.atoms.relayRefresh },
 }));
@@ -342,6 +353,8 @@ vi.mock("../../../state/use-atom-command", () => ({
     if (atom === h.atoms.connectPairing) return h.commands.connectPairing;
     if (atom === h.atoms.connectSsh) return h.commands.connectSsh;
     if (atom === h.atoms.catalogRegister) return h.commands.register;
+    if (atom === h.atoms.catalogConnect) return h.commands.connect;
+    if (atom === h.atoms.catalogDisconnect) return h.commands.disconnect;
     if (atom === h.atoms.catalogRemove) return h.commands.remove;
     if (atom === h.atoms.catalogRetryNow) return h.commands.retryNow;
     if (atom === h.atoms.relayRefresh) return h.commands.relayRefresh;
@@ -930,6 +943,7 @@ beforeEach(() => {
   h.clerkAuth.getToken.mockReset();
   h.clerkAuth.getToken.mockResolvedValue("clerk-token");
   h.environments = [];
+  h.threadShells = [];
   h.compatVerdicts.clear();
   h.primaryEnvironment = { environmentId: PRIMARY_ID, serverConfig: null };
   h.relayDiscovery = { environments: new Map(), refreshing: false };
@@ -1258,7 +1272,7 @@ describe("Remote Servers tabs", () => {
       environment({
         id: "environment-idle",
         label: "Idle Env",
-        connection: { phase: "disconnected" },
+        connection: { phase: "available" },
       }),
     ];
 
@@ -1275,27 +1289,101 @@ describe("Remote Servers tabs", () => {
     // Disconnect the connected SSH environment.
     invoke(control("button", "Disconnect"), "onClick");
     await flush();
-    expect(h.commands.remove).toHaveBeenCalledWith(EnvironmentId.make("environment-ssh"));
+    expect(h.commands.disconnect).toHaveBeenCalledWith(EnvironmentId.make("environment-ssh"));
+    expect(h.commands.remove).not.toHaveBeenCalled();
 
     // Connect the idle environment.
     invoke(control("button", "Connect"), "onClick");
     await flush();
-    expect(h.commands.retryNow).toHaveBeenCalledWith(EnvironmentId.make("environment-idle"));
+    expect(h.commands.connect).toHaveBeenCalledWith(EnvironmentId.make("environment-idle"));
 
     // Failures surface a toast.
-    h.commands.retryNow.mockResolvedValueOnce(failure(new Error("connect failed")));
+    h.commands.connect.mockResolvedValueOnce(failure(new Error("connect failed")));
     invoke(control("button", "Connect"), "onClick");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not connect backend" }),
     );
 
-    h.commands.remove.mockResolvedValueOnce(failure(new Error("remove failed")));
+    h.commands.disconnect.mockResolvedValueOnce(failure(new Error("disconnect failed")));
     invoke(control("button", "Disconnect"), "onClick");
     await flush();
     expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Could not remove backend" }),
+      expect.objectContaining({ title: "Could not disconnect backend" }),
     );
+  });
+
+  it("Disconnect latches instead of removing, and Remove moves behind a confirmation", async () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "connected" },
+      }),
+    ];
+
+    const container = await mountConnections();
+    invoke(control("button", "Disconnect"), "onClick");
+    await flush();
+    expect(h.commands.disconnect).toHaveBeenCalledWith(EnvironmentId.make("env-1"));
+    expect(h.commands.remove).not.toHaveBeenCalled();
+
+    await act(async () => {
+      invoke(control("menu-item", "Remove server…"), "onClick");
+    });
+    expect(container.textContent).toContain("Remove AI-SERVER?");
+    expect(h.commands.remove).not.toHaveBeenCalled();
+
+    await act(async () => {
+      invoke(findControls("button", "Remove server").at(-1)!, "onClick");
+      await flush();
+    });
+    expect(h.commands.remove).toHaveBeenCalledWith(EnvironmentId.make("env-1"));
+  });
+
+  it("renders a latched available environment as Disconnected with a Connect action", () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "available" },
+      }),
+    ];
+
+    const markup = render(<ConnectTab />);
+    expect(markup).toContain("Disconnected");
+    expect(markup).toContain("Connect");
+  });
+
+  it("escalates removal confirmation when the environment owns running work", async () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.environments = [
+      environment({
+        id: "env-1",
+        label: "AI-SERVER",
+        targetTag: "BearerConnectionTarget",
+        connection: { phase: "connected" },
+      }),
+    ];
+    h.threadShells = [
+      { environmentId: EnvironmentId.make("env-1"), session: { status: "running" } },
+      { environmentId: EnvironmentId.make("env-1"), session: { status: "running" } },
+      { environmentId: EnvironmentId.make("env-2"), session: { status: "running" } },
+    ];
+
+    const container = await mountConnections();
+    await act(async () => {
+      invoke(control("menu-item", "Remove server…"), "onClick");
+    });
+    expect(container.textContent).toContain("2 running sessions");
+    expect(h.commands.remove).not.toHaveBeenCalled();
   });
 
   it("manages pairing links and authorized clients for a remote-reachable browser admin", async () => {
