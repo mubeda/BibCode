@@ -554,7 +554,15 @@ function CloudRemoteEnvironmentRows({
   ) : null;
 }
 
-export function ConnectTab({ initialPairingCode = null }: { initialPairingCode?: string | null }) {
+export const SERVER_UPDATE_CHECK_ENABLED = false;
+
+export function ConnectTab({
+  initialPairingCode = null,
+  showServerUpdateCheck = SERVER_UPDATE_CHECK_ENABLED,
+}: {
+  readonly initialPairingCode?: string | null;
+  readonly showServerUpdateCheck?: boolean;
+}) {
   const desktopBridge = window.desktopBridge;
   const { environments } = useEnvironments();
   const threadShells = useThreadShells();
@@ -644,6 +652,7 @@ export function ConnectTab({ initialPairingCode = null }: { initialPairingCode?:
     removalCandidate === null
       ? 0
       : countRunningThreadsForEnvironment(threadShells, removalCandidate.environmentId);
+  const onCheckForServerUpdates = useCallback(() => undefined, []);
   const normalizedPairingCode = normalizePairingCodeInput(pairingCodeInput);
   const decodedPairingCode = useMemo(() => {
     if (normalizedPairingCode === null) return null;
@@ -1218,67 +1227,81 @@ export function ConnectTab({ initialPairingCode = null }: { initialPairingCode?:
       <SettingsSection
         title="Saved servers"
         headerAction={
-          <Dialog
-            open={addBackendDialogOpen}
-            onOpenChange={(open) => {
-              setAddBackendDialogOpen(open);
-              if (!open) {
-                setSavedBackendError(null);
-              }
-            }}
-          >
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <DialogTrigger
-                    render={
-                      <Button
-                        size="xs"
-                        variant="ghost"
-                        className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
-                        aria-label="Add Server"
-                      >
-                        <PlusIcon className="size-3" />
-                        <span>Add Server</span>
-                      </Button>
-                    }
-                  />
+          <div className="flex items-center gap-1">
+            {showServerUpdateCheck ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
+                onClick={onCheckForServerUpdates}
+              >
+                <RefreshCwIcon className="size-3" />
+                <span>Check for Server Updates</span>
+              </Button>
+            ) : null}
+            <Dialog
+              open={addBackendDialogOpen}
+              onOpenChange={(open) => {
+                setAddBackendDialogOpen(open);
+                if (!open) {
+                  setSavedBackendError(null);
                 }
-              />
-              <TooltipPopup side="top">Add Server</TooltipPopup>
-            </Tooltip>
-            <DialogPopup className="max-h-[80dvh] sm:max-w-3xl">
-              <DialogHeader>
-                <DialogTitle>Add Server</DialogTitle>
-                <DialogDescription>
-                  Connect this device to another BiBCode server.
-                </DialogDescription>
-              </DialogHeader>
-              <DialogPanel>
-                <div className="space-y-4">
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    {renderConnectionModeCard({
-                      mode: "pairing-code",
-                      title: "Pairing code",
-                      description: "Paste a pairing code from the server's Share tab.",
-                      icon: <QrCodeIcon aria-hidden className="size-4" />,
-                    })}
-                    {desktopBridge
-                      ? renderConnectionModeCard({
-                          mode: "ssh",
-                          title: "SSH",
-                          description: "Use local SSH config, agent, and tunnels for the backend.",
-                          icon: <TerminalIcon aria-hidden className="size-4" />,
-                        })
-                      : null}
+              }}
+            >
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <DialogTrigger
+                      render={
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
+                          aria-label="Add Server"
+                        >
+                          <PlusIcon className="size-3" />
+                          <span>Add Server</span>
+                        </Button>
+                      }
+                    />
+                  }
+                />
+                <TooltipPopup side="top">Add Server</TooltipPopup>
+              </Tooltip>
+              <DialogPopup className="max-h-[80dvh] sm:max-w-3xl">
+                <DialogHeader>
+                  <DialogTitle>Add Server</DialogTitle>
+                  <DialogDescription>
+                    Connect this device to another BiBCode server.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogPanel>
+                  <div className="space-y-4">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      {renderConnectionModeCard({
+                        mode: "pairing-code",
+                        title: "Pairing code",
+                        description: "Paste a pairing code from the server's Share tab.",
+                        icon: <QrCodeIcon aria-hidden className="size-4" />,
+                      })}
+                      {desktopBridge
+                        ? renderConnectionModeCard({
+                            mode: "ssh",
+                            title: "SSH",
+                            description:
+                              "Use local SSH config, agent, and tunnels for the backend.",
+                            icon: <TerminalIcon aria-hidden className="size-4" />,
+                          })
+                        : null}
+                    </div>
+                    <AnimatedHeight>
+                      {savedBackendMode === "ssh" ? renderSshFields() : renderPairingCodeModeBody()}
+                    </AnimatedHeight>
                   </div>
-                  <AnimatedHeight>
-                    {savedBackendMode === "ssh" ? renderSshFields() : renderPairingCodeModeBody()}
-                  </AnimatedHeight>
-                </div>
-              </DialogPanel>
-            </DialogPopup>
-          </Dialog>
+                </DialogPanel>
+              </DialogPopup>
+            </Dialog>
+          </div>
         }
       >
         {savedEnvironments.map((environment) => (

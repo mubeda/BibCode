@@ -2098,7 +2098,7 @@ git commit -m "feat(web): add pairing-code Add Server flow with advanced manual 
   replaces the constant with the `remoteUpdateControl`-capability predicate (spec §4.5) and
   fills the handler with the max-2-concurrent `updater.check` fan-out.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```tsx
 describe("Check for Server Updates placement", () => {
@@ -2114,12 +2114,12 @@ describe("Check for Server Updates placement", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 Expected: FAIL — the enabled case finds no button.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```tsx
 // ConnectTab.tsx
@@ -2165,12 +2165,12 @@ headerAction={
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `vp test run apps/web/src/components/settings/remote-servers/ConnectTab.test.tsx`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add apps/web/src/components/settings/remote-servers
