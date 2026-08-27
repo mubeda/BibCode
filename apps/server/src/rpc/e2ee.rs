@@ -522,10 +522,12 @@ async fn run_established_e2ee(
         inbound_shutdown.cancel();
     });
 
-    let (context, expiration_guard, connected_session_id) = match accept {
+    let (context, expiration_guard, connected_session) = match accept {
         E2eeAccept::Authenticated { principal, .. } => {
-            auth.mark_connected(&principal.session_id).await;
             let session_id = principal.session_id.clone();
+            let connection_id = auth
+                .mark_connected(&session_id, session_shutdown.clone())
+                .await;
             let expires_at_ms = principal.expires_at_ms;
             (
                 RpcSessionContext::authenticated(principal, auth.clone()),
@@ -533,7 +535,7 @@ async fn run_established_e2ee(
                     expires_at_ms,
                     session_shutdown.clone(),
                 )),
-                Some(session_id),
+                Some((session_id, connection_id)),
             )
         }
         E2eeAccept::Unauthenticated => (RpcSessionContext::unauthenticated(), None, None),
@@ -558,8 +560,8 @@ async fn run_established_e2ee(
     }
     reap_pump(outbound_pump).await;
     reap_pump(inbound_pump).await;
-    if let Some(session_id) = connected_session_id {
-        auth.mark_disconnected(&session_id).await;
+    if let Some((session_id, connection_id)) = connected_session {
+        auth.mark_disconnected(&session_id, connection_id).await;
     }
 }
 
