@@ -99,6 +99,25 @@ A focused suite must cover the changed success behavior and its material
 failure, cancellation, retry, restart, and cleanup seams. For cross-platform
 logic, include host-independent fixtures for every affected platform.
 
+### Direct E2EE interop gate
+
+When direct pairing, host identity, `/ws-e2ee`, Noise framing, or client E2EE
+session preparation changes, build the current Rust server and run the opt-in
+TypeScript-to-Rust interop suite:
+
+```sh
+cargo build -p bibcode-server
+cd packages/client-runtime
+BIBCODE_E2EE_SERVER_BIN="$(git rev-parse --show-toplevel)/target/debug/bibcode" vp test run src/e2ee/serverInterop.test.ts
+cd ../..
+```
+
+The suite must mint through the real pairing endpoint, pin the persisted host
+key, authenticate and call RPC through Noise NK, reconnect with the in-channel
+credential, reassemble a fragmented request, and reject a bad pairing token.
+Without `BIBCODE_E2EE_SERVER_BIN`, the same file intentionally reports skipped
+so ordinary `vp test` does not depend on a prebuilt binary.
+
 ### VCS coordination gates
 
 When VCS status observation, mutation ownership, automatic fetch, or client

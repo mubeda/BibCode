@@ -41,7 +41,7 @@ export interface AuthorizedRemoteEnvironment {
   readonly descriptor: ExecutionEnvironmentDescriptor;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
-  readonly httpAuthorization: PreparedHttpAuthorization;
+  readonly httpAuthorization: PreparedHttpAuthorization | null;
   readonly e2ee: PreparedE2eeChannel | null;
 }
 
@@ -152,10 +152,13 @@ export const make = Effect.gen(function* () {
         label: descriptor.label,
         httpBaseUrl: input.httpBaseUrl,
         socketUrl,
-        httpAuthorization: {
-          _tag: "Bearer" as const,
-          token: input.bearerToken,
-        },
+        httpAuthorization:
+          e2ee === null
+            ? {
+                _tag: "Bearer" as const,
+                token: input.bearerToken,
+              }
+            : null,
         e2ee,
       };
     },

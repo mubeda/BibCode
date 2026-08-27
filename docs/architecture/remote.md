@@ -59,15 +59,108 @@ user's default is persisted by stable endpoint ID rather than by array position.
 
 ### Direct bearer access
 
-Manual pairing produces a one-time bootstrap credential and advertised
-endpoint. The onboarding flow saves the endpoint profile separately from the
-credential, exchanges the bootstrap at `/oauth/token`, verifies the returned
-environment identity, and obtains a WebSocket ticket from
-`/api/auth/websocket-ticket`.
+Legacy manual pairing produces a one-time bootstrap credential and advertised
+endpoint. A profile without a pinned host key saves the endpoint separately
+from the credential, exchanges the bootstrap at `/oauth/token`, verifies the
+returned environment identity, and obtains a WebSocket ticket from
+`/api/auth/websocket-ticket`. This legacy route remains available for existing
+profiles, but its connection presentation is `unencrypted` with guidance to
+pair again.
 
 Pairing links may carry a bootstrap in the URL fragment. Fragments are not sent
 to the hosting web server. Compatibility parsing accepts older query-form links,
 but newly generated links use the fragment form.
+
+### Direct-connection E2EE
+
+New direct pairings pin a server identity and carry RPC over an encrypted
+WebSocket. The server generates one static X25519 responder key on first use and
+stores the 64-byte private-then-public record as the secret
+`host-identity-x25519` (`host-identity-x25519.bin` in the filesystem-backed
+store). Public-key encoding is unpadded base64url of the raw 32 bytes. The public
+key is distributed only in pairing codes; the unauthenticated descriptor never
+publishes it.
+
+The encrypted route is `/ws-e2ee` and uses
+`Noise_NK_25519_ChaChaPoly_SHA256`. The client initiator pins the responder
+static key from the pairing code. Both handshake messages require empty
+payloads. After the handshake, every binary WebSocket message is one Noise
+transport ciphertext containing one record:
+
+- byte `0x00` marks the final chunk and byte `0x01` marks a continuation;
+- a chunk is at most 65,518 bytes, keeping ciphertext within Noise's 65,535-byte
+  message limit; and
+- reassembled logical messages are capped at 64 MiB and are exactly the bytes
+  consumed by the unchanged RPC protocol.
+
+The first logical message authenticates inside the encrypted channel. A new
+device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}`. Only a
+successful exchange consumes that token; a wrong host, failed handshake, or
+transport loss leaves it retryable. The server returns
+`e2ee_authenticated` with the minted string credential plus `environmentId` and
+`storageInstanceId`. A returning device sends
+`{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
+`e2ee_authenticated` acknowledgement. Invalid credentials receive
+`e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
+both paths close the socket.
+
+Sessions minted by this route have the signed token claim `transport: "e2ee"`.
+Plain WebSocket and authenticated plain-HTTP surfaces reject that credential;
+tokens without a transport claim decode as `plain` for compatibility. Client
+preparation also sets `httpAuthorization` to `null` for a pinned profile, so an
+E2EE-only credential is not exposed as a usable HTTP authorization capability.
+
+Pre-auth work is bounded independently of normal RPC traffic. The complete
+upgrade, handshake, and authentication sequence has one 10-second deadline;
+the authentication message is capped at 64 KiB; at most 32 unauthenticated
+E2EE connections may be in flight; and non-empty handshake payloads fail the
+protocol. Failure to decrypt the first handshake message closes with code 4403,
+which a pinned initiator classifies as a host-identity mismatch. Encrypted
+writes retain the plain session's five-second write bound and one-second pump
+join bound. Transport cipher nonces are monotonically increasing 64-bit
+counters. V1 does not rekey: exhaustion or any AEAD/protocol error fails closed
+and requires a new connection.
+
+The pairing payload is base64url-unpadded JSON in
+`bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
+token, host public key, reach intent, and persistent storage identity. An
+authenticated caller with `access:write` mints it through
+`POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
+the original offer and rejects reuse with different input. The server validates
+that `this-computer` uses loopback, `another-device` does not use loopback, and
+that no offered endpoint is wildcard or port zero. Reach is embedded in the
+code; it is not persisted as connection policy until the Phase 5 sharing UI
+owns that state.
+
+The add flow parses and classifies the endpoint, fetches the public descriptor,
+performs the pinned handshake and in-channel pairing, and calls authenticated
+`server.getConfig` before saving anything. It compares the in-channel
+environment and storage identities with both the pairing payload and descriptor.
+Failures are classified as `unreachable`, `host-identity-mismatch`,
+`pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. Only the
+verified credential, profile, and accepted storage identity are then persisted.
+
+A saved direct bearer profile with a non-null `hostKey` always selects
+`/ws-e2ee`; no `/oauth/token` or `/api/auth/websocket-ticket` request is made.
+A profile whose additively decoded `hostKey` is null is a legacy `/ws` profile.
+Relay and SSH selection is unchanged. `connectionTransportSecurity` is the
+single presentation policy for `e2ee`, `unencrypted`, `channel-secured`, and
+`local` badges.
+
+#### Host-key HTTP audit
+
+Pinned profiles allow one pre-auth HTTP request: the unauthenticated
+`/.well-known/bibcode/environment` descriptor, which is only a routing hint and
+is re-verified over RPC. The production call-site audit is:
+
+| Call site or surface                                                                                                                      | Host-key verdict                                                                                                                                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `environment/descriptor.ts`, `authorization/service.ts`, and `connection/pairingAdd.ts` descriptor fetches                                | Allowed unauthenticated descriptor request. Pairing and reconnect both re-verify identity inside E2EE.                                                                                                                                      |
+| `/oauth/token`, `/api/auth/session`, and `/api/auth/websocket-ticket` helpers in `authorization/remote.ts` and `authorization/service.ts` | Not reachable for a profile with `hostKey`; those helpers serve legacy bearer, primary, relay, and SSH flows.                                                                                                                               |
+| `PreparedConnection.httpAuthorization`                                                                                                    | Explicitly `null` whenever `PreparedConnection.e2ee` is non-null. Pinned bearer credentials exist only in the E2EE auth form.                                                                                                               |
+| `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.             |
+| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Direct authenticated HTTP is primary-environment-only and cannot target a saved bearer profile. Environment-scoped remote diagnostics are therefore unavailable until represented as RPC; an E2EE bearer must not be added to this request. |
+| `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                    |
 
 ### BiBCode Connect
 

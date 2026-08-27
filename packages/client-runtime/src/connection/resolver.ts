@@ -155,7 +155,7 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
-      httpAuthorization: authorized.httpAuthorization,
+      httpAuthorization: authorized.e2ee === null ? authorized.httpAuthorization : null,
       e2ee: authorized.e2ee,
       target,
     } satisfies PreparedConnection;

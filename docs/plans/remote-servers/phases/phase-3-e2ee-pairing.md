@@ -5187,7 +5187,7 @@ The amended spec §4.3 pins the in-channel bootstrap: for hostKey targets the **
 - Possibly modify: `packages/client-runtime/src/rpc/http.ts` call sites (audit outcome)
 - Review: `docs/testing/linux-desktop.md`, `docs/testing/windows-desktop.md`, `docs/testing/macos-desktop.md`, `docs/testing/cross-platform-validation.md`, `docs/testing/README.md`
 
-- [ ] **Step 1: Audit post-auth HTTP usage against bearer targets**
+- [x] **Step 1: Audit post-auth HTTP usage against bearer targets**
 
 ```bash
 rg -n "httpBaseUrl|environmentEndpointUrl|httpAuthorization" packages/client-runtime/src --type ts | rg -v "test"
@@ -5202,7 +5202,7 @@ For each hit that can execute against a Bearer target with a stored `hostKey` (c
 
 Record the complete audit table (call site → verdict) in `remote.md`; do not silently skip any hit.
 
-- [ ] **Step 2: Update the living docs (same patch as behavior)**
+- [x] **Step 2: Update the living docs (same patch as behavior)**
 
 `docs/architecture/remote.md` — new "Direct-connection E2EE" section covering: host identity key (storage name, encoding, distribution-only-via-pairing-codes), `/ws-e2ee` (handshake, record layer with the flag byte and both caps, in-channel `e2ee_auth` two-form bootstrap with the pairing-token-consumed-only-on-success rule, no-downgrade `transport` claim, pre-auth hardening: 64 KiB auth cap, combined deadline, connection cap, empty-payload rule, 4403 wrong-key close, pump write/join timeouts, `e2ee_error` close paths, nonce policy: no rekey, counter bound, fail-closed), pairing-code format + `POST /api/auth/pairing-offer` (scope `access:write`; idempotent via `Idempotency-Key`; reach validated and embedded but persisted only from Phase 5 on), verify-then-add classifications incl. the in-channel identity re-verification, the channel-selection rule and legacy-`/ws` badge, and the Step 1 HTTP audit table.
 
@@ -5216,7 +5216,7 @@ amendment: for hostKey targets the pre-auth allowance is the descriptor fetch on
 `/oauth/token` and `/api/auth/websocket-ticket` from its list; flag the edit for the spec
 owner in the final report. Amend nothing else.
 
-- [ ] **Step 3: Review the testing runbooks**
+- [x] **Step 3: Review the testing runbooks**
 
 Read the five `docs/testing/` documents. This phase adds one opt-in test command (the Task 14 interop suite) and new always-on suites that run under the existing `vp test` umbrella. If a runbook enumerates test commands or validation evidence for the affected areas, add the interop command with its `BIBCODE_E2EE_SERVER_BIN` prerequisite; if none does, the final report must state the runbooks were **reviewed and remain accurate**.
 
@@ -5237,7 +5237,7 @@ git status --short && git diff --stat
 
 Expected: all green; `git status` shows only intended files (and never resurrects the pending deletions under `docs/plans/2026-08-24-environment-project-management/`). Report the exact commands run, anything that could not run, and residual risk.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/architecture/remote.md docs/architecture/connection-runtime.md docs/plans/remote-servers/remote-servers-spec.md packages/client-runtime/src docs/testing

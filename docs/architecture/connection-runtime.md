@@ -53,6 +53,46 @@ persisted as saved connections.
 Profiles and credentials remain separate so catalog metadata can be listed
 without exposing secrets.
 
+## Pinned direct profiles and sessions
+
+`BearerConnectionProfile` additively stores `hostKey` in the existing schema-v1
+catalog document. Missing values decode to `null`, so no catalog version bump or
+compatibility alias is required. Browser storage persists the document normally;
+the protected desktop catalog encrypts and restores the same serialized document
+as opaque bytes and does not interpret the new field.
+
+`ConnectionResolver` treats a non-null `hostKey` as a hard channel-selection
+rule. It fetches only the unauthenticated descriptor, derives `/ws-e2ee`, and
+builds `PreparedConnection.e2ee` with the pinned key and one of two auth forms:
+`{ kind: "pairing", token }` during verify-then-add or
+`{ kind: "bearer", credential }` on later connections. It does not exchange the
+credential at `/oauth/token` or request `/api/auth/websocket-ticket`.
+`PreparedConnection.httpAuthorization` is `null` whenever `e2ee` is non-null,
+preventing an E2EE-only bearer from being projected as plain-HTTP authority.
+A null host key preserves the legacy ticketed `/ws` path.
+
+`RpcSessionFactory` wraps the ordinary Effect socket with the Noise NK and
+record-layer adapter before constructing the unchanged RPC protocol. The
+wrapper completes the handshake, sends the in-channel auth message, validates
+`e2ee_authenticated`, and only then exposes RPC bytes. The resulting
+`RpcSession.e2eeAuthenticated` effect publishes the authenticated response for
+pairing identity checks; it resolves to `null` for non-E2EE sessions. Handshake
+identity and authentication failures are blocked connection failures, while a
+deadline or transport failure follows the supervisor's bounded transient retry
+policy.
+
+The verify-then-add flow uses that session to compare the descriptor, pairing
+payload, `e2ee_authenticated` response, and `server.getConfig` identities before
+registering the profile and credential. This prevents a routing endpoint from
+substituting a different logical environment or persistent store after the
+pinned handshake.
+
+Presentation uses `connectionTransportSecurity` as the shared policy:
+non-null bearer `hostKey` is `e2ee`, null is `unencrypted`, relay and SSH are
+`channel-secured`, and primary or desktop-local targets are `local`. Legacy
+direct profiles remain usable but surface re-pair guidance instead of silently
+claiming encrypted transport.
+
 ## Accepted storage identity
 
 The schema-v1 connection catalog additively stores accepted non-null storage
