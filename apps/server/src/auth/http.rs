@@ -22,8 +22,8 @@ use super::{
         encode_pairing_code,
     },
     service::{
-        AuthError, AuthService, PairingOfferReplay, default_standard_scopes, format_iso,
-        is_loopback_host, now_ms, parse_scopes,
+        AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferReplay, default_standard_scopes,
+        format_iso, is_loopback_host, now_ms, parse_scopes,
     },
 };
 use crate::http::AppState;
@@ -335,11 +335,13 @@ async fn create_pairing_offer(
         );
     }
     let endpoint_is_loopback = is_loopback_host(host);
+    if !PAIRING_REACH_VALUES.contains(&payload.reach.as_str()) {
+        return invalid_pairing_offer_response("reach does not match the offered endpoint");
+    }
     let reach_ok = match payload.reach.as_str() {
         "this-computer" => endpoint_is_loopback,
         "another-device" => !endpoint_is_loopback,
-        "custom" => true,
-        _ => false,
+        _ => true,
     };
     let name = payload.name.trim().to_owned();
     if !reach_ok || name.is_empty() {
@@ -375,7 +377,16 @@ async fn create_pairing_offer(
         .filter(|label| !label.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| name.clone());
-    let issued = match state.auth.issue_pairing(scopes, Some(label)).await {
+    let off_host = match payload.reach.as_str() {
+        "another-device" => true,
+        "this-computer" => false,
+        _ => !endpoint_is_loopback,
+    };
+    let issued = match state
+        .auth
+        .issue_share_pairing(scopes, Some(label), payload.reach.clone(), off_host)
+        .await
+    {
         Ok(issued) => issued,
         Err(error) => {
             return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
