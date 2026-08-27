@@ -2007,6 +2007,17 @@ staticDescribe("Sidebar environment scoping", () => {
     render(<Sidebar />);
     expect(captured("EnvironmentContextCard")).toHaveLength(1);
   });
+
+  it('labels the add-project trigger "Add project on <name>" only for a remote selection', () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    const remoteMarkup = render(<Sidebar />);
+    expect(remoteMarkup).toContain("Add project on AI-SERVER");
+
+    h.state.activeEnvironmentId = ENV_MAIN;
+    const localMarkup = render(<Sidebar />);
+    expect(localMarkup).not.toContain("Add project on");
+  });
 });
 
 staticDescribe("Sidebar sort menu", () => {

@@ -40,6 +40,7 @@ const harness = vi.hoisted(() => ({
   readThreadShell: vi.fn(),
   replaceMainWithTerminal: vi.fn(),
   onOpenChange: vi.fn(),
+  activeEnvironmentId: null as EnvironmentId | null,
 }));
 
 vi.mock("~/connection/useDesktopLocalBootstraps", () => ({
@@ -71,6 +72,7 @@ vi.mock("~/state/environments", () => ({
 
 vi.mock("~/state/entities", () => ({
   useProjects: () => harness.projects,
+  useActiveEnvironmentId: () => harness.activeEnvironmentId,
   readEnvironmentThreadRefs: (environmentId: unknown) =>
     harness.readEnvironmentThreadRefs(environmentId),
   readThreadShell: (ref: unknown) => harness.readThreadShell(ref),
@@ -297,6 +299,7 @@ beforeEach(() => {
   harness.readThreadShell.mockReset().mockReturnValue(null);
   harness.replaceMainWithTerminal.mockReset();
   harness.onOpenChange.mockReset();
+  harness.activeEnvironmentId = null;
 });
 
 afterEach(async () => {
@@ -311,7 +314,27 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflow public adapter", () => {
-  it("presents only this device without a location selector on macOS desktop", async () => {
+  it("keeps saved remote hosts on desktop and defaults to the rail selection", async () => {
+    harness.environments = [
+      ...harness.environments,
+      environment(sshEnvironmentId, "Build server", {
+        _tag: "SshConnectionTarget",
+        connectionId: "ssh:build-server",
+      }),
+    ];
+    harness.presentation = presentation("desktop", "macos");
+    harness.activeEnvironmentId = sshEnvironmentId;
+
+    await mountWorkflow();
+
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
+      "This device",
+      "Build server",
+    ]);
+    expect(currentWorkflow.selectedHost.environmentId).toBe(sshEnvironmentId);
+  });
+
+  it("presents this device and saved remote hosts on macOS desktop", async () => {
     harness.environments = [
       ...harness.environments,
       environment(wslEnvironmentId, "Ubuntu (WSL)", {
@@ -332,11 +355,16 @@ describe("useAddProjectWorkflow public adapter", () => {
 
     await mountWorkflow();
 
-    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual(["This device"]);
+    expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
+      "This device",
+      "Build server",
+      "Relay server",
+      "Remote server",
+    ]);
     expect(currentWorkflow).toHaveProperty("locationLabel", null);
   });
 
-  it("presents primary and WSL locations on Windows desktop", async () => {
+  it("presents primary, WSL, and saved remote locations on Windows desktop", async () => {
     const wsl = environment(wslEnvironmentId, "Ubuntu (WSL)", {
       _tag: "BearerConnectionTarget",
       connectionId: "local:wsl:Ubuntu",
@@ -362,6 +390,9 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(currentWorkflow.hosts.map((host) => host.label)).toEqual([
       "This device",
       "Ubuntu (WSL)",
+      "Build server",
+      "Relay server",
+      "Remote server",
     ]);
     expect(currentWorkflow).toHaveProperty("locationLabel", "Location");
   });

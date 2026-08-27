@@ -160,6 +160,8 @@ const testState = vi.hoisted(() => ({
   terminalSurfaceOpen: false,
   projects: [] as unknown[],
   threads: [] as unknown[],
+  environments: [] as unknown[],
+  activeEnvironmentId: null as EnvironmentId | null,
   activeThread: null as unknown,
   activeDraftThread: null as unknown,
   defaultProjectRef: null as unknown,
@@ -235,6 +237,11 @@ vi.mock("../hooks/useSettings", () => ({
 vi.mock("../state/entities", () => ({
   useProjects: () => testState.projects,
   useThreadShells: () => testState.threads,
+  useActiveEnvironmentId: () => testState.activeEnvironmentId,
+}));
+
+vi.mock("../state/environments", () => ({
+  useEnvironments: () => ({ environments: testState.environments }),
 }));
 
 vi.mock("../lib/chatThreadActions", () => ({
@@ -338,6 +345,7 @@ import { CommandPalette, reduceCommandPaletteUiState } from "./CommandPalette";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ENV_PRIMARY = EnvironmentId.make("env-primary");
+const ENV_REMOTE = EnvironmentId.make("env-remote");
 const PROJECT_A = ProjectId.make("project-a");
 const PROJECT_B = ProjectId.make("project-b");
 
@@ -577,6 +585,21 @@ beforeEach(() => {
     }),
   ];
   testState.threads = [makeThread("thread-1")];
+  testState.environments = [
+    {
+      environmentId: ENV_PRIMARY,
+      label: "Local",
+      entry: { target: { _tag: "PrimaryConnectionTarget" } },
+    },
+    {
+      environmentId: ENV_REMOTE,
+      label: "AI-SERVER",
+      entry: {
+        target: { _tag: "BearerConnectionTarget", connectionId: "remote:server" },
+      },
+    },
+  ];
+  testState.activeEnvironmentId = null;
   testState.activeThread = makeThread("thread-1");
   testState.activeDraftThread = null;
   testState.defaultProjectRef = null;
@@ -712,6 +735,14 @@ describe("palette shell", () => {
 });
 
 describe("root actions", () => {
+  it("names Add project for the selected remote environment", () => {
+    testState.activeEnvironmentId = ENV_REMOTE;
+
+    openPalette();
+
+    expect(itemByValue("action:add-project")?.title).toBe("Add project on AI-SERVER");
+  });
+
   it("builds the root actions and recent threads", () => {
     openPalette();
     const groups = resultsProps().groups;
