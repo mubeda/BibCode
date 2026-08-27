@@ -911,7 +911,7 @@ git commit -m "docs(remote): record repaired SSH pairing bootstrap"
 **Interfaces:** none — this task executes the master plan's validation gate for the
 phase and produces the evidence for the phase report.
 
-- [ ] **Step 1: Formatting and lints**
+- [x] **Step 1: Formatting and lints**
 
 Run, in order, from the repository root:
 
@@ -924,7 +924,7 @@ cargo clippy -p bibcode-desktop --all-targets -- -D warnings
 Expected: all clean. Fix any finding and amend the owning task's commit before
 proceeding.
 
-- [ ] **Step 2: Focused and affected-crate tests**
+- [x] **Step 2: Focused and affected-crate tests**
 
 ```bash
 cargo test -p bibcode-server --lib auth::
@@ -944,7 +944,7 @@ cargo test -p bibcode-desktop
 
 Expected: all PASS.
 
-- [ ] **Step 3: Workspace checks**
+- [x] **Step 3: Workspace checks**
 
 ```bash
 vp check
@@ -954,7 +954,7 @@ vp run typecheck
 Expected: clean. No TypeScript was touched in this phase, so `vp run typecheck` is a
 regression guard only; `vp test` runs are not required beyond it for this phase.
 
-- [ ] **Step 4: Diff hygiene**
+- [x] **Step 4: Diff hygiene**
 
 ```bash
 git status --short
@@ -967,7 +967,7 @@ adds no dependencies), and the pre-existing pending deletions under
 `docs/plans/2026-08-24-environment-project-management/` (if present in the worktree)
 remain exactly as the user left them.
 
-- [ ] **Step 5: Report**
+- [x] **Step 5: Report**
 
 Write the phase report with: every command from Steps 1-4 and its outcome, any command
 that could not run (and why), the runbook statement from Task 4 Step 3, and the
