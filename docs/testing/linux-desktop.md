@@ -158,6 +158,12 @@ verify:
   off-host offer or client and verify exposure returns to loopback.
   the local-machine flow still has no Host selector; remote targeting is driven
   by the environment rail;
+- Remote server updates: with a second BiBCode server saved (headless
+  `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
+  Server Updates**, and confirm each saved server row shows an update badge
+  (**Manual updates** for a headless server) and a manual-instructions block
+  with a copy button. An offline server must show **Status unavailable** without
+  blocking the rest of the batch;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
   the code prefilled;

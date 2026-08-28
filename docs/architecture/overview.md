@@ -516,6 +516,35 @@ Stopping the primary in-process backend never sweeps descendants of the shared
 desktop PID; doing so would terminate the system WebView before the installer
 can take ownership of application restart.
 
+### Remote server updates
+
+Every server answers the `updater.status`, `updater.check`, and
+`updater.install` RPC methods (contract:
+`packages/contracts/src/remoteUpdate.ts`; Rust mirror:
+`apps/server/src/remote_update.rs`). All three environment-descriptor
+producers—the well-known route (`apps/server/src/http.rs`),
+`server.getConfig` (`apps/server/src/production/control.rs`), and the
+Connect/relay descriptor (`apps/server/src/lifecycle.rs`)—embed
+`remoteUpdateSupport` and advertise the surface with the default-false
+`remoteUpdateControl` capability. Clients therefore know the install mode
+before asking.
+
+- Desktop-hosted in-process servers run in `interactive` mode.
+  `updater.install` routes through the host's `DesktopUpdateManager` via the
+  `RemoteUpdateDelegate` seam
+  (`apps/desktop/src-tauri/src/remote_update_delegate.rs`), so remote install
+  uses the same update-protection drain as local install and cannot skip backup
+  protection.
+- Headless `bibcode serve` and WSL/external desktop backends run in `manual`
+  mode. `updater.check` refreshes the server's own version,
+  `latestVersion` remains `null` because the server has no update feed, and
+  `updater.install` fails with `remote_update_manual_required`. Clients render
+  copyable operator instructions instead of an install action.
+
+`updater.status` requires `orchestration:read`; `updater.check` and
+`updater.install` require `orchestration:operate`
+(`apps/server/src/auth/scope.rs`).
+
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
 support therefore varies between desktop hosts, and between desktop and browser
