@@ -43,10 +43,7 @@ export async function reconcileShareExposureOnce(
     operations.getShareState(),
     operations.getExposureState(),
   ]);
-  if (
-    shareState.desiredExposure === "wide" &&
-    exposureState.mode === "local-only"
-  ) {
+  if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
     await operations.applyExposure("network-accessible");
     refreshDesktopNetworkAccessState();
     return "widened";

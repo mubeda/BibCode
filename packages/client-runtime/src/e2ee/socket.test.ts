@@ -418,12 +418,9 @@ describe("makeE2eeSocket", () => {
         blockNextWrite = true;
         const firstMessage = encodeJson({ blob: "x".repeat(200_000) });
         const secondMessage = encodeJson({ ordinal: 2 });
-        const writeFiber = yield* Effect.forkChild(
-          write(firstMessage),
-          {
-            startImmediately: true,
-          },
-        );
+        const writeFiber = yield* Effect.forkChild(write(firstMessage), {
+          startImmediately: true,
+        });
         yield* Deferred.await(firstWriteStarted);
         expect(encryptProbe.calls).toBe(1);
         const secondWriteFiber = yield* Effect.forkChild(write(secondMessage), {
