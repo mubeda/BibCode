@@ -748,6 +748,38 @@ async fn run_established_e2ee(
         accept,
         _permit: established_permit,
     } = admission;
+    let ((context, expiration_guard, connected_session), established_permit) = match accept {
+        E2eeAccept::Authenticated { principal, .. } => {
+            let session_id = principal.session_id.clone();
+            let Ok((connection_id, admitted_permit)) = register_e2ee_connection(
+                &auth,
+                &session_id,
+                session_shutdown.clone(),
+                established_permit,
+            )
+            .await
+            else {
+                session_shutdown.cancel();
+                let _ = timeout(SOCKET_WRITE_TIMEOUT, ws_writer.close()).await;
+                return;
+            };
+            let established_permit = admitted_permit;
+            let expires_at_ms = principal.expires_at_ms;
+            let session = (
+                RpcSessionContext::authenticated(principal, auth.clone()),
+                Some(spawn_session_expiration_guard(
+                    expires_at_ms,
+                    session_shutdown.clone(),
+                )),
+                Some((session_id, connection_id)),
+            );
+            (session, established_permit)
+        }
+        E2eeAccept::Unauthenticated => (
+            (RpcSessionContext::unauthenticated(), None, None),
+            established_permit,
+        ),
+    };
     let principal_inbound_permits = established_permit.principal_inbound();
     let global_inbound_permits = E2EE_RESOURCE_BUDGET.global_inbound();
     let channel = Arc::new(Mutex::new(channel));
@@ -837,25 +869,6 @@ async fn run_established_e2ee(
         inbound_shutdown.cancel();
     });
 
-    let (context, expiration_guard, connected_session) = match accept {
-        E2eeAccept::Authenticated { principal, .. } => {
-            let session_id = principal.session_id.clone();
-            let connection_id = auth
-                .mark_connected(&session_id, session_shutdown.clone())
-                .await;
-            let expires_at_ms = principal.expires_at_ms;
-            (
-                RpcSessionContext::authenticated(principal, auth.clone()),
-                Some(spawn_session_expiration_guard(
-                    expires_at_ms,
-                    session_shutdown.clone(),
-                )),
-                Some((session_id, connection_id)),
-            )
-        }
-        E2eeAccept::Unauthenticated => (RpcSessionContext::unauthenticated(), None, None),
-    };
-
     let writer_sink = PollSender::new(outbound_tx);
     let reader_stream = stream::unfold(inbound_rx, |mut receiver| async {
         receiver.recv().await.map(|item| (item, receiver))
@@ -883,6 +896,21 @@ async fn run_established_e2ee(
     reap_pump(inbound_pump).await;
     if let Some((session_id, connection_id)) = connected_session {
         auth.mark_disconnected(&session_id, connection_id).await;
+    }
+}
+
+async fn register_e2ee_connection(
+    auth: &AuthService,
+    session_id: &str,
+    session_shutdown: CancellationToken,
+    established_permit: E2eeEstablishedPermit,
+) -> Result<(u64, E2eeEstablishedPermit), crate::auth::AuthError> {
+    match auth.mark_connected(session_id, session_shutdown).await {
+        Ok(connection_id) => Ok((connection_id, established_permit)),
+        Err(error) => {
+            drop(established_permit);
+            Err(error)
+        }
     }
 }
 
@@ -1414,6 +1442,82 @@ mod tests {
         assert!(matches!(budget.try_reserve(), Err("protocol")));
         drop(permit);
         assert!(budget.try_reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn revoked_registration_releases_e2ee_capacity_before_socket_close() {
+        let config = ServerConfig::new(".")
+            .with_bind("127.0.0.1", 3773)
+            .with_desktop("desktop-test-seed")
+            .expect("desktop config");
+        let auth = AuthService::new(&config, vec![7_u8; 32]);
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                e2ee_client_metadata(),
+                None,
+                SessionTransport::E2ee,
+            )
+            .await
+            .expect("E2EE session");
+        let principal = auth
+            .authenticate_token(&issued.token, SessionTransport::E2ee)
+            .await
+            .expect("authentication completes before the race pause");
+        let budget = E2eeResourceBudget::new(1, 1, 8, 4, 1);
+        let permit = budget
+            .try_reserve()
+            .expect("established slot")
+            .bind_principal(&principal.session_id)
+            .expect("principal slot");
+        let principal_inbound = permit.principal_inbound().expect("principal byte budget");
+        let global_inbound = budget.global_inbound();
+        let session_shutdown = CancellationToken::new();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+
+        let (registration, revocation) = tokio::join!(
+            async {
+                paused_tx
+                    .send(())
+                    .expect("signal pause after principal budget binding");
+                resume_rx.await.expect("resume registration");
+                register_e2ee_connection(
+                    &auth,
+                    &principal.session_id,
+                    session_shutdown.clone(),
+                    permit,
+                )
+                .await
+            },
+            async {
+                paused_rx.await.expect("registration reached race pause");
+                let revoked = auth
+                    .revoke_client("other-session", &principal.session_id)
+                    .await
+                    .expect("revoke authenticated principal");
+                resume_tx.send(()).expect("release registration");
+                revoked
+            },
+        );
+
+        assert!(revocation);
+        assert!(matches!(
+            registration,
+            Err(crate::auth::AuthError::InvalidCredential)
+        ));
+        assert!(session_shutdown.is_cancelled());
+        assert_eq!(global_inbound.available_permits(), 8);
+        assert_eq!(principal_inbound.available_permits(), 4);
+        assert!(
+            budget
+                .try_reserve()
+                .expect("global established capacity is immediately reusable")
+                .bind_principal(&principal.session_id)
+                .is_ok(),
+            "principal established capacity is immediately reusable"
+        );
     }
 
     #[tokio::test]

@@ -1473,54 +1473,65 @@ impl AuthService {
         Ok(revoked)
     }
 
-    pub async fn mark_connected(&self, session_id: &str, shutdown: CancellationToken) -> u64 {
+    pub async fn mark_connected(
+        &self,
+        session_id: &str,
+        shutdown: CancellationToken,
+    ) -> Result<u64, AuthError> {
         let mut state = self.state.lock().await;
+        let observed_at = now_ms();
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            drop(state);
+            shutdown.cancel();
+            return Err(AuthError::InvalidCredential);
+        };
+        if session.revoked_at_ms.is_some() || session.expires_at_ms <= observed_at {
+            drop(state);
+            shutdown.cancel();
+            return Err(AuthError::InvalidCredential);
+        }
+        if session.connected_count == 0 {
+            session.last_connected_at_ms = Some(observed_at);
+        }
+        session.connected_count = session.connected_count.saturating_add(1);
+        let view = session.view(false);
         state.next_connection_id = state.next_connection_id.wrapping_add(1);
         let connection_id = state.next_connection_id;
-        let view = if let Some(session) = state.sessions.get_mut(session_id) {
-            if session.connected_count == 0 {
-                session.last_connected_at_ms = Some(now_ms());
-            }
-            session.connected_count = session.connected_count.saturating_add(1);
-            Some(session.view(false))
-        } else {
-            None
-        };
-        if view.is_some() {
-            state
-                .live_connections
-                .entry(session_id.to_owned())
-                .or_default()
-                .insert(connection_id, shutdown);
-        } else {
-            shutdown.cancel();
-        }
+        state
+            .live_connections
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(connection_id, shutdown);
         drop(state);
-        if let Some(view) = view {
-            if let Some(repositories) = &self.repositories
-                && let Err(error) = repositories
-                    .set_auth_session_last_connected_at(
-                        session_id.to_owned(),
-                        view.last_connected_at
-                            .clone()
-                            .unwrap_or_else(|| format_iso(now_ms())),
-                    )
-                    .await
-            {
-                tracing::error!(%error, %session_id, "failed to persist session connection time");
-            }
-            self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        if let Some(repositories) = &self.repositories
+            && let Err(error) = repositories
+                .set_auth_session_last_connected_at(
+                    session_id.to_owned(),
+                    view.last_connected_at
+                        .clone()
+                        .unwrap_or_else(|| format_iso(observed_at)),
+                )
+                .await
+        {
+            tracing::error!(%error, %session_id, "failed to persist session connection time");
         }
-        connection_id
+        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        Ok(connection_id)
     }
 
     pub async fn mark_disconnected(&self, session_id: &str, connection_id: u64) {
         let mut state = self.state.lock().await;
-        if let Some(connections) = state.live_connections.get_mut(session_id) {
-            connections.remove(&connection_id);
+        let disconnected = if let Some(connections) = state.live_connections.get_mut(session_id) {
+            let disconnected = connections.remove(&connection_id).is_some();
             if connections.is_empty() {
                 state.live_connections.remove(session_id);
             }
+            disconnected
+        } else {
+            false
+        };
+        if !disconnected {
+            return;
         }
         let view = if let Some(session) = state.sessions.get_mut(session_id) {
             session.connected_count = session.connected_count.saturating_sub(1);
@@ -2347,13 +2358,17 @@ mod tests {
         let second_shutdown = CancellationToken::new();
         let current_connection = auth
             .mark_connected(&current.principal.session_id, current_shutdown.clone())
-            .await;
+            .await
+            .expect("current connection registers");
         auth.mark_connected(&first.principal.session_id, first_shutdown_a.clone())
-            .await;
+            .await
+            .expect("first connection registers");
         auth.mark_connected(&first.principal.session_id, first_shutdown_b.clone())
-            .await;
+            .await
+            .expect("second connection registers");
         auth.mark_connected(&second.principal.session_id, second_shutdown.clone())
-            .await;
+            .await
+            .expect("third connection registers");
 
         assert_eq!(
             auth.revoke_other_clients(&current.principal.session_id)
@@ -2368,6 +2383,136 @@ mod tests {
 
         auth.mark_disconnected(&current.principal.session_id, current_connection)
             .await;
+    }
+
+    #[tokio::test]
+    async fn connection_registration_rejects_a_session_revoked_after_authentication() {
+        let auth = service();
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        auth.authenticate_token(&issued.token, SessionTransport::Plain)
+            .await
+            .expect("authentication completes before the race pause");
+        let session_id = issued.principal.session_id;
+        let connection_shutdown = CancellationToken::new();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let registering_auth = auth.clone();
+        let registering_session_id = session_id.clone();
+        let registering_shutdown = connection_shutdown.clone();
+        let registration = tokio::spawn(async move {
+            paused_tx.send(()).expect("signal deterministic race pause");
+            resume_rx.await.expect("resume registration");
+            registering_auth
+                .mark_connected(&registering_session_id, registering_shutdown)
+                .await
+        });
+
+        paused_rx.await.expect("registration reached race pause");
+        let next_connection_id = auth.state.lock().await.next_connection_id;
+        assert!(
+            auth.revoke_client("other-session", &session_id)
+                .await
+                .expect("revoke authenticated session")
+        );
+        resume_tx.send(()).expect("release registration");
+        assert!(matches!(
+            registration.await.expect("registration task completes"),
+            Err(AuthError::InvalidCredential)
+        ));
+
+        assert!(connection_shutdown.is_cancelled());
+        let state = auth.state.lock().await;
+        assert_eq!(state.next_connection_id, next_connection_id);
+        assert!(!state.live_connections.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn connection_registration_rejects_an_expired_extant_session() {
+        let auth = service();
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        let session_id = issued.principal.session_id;
+        {
+            let mut state = auth.state.lock().await;
+            state
+                .sessions
+                .get_mut(&session_id)
+                .expect("cached session")
+                .expires_at_ms = now_ms() - 1;
+        }
+        let connection_shutdown = CancellationToken::new();
+        let next_connection_id = auth.state.lock().await.next_connection_id;
+
+        assert!(matches!(
+            auth.mark_connected(&session_id, connection_shutdown.clone())
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+
+        assert!(connection_shutdown.is_cancelled());
+        let state = auth.state.lock().await;
+        assert_eq!(state.next_connection_id, next_connection_id);
+        assert!(!state.live_connections.contains_key(&session_id));
+        assert_eq!(
+            state
+                .sessions
+                .get(&session_id)
+                .expect("expired record remains available for the assertion")
+                .connected_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_bookkeeping_ignores_unadmitted_connection_ids() {
+        let auth = service();
+        let issued = auth
+            .exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session");
+        let session_id = issued.principal.session_id;
+        let connection_id = auth
+            .mark_connected(&session_id, CancellationToken::new())
+            .await
+            .expect("connection registers");
+
+        auth.mark_disconnected(&session_id, connection_id.wrapping_add(1))
+            .await;
+
+        assert_eq!(
+            auth.state
+                .lock()
+                .await
+                .sessions
+                .get(&session_id)
+                .expect("live session")
+                .connected_count,
+            1
+        );
+        auth.mark_disconnected(&session_id, connection_id).await;
     }
 
     fn service() -> AuthService {
@@ -2799,7 +2944,8 @@ mod tests {
             .expect("other session should issue");
         let connection_id = service
             .mark_connected(&current.principal.session_id, CancellationToken::new())
-            .await;
+            .await
+            .expect("connection registers");
         let clients = service.list_clients(&current.principal.session_id).await;
         assert_eq!(clients.len(), 3);
         assert!(clients[0].current);
@@ -2992,8 +3138,11 @@ mod tests {
                 .await
                 .unwrap()
         );
-        auth.mark_connected("missing-session", CancellationToken::new())
-            .await;
+        assert!(matches!(
+            auth.mark_connected("missing-session", CancellationToken::new())
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
 
         let mut expired_service = service();
         expired_service
@@ -3627,7 +3776,8 @@ mod tests {
         let connection_shutdown = CancellationToken::new();
         second
             .mark_connected(&issued.principal.session_id, connection_shutdown.clone())
-            .await;
+            .await
+            .expect("connection registers");
         tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
 
         assert!(
