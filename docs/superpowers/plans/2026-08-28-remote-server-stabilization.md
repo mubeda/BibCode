@@ -1154,3 +1154,69 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - [x] Restore the unrelated environment-project plan/spec and provider reconciliation assertion to the pre-range baseline in history.
 - [ ] Repeat focused tests, all repository gates, complete Rust suites, Clippy, direct interop, and the separate-container Docker boundary after these changes.
 - [ ] Request fresh standards, specification, and core review over `3b1864eff..HEAD`; fix every confirmed High/Medium issue before completion.
+
+### Task 11: Make pairing-add compensation durable across client runtimes
+
+**Files:**
+
+- Modify: `packages/client-runtime/src/platform/persistence.ts`
+- Modify: `packages/client-runtime/src/connection/registry.ts`
+- Modify: `apps/web/src/connection/storage.ts`
+- Modify: the closest storage-document and registry tests
+
+**Interfaces:**
+
+- Consumes: an exact `ConnectionRegistration`, the encrypted connection catalog compare-and-set boundary, and the registry's per-environment lease.
+- Produces: conditional rollback that removes only the exact durable registration written by the failed add, even when another tab/runtime has already replaced it.
+
+- [ ] Add a failing two-store test for A-register, B-replace, A-rollback that proves B's target, profile, and credential survive.
+- [ ] Move conditional removal into `ConnectionRegistrationStore`; use the platform catalog CAS loop rather than process-local object identity as the durable authority.
+- [ ] Keep runtime cleanup conditional on the durable CAS outcome and cover both rollback-before-replacement and replacement-before-rollback orderings.
+- [ ] Run focused storage, registry, and pairing-add tests; update `docs/architecture/connection-runtime.md` if its existing cross-store guarantee needs clarification.
+
+### Task 12: Make auth revocation and offer authority coherent across live servers
+
+**Files:**
+
+- Modify: `apps/server/src/auth/service.rs`
+- Modify: `apps/server/src/persistence/repositories.rs`
+- Modify: `apps/server/tests/auth_http.rs`
+- Modify: repository/service tests and `docs/architecture/remote.md`
+
+**Interfaces:**
+
+- Consumes: simultaneously live `AuthService` instances sharing SQLite, durable sessions/pairing grants, and principal/key offer rows.
+- Produces: transactional replay/reservation/quota/cancellation results and bounded cross-process live-connection revocation.
+
+- [ ] Add a failing two-live-service test for create on A, replay/conflict/cancel on B, replay after cancellation on A, and shared 128-per-principal/4,096-global quota enforcement.
+- [ ] Make SQLite keyed reservation authoritative: return the persisted existing/pending/cancelled/reserved row from one transaction, enforce both quotas there, and refresh each process-local projection from repository outcomes.
+- [ ] Add a failing two-server live-subscription test proving revocation through B closes an already-ACKed stream on A before later events can be delivered.
+- [ ] Implement one bounded per-service durable-state watcher while live connections exist; avoid one poller per socket, stop it when idle, and preserve immediate same-process cancellation.
+- [ ] Run focused repository, auth service, auth HTTP/WebSocket, restart, and simultaneous-server tests; document the cross-process convergence bound.
+
+### Task 13: Budget E2EE resources by principal and outbound bytes
+
+**Files:**
+
+- Modify: `apps/server/src/rpc/e2ee.rs`
+- Modify: `apps/server/src/rpc/session.rs` only if the enqueue boundary must carry byte permits
+- Modify: E2EE/session tests and `docs/architecture/remote.md`
+
+**Interfaces:**
+
+- Consumes: authenticated principal/session identity, plaintext record reassembly, generic RPC response enqueue, and encrypted socket writes.
+- Produces: per-principal established-socket and inbound-byte quotas plus process-wide/per-connection outbound byte permits retained until encrypted write completion.
+
+- [ ] Add failing two-principal tests proving one principal cannot consume every established socket or all inbound plaintext bytes through multiple connections.
+- [ ] Key aggregate established and inbound admission by authenticated principal, clean quotas on every close/error/cancellation path, and retain global defense-in-depth caps.
+- [ ] Add a failing slow-reader multi-socket test showing large bounded RPC responses cannot accumulate beyond configured process and connection byte budgets.
+- [ ] Acquire outbound byte permits before response enqueue, retain them through encrypted socket write, and keep the existing five-second send failure behavior.
+- [ ] Run focused E2EE, session, WebSocket, interop, and Clippy checks; update the documented exact caps and ownership.
+
+### Task 14: Repeat completion evidence and review
+
+- [ ] Re-run every focused regression plus `vp check`, `vp run typecheck`, `vp test`, Rust formatting, complete server/desktop suites, and both Clippy targets.
+- [ ] Rebuild and run direct TypeScript-to-Rust E2EE interop and the separate Debian/Node Docker smoke; prove test-owned resources are removed.
+- [ ] Complete the execution-report template without claiming unavailable native/package evidence or Docker fragmentation that was not exercised.
+- [ ] Reapply the two original user-staged environment-project documentation deletions after every product commit.
+- [ ] Request one final adversarial review of `3b1864eff..HEAD` and close every confirmed High/Medium issue.
