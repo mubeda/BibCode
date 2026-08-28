@@ -430,12 +430,9 @@ pub(crate) async fn run_e2ee_session(
             });
         }
 
-        let Ok(established_permit) = try_acquire_established_permit(&E2EE_ESTABLISHED_PERMITS)
-        else {
-            return Ok(EstablishOutcome::Rejected {
-                channel,
-                code: "busy",
-            });
+        let established_permit = match try_acquire_established_permit(&E2EE_ESTABLISHED_PERMITS) {
+            Ok(permit) => permit,
+            Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
         let accept = if config.unsafe_no_auth {
@@ -752,10 +749,10 @@ fn acquire_inbound_bytes(
 
 fn try_acquire_established_permit(
     budget: &Arc<Semaphore>,
-) -> Result<OwnedSemaphorePermit, E2eeSessionError> {
+) -> Result<OwnedSemaphorePermit, &'static str> {
     Arc::clone(budget)
         .try_acquire_owned()
-        .map_err(|_| E2eeSessionError::Protocol("established connection capacity exhausted".into()))
+        .map_err(|_| "protocol")
 }
 
 async fn reap_pump(mut pump: tokio::task::JoinHandle<()>) {
@@ -1024,7 +1021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_messages_retain_their_global_record_budget() {
+    async fn completed_messages_retain_their_global_buffer_budget() {
         let (mut initiator, mut responder) = establish().await;
         let continuation = vec![b'f'; MAX_E2EE_CHUNK_BYTES];
         let message_bytes = continuation.len() + b"second".len();
@@ -1222,7 +1219,11 @@ mod tests {
     fn established_connection_capacity_is_released_on_drop() {
         let budget = Arc::new(Semaphore::new(1));
         let permit = try_acquire_established_permit(&budget).expect("first connection");
-        assert!(try_acquire_established_permit(&budget).is_err());
+        assert_eq!(
+            try_acquire_established_permit(&budget).unwrap_err(),
+            "protocol",
+            "capacity rejection stays within the declared e2ee_error codes"
+        );
         drop(permit);
         assert!(try_acquire_established_permit(&budget).is_ok());
     }
