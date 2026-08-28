@@ -35,7 +35,8 @@ export type PairingAddFailureReason =
   | "host-identity-mismatch"
   | "pairing-rejected"
   | "incompatible"
-  | "duplicate-storage-identity";
+  | "duplicate-storage-identity"
+  | "local-persistence-failed";
 
 export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()("PairingAddError", {
   reason: Schema.Literals([
@@ -44,6 +45,7 @@ export class PairingAddError extends Schema.TaggedErrorClass<PairingAddError>()(
     "pairing-rejected",
     "incompatible",
     "duplicate-storage-identity",
+    "local-persistence-failed",
   ]),
   detail: Schema.String,
 }) {
@@ -70,6 +72,11 @@ const IDENTITY_MISMATCH_DETAIL = "The server behind this endpoint does not match
 const POST_BOOTSTRAP_REVOCATION_DETAIL =
   "This pairing attempt may still appear in the server's client list; revoke it there before retrying.";
 const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL = `${IDENTITY_MISMATCH_DETAIL} ${POST_BOOTSTRAP_REVOCATION_DETAIL}`;
+const postBootstrapPersistenceError = (target: string): PairingAddError =>
+  new PairingAddError({
+    reason: "local-persistence-failed",
+    detail: `The device credential was created, but ${target} could not be saved locally. ${POST_BOOTSTRAP_REVOCATION_DETAIL}`,
+  });
 const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
 const isPairingAddError = Schema.is(PairingAddError);
@@ -245,10 +252,14 @@ export const verifyAndAddPairingCode = Effect.fn(
     }),
     credential: new BearerConnectionCredential({ token: verified.credential }),
   });
-  yield* registry.register(registration);
-  yield* identities.accept({
-    targetKey: storageIdentityTargetKey(target),
-    storageInstanceId: verified.storageInstanceId,
-  });
+  yield* registry
+    .register(registration)
+    .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
+  yield* identities
+    .accept({
+      targetKey: storageIdentityTargetKey(target),
+      storageInstanceId: verified.storageInstanceId,
+    })
+    .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server identity")));
   return registration.target.environmentId as EnvironmentId;
 });

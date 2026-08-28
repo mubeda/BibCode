@@ -100,13 +100,14 @@ describe("resolveTransportBadge", () => {
 });
 
 describe("add-server failure copy", () => {
-  it("has copy for all five spec-pinned failure reasons", () => {
+  it("has copy for every spec-pinned failure reason", () => {
     expect(ADD_SERVER_FAILURE_REASONS).toEqual([
       "unreachable",
       "host-identity-mismatch",
       "pairing-rejected",
       "incompatible",
       "duplicate-storage-identity",
+      "local-persistence-failed",
     ]);
     for (const reason of ADD_SERVER_FAILURE_REASONS) {
       const described = describeAddServerFailure(reason);
@@ -114,6 +115,9 @@ describe("add-server failure copy", () => {
       expect(described.detail.length).toBeGreaterThan(0);
     }
     expect(describeAddServerFailure("pairing-rejected").title).toBe("Pairing rejected");
+    expect(describeAddServerFailure("local-persistence-failed").detail).toContain(
+      "revoke the incomplete attempt",
+    );
   });
 
   it("reads the reason off a PairingAddError and rejects everything else", () => {

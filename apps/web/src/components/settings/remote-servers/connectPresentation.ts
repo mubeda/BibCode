@@ -77,6 +77,7 @@ export const ADD_SERVER_FAILURE_REASONS: ReadonlyArray<PairingAddFailureReason> 
   "pairing-rejected",
   "incompatible",
   "duplicate-storage-identity",
+  "local-persistence-failed",
 ];
 
 export function resolvePairingAddFailureReason(error: unknown): PairingAddFailureReason | null {
@@ -130,6 +131,12 @@ export function describeAddServerFailure(reason: PairingAddFailureReason): {
         title: "Server already saved",
         detail:
           "A saved server already uses this server's storage identity. Reconnect or adopt the existing entry instead of adding a duplicate.",
+      };
+    case "local-persistence-failed":
+      return {
+        title: "Server could not be saved",
+        detail:
+          "The server created a client credential, but this app could not save it. Open the server's client list and revoke the incomplete attempt before generating a new pairing offer.",
       };
   }
 }
