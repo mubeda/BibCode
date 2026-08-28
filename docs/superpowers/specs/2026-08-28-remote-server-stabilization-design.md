@@ -34,15 +34,33 @@ history. The relay executable-handle fix in `81eff018` is retained and
 explicitly disclosed in the remediation report instead of being hidden by a
 history rewrite.
 
+## Approved Final-Review Amendments
+
+The user approved the critical final-review corrections in the same session.
+They refine the fail-closed model in three places:
+
+- every fresh desktop process starts the actual backend local-only, and the
+  authenticated renderer re-widens only from authoritative live share state;
+- Tailscale and WSL settings restarts share the exposure coordinator and
+  preserve actual runtime exposure rather than replaying a stale setting; and
+- an ambiguous failed mint cancels its principal-scoped idempotency key before
+  exposure cleanup; the server revokes a committed grant or stores a tombstone
+  that blocks a delayed create.
+
+These amendments do not change the public pairing-code or Noise protocol. They
+close crash, restart, and response-loss paths that the original remediation
+design did not fully specify.
+
 ## Ownership and Sources of Truth
 
 `apps/server` owns authentication grants and sessions. Its share-state result
 is the authority for whether a live off-host access reason exists.
 
-`apps/desktop` owns the durable boot-time exposure setting, the actual
+`apps/desktop` owns the durable exposure setting, the actual
 in-process backend topology, native firewall state, and serialization of
-exposure transitions. The persisted setting is the next-launch target; it is
-not treated as proof that a restart or firewall operation succeeded.
+exposure transitions. Fresh processes always start local-only; the persisted
+setting is not treated as startup permission or proof that a restart or
+firewall operation succeeded.
 
 `apps/web` owns the share ceremony and presentation. It can request a native
 transition through `DesktopBridge`, but it cannot mutate settings, restart the
@@ -74,17 +92,18 @@ network-accessible until the resulting browser session is revoked.
 
 ### Serialization
 
-The desktop host serializes every exposure apply under one asynchronous mutex.
+The desktop host serializes every exposure apply and every other settings
+operation that can restart native or WSL topology under one asynchronous mutex.
 The mutex covers settings, backend restart, verification, recovery, and
-firewall synchronization so two renderer invocations cannot interleave native
-side effects or restart the backend past each other.
+firewall synchronization so renderer invocations cannot interleave native side
+effects or restart the backend past each other. Non-exposure settings changes
+preserve the actual runtime exposure mode.
 
-Renderer reconciliation still guards against stale observations. It records
-the share-state revision used for a narrowing decision and fetches share state
-again after the apply completes. If a newer live reason appeared during the
-operation, it performs one compensating re-widen for that race. This is not a
-general startup auto-widen rule: it is allowed only when the same in-flight
-narrowing operation observed that it displaced a newly created live reason.
+Fresh desktop startup always launches the actual backend local-only under this
+mutex. Renderer reconciliation then compares authenticated share state with
+actual topology: it widens only when a live off-host reason exists, and narrows
+when none remains. It fetches share state again after narrowing and performs one
+compensating re-widen if a newer live reason appeared during the operation.
 Further revision changes schedule a fresh reconciliation instead of forming an
 unbounded loop.
 
@@ -126,15 +145,20 @@ after reporting failure. The next launch remains local-only.
 
 ### Failed Share Ceremony
 
-Share generation continues to use bounded mint retries, but a mint failure
-after this ceremony widened the server invokes convergence directly and awaits
-it before presenting the final error. Convergence first refreshes share state:
+Share generation continues to use bounded mint retries. When all attempts fail,
+the renderer first calls the authenticated cancellation endpoint with the same
+principal-scoped idempotency key. Under the issuance lock, cancellation revokes
+an already committed offer or records an expiring tombstone that blocks a
+delayed create. Only after cancellation succeeds does convergence refresh share
+state:
 
 - if another live off-host reason exists, it leaves the listener wide;
 - otherwise it applies local-only immediately through the serialized host
   transition.
 
-The mount/revision reconciler remains a backstop, not the primary rollback
+If cancellation cannot be confirmed, the renderer does not narrow because an
+unreported grant may still exist; it presents an explicit cleanup failure. The
+mount/revision reconciler remains a backstop, not the primary rollback
 mechanism. The direct path does not depend on `access_revision`, so an
 in-process backend restart resetting an in-memory revision cannot suppress
 cleanup. The UI distinguishes “offer creation failed and remote access was

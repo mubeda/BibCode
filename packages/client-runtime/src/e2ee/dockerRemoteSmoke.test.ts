@@ -1,5 +1,5 @@
 // Opt-in cross-container boundary test. The server and client are started by
-// docs/superpowers/plans/2026-08-28-remote-server-stabilization.md.
+// docs/testing/cross-platform-validation.md.
 // @effect-diagnostics globalFetch:off - Every request targets the explicit Docker server URL.
 import {
   AuthAccessTokenResult,
