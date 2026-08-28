@@ -5,6 +5,7 @@ import {
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Socket from "effect/unstable/socket/Socket";
 
@@ -64,6 +65,7 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
   const timeoutMs = options.handshakeTimeoutMs ?? E2EE_HANDSHAKE_TIMEOUT_MS;
   let transportDeferred = Deferred.makeUnsafe<NkTransport, Socket.SocketError>();
   let hasStarted = false;
+  const outboundMessages = Semaphore.makeUnsafe(1);
 
   const encryptAndSend = (
     transport: NkTransport,
@@ -283,12 +285,14 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
       return (chunk: Uint8Array | string | Socket.CloseEvent) =>
         Socket.isCloseEvent(chunk)
           ? innerWrite(chunk)
-          : Deferred.await(transportDeferred).pipe(
-              Effect.flatMap((readyTransport) =>
-                encryptAndSend(
-                  readyTransport,
-                  innerWrite,
-                  typeof chunk === "string" ? encoder.encode(chunk) : chunk,
+          : outboundMessages.withPermits(1)(
+              Deferred.await(transportDeferred).pipe(
+                Effect.flatMap((readyTransport) =>
+                  encryptAndSend(
+                    readyTransport,
+                    innerWrite,
+                    typeof chunk === "string" ? encoder.encode(chunk) : chunk,
+                  ),
                 ),
               ),
             );
