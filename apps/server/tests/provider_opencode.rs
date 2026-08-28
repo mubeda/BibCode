@@ -4511,7 +4511,10 @@ async fn reconciliation_defers_history_that_cannot_fit_without_poisoning_its_sig
         .iter()
         .filter(|request| request.contains("/session/child-b/message"))
         .count();
-    assert_eq!(child_a_requests, 2, "the reconnect force revalidates child-a");
+    assert_eq!(
+        child_a_requests, 2,
+        "the reconnect force revalidates child-a"
+    );
     assert!(
         (2..=3).contains(&child_b_requests),
         "child-b is revalidated, with at most one unfinished-cursor fetch"
