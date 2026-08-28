@@ -1,5 +1,9 @@
 import { act, type ReactNode } from "react";
-import type { DesktopServerExposureMode, DesktopServerExposureState } from "@bibcode/contracts";
+import type {
+  AdvertisedEndpoint,
+  DesktopServerExposureMode,
+  DesktopServerExposureState,
+} from "@bibcode/contracts";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import * as DateTime from "effect/DateTime";
@@ -22,11 +26,12 @@ const h = vi.hoisted(() => ({
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
       },
-      advertisedEndpoints: [],
+      advertisedEndpoints: [] as AdvertisedEndpoint[],
     },
     error: null,
     isPending: false,
   },
+  wslQuery: { data: { wslOnly: false }, error: null, isPending: false },
   sessionState: {
     data: { authenticated: true, auth: { policy: "remote-reachable" as const } },
   },
@@ -36,12 +41,17 @@ vi.mock("~/environments/primary", () => ({
   cancelServerPairingOffer: h.cancelOffer,
   createServerPairingOffer: h.createOffer,
   getServerShareState: h.getShareState,
+  PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS: 50,
   usePrimarySessionState: () => h.sessionState,
 }));
 
 vi.mock("~/state/desktopNetworkAccess", () => ({
   desktopNetworkAccessStateAtom: Symbol.for("desktop-network-access"),
   refreshDesktopNetworkAccessState: h.refreshNetwork,
+}));
+
+vi.mock("~/state/desktopWslState", () => ({
+  desktopWslStateAtom: Symbol.for("desktop-wsl-state"),
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -53,7 +63,12 @@ vi.mock("~/state/environments", () => ({
 }));
 
 vi.mock("~/state/query", () => ({
-  useEnvironmentQuery: (atom: unknown) => (atom === null ? { data: null } : h.networkQuery),
+  useEnvironmentQuery: (atom: unknown) =>
+    atom === null
+      ? { data: null }
+      : atom === Symbol.for("desktop-wsl-state")
+        ? h.wslQuery
+        : h.networkQuery,
 }));
 
 vi.mock("~/connection/currentEnvironmentPresentation", () => ({
@@ -192,6 +207,8 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   Object.assign(h.networkQuery.data.serverExposureState, localState);
+  h.networkQuery.data.advertisedEndpoints = [];
+  h.wslQuery.data.wslOnly = false;
   h.cancelOffer.mockReset().mockResolvedValue(undefined);
   h.createOffer.mockReset().mockImplementation(async (input) => ({
     id: "offer-1",
@@ -319,6 +336,32 @@ describe("ShareThisHostTab", () => {
       expect.any(String),
     );
     expect(container.textContent).toContain("Loopback offer: reachable only through a tunnel");
+  });
+
+  it("mints against the WSL endpoint without invoking native exposure", async () => {
+    h.wslQuery.data.wslOnly = true;
+    h.networkQuery.data.advertisedEndpoints = [
+      {
+        id: "wsl-primary",
+        label: "WSL",
+        provider: { id: "wsl", label: "WSL", kind: "private-network", isAddon: false },
+        httpBaseUrl: "http://172.20.10.2:3773/",
+        wsBaseUrl: "ws://172.20.10.2:3773/",
+        reachability: "private-network",
+        compatibility: { hostedHttpsApp: "compatible", desktopApp: "compatible" },
+        source: "desktop-core",
+        status: "available",
+      },
+    ];
+    const apply = installBridge();
+    await renderTab();
+    await click("Generate pairing offer");
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(h.createOffer).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: "http://172.20.10.2:3773/" }),
+      expect.any(String),
+    );
   });
 
   it("keeps browser exposure read-only while server-side minting remains available", async () => {

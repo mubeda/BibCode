@@ -14,7 +14,9 @@ import type {
 import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { HttpClientError } from "effect/unstable/http";
 
@@ -42,6 +44,39 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
+export const PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS = 5_000;
+
+export class PrimaryEnvironmentRequestTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestTimeoutError>()(
+  "PrimaryEnvironmentRequestTimeoutError",
+  {
+    operation: PrimaryEnvironmentRequestOperation,
+    timeoutMs: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Primary environment request timed out during ${this.operation} after ${String(this.timeoutMs)}ms.`;
+  }
+}
+
+const isPrimaryEnvironmentRequestTimeoutError = Schema.is(PrimaryEnvironmentRequestTimeoutError);
+
+function withPrimaryRequestTimeout<A, E, R>(
+  operation: PrimaryEnvironmentRequestOperation,
+  request: Effect.Effect<A, E, R>,
+  timeoutMs = PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
+): Effect.Effect<A, E | PrimaryEnvironmentRequestTimeoutError, R> {
+  return request.pipe(
+    Effect.timeoutOption(Duration.millis(timeoutMs)),
+    Effect.flatMap(
+      Option.match({
+        onNone: () =>
+          Effect.fail(new PrimaryEnvironmentRequestTimeoutError({ operation, timeoutMs })),
+        onSome: Effect.succeed,
+      }),
+    ),
+  );
+}
+
 export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<PrimaryEnvironmentRequestError>()(
   "PrimaryEnvironmentRequestError",
   {
@@ -58,7 +93,9 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedErrorClass<Prim
     readonly pairingLinkId?: string;
     readonly sessionId?: string;
   }): PrimaryEnvironmentRequestError {
-    const status = readHttpApiStatus(input.cause) ?? 500;
+    const status = isPrimaryEnvironmentRequestTimeoutError(input.cause)
+      ? 504
+      : (readHttpApiStatus(input.cause) ?? 500);
     return new PrimaryEnvironmentRequestError({
       operation: input.operation,
       status,
@@ -330,6 +367,7 @@ export const primaryEnvironmentAuthInternals = {
   isTransientBootstrapError,
   readEnvironmentHttpErrorStatus,
   readHttpApiStatus,
+  withPrimaryRequestTimeout,
 };
 
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
@@ -406,12 +444,15 @@ export async function createServerPairingOffer(
 ): Promise<AuthPairingOfferResult> {
   try {
     return await runPrimaryHttp(
-      PrimaryEnvironmentHttpClient.pipe(
-        Effect.flatMap((client) =>
-          client.auth.pairingOffer({
-            headers: { "idempotency-key": idempotencyKey },
-            payload: input,
-          }),
+      withPrimaryRequestTimeout(
+        "create-pairing-offer",
+        PrimaryEnvironmentHttpClient.pipe(
+          Effect.flatMap((client) =>
+            client.auth.pairingOffer({
+              headers: { "idempotency-key": idempotencyKey },
+              payload: input,
+            }),
+          ),
         ),
       ),
     );
@@ -426,12 +467,15 @@ export async function createServerPairingOffer(
 export async function cancelServerPairingOffer(idempotencyKey: string): Promise<void> {
   try {
     await runPrimaryHttp(
-      PrimaryEnvironmentHttpClient.pipe(
-        Effect.flatMap((client) =>
-          client.auth.cancelPairingOffer({
-            headers: {},
-            payload: { idempotencyKey },
-          }),
+      withPrimaryRequestTimeout(
+        "cancel-pairing-offer",
+        PrimaryEnvironmentHttpClient.pipe(
+          Effect.flatMap((client) =>
+            client.auth.cancelPairingOffer({
+              headers: {},
+              payload: { idempotencyKey },
+            }),
+          ),
         ),
       ),
     );

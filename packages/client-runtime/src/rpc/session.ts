@@ -128,6 +128,11 @@ export const make = Effect.gen(function* () {
         Effect.asVoid,
       ),
     });
+    const connectionWebSocketConstructor: typeof webSocketConstructor = (url, protocols) => {
+      const socket = webSocketConstructor(url, protocols);
+      if (connection.e2ee !== null) socket.binaryType = "arraybuffer";
+      return socket;
+    };
     const socketLayer = Layer.effect(
       Socket.Socket,
       Socket.makeWebSocket(connection.socketUrl, { openTimeout: SOCKET_OPEN_TIMEOUT }).pipe(
@@ -152,7 +157,9 @@ export const make = Effect.gen(function* () {
           });
         }),
       ),
-    ).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor)));
+    ).pipe(
+      Layer.provide(Layer.succeed(Socket.WebSocketConstructor, connectionWebSocketConstructor)),
+    );
     const protocolLayer = Layer.effect(
       RpcClient.Protocol,
       RpcClient.makeProtocolSocket({

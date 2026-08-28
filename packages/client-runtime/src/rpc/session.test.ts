@@ -39,6 +39,7 @@ class TestWebSocket {
   static readonly CLOSED = 3;
 
   readyState = TestWebSocket.CONNECTING;
+  binaryType: BinaryType = "blob";
   readonly sent: Array<string | Uint8Array> = [];
   readonly url: string;
   private readonly listeners = new Map<SocketEventType, Set<SocketListener>>();
@@ -300,6 +301,7 @@ describe("RpcSessionFactory", () => {
           const readyFiber = yield* Effect.forkChild(session.ready);
           const socket = yield* awaitSocket(sockets);
           expect(socket.url).toBe("wss://environment.example.test/ws-e2ee");
+          expect(socket.binaryType).toBe("arraybuffer");
 
           socket.open();
           for (let attempt = 0; attempt < 100 && socket.sent.length === 0; attempt += 1) {

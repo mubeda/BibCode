@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const h = vi.hoisted(() => ({
   primaryEnvironmentId: "primary" as string | null,
   revision: 1,
+  wslOnly: false,
   getShareState: vi.fn(),
   toastAdd: vi.fn(),
   refreshNetwork: vi.fn(),
@@ -19,6 +20,10 @@ vi.mock("./primaryEnvironment", () => ({
   primaryEnvironmentIdAtom: Symbol.for("primary-environment-id"),
 }));
 
+vi.mock("./desktopWslState", () => ({
+  desktopWslStateAtom: Symbol.for("desktop-wsl-state"),
+}));
+
 vi.mock("./auth", () => ({
   authEnvironment: {
     accessChanges: () => Symbol.for("auth-access-changes"),
@@ -26,9 +31,10 @@ vi.mock("./auth", () => ({
 }));
 
 vi.mock("./query", () => ({
-  useEnvironmentQuery: (atom: unknown) => ({
-    data: atom === null ? null : { revision: h.revision },
-  }),
+  useEnvironmentQuery: (atom: unknown) =>
+    atom === Symbol.for("desktop-wsl-state")
+      ? { data: { wslOnly: h.wslOnly } }
+      : { data: atom === null ? null : { revision: h.revision } },
 }));
 
 vi.mock("../environments/primary", () => ({
@@ -191,6 +197,7 @@ describe("useShareExposureReconciler", () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     h.primaryEnvironmentId = "primary";
     h.revision = 1;
+    h.wslOnly = false;
     h.getShareState.mockReset().mockResolvedValue({
       desiredExposure: "loopback",
       offHostGrantCount: 0,
@@ -253,5 +260,24 @@ describe("useShareExposureReconciler", () => {
     });
     expect(h.getShareState).not.toHaveBeenCalled();
     expect(h.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not run the native exposure state machine for a WSL-only primary", async () => {
+    h.wslOnly = true;
+    const getServerExposureState = vi.fn(async () => wideExposure);
+    const applyServerExposure = vi.fn(async () => localExposure);
+    Object.defineProperty(window, "desktopBridge", {
+      configurable: true,
+      value: { getServerExposureState, applyServerExposure },
+    });
+
+    await act(async () => {
+      root.render(<HookHarness />);
+      await Promise.resolve();
+    });
+
+    expect(h.getShareState).not.toHaveBeenCalled();
+    expect(getServerExposureState).not.toHaveBeenCalled();
+    expect(applyServerExposure).not.toHaveBeenCalled();
   });
 });

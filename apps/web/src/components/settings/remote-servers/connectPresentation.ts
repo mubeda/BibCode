@@ -112,7 +112,7 @@ export function describeAddServerFailure(reason: PairingAddFailureReason): {
       return {
         title: "Host identity changed",
         detail:
-          "The server's identity key does not match this pairing code. Generate a fresh pairing code on the server and try again.",
+          "The server's identity key does not match this pairing code. Generate a fresh pairing code on the server and try again. If the code was already accepted, open the server's client list and revoke the incomplete attempt first.",
       };
     case "pairing-rejected":
       return {
@@ -136,7 +136,7 @@ export function describeAddServerFailure(reason: PairingAddFailureReason): {
       return {
         title: "Server could not be saved",
         detail:
-          "The server created a client credential, but this app could not save it. Open the server's client list and revoke the incomplete attempt before generating a new pairing offer.",
+          "The server created a client credential, but this app could not save it. Remove any saved local entry, then open the server's client list and revoke the incomplete attempt before generating a new pairing offer.",
       };
   }
 }
