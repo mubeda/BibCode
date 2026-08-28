@@ -1092,19 +1092,21 @@ impl BackendSupervisor {
         &self,
         app: AppHandle<R>,
     ) -> Result<BackendRunConfig, String> {
-        self.start_default_with_reason(app, "started").await
+        self.start_default_with_reason(app, "started", None).await
     }
 
     async fn start_default_with_reason<R: Runtime>(
         &self,
         app: AppHandle<R>,
         reason: &'static str,
+        exposure_override: Option<&str>,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
         let selection = match default_launch_plans(
             &app,
             self.backend_port_resolver.as_ref(),
             self.wsl_command_resolver.as_ref(),
+            exposure_override,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -1170,6 +1172,27 @@ impl BackendSupervisor {
         &self,
         app: AppHandle<R>,
     ) -> Result<Option<BackendRunConfig>, String> {
+        self.restart_default_if_active_with_override(app, None)
+            .await
+    }
+
+    pub async fn restart_default_if_active_with_exposure<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        desired: &str,
+    ) -> Result<Option<BackendRunConfig>, String> {
+        if !matches!(desired, "local-only" | "network-accessible") {
+            return Err(format!("Unsupported server exposure mode: {desired}"));
+        }
+        self.restart_default_if_active_with_override(app, Some(desired))
+            .await
+    }
+
+    async fn restart_default_if_active_with_override<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        exposure_override: Option<&str>,
+    ) -> Result<Option<BackendRunConfig>, String> {
         let is_active = {
             let state = self
                 .state
@@ -1184,7 +1207,7 @@ impl BackendSupervisor {
         }
 
         self.stop(BackendShutdownConfig::default()).await?;
-        self.start_default_with_reason(app, "restarted")
+        self.start_default_with_reason(app, "restarted", exposure_override)
             .await
             .map(Some)
     }
@@ -2615,9 +2638,18 @@ fn default_launch_plans<R: Runtime>(
     app: &AppHandle<R>,
     backend_port_resolver: &dyn BackendPortResolver,
     wsl_command_resolver: &dyn WslCommandResolver,
+    exposure_override: Option<&str>,
 ) -> Result<DefaultLaunchPlans, BackendPlanError> {
-    let settings =
+    let mut settings =
         read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    if let Some(desired) = exposure_override {
+        if !matches!(desired, "local-only" | "network-accessible") {
+            return Err(BackendPlanError::Other {
+                detail: format!("Unsupported server exposure mode: {desired}"),
+            });
+        }
+        settings.server_exposure_mode = desired.to_string();
+    }
     let log_path =
         primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
     let port = backend_port_resolver.port();
@@ -5128,11 +5160,67 @@ exit /b 9
                 handle,
                 &SystemBackendPortResolver,
                 &SystemWslCommandResolver,
+                None,
             )
             .unwrap()
             .plans
             .is_empty()
         );
+    }
+
+    #[test]
+    fn exposure_override_controls_launch_planning_without_changing_persisted_settings() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+        let settings_directory = desktop_base_dir(app.handle())
+            .expect("desktop base directory")
+            .join("dev");
+        fs::create_dir_all(&settings_directory).expect("settings directory");
+        let settings_path = settings_directory.join(DESKTOP_SETTINGS_FILE_NAME);
+        fs::write(
+            &settings_path,
+            r#"{"serverExposureMode":"network-accessible"}"#,
+        )
+        .expect("wide desktop settings");
+
+        let local_override = default_launch_plans(
+            app.handle(),
+            &SystemBackendPortResolver,
+            &SystemWslCommandResolver,
+            Some("local-only"),
+        )
+        .expect("local override launch plan")
+        .plans
+        .into_iter()
+        .find(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
+        .expect("primary local plan");
+        assert_eq!(local_override.config.server_exposure_mode, "local-only");
+        assert_eq!(local_override.config.bind_host, DESKTOP_LOOPBACK_HOST);
+
+        fs::write(&settings_path, r#"{"serverExposureMode":"local-only"}"#)
+            .expect("local desktop settings");
+        let wide_override = default_launch_plans(
+            app.handle(),
+            &SystemBackendPortResolver,
+            &SystemWslCommandResolver,
+            Some("network-accessible"),
+        )
+        .expect("wide override launch plan")
+        .plans
+        .into_iter()
+        .find(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
+        .expect("primary wide plan");
+        assert_eq!(
+            wide_override.config.server_exposure_mode,
+            "network-accessible"
+        );
+        assert_eq!(wide_override.config.bind_host, DESKTOP_LAN_BIND_HOST);
     }
 
     #[tokio::test]

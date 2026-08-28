@@ -14,7 +14,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::backend::{BackendPlanError, BackendRunConfig, BackendSupervisor};
+use crate::backend::{
+    BackendPlanError, BackendRunConfig, BackendShutdownConfig, BackendSupervisor,
+};
 use crate::config::{
     app_branding, read_json_file, resolve_pick_folder_default_path, state_dir, write_json_file,
 };
@@ -26,6 +28,9 @@ use crate::data_safety;
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
+};
+use crate::server_exposure::{
+    BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure,
 };
 use crate::ssh::{
     SshEnvironmentEnsureOptions, SshEnvironmentManager, SshEnvironmentTarget,
@@ -443,35 +448,6 @@ fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunC
         "tailscaleServeEnabled": settings.tailscale_serve_enabled,
         "tailscaleServePort": settings.tailscale_serve_port,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExposureApplyOutcome {
-    Commit,
-    CommitWithFirewallWarning,
-    Rollback,
-}
-
-fn exposure_apply_outcome(
-    desired: &str,
-    restart_ok: bool,
-    achieved_mode: Option<&str>,
-    firewall_ok: bool,
-) -> ExposureApplyOutcome {
-    if !restart_ok {
-        return ExposureApplyOutcome::Rollback;
-    }
-    if desired == "network-accessible" {
-        if achieved_mode != Some("network-accessible") || !firewall_ok {
-            return ExposureApplyOutcome::Rollback;
-        }
-        return ExposureApplyOutcome::Commit;
-    }
-    if firewall_ok {
-        ExposureApplyOutcome::Commit
-    } else {
-        ExposureApplyOutcome::CommitWithFirewallWarning
-    }
 }
 
 fn normalize_http_base_url(raw_value: &str) -> Result<String, String> {
@@ -1214,85 +1190,66 @@ pub fn desktop_bridge_get_server_exposure_state(
         .map(|settings| server_exposure_state(&settings, backend.current_run_config().as_ref()))
 }
 
+struct DesktopExposureOperations<'a> {
+    app: &'a AppHandle<DesktopRuntime>,
+    backend: &'a BackendSupervisor,
+}
+
+impl ExposureOperations for DesktopExposureOperations<'_> {
+    fn persisted_mode(&self) -> Result<String, String> {
+        read_desktop_settings(self.app).map(|settings| settings.server_exposure_mode)
+    }
+
+    fn persist_mode<'a>(&'a self, mode: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            update_desktop_settings(self.app, |settings| {
+                settings.server_exposure_mode = mode.to_owned();
+            })
+            .map(|_| ())
+        })
+    }
+
+    fn current_config(&self) -> Option<BackendRunConfig> {
+        self.backend.current_run_config()
+    }
+
+    fn restart_with_mode<'a>(
+        &'a self,
+        mode: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackendRunConfig>, String>> {
+        Box::pin(async move {
+            self.backend
+                .restart_default_if_active_with_exposure(self.app.clone(), mode)
+                .await
+        })
+    }
+
+    fn sync_firewall(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(crate::firewall::sync_remote_access_rule(enabled))
+    }
+
+    fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { self.backend.stop(BackendShutdownConfig::default()).await })
+    }
+}
+
 #[tauri::command]
 pub async fn desktop_bridge_apply_server_exposure(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     desired: String,
 ) -> Result<Value, String> {
-    if !matches!(desired.as_str(), "local-only" | "network-accessible") {
-        return Err(format!("Unsupported server exposure mode: {desired}"));
-    }
-    let previous = read_desktop_settings(&app)?.server_exposure_mode;
-    if previous == desired {
-        let settings = read_desktop_settings(&app)?;
-        crate::firewall::sync_remote_access_rule(desired == "network-accessible").await?;
-        return Ok(server_exposure_state(
-            &settings,
-            backend.current_run_config().as_ref(),
-        ));
-    }
-
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.server_exposure_mode = desired.clone();
-    })?;
-    let restart = backend.restart_default_if_active(app.clone()).await;
-    let current_config = match &restart {
-        Ok(config) => config.clone().or_else(|| backend.current_run_config()),
-        Err(_) => None,
+    let operations = DesktopExposureOperations {
+        app: &app,
+        backend: backend.inner(),
     };
-    let achieved_mode = current_config
-        .as_ref()
-        .map(|config| config.server_exposure_mode.as_str());
-    let verified =
-        restart.is_ok() && (desired == "local-only" || achieved_mode == Some("network-accessible"));
-    let firewall_result = if verified {
-        crate::firewall::sync_remote_access_rule(desired == "network-accessible").await
-    } else {
-        Ok(())
-    };
-
-    match exposure_apply_outcome(
-        &desired,
-        restart.is_ok(),
-        achieved_mode,
-        firewall_result.is_ok(),
-    ) {
-        ExposureApplyOutcome::Commit => {
-            Ok(server_exposure_state(&settings, current_config.as_ref()))
-        }
-        ExposureApplyOutcome::CommitWithFirewallWarning => {
-            tracing::warn!(
-                target: "bibcode_desktop_tauri::bridge",
-                "exposure narrowed but firewall cleanup failed: {}",
-                firewall_result.err().unwrap_or_default()
-            );
-            Ok(server_exposure_state(&settings, current_config.as_ref()))
-        }
-        ExposureApplyOutcome::Rollback => {
-            let detail = match (&restart, &firewall_result) {
-                (Err(error), _) => error.clone(),
-                (Ok(_), Err(error)) => {
-                    format!("firewall rule synchronization failed: {error}")
-                }
-                (Ok(_), Ok(())) => {
-                    "the backend could not bind a network-accessible address".to_owned()
-                }
-            };
-            let _ = update_desktop_settings(&app, |settings| {
-                settings.server_exposure_mode = previous.clone();
-            })?;
-            let recovery = backend.restart_default_if_active(app.clone()).await;
-            let _ = crate::firewall::sync_remote_access_rule(false).await;
-            let recovery_note = match recovery {
-                Ok(_) => String::new(),
-                Err(error) => format!(" Recovery restart also failed: {error}"),
-            };
-            Err(format!(
-                "Could not change server exposure; reverted to {previous}: {detail}.{recovery_note}"
-            ))
-        }
-    }
+    let transition = apply_exposure(coordinator.inner(), &operations, &desired).await?;
+    let settings = read_desktop_settings(&app)?;
+    Ok(server_exposure_state(
+        &settings,
+        transition.current_config.as_ref(),
+    ))
 }
 
 #[tauri::command]
@@ -2358,45 +2315,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_server_exposure_outcomes_cover_bind_and_firewall_failures() {
-        use ExposureApplyOutcome::{Commit, CommitWithFirewallWarning, Rollback};
-
-        assert_eq!(
-            exposure_apply_outcome("local-only", true, None, true),
-            Commit
-        );
-        assert_eq!(
-            exposure_apply_outcome("network-accessible", true, Some("network-accessible"), true,),
-            Commit
-        );
-        assert_eq!(
-            exposure_apply_outcome("network-accessible", true, Some("local-only"), true),
-            Rollback
-        );
-        assert_eq!(
-            exposure_apply_outcome("network-accessible", true, None, true),
-            Rollback
-        );
-        assert_eq!(
-            exposure_apply_outcome("network-accessible", false, None, true),
-            Rollback
-        );
-        assert_eq!(
-            exposure_apply_outcome(
-                "network-accessible",
-                true,
-                Some("network-accessible"),
-                false,
-            ),
-            Rollback
-        );
-        assert_eq!(
-            exposure_apply_outcome("local-only", true, None, false),
-            CommitWithFirewallWarning
-        );
-    }
-
-    #[test]
     fn advertised_endpoint_urls_normalize_supported_schemes() {
         assert_eq!(
             normalize_http_base_url("ws://example.test:13773/path?q=1#fragment")
@@ -2935,6 +2853,7 @@ mod tests {
         let app = mock_builder()
             .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
+            .manage(ServerExposureCoordinator::default())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
             .manage(SshEnvironmentManager::new())
