@@ -1,5 +1,6 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as TokenStore from "../authorization/tokenStore.ts";
@@ -198,6 +199,7 @@ describe("ConnectionCatalogDocument", () => {
     expect(removeConnectionRegistrationFromCatalog(document, first)).toEqual({
       document,
       removed: false,
+      current: { target: replacement.target, profile: Option.some(replacement.profile) },
     });
   });
 
@@ -207,11 +209,21 @@ describe("ConnectionCatalogDocument", () => {
       profile: BEARER_PROFILE,
       credential: BEARER_CREDENTIAL,
     });
-    const document = registerConnectionInCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT, registration);
+    const document = registerConnectionInCatalog(
+      {
+        ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        remoteDpopTokens: [REMOTE_TOKEN],
+      },
+      registration,
+    );
 
     expect(removeConnectionRegistrationFromCatalog(document, registration)).toEqual({
-      document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      document: {
+        ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        remoteDpopTokens: [REMOTE_TOKEN],
+      },
       removed: true,
+      current: null,
     });
   });
 

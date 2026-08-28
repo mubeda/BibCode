@@ -122,11 +122,14 @@ Pairing-add compensation uses that same cross-runtime boundary. The registration
 store removes a failed add only when the current durable registration-owned
 target, profile, and credential fields still equal the exact registration being
 compensated. A conflict rereads and re-evaluates the condition, so a replacement
-committed by another tab, WebView, or client runtime wins intact. The environment
-registry closes its local supervisor and clears environment-owned runtime data
-only after the conditional catalog transition reports that it removed the
-registration; a non-matching durable replacement leaves the local runtime
-untouched until normal catalog reconciliation observes it.
+committed by another tab, WebView, or client runtime wins intact. Compensation
+removes only those registration-owned fields; a same-environment DPoP token or
+accepted storage identity remains untouched. The compare-only result carries the
+current durable catalog entry when another registration won. The environment
+registry then retires the failed add's local supervisor and installs that winner
+without clearing environment-owned data. When compensation itself removes the
+registration, the registry closes the local supervisor and clears owned runtime
+data only after the conditional CAS succeeds.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`

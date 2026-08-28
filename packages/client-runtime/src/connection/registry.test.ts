@@ -25,6 +25,7 @@ import {
   BearerConnectionCredential,
   BearerConnectionProfile,
   BearerConnectionRegistration,
+  connectionRegistrationCatalogEntry,
   type ConnectionRegistration,
   PrimaryConnectionRegistration,
   RelayConnectionRegistration,
@@ -313,11 +314,19 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     removeIfMatching: (registration) =>
       Effect.gen(function* () {
         const stored = (yield* Ref.get(storedRegistrations)).get(registration.target.environmentId);
-        if (stored === undefined || !Equal.equals(stored, registration)) return false;
+        if (stored === undefined || !Equal.equals(stored, registration)) {
+          return {
+            removed: false,
+            current: stored === undefined ? null : connectionRegistrationCatalogEntry(stored),
+          };
+        }
         yield* removeStoredRegistration(registration.target);
-        return true;
+        return { removed: true, current: null };
       }),
     remove: removeStoredRegistration,
+  });
+  const externalRegistrationStore = Persistence.ConnectionRegistrationStore.of({
+    ...registrationStore,
   });
   const acceptedStorageIdentityService = {
     get: (targetKey: string) =>
@@ -562,6 +571,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
 
   return {
     layer,
+    externalRegistrationStore,
     storedTargets,
     shellCache,
     threadCache,
@@ -1216,6 +1226,60 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("reconciles the local runtime to a replacement from another store", () =>
+    Effect.gen(function* () {
+      const first = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "first-credential" }),
+      });
+      const replacementTarget = new BearerConnectionTarget({
+        ...BEARER_TARGET,
+        label: "Replacement environment",
+      });
+      const replacement = new BearerConnectionRegistration({
+        target: replacementTarget,
+        profile: new BearerConnectionProfile({
+          ...BEARER_PROFILE,
+          label: replacementTarget.label,
+          httpBaseUrl: "https://replacement.example.test",
+          wsBaseUrl: "wss://replacement.example.test",
+        }),
+        credential: new BearerConnectionCredential({ token: "replacement-credential" }),
+      });
+      const harness = yield* makeHarness([]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.register(first);
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        yield* harness.externalRegistrationStore.register(replacement);
+        expect(yield* registry.rollbackRegistration(first)).toBe(false);
+
+        const entry = (yield* SubscriptionRef.get(registry.entries)).get(
+          BEARER_TARGET.environmentId,
+        );
+        expect(entry?.target).toEqual(replacement.target);
+        expect(Option.getOrThrow(entry?.profile ?? Option.none())).toEqual(replacement.profile);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(1);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("finishes rollback before installing a queued replacement", () =>
     Effect.gen(function* () {
       const first = new BearerConnectionRegistration({
@@ -1488,6 +1552,25 @@ describe("EnvironmentRegistry", () => {
       yield* Effect.gen(function* () {
         const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
         yield* registry.start;
+        const refreshedTarget: DesktopSshEnvironmentTarget = {
+          alias: "refreshed",
+          hostname: "refreshed.example.test",
+          username: "operator",
+          port: 2222,
+        };
+        yield* Ref.update(harness.storedProfiles, (current) => {
+          const next = new Map(current);
+          next.set(
+            SSH_CONNECTION.connectionId,
+            new SshConnectionProfile({
+              connectionId: SSH_CONNECTION.connectionId,
+              environmentId: SSH_CONNECTION.environmentId,
+              label: SSH_CONNECTION.label,
+              target: refreshedTarget,
+            }),
+          );
+          return next;
+        });
         yield* registry.remove(SSH_CONNECTION.environmentId);
 
         expect((yield* Ref.get(harness.storedProfiles)).has(SSH_CONNECTION.connectionId)).toBe(
@@ -1499,7 +1582,7 @@ describe("EnvironmentRegistry", () => {
         expect((yield* Ref.get(harness.storedRemoteTokens)).has(SSH_CONNECTION.environmentId)).toBe(
           false,
         );
-        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([refreshedTarget]);
       }).pipe(Effect.provide(harness.layer));
     }),
   );
