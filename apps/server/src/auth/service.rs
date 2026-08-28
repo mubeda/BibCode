@@ -3,9 +3,9 @@ use std::{
     net::IpAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use subtle::ConstantTimeEq;
@@ -27,9 +27,10 @@ use super::{
 };
 use crate::config::{ServerConfig, ServerMode};
 use crate::persistence::{
-    AuthPairingLink as PersistedPairingLink, AuthSession as PersistedAuthSession,
-    AuthSessionClient as PersistedAuthSessionClient, NewAuthPairingOffer, NewAuthSession,
-    Repositories,
+    AuthAuthoritySnapshot as PersistedAuthAuthoritySnapshot,
+    AuthPairingLink as PersistedPairingLink, AuthPairingOffer as PersistedPairingOffer,
+    AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
+    NewAuthPairingOffer, NewAuthSession, PersistenceError, Repositories,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -43,6 +44,7 @@ const PAIRING_LENGTH: usize = 12;
 const PAIRING_REJECTION_LIMIT: u8 =
     (u8::MAX as usize / PAIRING_ALPHABET.len() * PAIRING_ALPHABET.len()) as u8;
 const ACCESS_EVENT_CAPACITY: usize = 64;
+const AUTHORITY_CONVERGENCE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_ACTIVE_PAIRINGS: usize = 4_096;
 const MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL: usize = 128;
 const MAX_ACTIVE_SESSIONS: usize = 4_096;
@@ -73,8 +75,9 @@ pub struct AuthService {
     issuance: Arc<Mutex<()>>,
     pairing_offer_issuance: Arc<Mutex<()>>,
     repositories: Option<Repositories>,
-    access_events: broadcast::Sender<AuthAccessEvent>,
+    access_events: Arc<broadcast::Sender<AuthAccessEvent>>,
     access_revision: Arc<AtomicU64>,
+    authority_watcher_running: Arc<AtomicBool>,
     dpop: DpopVerifier,
 }
 
@@ -91,6 +94,13 @@ struct AuthState {
     pairing_offer_idempotency: HashMap<(String, String), StoredPairingOffer>,
     live_connections: HashMap<String, HashMap<u64, CancellationToken>>,
     next_connection_id: u64,
+    authority_generation: u64,
+}
+
+impl AuthState {
+    fn bump_authority_generation(&mut self) {
+        self.authority_generation = self.authority_generation.wrapping_add(1);
+    }
 }
 
 #[derive(Clone)]
@@ -101,10 +111,24 @@ struct StoredPairingOffer {
     expires_at_ms: i64,
 }
 
-struct PairingOfferReservation {
+pub(crate) struct PairingOfferReservation {
     principal_id: String,
     idempotency_key: String,
     input_fingerprint: String,
+}
+
+impl PairingOfferReservation {
+    pub(crate) fn new(
+        principal_id: String,
+        idempotency_key: String,
+        input_fingerprint: String,
+    ) -> Self {
+        Self {
+            principal_id,
+            idempotency_key,
+            input_fingerprint,
+        }
+    }
 }
 
 fn ensure_pairing_offer_capacity(
@@ -144,6 +168,16 @@ pub(crate) enum PairingOfferReplay {
     Cancelled,
     Conflict,
     Fresh,
+}
+
+pub(crate) enum PairingOfferIssuance {
+    Reserved(PairingCredentialResult),
+    Replay(PairingOfferReplay),
+}
+
+enum PairingIssuance {
+    Reserved(PairingCredentialResult),
+    Existing(PersistedPairingOffer),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +272,7 @@ impl AuthService {
             Some(repositories),
         );
         service.hydrate_active_state().await?;
+        service.ensure_authority_watcher();
         Ok(service)
     }
 
@@ -293,8 +328,9 @@ impl AuthService {
             issuance: Arc::new(Mutex::new(())),
             pairing_offer_issuance: Arc::new(Mutex::new(())),
             repositories,
-            access_events,
+            access_events: Arc::new(access_events),
             access_revision: Arc::new(AtomicU64::new(1)),
+            authority_watcher_running: Arc::new(AtomicBool::new(false)),
             dpop: DpopVerifier::new(secret_store),
         }
     }
@@ -303,46 +339,24 @@ impl AuthService {
         let Some(repositories) = &self.repositories else {
             return Ok(());
         };
-        let now = format_iso(now_ms());
-        let pairings = repositories
-            .list_active_auth_pairing_links(now.clone())
+        let snapshot = repositories
+            .load_auth_authority_snapshot(format_iso(now_ms()))
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
-        let pairing_offers = repositories
-            .prune_and_list_active_auth_pairing_offers(now.clone())
-            .await
-            .map_err(|error| AuthError::Internal(error.to_string()))?;
-        let sessions = repositories
-            .list_active_auth_sessions(now)
-            .await
-            .map_err(|error| AuthError::Internal(error.to_string()))?;
-        let pairings = pairings
+        let pairings = snapshot
+            .pairings
             .into_iter()
             .map(pairing_record_from_persisted)
             .collect::<Result<Vec<_>, _>>()?;
-        let sessions = sessions
+        let sessions = snapshot
+            .sessions
             .into_iter()
             .map(session_record_from_persisted)
             .collect::<Result<Vec<_>, _>>()?;
-        let pairing_offers = pairing_offers
+        let pairing_offers = snapshot
+            .offers
             .into_iter()
-            .map(|offer| {
-                let expires_at_ms = parse_timestamp_ms(&offer.expires_at)?;
-                let result = offer
-                    .result
-                    .map(serde_json::from_value::<PairingOfferResult>)
-                    .transpose()
-                    .map_err(|error| AuthError::Internal(error.to_string()))?;
-                Ok((
-                    (offer.principal_id, offer.idempotency_key),
-                    StoredPairingOffer {
-                        input_fingerprint: offer.input_fingerprint,
-                        pairing_id: offer.pairing_id,
-                        result,
-                        expires_at_ms,
-                    },
-                ))
-            })
+            .map(stored_pairing_offer_from_persisted)
             .collect::<Result<HashMap<_, _>, AuthError>>()?;
         let mut state = self.state.lock().await;
         state.pairings = pairings
@@ -374,7 +388,9 @@ impl AuthService {
 
     #[must_use]
     pub(crate) fn subscribe_access(&self) -> broadcast::Receiver<AuthAccessEvent> {
-        self.access_events.subscribe()
+        let receiver = self.access_events.subscribe();
+        self.ensure_authority_watcher();
+        receiver
     }
 
     pub(crate) async fn access_snapshot(
@@ -406,10 +422,121 @@ impl AuthService {
     }
 
     fn emit_access_change(&self, change: AuthAccessChange) {
-        let revision = self.access_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = self
-            .access_events
-            .send(AuthAccessEvent { revision, change });
+        emit_access_change_on(&self.access_events, &self.access_revision, change);
+    }
+
+    fn ensure_authority_watcher(&self) {
+        let Some(repositories) = self.repositories.clone() else {
+            return;
+        };
+        if self
+            .authority_watcher_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let state = Arc::downgrade(&self.state);
+        let access_events = Arc::downgrade(&self.access_events);
+        let access_revision = Arc::downgrade(&self.access_revision);
+        let watcher_running = Arc::downgrade(&self.authority_watcher_running);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(AUTHORITY_CONVERGENCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut observed_revision = None;
+            let mut next_expiry_ms = None;
+            'watcher: loop {
+                interval.tick().await;
+                let (
+                    Some(state),
+                    Some(access_events),
+                    Some(access_revision),
+                    Some(watcher_running),
+                ) = (
+                    state.upgrade(),
+                    access_events.upgrade(),
+                    access_revision.upgrade(),
+                    watcher_running.upgrade(),
+                )
+                else {
+                    break;
+                };
+                let now = now_ms();
+                match repositories.auth_authority_revision().await {
+                    Ok(revision)
+                        if observed_revision != Some(revision)
+                            || next_expiry_ms.is_some_and(|expires_at| expires_at <= now) =>
+                    {
+                        let generation = state.lock().await.authority_generation;
+                        match repositories
+                            .load_auth_authority_snapshot(format_iso(now))
+                            .await
+                        {
+                            Ok(snapshot) => {
+                                let snapshot_revision = snapshot.revision;
+                                let snapshot_expiry = snapshot
+                                    .next_expiry_at
+                                    .as_deref()
+                                    .map(parse_timestamp_ms)
+                                    .transpose();
+                                match (
+                                    snapshot_expiry,
+                                    reconcile_authority_snapshot(&state, snapshot, generation)
+                                        .await,
+                                ) {
+                                    (Ok(snapshot_expiry), Ok(Some(changes))) => {
+                                        observed_revision = Some(snapshot_revision);
+                                        next_expiry_ms = snapshot_expiry;
+                                        for change in changes {
+                                            emit_access_change_on(
+                                                &access_events,
+                                                &access_revision,
+                                                change,
+                                            );
+                                        }
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => {
+                                        tracing::error!(
+                                            ?error,
+                                            "failed to decode durable auth authority snapshot"
+                                        );
+                                    }
+                                    (Ok(_), Ok(None)) => {}
+                                }
+                            }
+                            Err(PersistenceError::WorkerUnavailable) => {
+                                watcher_running.store(false, Ordering::Release);
+                                break 'watcher;
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "failed to reconcile durable auth authority");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(PersistenceError::WorkerUnavailable) => {
+                        watcher_running.store(false, Ordering::Release);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to read durable auth authority revision");
+                    }
+                }
+
+                if authority_has_consumers(&state, &access_events).await {
+                    continue;
+                }
+                watcher_running.store(false, Ordering::Release);
+                if authority_has_consumers(&state, &access_events).await
+                    && watcher_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+        });
     }
 
     pub(crate) async fn create_browser_session(
@@ -618,23 +745,55 @@ impl AuthService {
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
         let Some(persisted) = persisted else {
-            self.state.lock().await.sessions.remove(session_id);
+            self.remove_cached_session(session_id).await;
             return Err(AuthError::InvalidCredential);
         };
         if persisted.revoked_at.is_some()
             || parse_timestamp_ms(&persisted.expires_at)? <= observed_at
         {
-            self.state.lock().await.sessions.remove(session_id);
+            self.remove_cached_session(session_id).await;
             return Err(AuthError::InvalidCredential);
         }
         let mut refreshed = session_record_from_persisted(persisted)?;
         let mut state = self.state.lock().await;
-        if let Some(current) = state.sessions.get(session_id) {
+        let change = if let Some(current) = state.sessions.get(session_id) {
+            let previous_view = current.view(false);
             refreshed.connected_count = current.connected_count;
             refreshed.proof_key_thumbprint = current.proof_key_thumbprint.clone();
-        }
+            refreshed.transport = current.transport;
+            if current.last_connected_at_ms > refreshed.last_connected_at_ms {
+                refreshed.last_connected_at_ms = current.last_connected_at_ms;
+            }
+            (refreshed.view(false) != previous_view)
+                .then(|| AuthAccessChange::ClientUpserted(refreshed.view(false)))
+        } else {
+            Some(AuthAccessChange::ClientUpserted(refreshed.view(false)))
+        };
         state.sessions.insert(session_id.to_owned(), refreshed);
+        if change.is_some() {
+            state.bump_authority_generation();
+        }
+        drop(state);
+        if let Some(change) = change {
+            self.emit_access_change(change);
+        }
+        self.ensure_authority_watcher();
         Ok(())
+    }
+
+    async fn remove_cached_session(&self, session_id: &str) {
+        let mut state = self.state.lock().await;
+        let removed = state.sessions.remove(session_id).is_some();
+        cancel_live_connections(&mut state, session_id);
+        if removed {
+            state.bump_authority_generation();
+        }
+        drop(state);
+        if removed {
+            self.emit_access_change(AuthAccessChange::ClientRemoved {
+                session_id: session_id.to_owned(),
+            });
+        }
     }
 
     pub async fn issue_pairing(
@@ -642,15 +801,17 @@ impl AuthService {
         scopes: Vec<String>,
         label: Option<String>,
     ) -> Result<PairingCredentialResult, AuthError> {
-        self.issue_pairing_for_subject(
-            scopes,
-            label,
-            "one-time-token",
-            PAIRING_TTL_MS,
-            AuthGrantMetadata::default(),
-            None,
+        reserved_pairing(
+            self.issue_pairing_for_subject(
+                scopes,
+                label,
+                "one-time-token",
+                PAIRING_TTL_MS,
+                AuthGrantMetadata::default(),
+                None,
+            )
+            .await?,
         )
-        .await
     }
 
     pub async fn issue_pairing_with_proof(
@@ -662,18 +823,20 @@ impl AuthService {
         if proof_key_thumbprint.trim().is_empty() {
             return Err(AuthError::InvalidCredential);
         }
-        self.issue_pairing_for_subject(
-            scopes,
-            label,
-            "one-time-token",
-            PAIRING_TTL_MS,
-            AuthGrantMetadata {
-                proof_key_thumbprint: Some(proof_key_thumbprint),
-                ..AuthGrantMetadata::default()
-            },
-            None,
+        reserved_pairing(
+            self.issue_pairing_for_subject(
+                scopes,
+                label,
+                "one-time-token",
+                PAIRING_TTL_MS,
+                AuthGrantMetadata {
+                    proof_key_thumbprint: Some(proof_key_thumbprint),
+                    ..AuthGrantMetadata::default()
+                },
+                None,
+            )
+            .await?,
         )
-        .await
     }
 
     pub async fn issue_cloud_pairing(
@@ -683,30 +846,34 @@ impl AuthService {
         if proof_key_thumbprint.trim().is_empty() {
             return Err(AuthError::InvalidCredential);
         }
-        self.issue_pairing_for_subject(
-            owned_scopes(STANDARD_SCOPES),
-            Some("BiBCode Connect connect".to_owned()),
-            "cloud-connect",
-            CLOUD_PAIRING_TTL_MS,
-            AuthGrantMetadata {
-                proof_key_thumbprint: Some(proof_key_thumbprint),
-                ..AuthGrantMetadata::default()
-            },
-            None,
+        reserved_pairing(
+            self.issue_pairing_for_subject(
+                owned_scopes(STANDARD_SCOPES),
+                Some("BiBCode Connect connect".to_owned()),
+                "cloud-connect",
+                CLOUD_PAIRING_TTL_MS,
+                AuthGrantMetadata {
+                    proof_key_thumbprint: Some(proof_key_thumbprint),
+                    ..AuthGrantMetadata::default()
+                },
+                None,
+            )
+            .await?,
         )
-        .await
     }
 
     pub(crate) async fn issue_startup_pairing(&self) -> Result<PairingCredentialResult, AuthError> {
-        self.issue_pairing_for_subject(
-            owned_scopes(ADMINISTRATIVE_SCOPES),
-            None,
-            "administrative-bootstrap",
-            PAIRING_TTL_MS,
-            AuthGrantMetadata::default(),
-            None,
+        reserved_pairing(
+            self.issue_pairing_for_subject(
+                owned_scopes(ADMINISTRATIVE_SCOPES),
+                None,
+                "administrative-bootstrap",
+                PAIRING_TTL_MS,
+                AuthGrantMetadata::default(),
+                None,
+            )
+            .await?,
         )
-        .await
     }
 
     pub async fn issue_share_pairing(
@@ -719,19 +886,21 @@ impl AuthService {
         if !is_valid_pairing_reach(&reach) {
             return Err(AuthError::InvalidCredential);
         }
-        self.issue_pairing_for_subject(
-            scopes,
-            label,
-            "one-time-token",
-            PAIRING_TTL_MS,
-            AuthGrantMetadata {
-                reach: Some(reach),
-                off_host: Some(off_host),
-                ..AuthGrantMetadata::default()
-            },
-            None,
+        reserved_pairing(
+            self.issue_pairing_for_subject(
+                scopes,
+                label,
+                "one-time-token",
+                PAIRING_TTL_MS,
+                AuthGrantMetadata {
+                    reach: Some(reach),
+                    off_host: Some(off_host),
+                    ..AuthGrantMetadata::default()
+                },
+                None,
+            )
+            .await?,
         )
-        .await
     }
 
     pub(crate) async fn issue_share_pairing_offer(
@@ -740,30 +909,32 @@ impl AuthService {
         label: Option<String>,
         reach: String,
         off_host: bool,
-        principal_id: String,
-        idempotency_key: String,
-        input_fingerprint: String,
-    ) -> Result<PairingCredentialResult, AuthError> {
+        reservation: PairingOfferReservation,
+    ) -> Result<PairingOfferIssuance, AuthError> {
         if !is_valid_pairing_reach(&reach) {
             return Err(AuthError::InvalidCredential);
         }
-        self.issue_pairing_for_subject(
-            scopes,
-            label,
-            "one-time-token",
-            PAIRING_TTL_MS,
-            AuthGrantMetadata {
-                reach: Some(reach),
-                off_host: Some(off_host),
-                ..AuthGrantMetadata::default()
-            },
-            Some(PairingOfferReservation {
-                principal_id,
-                idempotency_key,
-                input_fingerprint,
-            }),
-        )
-        .await
+        let replay_fingerprint = reservation.input_fingerprint.clone();
+        match self
+            .issue_pairing_for_subject(
+                scopes,
+                label,
+                "one-time-token",
+                PAIRING_TTL_MS,
+                AuthGrantMetadata {
+                    reach: Some(reach),
+                    off_host: Some(off_host),
+                    ..AuthGrantMetadata::default()
+                },
+                Some(reservation),
+            )
+            .await?
+        {
+            PairingIssuance::Reserved(issued) => Ok(PairingOfferIssuance::Reserved(issued)),
+            PairingIssuance::Existing(offer) => Ok(PairingOfferIssuance::Replay(
+                pairing_offer_replay_from_persisted(&offer, &replay_fingerprint)?,
+            )),
+        }
     }
 
     async fn issue_pairing_for_subject(
@@ -774,7 +945,7 @@ impl AuthService {
         ttl_ms: i64,
         metadata: AuthGrantMetadata,
         offer_reservation: Option<PairingOfferReservation>,
-    ) -> Result<PairingCredentialResult, AuthError> {
+    ) -> Result<PairingIssuance, AuthError> {
         let AuthGrantMetadata {
             proof_key_thumbprint,
             reach,
@@ -789,6 +960,7 @@ impl AuthService {
         }
         let now = now_ms();
         let expires_at = now.saturating_add(ttl_ms);
+        let durable_offer_reservation = self.repositories.is_some() && offer_reservation.is_some();
         let credential = {
             let mut state = self.state.lock().await;
             state.pairings.retain(|_, pairing| {
@@ -799,12 +971,12 @@ impl AuthService {
             state
                 .pairing_offer_idempotency
                 .retain(|_, stored| stored.expires_at_ms > now);
-            if state.pairings.len() >= MAX_ACTIVE_PAIRINGS {
+            if !durable_offer_reservation && state.pairings.len() >= MAX_ACTIVE_PAIRINGS {
                 return Err(AuthError::Internal(
                     "active pairing capacity exceeded".to_owned(),
                 ));
             }
-            if let Some(reservation) = &offer_reservation {
+            if !durable_offer_reservation && let Some(reservation) = &offer_reservation {
                 let lookup_key = (
                     reservation.principal_id.clone(),
                     reservation.idempotency_key.clone(),
@@ -845,7 +1017,7 @@ impl AuthService {
         let view = record.view();
         if let Some(repositories) = &self.repositories {
             if let Some(reservation) = &offer_reservation {
-                repositories
+                let reservation = repositories
                     .create_auth_pairing_link_with_offer(
                         persisted_pairing_link(&record),
                         NewAuthPairingOffer {
@@ -857,6 +1029,34 @@ impl AuthService {
                     )
                     .await
                     .map_err(|error| AuthError::Internal(error.to_string()))?;
+                if !reservation.reserved {
+                    let offer = reservation.offer;
+                    let (lookup_key, stored) = stored_pairing_offer_from_persisted(offer.clone())?;
+                    let mut state = self.state.lock().await;
+                    state.pairing_offer_idempotency.insert(lookup_key, stored);
+                    let access_change = if let Some(pairing) = reservation.pairing {
+                        let pairing = pairing_record_from_persisted(pairing)?;
+                        let change = (!state.pairings.contains_key(&pairing.id))
+                            .then(|| AuthAccessChange::PairingLinkUpserted(pairing.view()));
+                        state.pairings.insert(pairing.id.clone(), pairing);
+                        change
+                    } else if let Some(pairing_id) = &offer.pairing_id {
+                        state.pairings.remove(pairing_id).map(|_| {
+                            AuthAccessChange::PairingLinkRemoved {
+                                id: pairing_id.clone(),
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    state.bump_authority_generation();
+                    drop(state);
+                    if let Some(change) = access_change {
+                        self.emit_access_change(change);
+                    }
+                    self.ensure_authority_watcher();
+                    return Ok(PairingIssuance::Existing(offer));
+                }
             } else {
                 repositories
                     .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -877,14 +1077,16 @@ impl AuthService {
                 },
             );
         }
+        state.bump_authority_generation();
         drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkUpserted(view));
-        Ok(PairingCredentialResult {
+        self.ensure_authority_watcher();
+        Ok(PairingIssuance::Reserved(PairingCredentialResult {
             id,
             credential,
             label,
             expires_at: format_iso(expires_at),
-        })
+        }))
     }
 
     pub async fn list_pairings(&self) -> Vec<PairingLinkView> {
@@ -918,14 +1120,56 @@ impl AuthService {
         principal_id: &str,
         key: &str,
         input_fingerprint: &str,
-    ) -> PairingOfferReplay {
+    ) -> Result<PairingOfferReplay, AuthError> {
         let observed_at = now_ms();
+        let lookup_key = (principal_id.to_owned(), key.to_owned());
+        let mut access_change = None;
+        if let Some(repositories) = &self.repositories {
+            let persisted = repositories
+                .prune_and_get_active_auth_pairing_offer(
+                    principal_id.to_owned(),
+                    key.to_owned(),
+                    format_iso(observed_at),
+                )
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            let mut state = self.state.lock().await;
+            match persisted {
+                Some(authority) => {
+                    let offer = authority.offer;
+                    let (persisted_key, stored) =
+                        stored_pairing_offer_from_persisted(offer.clone())?;
+                    state
+                        .pairing_offer_idempotency
+                        .insert(persisted_key, stored);
+                    if let Some(pairing) = authority.pairing {
+                        let pairing = pairing_record_from_persisted(pairing)?;
+                        if !state.pairings.contains_key(&pairing.id) {
+                            access_change =
+                                Some(AuthAccessChange::PairingLinkUpserted(pairing.view()));
+                        }
+                        state.pairings.insert(pairing.id.clone(), pairing);
+                    } else if let Some(pairing_id) = offer.pairing_id
+                        && state.pairings.remove(&pairing_id).is_some()
+                    {
+                        access_change =
+                            Some(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
+                    }
+                }
+                None => {
+                    state.pairing_offer_idempotency.remove(&lookup_key);
+                }
+            }
+            state.bump_authority_generation();
+        }
+        if let Some(change) = access_change {
+            self.emit_access_change(change);
+        }
         let mut state = self.state.lock().await;
         state
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
-        let lookup_key = (principal_id.to_owned(), key.to_owned());
-        match state.pairing_offer_idempotency.get(&lookup_key) {
+        Ok(match state.pairing_offer_idempotency.get(&lookup_key) {
             Some(stored) if stored.result.is_none() => PairingOfferReplay::Cancelled,
             Some(stored) if stored.input_fingerprint == input_fingerprint => stored
                 .result
@@ -934,7 +1178,7 @@ impl AuthService {
                 .unwrap_or(PairingOfferReplay::Cancelled),
             Some(_) => PairingOfferReplay::Conflict,
             None => PairingOfferReplay::Fresh,
-        }
+        })
     }
 
     pub(crate) async fn record_pairing_offer(
@@ -981,6 +1225,9 @@ impl AuthService {
                 },
             );
         }
+        state.bump_authority_generation();
+        drop(state);
+        self.ensure_authority_watcher();
         Ok(())
     }
 
@@ -996,7 +1243,9 @@ impl AuthService {
             state
                 .pairing_offer_idempotency
                 .retain(|_, stored| stored.expires_at_ms > observed_at);
-            ensure_pairing_offer_capacity(&state, &lookup_key)?;
+            if self.repositories.is_none() {
+                ensure_pairing_offer_capacity(&state, &lookup_key)?;
+            }
             state
                 .pairing_offer_idempotency
                 .get(&lookup_key)
@@ -1035,6 +1284,7 @@ impl AuthService {
                     expires_at_ms: observed_at.saturating_add(PAIRING_TTL_MS),
                 },
             );
+            state.bump_authority_generation();
             removed
         };
         if self.repositories.is_some()
@@ -1099,7 +1349,10 @@ impl AuthService {
             if !revoked {
                 return Ok(false);
             }
-            self.state.lock().await.pairings.remove(id);
+            let mut state = self.state.lock().await;
+            state.pairings.remove(id);
+            state.bump_authority_generation();
+            drop(state);
             self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: id.to_owned() });
             return Ok(true);
         }
@@ -1113,6 +1366,7 @@ impl AuthService {
         pairing.revoked_at_ms = Some(revoked_at);
         let id = pairing.id.clone();
         state.pairings.remove(&id);
+        state.bump_authority_generation();
         drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id });
         Ok(true)
@@ -1152,6 +1406,7 @@ impl AuthService {
                 let mut state = self.state.lock().await;
                 state.sessions.remove(target_session_id);
                 cancel_live_connections(&mut state, target_session_id);
+                state.bump_authority_generation();
                 drop(state);
                 self.emit_access_change(AuthAccessChange::ClientRemoved {
                     session_id: target_session_id.to_owned(),
@@ -1170,6 +1425,7 @@ impl AuthService {
         let session_id = session.session_id.clone();
         state.sessions.remove(&session_id);
         cancel_live_connections(&mut state, &session_id);
+        state.bump_authority_generation();
         drop(state);
         self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
         Ok(true)
@@ -1187,6 +1443,7 @@ impl AuthService {
                 state.sessions.remove(session_id);
                 cancel_live_connections(&mut state, session_id);
             }
+            state.bump_authority_generation();
             drop(state);
             for session_id in &removed_session_ids {
                 self.emit_access_change(AuthAccessChange::ClientRemoved {
@@ -1208,6 +1465,7 @@ impl AuthService {
         for session_id in &removed_session_ids {
             cancel_live_connections(&mut state, session_id);
         }
+        state.bump_authority_generation();
         drop(state);
         for session_id in removed_session_ids {
             self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
@@ -1349,12 +1607,12 @@ impl AuthService {
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
         }
-        self.state
-            .lock()
-            .await
-            .sessions
-            .insert(session_id.clone(), record);
+        let mut state = self.state.lock().await;
+        state.sessions.insert(session_id.clone(), record);
+        state.bump_authority_generation();
+        drop(state);
         self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.ensure_authority_watcher();
         Ok(IssuedSession {
             token,
             principal: Principal {
@@ -1402,7 +1660,10 @@ impl AuthService {
                 .map_err(|error| AuthError::Internal(error.to_string()))?
                 .ok_or(AuthError::InvalidCredential)?;
             let pairing = pairing_record_from_persisted(consumed)?;
-            self.state.lock().await.pairings.remove(&pairing.id);
+            let mut state = self.state.lock().await;
+            state.pairings.remove(&pairing.id);
+            state.bump_authority_generation();
+            drop(state);
             self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
                 id: pairing.id.clone(),
             });
@@ -1498,6 +1759,102 @@ fn cancel_live_connections(state: &mut AuthState, session_id: &str) {
     }
 }
 
+fn emit_access_change_on(
+    events: &broadcast::Sender<AuthAccessEvent>,
+    revision: &AtomicU64,
+    change: AuthAccessChange,
+) {
+    let revision = revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let _ = events.send(AuthAccessEvent { revision, change });
+}
+
+async fn authority_has_consumers(
+    state: &Mutex<AuthState>,
+    access_events: &broadcast::Sender<AuthAccessEvent>,
+) -> bool {
+    let state = state.lock().await;
+    !state.pairings.is_empty()
+        || !state.sessions.is_empty()
+        || !state.live_connections.is_empty()
+        || access_events.receiver_count() > 0
+}
+
+async fn reconcile_authority_snapshot(
+    state: &Mutex<AuthState>,
+    snapshot: PersistedAuthAuthoritySnapshot,
+    expected_generation: u64,
+) -> Result<Option<Vec<AuthAccessChange>>, AuthError> {
+    let pairings = snapshot
+        .pairings
+        .into_iter()
+        .map(pairing_record_from_persisted)
+        .collect::<Result<Vec<_>, _>>()?;
+    let sessions = snapshot
+        .sessions
+        .into_iter()
+        .map(session_record_from_persisted)
+        .collect::<Result<Vec<_>, _>>()?;
+    let offers = snapshot
+        .offers
+        .into_iter()
+        .map(stored_pairing_offer_from_persisted)
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let mut state = state.lock().await;
+    if state.authority_generation != expected_generation {
+        return Ok(None);
+    }
+
+    let mut changes = Vec::new();
+    let mut next_pairings = HashMap::with_capacity(pairings.len());
+    for pairing in pairings {
+        if !state.pairings.contains_key(&pairing.id) {
+            changes.push(AuthAccessChange::PairingLinkUpserted(pairing.view()));
+        }
+        next_pairings.insert(pairing.id.clone(), pairing);
+    }
+    for pairing_id in state.pairings.keys() {
+        if !next_pairings.contains_key(pairing_id) {
+            changes.push(AuthAccessChange::PairingLinkRemoved {
+                id: pairing_id.clone(),
+            });
+        }
+    }
+
+    let mut next_sessions = HashMap::with_capacity(sessions.len());
+    for mut session in sessions {
+        if let Some(current) = state.sessions.get(&session.session_id) {
+            let previous_view = current.view(false);
+            session.connected_count = current.connected_count;
+            session.proof_key_thumbprint = current.proof_key_thumbprint.clone();
+            session.transport = current.transport;
+            if current.last_connected_at_ms > session.last_connected_at_ms {
+                session.last_connected_at_ms = current.last_connected_at_ms;
+            }
+            if session.view(false) != previous_view {
+                changes.push(AuthAccessChange::ClientUpserted(session.view(false)));
+            }
+        } else {
+            changes.push(AuthAccessChange::ClientUpserted(session.view(false)));
+        }
+        next_sessions.insert(session.session_id.clone(), session);
+    }
+    let removed_sessions = state
+        .sessions
+        .keys()
+        .filter(|session_id| !next_sessions.contains_key(*session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for session_id in removed_sessions {
+        cancel_live_connections(&mut state, &session_id);
+        changes.push(AuthAccessChange::ClientRemoved { session_id });
+    }
+
+    state.pairings = next_pairings;
+    state.sessions = next_sessions;
+    state.pairing_offer_idempotency = offers;
+    Ok(Some(changes))
+}
+
 fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
     PersistedPairingLink {
         id: record.id.clone(),
@@ -1561,6 +1918,55 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
         reach: row.reach,
         off_host: row.off_host,
     })
+}
+
+fn stored_pairing_offer_from_persisted(
+    offer: PersistedPairingOffer,
+) -> Result<((String, String), StoredPairingOffer), AuthError> {
+    let expires_at_ms = parse_timestamp_ms(&offer.expires_at)?;
+    let result = offer
+        .result
+        .map(serde_json::from_value::<PairingOfferResult>)
+        .transpose()
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    Ok((
+        (offer.principal_id, offer.idempotency_key),
+        StoredPairingOffer {
+            input_fingerprint: offer.input_fingerprint,
+            pairing_id: offer.pairing_id,
+            result,
+            expires_at_ms,
+        },
+    ))
+}
+
+fn pairing_offer_replay_from_persisted(
+    offer: &PersistedPairingOffer,
+    input_fingerprint: &str,
+) -> Result<PairingOfferReplay, AuthError> {
+    if offer.cancelled_at.is_some() || offer.result.is_none() {
+        return Ok(PairingOfferReplay::Cancelled);
+    }
+    if offer.input_fingerprint != input_fingerprint {
+        return Ok(PairingOfferReplay::Conflict);
+    }
+    serde_json::from_value::<PairingOfferResult>(
+        offer
+            .result
+            .clone()
+            .expect("completed pairing offer checked above"),
+    )
+    .map(PairingOfferReplay::Original)
+    .map_err(|error| AuthError::Internal(error.to_string()))
+}
+
+fn reserved_pairing(issuance: PairingIssuance) -> Result<PairingCredentialResult, AuthError> {
+    match issuance {
+        PairingIssuance::Reserved(issued) => Ok(issued),
+        PairingIssuance::Existing(_) => Err(AuthError::Internal(
+            "unexpected keyed pairing offer reservation".to_owned(),
+        )),
+    }
 }
 
 fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRecord, AuthError> {
@@ -2695,19 +3101,19 @@ mod tests {
             service
                 .replay_pairing_offer("principal-a", "shared-key", "fingerprint-a")
                 .await,
-            PairingOfferReplay::Original(result) if result.id == first.id
+            Ok(PairingOfferReplay::Original(result)) if result.id == first.id
         ));
         assert!(matches!(
             service
                 .replay_pairing_offer("principal-a", "shared-key", "different-input")
                 .await,
-            PairingOfferReplay::Conflict
+            Ok(PairingOfferReplay::Conflict)
         ));
         assert!(matches!(
             service
                 .replay_pairing_offer("principal-b", "shared-key", "fingerprint-a")
                 .await,
-            PairingOfferReplay::Fresh
+            Ok(PairingOfferReplay::Fresh)
         ));
 
         let second = PairingOfferResult {
@@ -2731,7 +3137,7 @@ mod tests {
             service
                 .replay_pairing_offer("principal-b", "shared-key", "fingerprint-b")
                 .await,
-            PairingOfferReplay::Original(result) if result.id == second.id
+            Ok(PairingOfferReplay::Original(result)) if result.id == second.id
         ));
     }
 
@@ -2766,12 +3172,17 @@ mod tests {
                 Some("Tablet".to_owned()),
                 "another-device".to_owned(),
                 true,
-                "principal".to_owned(),
-                "request-key".to_owned(),
-                "fingerprint".to_owned(),
+                PairingOfferReservation::new(
+                    "principal".to_owned(),
+                    "request-key".to_owned(),
+                    "fingerprint".to_owned(),
+                ),
             )
             .await
             .expect("durable offer reservation");
+        let PairingOfferIssuance::Reserved(issued) = issued else {
+            panic!("fresh offer must reserve its grant");
+        };
         let result = PairingOfferResult {
             id: issued.id.clone(),
             code: "encoded-offer".to_owned(),
@@ -2805,7 +3216,7 @@ mod tests {
             restarted
                 .replay_pairing_offer("principal", "request-key", "fingerprint")
                 .await,
-            PairingOfferReplay::Original(replayed) if replayed.id == result.id
+            Ok(PairingOfferReplay::Original(replayed)) if replayed.id == result.id
         ));
         assert_eq!(
             restarted.share_exposure_state().await.desired_exposure,
@@ -2837,11 +3248,470 @@ mod tests {
             after_cancel
                 .replay_pairing_offer("principal", "request-key", "fingerprint")
                 .await,
-            PairingOfferReplay::Cancelled
+            Ok(PairingOfferReplay::Cancelled)
         ));
         assert_eq!(
             after_cancel.share_exposure_state().await.desired_exposure,
             "loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_offer_cancellation_converges_dormant_share_state_and_access_events() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories,
+        )
+        .await
+        .expect("second live service");
+
+        let issued = first
+            .issue_share_pairing_offer(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+                PairingOfferReservation::new(
+                    "principal".to_owned(),
+                    "dormant-key".to_owned(),
+                    "fingerprint".to_owned(),
+                ),
+            )
+            .await
+            .expect("off-host reservation");
+        let PairingOfferIssuance::Reserved(issued) = issued else {
+            panic!("fresh offer must reserve its grant");
+        };
+        first
+            .record_pairing_offer(
+                "principal",
+                "dormant-key".to_owned(),
+                "fingerprint".to_owned(),
+                PairingOfferResult {
+                    id: issued.id.clone(),
+                    code: "encoded-offer".to_owned(),
+                    reach: "another-device".to_owned(),
+                    endpoint: "http://192.168.1.20:3773".to_owned(),
+                    name: "Tablet".to_owned(),
+                    expires_at: issued.expires_at,
+                },
+            )
+            .await
+            .expect("offer completion");
+        assert_eq!(first.state.lock().await.live_connections.len(), 0);
+        assert_eq!(first.share_exposure_state().await.desired_exposure, "wide");
+        let mut access_events = first.subscribe_access();
+
+        assert!(
+            second
+                .cancel_pairing_offer("principal", "dormant-key".to_owned())
+                .await
+                .expect("remote cancellation")
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = access_events
+                    .recv()
+                    .await
+                    .expect("access channel remains open");
+                if matches!(
+                    &event.change,
+                    AuthAccessChange::PairingLinkRemoved { id } if id == &issued.id
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("dormant grant removal must converge");
+        assert!(event.revision > 1);
+        assert_eq!(first.state.lock().await.live_connections.len(), 0);
+        assert_eq!(
+            first.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_subscriber_keeps_one_service_watcher_without_cached_authority() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories,
+        )
+        .await
+        .expect("second live service");
+        assert!(first.state.lock().await.pairings.is_empty());
+        assert!(first.state.lock().await.sessions.is_empty());
+        let mut access_events = first.subscribe_access();
+        tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
+
+        let issued = second
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("Tablet".to_owned()))
+            .await
+            .expect("remote pairing");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = access_events
+                    .recv()
+                    .await
+                    .expect("access channel remains open");
+                if matches!(
+                    &event.change,
+                    AuthAccessChange::PairingLinkUpserted(pairing) if pairing.id == issued.id
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("subscriber-only authority watcher must converge");
+        assert!(event.revision > 1);
+    }
+
+    #[tokio::test]
+    async fn cached_grant_keeps_one_service_watcher_without_socket_or_subscriber() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories,
+        )
+        .await
+        .expect("second live service");
+        let issued = first
+            .issue_share_pairing_offer(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+                PairingOfferReservation::new(
+                    "principal".to_owned(),
+                    "grant-only-key".to_owned(),
+                    "fingerprint".to_owned(),
+                ),
+            )
+            .await
+            .expect("off-host reservation");
+        assert!(matches!(issued, PairingOfferIssuance::Reserved(_)));
+        assert_eq!(first.access_events.receiver_count(), 0);
+        assert!(first.state.lock().await.live_connections.is_empty());
+        tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
+
+        assert!(
+            second
+                .cancel_pairing_offer("principal", "grant-only-key".to_owned())
+                .await
+                .expect("remote cancellation")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if first.share_exposure_state().await.desired_exposure == "loopback" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cached grant watcher must converge without a socket or subscriber");
+    }
+
+    #[tokio::test]
+    async fn cached_session_keeps_one_service_watcher_without_live_connection() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories,
+        )
+        .await
+        .expect("second live service");
+        let pairing = first
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("Tablet".to_owned()))
+            .await
+            .expect("pairing grant");
+        let issued = first
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("cached session");
+        assert!(first.state.lock().await.pairings.is_empty());
+        assert!(first.state.lock().await.live_connections.is_empty());
+        tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
+
+        assert!(
+            second
+                .revoke_client("other-session", &issued.principal.session_id)
+                .await
+                .expect("remote session revocation")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if first.list_clients("other-session").await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cached session watcher must converge without a live connection");
+    }
+
+    #[tokio::test]
+    async fn cross_service_authentication_starts_watcher_for_the_cached_session() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("first secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first live service");
+        let second = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("second secret store"),
+            repositories,
+        )
+        .await
+        .expect("second live service");
+        tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
+        let pairing = first
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("Tablet".to_owned()))
+            .await
+            .expect("pairing grant");
+        let issued = first
+            .exchange_bootstrap(
+                &pairing.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("session minted on first service");
+        second
+            .authenticate_token(&issued.token, SessionTransport::Plain)
+            .await
+            .expect("second service authenticates durable session");
+        let connection_shutdown = CancellationToken::new();
+        second
+            .mark_connected(&issued.principal.session_id, connection_shutdown.clone())
+            .await;
+        tokio::time::sleep(AUTHORITY_CONVERGENCE_INTERVAL * 2).await;
+
+        assert!(
+            first
+                .revoke_client("other-session", &issued.principal.session_id)
+                .await
+                .expect("remote session revocation")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            connection_shutdown.cancelled().await;
+        })
+        .await
+        .expect("authenticated peer session must retain revocation convergence");
+    }
+
+    #[tokio::test]
+    async fn unchanged_revision_reconciles_at_the_nearest_authority_expiry() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let expires_at = now_ms().saturating_add(200);
+        repositories
+            .create_auth_pairing_link(PersistedPairingLink {
+                id: "expiring-grant".to_owned(),
+                credential: "expiring-credential".to_owned(),
+                method: "one-time-token".to_owned(),
+                scopes: serde_json::json!(owned_scopes(STANDARD_SCOPES)),
+                subject: "one-time-token".to_owned(),
+                label: Some("Expiring".to_owned()),
+                proof_key_thumbprint: None,
+                created_at: format_iso(now_ms()),
+                expires_at: format_iso(expires_at),
+                consumed_at: None,
+                revoked_at: None,
+                reach: Some("another-device".to_owned()),
+                off_host: Some(true),
+            })
+            .await
+            .expect("expiring authority row");
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("service hydrates expiring authority");
+        assert_eq!(service.list_pairings().await.len(), 1);
+        let mut access_events = service.subscribe_access();
+        let revision = repositories
+            .auth_authority_revision()
+            .await
+            .expect("authority revision");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = access_events
+                    .recv()
+                    .await
+                    .expect("access channel remains open");
+                if matches!(
+                    &event.change,
+                    AuthAccessChange::PairingLinkRemoved { id } if id == "expiring-grant"
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("nearest expiry must reconcile without another mutation");
+        assert!(event.revision > 1);
+        assert_eq!(
+            repositories
+                .auth_authority_revision()
+                .await
+                .expect("unchanged authority revision"),
+            revision
         );
     }
 
@@ -2870,18 +3740,21 @@ mod tests {
         )
         .await
         .expect("initial service");
-        service
+        let issued = service
             .issue_share_pairing_offer(
                 owned_scopes(STANDARD_SCOPES),
                 Some("Tablet".to_owned()),
                 "another-device".to_owned(),
                 true,
-                "principal".to_owned(),
-                "pending-key".to_owned(),
-                "fingerprint".to_owned(),
+                PairingOfferReservation::new(
+                    "principal".to_owned(),
+                    "pending-key".to_owned(),
+                    "fingerprint".to_owned(),
+                ),
             )
             .await
             .expect("pairing and reservation commit");
+        assert!(matches!(issued, PairingOfferIssuance::Reserved(_)));
         drop(service);
 
         let restarted = AuthService::new_with_persistence(
@@ -2898,7 +3771,7 @@ mod tests {
             restarted
                 .replay_pairing_offer("principal", "pending-key", "fingerprint")
                 .await,
-            PairingOfferReplay::Cancelled
+            Ok(PairingOfferReplay::Cancelled)
         ));
         assert!(
             restarted
