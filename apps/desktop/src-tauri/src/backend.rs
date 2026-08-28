@@ -1092,7 +1092,8 @@ impl BackendSupervisor {
         &self,
         app: AppHandle<R>,
     ) -> Result<BackendRunConfig, String> {
-        self.start_default_with_reason(app, "started", None).await
+        self.start_default_with_reason(app, "started", Some("local-only"))
+            .await
     }
 
     async fn start_default_with_reason<R: Runtime>(

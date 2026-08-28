@@ -1256,22 +1256,27 @@ pub async fn desktop_bridge_apply_server_exposure(
 pub async fn desktop_bridge_set_tailscale_serve_enabled(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     input: Value,
 ) -> Result<Value, String> {
-    let enabled = input
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let requested_port = input.get("port").and_then(Value::as_u64);
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.tailscale_serve_enabled = enabled;
-        settings.tailscale_serve_port = normalize_tailscale_serve_port(
-            requested_port.or(Some(settings.tailscale_serve_port as u64)),
-        );
-    })?;
-    let restarted_config = backend.restart_default_if_active(app.clone()).await?;
-    let current_config = restarted_config.or_else(|| backend.current_run_config());
-    Ok(server_exposure_state(&settings, current_config.as_ref()))
+    coordinator
+        .run_exclusive(async {
+            let enabled = input
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let requested_port = input.get("port").and_then(Value::as_u64);
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.tailscale_serve_enabled = enabled;
+                settings.tailscale_serve_port = normalize_tailscale_serve_port(
+                    requested_port.or(Some(settings.tailscale_serve_port as u64)),
+                );
+            })?;
+            let restarted_config = backend.restart_default_if_active(app.clone()).await?;
+            let current_config = restarted_config.or_else(|| backend.current_run_config());
+            Ok(server_exposure_state(&settings, current_config.as_ref()))
+        })
+        .await
 }
 
 #[tauri::command]
@@ -1286,42 +1291,57 @@ pub fn desktop_bridge_get_wsl_state(
 pub async fn desktop_bridge_set_wsl_backend_enabled(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     enabled: bool,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_backend_enabled = enabled;
-        if !enabled {
-            settings.wsl_only = false;
-        }
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.wsl_backend_enabled = enabled;
+                if !enabled {
+                    settings.wsl_only = false;
+                }
+            })?;
+            backend.restart_default_if_active(app.clone()).await?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn desktop_bridge_set_wsl_distro(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     distro: Option<String>,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_distro = normalize_wsl_distro(distro);
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.wsl_distro = normalize_wsl_distro(distro);
+            })?;
+            backend.restart_default_if_active(app.clone()).await?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn desktop_bridge_set_wsl_only(
     app: AppHandle<DesktopRuntime>,
     backend: State<'_, BackendSupervisor>,
+    coordinator: State<'_, ServerExposureCoordinator>,
     enabled: bool,
 ) -> Result<Value, String> {
-    let settings = update_desktop_settings(&app, |settings| {
-        settings.wsl_only = enabled;
-    })?;
-    backend.restart_default_if_active(app.clone()).await?;
-    Ok(wsl_state(&settings, &backend))
+    coordinator
+        .run_exclusive(async {
+            let settings = update_desktop_settings(&app, |settings| {
+                settings.wsl_only = enabled;
+            })?;
+            backend.restart_default_if_active(app.clone()).await?;
+            Ok(wsl_state(&settings, &backend))
+        })
+        .await
 }
 
 #[tauri::command]

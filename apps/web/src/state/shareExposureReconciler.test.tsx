@@ -159,6 +159,23 @@ describe("reconcileShareExposureOnce", () => {
     expect(applyExposure).not.toHaveBeenCalled();
     expect(h.refreshNetwork).not.toHaveBeenCalled();
   });
+
+  it("restores a local startup to wide only when a live off-host grant requires it", async () => {
+    const applyExposure = vi.fn(async () => wideExposure);
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState: async () => ({
+          desiredExposure: "wide",
+          offHostGrantCount: 1,
+          legacyGrantCount: 0,
+        }),
+        getExposureState: async () => localExposure,
+        applyExposure,
+      }),
+    ).resolves.toBe("widened");
+    expect(applyExposure).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(h.refreshNetwork).toHaveBeenCalledOnce();
+  });
 });
 
 function HookHarness() {
