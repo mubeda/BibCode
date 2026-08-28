@@ -1207,11 +1207,11 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - Consumes: authenticated principal/session identity, plaintext record reassembly, generic RPC response enqueue, and encrypted socket writes.
 - Produces: per-principal established-socket and inbound-byte quotas plus process-wide/per-connection outbound byte permits retained until encrypted write completion.
 
-- [ ] Add failing two-principal tests proving one principal cannot consume every established socket or all inbound plaintext bytes through multiple connections.
-- [ ] Key aggregate established and inbound admission by authenticated principal, clean quotas on every close/error/cancellation path, and retain global defense-in-depth caps.
-- [ ] Add a failing slow-reader multi-socket test showing large bounded RPC responses cannot accumulate beyond configured process and connection byte budgets.
-- [ ] Acquire outbound byte permits before response enqueue, retain them through encrypted socket write, and keep the existing five-second send failure behavior.
-- [ ] Run focused E2EE, session, WebSocket, interop, and Clippy checks; update the documented exact caps and ownership.
+- [x] Add failing two-principal tests proving one principal cannot consume every established socket or all inbound plaintext bytes through multiple connections.
+- [x] Key aggregate established and inbound admission by authenticated principal, clean quotas on every close/error/cancellation path, and retain global defense-in-depth caps.
+- [x] Add a failing slow-reader multi-socket test showing large bounded RPC responses cannot accumulate beyond configured process and connection byte budgets.
+- [x] Acquire outbound byte permits before response enqueue, retain them through encrypted socket write, and keep the existing five-second send failure behavior.
+- [x] Run focused E2EE, session, WebSocket, interop, and Clippy checks; update the documented exact caps and ownership.
 
 ### Task 14: Repeat completion evidence and review
 
