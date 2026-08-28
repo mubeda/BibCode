@@ -47,6 +47,9 @@ export class ConnectionRegistrationStore extends Context.Service<
     readonly register: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly removeIfMatching: (
+      registration: ConnectionRegistration,
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly remove: (target: ConnectionTarget) => Effect.Effect<void, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionRegistrationStore") {}

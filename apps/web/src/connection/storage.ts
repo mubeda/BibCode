@@ -12,6 +12,7 @@ import {
   registerConnectionInCatalog,
   removeCatalogValue,
   removeConnectionFromCatalog,
+  removeConnectionRegistrationFromCatalog,
   replaceCatalogValue,
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
@@ -615,6 +616,18 @@ export const connectionStorageLayer = Layer.effectContext(
         catalog
           .update((document) => registerConnectionInCatalog(document, registration))
           .pipe(Effect.mapError((cause) => persistenceError("register-connection", cause))),
+      removeIfMatching: (registration) =>
+        catalog
+          .modify((document) => {
+            const removal = removeConnectionRegistrationFromCatalog(document, registration);
+            return removal.removed
+              ? {
+                  mutation: { _tag: "Set", document: removal.document },
+                  result: true,
+                }
+              : { mutation: { _tag: "Keep" }, result: false };
+          })
+          .pipe(Effect.mapError((cause) => persistenceError("remove-connection", cause))),
       remove: (target) =>
         catalog
           .update((document) => removeConnectionFromCatalog(document, target))

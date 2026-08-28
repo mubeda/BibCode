@@ -118,6 +118,16 @@ and rejects mutations while that revision remains authoritative. An explicit
 reset uses exact compare-and-set to install an empty catalog; a concurrent valid
 repair wins without being overwritten.
 
+Pairing-add compensation uses that same cross-runtime boundary. The registration
+store removes a failed add only when the current durable registration-owned
+target, profile, and credential fields still equal the exact registration being
+compensated. A conflict rereads and re-evaluates the condition, so a replacement
+committed by another tab, WebView, or client runtime wins intact. The environment
+registry closes its local supervisor and clears environment-owned runtime data
+only after the conditional catalog transition reports that it removed the
+registration; a non-matching durable replacement leaves the local runtime
+untouched until normal catalog reconciliation observes it.
+
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`
 transitions in `readwrite` transactions on the catalog key, so its transaction

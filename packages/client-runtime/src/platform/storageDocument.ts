@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
 
 import {
@@ -145,4 +146,50 @@ export function removeConnectionFromCatalog(
   target: ConnectionTarget,
 ): ConnectionCatalogDocument {
   return removeConnectionMetadata(document, target, true);
+}
+
+export interface ConditionalConnectionRegistrationRemoval {
+  readonly document: ConnectionCatalogDocument;
+  readonly removed: boolean;
+}
+
+export function removeConnectionRegistrationFromCatalog(
+  document: ConnectionCatalogDocument,
+  registration: ConnectionRegistration,
+): ConditionalConnectionRegistrationRemoval {
+  const target = document.targets.find(
+    (candidate) => candidate.environmentId === registration.target.environmentId,
+  );
+  if (target === undefined || !Equal.equals(target, registration.target)) {
+    return { document, removed: false };
+  }
+
+  if (registration._tag === "BearerConnectionRegistration") {
+    const profile = document.profiles.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    const credential = document.credentials.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    if (
+      profile === undefined ||
+      !Equal.equals(profile, registration.profile) ||
+      credential === undefined ||
+      !Equal.equals(credential.credential, registration.credential)
+    ) {
+      return { document, removed: false };
+    }
+  } else if (registration._tag === "SshConnectionRegistration") {
+    const profile = document.profiles.find(
+      (candidate) => candidate.connectionId === registration.target.connectionId,
+    );
+    if (profile === undefined || !Equal.equals(profile, registration.profile)) {
+      return { document, removed: false };
+    }
+  }
+
+  return {
+    document: removeConnectionFromCatalog(document, registration.target),
+    removed: true,
+  };
 }
