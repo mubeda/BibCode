@@ -341,8 +341,7 @@ export type AuthPairingLinkRevokeResult = typeof AuthPairingLinkRevokeResult.Typ
 export const AuthPairingOfferCancellationResult = Schema.Struct({
   cancelled: Schema.Boolean,
 });
-export type AuthPairingOfferCancellationResult =
-  typeof AuthPairingOfferCancellationResult.Type;
+export type AuthPairingOfferCancellationResult = typeof AuthPairingOfferCancellationResult.Type;
 
 export const AuthClientSessionRevokeResult = Schema.Struct({
   revoked: Schema.Boolean,
