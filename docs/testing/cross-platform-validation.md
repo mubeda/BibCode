@@ -179,12 +179,17 @@ trap cleanup_bibcode_remote_docker EXIT INT TERM
 
 docker run -d --name bibcode-remote-server \
   --network bibcode-remote-stabilization \
+  --security-opt label=disable \
+  -e DEBIAN_FRONTEND=noninteractive \
   -v "$PWD/target/debug/bibcode:/usr/local/bin/bibcode:ro" \
   -v bibcode-remote-stabilization-data:/data \
   debian:trixie-slim \
-  /usr/local/bin/bibcode --base-dir /data --host 0.0.0.0 --port 3773 serve
+  sh -c 'apt-get update >/dev/null && \
+    apt-get install -y --no-install-recommends ca-certificates >/dev/null && \
+    rm -rf /var/lib/apt/lists/* && \
+    exec /usr/local/bin/bibcode --base-dir /data --host 0.0.0.0 --port 3773 serve'
 
-for attempt in $(seq 1 40); do
+for attempt in $(seq 1 120); do
   BIBCODE_DOCKER_PAIRING_JSON=$(docker exec bibcode-remote-server \
     /usr/local/bin/bibcode --base-dir /data pairing issue --json 2>/dev/null) && break
   sleep 0.25
@@ -196,11 +201,13 @@ BIBCODE_DOCKER_ADMIN_CREDENTIAL=$(node -e \
 
 docker run --rm --name bibcode-remote-client \
   --network bibcode-remote-stabilization \
+  --security-opt label=disable \
   -v "$PWD:/workspace:ro" -w /workspace \
+  --tmpfs /workspace/node_modules/.vite-temp:rw,mode=1777 \
   -e BIBCODE_DOCKER_SERVER_URL=http://bibcode-remote-server:3773 \
   -e BIBCODE_DOCKER_ADMIN_CREDENTIAL="$BIBCODE_DOCKER_ADMIN_CREDENTIAL" \
   node:26-bookworm \
-  corepack pnpm exec vite-plus test packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
+  ./node_modules/.bin/vp test packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
 
 unset BIBCODE_DOCKER_PAIRING_JSON BIBCODE_DOCKER_ADMIN_CREDENTIAL
 cleanup_bibcode_remote_docker
@@ -211,8 +218,13 @@ The smoke test must cover descriptor negotiation, administrative token
 exchange, an off-host pairing offer, pinned-host Noise NK authentication,
 authenticated E2EE RPC, `updater.status`, `updater.check`, the typed manual
 install failure, browser-session share-state retention, client revocation, and
-the final loopback share state. It must not spawn a host server or fall back to
-loopback.
+the final loopback share state. It must also cancel an ambiguously delivered
+pairing offer and prove that a delayed retry cannot recreate its grant. The
+test containers disable SELinux process labeling because both host bind mounts
+are read-only; this keeps the command portable on enforcing hosts without
+relabeling the worktree. The client receives a narrow tmpfs for Vite's generated
+config cache, so the repository itself stays read-only. It must not spawn a host
+server or fall back to loopback.
 
 After the run, all three commands below must print nothing:
 
