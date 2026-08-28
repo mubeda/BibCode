@@ -1042,7 +1042,139 @@ impl Repositories {
     }
 
     pub async fn create_auth_pairing_link(&self, row: AuthPairingLink) -> Result<()> {
-        self.database.call(move |connection| { connection.execute("INSERT INTO auth_pairing_links (id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)", params![row.id,row.credential,row.method,encode_json(&row.scopes)?,row.subject,row.label,row.proof_key_thumbprint,row.created_at,row.expires_at,row.reach,row.off_host])?; Ok(()) }).await
+        self.database
+            .call(move |connection| insert_auth_pairing_link_on(connection, &row))
+            .await
+    }
+    pub async fn create_auth_pairing_link_with_offer(
+        &self,
+        row: AuthPairingLink,
+        offer: NewAuthPairingOffer,
+    ) -> Result<()> {
+        self.database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&row.created_at],
+                )?;
+                insert_auth_pairing_link_on(&transaction, &row)?;
+                transaction.execute(
+                    "INSERT INTO auth_pairing_offer_idempotency (
+                        principal_id, idempotency_key, input_fingerprint, pairing_id,
+                        result_json, expires_at, cancelled_at
+                     ) VALUES (?, ?, ?, ?, NULL, ?, NULL)",
+                    params![
+                        offer.principal_id,
+                        offer.idempotency_key,
+                        offer.input_fingerprint,
+                        row.id,
+                        offer.expires_at,
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+    pub async fn complete_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        result: Value,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                Ok(connection
+                    .query_row(
+                        "UPDATE auth_pairing_offer_idempotency SET result_json = ?
+                         WHERE principal_id = ? AND idempotency_key = ?
+                           AND cancelled_at IS NULL AND pairing_id IS NOT NULL
+                         RETURNING idempotency_key",
+                        params![encode_json(&result)?, principal_id, idempotency_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+    }
+    pub async fn prune_and_list_active_auth_pairing_offers(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<AuthPairingOffer>> {
+        self.database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&now],
+                )?;
+                let offers = collect(
+                    &transaction,
+                    PAIRING_OFFER_SELECT,
+                    [&now],
+                    decode_pairing_offer,
+                )?;
+                transaction.commit()?;
+                Ok(offers)
+            })
+            .await
+    }
+    pub async fn cancel_auth_pairing_offer(
+        &self,
+        principal_id: String,
+        idempotency_key: String,
+        cancelled_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<AuthPairingOfferCancellation> {
+        self.database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "DELETE FROM auth_pairing_offer_idempotency WHERE expires_at <= ?",
+                    [&cancelled_at],
+                )?;
+                let pairing_id = transaction
+                    .query_row(
+                        "SELECT pairing_id FROM auth_pairing_offer_idempotency
+                         WHERE principal_id = ? AND idempotency_key = ?",
+                        params![principal_id, idempotency_key],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let revoked = if let Some(pairing_id) = &pairing_id {
+                    transaction
+                        .query_row(
+                            "UPDATE auth_pairing_links SET revoked_at = ?
+                             WHERE id = ? AND revoked_at IS NULL AND consumed_at IS NULL
+                             RETURNING id",
+                            params![cancelled_at, pairing_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .is_some()
+                } else {
+                    false
+                };
+                transaction.execute(
+                    "INSERT INTO auth_pairing_offer_idempotency (
+                        principal_id, idempotency_key, input_fingerprint, pairing_id,
+                        result_json, expires_at, cancelled_at
+                     ) VALUES (?, ?, '', NULL, NULL, ?, ?)
+                     ON CONFLICT (principal_id, idempotency_key) DO UPDATE SET
+                        input_fingerprint = '', pairing_id = NULL, result_json = NULL,
+                        expires_at = excluded.expires_at, cancelled_at = excluded.cancelled_at",
+                    params![principal_id, idempotency_key, expires_at, cancelled_at],
+                )?;
+                transaction.commit()?;
+                Ok(AuthPairingOfferCancellation {
+                    pairing_id,
+                    revoked,
+                })
+            })
+            .await
     }
     pub async fn consume_auth_pairing_link(
         &self,
@@ -1455,6 +1587,28 @@ pub struct AuthPairingLink {
     pub off_host: Option<bool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewAuthPairingOffer {
+    pub principal_id: String,
+    pub idempotency_key: String,
+    pub input_fingerprint: String,
+    pub expires_at: Timestamp,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthPairingOffer {
+    pub principal_id: String,
+    pub idempotency_key: String,
+    pub input_fingerprint: String,
+    pub pairing_id: Option<String>,
+    pub result: Option<Value>,
+    pub expires_at: Timestamp,
+    pub cancelled_at: Option<Timestamp>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthPairingOfferCancellation {
+    pub pairing_id: Option<String>,
+    pub revoked: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthSessionClient {
     pub label: Option<String>,
     pub ip_address: Option<String>,
@@ -1496,6 +1650,7 @@ const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, messa
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host FROM auth_pairing_links";
+const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host";
 const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host FROM auth_sessions";
 
@@ -1512,6 +1667,28 @@ where
     Ok(statement
         .query_map(params, decode)?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+fn insert_auth_pairing_link_on(connection: &Connection, row: &AuthPairingLink) -> Result<()> {
+    connection.execute(
+        "INSERT INTO auth_pairing_links (
+            id, credential, method, scopes, subject, label, proof_key_thumbprint,
+            created_at, expires_at, consumed_at, revoked_at, reach, off_host
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+        params![
+            row.id,
+            row.credential,
+            row.method,
+            encode_json(&row.scopes)?,
+            row.subject,
+            row.label,
+            row.proof_key_thumbprint,
+            row.created_at,
+            row.expires_at,
+            row.reach,
+            row.off_host,
+        ],
+    )?;
+    Ok(())
 }
 fn encode_json(value: &Value) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
@@ -1836,6 +2013,20 @@ fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
         revoked_at: row.get(10)?,
         reach: row.get(11)?,
         off_host: row.get(12)?,
+    })
+}
+fn decode_pairing_offer(row: &Row<'_>) -> rusqlite::Result<AuthPairingOffer> {
+    Ok(AuthPairingOffer {
+        principal_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        input_fingerprint: row.get(2)?,
+        pairing_id: row.get(3)?,
+        result: row
+            .get::<_, Option<String>>(4)?
+            .map(|value| decode_json(value, "result_json"))
+            .transpose()?,
+        expires_at: row.get(5)?,
+        cancelled_at: row.get(6)?,
     })
 }
 fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {

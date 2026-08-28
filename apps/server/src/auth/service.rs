@@ -28,7 +28,8 @@ use super::{
 use crate::config::{ServerConfig, ServerMode};
 use crate::persistence::{
     AuthPairingLink as PersistedPairingLink, AuthSession as PersistedAuthSession,
-    AuthSessionClient as PersistedAuthSessionClient, NewAuthSession, Repositories,
+    AuthSessionClient as PersistedAuthSessionClient, NewAuthPairingOffer, NewAuthSession,
+    Repositories,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -95,8 +96,15 @@ struct AuthState {
 #[derive(Clone)]
 struct StoredPairingOffer {
     input_fingerprint: String,
+    pairing_id: Option<String>,
     result: Option<PairingOfferResult>,
     expires_at_ms: i64,
+}
+
+struct PairingOfferReservation {
+    principal_id: String,
+    idempotency_key: String,
+    input_fingerprint: String,
 }
 
 fn ensure_pairing_offer_capacity(
@@ -300,6 +308,10 @@ impl AuthService {
             .list_active_auth_pairing_links(now.clone())
             .await
             .map_err(|error| AuthError::Internal(error.to_string()))?;
+        let pairing_offers = repositories
+            .prune_and_list_active_auth_pairing_offers(now.clone())
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
         let sessions = repositories
             .list_active_auth_sessions(now)
             .await
@@ -312,6 +324,26 @@ impl AuthService {
             .into_iter()
             .map(session_record_from_persisted)
             .collect::<Result<Vec<_>, _>>()?;
+        let pairing_offers = pairing_offers
+            .into_iter()
+            .map(|offer| {
+                let expires_at_ms = parse_timestamp_ms(&offer.expires_at)?;
+                let result = offer
+                    .result
+                    .map(serde_json::from_value::<PairingOfferResult>)
+                    .transpose()
+                    .map_err(|error| AuthError::Internal(error.to_string()))?;
+                Ok((
+                    (offer.principal_id, offer.idempotency_key),
+                    StoredPairingOffer {
+                        input_fingerprint: offer.input_fingerprint,
+                        pairing_id: offer.pairing_id,
+                        result,
+                        expires_at_ms,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, AuthError>>()?;
         let mut state = self.state.lock().await;
         state.pairings = pairings
             .into_iter()
@@ -321,6 +353,7 @@ impl AuthService {
             .into_iter()
             .map(|session| (session.session_id.clone(), session))
             .collect();
+        state.pairing_offer_idempotency = pairing_offers;
         Ok(())
     }
 
@@ -615,6 +648,7 @@ impl AuthService {
             "one-time-token",
             PAIRING_TTL_MS,
             AuthGrantMetadata::default(),
+            None,
         )
         .await
     }
@@ -637,6 +671,7 @@ impl AuthService {
                 proof_key_thumbprint: Some(proof_key_thumbprint),
                 ..AuthGrantMetadata::default()
             },
+            None,
         )
         .await
     }
@@ -657,6 +692,7 @@ impl AuthService {
                 proof_key_thumbprint: Some(proof_key_thumbprint),
                 ..AuthGrantMetadata::default()
             },
+            None,
         )
         .await
     }
@@ -668,6 +704,7 @@ impl AuthService {
             "administrative-bootstrap",
             PAIRING_TTL_MS,
             AuthGrantMetadata::default(),
+            None,
         )
         .await
     }
@@ -692,6 +729,39 @@ impl AuthService {
                 off_host: Some(off_host),
                 ..AuthGrantMetadata::default()
             },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn issue_share_pairing_offer(
+        &self,
+        scopes: Vec<String>,
+        label: Option<String>,
+        reach: String,
+        off_host: bool,
+        principal_id: String,
+        idempotency_key: String,
+        input_fingerprint: String,
+    ) -> Result<PairingCredentialResult, AuthError> {
+        if !is_valid_pairing_reach(&reach) {
+            return Err(AuthError::InvalidCredential);
+        }
+        self.issue_pairing_for_subject(
+            scopes,
+            label,
+            "one-time-token",
+            PAIRING_TTL_MS,
+            AuthGrantMetadata {
+                reach: Some(reach),
+                off_host: Some(off_host),
+                ..AuthGrantMetadata::default()
+            },
+            Some(PairingOfferReservation {
+                principal_id,
+                idempotency_key,
+                input_fingerprint,
+            }),
         )
         .await
     }
@@ -703,6 +773,7 @@ impl AuthService {
         subject: &str,
         ttl_ms: i64,
         metadata: AuthGrantMetadata,
+        offer_reservation: Option<PairingOfferReservation>,
     ) -> Result<PairingCredentialResult, AuthError> {
         let AuthGrantMetadata {
             proof_key_thumbprint,
@@ -725,10 +796,25 @@ impl AuthService {
                     && pairing.revoked_at_ms.is_none()
                     && pairing.expires_at_ms > now
             });
+            state
+                .pairing_offer_idempotency
+                .retain(|_, stored| stored.expires_at_ms > now);
             if state.pairings.len() >= MAX_ACTIVE_PAIRINGS {
                 return Err(AuthError::Internal(
                     "active pairing capacity exceeded".to_owned(),
                 ));
+            }
+            if let Some(reservation) = &offer_reservation {
+                let lookup_key = (
+                    reservation.principal_id.clone(),
+                    reservation.idempotency_key.clone(),
+                );
+                ensure_pairing_offer_capacity(&state, &lookup_key)?;
+                if state.pairing_offer_idempotency.contains_key(&lookup_key) {
+                    return Err(AuthError::Internal(
+                        "pairing offer idempotency key is already reserved".to_owned(),
+                    ));
+                }
             }
             loop {
                 let candidate = generate_pairing_credential()?;
@@ -758,12 +844,40 @@ impl AuthService {
         };
         let view = record.view();
         if let Some(repositories) = &self.repositories {
-            repositories
-                .create_auth_pairing_link(persisted_pairing_link(&record))
-                .await
-                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if let Some(reservation) = &offer_reservation {
+                repositories
+                    .create_auth_pairing_link_with_offer(
+                        persisted_pairing_link(&record),
+                        NewAuthPairingOffer {
+                            principal_id: reservation.principal_id.clone(),
+                            idempotency_key: reservation.idempotency_key.clone(),
+                            input_fingerprint: reservation.input_fingerprint.clone(),
+                            expires_at: format_iso(expires_at),
+                        },
+                    )
+                    .await
+                    .map_err(|error| AuthError::Internal(error.to_string()))?;
+            } else {
+                repositories
+                    .create_auth_pairing_link(persisted_pairing_link(&record))
+                    .await
+                    .map_err(|error| AuthError::Internal(error.to_string()))?;
+            }
         }
-        self.state.lock().await.pairings.insert(id.clone(), record);
+        let mut state = self.state.lock().await;
+        state.pairings.insert(id.clone(), record);
+        if let Some(reservation) = offer_reservation {
+            state.pairing_offer_idempotency.insert(
+                (reservation.principal_id, reservation.idempotency_key),
+                StoredPairingOffer {
+                    input_fingerprint: reservation.input_fingerprint,
+                    pairing_id: Some(id.clone()),
+                    result: None,
+                    expires_at_ms: expires_at,
+                },
+            );
+        }
+        drop(state);
         self.emit_access_change(AuthAccessChange::PairingLinkUpserted(view));
         Ok(PairingCredentialResult {
             id,
@@ -832,20 +946,41 @@ impl AuthService {
     ) -> Result<(), AuthError> {
         let expires_at_ms = parse_timestamp_ms(&result.expires_at)?;
         let observed_at = now_ms();
+        if let Some(repositories) = &self.repositories {
+            let persisted = serde_json::to_value(&result)
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if !repositories
+                .complete_auth_pairing_offer(principal_id.to_owned(), key.clone(), persisted)
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?
+            {
+                return Err(AuthError::Internal(
+                    "pairing offer reservation is unavailable".to_owned(),
+                ));
+            }
+        }
         let mut state = self.state.lock().await;
         state
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
-        let lookup_key = (principal_id.to_owned(), key);
+        let lookup_key = (principal_id.to_owned(), key.clone());
         ensure_pairing_offer_capacity(&state, &lookup_key)?;
-        state.pairing_offer_idempotency.insert(
-            lookup_key,
-            StoredPairingOffer {
-                input_fingerprint,
-                result: Some(result),
-                expires_at_ms,
-            },
-        );
+        if let Some(stored) = state.pairing_offer_idempotency.get_mut(&lookup_key) {
+            stored.input_fingerprint = input_fingerprint;
+            stored.pairing_id = Some(result.id.clone());
+            stored.result = Some(result);
+            stored.expires_at_ms = expires_at_ms;
+        } else {
+            state.pairing_offer_idempotency.insert(
+                lookup_key,
+                StoredPairingOffer {
+                    input_fingerprint,
+                    pairing_id: Some(result.id.clone()),
+                    result: Some(result),
+                    expires_at_ms,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -855,7 +990,7 @@ impl AuthService {
         key: String,
     ) -> Result<bool, AuthError> {
         let observed_at = now_ms();
-        let lookup_key = (principal_id.to_owned(), key);
+        let lookup_key = (principal_id.to_owned(), key.clone());
         let offer_id = {
             let mut state = self.state.lock().await;
             state
@@ -865,22 +1000,49 @@ impl AuthService {
             state
                 .pairing_offer_idempotency
                 .get(&lookup_key)
-                .and_then(|stored| stored.result.as_ref())
-                .map(|result| result.id.clone())
+                .and_then(|stored| stored.pairing_id.clone())
         };
 
-        let cancelled = match offer_id {
-            Some(id) => self.revoke_pairing(&id).await?,
-            None => false,
+        let (cancelled, cancelled_pairing_id) = if let Some(repositories) = &self.repositories {
+            let cancellation = repositories
+                .cancel_auth_pairing_offer(
+                    principal_id.to_owned(),
+                    key.clone(),
+                    format_iso(observed_at),
+                    format_iso(observed_at.saturating_add(PAIRING_TTL_MS)),
+                )
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            (cancellation.revoked, cancellation.pairing_id)
+        } else {
+            let cancelled = match &offer_id {
+                Some(id) => self.revoke_pairing(id).await?,
+                None => false,
+            };
+            (cancelled, offer_id)
         };
-        self.state.lock().await.pairing_offer_idempotency.insert(
-            lookup_key,
-            StoredPairingOffer {
-                input_fingerprint: String::new(),
-                result: None,
-                expires_at_ms: observed_at.saturating_add(PAIRING_TTL_MS),
-            },
-        );
+        let removed = {
+            let mut state = self.state.lock().await;
+            let removed = cancelled_pairing_id
+                .as_ref()
+                .and_then(|id| state.pairings.remove(id));
+            state.pairing_offer_idempotency.insert(
+                lookup_key,
+                StoredPairingOffer {
+                    input_fingerprint: String::new(),
+                    pairing_id: None,
+                    result: None,
+                    expires_at_ms: observed_at.saturating_add(PAIRING_TTL_MS),
+                },
+            );
+            removed
+        };
+        if self.repositories.is_some()
+            && cancelled
+            && let Some(pairing) = removed
+        {
+            self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing.id });
+        }
         Ok(cancelled)
     }
 
@@ -2574,6 +2736,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_pairing_offer_replays_and_cancels_after_restart() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("initial service");
+        let issued = service
+            .issue_share_pairing_offer(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+                "principal".to_owned(),
+                "request-key".to_owned(),
+                "fingerprint".to_owned(),
+            )
+            .await
+            .expect("durable offer reservation");
+        let result = PairingOfferResult {
+            id: issued.id.clone(),
+            code: "encoded-offer".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.20:3773".to_owned(),
+            name: "Tablet".to_owned(),
+            expires_at: issued.expires_at,
+        };
+        service
+            .record_pairing_offer(
+                "principal",
+                "request-key".to_owned(),
+                "fingerprint".to_owned(),
+                result.clone(),
+            )
+            .await
+            .expect("offer completion");
+        drop(service);
+
+        let restarted = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("reopened secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("restarted service hydrates offer ledger");
+        assert!(matches!(
+            restarted
+                .replay_pairing_offer("principal", "request-key", "fingerprint")
+                .await,
+            PairingOfferReplay::Original(replayed) if replayed.id == result.id
+        ));
+        assert_eq!(
+            restarted.share_exposure_state().await.desired_exposure,
+            "wide"
+        );
+        assert!(
+            restarted
+                .cancel_pairing_offer("principal", "request-key".to_owned())
+                .await
+                .expect("restart-safe cancellation")
+        );
+        assert_eq!(
+            restarted.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+        drop(restarted);
+
+        let after_cancel = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("reopened secret store after cancellation"),
+            repositories,
+        )
+        .await
+        .expect("tombstone hydrates");
+        assert!(matches!(
+            after_cancel
+                .replay_pairing_offer("principal", "request-key", "fingerprint")
+                .await,
+            PairingOfferReplay::Cancelled
+        ));
+        assert_eq!(
+            after_cancel.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_pairing_offer_can_be_cancelled_after_restart() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("initial service");
+        service
+            .issue_share_pairing_offer(
+                owned_scopes(STANDARD_SCOPES),
+                Some("Tablet".to_owned()),
+                "another-device".to_owned(),
+                true,
+                "principal".to_owned(),
+                "pending-key".to_owned(),
+                "fingerprint".to_owned(),
+            )
+            .await
+            .expect("pairing and reservation commit");
+        drop(service);
+
+        let restarted = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("reopened secret store"),
+            repositories,
+        )
+        .await
+        .expect("pending reservation hydrates");
+        assert!(matches!(
+            restarted
+                .replay_pairing_offer("principal", "pending-key", "fingerprint")
+                .await,
+            PairingOfferReplay::Cancelled
+        ));
+        assert!(
+            restarted
+                .cancel_pairing_offer("principal", "pending-key".to_owned())
+                .await
+                .expect("pending grant cancellation")
+        );
+        assert_eq!(
+            restarted.share_exposure_state().await.desired_exposure,
+            "loopback"
+        );
+    }
+
+    #[tokio::test]
     async fn pairing_offer_idempotency_prunes_expired_entries_and_caps_memory() {
         let service = service();
         let now = now_ms();
@@ -2585,6 +2924,7 @@ mod tests {
                     (format!("principal-{index}"), format!("key-{index}")),
                     StoredPairingOffer {
                         input_fingerprint: format!("fingerprint-{index}"),
+                        pairing_id: Some(id.clone()),
                         result: Some(PairingOfferResult {
                             id,
                             code: format!("code-{index}"),

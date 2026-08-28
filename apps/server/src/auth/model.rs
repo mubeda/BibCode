@@ -125,7 +125,7 @@ pub struct CancelPairingOfferRequest {
     pub idempotency_key: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingOfferResult {
     pub id: String,
