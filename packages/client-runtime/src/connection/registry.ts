@@ -15,6 +15,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
   type ConnectionCatalogEntry,
+  type ConnectionProfile,
   type ConnectionRegistration,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
@@ -576,9 +577,8 @@ export const make = Effect.gen(function* () {
   });
 
   const cleanupRemovedEntryLocked = Effect.fn("EnvironmentRegistry.cleanupRemovedEntryLocked")(
-    function* (entry: ConnectionCatalogEntry) {
+    function* (entry: ConnectionCatalogEntry, profile: Option.Option<ConnectionProfile>) {
       const target = entry.target;
-      const profile = entry.profile;
       yield* Ref.update(persistedTargetsByEnvironment, (current) => {
         const next = new Map(current);
         next.delete(target.environmentId);
@@ -632,8 +632,12 @@ export const make = Effect.gen(function* () {
       });
     }
     const entry = yield* getEntry(environmentId);
+    const profile =
+      entry.target._tag === "BearerConnectionTarget" || entry.target._tag === "SshConnectionTarget"
+        ? yield* profiles.get(entry.target.connectionId)
+        : entry.profile;
     yield* registrations.remove(entry.target);
-    yield* cleanupRemovedEntryLocked(entry);
+    yield* cleanupRemovedEntryLocked(entry, profile);
   });
 
   const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
@@ -647,8 +651,33 @@ export const make = Effect.gen(function* () {
     return yield* withLeaseLock(
       environmentId,
       Effect.gen(function* () {
-        const removed = yield* registrations.removeIfMatching(registration);
-        if (!removed) return false;
+        const removal = yield* registrations.removeIfMatching(registration);
+        if (!removal.removed) {
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+            yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+              const next = new Map(current);
+              if (removal.current === null) next.delete(environmentId);
+              else next.set(environmentId, removal.current.target);
+              return next;
+            });
+            return false;
+          }
+          if (removal.current !== null) {
+            const currentEntry = removal.current;
+            yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+              const next = new Map(current);
+              next.set(environmentId, currentEntry.target);
+              return next;
+            });
+            yield* installEntryLocked(currentEntry);
+            return false;
+          }
+          const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+          if (entry !== undefined) {
+            yield* cleanupRemovedEntryLocked(entry, entry.profile);
+          }
+          return false;
+        }
         if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
           yield* Ref.update(persistedTargetsByEnvironment, (current) => {
             const next = new Map(current);
@@ -659,7 +688,7 @@ export const make = Effect.gen(function* () {
         }
         const entry = yield* getEntry(environmentId);
         if (!Equal.equals(entry, connectionRegistrationCatalogEntry(registration))) return true;
-        yield* cleanupRemovedEntryLocked(entry);
+        yield* cleanupRemovedEntryLocked(entry, entry.profile);
         return true;
       }),
     );

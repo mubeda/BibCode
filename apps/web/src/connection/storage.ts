@@ -623,9 +623,12 @@ export const connectionStorageLayer = Layer.effectContext(
             return removal.removed
               ? {
                   mutation: { _tag: "Set", document: removal.document },
-                  result: true,
+                  result: { removed: true, current: null },
                 }
-              : { mutation: { _tag: "Keep" }, result: false };
+              : {
+                  mutation: { _tag: "Keep" },
+                  result: { removed: false, current: removal.current },
+                };
           })
           .pipe(Effect.mapError((cause) => persistenceError("remove-connection", cause))),
       remove: (target) =>

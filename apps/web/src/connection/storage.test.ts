@@ -1862,9 +1862,12 @@ describe("connectionStorageLayer", () => {
         const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
 
         yield* secondRegistrationStore.register(replacement);
-        const removed = yield* firstRegistrationStore.removeIfMatching(first);
+        const removal = yield* firstRegistrationStore.removeIfMatching(first);
 
-        expect(removed).toBe(false);
+        expect(removal).toEqual({
+          removed: false,
+          current: { target: replacement.target, profile: Option.some(replacement.profile) },
+        });
         expect(yield* targetStore.list).toEqual([replacement.target]);
         expect(yield* profileStore.get(connectionId)).toEqual(Option.some(replacement.profile));
         expect(yield* credentialStore.get(connectionId)).toEqual(
@@ -1885,7 +1888,10 @@ describe("connectionStorageLayer", () => {
       const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
 
       yield* registrationStore.register(registration);
-      expect(yield* registrationStore.removeIfMatching(registration)).toBe(true);
+      expect(yield* registrationStore.removeIfMatching(registration)).toEqual({
+        removed: true,
+        current: null,
+      });
       expect(yield* targetStore.list).toEqual([]);
       expect(yield* profileStore.get(connectionId)).toEqual(Option.none());
       expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
