@@ -308,10 +308,14 @@ failure attempts every local safeguard even if an earlier recovery step fails:
 persist local-only, restart with a local-only override, close the firewall, and
 stop an unverified backend. Narrowing persists local-only first, restarts and
 verifies local topology, then closes the firewall; it never restores durable
-wide state as compensation. The persisted desktop setting records the last
-completed transition but is neither proof of actual topology nor permission to
-start wide. Creating a **This computer only** or loopback-custom grant never
-widens a later launch, and there is no independent manual exposure toggle.
+wide state as compensation. On Windows, closing enumerates the persistent
+firewall store, removes only the named BiBCode rule, and re-enumerates to verify
+absence. A missing rule is successful only after that absence check; process,
+policy, and verification failures propagate to the coordinator and are reported
+as incomplete cleanup. The persisted desktop setting records the last completed
+transition but is neither proof of actual topology nor permission to start wide.
+Creating a **This computer only** or loopback-custom grant never widens a later
+launch, and there is no independent manual exposure toggle.
 
 This coordinator governs only a native primary. When Windows desktop is in
 WSL-only mode, the Share tab chooses an available WSL-owned advertised endpoint

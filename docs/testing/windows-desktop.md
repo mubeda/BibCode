@@ -343,7 +343,11 @@ minimum-size, and relevant Windows DPI states. Verify:
   TCP-only, and limited to Domain/Private profiles. Revoke the last off-host
   offer or paired client, verify exposure returns to loopback, and confirm the
   named rule is absent. Record an elevation or policy denial as failed native
-  evidence; do not substitute a manually created rule. Capture the shared
+  evidence; do not substitute a manually created rule. Run the host-independent
+  deletion-spawn and policy-denial tests, then reproduce a deletion denial
+  natively and confirm the app reports incomplete cleanup rather than claiming
+  the rule was removed. A missing rule is benign only when the persistent
+  firewall store can be queried and its absence verified. Capture the shared
   runbook's five compensation outcomes: successful local-only cleanup after a
   failed mint, explicit cleanup failure, last-browser-session revocation with a
   local-only restart and removed rule, and one compensating widen when a

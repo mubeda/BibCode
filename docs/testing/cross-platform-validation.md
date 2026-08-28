@@ -140,6 +140,7 @@ transport-size tests from the repository root whenever this boundary changes:
 vp test scripts/remote-architecture-contract.test.ts
 vp test packages/client-runtime/src/rpc/session.test.ts
 cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
+cargo test -p bibcode-server --test auth_http auth_routes_include_browser_cors_and_preflight_headers -- --exact
 cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
 cargo test -p bibcode-server --test e2ee_ws established_capacity_is_partitioned_by_principal_and_released_on_close -- --exact
 cargo test -p bibcode-server --test e2ee_ws inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_close -- --exact
@@ -156,6 +157,7 @@ cargo test -p bibcode-server auth::service::tests::cross_service_authentication_
 cargo test -p bibcode-server --test repositories pairing_offer_reservations_enforce_the_shared_ -- --nocapture
 cargo test -p bibcode-server --test auth_http pairing_offer_authority_is_shared_across_simultaneously_live_servers -- --exact
 cargo test -p bibcode-server --test auth_http remote_revocation_closes_an_acked_live_stream_before_later_events -- --exact
+cargo test -p bibcode-desktop firewall::tests --lib -- --nocapture
 ```
 
 ### Direct E2EE interop gate
