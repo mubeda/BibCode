@@ -1169,11 +1169,14 @@ impl BackendSupervisor {
         Ok(primary_config)
     }
 
-    pub async fn restart_default_if_active<R: Runtime>(
+    pub async fn restart_default_if_active_preserving_exposure<R: Runtime>(
         &self,
         app: AppHandle<R>,
     ) -> Result<Option<BackendRunConfig>, String> {
-        self.restart_default_if_active_with_override(app, None)
+        let exposure_override = self
+            .current_run_config()
+            .map(|config| config.server_exposure_mode);
+        self.restart_default_if_active_with_override(app, exposure_override.as_deref())
             .await
     }
 
@@ -5255,17 +5258,19 @@ exit /b 9
             .await
             .expect("default backend should start");
         assert_ne!(started.port, 0);
+        assert_eq!(started.server_exposure_mode, "local-only");
         assert!(
             TcpListener::bind((Ipv4Addr::LOCALHOST, started.port)).is_err(),
             "the running server must retain its published listener address"
         );
 
         let restarted = supervisor
-            .restart_default_if_active(app.handle().clone())
+            .restart_default_if_active_preserving_exposure(app.handle().clone())
             .await
             .expect("default backend should restart")
             .expect("active backend should produce a replacement config");
         assert_ne!(restarted.port, 0);
+        assert_eq!(restarted.server_exposure_mode, "local-only");
         assert!(
             TcpListener::bind((Ipv4Addr::LOCALHOST, restarted.port)).is_err(),
             "the replacement server must retain its published listener address"

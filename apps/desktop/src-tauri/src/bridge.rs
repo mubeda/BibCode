@@ -1272,7 +1272,9 @@ pub async fn desktop_bridge_set_tailscale_serve_enabled(
                     requested_port.or(Some(settings.tailscale_serve_port as u64)),
                 );
             })?;
-            let restarted_config = backend.restart_default_if_active(app.clone()).await?;
+            let restarted_config = backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
             let current_config = restarted_config.or_else(|| backend.current_run_config());
             Ok(server_exposure_state(&settings, current_config.as_ref()))
         })
@@ -1302,7 +1304,9 @@ pub async fn desktop_bridge_set_wsl_backend_enabled(
                     settings.wsl_only = false;
                 }
             })?;
-            backend.restart_default_if_active(app.clone()).await?;
+            backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
             Ok(wsl_state(&settings, &backend))
         })
         .await
@@ -1320,7 +1324,9 @@ pub async fn desktop_bridge_set_wsl_distro(
             let settings = update_desktop_settings(&app, |settings| {
                 settings.wsl_distro = normalize_wsl_distro(distro);
             })?;
-            backend.restart_default_if_active(app.clone()).await?;
+            backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
             Ok(wsl_state(&settings, &backend))
         })
         .await
@@ -1338,7 +1344,9 @@ pub async fn desktop_bridge_set_wsl_only(
             let settings = update_desktop_settings(&app, |settings| {
                 settings.wsl_only = enabled;
             })?;
-            backend.restart_default_if_active(app.clone()).await?;
+            backend
+                .restart_default_if_active_preserving_exposure(app.clone())
+                .await?;
             Ok(wsl_state(&settings, &backend))
         })
         .await
