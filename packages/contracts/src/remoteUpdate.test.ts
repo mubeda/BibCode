@@ -42,6 +42,18 @@ describe("RemoteUpdateSnapshot", () => {
     expect(support.installMode).toBe("supervised");
   });
 
+  it("preserves an empty desktop updater error string", () => {
+    expect(
+      decodeSnapshot({
+        serverVersion: "0.4.2",
+        latestVersion: null,
+        state: "error",
+        error: "",
+        support: { installMode: "interactive", reason: "available" },
+      }).error,
+    ).toBe("");
+  });
+
   it("rejects unknown states", () => {
     expect(() =>
       decodeSnapshot({

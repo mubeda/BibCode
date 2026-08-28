@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
+import {
+  DESKTOP_LOCAL_CONNECTION_ID_PREFIX,
+  isDesktopLocalConnectionId,
+} from "@bibcode/client-runtime/connection";
 
 import {
   ADD_SERVER_FAILURE_REASONS,
@@ -81,11 +85,13 @@ describe("resolveTransportBadge", () => {
   });
 
   it("shows no transport badge for the desktop-managed local (WSL) environment", () => {
+    const connectionId = `${DESKTOP_LOCAL_CONNECTION_ID_PREFIX}wsl`;
+    expect(isDesktopLocalConnectionId(connectionId)).toBe(true);
     expect(
       resolveTransportBadge({
         relayManaged: false,
         entry: {
-          target: { _tag: "BearerConnectionTarget", connectionId: "local:wsl" },
+          target: { _tag: "BearerConnectionTarget", connectionId },
           profile: { _tag: "None" },
         },
       }),

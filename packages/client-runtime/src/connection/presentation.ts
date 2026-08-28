@@ -32,8 +32,11 @@ export interface EnvironmentPresentation {
 
 export type ConnectionTransportSecurity = "local" | "e2ee" | "channel-secured" | "unencrypted";
 
-// Mirrors DESKTOP_LOCAL_CONNECTION_ID_PREFIX in apps/web/src/connection/desktopLocal.ts.
-const DESKTOP_LOCAL_CONNECTION_ID_PREFIX = "local:";
+export const DESKTOP_LOCAL_CONNECTION_ID_PREFIX = "local:";
+
+export function isDesktopLocalConnectionId(connectionId: string | undefined): boolean {
+  return connectionId?.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX) ?? false;
+}
 
 export function connectionTransportSecurity(
   entry: ConnectionCatalogEntry,
@@ -46,7 +49,7 @@ export function connectionTransportSecurity(
     case "SshConnectionTarget":
       return "channel-secured";
     case "BearerConnectionTarget": {
-      if (entry.target.connectionId.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX)) {
+      if (isDesktopLocalConnectionId(entry.target.connectionId)) {
         return "local";
       }
       const profile =

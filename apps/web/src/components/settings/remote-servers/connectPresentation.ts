@@ -1,4 +1,8 @@
-import type { CompatVerdict, PairingAddFailureReason } from "@bibcode/client-runtime/connection";
+import {
+  isDesktopLocalConnectionId,
+  type CompatVerdict,
+  type PairingAddFailureReason,
+} from "@bibcode/client-runtime/connection";
 
 /** D16: version strings render as "BiBCode v<serverVersion>". */
 export function formatServerVersionLabel(serverVersion: string | null | undefined): string | null {
@@ -51,7 +55,7 @@ export function resolveTransportBadge(environment: TransportBadgeInput): Transpo
   const target = environment.entry.target;
   if (target._tag === "SshConnectionTarget") return { kind: "ssh", label: "SSH tunnel" };
   if (target._tag !== "BearerConnectionTarget") return null;
-  if (target.connectionId?.startsWith("local:")) return null;
+  if (isDesktopLocalConnectionId(target.connectionId)) return null;
   const profile = environment.entry.profile;
   const hostKey =
     profile._tag === "Some" && profile.value._tag === "BearerConnectionProfile"

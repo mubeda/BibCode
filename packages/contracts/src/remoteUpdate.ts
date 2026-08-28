@@ -34,7 +34,7 @@ export const RemoteUpdateSnapshot = Schema.Struct({
   serverVersion: TrimmedNonEmptyString,
   latestVersion: Schema.NullOr(TrimmedNonEmptyString),
   state: RemoteUpdateState,
-  error: Schema.NullOr(TrimmedNonEmptyString),
+  error: Schema.NullOr(Schema.String),
   support: RemoteUpdateSupport,
 });
 export type RemoteUpdateSnapshot = typeof RemoteUpdateSnapshot.Type;

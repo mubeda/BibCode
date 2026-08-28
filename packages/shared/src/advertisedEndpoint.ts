@@ -62,12 +62,16 @@ export type PairingEndpointClassification =
   | "public"
   | "unconnectable";
 
-function isPrivateIpv4(host: string): boolean {
-  const octets = host.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet))) {
-    return false;
-  }
-  const [a, b] = octets as [number, number, number, number];
+function parseIpv4(host: string): readonly [number, number, number, number] | null {
+  const segments = host.split(".");
+  if (segments.length !== 4 || segments.some((segment) => !/^\d+$/u.test(segment))) return null;
+  const octets = segments.map(Number);
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return null;
+  return octets as [number, number, number, number];
+}
+
+function isPrivateIpv4(octets: readonly [number, number, number, number]): boolean {
+  const [a, b] = octets;
   return (
     a === 10 ||
     (a === 172 && b >= 16 && b <= 31) ||
@@ -77,6 +81,14 @@ function isPrivateIpv4(host: string): boolean {
   );
 }
 
+function isPrivateIpv6(host: string): boolean {
+  if (!host.includes(":")) return false;
+  const firstSegment = host.split(":", 1)[0] ?? "";
+  if (!/^[0-9a-f]{1,4}$/u.test(firstSegment)) return false;
+  const first = Number.parseInt(firstSegment, 16);
+  return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80;
+}
+
 export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassification {
   let url: URL;
   try {
@@ -84,20 +96,21 @@ export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassi
   } catch {
     return "unconnectable";
   }
-  if (/:0(?:[/?#]|$)/.test(endpoint.trim())) {
+  if (url.port === "0") {
     return "unconnectable";
   }
   const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (host === "0.0.0.0" || host === "::" || host === "") {
     return "unconnectable";
   }
-  if (host === "localhost" || host === "::1" || host.startsWith("127.")) {
+  const ipv4 = parseIpv4(host);
+  if (host === "localhost" || host === "::1" || ipv4?.[0] === 127) {
     return "loopback";
   }
-  if (isPrivateIpv4(host)) {
+  if (ipv4 !== null && isPrivateIpv4(ipv4)) {
     return "private-network";
   }
-  if (host.startsWith("fd") || host.startsWith("fc") || host.startsWith("fe80")) {
+  if (isPrivateIpv6(host)) {
     return "private-network";
   }
   return "public";

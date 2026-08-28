@@ -1,5 +1,6 @@
 import type { AdvertisedEndpoint, DesktopServerExposureState } from "@bibcode/contracts";
 import { normalizeHttpBaseUrl } from "@bibcode/shared/advertisedEndpoint";
+import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
 import { shareClassForPairingEndpoint } from "./endpointClass.ts";
 
@@ -10,19 +11,6 @@ export interface ShareAddressOption {
   readonly label: string;
   readonly httpBaseUrl: string | null;
   readonly description?: string;
-}
-
-export function buildPairDeepLink(code: string): string {
-  return `bibcode://pair?code=${encodeURIComponent(code)}`;
-}
-
-export function buildBrowserPairUrl(endpoint: string, code: string): string {
-  const url = new URL(endpoint);
-  url.pathname = "/pair";
-  url.search = "";
-  url.searchParams.set("code", code);
-  url.hash = "";
-  return url.toString();
 }
 
 export function resolveShareAddressOptions(input: {
@@ -210,7 +198,7 @@ export async function generateShareOffer(
         ok: true,
         offer: {
           code: minted.code,
-          deepLink: buildPairDeepLink(minted.code),
+          deepLink: buildPairingDeepLink(minted.code),
           browserUrl: buildBrowserPairUrl(minted.endpoint, minted.code),
           endpoint: minted.endpoint,
           name: minted.name,
