@@ -387,10 +387,10 @@ describe("makeE2eeSocket", () => {
     }),
   );
 
-  it.live("does not encrypt later records while the first write is backpressured", () =>
+  it.live("serializes concurrent logical messages while the first write is backpressured", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const { hostKey, script } = responderScript();
+        const { hostKey, script, received } = responderScript();
         const firstWriteStarted = yield* Deferred.make<void>();
         const releaseFirstWrite = yield* Deferred.make<void>();
         let blockNextWrite = false;
@@ -416,17 +416,26 @@ describe("makeE2eeSocket", () => {
         const write = yield* socket.writer;
         encryptProbe.calls = 0;
         blockNextWrite = true;
+        const firstMessage = encodeJson({ blob: "x".repeat(200_000) });
+        const secondMessage = encodeJson({ ordinal: 2 });
         const writeFiber = yield* Effect.forkChild(
-          write(encodeJson({ blob: "x".repeat(200_000) })),
+          write(firstMessage),
           {
             startImmediately: true,
           },
         );
         yield* Deferred.await(firstWriteStarted);
         expect(encryptProbe.calls).toBe(1);
+        const secondWriteFiber = yield* Effect.forkChild(write(secondMessage), {
+          startImmediately: true,
+        });
+        yield* Effect.sleep("10 millis");
+        expect(encryptProbe.calls).toBe(1);
 
         yield* Deferred.succeed(releaseFirstWrite, undefined);
         yield* Fiber.join(writeFiber);
+        yield* Fiber.join(secondWriteFiber);
+        expect(received.slice(1)).toEqual([firstMessage, secondMessage]);
         yield* Fiber.interrupt(runFiber);
       }),
     ),
