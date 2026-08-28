@@ -1,7 +1,6 @@
 # Remote Server Stabilization Design
 
-**Status:** Design direction approved in chat on 2026-08-28; written design
-awaiting confirmation before implementation.
+**Status:** Approved in chat on 2026-08-28.
 
 ## Outcome
 
