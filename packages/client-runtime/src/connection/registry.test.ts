@@ -1181,9 +1181,9 @@ describe("EnvironmentRegistry", () => {
         yield* Fiber.join(replacementFiber);
         expect(yield* Fiber.join(rollbackFiber)).toBe(false);
 
-        expect(
-          (yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId),
-        ).toEqual(replacement.credential);
+        expect((yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId)).toEqual(
+          replacement.credential,
+        );
         expect(
           (yield* SubscriptionRef.get(registry.entries)).get(BEARER_TARGET.environmentId)?.target,
         ).toEqual(BEARER_TARGET);

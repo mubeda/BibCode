@@ -181,9 +181,9 @@ export const make = Effect.gen(function* () {
   const persistedTargetsByEnvironment = yield* Ref.make<
     ReadonlyMap<EnvironmentId, ConnectionTarget>
   >(new Map(persistedTargets.map((target) => [target.environmentId, target])));
-  const registrationOwners = yield* Ref.make<
-    ReadonlyMap<EnvironmentId, ConnectionRegistration>
-  >(new Map());
+  const registrationOwners = yield* Ref.make<ReadonlyMap<EnvironmentId, ConnectionRegistration>>(
+    new Map(),
+  );
   interface LeaseLock {
     readonly semaphore: Semaphore.Semaphore;
     readonly users: number;
