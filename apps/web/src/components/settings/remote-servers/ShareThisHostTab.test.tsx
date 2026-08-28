@@ -9,6 +9,7 @@ type AnyProps = Record<string, unknown>;
 
 const h = vi.hoisted(() => ({
   radioGroupProps: null as AnyProps | null,
+  cancelOffer: vi.fn(),
   createOffer: vi.fn(),
   getShareState: vi.fn(),
   refreshNetwork: vi.fn(),
@@ -32,6 +33,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("~/environments/primary", () => ({
+  cancelServerPairingOffer: h.cancelOffer,
   createServerPairingOffer: h.createOffer,
   getServerShareState: h.getShareState,
   usePrimarySessionState: () => h.sessionState,
@@ -190,6 +192,7 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   Object.assign(h.networkQuery.data.serverExposureState, localState);
+  h.cancelOffer.mockReset().mockResolvedValue(undefined);
   h.createOffer.mockReset().mockImplementation(async (input) => ({
     id: "offer-1",
     code: "c0de",
