@@ -115,6 +115,9 @@ export function ShareThisHostTab(): ReactElement {
     options.find((option) => option.id === selectedOptionId) ??
     (wslOnlyPrimary ? options.find((option) => option.httpBaseUrl !== null) : options[0]) ??
     null;
+  const wslExposureEndpoint = wslOnlyPrimary
+    ? (offer?.endpoint ?? selectedOption?.httpBaseUrl ?? null)
+    : null;
   const effectiveName = defaultOfferName(
     offerName === "" ? (primaryEnvironment?.serverConfig?.environment.label ?? null) : offerName,
   );
@@ -322,19 +325,28 @@ export function ShareThisHostTab(): ReactElement {
           description={
             <span className="space-y-1">
               <span className="block">
-                {!hasDesktopBridge
-                  ? primarySessionState.data?.auth.policy === "remote-reachable"
-                    ? "This server is configured for remote access."
-                    : "This server is limited to this machine."
-                  : exposureState?.mode === "network-accessible"
-                    ? exposureState.endpointUrl
-                      ? `Reachable at ${exposureState.endpointUrl}`
-                      : "Reachable from the network."
-                    : exposureState
-                      ? "Limited to this machine."
-                      : "Loading…"}
+                {wslOnlyPrimary
+                  ? wslExposureEndpoint
+                    ? `Reachable at ${wslExposureEndpoint}`
+                    : "The WSL network address is unavailable."
+                  : !hasDesktopBridge
+                    ? primarySessionState.data?.auth.policy === "remote-reachable"
+                      ? "This server is configured for remote access."
+                      : "This server is limited to this machine."
+                    : exposureState?.mode === "network-accessible"
+                      ? exposureState.endpointUrl
+                        ? `Reachable at ${exposureState.endpointUrl}`
+                        : "Reachable from the network."
+                      : exposureState
+                        ? "Limited to this machine."
+                        : "Loading…"}
               </span>
-              {!hasDesktopBridge ? (
+              {wslOnlyPrimary ? (
+                <span className="block">
+                  Exposure is owned by the WSL backend. BiBCode leaves the native Windows server and
+                  firewall unchanged.
+                </span>
+              ) : !hasDesktopBridge ? (
                 <span className="block">
                   Exposure is controlled where the server is launched — restart `bibcode serve` with
                   `--host` to change it.
