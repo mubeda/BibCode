@@ -1148,6 +1148,49 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("does not roll back a newer registration for the same environment", () =>
+    Effect.gen(function* () {
+      const first = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "first-credential" }),
+      });
+      const replacement = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "replacement-credential" }),
+      });
+      const replacementRegisterStarted = yield* Deferred.make<void>();
+      const releaseReplacementRegister = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([], [], [], {
+        beforeRegistrationRegister: (registration) =>
+          registration === replacement
+            ? Deferred.succeed(replacementRegisterStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseReplacementRegister)),
+              )
+            : Effect.void,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.register(first);
+        const replacementFiber = yield* Effect.forkChild(registry.register(replacement));
+        yield* Deferred.await(replacementRegisterStarted);
+        const rollbackFiber = yield* Effect.forkChild(registry.rollbackRegistration(first));
+        yield* Deferred.succeed(releaseReplacementRegister, undefined);
+        yield* Fiber.join(replacementFiber);
+        expect(yield* Fiber.join(rollbackFiber)).toBe(false);
+
+        expect(
+          (yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId),
+        ).toEqual(replacement.credential);
+        expect(
+          (yield* SubscriptionRef.get(registry.entries)).get(BEARER_TARGET.environmentId)?.target,
+        ).toEqual(BEARER_TARGET);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("starts platform environments without persisting or removing them", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([]);

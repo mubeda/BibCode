@@ -265,7 +265,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       Effect.orElseSucceed(() => postBootstrapPersistenceError("the server identity")),
     );
   if (identityPersistenceError !== null) {
-    const registrationCleanupFailed = yield* registry.remove(verified.environmentId).pipe(
+    const registrationCleanupFailed = yield* registry.rollbackRegistration(registration).pipe(
       Effect.as(false),
       Effect.orElseSucceed(() => true),
     );
