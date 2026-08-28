@@ -112,6 +112,7 @@ const h = vi.hoisted(() => {
       isPending: false,
       refresh: vi.fn(),
     },
+    remoteUpdateQueries: new Map<string, Record<string, unknown>>(),
     atoms: {
       desktopNetworkAccess: Symbol("desktopNetworkAccessStateAtom"),
       desktopSshHosts: Symbol("desktopSshHostsStateAtom"),
@@ -127,6 +128,8 @@ const h = vi.hoisted(() => {
       relayRefresh: Symbol("relayEnvironmentDiscovery.refresh"),
       linkPrimary: Symbol("linkPrimaryEnvironment"),
       unlinkPrimary: Symbol("unlinkPrimaryEnvironment"),
+      remoteUpdateCheck: Symbol("remoteUpdateEnvironment.check"),
+      remoteUpdateInstall: Symbol("remoteUpdateEnvironment.install"),
     },
     commands: {
       connectPairing: vi.fn(),
@@ -140,6 +143,8 @@ const h = vi.hoisted(() => {
       relayRefresh: vi.fn(),
       link: vi.fn(),
       unlink: vi.fn(),
+      remoteUpdateCheck: vi.fn(),
+      remoteUpdateInstall: vi.fn(),
     },
     refreshDesktopNetworkAccessState: vi.fn(),
     refreshDesktopWslState: vi.fn(),
@@ -332,6 +337,11 @@ vi.mock("~/state/query", () => ({
     if (atom === h.atoms.desktopSshHosts) return h.sshHostsQuery;
     if (atom === h.atoms.desktopWsl) return h.wslQuery;
     if ((atom as { __kind?: string }).__kind === "accessChanges") return h.accessChangesQuery;
+    if ((atom as { __kind?: string }).__kind === "remoteUpdateSnapshot") {
+      return (
+        h.remoteUpdateQueries.get((atom as { environmentId: string }).environmentId) ?? h.nullQuery
+      );
+    }
     return h.nullQuery;
   },
 }));
@@ -348,6 +358,17 @@ vi.mock("~/state/desktopSshHosts", () => ({
 vi.mock("~/state/desktopWslState", () => ({
   desktopWslStateAtom: h.atoms.desktopWsl,
   refreshDesktopWslState: h.refreshDesktopWslState,
+}));
+
+vi.mock("~/state/remoteUpdates", () => ({
+  remoteUpdateEnvironment: {
+    snapshot: ({ environmentId }: { environmentId: string }) => ({
+      __kind: "remoteUpdateSnapshot",
+      environmentId,
+    }),
+    check: h.atoms.remoteUpdateCheck,
+    install: h.atoms.remoteUpdateInstall,
+  },
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -377,6 +398,8 @@ vi.mock("../../../state/use-atom-command", () => ({
     if (atom === h.atoms.relayRefresh) return h.commands.relayRefresh;
     if (atom === h.atoms.linkPrimary) return h.commands.link;
     if (atom === h.atoms.unlinkPrimary) return h.commands.unlink;
+    if (atom === h.atoms.remoteUpdateCheck) return h.commands.remoteUpdateCheck;
+    if (atom === h.atoms.remoteUpdateInstall) return h.commands.remoteUpdateInstall;
     throw new Error("Unexpected atom command in test");
   },
 }));
@@ -900,6 +923,18 @@ function environment(input: {
   };
   readonly serverConfig?: unknown;
 }) {
+  const serverConfigSource =
+    input.serverConfig !== null && typeof input.serverConfig === "object"
+      ? (input.serverConfig as Record<string, unknown>)
+      : null;
+  const descriptorSource =
+    serverConfigSource?.environment !== null && typeof serverConfigSource?.environment === "object"
+      ? (serverConfigSource.environment as Record<string, unknown>)
+      : {};
+  const capabilitiesSource =
+    descriptorSource.capabilities !== null && typeof descriptorSource.capabilities === "object"
+      ? (descriptorSource.capabilities as Record<string, unknown>)
+      : {};
   return {
     environmentId: EnvironmentId.make(input.id),
     label: input.label,
@@ -908,7 +943,16 @@ function environment(input: {
       traceId: null,
       ...(input.connection ?? { phase: "disconnected" }),
     },
-    serverConfig: input.serverConfig ?? null,
+    serverConfig:
+      serverConfigSource === null
+        ? null
+        : {
+            ...serverConfigSource,
+            environment: {
+              ...descriptorSource,
+              capabilities: { remoteUpdateControl: false, ...capabilitiesSource },
+            },
+          },
     entry: {
       target: { _tag: input.targetTag ?? "SavedConnectionTarget", label: input.label },
       profile: input.sshTarget
@@ -988,6 +1032,7 @@ beforeEach(() => {
   h.sshHostsQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.wslQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.accessChangesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
+  h.remoteUpdateQueries.clear();
   for (const command of Object.values(h.commands)) {
     command.mockReset();
     command.mockResolvedValue(success(undefined));
@@ -1555,7 +1600,95 @@ describe("Remote Servers tabs", () => {
 
     it("renders in the Saved servers header when the seam is enabled", () => {
       stubBrowserWindow();
+      h.environments = [
+        environment({
+          id: "env-capable",
+          label: "Capable server",
+          serverConfig: {
+            environment: { capabilities: { remoteUpdateControl: true } },
+          },
+        }),
+      ];
       expect(render(<ConnectTab showServerUpdateCheck />)).toContain("Check for Server Updates");
+    });
+
+    it("renders update badges only for servers advertising update control", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const capableId = EnvironmentId.make("env-capable");
+      h.environments = [
+        environment({ id: "env-legacy", label: "Legacy server" }),
+        environment({
+          id: capableId,
+          label: "Capable server",
+          serverConfig: {
+            environment: {
+              serverVersion: "0.4.2",
+              capabilities: { remoteUpdateControl: true },
+            },
+          },
+        }),
+      ];
+      h.remoteUpdateQueries.set(capableId, {
+        data: {
+          serverVersion: "0.4.2",
+          latestVersion: null,
+          state: "idle",
+          error: null,
+          support: { installMode: "manual", reason: "manual-update-required" },
+        },
+        error: null,
+        isPending: false,
+        refresh: vi.fn(),
+      });
+
+      const markup = render(<ConnectTab />);
+      expect(markup.match(/data-variant="manual"/gu)).toHaveLength(1);
+      expect(markup).toContain("Manual updates");
+      expect(markup).toContain("Copy instructions");
+    });
+
+    it("keeps a failed batch check local to the row as Status unavailable", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-check-failure");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Offline update server",
+          serverConfig: {
+            environment: {
+              serverVersion: "0.4.2",
+              capabilities: { remoteUpdateControl: true },
+            },
+          },
+        }),
+      ];
+      h.remoteUpdateQueries.set(environmentId, {
+        data: {
+          serverVersion: "0.4.2",
+          latestVersion: null,
+          state: "up-to-date",
+          error: null,
+          support: { installMode: "interactive", reason: "available" },
+        },
+        error: null,
+        isPending: false,
+        refresh: vi.fn(),
+      });
+      h.commands.remoteUpdateCheck.mockResolvedValueOnce(failure(new Error("offline")));
+
+      const container = await mountConnections(<ConnectTab />);
+      await act(async () => {
+        invoke(control("button", "Check for Server Updates"), "onClick");
+        await flush();
+      });
+
+      expect(container.textContent).toContain("Status unavailable");
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
     });
   });
 
@@ -2490,7 +2623,12 @@ describe("Remote Servers tabs", () => {
         environmentId,
         label: "AI-SERVER",
         relayManaged: false,
-        serverConfig: { environment: { serverVersion: "1.4.2" } },
+        serverConfig: {
+          environment: {
+            serverVersion: "1.4.2",
+            capabilities: { remoteUpdateControl: false },
+          },
+        },
         connection: { phase: "connected", error: null, traceId: null },
         entry: {
           target: { _tag: "BearerConnectionTarget", connectionId: "bearer:env-presentation" },

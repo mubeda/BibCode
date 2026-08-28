@@ -13,7 +13,9 @@ import type {
   DesktopDiscoveredSshHost,
   DesktopSshEnvironmentTarget,
   EnvironmentId,
+  RemoteUpdateSnapshot,
 } from "@bibcode/contracts";
+import { REMOTE_UPDATE_MANUAL_REQUIRED } from "@bibcode/contracts";
 import {
   connectionStatusText,
   type CompatVerdict,
@@ -28,6 +30,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
+import { fanOutRemoteUpdateChecks } from "@bibcode/client-runtime/state/remoteUpdates";
 import type { RelayClientEnvironmentRecord } from "@bibcode/contracts/relay";
 import * as Option from "effect/Option";
 
@@ -36,6 +39,7 @@ import { cn } from "../../../lib/utils";
 import { resolveServerConfigVersionMismatch } from "~/versionSkew";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
+import { selectRemoteUpdateControlCapability } from "~/connection/environmentCompat";
 import { environmentCatalog } from "~/connection/catalog";
 import {
   connectPairing as connectPairingAtom,
@@ -43,6 +47,7 @@ import {
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
+import { remoteUpdateEnvironment } from "~/state/remoteUpdates";
 import {
   type EnvironmentPresentation,
   useEnvironments,
@@ -87,6 +92,11 @@ import { stackedThreadToast, toastManager } from "../../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import { SettingsSection } from "../settingsLayout";
 import {
+  ServerUpdateBadge,
+  manualUpdateInstructions,
+  serverUpdateBadgeVariant,
+} from "../ServerUpdateBadge";
+import {
   ConnectionStatusDot,
   EMPTY_DISCOVERED_SSH_HOSTS,
   formatDesktopSshConnectionError,
@@ -112,19 +122,29 @@ import {
 type RemoteServerRowProps = {
   environment: EnvironmentPresentation;
   compat: CompatVerdict | null;
+  remoteUpdateControl: boolean;
+  updateSnapshot: RemoteUpdateSnapshot | null;
+  updatePending: boolean;
   removingEnvironmentId: EnvironmentId | null;
   onConnect: (environmentId: EnvironmentId) => void;
   onDisconnect: (environmentId: EnvironmentId) => void;
   onRequestRemove: (environmentId: EnvironmentId, label: string) => void;
+  onCheckForUpdate: () => void;
+  onInstallUpdate: () => void;
 };
 
 function RemoteServerRow({
   environment,
   compat,
+  remoteUpdateControl,
+  updateSnapshot,
+  updatePending,
   removingEnvironmentId,
   onConnect,
   onDisconnect,
   onRequestRemove,
+  onCheckForUpdate,
+  onInstallUpdate,
 }: RemoteServerRowProps) {
   const environmentId = environment.environmentId;
   const connectionState = environment.connection.phase;
@@ -166,12 +186,37 @@ function RemoteServerRow({
     },
     [copyTraceIdToClipboard],
   );
+  const { copyToClipboard: copyUpdateInstructionsToClipboard } = useCopyToClipboard<{
+    instructions: string;
+  }>({
+    target: "manual update instructions",
+    onCopy: () => {
+      toastManager.add({
+        type: "success",
+        title: "Update instructions copied",
+      });
+    },
+    onError: (error) => {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not copy update instructions",
+          description: error.message,
+        }),
+      );
+    },
+  });
   const versionMismatch = resolveServerConfigVersionMismatch(environment.serverConfig);
   const versionLabel = formatServerVersionLabel(
     environment.serverConfig?.environment?.serverVersion,
   );
   const compatBadge = describeCompatBadge(compat);
   const transportBadge = resolveTransportBadge(environment);
+  const updateVariant = serverUpdateBadgeVariant(updateSnapshot);
+  const updateInstructions =
+    updateSnapshot?.support.installMode === "manual"
+      ? manualUpdateInstructions(updateSnapshot.serverVersion)
+      : null;
   const statusUnavailable =
     versionLabel === null && compatBadge === null && environment.connection.error !== null;
   const sshTarget =
@@ -234,6 +279,7 @@ function RemoteServerRow({
                 <Badge variant="outline">{transportBadge.label}</Badge>
               )
             ) : null}
+            {remoteUpdateControl ? <ServerUpdateBadge snapshot={updateSnapshot} /> : null}
             {metadataBits.length > 0 ? (
               <span className="text-xs text-muted-foreground">{metadataBits.join(" · ")}</span>
             ) : null}
@@ -259,8 +305,43 @@ function RemoteServerRow({
               ) : null}
             </p>
           ) : null}
+          {updateInstructions ? (
+            <Collapsible>
+              <CollapsibleTrigger className="text-xs text-muted-foreground underline underline-offset-2">
+                Manual update steps
+              </CollapsibleTrigger>
+              <CollapsibleContent className="mt-2 space-y-2">
+                <pre className="overflow-x-auto rounded-md bg-muted p-2 text-xs whitespace-pre-wrap">
+                  {updateInstructions}
+                </pre>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() =>
+                    copyUpdateInstructionsToClipboard(updateInstructions, {
+                      instructions: updateInstructions,
+                    })
+                  }
+                >
+                  Copy instructions
+                </Button>
+              </CollapsibleContent>
+            </Collapsible>
+          ) : null}
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+          {remoteUpdateControl ? (
+            <Button size="xs" variant="ghost" disabled={updatePending} onClick={onCheckForUpdate}>
+              {updatePending ? "Checking…" : "Check"}
+            </Button>
+          ) : null}
+          {remoteUpdateControl &&
+          updateSnapshot?.support.installMode === "interactive" &&
+          updateVariant === "update-available" ? (
+            <Button size="xs" disabled={updatePending} onClick={onInstallUpdate}>
+              Update
+            </Button>
+          ) : null}
           {isWslEnvironment ? (
             <Tooltip>
               <TooltipTrigger
@@ -316,11 +397,98 @@ function RemoteServerRow({
   );
 }
 
-function RemoteServerRowFromSession(props: Omit<RemoteServerRowProps, "compat">) {
+function RemoteServerRowFromSession(
+  props: Omit<
+    RemoteServerRowProps,
+    | "compat"
+    | "remoteUpdateControl"
+    | "updateSnapshot"
+    | "updatePending"
+    | "onCheckForUpdate"
+    | "onInstallUpdate"
+  > & {
+    readonly updateCheckFailed: boolean;
+    readonly updateRefreshEpoch: number;
+    readonly onUpdateCheckResult: (environmentId: EnvironmentId, succeeded: boolean) => void;
+  },
+) {
   const compat = useAtomValue(
     environmentSession.compatVerdictAtom(props.environment.environmentId),
   );
-  return <RemoteServerRow {...props} compat={compat} />;
+  const environmentId = props.environment.environmentId;
+  const remoteUpdateControl = selectRemoteUpdateControlCapability(props.environment.serverConfig);
+  const updateQuery = useEnvironmentQuery(
+    remoteUpdateControl ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} }) : null,
+  );
+  const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
+  const runInstall = useAtomCommand(remoteUpdateEnvironment.install, { reportFailure: false });
+  const [commandPending, setCommandPending] = useState(false);
+  const [manualInstallRequired, setManualInstallRequired] = useState(false);
+
+  useEffect(() => {
+    if (remoteUpdateControl && props.updateRefreshEpoch > 0) {
+      updateQuery.refresh();
+    }
+  }, [props.updateRefreshEpoch, remoteUpdateControl, updateQuery.refresh]);
+
+  const checkForUpdate = useCallback(async () => {
+    setCommandPending(true);
+    const result = await runCheck({ environmentId, input: {} });
+    setCommandPending(false);
+    props.onUpdateCheckResult(environmentId, result._tag === "Success");
+    if (result._tag === "Success") {
+      updateQuery.refresh();
+    }
+  }, [environmentId, props.onUpdateCheckResult, runCheck, updateQuery.refresh]);
+
+  const installUpdate = useCallback(async () => {
+    setCommandPending(true);
+    const result = await runInstall({ environmentId, input: {} });
+    setCommandPending(false);
+    if (result._tag === "Success") {
+      setManualInstallRequired(false);
+      props.onUpdateCheckResult(environmentId, true);
+      updateQuery.refresh();
+      return;
+    }
+    const error = squashAtomCommandFailure(result);
+    if (
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === REMOTE_UPDATE_MANUAL_REQUIRED
+    ) {
+      setManualInstallRequired(true);
+      props.onUpdateCheckResult(environmentId, true);
+      updateQuery.refresh();
+    }
+  }, [environmentId, props.onUpdateCheckResult, runInstall, updateQuery.refresh]);
+
+  const snapshot = props.updateCheckFailed
+    ? null
+    : manualInstallRequired && updateQuery.data !== null
+      ? {
+          ...updateQuery.data,
+          support: { installMode: "manual" as const, reason: "manual-update-required" as const },
+        }
+      : updateQuery.data;
+  const {
+    onUpdateCheckResult: _onUpdateCheckResult,
+    updateCheckFailed: _updateCheckFailed,
+    updateRefreshEpoch: _updateRefreshEpoch,
+    ...rowProps
+  } = props;
+  return (
+    <RemoteServerRow
+      {...rowProps}
+      compat={compat}
+      remoteUpdateControl={remoteUpdateControl}
+      updateSnapshot={snapshot}
+      updatePending={commandPending || updateQuery.isPending}
+      onCheckForUpdate={() => void checkForUpdate()}
+      onInstallUpdate={() => void installUpdate()}
+    />
+  );
 }
 
 interface DesktopSshHostRowProps {
@@ -554,7 +722,7 @@ function CloudRemoteEnvironmentRows({
   ) : null;
 }
 
-export const SERVER_UPDATE_CHECK_ENABLED = false;
+export const SERVER_UPDATE_CHECK_ENABLED = true;
 
 export function ConnectTab({
   initialPairingCode = null,
@@ -583,6 +751,9 @@ export function ConnectTab({
     reportFailure: false,
   });
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
+  const runRemoteUpdateCheck = useAtomCommand(remoteUpdateEnvironment.check, {
+    reportFailure: false,
+  });
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
   const savedEnvironments = useMemo(
     () =>
@@ -593,6 +764,13 @@ export function ConnectTab({
   );
   const savedEnvironmentIds = useMemo(
     () => savedEnvironments.map((environment) => environment.environmentId),
+    [savedEnvironments],
+  );
+  const updateCapableEnvironmentIds = useMemo(
+    () =>
+      savedEnvironments
+        .filter((environment) => selectRemoteUpdateControlCapability(environment.serverConfig))
+        .map((environment) => environment.environmentId),
     [savedEnvironments],
   );
   const savedDesktopSshEnvironmentsByAlias = useMemo(
@@ -660,7 +838,44 @@ export function ConnectTab({
     removalCandidate === null
       ? 0
       : countRunningThreadsForEnvironment(threadShells, removalCandidate.environmentId);
-  const onCheckForServerUpdates = useCallback(() => undefined, []);
+  const [checkingAllServerUpdates, setCheckingAllServerUpdates] = useState(false);
+  const [updateRefreshEpochs, setUpdateRefreshEpochs] = useState<
+    ReadonlyMap<EnvironmentId, number>
+  >(new Map());
+  const [updateCheckFailures, setUpdateCheckFailures] = useState<ReadonlySet<EnvironmentId>>(
+    new Set(),
+  );
+  const recordUpdateCheckResult = useCallback(
+    (environmentId: EnvironmentId, succeeded: boolean) => {
+      setUpdateCheckFailures((current) => {
+        const next = new Set(current);
+        if (succeeded) next.delete(environmentId);
+        else next.add(environmentId);
+        return next;
+      });
+    },
+    [],
+  );
+  const onCheckForServerUpdates = useCallback(async () => {
+    if (checkingAllServerUpdates || updateCapableEnvironmentIds.length === 0) return;
+    setCheckingAllServerUpdates(true);
+    await fanOutRemoteUpdateChecks(updateCapableEnvironmentIds, async (environmentId) => {
+      const result = await runRemoteUpdateCheck({ environmentId, input: {} });
+      recordUpdateCheckResult(environmentId, result._tag === "Success");
+      setUpdateRefreshEpochs((current) => {
+        const next = new Map(current);
+        next.set(environmentId, (current.get(environmentId) ?? 0) + 1);
+        return next;
+      });
+      return result;
+    });
+    setCheckingAllServerUpdates(false);
+  }, [
+    checkingAllServerUpdates,
+    recordUpdateCheckResult,
+    runRemoteUpdateCheck,
+    updateCapableEnvironmentIds,
+  ]);
   const consumeInitialPairingCode = useCallback(() => {
     if (initialPairingCode === null || initialPairingCodeConsumedRef.current) return;
     initialPairingCodeConsumedRef.current = true;
@@ -1264,15 +1479,22 @@ export function ConnectTab({
         title="Saved servers"
         headerAction={
           <div className="flex items-center gap-1">
-            {showServerUpdateCheck ? (
+            {showServerUpdateCheck && updateCapableEnvironmentIds.length > 0 ? (
               <Button
                 size="xs"
                 variant="ghost"
                 className="h-5 gap-1 rounded-sm px-1 text-[11px] font-normal text-muted-foreground/60 hover:text-muted-foreground"
-                onClick={onCheckForServerUpdates}
+                disabled={checkingAllServerUpdates}
+                onClick={() => void onCheckForServerUpdates()}
               >
-                <RefreshCwIcon className="size-3" />
-                <span>Check for Server Updates</span>
+                <RefreshCwIcon
+                  className={cn("size-3", checkingAllServerUpdates && "animate-spin")}
+                />
+                <span>
+                  {checkingAllServerUpdates
+                    ? "Checking Server Updates…"
+                    : "Check for Server Updates"}
+                </span>
               </Button>
             ) : null}
             <Dialog
@@ -1345,6 +1567,9 @@ export function ConnectTab({
           <RemoteServerRowFromSession
             key={environment.environmentId}
             environment={environment}
+            updateCheckFailed={updateCheckFailures.has(environment.environmentId)}
+            updateRefreshEpoch={updateRefreshEpochs.get(environment.environmentId) ?? 0}
+            onUpdateCheckResult={recordUpdateCheckResult}
             removingEnvironmentId={removingSavedEnvironmentId}
             onConnect={handleConnectSavedBackend}
             onDisconnect={handleDisconnectSavedBackend}

@@ -15,17 +15,6 @@ export function resolveEnvironmentCompatVerdict(
   return computeCompatVerdict(serverConfig.environment);
 }
 
-/**
- * Whether the server advertises remote update control. Phase 7 adds the typed
- * capability field; until then this is the single defensive compatibility
- * read and defaults closed for older descriptors.
- */
 export function selectRemoteUpdateControlCapability(serverConfig: ServerConfig | null): boolean {
-  if (serverConfig === null) {
-    return false;
-  }
-  const capabilities = serverConfig.environment.capabilities as {
-    readonly remoteUpdateControl?: unknown;
-  };
-  return capabilities.remoteUpdateControl === true;
+  return serverConfig?.environment.capabilities.remoteUpdateControl === true;
 }

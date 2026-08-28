@@ -16,6 +16,10 @@ function serverConfigWith(environment: Record<string, unknown>): ServerConfig {
   return { environment } as unknown as ServerConfig;
 }
 
+function serverConfigWithRemoteUpdateControl(remoteUpdateControl: boolean): ServerConfig {
+  return serverConfigWith({ capabilities: { remoteUpdateControl } });
+}
+
 describe("resolveEnvironmentCompatVerdict", () => {
   it("returns null when the environment has never delivered a config", () => {
     expect(resolveEnvironmentCompatVerdict(null)).toBeNull();
@@ -35,19 +39,14 @@ describe("resolveEnvironmentCompatVerdict", () => {
 describe("selectRemoteUpdateControlCapability", () => {
   it("defaults to hidden for null config and for servers without the capability", () => {
     expect(selectRemoteUpdateControlCapability(null)).toBe(false);
-    expect(selectRemoteUpdateControlCapability(serverConfigWith({ capabilities: {} }))).toBe(false);
+    expect(selectRemoteUpdateControlCapability(serverConfigWithRemoteUpdateControl(false))).toBe(
+      false,
+    );
   });
 
   it("is true only for an explicit capability boolean", () => {
-    expect(
-      selectRemoteUpdateControlCapability(
-        serverConfigWith({ capabilities: { remoteUpdateControl: true } }),
-      ),
-    ).toBe(true);
-    expect(
-      selectRemoteUpdateControlCapability(
-        serverConfigWith({ capabilities: { remoteUpdateControl: "yes" } }),
-      ),
-    ).toBe(false);
+    expect(selectRemoteUpdateControlCapability(serverConfigWithRemoteUpdateControl(true))).toBe(
+      true,
+    );
   });
 });
