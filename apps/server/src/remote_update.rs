@@ -3,7 +3,7 @@
 //! The TypeScript source of truth is `packages/contracts/src/remoteUpdate.ts`;
 //! serde attributes here must keep the wire shapes byte-identical.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,6 +76,10 @@ pub struct HostUpdaterStatus {
 
 pub type HostUpdaterFuture = Pin<Box<dyn Future<Output = HostUpdaterStatus> + Send>>;
 
+const REMOTE_UPDATE_DELEGATE_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_UPDATE_DELEGATE_TIMEOUT_ERROR: &str =
+    "Desktop updater did not respond within 30 seconds.";
+
 /// Implemented by the desktop host (pattern: `DesktopUiProcessObserver`).
 /// Consulted only when `RemoteUpdateSupport.install_mode` is `Interactive`.
 pub trait RemoteUpdateDelegate: Send + Sync + 'static {
@@ -103,6 +107,7 @@ pub struct RemoteUpdateService {
     server_version: String,
     support: RemoteUpdateSupport,
     delegate: Option<Arc<dyn RemoteUpdateDelegate>>,
+    delegate_timeout: Duration,
 }
 
 impl RemoteUpdateService {
@@ -116,7 +121,14 @@ impl RemoteUpdateService {
             server_version,
             support,
             delegate,
+            delegate_timeout: REMOTE_UPDATE_DELEGATE_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_delegate_timeout(mut self, delegate_timeout: Duration) -> Self {
+        self.delegate_timeout = delegate_timeout;
+        self
     }
 
     fn interactive_delegate(&self) -> Option<&Arc<dyn RemoteUpdateDelegate>> {
@@ -145,9 +157,20 @@ impl RemoteUpdateService {
         }
     }
 
+    async fn await_delegate(&self, future: HostUpdaterFuture) -> HostUpdaterStatus {
+        match tokio::time::timeout(self.delegate_timeout, future).await {
+            Ok(status) => status,
+            Err(_) => HostUpdaterStatus {
+                latest_version: None,
+                state: RemoteUpdateState::Error,
+                error: Some(REMOTE_UPDATE_DELEGATE_TIMEOUT_ERROR.to_owned()),
+            },
+        }
+    }
+
     pub async fn status(&self) -> RemoteUpdateSnapshot {
         let status = match self.interactive_delegate() {
-            Some(delegate) => delegate.status().await,
+            Some(delegate) => self.await_delegate(delegate.status()).await,
             None => Self::manual_status(),
         };
         self.snapshot(status)
@@ -155,7 +178,7 @@ impl RemoteUpdateService {
 
     pub async fn check(&self) -> RemoteUpdateSnapshot {
         let status = match self.interactive_delegate() {
-            Some(delegate) => delegate.check().await,
+            Some(delegate) => self.await_delegate(delegate.check()).await,
             None => Self::manual_status(),
         };
         self.snapshot(status)
@@ -163,7 +186,9 @@ impl RemoteUpdateService {
 
     pub async fn install(&self) -> Result<RemoteUpdateSnapshot, Value> {
         match self.interactive_delegate() {
-            Some(delegate) => Ok(self.snapshot(delegate.request_install().await)),
+            Some(delegate) => {
+                Ok(self.snapshot(self.await_delegate(delegate.request_install()).await))
+            }
             None => Err(remote_update_manual_required_error()),
         }
     }
@@ -214,6 +239,22 @@ mod tests {
                     error: None,
                 }
             })
+        }
+    }
+
+    struct PendingHostUpdater;
+
+    impl RemoteUpdateDelegate for PendingHostUpdater {
+        fn status(&self) -> HostUpdaterFuture {
+            Box::pin(std::future::pending())
+        }
+
+        fn check(&self) -> HostUpdaterFuture {
+            Box::pin(std::future::pending())
+        }
+
+        fn request_install(&self) -> HostUpdaterFuture {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -281,6 +322,30 @@ mod tests {
             .await
             .expect("interactive install accepted");
         assert_eq!(installing.state, RemoteUpdateState::Installing);
+    }
+
+    #[tokio::test]
+    async fn hung_delegate_calls_return_typed_error_snapshots() {
+        let service = RemoteUpdateService::new(
+            "0.4.2".to_owned(),
+            interactive_support(),
+            Some(Arc::new(PendingHostUpdater)),
+        )
+        .with_delegate_timeout(std::time::Duration::from_millis(10));
+
+        let status = service.status().await;
+        assert_eq!(status.state, RemoteUpdateState::Error);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("Desktop updater did not respond within 30 seconds.")
+        );
+        let checked = service.check().await;
+        assert_eq!(checked.state, RemoteUpdateState::Error);
+        let installing = service
+            .install()
+            .await
+            .expect("interactive timeout is a typed status");
+        assert_eq!(installing.state, RemoteUpdateState::Error);
     }
 
     #[tokio::test]
