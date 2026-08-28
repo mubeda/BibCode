@@ -86,7 +86,7 @@ struct DesktopBootstrap {
 struct AuthState {
     sessions: HashMap<String, SessionRecord>,
     pairings: HashMap<String, PairingRecord>,
-    pairing_offer_idempotency: HashMap<String, StoredPairingOffer>,
+    pairing_offer_idempotency: HashMap<(String, String), StoredPairingOffer>,
     live_connections: HashMap<String, HashMap<u64, CancellationToken>>,
     next_connection_id: u64,
 }
@@ -774,6 +774,7 @@ impl AuthService {
 
     pub(crate) async fn replay_pairing_offer(
         &self,
+        principal_id: &str,
         key: &str,
         input_fingerprint: &str,
     ) -> PairingOfferReplay {
@@ -782,7 +783,8 @@ impl AuthService {
         state
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
-        match state.pairing_offer_idempotency.get(key) {
+        let lookup_key = (principal_id.to_owned(), key.to_owned());
+        match state.pairing_offer_idempotency.get(&lookup_key) {
             Some(stored) if stored.input_fingerprint == input_fingerprint => {
                 PairingOfferReplay::Original(stored.result.clone())
             }
@@ -793,13 +795,27 @@ impl AuthService {
 
     pub(crate) async fn record_pairing_offer(
         &self,
+        principal_id: &str,
         key: String,
         input_fingerprint: String,
         result: PairingOfferResult,
     ) -> Result<(), AuthError> {
         let expires_at_ms = parse_timestamp_ms(&result.expires_at)?;
-        self.state.lock().await.pairing_offer_idempotency.insert(
-            key,
+        let observed_at = now_ms();
+        let mut state = self.state.lock().await;
+        state
+            .pairing_offer_idempotency
+            .retain(|_, stored| stored.expires_at_ms > observed_at);
+        let lookup_key = (principal_id.to_owned(), key);
+        if !state.pairing_offer_idempotency.contains_key(&lookup_key)
+            && state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS
+        {
+            return Err(AuthError::Internal(
+                "pairing offer idempotency capacity exceeded".to_owned(),
+            ));
+        }
+        state.pairing_offer_idempotency.insert(
+            lookup_key,
             StoredPairingOffer {
                 input_fingerprint,
                 result,
@@ -829,10 +845,6 @@ impl AuthService {
                 session.subject == "one-time-token"
                     && session.revoked_at_ms.is_none()
                     && session.expires_at_ms > now
-                    && matches!(
-                        session.method.as_str(),
-                        "bearer-access-token" | "dpop-access-token"
-                    )
             })
             .map(|session| session.off_host);
         let mut off_host_grant_count = 0usize;
@@ -2435,5 +2447,140 @@ mod tests {
                 .await,
             Err(AuthError::Internal(message)) if message == "active session capacity exceeded"
         ));
+    }
+
+    #[tokio::test]
+    async fn pairing_offer_idempotency_is_scoped_to_the_authenticated_principal() {
+        let service = service();
+        let first = PairingOfferResult {
+            id: "offer-a".to_owned(),
+            code: "code-a".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.20:3773".to_owned(),
+            name: "Tablet A".to_owned(),
+            expires_at: format_iso(now_ms() + PAIRING_TTL_MS),
+        };
+        service
+            .record_pairing_offer(
+                "principal-a",
+                "shared-key".to_owned(),
+                "fingerprint-a".to_owned(),
+                first.clone(),
+            )
+            .await
+            .expect("first principal records offer");
+
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal-a", "shared-key", "fingerprint-a")
+                .await,
+            PairingOfferReplay::Original(result) if result.id == first.id
+        ));
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal-a", "shared-key", "different-input")
+                .await,
+            PairingOfferReplay::Conflict
+        ));
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal-b", "shared-key", "fingerprint-a")
+                .await,
+            PairingOfferReplay::Fresh
+        ));
+
+        let second = PairingOfferResult {
+            id: "offer-b".to_owned(),
+            code: "code-b".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.21:3773".to_owned(),
+            name: "Tablet B".to_owned(),
+            expires_at: format_iso(now_ms() + PAIRING_TTL_MS),
+        };
+        service
+            .record_pairing_offer(
+                "principal-b",
+                "shared-key".to_owned(),
+                "fingerprint-b".to_owned(),
+                second.clone(),
+            )
+            .await
+            .expect("second principal records its own offer");
+        assert!(matches!(
+            service
+                .replay_pairing_offer("principal-b", "shared-key", "fingerprint-b")
+                .await,
+            PairingOfferReplay::Original(result) if result.id == second.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn pairing_offer_idempotency_prunes_expired_entries_and_caps_memory() {
+        let service = service();
+        let now = now_ms();
+        {
+            let mut state = service.state.lock().await;
+            for index in 0..MAX_ACTIVE_PAIRINGS {
+                let id = format!("offer-{index}");
+                state.pairing_offer_idempotency.insert(
+                    (format!("principal-{index}"), format!("key-{index}")),
+                    StoredPairingOffer {
+                        input_fingerprint: format!("fingerprint-{index}"),
+                        result: PairingOfferResult {
+                            id,
+                            code: format!("code-{index}"),
+                            reach: "another-device".to_owned(),
+                            endpoint: "http://192.168.1.20:3773".to_owned(),
+                            name: format!("Client {index}"),
+                            expires_at: format_iso(now + PAIRING_TTL_MS),
+                        },
+                        expires_at_ms: now + PAIRING_TTL_MS,
+                    },
+                );
+            }
+        }
+
+        let overflow = PairingOfferResult {
+            id: "overflow".to_owned(),
+            code: "overflow-code".to_owned(),
+            reach: "another-device".to_owned(),
+            endpoint: "http://192.168.1.21:3773".to_owned(),
+            name: "Overflow client".to_owned(),
+            expires_at: format_iso(now + PAIRING_TTL_MS),
+        };
+        assert!(matches!(
+            service
+                .record_pairing_offer(
+                    "overflow-principal",
+                    "overflow-key".to_owned(),
+                    "overflow-fingerprint".to_owned(),
+                    overflow.clone(),
+                )
+                .await,
+            Err(AuthError::Internal(message))
+                if message == "pairing offer idempotency capacity exceeded"
+        ));
+
+        service
+            .state
+            .lock()
+            .await
+            .pairing_offer_idempotency
+            .get_mut(&("principal-0".to_owned(), "key-0".to_owned()))
+            .expect("idempotency fixture")
+            .expires_at_ms = now - 1;
+        service
+            .record_pairing_offer(
+                "overflow-principal",
+                "overflow-key".to_owned(),
+                "overflow-fingerprint".to_owned(),
+                overflow,
+            )
+            .await
+            .expect("expired idempotency entry frees capacity");
+        assert_eq!(
+            service.state.lock().await.pairing_offer_idempotency.len(),
+            MAX_ACTIVE_PAIRINGS
+        );
     }
 }

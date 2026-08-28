@@ -539,6 +539,107 @@ async fn pairing_offer_persists_reach_onto_the_minted_grant() {
 }
 
 #[tokio::test]
+async fn browser_pairing_session_keeps_off_host_exposure_until_revoked() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator);
+
+    let offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(administrator_token)
+            .json(&json!({
+                "name": "Tablet browser",
+                "endpoint": "http://192.168.1.20:3773",
+                "reach": "another-device",
+            }))
+            .send()
+            .await
+            .expect("pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    let payload = bibcode_server::auth_pairing_code::decode_pairing_code(
+        offer["code"].as_str().expect("pairing code"),
+    )
+    .expect("pairing code decodes");
+
+    let browser_session = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/browser-session"))
+            .json(&json!({ "credential": payload.token }))
+            .send()
+            .await
+            .expect("browser pairing exchange"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(browser_session["sessionMethod"], "browser-session-cookie");
+
+    let state = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("share state after browser pairing"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(state["desiredExposure"], "wide");
+    assert_eq!(state["offHostGrantCount"], 1);
+
+    let clients = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/clients"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("list clients"),
+        StatusCode::OK,
+    )
+    .await;
+    let browser_session_id = clients
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["method"] == "browser-session-cookie")
+        })
+        .and_then(|item| item["sessionId"].as_str())
+        .expect("browser session id");
+    let revoked = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/clients/revoke"))
+            .bearer_auth(administrator_token)
+            .json(&json!({ "sessionId": browser_session_id }))
+            .send()
+            .await
+            .expect("revoke browser session"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(revoked["revoked"], true);
+
+    let state = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("share state after revocation"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(state["desiredExposure"], "loopback");
+    assert_eq!(state["offHostGrantCount"], 0);
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn loopback_custom_offers_never_flip_desired_exposure_wide() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
