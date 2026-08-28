@@ -8,6 +8,7 @@ import {
   buildPairingDeepLink,
   encodePairingCode,
   parsePairingCode,
+  resolvePairingDeepLinkCode,
 } from "./pairingCode.ts";
 
 const payload: RemotePairingCodePayload = {
@@ -28,11 +29,25 @@ describe("pairingCode", () => {
   it("parses the deep-link and browser-url forms", () => {
     const code = encodePairingCode(payload);
     expect(parsePairingCode(buildPairingDeepLink(code))).toEqual(payload);
+    expect(parsePairingCode(`bibcode:/pair?code=${code}`)).toEqual(payload);
     expect(parsePairingCode(buildBrowserPairUrl(payload.endpoint, code))).toEqual(payload);
     expect(buildPairingDeepLink(code)).toBe(`bibcode://pair?code=${code}`);
     expect(buildBrowserPairUrl(payload.endpoint, code)).toBe(
       `http://192.168.1.20:3773/pair?code=${code}`,
     );
+    expect(() => parsePairingCode(`bibcode://other?code=${code}`)).toThrow(PairingCodeParseError);
+  });
+
+  it.each([
+    ["bibcode://pair?code=abc123-_", "abc123-_"],
+    ["bibcode:/pair?code=abc123-_", "abc123-_"],
+    ["https://pair?code=abc123-_", null],
+    ["bibcode://other?code=abc123-_", null],
+    ["bibcode:/other?code=abc123-_", null],
+    ["bibcode://pair", null],
+    ["not a url", null],
+  ])("resolves pairing deep link %s", (rawUrl, expected) => {
+    expect(resolvePairingDeepLinkCode(rawUrl)).toBe(expected);
   });
 
   it("classifies an unknown version as unsupported", () => {

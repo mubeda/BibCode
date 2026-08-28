@@ -16,10 +16,12 @@ import {
   type SupervisorConnectionState,
 } from "./model.ts";
 import {
+  DESKTOP_LOCAL_CONNECTION_ID_PREFIX,
   connectionCatalogDisplayUrl,
   connectionPhaseMessage,
   connectionStatusText,
   connectionTransportSecurity,
+  isDesktopLocalConnectionId,
   presentEnvironmentConnection,
   presentConnectionState,
 } from "./presentation.ts";
@@ -59,6 +61,13 @@ function supervisorState(overrides: Partial<SupervisorConnectionState>): Supervi
 }
 
 describe("connection presentation", () => {
+  it("owns the desktop-local connection id convention", () => {
+    expect(DESKTOP_LOCAL_CONNECTION_ID_PREFIX).toBe("local:");
+    expect(isDesktopLocalConnectionId("local:wsl:Ubuntu")).toBe(true);
+    expect(isDesktopLocalConnectionId("bearer:remote")).toBe(false);
+    expect(isDesktopLocalConnectionId(undefined)).toBe(false);
+  });
+
   it("classifies local, authenticated-channel, and legacy plaintext transports", () => {
     const entry = (
       target: ConnectionCatalogEntry["target"],

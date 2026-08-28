@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
@@ -199,6 +200,7 @@ const failureReason = <R>(effect: Effect.Effect<unknown, PairingFailure, R>) =>
         : undefined,
     ),
   );
+const isPairingAddError = Schema.is(PairingAddError);
 
 describe("verifyAndAddPairingCode", () => {
   it.effect("requires explicit acknowledgement before dialing loopback codes", () =>
@@ -338,7 +340,13 @@ describe("verifyAndAddPairingCode", () => {
   it.effect("requires authenticated storage identity to match the pairing payload", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ authenticatedStorageInstanceId: "different-store" });
-      expect(yield* failureReason(harness.run(validPayload()))).toBe("host-identity-mismatch");
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(PairingAddError);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error).toMatchObject({ reason: "host-identity-mismatch" });
+      expect(error.detail).toContain(
+        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
+      );
       expect(harness.registrations).toEqual([]);
     }),
   );
@@ -348,7 +356,12 @@ describe("verifyAndAddPairingCode", () => {
       const harness = yield* makeHarness({
         configEnvironmentId: EnvironmentId.make("environment-impostor"),
       });
-      expect(yield* failureReason(harness.run(validPayload()))).toBe("host-identity-mismatch");
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("host-identity-mismatch");
+      expect(error.detail).toContain(
+        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
+      );
       expect(harness.registrations).toEqual([]);
     }),
   );

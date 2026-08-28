@@ -67,6 +67,9 @@ export interface VerifyPairingCodeInput {
 }
 
 const IDENTITY_MISMATCH_DETAIL = "The server behind this endpoint does not match the pairing code.";
+const POST_BOOTSTRAP_REVOCATION_DETAIL =
+  "This pairing attempt may still appear in the server's client list; revoke it there before retrying.";
+const POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL = `${IDENTITY_MISMATCH_DETAIL} ${POST_BOOTSTRAP_REVOCATION_DETAIL}`;
 const isPairingCodeParseError = Schema.is(PairingCodeParseError);
 const isPairingCodeUnsupportedVersionError = Schema.is(PairingCodeUnsupportedVersionError);
 const isPairingAddError = Schema.is(PairingAddError);
@@ -207,7 +210,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       ) {
         return yield* new PairingAddError({
           reason: "host-identity-mismatch",
-          detail: IDENTITY_MISMATCH_DETAIL,
+          detail: POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL,
         });
       }
       const config = yield* session.initialConfig;
@@ -217,7 +220,7 @@ export const verifyAndAddPairingCode = Effect.fn(
       ) {
         return yield* new PairingAddError({
           reason: "host-identity-mismatch",
-          detail: IDENTITY_MISMATCH_DETAIL,
+          detail: POST_BOOTSTRAP_IDENTITY_MISMATCH_DETAIL,
         });
       }
       return {

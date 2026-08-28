@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { resolvePairingDeepLinkCode } from "@bibcode/shared/pairingCode";
 
 import { resolvePairingDeepLink } from "./desktopDeepLink";
 
@@ -7,6 +8,7 @@ describe("resolvePairingDeepLink", () => {
     expect(resolvePairingDeepLink("bibcode://pair?code=abc123-_")).toEqual({
       code: "abc123-_",
     });
+    expect(resolvePairingDeepLinkCode("bibcode:/pair?code=abc123-_")).toBe("abc123-_");
   });
 
   it("rejects other schemes, hosts, and codeless links", () => {

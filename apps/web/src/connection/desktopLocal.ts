@@ -1,4 +1,8 @@
-import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
+import {
+  DESKTOP_LOCAL_CONNECTION_ID_PREFIX,
+  isDesktopLocalConnectionId,
+  type ConnectionTarget,
+} from "@bibcode/client-runtime/connection";
 import {
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   type DesktopBridge,
@@ -17,7 +21,7 @@ import {
  * via {@link isDesktopLocalConnectionTarget}, so the convention can never drift
  * between the two.
  */
-export const DESKTOP_LOCAL_CONNECTION_ID_PREFIX = "local:";
+export { DESKTOP_LOCAL_CONNECTION_ID_PREFIX } from "@bibcode/client-runtime/connection";
 
 export function desktopLocalConnectionId(backendId: string): string {
   return `${DESKTOP_LOCAL_CONNECTION_ID_PREFIX}${backendId}`;
@@ -31,7 +35,7 @@ export function isDesktopLocalConnectionTarget(
 > {
   return (
     (target._tag === "BearerConnectionTarget" || target._tag === "UnavailableConnectionTarget") &&
-    target.connectionId.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX)
+    isDesktopLocalConnectionId(target.connectionId)
   );
 }
 

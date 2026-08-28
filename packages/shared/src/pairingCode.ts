@@ -48,13 +48,33 @@ export function encodePairingCode(payload: RemotePairingCodePayload): string {
   return base64UrlEncode(JSON.stringify(payload));
 }
 
+export function resolvePairingDeepLinkCode(rawUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "bibcode:") return null;
+  const isAuthorityForm = url.hostname === "pair" && (url.pathname === "" || url.pathname === "/");
+  const isPathForm = url.hostname === "" && url.pathname === "/pair";
+  if (!isAuthorityForm && !isPathForm) return null;
+  const code = url.searchParams.get("code")?.trim() ?? "";
+  return code.length > 0 ? code : null;
+}
+
 function extractCode(raw: string): string {
   const trimmed = raw.trim();
-  if (
-    trimmed.startsWith("bibcode://") ||
-    trimmed.startsWith("http://") ||
-    trimmed.startsWith("https://")
-  ) {
+  if (trimmed.toLowerCase().startsWith("bibcode:")) {
+    const code = resolvePairingDeepLinkCode(trimmed);
+    if (code === null) {
+      throw new PairingCodeParseError({
+        detail: "the URL is not a pairing link or carries no code",
+      });
+    }
+    return code;
+  }
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
     let url: URL;
     try {
       url = new URL(trimmed);
@@ -99,13 +119,15 @@ export function parsePairingCode(raw: string): RemotePairingCodePayload {
 }
 
 export function buildPairingDeepLink(code: string): string {
-  return `bibcode://pair?code=${code}`;
+  const query = new URLSearchParams({ code });
+  return `bibcode://pair?${query.toString()}`;
 }
 
 export function buildBrowserPairUrl(endpoint: string, code: string): string {
   const url = new URL(endpoint);
   url.pathname = "/pair";
-  url.search = `code=${code}`;
+  url.search = "";
+  url.searchParams.set("code", code);
   url.hash = "";
   return url.toString();
 }

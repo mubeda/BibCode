@@ -1,11 +1,7 @@
 import { describe, expect, it, vi } from "@effect/vitest";
+import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
-import {
-  buildBrowserPairUrl,
-  buildPairDeepLink,
-  generateShareOffer,
-  resolveShareAddressOptions,
-} from "./shareOffer.ts";
+import { generateShareOffer, resolveShareAddressOptions } from "./shareOffer.ts";
 
 const wideState = {
   mode: "network-accessible" as const,
@@ -30,7 +26,7 @@ const defaultDeps = {
 
 describe("share offer links", () => {
   it("builds the deep link and browser URL from one code", () => {
-    expect(buildPairDeepLink("abc123")).toBe("bibcode://pair?code=abc123");
+    expect(buildPairingDeepLink("abc123")).toBe("bibcode://pair?code=abc123");
     expect(buildBrowserPairUrl("http://192.168.1.20:3773", "abc123")).toBe(
       "http://192.168.1.20:3773/pair?code=abc123",
     );

@@ -1,19 +1,10 @@
 import { useNavigate } from "@tanstack/react-router";
+import { resolvePairingDeepLinkCode } from "@bibcode/shared/pairingCode";
 import { useEffect } from "react";
 
 export function resolvePairingDeepLink(rawUrl: string): { readonly code: string } | null {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "bibcode:") return null;
-  const isPairTarget =
-    url.hostname === "pair" || url.pathname === "/pair" || url.pathname === "//pair";
-  if (!isPairTarget) return null;
-  const code = url.searchParams.get("code")?.trim() ?? "";
-  return code.length > 0 ? { code } : null;
+  const code = resolvePairingDeepLinkCode(rawUrl);
+  return code === null ? null : { code };
 }
 
 /** Mounted once by the root route in desktop mode; renders nothing. */
