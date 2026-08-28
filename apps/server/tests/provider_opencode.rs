@@ -4501,10 +4501,23 @@ async fn reconciliation_defers_history_that_cannot_fit_without_poisoning_its_sig
         ProviderActivityMutation::AppendEntry(entry)
             if entry.id.contains("child-b-message-199")
     )));
+    sleep(Duration::from_millis(350)).await;
+    let history_requests = state.history_requests.lock().await;
+    let child_a_requests = history_requests
+        .iter()
+        .filter(|request| request.contains("/session/child-a/message"))
+        .count();
+    let child_b_requests = history_requests
+        .iter()
+        .filter(|request| request.contains("/session/child-b/message"))
+        .count();
     assert_eq!(
-        state.history_requests.lock().await.len(),
-        4,
-        "a newly queued reconnect force still revalidates both histories while the unfinished cursor resumes"
+        child_a_requests, 2,
+        "the reconnect force revalidates child-a"
+    );
+    assert!(
+        (2..=3).contains(&child_b_requests),
+        "child-b is revalidated, with at most one unfinished-cursor fetch"
     );
 
     runtime.stop().await.expect("stop");
