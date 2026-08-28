@@ -9,6 +9,7 @@ import {
   AuthClientSessionRevokeResult,
   AuthEnvironmentBootstrapTokenType,
   AuthPairingOfferResult,
+  AuthPairingOfferCancellationResult,
   AuthSessionState,
   AuthShareStateResult,
   AuthTokenExchangeGrantType,
@@ -43,6 +44,9 @@ const decodeClientSessions = Schema.decodeUnknownSync(
   Schema.toCodecJson(Schema.Array(AuthClientSession)),
 );
 const decodePairingOffer = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingOfferResult));
+const decodePairingOfferCancellation = Schema.decodeUnknownSync(
+  Schema.toCodecJson(AuthPairingOfferCancellationResult),
+);
 const decodeSession = Schema.decodeUnknownSync(Schema.toCodecJson(AuthSessionState));
 
 const RpcSuccess = Schema.TaggedStruct("Exit", {
@@ -220,6 +224,52 @@ async function assertBrowserPairingRetainsAndRevokesExposure(
   });
 }
 
+async function assertAmbiguousOfferCancellation(administrator: string): Promise<void> {
+  const idempotencyKey = "docker-lost-response";
+  const create = () =>
+    fetch(`${serverUrl!}/api/auth/pairing-offer`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${administrator}`,
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify({
+        name: "docker-cancelled",
+        endpoint: serverUrl,
+        reach: "another-device",
+      }),
+    });
+  const created = await create();
+  expect(created.ok).toBe(true);
+  decodePairingOffer(await created.json());
+  expect(await shareState(administrator)).toMatchObject({
+    desiredExposure: "wide",
+    offHostGrantCount: 1,
+  });
+
+  const cancelled = decodePairingOfferCancellation(
+    await fetchJson("/api/auth/pairing-offer/cancel", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${administrator}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ idempotencyKey }),
+    }),
+  );
+  expect(cancelled.cancelled).toBe(true);
+  expect(await shareState(administrator)).toEqual({
+    desiredExposure: "loopback",
+    offHostGrantCount: 0,
+    legacyGrantCount: 0,
+  });
+
+  const delayed = await create();
+  expect(delayed.status).toBe(400);
+  expect(await delayed.json()).toMatchObject({ reason: "invalid_pairing_offer" });
+}
+
 describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
   "remote server Docker boundary",
   () => {
@@ -244,6 +294,7 @@ describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
       await assertRemoteUpdateRpc(channel);
       channel.close();
       await assertBrowserPairingRetainsAndRevokesExposure(administrator, e2eeLabel);
+      await assertAmbiguousOfferCancellation(administrator);
     }, 60_000);
   },
 );
