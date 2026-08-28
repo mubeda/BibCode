@@ -70,7 +70,12 @@ export function resolveShareAddressOptions(input: {
 export type GenerateShareOfferFailure =
   | { readonly kind: "invalid-address"; readonly message: string }
   | { readonly kind: "widen-failed"; readonly message: string }
-  | { readonly kind: "mint-failed"; readonly message: string; readonly widened: boolean };
+  | {
+      readonly kind: "mint-failed";
+      readonly message: string;
+      readonly widened: boolean;
+      readonly cleanup: "not-needed" | "restored" | "failed";
+    };
 
 export interface GeneratedShareOffer {
   readonly code: string;
@@ -101,6 +106,9 @@ export interface GenerateShareOfferDeps {
   }) => Promise<{ code: string; endpoint: string; name: string; expiresAt: string }>;
   readonly newIdempotencyKey: () => string;
   readonly classifyMintError: (error: unknown) => "retryable" | "fatal";
+  readonly cleanupExposureAfterFailedMint:
+    | null
+    | (() => Promise<"unchanged" | "narrowed" | "rewidened">);
   readonly sleep: (ms: number) => Promise<void>;
 }
 
@@ -213,13 +221,27 @@ export async function generateShareOffer(
     }
   }
 
+  let cleanup: "not-needed" | "restored" | "failed" = "not-needed";
+  let message =
+    lastError instanceof Error ? lastError.message : "Could not create the pairing offer.";
+  if (widened && deps.cleanupExposureAfterFailedMint !== null) {
+    try {
+      const outcome = await deps.cleanupExposureAfterFailedMint();
+      cleanup = outcome === "narrowed" ? "restored" : "not-needed";
+    } catch (error) {
+      cleanup = "failed";
+      const cleanupMessage = error instanceof Error ? error.message : String(error);
+      message = `${message} Remote-access cleanup failed: ${cleanupMessage}`;
+    }
+  }
+
   return {
     ok: false,
     failure: {
       kind: "mint-failed",
       widened,
-      message:
-        lastError instanceof Error ? lastError.message : "Could not create the pairing offer.",
+      cleanup,
+      message,
     },
   };
 }

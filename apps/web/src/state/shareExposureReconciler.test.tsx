@@ -43,7 +43,25 @@ vi.mock("./desktopNetworkAccess", () => ({
   refreshDesktopNetworkAccessState: h.refreshNetwork,
 }));
 
-import { shouldRevertExposure, useShareExposureReconciler } from "./shareExposureReconciler";
+import {
+  reconcileShareExposureOnce,
+  shouldRevertExposure,
+  useShareExposureReconciler,
+} from "./shareExposureReconciler";
+
+const localExposure = {
+  mode: "local-only" as const,
+  endpointUrl: null,
+  advertisedHost: null,
+  tailscaleServeEnabled: false,
+  tailscaleServePort: 443,
+};
+const wideExposure = {
+  ...localExposure,
+  mode: "network-accessible" as const,
+  endpointUrl: "http://192.168.1.20:3773",
+  advertisedHost: "192.168.1.20",
+};
 
 describe("shouldRevertExposure", () => {
   const loopbackDesired = {
@@ -80,6 +98,66 @@ describe("shouldRevertExposure", () => {
         exposureMode: "network-accessible",
       }),
     ).toBe(false);
+  });
+});
+
+describe("reconcileShareExposureOnce", () => {
+  const loopbackDesired = {
+    desiredExposure: "loopback" as const,
+    offHostGrantCount: 0,
+    legacyGrantCount: 0,
+  };
+
+  beforeEach(() => h.refreshNetwork.mockReset());
+
+  it("narrows a stale wide exposure and confirms the post-apply share state", async () => {
+    const getShareState = vi.fn(async () => loopbackDesired);
+    const applyExposure = vi.fn(async () => localExposure);
+
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState,
+        getExposureState: async () => wideExposure,
+        applyExposure,
+      }),
+    ).resolves.toBe("narrowed");
+    expect(getShareState).toHaveBeenCalledTimes(2);
+    expect(applyExposure).toHaveBeenCalledExactlyOnceWith("local-only");
+    expect(h.refreshNetwork).toHaveBeenCalledOnce();
+  });
+
+  it("re-widens when an off-host grant appears during narrowing", async () => {
+    const getShareState = vi.fn().mockResolvedValueOnce(loopbackDesired).mockResolvedValueOnce({
+      desiredExposure: "wide",
+      offHostGrantCount: 1,
+      legacyGrantCount: 0,
+    });
+    const applyExposure = vi.fn(async (desired: "local-only" | "network-accessible") =>
+      desired === "local-only" ? localExposure : wideExposure,
+    );
+
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState,
+        getExposureState: async () => wideExposure,
+        applyExposure,
+      }),
+    ).resolves.toBe("rewidened");
+    expect(applyExposure.mock.calls).toEqual([["local-only"], ["network-accessible"]]);
+    expect(h.refreshNetwork).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves wide exposure unchanged while a legacy grant blocks narrowing", async () => {
+    const applyExposure = vi.fn();
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState: async () => ({ ...loopbackDesired, legacyGrantCount: 1 }),
+        getExposureState: async () => wideExposure,
+        applyExposure,
+      }),
+    ).resolves.toBe("unchanged");
+    expect(applyExposure).not.toHaveBeenCalled();
+    expect(h.refreshNetwork).not.toHaveBeenCalled();
   });
 });
 
@@ -139,7 +217,7 @@ describe("useShareExposureReconciler", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(h.getShareState).toHaveBeenCalledTimes(2);
+    expect(h.getShareState).toHaveBeenCalledTimes(3);
     expect(applyServerExposure).toHaveBeenCalledExactlyOnceWith("local-only");
     expect(h.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ type: "info", title: "Remote access switched off" }),

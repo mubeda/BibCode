@@ -1,4 +1,5 @@
 import { act, type ReactNode } from "react";
+import type { DesktopServerExposureMode, DesktopServerExposureState } from "@bibcode/contracts";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import * as DateTime from "effect/DateTime";
@@ -130,10 +131,15 @@ const wideState = {
   advertisedHost: "192.168.1.20",
 };
 
-function installBridge(applyServerExposure = vi.fn(async () => wideState)) {
+function installBridge(
+  applyServerExposure = vi.fn<
+    (desired: DesktopServerExposureMode) => Promise<DesktopServerExposureState>
+  >(async () => wideState),
+  getServerExposureState = vi.fn<() => Promise<DesktopServerExposureState>>(async () => wideState),
+) {
   Object.defineProperty(window, "desktopBridge", {
     configurable: true,
-    value: { applyServerExposure },
+    value: { applyServerExposure, getServerExposureState },
   });
   return applyServerExposure;
 }
@@ -253,6 +259,50 @@ describe("ShareThisHostTab", () => {
     await click("Generate pairing offer");
     expect(h.createOffer).not.toHaveBeenCalled();
     expect(container.textContent).toContain("bind failed");
+  });
+
+  it("reports completed local-only restoration when minting fails after widening", async () => {
+    const apply = installBridge(
+      vi.fn(async (desired: "local-only" | "network-accessible") =>
+        desired === "local-only" ? localState : wideState,
+      ),
+    );
+    h.createOffer.mockRejectedValue(
+      Object.assign(new Error("mint failed"), {
+        cause: { _tag: "EnvironmentRequestInvalidError" },
+      }),
+    );
+
+    await renderTab();
+    await click("Generate pairing offer");
+
+    expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
+    expect(container.textContent).toContain(
+      "The offer was not created. Remote access was restored to local-only.",
+    );
+    expect(container.textContent).not.toContain("will switch off again automatically");
+  });
+
+  it("reports when minting and the direct exposure cleanup both fail", async () => {
+    installBridge(
+      vi.fn(async (desired: "local-only" | "network-accessible") => {
+        if (desired === "local-only") throw new Error("firewall cleanup failed");
+        return wideState;
+      }),
+    );
+    h.createOffer.mockRejectedValue(
+      Object.assign(new Error("mint failed"), {
+        cause: { _tag: "EnvironmentRequestInvalidError" },
+      }),
+    );
+
+    await renderTab();
+    await click("Generate pairing offer");
+
+    expect(container.textContent).toContain(
+      "The offer was not created, and remote-access cleanup also failed. Review Exposure and retry cleanup.",
+    );
+    expect(container.textContent).not.toContain("will switch off again automatically");
   });
 
   it("creates a loopback offer without touching exposure", async () => {

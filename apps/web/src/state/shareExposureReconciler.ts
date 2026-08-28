@@ -3,6 +3,7 @@ import type {
   AuthShareStateResult,
   DesktopBridge,
   DesktopServerExposureMode,
+  DesktopServerExposureState,
   EnvironmentId,
 } from "@bibcode/contracts";
 import { useCallback, useEffect, useRef } from "react";
@@ -23,6 +24,37 @@ export function shouldRevertExposure(input: {
     input.shareState.desiredExposure === "loopback" &&
     input.shareState.legacyGrantCount === 0
   );
+}
+
+export interface ShareExposureOperations {
+  readonly getShareState: () => Promise<AuthShareStateResult>;
+  readonly getExposureState: () => Promise<DesktopServerExposureState>;
+  readonly applyExposure: (
+    desired: DesktopServerExposureMode,
+  ) => Promise<DesktopServerExposureState>;
+}
+
+export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "rewidened";
+
+export async function reconcileShareExposureOnce(
+  operations: ShareExposureOperations,
+): Promise<ShareExposureReconciliationOutcome> {
+  const [shareState, exposureState] = await Promise.all([
+    operations.getShareState(),
+    operations.getExposureState(),
+  ]);
+  if (!shouldRevertExposure({ shareState, exposureMode: exposureState.mode })) {
+    return "unchanged";
+  }
+
+  await operations.applyExposure("local-only");
+  refreshDesktopNetworkAccessState();
+  const confirmedShareState = await operations.getShareState();
+  if (confirmedShareState.desiredExposure !== "wide") return "narrowed";
+
+  await operations.applyExposure("network-accessible");
+  refreshDesktopNetworkAccessState();
+  return "rewidened";
 }
 
 interface ReconcileTarget {
@@ -53,26 +85,21 @@ export function useShareExposureReconciler(): void {
       while (requestedRef.current) {
         requestedRef.current = false;
         const target = targetRef.current;
+        const targetBridge = target.bridge;
         if (
-          target.bridge?.applyServerExposure === undefined ||
-          target.bridge.getServerExposureState === undefined ||
+          targetBridge?.applyServerExposure === undefined ||
+          targetBridge.getServerExposureState === undefined ||
           target.primaryEnvironmentId === null
         ) {
           continue;
         }
         try {
-          const [shareState, exposureState] = await Promise.all([
-            getServerShareState(),
-            target.bridge.getServerExposureState(),
-          ]);
-          if (
-            shouldRevertExposure({
-              shareState,
-              exposureMode: exposureState.mode,
-            })
-          ) {
-            await target.bridge.applyServerExposure("local-only");
-            refreshDesktopNetworkAccessState();
+          const outcome = await reconcileShareExposureOnce({
+            getShareState: getServerShareState,
+            getExposureState: () => targetBridge.getServerExposureState(),
+            applyExposure: (desired) => targetBridge.applyServerExposure(desired),
+          });
+          if (outcome === "narrowed") {
             toastManager.add({
               type: "info",
               title: "Remote access switched off",

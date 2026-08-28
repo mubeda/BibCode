@@ -21,6 +21,7 @@ const loopbackState = {
 const defaultDeps = {
   newIdempotencyKey: () => "key-1",
   classifyMintError: (): "retryable" | "fatal" => "retryable",
+  cleanupExposureAfterFailedMint: null,
   sleep: async () => {},
 };
 
@@ -181,6 +182,93 @@ describe("generateShareOffer", () => {
     expect(mintOffer).toHaveBeenCalledTimes(5);
     expect(sleep).toHaveBeenCalledTimes(4);
     expect(result).toMatchObject({ ok: false, failure: { kind: "mint-failed" } });
+  });
+
+  it("restores local-only exposure after widening when every mint attempt fails", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const mintOffer = vi.fn(async () => {
+      throw new Error("still unreachable");
+    });
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer,
+      ...defaultDeps,
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(mintOffer).toHaveBeenCalledTimes(5);
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "mint-failed", widened: true, cleanup: "restored" },
+    });
+  });
+
+  it("reports a failed exposure cleanup alongside the mint error", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => {
+      throw new Error("firewall cleanup failed");
+    });
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("mint failed");
+      },
+      ...defaultDeps,
+      classifyMintError: () => "fatal",
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: {
+        kind: "mint-failed",
+        widened: true,
+        cleanup: "failed",
+        message: expect.stringContaining("firewall cleanup failed"),
+      },
+    });
+  });
+
+  it("does not run exposure cleanup when the ceremony did not widen", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: {
+        id: "existing-wide",
+        label: "Existing wide endpoint",
+        httpBaseUrl: wideState.endpointUrl,
+      },
+      hasDesktopBridge: true,
+      exposureState: wideState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("mint failed");
+      },
+      ...defaultDeps,
+      classifyMintError: () => "fatal",
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "mint-failed", widened: false, cleanup: "not-needed" },
+    });
   });
 
   it("classifies a loopback custom address without widening", async () => {

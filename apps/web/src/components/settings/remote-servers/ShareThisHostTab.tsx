@@ -19,6 +19,7 @@ import {
   usePrimaryEnvironmentId,
 } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
+import { reconcileShareExposureOnce } from "~/state/shareExposureReconciler";
 import { randomUUID } from "~/lib/utils";
 
 import { Button } from "../../ui/button";
@@ -150,6 +151,15 @@ export function ShareThisHostTab(): ReactElement {
       },
       newIdempotencyKey: randomUUID,
       classifyMintError,
+      cleanupExposureAfterFailedMint:
+        !hasDesktopBridge || desktopBridge === undefined
+          ? null
+          : () =>
+              reconcileShareExposureOnce({
+                getShareState: getServerShareState,
+                getExposureState: () => desktopBridge.getServerExposureState(),
+                applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
+              }),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     });
     if (result.ok) setOffer(result.offer);
@@ -169,7 +179,16 @@ export function ShareThisHostTab(): ReactElement {
   ]);
 
   const customAddressError = failure?.kind === "invalid-address" ? failure.message : null;
-  const sectionError = failure?.kind === "invalid-address" ? null : (failure?.message ?? null);
+  const sectionError =
+    failure === null || failure.kind === "invalid-address"
+      ? null
+      : failure.kind !== "mint-failed"
+        ? failure.message
+        : failure.cleanup === "restored"
+          ? "The offer was not created. Remote access was restored to local-only."
+          : failure.cleanup === "failed"
+            ? "The offer was not created, and remote-access cleanup also failed. Review Exposure and retry cleanup."
+            : failure.message;
 
   return (
     <>
@@ -276,14 +295,7 @@ export function ShareThisHostTab(): ReactElement {
             stop.
           </p>
         ) : null}
-        {sectionError ? (
-          <p className="mx-4 mb-3 text-xs text-destructive">
-            {sectionError}
-            {failure?.kind === "mint-failed" && failure.widened
-              ? " Remote access will switch off again automatically because no offer was created."
-              : ""}
-          </p>
-        ) : null}
+        {sectionError ? <p className="mx-4 mb-3 text-xs text-destructive">{sectionError}</p> : null}
         <div className="px-4 pb-4">
           <Button
             disabled={isGenerating || selectedOption === null}
