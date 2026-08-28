@@ -375,6 +375,11 @@ export const AuthCreatePairingOfferInput = Schema.Struct({
 });
 export type AuthCreatePairingOfferInput = typeof AuthCreatePairingOfferInput.Type;
 
+export const AuthCancelPairingOfferInput = Schema.Struct({
+  idempotencyKey: TrimmedNonEmptyString,
+});
+export type AuthCancelPairingOfferInput = typeof AuthCancelPairingOfferInput.Type;
+
 export const AuthSessionState = Schema.Struct({
   authenticated: Schema.Boolean,
   auth: ServerAuthDescriptor,

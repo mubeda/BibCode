@@ -20,7 +20,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -55,7 +55,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -96,7 +96,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -125,7 +125,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -172,7 +172,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -219,7 +219,54 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
+        }
+      ]
+    },
+    {
+      "name": "cancelPairingOffer",
+      "method": "POST",
+      "path": "/api/auth/pairing-offer/cancel",
+      "requestContentTypes": ["application/json"],
+      "payloads": [
+        {
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "01c5b2929a2d618087a1aeb429dd116735a50933ba2670b03dc61de05c764433"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "a44ddf882651be30f045f99197fab6f26c0440e5725a12246fb1116b85d71e51"
+        }
+      ],
+      "errors": [
+        {
+          "status": 400,
+          "contentType": "application/json",
+          "schema": "EnvironmentRequestInvalidError",
+          "fingerprint": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5"
+        },
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -254,7 +301,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -289,7 +336,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -330,7 +377,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -365,7 +412,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -412,7 +459,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     },
@@ -447,7 +494,7 @@
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
-          "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f"
+          "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28"
         }
       ]
     }
@@ -485,7 +532,7 @@
       "schema": "EnvironmentInternalError",
       "status": 500,
       "contentType": "application/json",
-      "fingerprint": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f",
+      "fingerprint": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28",
       "fixture": "errors/internal.json"
     }
   ],
@@ -541,6 +588,10 @@
       "request": "requests/pairing-offer.json",
       "success": "responses/pairing-offer.json"
     },
+    "cancelPairingOffer": {
+      "request": "requests/pairing-offer-cancel.json",
+      "success": "responses/pairing-offer-cancel.json"
+    },
     "shareState": {
       "success": "responses/share-state.json"
     },
@@ -566,6 +617,7 @@
     "AuthAccessTokenResult": "cea8aabefb044f9daf941efa9e83f1d17d3817247c3e32a153f5765fca0891ad",
     "AuthBrowserSessionRequest": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44",
     "AuthBrowserSessionResult": "39abbe3526341131c33f73525739e84b4949ae9dba0abb1293359bec43dc5e90",
+    "AuthCancelPairingOfferInput": "01c5b2929a2d618087a1aeb429dd116735a50933ba2670b03dc61de05c764433",
     "AuthClientSession": "e2402f16655d3c72d1f22aabfd0bbf7b85143ac0d0b9f0b4894aaaa13dfcc023",
     "AuthClientSessionList": "4a5baec8f9d5a5f9492f76418765dadeb800268c26ce2f2cf0ea0f7d0a944b51",
     "AuthClientSessionRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
@@ -578,6 +630,7 @@
     "AuthPairingLink": "b1fbdcb84a2cb5fe669e0b40925a9148b307f83785d103899ef4c9bbbace560f",
     "AuthPairingLinkList": "8d97c692592cb80e7e4953113ae60b0290636657d54fde778c5b01461a00050a",
     "AuthPairingLinkRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
+    "AuthPairingOfferCancellationResult": "a44ddf882651be30f045f99197fab6f26c0440e5725a12246fb1116b85d71e51",
     "AuthPairingOfferResult": "c7167a19d245abb4c09550e140f3043f8d95fd56ceaf81c9c3ec4070056ca27e",
     "AuthRevokeClientSessionInput": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58",
     "AuthRevokePairingLinkInput": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968",
@@ -586,7 +639,7 @@
     "AuthTokenExchangeRequest": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7",
     "AuthWebSocketTicketResult": "4d4b514499bf6373a0812f5defaf5b880acb5d42ce3e057da68f5ab9c5c36a84",
     "EnvironmentAuthInvalidError": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",
-    "EnvironmentInternalError": "5f07f337a34799a4a866cdfa283f0fe186e818213244c021ec3a70168f16917f",
+    "EnvironmentInternalError": "2907e4e2d5e721642dc38d6343fd9ba2a421922880f03d0531715900ef4b8b28",
     "EnvironmentOperationForbiddenError": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2",
     "EnvironmentRequestInvalidError": "5e70b4b5f968528645fd25c426988023641a5266ab976d12672d25f9d4ce11a5",
     "EnvironmentScopeRequiredError": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
@@ -600,6 +653,7 @@
     "requests/browser-session.json",
     "requests/client-revoke.json",
     "requests/pairing-create.json",
+    "requests/pairing-offer-cancel.json",
     "requests/pairing-offer.json",
     "requests/pairing-revoke.json",
     "requests/token-form.txt",
@@ -609,6 +663,7 @@
     "responses/client-revoke.json",
     "responses/pairing-create.json",
     "responses/pairing-list.json",
+    "responses/pairing-offer-cancel.json",
     "responses/pairing-offer.json",
     "responses/pairing-revoke.json",
     "responses/session.json",

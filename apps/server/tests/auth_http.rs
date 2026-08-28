@@ -815,6 +815,89 @@ async fn revoking_a_client_terminates_its_live_websocket() {
 }
 
 #[tokio::test]
+async fn plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator);
+    let pairing = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(administrator_token)
+            .json(&json!({ "label": "Lifecycle client" }))
+            .send()
+            .await
+            .expect("pairing"),
+        StatusCode::OK,
+    )
+    .await;
+    let paired = exchange_token(
+        &client,
+        &handle,
+        pairing["credential"].as_str().expect("credential"),
+        None,
+    )
+    .await;
+    let paired_token = access_token(&paired);
+    let paired_ticket = websocket_ticket(&client, &handle, paired_token).await;
+    let (mut socket, _) = connect_async(format!(
+        "ws://{}/ws?wsTicket={paired_ticket}",
+        handle.local_addr()
+    ))
+    .await
+    .expect("paired WebSocket");
+
+    let clients = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/clients"))
+            .bearer_auth(administrator_token)
+            .send()
+            .await
+            .expect("clients"),
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = clients
+        .as_array()
+        .expect("clients array")
+        .iter()
+        .find(|session| session["current"] == false && session["connected"] == true)
+        .and_then(|session| session["sessionId"].as_str())
+        .expect("connected paired session")
+        .to_owned();
+
+    socket.close(None).await.expect("close paired WebSocket");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let clients = get_json(
+                client
+                    .get(http_url(&handle, "/api/auth/clients"))
+                    .bearer_auth(administrator_token)
+                    .send()
+                    .await
+                    .expect("clients after close"),
+                StatusCode::OK,
+            )
+            .await;
+            let disconnected = clients
+                .as_array()
+                .expect("clients array")
+                .iter()
+                .any(|session| session["sessionId"] == session_id && session["connected"] == false);
+            if disconnected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("closed WebSocket must be marked disconnected");
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
 async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
@@ -1427,6 +1510,96 @@ async fn pairing_offer_replays_are_idempotent_per_key() {
     .expect("conflicting mint");
     let conflict_body = get_json(conflicting, StatusCode::BAD_REQUEST).await;
     assert_eq!(conflict_body["reason"], "invalid_pairing_offer");
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_cancellation_revokes_committed_grants_and_tombstones_the_key() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let token_response = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&token_response);
+    let body = json!({
+        "name": "AI-SERVER",
+        "endpoint": "http://192.168.1.20:3773",
+        "reach": "another-device",
+    });
+
+    let offer = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .header("idempotency-key", "lost-response-key")
+            .json(&body)
+            .send()
+            .await
+            .expect("pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(offer["id"].is_string());
+
+    let cancelled = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer/cancel"))
+            .bearer_auth(token)
+            .json(&json!({ "idempotencyKey": "lost-response-key" }))
+            .send()
+            .await
+            .expect("cancel pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cancelled["cancelled"], true);
+
+    let share_state = get_json(
+        client
+            .get(http_url(&handle, "/api/auth/share-state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("share state"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(share_state["desiredExposure"], "loopback");
+    assert_eq!(share_state["offHostGrantCount"], 0);
+
+    let replay = client
+        .post(http_url(&handle, "/api/auth/pairing-offer"))
+        .bearer_auth(token)
+        .header("idempotency-key", "lost-response-key")
+        .json(&body)
+        .send()
+        .await
+        .expect("cancelled replay");
+    let replay_body = get_json(replay, StatusCode::BAD_REQUEST).await;
+    assert_eq!(replay_body["reason"], "invalid_pairing_offer");
+
+    let pre_cancelled = get_json(
+        client
+            .post(http_url(&handle, "/api/auth/pairing-offer/cancel"))
+            .bearer_auth(token)
+            .json(&json!({ "idempotencyKey": "cancel-before-create" }))
+            .send()
+            .await
+            .expect("pre-cancel pairing offer"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(pre_cancelled["cancelled"], false);
+    let delayed_create = client
+        .post(http_url(&handle, "/api/auth/pairing-offer"))
+        .bearer_auth(token)
+        .header("idempotency-key", "cancel-before-create")
+        .json(&body)
+        .send()
+        .await
+        .expect("delayed create");
+    let delayed_body = get_json(delayed_create, StatusCode::BAD_REQUEST).await;
+    assert_eq!(delayed_body["reason"], "invalid_pairing_offer");
+
     shutdown(handle).await;
 }
 

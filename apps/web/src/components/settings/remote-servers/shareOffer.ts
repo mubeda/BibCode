@@ -106,9 +106,10 @@ export interface GenerateShareOfferDeps {
   }) => Promise<{ code: string; endpoint: string; name: string; expiresAt: string }>;
   readonly newIdempotencyKey: () => string;
   readonly classifyMintError: (error: unknown) => "retryable" | "fatal";
+  readonly cancelOffer: (idempotencyKey: string) => Promise<void>;
   readonly cleanupExposureAfterFailedMint:
     | null
-    | (() => Promise<"unchanged" | "narrowed" | "rewidened">);
+    | (() => Promise<"unchanged" | "narrowed" | "widened" | "rewidened">);
   readonly sleep: (ms: number) => Promise<void>;
 }
 
@@ -224,7 +225,16 @@ export async function generateShareOffer(
   let cleanup: "not-needed" | "restored" | "failed" = "not-needed";
   let message =
     lastError instanceof Error ? lastError.message : "Could not create the pairing offer.";
-  if (widened && deps.cleanupExposureAfterFailedMint !== null) {
+  let cancellationSucceeded = false;
+  try {
+    await deps.cancelOffer(idempotencyKey);
+    cancellationSucceeded = true;
+  } catch (error) {
+    cleanup = "failed";
+    const cancellationMessage = error instanceof Error ? error.message : String(error);
+    message = `${message} Pairing-offer cancellation failed: ${cancellationMessage}`;
+  }
+  if (cancellationSucceeded && widened && deps.cleanupExposureAfterFailedMint !== null) {
     try {
       const outcome = await deps.cleanupExposureAfterFailedMint();
       cleanup = outcome === "narrowed" ? "restored" : "not-needed";

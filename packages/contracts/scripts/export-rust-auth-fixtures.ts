@@ -15,6 +15,7 @@ import {
   AuthAdministrativeScopes,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -37,6 +38,7 @@ import {
 import {
   AuthClientSessionRevokeResult,
   AuthOtherClientSessionsRevokeResult,
+  AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
   EnvironmentAuthInvalidError,
   EnvironmentHttpApi,
@@ -61,6 +63,7 @@ const authRouteNames = [
   "webSocketTicket",
   "pairingCredential",
   "pairingOffer",
+  "cancelPairingOffer",
   "shareState",
   "pairingLinks",
   "revokePairingLink",
@@ -191,6 +194,7 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
@@ -198,6 +202,7 @@ const namedSchemas = {
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthPairingOfferCancellationResult,
   AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
@@ -342,6 +347,12 @@ addJsonFixture("responses/pairing-offer.json", AuthPairingOfferResult, {
   name: "AI-SERVER",
   expiresAt: "2026-08-27T01:00:00.000Z",
 });
+addJsonFixture("requests/pairing-offer-cancel.json", AuthCancelPairingOfferInput, {
+  idempotencyKey: "fixture-pairing-offer-key",
+});
+addJsonFixture("responses/pairing-offer-cancel.json", AuthPairingOfferCancellationResult, {
+  cancelled: true,
+});
 addJsonFixture("responses/share-state.json", AuthShareStateResult, {
   desiredExposure: "loopback",
   offHostGrantCount: 0,
@@ -468,6 +479,10 @@ const samples = {
   pairingOffer: {
     request: "requests/pairing-offer.json",
     success: "responses/pairing-offer.json",
+  },
+  cancelPairingOffer: {
+    request: "requests/pairing-offer-cancel.json",
+    success: "responses/pairing-offer-cancel.json",
   },
   shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },

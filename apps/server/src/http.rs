@@ -87,6 +87,7 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/auth/websocket-ticket"),
     route(RouteMethod::Post, "/api/auth/pairing-token"),
     route(RouteMethod::Post, "/api/auth/pairing-offer"),
+    route(RouteMethod::Post, "/api/auth/pairing-offer/cancel"),
     route(RouteMethod::Get, "/api/auth/share-state"),
     route(RouteMethod::Get, "/api/auth/pairing-links"),
     route(RouteMethod::Post, "/api/auth/pairing-links/revoke"),
