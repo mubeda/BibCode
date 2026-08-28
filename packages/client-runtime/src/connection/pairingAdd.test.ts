@@ -121,6 +121,20 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
         : Effect.sync(() => {
             registrations.push(registration);
           }),
+    rollbackRegistration: (registration: ConnectionRegistration) =>
+      options.registrationRemovalFailure === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "remove-connection",
+              message: "registration cleanup unavailable",
+            }),
+          )
+        : Effect.sync(() => {
+            const index = registrations.indexOf(registration);
+            if (index === -1) return false;
+            registrations.splice(index, 1);
+            return true;
+          }),
     remove: () =>
       options.registrationRemovalFailure === true
         ? Effect.fail(
