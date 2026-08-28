@@ -205,6 +205,8 @@ vi.mock("~/connection/currentEnvironmentPresentation", () => ({
 
 vi.mock("@bibcode/client-runtime/connection", () => ({
   connectionStatusText: (connection: { phase: string }) => `status:${connection.phase}`,
+  isDesktopLocalConnectionId: (connectionId: string | undefined) =>
+    connectionId?.startsWith("local:") ?? false,
   RelayConnectionRegistration: class RelayConnectionRegistration {
     readonly input: unknown;
     constructor(input: unknown) {
