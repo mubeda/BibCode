@@ -111,7 +111,12 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     entries,
     register: (registration: ConnectionRegistration) =>
       options.registrationPersistenceFailure === true
-        ? Effect.fail(new Error("registration storage unavailable"))
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "register-connection",
+              message: "registration storage unavailable",
+            }),
+          )
         : Effect.sync(() => {
             registrations.push(registration);
           }),
@@ -120,7 +125,12 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
     get: (targetKey) => Effect.succeed(Option.fromUndefinedOr(accepted.get(targetKey))),
     accept: (identity) =>
       options.identityPersistenceFailure === true
-        ? Effect.fail(new Error("identity storage unavailable"))
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "identity storage unavailable",
+            }),
+          )
         : Effect.sync(() => {
             accepted.set(identity.targetKey, identity.storageInstanceId);
             acceptedIdentities.push(identity);
