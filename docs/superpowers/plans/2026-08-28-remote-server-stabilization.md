@@ -1169,10 +1169,10 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - Consumes: an exact `ConnectionRegistration`, the encrypted connection catalog compare-and-set boundary, and the registry's per-environment lease.
 - Produces: conditional rollback that removes only the exact durable registration written by the failed add, even when another tab/runtime has already replaced it.
 
-- [ ] Add a failing two-store test for A-register, B-replace, A-rollback that proves B's target, profile, and credential survive.
-- [ ] Move conditional removal into `ConnectionRegistrationStore`; use the platform catalog CAS loop rather than process-local object identity as the durable authority.
-- [ ] Keep runtime cleanup conditional on the durable CAS outcome and cover both rollback-before-replacement and replacement-before-rollback orderings.
-- [ ] Run focused storage, registry, and pairing-add tests; update `docs/architecture/connection-runtime.md` if its existing cross-store guarantee needs clarification.
+- [x] Add a failing two-store test for A-register, B-replace, A-rollback that proves B's target, profile, and credential survive.
+- [x] Move conditional removal into `ConnectionRegistrationStore`; use the platform catalog CAS loop rather than process-local object identity as the durable authority.
+- [x] Keep runtime cleanup conditional on the durable CAS outcome and cover both rollback-before-replacement and replacement-before-rollback orderings.
+- [x] Run focused storage, registry, and pairing-add tests; update `docs/architecture/connection-runtime.md` if its existing cross-store guarantee needs clarification.
 
 ### Task 12: Make auth revocation and offer authority coherent across live servers
 
@@ -1191,7 +1191,7 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - [ ] Add a failing two-live-service test for create on A, replay/conflict/cancel on B, replay after cancellation on A, and shared 128-per-principal/4,096-global quota enforcement.
 - [ ] Make SQLite keyed reservation authoritative: return the persisted existing/pending/cancelled/reserved row from one transaction, enforce both quotas there, and refresh each process-local projection from repository outcomes.
 - [ ] Add a failing two-server live-subscription test proving revocation through B closes an already-ACKed stream on A before later events can be delivered.
-- [ ] Implement one bounded per-service durable-state watcher while live connections exist; avoid one poller per socket, stop it when idle, and preserve immediate same-process cancellation.
+- [ ] Implement one bounded per-service durable-state watcher while any local live connection, cached active grant/session, or access-state subscriber can require convergence; avoid one poller per socket, stop it only when the service has no remaining authority consumer, and preserve immediate same-process cancellation. Prove an off-host grant cancelled through B converges A's share state and access-change event even when A has no live socket.
 - [ ] Run focused repository, auth service, auth HTTP/WebSocket, restart, and simultaneous-server tests; document the cross-process convergence bound.
 
 ### Task 13: Budget E2EE resources by principal and outbound bytes
