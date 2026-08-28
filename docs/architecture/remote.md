@@ -153,6 +153,33 @@ and presents SSH as a first-class desktop option. BiBCode Connect relay rows
 remain part of the same tab. The **Share this host** tab owns exposure and
 pairing-code generation for the primary environment.
 
+### Remote server updates
+
+The typed update surface consists of `updater.status`, `updater.check`, and
+`updater.install`. Each successful call returns a snapshot containing
+`serverVersion`, nullable `latestVersion`, lifecycle `state`, nullable `error`,
+and `support` (`installMode` plus `reason`). A server that cannot install on
+behalf of the caller rejects `updater.install` with
+`RemoteUpdateInstallError` code `remote_update_manual_required`. The TypeScript
+wire contract is `packages/contracts/src/remoteUpdate.ts`; its Rust mirror and
+state owner are in `apps/server/src/remote_update.rs`.
+
+The well-known descriptor, `server.getConfig`, and the Connect/relay descriptor
+all embed `remoteUpdateSupport`. Clients render update controls only when the
+additive, default-false `remoteUpdateControl` capability is true. The Remote
+Servers settings page checks all capable saved environments through
+`packages/client-runtime/src/state/remoteUpdates.ts`, with at most two requests
+in flight. One failed or offline environment remains **Status unavailable**
+without cancelling or blocking the rest of the batch. A last-known
+`update-available` snapshot also turns that environment's rail dot amber.
+
+The update feed URL is baked into the desktop release configuration only
+(`apps/desktop/src-tauri/tauri.release.conf.json`); the server binary has no
+feed access. A `manual`-mode server therefore never reports a `latestVersion`:
+the snapshot is honest about what the server can know, and manual-mode UI copy
+instructs the operator instead of guessing. Teaching servers a feed URL is a
+possible future extension, deliberately out of scope for v1.
+
 ### Share ceremony and exposure
 
 The Share tab mints the complete pairing payload on the server through

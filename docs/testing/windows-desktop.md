@@ -324,6 +324,12 @@ minimum-size, and relevant Windows DPI states. Verify:
   grant-driven sharing appears because the desktop bridge is present.
   remote targeting is driven by the environment rail rather than mixing saved
   servers into the Local WSL picker;
+- Remote server updates: with a second BiBCode server saved (headless
+  `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
+  Server Updates**, and confirm each saved server row shows an update badge
+  (**Manual updates** for a headless server) and a manual-instructions block
+  with a copy button. An offline server must show **Status unavailable** without
+  blocking the rest of the batch;
 - in **Settings → Remote Servers → Share this host**, generate an **Another
   device** offer. Confirm the local server restarts before the pairing offer is
   shown, and that the result contains the browser URL, `bibcode://` deep link,
