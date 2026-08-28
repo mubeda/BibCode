@@ -181,9 +181,6 @@ export const make = Effect.gen(function* () {
   const persistedTargetsByEnvironment = yield* Ref.make<
     ReadonlyMap<EnvironmentId, ConnectionTarget>
   >(new Map(persistedTargets.map((target) => [target.environmentId, target])));
-  const registrationOwners = yield* Ref.make<ReadonlyMap<EnvironmentId, ConnectionRegistration>>(
-    new Map(),
-  );
   interface LeaseLock {
     readonly semaphore: Semaphore.Semaphore;
     readonly users: number;
@@ -425,11 +422,6 @@ export const make = Effect.gen(function* () {
           return next;
         });
         yield* installEntryLocked(entry);
-        yield* Ref.update(registrationOwners, (current) => {
-          const next = new Map(current);
-          next.set(environmentId, registration);
-          return next;
-        });
       }),
     );
   });
@@ -499,11 +491,6 @@ export const make = Effect.gen(function* () {
           }
 
           yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
-          yield* Ref.update(registrationOwners, (current) => {
-            const next = new Map(current);
-            next.delete(target.environmentId);
-            return next;
-          });
         }),
       );
     },
@@ -588,6 +575,54 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
   });
 
+  const cleanupRemovedEntryLocked = Effect.fn("EnvironmentRegistry.cleanupRemovedEntryLocked")(
+    function* (entry: ConnectionCatalogEntry) {
+      const target = entry.target;
+      const profile = entry.profile;
+      yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* closeServiceScope(target.environmentId);
+      yield* SubscriptionRef.update(entries, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* Effect.all(
+        [
+          cache.clear(target.environmentId).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Could not clear cached environment data after removal.", {
+                environmentId: target.environmentId,
+                error,
+              }),
+            ),
+          ),
+          ownedDataCleanup.clear(target.environmentId),
+        ],
+        { concurrency: "unbounded", discard: true },
+      );
+
+      if (
+        target._tag === "SshConnectionTarget" &&
+        Option.isSome(profile) &&
+        isSshConnectionProfile(profile.value)
+      ) {
+        yield* ssh.disconnect(profile.value.target).pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("Could not disconnect the managed SSH environment.", {
+              environmentId: target.environmentId,
+              error,
+            }),
+          ),
+          Effect.ignore,
+        );
+      }
+    },
+  );
+
   const removeLocked = Effect.fn("EnvironmentRegistry.removeLocked")(function* (
     environmentId: EnvironmentId,
   ) {
@@ -596,59 +631,9 @@ export const make = Effect.gen(function* () {
         environmentId,
       });
     }
-    const target = (yield* getEntry(environmentId)).target;
-    const profile =
-      target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget"
-        ? yield* profiles.get(target.connectionId)
-        : Option.none();
-
-    yield* registrations.remove(target);
-    yield* Ref.update(persistedTargetsByEnvironment, (current) => {
-      const next = new Map(current);
-      next.delete(environmentId);
-      return next;
-    });
-    yield* Ref.update(registrationOwners, (current) => {
-      const next = new Map(current);
-      next.delete(environmentId);
-      return next;
-    });
-    yield* closeServiceScope(environmentId);
-    yield* SubscriptionRef.update(entries, (current) => {
-      const next = new Map(current);
-      next.delete(environmentId);
-      return next;
-    });
-    yield* Effect.all(
-      [
-        cache.clear(environmentId).pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("Could not clear cached environment data after removal.", {
-              environmentId,
-              error,
-            }),
-          ),
-        ),
-        ownedDataCleanup.clear(environmentId),
-      ],
-      { concurrency: "unbounded", discard: true },
-    );
-
-    if (
-      target._tag === "SshConnectionTarget" &&
-      Option.isSome(profile) &&
-      isSshConnectionProfile(profile.value)
-    ) {
-      yield* ssh.disconnect(profile.value.target).pipe(
-        Effect.tapError((error) =>
-          Effect.logWarning("Could not disconnect the managed SSH environment.", {
-            environmentId,
-            error,
-          }),
-        ),
-        Effect.ignore,
-      );
-    }
+    const entry = yield* getEntry(environmentId);
+    yield* registrations.remove(entry.target);
+    yield* cleanupRemovedEntryLocked(entry);
   });
 
   const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
@@ -662,10 +647,19 @@ export const make = Effect.gen(function* () {
     return yield* withLeaseLock(
       environmentId,
       Effect.gen(function* () {
-        if ((yield* Ref.get(registrationOwners)).get(environmentId) !== registration) {
-          return false;
+        const removed = yield* registrations.removeIfMatching(registration);
+        if (!removed) return false;
+        if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+          yield* Ref.update(persistedTargetsByEnvironment, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
+          return true;
         }
-        yield* removeLocked(environmentId);
+        const entry = yield* getEntry(environmentId);
+        if (!Equal.equals(entry, connectionRegistrationCatalogEntry(registration))) return true;
+        yield* cleanupRemovedEntryLocked(entry);
         return true;
       }),
     );

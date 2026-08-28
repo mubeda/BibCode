@@ -21,6 +21,7 @@ import {
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
   registerConnectionInCatalog,
   removeConnectionFromCatalog,
+  removeConnectionRegistrationFromCatalog,
 } from "./storageDocument.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -168,6 +169,50 @@ describe("ConnectionCatalogDocument", () => {
     expect(removeConnectionFromCatalog(registered, BEARER_TARGET)).toEqual(
       EMPTY_CONNECTION_CATALOG_DOCUMENT,
     );
+  });
+
+  it("does not conditionally remove a replacement registration", () => {
+    const first = new BearerConnectionRegistration({
+      target: BEARER_TARGET,
+      profile: BEARER_PROFILE,
+      credential: BEARER_CREDENTIAL,
+    });
+    const replacement = new BearerConnectionRegistration({
+      target: new BearerConnectionTarget({
+        ...BEARER_TARGET,
+        label: "Replacement",
+      }),
+      profile: new BearerConnectionProfile({
+        ...BEARER_PROFILE,
+        label: "Replacement",
+        httpBaseUrl: "https://replacement.example.test",
+        wsBaseUrl: "wss://replacement.example.test",
+      }),
+      credential: new BearerConnectionCredential({ token: "replacement-token" }),
+    });
+    const document = registerConnectionInCatalog(
+      registerConnectionInCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT, first),
+      replacement,
+    );
+
+    expect(removeConnectionRegistrationFromCatalog(document, first)).toEqual({
+      document,
+      removed: false,
+    });
+  });
+
+  it("conditionally removes the exact registration", () => {
+    const registration = new BearerConnectionRegistration({
+      target: BEARER_TARGET,
+      profile: BEARER_PROFILE,
+      credential: BEARER_CREDENTIAL,
+    });
+    const document = registerConnectionInCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT, registration);
+
+    expect(removeConnectionRegistrationFromCatalog(document, registration)).toEqual({
+      document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      removed: true,
+    });
   });
 
   it("persists the normalized SSH profile beside its target", () => {

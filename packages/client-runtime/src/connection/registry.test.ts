@@ -10,6 +10,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -209,6 +210,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   );
   const profileReadCount = yield* Ref.make(0);
   const storedCredentials = yield* Ref.make(new Map(initialCredentials));
+  const storedRegistrations = yield* Ref.make<ReadonlyMap<EnvironmentId, ConnectionRegistration>>(
+    new Map(),
+  );
   const storedRemoteTokens = yield* Ref.make(
     new Map([
       [
@@ -237,6 +241,38 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   const targetStore = Persistence.ConnectionTargetStore.of({
     list: Ref.get(storedTargets).pipe(Effect.map((targets) => [...targets.values()])),
   });
+  const removeStoredRegistration = Effect.fn("TestEnvironmentRegistry.removeRegistration")(
+    function* (target: ConnectionTarget) {
+      yield* options?.beforeRegistrationRemove?.(target) ?? Effect.void;
+      yield* Ref.update(storedTargets, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      yield* Ref.update(storedRegistrations, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+      if (target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget") {
+        yield* Ref.update(storedProfiles, (current) => {
+          const next = new Map(current);
+          next.delete(target.connectionId);
+          return next;
+        });
+        yield* Ref.update(storedCredentials, (current) => {
+          const next = new Map(current);
+          next.delete(target.connectionId);
+          return next;
+        });
+      }
+      yield* Ref.update(storedRemoteTokens, (current) => {
+        const next = new Map(current);
+        next.delete(target.environmentId);
+        return next;
+      });
+    },
+  );
   const registrationStore = Persistence.ConnectionRegistrationStore.of({
     register: (registration) =>
       Effect.gen(function* () {
@@ -244,6 +280,11 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         yield* Ref.update(storedTargets, (current) => {
           const next = new Map(current);
           next.set(registration.target.environmentId, registration.target);
+          return next;
+        });
+        yield* Ref.update(storedRegistrations, (current) => {
+          const next = new Map(current);
+          next.set(registration.target.environmentId, registration);
           return next;
         });
         switch (registration._tag) {
@@ -269,32 +310,14 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
             });
         }
       }),
-    remove: (target) =>
+    removeIfMatching: (registration) =>
       Effect.gen(function* () {
-        yield* options?.beforeRegistrationRemove?.(target) ?? Effect.void;
-        yield* Ref.update(storedTargets, (current) => {
-          const next = new Map(current);
-          next.delete(target.environmentId);
-          return next;
-        });
-        if (target._tag === "BearerConnectionTarget" || target._tag === "SshConnectionTarget") {
-          yield* Ref.update(storedProfiles, (current) => {
-            const next = new Map(current);
-            next.delete(target.connectionId);
-            return next;
-          });
-          yield* Ref.update(storedCredentials, (current) => {
-            const next = new Map(current);
-            next.delete(target.connectionId);
-            return next;
-          });
-        }
-        yield* Ref.update(storedRemoteTokens, (current) => {
-          const next = new Map(current);
-          next.delete(target.environmentId);
-          return next;
-        });
+        const stored = (yield* Ref.get(storedRegistrations)).get(registration.target.environmentId);
+        if (stored === undefined || !Equal.equals(stored, registration)) return false;
+        yield* removeStoredRegistration(registration.target);
+        return true;
       }),
+    remove: removeStoredRegistration,
   });
   const acceptedStorageIdentityService = {
     get: (targetKey: string) =>
@@ -1187,6 +1210,51 @@ describe("EnvironmentRegistry", () => {
         expect(
           (yield* SubscriptionRef.get(registry.entries)).get(BEARER_TARGET.environmentId)?.target,
         ).toEqual(BEARER_TARGET);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("finishes rollback before installing a queued replacement", () =>
+    Effect.gen(function* () {
+      const first = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "first-credential" }),
+      });
+      const replacement = new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: BEARER_PROFILE,
+        credential: new BearerConnectionCredential({ token: "replacement-credential" }),
+      });
+      const rollbackStarted = yield* Deferred.make<void>();
+      const releaseRollback = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([], [], [], {
+        beforeRegistrationRemove: () =>
+          Deferred.succeed(rollbackStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseRollback)),
+          ),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.register(first);
+        const rollbackFiber = yield* Effect.forkChild(registry.rollbackRegistration(first));
+        yield* Deferred.await(rollbackStarted);
+        const replacementFiber = yield* Effect.forkChild(registry.register(replacement));
+        yield* Deferred.succeed(releaseRollback, undefined);
+
+        expect(yield* Fiber.join(rollbackFiber)).toBe(true);
+        yield* Fiber.join(replacementFiber);
+        expect((yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId)).toEqual(
+          replacement.credential,
+        );
+        expect(
+          (yield* SubscriptionRef.get(registry.entries)).get(BEARER_TARGET.environmentId)?.target,
+        ).toEqual(BEARER_TARGET);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([BEARER_TARGET.environmentId]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([BEARER_TARGET.environmentId]);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );

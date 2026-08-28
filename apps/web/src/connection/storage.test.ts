@@ -1831,6 +1831,67 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  it.effect("preserves a replacement written by another registration store", () => {
+    installFakeIndexedDb();
+    const first = bearerRegistration();
+    const replacement = new BearerConnectionRegistration({
+      target: new BearerConnectionTarget({
+        environmentId,
+        label: "Replacement backend",
+        connectionId,
+      }),
+      profile: new BearerConnectionProfile({
+        connectionId,
+        environmentId,
+        label: "Replacement backend",
+        httpBaseUrl: "https://replacement.example.test/",
+        wsBaseUrl: "wss://replacement.example.test/",
+        hostKey: "replacement-host-key",
+      }),
+      credential: new BearerConnectionCredential({ token: "replacement-token" }),
+    });
+
+    return Effect.gen(function* () {
+      const firstRegistrationStore = yield* ConnectionRegistrationStore;
+      yield* firstRegistrationStore.register(first);
+
+      yield* Effect.gen(function* () {
+        const secondRegistrationStore = yield* ConnectionRegistrationStore;
+        const targetStore = yield* ConnectionTargetStore;
+        const profileStore = yield* ProfileStore.ConnectionProfileStore;
+        const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+
+        yield* secondRegistrationStore.register(replacement);
+        const removed = yield* firstRegistrationStore.removeIfMatching(first);
+
+        expect(removed).toBe(false);
+        expect(yield* targetStore.list).toEqual([replacement.target]);
+        expect(yield* profileStore.get(connectionId)).toEqual(Option.some(replacement.profile));
+        expect(yield* credentialStore.get(connectionId)).toEqual(
+          Option.some(replacement.credential),
+        );
+      }).pipe(Effect.provide(connectionStorageLayer));
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("conditionally removes the exact durable registration", () => {
+    installFakeIndexedDb();
+    const registration = bearerRegistration();
+
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const targetStore = yield* ConnectionTargetStore;
+      const profileStore = yield* ProfileStore.ConnectionProfileStore;
+      const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+
+      yield* registrationStore.register(registration);
+      expect(yield* registrationStore.removeIfMatching(registration)).toBe(true);
+      expect(yield* targetStore.list).toEqual([]);
+      expect(yield* profileStore.get(connectionId)).toEqual(Option.none());
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("persists and restores shell and thread snapshots", () => {
     installFakeIndexedDb();
     return Effect.gen(function* () {
