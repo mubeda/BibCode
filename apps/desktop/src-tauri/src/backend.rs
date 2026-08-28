@@ -589,6 +589,9 @@ pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
     ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
+    remote_update_delegate:
+        Arc<Mutex<Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>>>,
+    remote_update_support: Arc<Mutex<Option<bibcode_server::remote_update::RemoteUpdateSupport>>>,
     backend_port_resolver: Arc<dyn BackendPortResolver>,
     wsl_command_resolver: Arc<dyn WslCommandResolver>,
     #[cfg(test)]
@@ -610,6 +613,8 @@ impl fmt::Debug for BackendSupervisor {
             .field("state", &self.state)
             .field("start_completed", &self.start_completed)
             .field("ui_process_observer", &self.ui_process_observer)
+            .field("remote_update_delegate", &"<delegate slot>")
+            .field("remote_update_support", &self.remote_update_support)
             .finish_non_exhaustive()
     }
 }
@@ -620,6 +625,8 @@ impl Default for BackendSupervisor {
             state: Arc::default(),
             start_completed: Arc::default(),
             ui_process_observer: Arc::default(),
+            remote_update_delegate: Arc::default(),
+            remote_update_support: Arc::default(),
             backend_port_resolver: Arc::new(SystemBackendPortResolver),
             wsl_command_resolver: Arc::new(SystemWslCommandResolver),
             #[cfg(test)]
@@ -977,6 +984,15 @@ impl BackendSupervisor {
             .unwrap_or_else(|| Arc::new(UnavailableDesktopUiProcessObserver))
     }
 
+    pub fn install_remote_update_integration(
+        &self,
+        delegate: Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>,
+        support: bibcode_server::remote_update::RemoteUpdateSupport,
+    ) {
+        *self.remote_update_delegate.lock().expect("delegate slot") = Some(delegate);
+        *self.remote_update_support.lock().expect("support slot") = Some(support);
+    }
+
     pub fn local_environment_bootstraps(&self) -> Vec<Value> {
         let state = self
             .state
@@ -1203,9 +1219,21 @@ impl BackendSupervisor {
         let permit =
             self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
         let ui_process_observer = self.ui_process_observer_for_start();
-        let (config, managed, pid) =
-            start_managed_backend(plan.clone(), readiness, ui_process_observer, permit.run_id)
-                .await?;
+        let remote_update_delegate = self
+            .remote_update_delegate
+            .lock()
+            .expect("delegate slot")
+            .clone();
+        let remote_update_support = *self.remote_update_support.lock().expect("support slot");
+        let (config, managed, pid) = start_managed_backend(
+            plan.clone(),
+            readiness,
+            ui_process_observer,
+            remote_update_delegate,
+            remote_update_support,
+            permit.run_id,
+        )
+        .await?;
         #[cfg(test)]
         self.wait_for_start_publish_gate().await;
         let mut active_plan = plan;
@@ -1734,19 +1762,36 @@ async fn start_managed_backend(
     plan: BackendLaunchPlan,
     readiness: BackendReadinessConfig,
     ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+    remote_update_delegate: Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>,
+    remote_update_support: Option<bibcode_server::remote_update::RemoteUpdateSupport>,
     run_id: u64,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
             #[cfg(test)]
             prepare_isolated_test_server_settings(&data_root.effective)?;
-            let server_config = server_config_for_launch(data_root.clone(), &plan.config);
-            let handle =
-                ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
+            let mut server_config = server_config_for_launch(data_root.clone(), &plan.config);
+            if let Some(support) = remote_update_support {
+                server_config = server_config.with_remote_update_support(support);
+            }
+            let handle = match remote_update_delegate {
+                Some(delegate) => {
+                    ServerRuntime::start_with_desktop_integration(
+                        server_config,
+                        ui_process_observer,
+                        delegate,
+                    )
                     .await
-                    .map_err(|error| {
-                        format!("Could not start in-process desktop backend: {error}")
-                    })?;
+                }
+                None => {
+                    ServerRuntime::start_with_ui_process_observer(
+                        server_config,
+                        ui_process_observer,
+                    )
+                    .await
+                }
+            }
+            .map_err(|error| format!("Could not start in-process desktop backend: {error}"))?;
 
             let mut config = plan.config.clone();
             config.port = handle.local_addr().port();
@@ -5488,6 +5533,8 @@ exit /b 9
                 request_timeout: Duration::ZERO,
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             0,
         )
         .await
@@ -5505,6 +5552,8 @@ exit /b 9
                 request_timeout: Duration::ZERO,
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             1,
         )
         .await
@@ -5525,6 +5574,8 @@ exit /b 9
                 request_timeout: Duration::from_millis(20),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             8,
         )
         .await
@@ -5969,6 +6020,8 @@ $client.Dispose()
                 request_timeout: Duration::from_secs(1),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             10,
         )
         .await
@@ -6048,6 +6101,8 @@ $client.Dispose()
                 request_timeout: Duration::from_secs(1),
             },
             Arc::new(UnavailableDesktopUiProcessObserver),
+            None,
+            None,
             11,
         )
         .await

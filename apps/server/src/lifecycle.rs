@@ -24,6 +24,7 @@ use crate::{
         jwt::PersistentJwtCodec,
         server_terminal::ProcessTreeCleanup,
     },
+    remote_update::RemoteUpdateDelegate,
     rpc::RpcRegistry,
 };
 
@@ -104,6 +105,7 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
         )
         .await
     }
@@ -117,6 +119,7 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::StandaloneServer,
+            None,
         )
         .await
     }
@@ -130,6 +133,22 @@ impl ServerRuntime {
             None,
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_desktop_integration(
+        config: ServerConfig,
+        ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+        update_delegate: Arc<dyn RemoteUpdateDelegate>,
+    ) -> Result<ServerHandle, ServerError> {
+        Self::start_internal(
+            config,
+            None,
+            ui_process_observer,
+            ProcessTreeCleanup::EmbeddedHost,
+            Some(update_delegate),
         )
         .await
     }
@@ -144,6 +163,7 @@ impl ServerRuntime {
             Some(rpc_registry),
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
         )
         .await
     }
@@ -153,6 +173,7 @@ impl ServerRuntime {
         custom_registry: Option<RpcRegistry>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
         process_tree_cleanup: ProcessTreeCleanup,
+        update_delegate: Option<Arc<dyn RemoteUpdateDelegate>>,
     ) -> Result<ServerHandle, ServerError> {
         let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
         config.base_dir = resolved_data_root.effective.clone();
@@ -231,6 +252,7 @@ impl ServerRuntime {
                         asset_secret,
                         ui_process_observer,
                         process_tree_cleanup,
+                        update_delegate,
                     )
                     .await
                     .map_err(ServerError::ProductionInitialize)?,

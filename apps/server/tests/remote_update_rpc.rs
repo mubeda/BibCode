@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use bibcode_server::remote_update::{
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
+    RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
+};
 use bibcode_server::{RpcExit, ServerConfig, ServerMessage, ServerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -118,6 +124,80 @@ async fn headless_server_answers_manual_update_surface() {
             && failure_text.contains("remote_update_manual_required"),
         "manual install must fail with the typed error, got {failure_text}"
     );
+
+    socket.close(None).await.expect("close socket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+struct FixtureHostUpdater;
+
+impl RemoteUpdateDelegate for FixtureHostUpdater {
+    fn status(&self) -> HostUpdaterFuture {
+        Box::pin(async {
+            HostUpdaterStatus {
+                latest_version: Some("9.9.9".to_owned()),
+                state: RemoteUpdateState::UpdateAvailable,
+                error: None,
+            }
+        })
+    }
+
+    fn check(&self) -> HostUpdaterFuture {
+        self.status()
+    }
+
+    fn request_install(&self) -> HostUpdaterFuture {
+        Box::pin(async {
+            HostUpdaterStatus {
+                latest_version: Some("9.9.9".to_owned()),
+                state: RemoteUpdateState::Installing,
+                error: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn desktop_integrated_server_routes_install_through_the_delegate() {
+    let temp = TempDir::new().expect("data root");
+    disable_provider_processes(temp.path());
+    let config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_unsafe_no_auth()
+        .with_remote_update_support(RemoteUpdateSupport {
+            install_mode: RemoteUpdateInstallMode::Interactive,
+            reason: RemoteUpdateSupportReason::Available,
+        });
+    let handle = ServerRuntime::start_with_desktop_integration(
+        config,
+        std::sync::Arc::new(bibcode_server::diagnostics::UnavailableDesktopUiProcessObserver),
+        Arc::new(FixtureHostUpdater),
+    )
+    .await
+    .expect("server starts");
+
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+
+    let checked = call_unary(&mut socket, "1", "updater.check").await;
+    assert!(matches!(
+        checked,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { value: Some(ref value) },
+            ..
+        } if value["latestVersion"] == "9.9.9" && value["state"] == "update-available"
+    ));
+
+    let install = call_unary(&mut socket, "2", "updater.install").await;
+    assert!(matches!(
+        install,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { value: Some(ref value) },
+            ..
+        } if value["state"] == "installing"
+    ));
 
     socket.close(None).await.expect("close socket");
     handle.shutdown();

@@ -114,6 +114,16 @@ pub fn run() {
         }
 
         let update_app = app.handle().clone();
+        {
+            use tauri_plugin_updater::UpdaterExt as _;
+            let backend = app.state::<crate::backend::BackendSupervisor>();
+            backend.install_remote_update_integration(
+                crate::remote_update_delegate::DesktopRemoteUpdateDelegate::new(update_app.clone()),
+                crate::remote_update_delegate::derive_remote_update_support(
+                    update_app.updater().is_ok(),
+                ),
+            );
+        }
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
         let app_handle = app.handle().clone();
@@ -256,6 +266,7 @@ mod context_menu;
 mod data_safety;
 mod firewall;
 mod preview;
+mod remote_update_delegate;
 mod security;
 mod shell_environment;
 pub mod ssh;

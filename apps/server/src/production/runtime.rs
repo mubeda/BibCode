@@ -140,6 +140,7 @@ impl ProductionRuntime {
             asset_secret,
             ui_process_observer,
             ProcessTreeCleanup::EmbeddedHost,
+            None,
         )
         .await
     }
@@ -151,6 +152,7 @@ impl ProductionRuntime {
         asset_secret: Vec<u8>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
         process_tree_cleanup: ProcessTreeCleanup,
+        remote_update_delegate: Option<Arc<dyn crate::remote_update::RemoteUpdateDelegate>>,
     ) -> Result<Self, String> {
         let state_paths = StatePaths::from_config(config);
         let trace_diagnostics =
@@ -392,9 +394,6 @@ impl ProductionRuntime {
         let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
-        let remote_update_delegate: Option<
-            std::sync::Arc<dyn crate::remote_update::RemoteUpdateDelegate>,
-        > = None;
         crate::production::remote_update_rpc::register_remote_update_rpc(
             &mut registry,
             crate::remote_update::RemoteUpdateService::new(
