@@ -366,6 +366,14 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("Exposure is owned by the WSL backend");
     expect(container.textContent).not.toContain("Limited to this machine");
     expect(container.textContent).not.toContain("Managed automatically");
+
+    await selectIntent("this-computer");
+    await click("Generate pairing offer");
+    const exposureSection = [...container.querySelectorAll("section")].find(
+      (section) => section.querySelector("h2")?.textContent === "Exposure",
+    );
+    expect(exposureSection?.textContent).toContain("Reachable at http://172.20.10.2:3773/");
+    expect(exposureSection?.textContent).not.toContain("http://127.0.0.1:3773");
   });
 
   it("keeps browser exposure read-only while server-side minting remains available", async () => {
