@@ -22,8 +22,9 @@ use super::{
         encode_pairing_code,
     },
     service::{
-        AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferReplay, default_standard_scopes,
-        format_iso, is_loopback_host, now_ms, parse_scopes,
+        AuthError, AuthService, PAIRING_REACH_VALUES, PairingOfferIssuance, PairingOfferReplay,
+        PairingOfferReservation, default_standard_scopes, format_iso, is_loopback_host, now_ms,
+        parse_scopes,
     },
 };
 use crate::http::AppState;
@@ -323,16 +324,19 @@ async fn create_pairing_offer(
             .replay_pairing_offer(&principal.session_id, key, &input_fingerprint)
             .await
         {
-            PairingOfferReplay::Original(original) => return Json(original).into_response(),
-            PairingOfferReplay::Cancelled => {
+            Ok(PairingOfferReplay::Original(original)) => return Json(original).into_response(),
+            Ok(PairingOfferReplay::Cancelled) => {
                 return invalid_pairing_offer_response("idempotency key was cancelled");
             }
-            PairingOfferReplay::Conflict => {
+            Ok(PairingOfferReplay::Conflict) => {
                 return invalid_pairing_offer_response(
                     "idempotency key was already used with a different input",
                 );
             }
-            PairingOfferReplay::Fresh => {}
+            Ok(PairingOfferReplay::Fresh) => {}
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
         }
     }
 
@@ -395,29 +399,55 @@ async fn create_pairing_offer(
         "this-computer" => false,
         _ => !endpoint_is_loopback,
     };
-    let issuance = if let Some(key) = &idempotency_key {
-        state
+    let issued = if let Some(key) = &idempotency_key {
+        match state
             .auth
             .issue_share_pairing_offer(
                 scopes,
                 Some(label),
                 payload.reach.clone(),
                 off_host,
-                principal.session_id.clone(),
-                key.clone(),
-                input_fingerprint.clone(),
+                PairingOfferReservation::new(
+                    principal.session_id.clone(),
+                    key.clone(),
+                    input_fingerprint.clone(),
+                ),
             )
             .await
+        {
+            Ok(PairingOfferIssuance::Reserved(issued)) => issued,
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Original(original))) => {
+                return Json(original).into_response();
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Cancelled)) => {
+                return invalid_pairing_offer_response("idempotency key was cancelled");
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Conflict)) => {
+                return invalid_pairing_offer_response(
+                    "idempotency key was already used with a different input",
+                );
+            }
+            Ok(PairingOfferIssuance::Replay(PairingOfferReplay::Fresh)) => {
+                return auth_error_for_request(
+                    AuthError::Internal("pairing offer reservation disappeared".to_owned()),
+                    &headers,
+                    "pairing_offer_issuance_failed",
+                );
+            }
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
+        }
     } else {
-        state
+        match state
             .auth
             .issue_share_pairing(scopes, Some(label), payload.reach.clone(), off_host)
             .await
-    };
-    let issued = match issuance {
-        Ok(issued) => issued,
-        Err(error) => {
-            return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+        {
+            Ok(issued) => issued,
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
+            }
         }
     };
     let code_payload = RemotePairingCodePayload {

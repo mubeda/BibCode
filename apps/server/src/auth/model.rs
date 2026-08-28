@@ -170,7 +170,7 @@ pub struct RevokeClientRequest {
     pub session_id: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,7 +199,7 @@ impl Default for ClientMetadata {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSessionView {
     pub session_id: String,

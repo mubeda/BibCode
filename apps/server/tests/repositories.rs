@@ -10,6 +10,7 @@ use bibcode_server::persistence::{
 };
 use serde::Serialize;
 use serde_json::json;
+use tempfile::TempDir;
 
 const T0: &str = "2026-07-10T10:00:00.000Z";
 const T1: &str = "2026-07-10T10:01:00.000Z";
@@ -30,6 +31,25 @@ async fn migrated_repositories() -> Repositories {
         .expect("all migrations apply");
     database.quick_check().await.expect("database is healthy");
     Repositories::new(database)
+}
+
+async fn migrated_repository_pair() -> (TempDir, Repositories, Repositories) {
+    let temp = TempDir::new().expect("temporary SQLite directory");
+    let path = temp.path().join("state.sqlite");
+    let first = Database::create_new(&path)
+        .await
+        .expect("first SQLite connection opens");
+    first
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("all migrations apply");
+    let second = Database::open_existing(&path)
+        .await
+        .expect("second SQLite connection opens");
+    (temp, Repositories::new(first), Repositories::new(second))
 }
 
 fn assert_row_eq<T: Serialize>(actual: &T, expected: &T) {
@@ -285,6 +305,7 @@ fn public_repository_api_inventory_is_explicit() {
 
     let mut expected = vec![
         "append_event",
+        "auth_authority_revision",
         "claim_provider_turn",
         "clear_checkpoint_turn_conflict",
         "consume_auth_pairing_link",
@@ -337,11 +358,13 @@ fn public_repository_api_inventory_is_explicit() {
         "list_threads_by_project",
         "load_worktree_catalog_projection",
         "list_turns_by_thread",
+        "load_auth_authority_snapshot",
         "max_event_sequence",
         "min_last_applied_sequence",
         "pin_project_worktree_repository_key",
         "prepare_reserved_command_receipt",
         "prune_and_list_active_auth_pairing_offers",
+        "prune_and_get_active_auth_pairing_offer",
         "new",
         "read_events_from_sequence",
         "release_reserved_command_receipt",
@@ -1694,6 +1717,53 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
 }
 
 #[tokio::test]
+async fn auth_authority_revision_changes_only_with_authority_transactions() {
+    let repositories = migrated_repositories().await;
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("initial auth revision"),
+        0
+    );
+    repositories
+        .upsert_project(project("unrelated", T1))
+        .await
+        .expect("unrelated durable mutation");
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("unchanged auth revision"),
+        0
+    );
+    repositories
+        .create_auth_pairing_link(pairing_offer_link(9_000))
+        .await
+        .expect("auth authority mutation");
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("created auth revision"),
+        1
+    );
+    assert!(
+        repositories
+            .revoke_auth_pairing_link("pairing-quota-9000".to_owned(), TIME_3.to_owned())
+            .await
+            .expect("auth revocation")
+    );
+    assert_eq!(
+        repositories
+            .auth_authority_revision()
+            .await
+            .expect("revoked auth revision"),
+        2
+    );
+}
+
+#[tokio::test]
 async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
     let repositories = migrated_repositories().await;
     let pairing = AuthPairingLink {
@@ -1728,27 +1798,27 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
         credential: "credential-conflict".to_owned(),
         ..pairing
     };
-    assert!(
-        repositories
-            .create_auth_pairing_link_with_offer(
-                conflicting_pairing,
-                NewAuthPairingOffer {
-                    principal_id: "principal".to_owned(),
-                    idempotency_key: "request-key".to_owned(),
-                    input_fingerprint: "other fingerprint".to_owned(),
-                    expires_at: FUTURE.to_owned(),
-                },
-            )
-            .await
-            .is_err()
-    );
+    let existing = repositories
+        .create_auth_pairing_link_with_offer(
+            conflicting_pairing,
+            NewAuthPairingOffer {
+                principal_id: "principal".to_owned(),
+                idempotency_key: "request-key".to_owned(),
+                input_fingerprint: "other fingerprint".to_owned(),
+                expires_at: FUTURE.to_owned(),
+            },
+        )
+        .await
+        .expect("existing keyed authority");
+    assert!(!existing.reserved);
+    assert_eq!(existing.offer.input_fingerprint, "fingerprint");
     assert!(
         repositories
             .get_auth_pairing_link_by_credential("credential-conflict".to_owned())
             .await
             .expect("rolled-back link lookup")
             .is_none(),
-        "a failed ledger insert must roll back the pairing link"
+        "the losing keyed candidate must not insert a pairing link"
     );
     let pending = repositories
         .prune_and_list_active_auth_pairing_offers(T2.to_owned())
@@ -1815,6 +1885,41 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
 }
 
 #[tokio::test]
+async fn concurrent_pairing_offer_reservations_return_the_persisted_keyed_authority() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    let reserve = |repositories: Repositories, index| async move {
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: "shared-key".to_owned(),
+                    input_fingerprint: "fingerprint".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+    };
+
+    let (first_result, second_result) = tokio::join!(reserve(first.clone(), 1), reserve(second, 2));
+    let first_result = first_result.expect("first reservation outcome");
+    let second_result = second_result.expect("second reservation outcome");
+    assert_ne!(first_result.reserved, second_result.reserved);
+    assert_eq!(
+        first_result.offer.pairing_id,
+        second_result.offer.pairing_id
+    );
+    assert_eq!(
+        first
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("active keyed pairing")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn pairing_offer_writes_prune_expired_ledger_rows() {
     let repositories = migrated_repositories().await;
     for index in 0..3 {
@@ -1844,6 +1949,120 @@ async fn pairing_offer_writes_prune_expired_ledger_rows() {
         .expect("bounded ledger");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].idempotency_key, "live");
+}
+
+#[tokio::test]
+async fn pairing_offer_reservations_enforce_the_shared_principal_quota() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    for index in 0..128 {
+        let repositories = if index % 2 == 0 { &first } else { &second };
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: format!("key-{index}"),
+                    input_fingerprint: format!("fingerprint-{index}"),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .expect("reservation within principal quota");
+    }
+
+    assert!(
+        first
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(128),
+                NewAuthPairingOffer {
+                    principal_id: "principal".to_owned(),
+                    idempotency_key: "key-128".to_owned(),
+                    input_fingerprint: "fingerprint-128".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .is_err(),
+        "the durable principal quota must reject reservation 129"
+    );
+    assert!(
+        second
+            .cancel_auth_pairing_offer(
+                "principal".to_owned(),
+                "cancelled-overflow".to_owned(),
+                T2.to_owned(),
+                FUTURE.to_owned(),
+            )
+            .await
+            .is_err(),
+        "a new cancellation tombstone must obey the durable principal quota"
+    );
+}
+
+#[tokio::test]
+async fn pairing_offer_reservations_enforce_the_shared_global_quota() {
+    let (_temp, first, second) = migrated_repository_pair().await;
+    for index in 0..4_096 {
+        let repositories = if index % 2 == 0 { &first } else { &second };
+        repositories
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(index),
+                NewAuthPairingOffer {
+                    principal_id: format!("principal-{}", index / 128),
+                    idempotency_key: format!("key-{index}"),
+                    input_fingerprint: format!("fingerprint-{index}"),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .expect("reservation within global quota");
+    }
+
+    assert!(
+        first
+            .create_auth_pairing_link_with_offer(
+                pairing_offer_link(4_096),
+                NewAuthPairingOffer {
+                    principal_id: "overflow-principal".to_owned(),
+                    idempotency_key: "overflow-key".to_owned(),
+                    input_fingerprint: "overflow-fingerprint".to_owned(),
+                    expires_at: FUTURE.to_owned(),
+                },
+            )
+            .await
+            .is_err(),
+        "the durable global quota must reject reservation 4,097"
+    );
+    assert!(
+        second
+            .cancel_auth_pairing_offer(
+                "overflow-principal".to_owned(),
+                "cancelled-global-overflow".to_owned(),
+                T2.to_owned(),
+                FUTURE.to_owned(),
+            )
+            .await
+            .is_err(),
+        "a new cancellation tombstone must obey the durable global quota"
+    );
+}
+
+fn pairing_offer_link(index: usize) -> AuthPairingLink {
+    AuthPairingLink {
+        id: format!("pairing-quota-{index}"),
+        credential: format!("credential-quota-{index}"),
+        method: "one-time-token".to_owned(),
+        scopes: json!(["orchestration:read"]),
+        subject: "one-time-token".to_owned(),
+        label: Some(format!("Client {index}")),
+        proof_key_thumbprint: None,
+        created_at: T1.to_owned(),
+        expires_at: FUTURE.to_owned(),
+        consumed_at: None,
+        revoked_at: None,
+        reach: Some("another-device".to_owned()),
+        off_host: Some(true),
+    }
 }
 
 #[tokio::test]

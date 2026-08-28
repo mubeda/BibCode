@@ -815,6 +815,100 @@ async fn revoking_a_client_terminates_its_live_websocket() {
 }
 
 #[tokio::test]
+async fn remote_revocation_closes_an_acked_live_stream_before_later_events() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let first = start_desktop_server(&temp).await;
+    let second = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let first_administrator = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
+    let first_token = access_token(&first_administrator);
+    let first_clients = get_json(
+        client
+            .get(http_url(&first, "/api/auth/clients"))
+            .bearer_auth(first_token)
+            .send()
+            .await
+            .expect("first client list"),
+        StatusCode::OK,
+    )
+    .await;
+    let first_session_id = first_clients
+        .as_array()
+        .expect("first clients")
+        .iter()
+        .find(|session| session["current"] == true)
+        .and_then(|session| session["sessionId"].as_str())
+        .expect("first administrator session")
+        .to_owned();
+    let second_administrator = exchange_token(&client, &second, DESKTOP_BOOTSTRAP, None).await;
+    let second_token = access_token(&second_administrator);
+
+    let ticket = websocket_ticket(&client, &first, first_token).await;
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?wsTicket={ticket}", first.local_addr()))
+            .await
+            .expect("first live WebSocket");
+    send_ws_json(
+        &mut socket,
+        json!({
+            "_tag": "Request",
+            "id": "201",
+            "tag": "subscribeAuthAccess",
+            "payload": {},
+            "headers": []
+        }),
+    )
+    .await;
+    let snapshot = next_ws_json(&mut socket).await;
+    assert_eq!(snapshot["_tag"], "Chunk");
+    assert_eq!(snapshot["requestId"], "201");
+    send_ws_json(&mut socket, json!({ "_tag": "Ack", "requestId": "201" })).await;
+
+    let revoked = get_json(
+        client
+            .post(http_url(&second, "/api/auth/clients/revoke"))
+            .bearer_auth(second_token)
+            .json(&json!({ "sessionId": first_session_id }))
+            .send()
+            .await
+            .expect("remote client revocation"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(revoked["revoked"], true);
+    let later_pairing = client
+        .post(http_url(&second, "/api/auth/pairing-token"))
+        .bearer_auth(second_token)
+        .json(&json!({ "label": "Must not reach revoked stream" }))
+        .send()
+        .await
+        .expect("later access mutation");
+    assert_eq!(later_pairing.status(), StatusCode::OK);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_)) => break,
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    let message: Value =
+                        serde_json::from_str(&text).expect("valid live-stream frame");
+                    assert_ne!(
+                        message["_tag"], "Chunk",
+                        "later access event reached the revoked stream: {message}"
+                    );
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("remote revocation must close the ACKed stream");
+
+    shutdown(second).await;
+    shutdown(first).await;
+}
+
+#[tokio::test]
 async fn plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
@@ -1511,6 +1605,146 @@ async fn pairing_offer_replays_are_idempotent_per_key() {
     let conflict_body = get_json(conflicting, StatusCode::BAD_REQUEST).await;
     assert_eq!(conflict_body["reason"], "invalid_pairing_offer");
     shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_authority_is_shared_across_simultaneously_live_servers() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let first = start_desktop_server(&temp).await;
+    let second = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&administrator);
+    let body = json!({
+        "name": "AI-SERVER",
+        "endpoint": "http://192.168.1.20:3773",
+        "reach": "another-device",
+    });
+
+    let created = get_json(
+        client
+            .post(http_url(&first, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .header("idempotency-key", "shared-authority-key")
+            .json(&body)
+            .send()
+            .await
+            .expect("create offer on first server"),
+        StatusCode::OK,
+    )
+    .await;
+    let replayed = get_json(
+        client
+            .post(http_url(&second, "/api/auth/pairing-offer"))
+            .bearer_auth(token)
+            .header("idempotency-key", "shared-authority-key")
+            .json(&body)
+            .send()
+            .await
+            .expect("replay offer on second server"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replayed, created);
+
+    let conflicting = client
+        .post(http_url(&second, "/api/auth/pairing-offer"))
+        .bearer_auth(token)
+        .header("idempotency-key", "shared-authority-key")
+        .json(&json!({
+            "name": "OTHER",
+            "endpoint": "http://192.168.1.20:3773",
+            "reach": "another-device",
+        }))
+        .send()
+        .await
+        .expect("conflicting replay on second server");
+    let conflict_body = get_json(conflicting, StatusCode::BAD_REQUEST).await;
+    assert_eq!(conflict_body["reason"], "invalid_pairing_offer");
+
+    let cancelled = get_json(
+        client
+            .post(http_url(&second, "/api/auth/pairing-offer/cancel"))
+            .bearer_auth(token)
+            .json(&json!({ "idempotencyKey": "shared-authority-key" }))
+            .send()
+            .await
+            .expect("cancel offer on second server"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cancelled["cancelled"], true);
+
+    let replay_after_cancellation = client
+        .post(http_url(&first, "/api/auth/pairing-offer"))
+        .bearer_auth(token)
+        .header("idempotency-key", "shared-authority-key")
+        .json(&body)
+        .send()
+        .await
+        .expect("replay cancelled offer on first server");
+    let replay_body = get_json(replay_after_cancellation, StatusCode::BAD_REQUEST).await;
+    assert_eq!(replay_body["reason"], "invalid_pairing_offer");
+
+    shutdown(second).await;
+    shutdown(first).await;
+}
+
+#[tokio::test]
+async fn concurrent_pairing_offer_retries_across_live_servers_return_one_result() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let first = start_desktop_server(&temp).await;
+    let second = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
+    let token = access_token(&administrator);
+    let body = json!({
+        "name": "AI-SERVER",
+        "endpoint": "http://192.168.1.20:3773",
+        "reach": "another-device",
+    });
+
+    for index in 0..16 {
+        let key = format!("concurrent-shared-key-{index}");
+        let mint = |handle: &ServerHandle| {
+            client
+                .post(http_url(handle, "/api/auth/pairing-offer"))
+                .bearer_auth(token)
+                .header("idempotency-key", &key)
+                .json(&body)
+                .send()
+        };
+        let (first_response, second_response) = tokio::join!(mint(&first), mint(&second));
+        let first_response = first_response.expect("first concurrent mint");
+        let second_response = second_response.expect("second concurrent mint");
+        let statuses = [first_response.status(), second_response.status()];
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(
+            statuses
+                .iter()
+                .all(|status| { matches!(*status, StatusCode::OK | StatusCode::BAD_REQUEST) })
+        );
+        if statuses == [StatusCode::OK, StatusCode::OK] {
+            let first_result = get_json(first_response, StatusCode::OK).await;
+            let second_result = get_json(second_response, StatusCode::OK).await;
+            assert_eq!(first_result, second_result);
+        } else if first_response.status() == StatusCode::OK {
+            assert!(get_json(first_response, StatusCode::OK).await["id"].is_string());
+            assert_eq!(
+                get_json(second_response, StatusCode::BAD_REQUEST).await["reason"],
+                "invalid_pairing_offer"
+            );
+        } else {
+            assert_eq!(
+                get_json(first_response, StatusCode::BAD_REQUEST).await["reason"],
+                "invalid_pairing_offer"
+            );
+            assert!(get_json(second_response, StatusCode::OK).await["id"].is_string());
+        }
+    }
+
+    shutdown(second).await;
+    shutdown(first).await;
 }
 
 #[tokio::test]

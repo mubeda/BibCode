@@ -157,12 +157,17 @@ window, replay is rejected conservatively until the caller cancels the key.
 Active results, pending reservations, and tombstones hydrate before capacity
 checks and remain under bounded, expiring caps: 128 live entries per principal
 and 4,096 globally. Expired rows are pruned at startup and inside every
-reservation or cancellation transaction.
+reservation or cancellation transaction. For a persisted server, one immediate
+SQLite transaction is the authority for a principal/key lookup, an existing or
+pending result, admission under both caps, and the new pairing-plus-reservation
+write. Simultaneously live services therefore return the persisted winner rather
+than treating a process-local cache miss or stale capacity count as authority.
 An authenticated `POST /api/auth/pairing-offer/cancel` names the same key. It
 atomically revokes the mapped pairing grant and stores an expiring tombstone,
 so cancellation remains safe after a lost response, across a process restart,
 and before a delayed create reaches the issuance lock. A cancelled key cannot
-mint or replay an offer.
+mint or replay an offer. New tombstones obey the same durable per-principal and
+global caps; replacing an existing keyed row does not consume another slot.
 The server validates that `this-computer` uses loopback, `another-device` does
 not use loopback, and that no offered endpoint is wildcard or port zero. Reach
 is embedded in the code and persisted with the grant as described below.
@@ -309,6 +314,23 @@ it leaves exposure unchanged and reports cleanup failure. The direct path does
 not depend on an auth revision event that may never arrive. The UI distinguishes
 a successful cleanup with local-only confirmation from an explicit cleanup
 failure, while the startup/revision reconciler remains a backstop.
+
+Every auth-authority mutation increments the singleton
+`auth_authority_state.revision` in the same SQLite transaction. Each live
+`AuthService` owns at most one convergence watcher while it has a cached active
+grant or session, a registered live connection, or a `subscribeAuthAccess`
+receiver. The watcher checks only that scalar every 250 ms when authority is
+unchanged; it reads and decodes one coherent, read-only pairing/offer/session
+snapshot only after the revision changes or the snapshot's nearest active
+expiry is reached. It stops after the final authority consumer disappears and
+uses a release-and-recheck handoff so a concurrent subscriber or grant cannot
+lose watcher ownership. Thus a committed change on another live service is
+eligible for reconciliation on the next 250 ms check (plus the bounded SQLite
+queue/read), without a poller per socket or repeated full-table scans on idle
+ticks. Reconciliation cancels removed sessions' local connection tokens while
+holding the service state lock and before publishing access changes, so an
+already-ACKed stream closes before later authority events are admitted. Local
+revocation still cancels immediately without waiting for the watcher.
 
 Each pairing-offer create attempt and cancellation has a five-second deadline
 at both the primary HTTP Effect and ceremony boundary. The HTTP deadline
