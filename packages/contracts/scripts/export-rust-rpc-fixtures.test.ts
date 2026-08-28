@@ -91,21 +91,21 @@ describe("RPC wire fixture exporter", () => {
         },
       },
     ]);
-    expect(manifest.methods).toHaveLength(97);
+    expect(manifest.methods).toHaveLength(100);
     expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(18);
     expect(manifest.streamMethodCount).toBe(18);
     expect(manifest.expectedTopLevelStreamShapes).toBe(65);
     expect(manifest.expectedOrchestrationEventShapes).toBe(23);
     expect(manifest.streamShapeFixtures).toHaveLength(65);
-    expect(manifest.typedFailureFixtures).toHaveLength(235);
+    expect(manifest.typedFailureFixtures).toHaveLength(241);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(321);
+    expect(manifest.fixtures).toHaveLength(327);
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(300);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(306);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));
