@@ -85,6 +85,7 @@ pub fn run() {
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
         .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .manage(backend::BackendSupervisor::new())
+        .manage(server_exposure::ServerExposureCoordinator::default())
         .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(context_menu::NativeContextMenuManager::new())
         .manage(ssh::SshEnvironmentManager::new())
@@ -268,6 +269,7 @@ mod firewall;
 mod preview;
 mod remote_update_delegate;
 mod security;
+mod server_exposure;
 mod shell_environment;
 pub mod ssh;
 mod tailscale;
