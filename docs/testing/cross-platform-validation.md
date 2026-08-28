@@ -112,6 +112,30 @@ server-side mint and revocation stay available. Windows additionally owns the
 program-scoped firewall evidence in its platform runbook; Linux and macOS do
 not substitute a firewall assertion.
 
+Capture visual evidence for all exposure-compensation outcomes, using a
+test-owned server/profile and controlled failure injection where required:
+
+- a mint failure after widening plus successful cleanup shows **The offer was
+  not created. Remote access was restored to local-only.**, and native state is
+  local-only;
+- the same mint failure plus failed cleanup shows the explicit remote-access
+  cleanup failure and does not claim local-only restoration;
+- consuming an off-host offer through the browser keeps exposure wide, and
+  revoking that last browser session causes one local-only restart; and
+- when a new off-host grant appears during narrowing, the one post-narrow read
+  causes one compensating widen and the resulting offer remains reachable.
+
+Record the exposure mode, grant/session row, restart boundary, visible message,
+and screenshot for each outcome. Do not use a later app restart as substitute
+evidence for direct failed-mint cleanup.
+
+Run the lifecycle source and living-document contracts from the repository
+root whenever this boundary changes:
+
+```sh
+vp test scripts/remote-architecture-contract.test.ts scripts/remote-transport-hardening.test.ts
+```
+
 ### Direct E2EE interop gate
 
 When direct pairing, host identity, `/ws-e2ee`, Noise framing, or client E2EE

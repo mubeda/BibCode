@@ -95,10 +95,13 @@ transport ciphertext containing one record:
 
 The first logical message authenticates inside the encrypted channel. A new
 device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}`. Only a
-successful exchange consumes that token; a wrong host, failed handshake, or
-transport loss leaves it retryable. The server returns
-`e2ee_authenticated` with the minted string credential plus `environmentId` and
-`storageInstanceId`. A returning device sends
+successful exchange consumes that token; a wrong host or failed handshake does
+not reach the exchange. The accepted exchange creates the session and consumes
+the token before the encrypted credential reply is delivered. This means an
+interrupted exchange may consume the one-time token without delivering its
+credential. The user must generate a new offer in that case. The server returns
+`e2ee_authenticated` with the minted string credential plus `environmentId` and,
+when available, `storageInstanceId`. A returning device sends
 `{"type":"e2ee_auth","bearer":"<stored credential>"}` and receives an
 `e2ee_authenticated` acknowledgement. Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
@@ -112,24 +115,29 @@ E2EE-only credential is not exposed as a usable HTTP authorization capability.
 
 Pre-auth work is bounded independently of normal RPC traffic. The complete
 upgrade, handshake, and authentication sequence has one 10-second deadline;
-the authentication message is capped at 64 KiB; at most 32 unauthenticated
-E2EE connections may be in flight; and non-empty handshake payloads fail the
-protocol. Failure to decrypt the first handshake message closes with code 4403,
-which a pinned initiator classifies as a host-identity mismatch. Encrypted
-writes retain the plain session's five-second write bound and one-second pump
-join bound. Transport cipher nonces are monotonically increasing 64-bit
-counters. V1 does not rekey: exhaustion or any AEAD/protocol error fails closed
-and requires a new connection.
+the WebSocket upgrade caps both frames and reassembled WebSocket messages at
+65,535 bytes before application buffering; the authentication logical message
+is capped at 64 KiB; at most 32 unauthenticated E2EE connections may be in
+flight; and non-empty handshake payloads fail the protocol. Failure to decrypt
+the first handshake message closes with code 4403, which a pinned initiator
+classifies as a host-identity mismatch. Encrypted writers iterate one plaintext
+record at a time, encrypt it, release the channel lock, and await its bounded
+write before producing the next record. The receiver reuses one bounded decrypt
+scratch buffer. Writes retain the plain session's five-second bound and
+one-second pump join bound. Transport cipher nonces are monotonically increasing
+64-bit counters. V1 does not rekey: exhaustion or any AEAD/protocol error fails
+closed and requires a new connection.
 
 The pairing payload is base64url-unpadded JSON in
 `bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
 token, host public key, reach intent, and persistent storage identity. An
 authenticated caller with `access:write` mints it through
 `POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
-the original offer and rejects reuse with different input. The server validates
-that `this-computer` uses loopback, `another-device` does not use loopback, and
-that no offered endpoint is wildcard or port zero. Reach is embedded in the
-code and persisted with the grant as described below.
+the original offer and rejects reuse with different input. Replay entries are
+scoped to the authenticated principal and kept under a bounded, expiring cap.
+The server validates that `this-computer` uses loopback, `another-device` does
+not use loopback, and that no offered endpoint is wildcard or port zero. Reach
+is embedded in the code and persisted with the grant as described below.
 
 The add flow parses and classifies the endpoint, fetches the public descriptor,
 performs the pinned handshake and in-channel pairing, and calls authenticated
@@ -138,6 +146,11 @@ environment and storage identities with both the pairing payload and descriptor.
 Failures are classified as `unreachable`, `host-identity-mismatch`,
 `pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. Only the
 verified credential, profile, and accepted storage identity are then persisted.
+A post-bootstrap client verification or local-persistence failure can leave the
+new server-side session visible even though no profile was saved. The failure
+message identifies that condition; the operator can revoke the session from the
+host's client list. The client does not claim transparent retry with the same
+one-time code.
 
 ### Remote Servers settings and pairing entry points
 
@@ -180,6 +193,14 @@ the snapshot is honest about what the server can know, and manual-mode UI copy
 instructs the operator instead of guessing. Teaching servers a feed URL is a
 possible future extension, deliberately out of scope for v1.
 
+On a desktop-integrated server, every call to the hosting updater delegate is
+bounded to 30 seconds. A delegate that does not answer produces a successful
+typed snapshot with `state: "error"` and the updater-timeout message, including
+for an install request; it cannot pin an environment's single-flight update
+operation indefinitely. Plain authenticated WebSockets enter the live-client
+registry only after the HTTP upgrade completes, and unregister from the same
+upgrade-owned lifecycle.
+
 ### Share ceremony and exposure
 
 The Share tab mints the complete pairing payload on the server through
@@ -192,16 +213,26 @@ session created by consuming the grant inherits both fields.
 The server is the source of truth for desired exposure.
 `GET /api/auth/share-state` derives `wide` only while at least one unrevoked
 pairing link or client session has `off_host = true`; it otherwise derives
-`loopback`. The desktop widens only as part of generating an off-host offer.
-`desktop_bridge_apply_server_exposure` persists the desired launch mode,
-restart-rebinds the backend, verifies the effective bind, and synchronizes the
-program-scoped `BiBCode Remote Access` Windows Firewall rule. A failed wide bind,
-verification, or firewall update restores the previous setting, restarts the
-previous topology, and removes the rule. Narrowing commits even if firewall-rule
-cleanup reports a warning because restoring the loopback bind is the safer
-state. The persisted desktop setting is only a launch-time cache of this
-ceremony; creating a **This computer only** or loopback-custom grant never
-widens a later launch. There is no independent manual exposure toggle.
+`loopback`. Every active off-host session counts regardless of access method,
+including `browser-session-cookie`, `bearer-access-token`, and
+`dpop-access-token`. Consuming a browser pairing link therefore replaces the
+one-time-link reason with the browser-session reason instead of narrowing and
+disconnecting the newly paired browser.
+
+The desktop widens only as part of generating an off-host offer. One native
+`ServerExposureCoordinator` serializes settings, backend restart, verification,
+firewall synchronization, and recovery for every apply. Widening uses an
+ephemeral launch override, verifies a network-accessible advertised endpoint,
+opens the program-scoped `BiBCode Remote Access` Windows Firewall rule, and
+persists network-accessible only after those native side effects succeed. Any
+failure attempts every local safeguard even if an earlier recovery step fails:
+persist local-only, restart with a local-only override, close the firewall, and
+stop an unverified backend. Narrowing persists local-only first, restarts and
+verifies local topology, then closes the firewall; it never restores durable
+wide state as compensation. The persisted desktop setting is the next-launch
+target, not evidence that an apply succeeded. Creating a **This computer only**
+or loopback-custom grant never widens a later launch, and there is no independent
+manual exposure toggle.
 
 Compatibility grants whose persisted reach and off-host fields are `NULL`
 never cause an automatic widen. While any unrevoked legacy one-time-token grant
@@ -209,14 +240,21 @@ remains, they do block automatic reversion from an already-wide bind. The Share
 tab identifies that condition and tells the user to revoke or re-pair those
 clients. Otherwise, the renderer checks share state at startup and after every
 auth-access revision and switches a wide desktop backend back to loopback when
-the last off-host grant is revoked. This reconciler is narrow-only.
+the last off-host grant is revoked. After narrowing it reads share state once
+more. Only if a concurrent new off-host grant appeared during that operation
+does it perform one compensating widen; later revisions schedule a fresh
+reconciliation rather than creating an internal loop.
 
 Revoking a client invalidates its credential and actively cancels every live
 plain or E2EE WebSocket registered to that session. Revoking all other clients
 does the same for each affected session. Exposure changes still use a backend
 restart: live local connections and running turns drop, while committed SQLite
 state and other durable server state survive. A failed post-restart mint leaves
-no grant, and the startup/revision reconciler restores loopback exposure.
+no grant. The share ceremony immediately awaits a local-only compensation
+instead of depending on an auth revision event that may never arrive. The UI
+distinguishes a successful cleanup with local-only confirmation from an
+explicit cleanup failure, while the startup/revision reconciler remains a
+backstop.
 
 A wide-bound native primary does not expose the desktop-only maintenance API.
 Update protection therefore degrades while sharing until exposure returns to

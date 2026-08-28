@@ -196,9 +196,12 @@ minimum sizes verify:
   grant-driven sharing appears because the desktop bridge is present. Generate
   an **Another device** offer, verify the restart completes before the browser
   URL, deep link, pairing code, and QR code appear, then revoke the last
-  off-host offer or client and verify exposure returns to loopback.
-  the local-machine flow still has no Host selector; remote targeting is driven
-  by the environment rail;
+  off-host offer or client and verify exposure returns to loopback. Capture the
+  shared runbook's four compensation outcomes: successful local-only cleanup
+  after a failed mint, explicit cleanup failure, last-browser-session revocation
+  with a local-only restart, and one compensating widen when a concurrent grant
+  appears during narrowing. The local-machine flow still has no Host selector;
+  remote targeting is driven by the environment rail;
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge
