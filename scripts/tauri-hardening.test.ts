@@ -402,7 +402,10 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(yield* fs.exists(path.join(repoRoot, "scripts/run-tauri-build.mjs")), true);
       assert.notMatch(desktopPackage, /pnpm dlx/);
       assert.notMatch(desktopLib, /if\s*!cfg!\(debug_assertions\)[\s\S]*?backend\.start_default/);
-      assert.match(desktopLib, /backend\.start_default\(app_handle\)\.await/);
+      assert.match(
+        desktopLib,
+        /\.run_exclusive\(backend\.start_default\(app_handle\)\)[\s\S]*?\.await/,
+      );
     }),
   );
 });
