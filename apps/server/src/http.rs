@@ -229,11 +229,11 @@ async fn websocket(
             let session_id = principal.session_id.clone();
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
-            let connection_id = auth
-                .mark_connected(&session_id, session_shutdown.clone())
-                .await;
             upgrade
                 .on_upgrade(move |socket| async move {
+                    let connection_id = auth
+                        .mark_connected(&session_id, session_shutdown.clone())
+                        .await;
                     let expiration_guard =
                         spawn_session_expiration_guard(expires_at_ms, session_shutdown.clone());
                     run_session(
