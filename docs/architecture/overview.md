@@ -448,10 +448,15 @@ identity and clears its environment cache.
 Native wildcard binds now occur exclusively through the **Share this host**
 offer ceremony. The renderer widens through the verified
 `desktop_bridge_apply_server_exposure` operation only when minting an off-host
-grant, and a narrow-only app-level reconciler restores loopback after the final
-off-host grant is revoked. The previous manual network-access toggle is gone;
-the server's persisted grant metadata is the policy source of truth and the
-desktop exposure setting is its restart-time cache.
+grant for a native primary. A bidirectional app-level reconciler derives the
+requested topology from live server grants: it widens a local-only native
+runtime when an off-host reason exists and restores loopback after the final
+reason is revoked. WSL-only primaries use their WSL-owned advertised endpoint
+and never enter this native exposure state machine. The previous manual
+network-access toggle is gone; server grant metadata is the policy source of
+truth. Every fresh native desktop process starts local-only, so the durable
+desktop setting records the last completed transition but is not startup
+permission to listen wide.
 
 ## Desktop update protection
 

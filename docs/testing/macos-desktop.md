@@ -197,10 +197,11 @@ minimum sizes verify:
   an **Another device** offer, verify the restart completes before the browser
   URL, deep link, pairing code, and QR code appear, then revoke the last
   off-host offer or client and verify exposure returns to loopback. Capture the
-  shared runbook's four compensation outcomes: successful local-only cleanup
+  shared runbook's five compensation outcomes: successful local-only cleanup
   after a failed mint, explicit cleanup failure, last-browser-session revocation
   with a local-only restart, and one compensating widen when a concurrent grant
-  appears during narrowing. The local-machine flow still has no Host selector;
+  appears during narrowing, plus bounded handling of a blackholed create
+  response. The local-machine flow still has no Host selector;
   remote targeting is driven by the environment rail;
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for

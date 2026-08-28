@@ -124,6 +124,10 @@ test-owned server/profile and controlled failure injection where required:
   revoking that last browser session causes one local-only restart; and
 - when a new off-host grant appears during narrowing, the one post-narrow read
   causes one compensating widen and the resulting offer remains reachable.
+- a blackholed pairing-offer create response reaches the five-second attempt
+  deadline, completes the bounded retry/cancel path, and reports either verified
+  local-only cleanup or explicit cancellation/cleanup failure instead of
+  remaining indefinitely in the generating state.
 
 Record the exposure mode, grant/session row, restart boundary, visible message,
 and screenshot for each outcome. Do not use a later app restart as substitute
@@ -134,8 +138,10 @@ transport-size tests from the repository root whenever this boundary changes:
 
 ```sh
 vp test scripts/remote-architecture-contract.test.ts
+vp test packages/client-runtime/src/rpc/session.test.ts
 cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
 cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::completed_messages_retain_their_global_record_budget --lib -- --exact
 ```
 
 ### Direct E2EE interop gate
@@ -168,14 +174,14 @@ available, and use test-owned names so cleanup can be proven:
 cargo build -p bibcode-server
 docker version
 
-docker network create bibcode-remote-stabilization
-docker volume create bibcode-remote-stabilization-data
 cleanup_bibcode_remote_docker() {
   docker rm -f bibcode-remote-server bibcode-remote-client 2>/dev/null || true
   docker network rm bibcode-remote-stabilization 2>/dev/null || true
   docker volume rm bibcode-remote-stabilization-data 2>/dev/null || true
 }
 trap cleanup_bibcode_remote_docker EXIT INT TERM
+docker network create bibcode-remote-stabilization
+docker volume create bibcode-remote-stabilization-data
 
 docker run -d --name bibcode-remote-server \
   --network bibcode-remote-stabilization \
