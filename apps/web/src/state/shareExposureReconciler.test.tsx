@@ -125,6 +125,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState,
         getExposureState: async () => wideExposure,
         applyExposure,
+        canApplyExposure: () => true,
       }),
     ).resolves.toBe("narrowed");
     expect(getShareState).toHaveBeenCalledTimes(2);
@@ -147,6 +148,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState,
         getExposureState: async () => wideExposure,
         applyExposure,
+        canApplyExposure: () => true,
       }),
     ).resolves.toBe("rewidened");
     expect(applyExposure.mock.calls).toEqual([["local-only"], ["network-accessible"]]);
@@ -160,6 +162,7 @@ describe("reconcileShareExposureOnce", () => {
         getShareState: async () => ({ ...loopbackDesired, legacyGrantCount: 1 }),
         getExposureState: async () => wideExposure,
         applyExposure,
+        canApplyExposure: () => true,
       }),
     ).resolves.toBe("unchanged");
     expect(applyExposure).not.toHaveBeenCalled();
@@ -177,6 +180,7 @@ describe("reconcileShareExposureOnce", () => {
         }),
         getExposureState: async () => localExposure,
         applyExposure,
+        canApplyExposure: () => true,
       }),
     ).resolves.toBe("widened");
     expect(applyExposure).toHaveBeenCalledExactlyOnceWith("network-accessible");
@@ -279,5 +283,49 @@ describe("useShareExposureReconciler", () => {
     expect(h.getShareState).not.toHaveBeenCalled();
     expect(getServerExposureState).not.toHaveBeenCalled();
     expect(applyServerExposure).not.toHaveBeenCalled();
+  });
+
+  it("cancels an in-flight native reconciliation when WSL-only wins the topology lock", async () => {
+    let resolveShareState!: (value: {
+      desiredExposure: "loopback";
+      offHostGrantCount: number;
+      legacyGrantCount: number;
+    }) => void;
+    h.getShareState.mockReturnValue(
+      new Promise((resolve) => {
+        resolveShareState = resolve;
+      }),
+    );
+    const getServerExposureState = vi.fn(async () => wideExposure);
+    const applyServerExposure = vi.fn(async () => localExposure);
+    Object.defineProperty(window, "desktopBridge", {
+      configurable: true,
+      value: { getServerExposureState, applyServerExposure },
+    });
+
+    await act(async () => {
+      root.render(<HookHarness />);
+      await Promise.resolve();
+    });
+    expect(h.getShareState).toHaveBeenCalledOnce();
+
+    h.wslOnly = true;
+    await act(async () => {
+      root.render(<HookHarness />);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      resolveShareState({
+        desiredExposure: "loopback",
+        offHostGrantCount: 0,
+        legacyGrantCount: 0,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applyServerExposure).not.toHaveBeenCalled();
+    expect(h.refreshNetwork).not.toHaveBeenCalled();
+    expect(h.toastAdd).not.toHaveBeenCalled();
   });
 });

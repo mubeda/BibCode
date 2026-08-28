@@ -1,7 +1,7 @@
 import type { AuthShareStateResult } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 import { RefreshCwIcon } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
 import {
@@ -78,6 +78,8 @@ export function ShareThisHostTab(): ReactElement {
   const desktopWsl = useEnvironmentQuery(hasDesktopBridge ? desktopWslStateAtom : null);
   const wslOnlyPrimary = desktopWsl.data?.wslOnly === true;
   const canManageNativeExposure = hasDesktopBridge && desktopWsl.data?.wslOnly === false;
+  const canManageNativeExposureRef = useRef(canManageNativeExposure);
+  canManageNativeExposureRef.current = canManageNativeExposure;
   const exposureState = desktopNetworkAccess.data?.serverExposureState ?? null;
   const advertisedEndpoints = desktopNetworkAccess.data?.advertisedEndpoints ?? [];
   const [intent, setIntent] = useState<ShareIntent>("another-device");
@@ -175,6 +177,7 @@ export function ShareThisHostTab(): ReactElement {
                 getShareState: getServerShareState,
                 getExposureState: () => desktopBridge.getServerExposureState(),
                 applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
+                canApplyExposure: () => canManageNativeExposureRef.current,
               }),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       requestTimeoutMs: PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,

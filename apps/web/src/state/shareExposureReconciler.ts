@@ -33,6 +33,7 @@ export interface ShareExposureOperations {
   readonly applyExposure: (
     desired: DesktopServerExposureMode,
   ) => Promise<DesktopServerExposureState>;
+  readonly canApplyExposure: () => boolean;
 }
 
 export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "widened" | "rewidened";
@@ -45,6 +46,7 @@ export async function reconcileShareExposureOnce(
     operations.getExposureState(),
   ]);
   if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
+    if (!operations.canApplyExposure()) return "unchanged";
     await operations.applyExposure("network-accessible");
     refreshDesktopNetworkAccessState();
     return "widened";
@@ -53,11 +55,13 @@ export async function reconcileShareExposureOnce(
     return "unchanged";
   }
 
+  if (!operations.canApplyExposure()) return "unchanged";
   await operations.applyExposure("local-only");
   refreshDesktopNetworkAccessState();
   const confirmedShareState = await operations.getShareState();
   if (confirmedShareState.desiredExposure !== "wide") return "narrowed";
 
+  if (!operations.canApplyExposure()) return "narrowed";
   await operations.applyExposure("network-accessible");
   refreshDesktopNetworkAccessState();
   return "rewidened";
@@ -66,6 +70,8 @@ export async function reconcileShareExposureOnce(
 interface ReconcileTarget {
   readonly bridge: DesktopBridge | undefined;
   readonly primaryEnvironmentId: EnvironmentId | null;
+  readonly canManageNativeExposure: boolean;
+  readonly generation: number;
 }
 
 export function useShareExposureReconciler(): void {
@@ -83,8 +89,29 @@ export function useShareExposureReconciler(): void {
       : null,
   );
   const revision = accessChanges.data?.revision ?? null;
-  const targetRef = useRef<ReconcileTarget>({ bridge, primaryEnvironmentId });
-  targetRef.current = { bridge, primaryEnvironmentId };
+  const generationRef = useRef(0);
+  const previousTargetRef = useRef({ bridge, primaryEnvironmentId, canManageNativeExposure });
+  const previousTarget = previousTargetRef.current;
+  if (
+    previousTarget.bridge !== bridge ||
+    previousTarget.primaryEnvironmentId !== primaryEnvironmentId ||
+    previousTarget.canManageNativeExposure !== canManageNativeExposure
+  ) {
+    generationRef.current += 1;
+    previousTargetRef.current = { bridge, primaryEnvironmentId, canManageNativeExposure };
+  }
+  const targetRef = useRef<ReconcileTarget>({
+    bridge,
+    primaryEnvironmentId,
+    canManageNativeExposure,
+    generation: generationRef.current,
+  });
+  targetRef.current = {
+    bridge,
+    primaryEnvironmentId,
+    canManageNativeExposure,
+    generation: generationRef.current,
+  };
   const requestedRef = useRef(false);
   const inFlightRef = useRef<Promise<void> | null>(null);
 
@@ -100,7 +127,8 @@ export function useShareExposureReconciler(): void {
         if (
           targetBridge?.applyServerExposure === undefined ||
           targetBridge.getServerExposureState === undefined ||
-          target.primaryEnvironmentId === null
+          target.primaryEnvironmentId === null ||
+          !target.canManageNativeExposure
         ) {
           continue;
         }
@@ -109,6 +137,15 @@ export function useShareExposureReconciler(): void {
             getShareState: getServerShareState,
             getExposureState: () => targetBridge.getServerExposureState(),
             applyExposure: (desired) => targetBridge.applyServerExposure(desired),
+            canApplyExposure: () => {
+              const current = targetRef.current;
+              return (
+                current.generation === target.generation &&
+                current.canManageNativeExposure &&
+                current.bridge === targetBridge &&
+                current.primaryEnvironmentId === target.primaryEnvironmentId
+              );
+            },
           });
           if (outcome === "narrowed") {
             toastManager.add({
