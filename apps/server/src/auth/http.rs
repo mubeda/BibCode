@@ -310,7 +310,7 @@ async fn create_pairing_offer(
     if let Some(key) = &idempotency_key {
         match state
             .auth
-            .replay_pairing_offer(key, &input_fingerprint)
+            .replay_pairing_offer(&principal.session_id, key, &input_fingerprint)
             .await
         {
             PairingOfferReplay::Original(original) => return Json(original).into_response(),
@@ -427,7 +427,12 @@ async fn create_pairing_offer(
     if let Some(key) = idempotency_key
         && let Err(error) = state
             .auth
-            .record_pairing_offer(key, input_fingerprint, result.clone())
+            .record_pairing_offer(
+                &principal.session_id,
+                key,
+                input_fingerprint,
+                result.clone(),
+            )
             .await
     {
         let _ = state.auth.revoke_pairing(&result.id).await;
