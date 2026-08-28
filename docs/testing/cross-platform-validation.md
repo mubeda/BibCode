@@ -141,7 +141,9 @@ vp test scripts/remote-architecture-contract.test.ts
 vp test packages/client-runtime/src/rpc/session.test.ts
 cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
 cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
-cargo test -p bibcode-server rpc::e2ee::tests::completed_messages_retain_their_global_record_budget --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::completed_messages_retain_their_global_buffer_budget --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::completed_pairing_offer_replays_and_cancels_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_can_be_cancelled_after_restart --lib -- --exact
 ```
 
 ### Direct E2EE interop gate

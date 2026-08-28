@@ -354,7 +354,12 @@ minimum-size, and relevant Windows DPI states. Verify:
   a usable WSL advertised endpoint. Confirm the native Windows backend process,
   native exposure state, and `BiBCode Remote Access` firewall rule do not change;
   the ceremony and reconciler must not call the native exposure bridge for this
-  topology;
+  topology. In the Exposure section, confirm the available off-host WSL URL is
+  shown and the native-only **Limited to this machine** and **Managed
+  automatically** copy is absent. Start one native reconciliation before the
+  switch and let it resume after WSL-only becomes active; it must produce no
+  exposure side effects. A direct native exposure bridge invocation after the
+  switch must be rejected by the host-side topology guard;
 
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with

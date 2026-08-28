@@ -148,13 +148,21 @@ The pairing payload is base64url-unpadded JSON in
 token, host public key, reach intent, and persistent storage identity. An
 authenticated caller with `access:write` mints it through
 `POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
-the original offer and rejects reuse with different input. Replay entries are
-scoped to the authenticated principal and kept under bounded, expiring caps:
-128 live entries per principal and 4,096 globally.
+the original offer and rejects reuse with different input. Entries are scoped
+to the authenticated principal and persisted in
+`auth_pairing_offer_idempotency`. The pairing grant and a pending principal/key
+reservation commit in one SQLite transaction; the encoded result completes that
+reservation before the HTTP response is sent. After a crash in the pending
+window, replay is rejected conservatively until the caller cancels the key.
+Active results, pending reservations, and tombstones hydrate before capacity
+checks and remain under bounded, expiring caps: 128 live entries per principal
+and 4,096 globally. Expired rows are pruned at startup and inside every
+reservation or cancellation transaction.
 An authenticated `POST /api/auth/pairing-offer/cancel` names the same key. It
-revokes a committed offer for that principal and stores an expiring tombstone,
-so cancellation is safe both after a lost response and before a delayed create
-reaches the issuance lock. A cancelled key cannot mint or replay an offer.
+atomically revokes the mapped pairing grant and stores an expiring tombstone,
+so cancellation remains safe after a lost response, across a process restart,
+and before a delayed create reaches the issuance lock. A cancelled key cannot
+mint or replay an offer.
 The server validates that `this-computer` uses loopback, `another-device` does
 not use loopback, and that no offered endpoint is wildcard or port zero. Reach
 is embedded in the code and persisted with the grant as described below.
@@ -167,7 +175,10 @@ Failures are classified as `unreachable`, `host-identity-mismatch`,
 `pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. The
 verified credential and profile are registered before the storage identity is
 accepted. If identity persistence fails, the client compensates by removing the
-partial local registration; if that removal also fails, the failure explicitly
+partial local registration. Compensation is conditional on that exact
+registration still owning the environment under the registry's per-environment
+lock, so a concurrent replacement cannot be removed by an older failed add. If
+that removal also fails, the failure explicitly
 instructs the user to remove it manually. Either failure can still leave the new
 server-side session visible because the one-time exchange was already committed.
 The failure message identifies that condition, and host-identity mismatch copy
@@ -265,8 +276,13 @@ widens a later launch, and there is no independent manual exposure toggle.
 This coordinator governs only a native primary. When Windows desktop is in
 WSL-only mode, the Share tab chooses an available WSL-owned advertised endpoint
 and neither the offer ceremony nor the reconciler calls the native exposure
-bridge. Consequently sharing a WSL primary cannot restart, widen, narrow, or
-stop a stale native backend.
+bridge. A renderer topology generation invalidates reconciliation work that was
+already awaiting share or exposure state when WSL-only mode changed. The
+privileged exposure operation also rereads authoritative desktop settings
+inside the same coordinator critical section and rejects every native exposure
+transition while WSL-only is active. Consequently sharing a WSL primary cannot
+restart, widen, narrow, or stop a stale native backend even if renderer work was
+in flight during the topology switch.
 
 Compatibility grants whose persisted reach and off-host fields are `NULL`
 never cause an automatic widen. While any unrevoked legacy one-time-token grant
