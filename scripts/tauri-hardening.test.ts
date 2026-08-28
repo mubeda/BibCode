@@ -380,6 +380,7 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
         "allow-desktop-bridge",
         "allow-desktop-preview",
         "core:default",
+        "deep-link:default",
       ]);
       assert.match(viteConfig, /tanstackRouter\(\{[\s\S]*?autoCodeSplitting: true,/);
       assert.match(viteConfig, /chunkSizeWarningLimit: 1536,/);

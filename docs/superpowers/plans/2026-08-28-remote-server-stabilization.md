@@ -84,8 +84,8 @@ Insert these sorted dependency records next to their cohorts:
 {
   "key": "rust:workspace:snow",
   "name": "snow",
-  "current": "0.10.0",
-  "target": "0.10.0",
+  "current": "0.10",
+  "target": "0.10",
   "channel": "stable",
   "source": "https://crates.io/crates/snow",
   "cohort": "rust-current",
@@ -98,8 +98,8 @@ Insert these sorted dependency records next to their cohorts:
 {
   "key": "rust:workspace:tauri-plugin-deep-link",
   "name": "tauri-plugin-deep-link",
-  "current": "2.4.9",
-  "target": "2.4.9",
+  "current": "2",
+  "target": "2",
   "channel": "stable",
   "source": "https://crates.io/crates/tauri-plugin-deep-link",
   "cohort": "rust-current",
@@ -112,8 +112,8 @@ Insert these sorted dependency records next to their cohorts:
 {
   "key": "rust:workspace:tauri-plugin-single-instance",
   "name": "tauri-plugin-single-instance",
-  "current": "2.4.3",
-  "target": "2.4.3",
+  "current": "2",
+  "target": "2",
   "channel": "stable",
   "source": "https://crates.io/crates/tauri-plugin-single-instance",
   "cohort": "rust-current",
