@@ -362,6 +362,10 @@ describe("ShareThisHostTab", () => {
       expect.objectContaining({ endpoint: "http://172.20.10.2:3773/" }),
       expect.any(String),
     );
+    expect(container.textContent).toContain("Reachable at http://172.20.10.2:3773/");
+    expect(container.textContent).toContain("Exposure is owned by the WSL backend");
+    expect(container.textContent).not.toContain("Limited to this machine");
+    expect(container.textContent).not.toContain("Managed automatically");
   });
 
   it("keeps browser exposure read-only while server-side minting remains available", async () => {
