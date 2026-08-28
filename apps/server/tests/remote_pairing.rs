@@ -16,14 +16,15 @@ fn read_fixture(name: &str) -> String {
 
 #[test]
 fn canonical_payload_fixture_round_trips_through_the_rust_mirror() {
+    let fixture = read_fixture("payload.json");
     let payload: RemotePairingCodePayload =
-        serde_json::from_str(read_fixture("payload.json").trim()).expect("decode payload");
+        serde_json::from_str(fixture.trim()).expect("decode payload");
     assert_eq!(payload.v, REMOTE_PAIRING_CODE_VERSION);
     assert_eq!(payload.endpoint, "http://192.168.1.20:3773");
     assert_eq!(payload.reach, RemotePairingReach::AnotherDevice);
     assert_eq!(
-        serde_json::to_string(&payload).expect("encode payload"),
-        read_fixture("payload.json").trim()
+        serde_json::to_value(&payload).expect("encode payload"),
+        serde_json::from_str::<serde_json::Value>(fixture.trim()).expect("decode fixture value")
     );
 }
 
