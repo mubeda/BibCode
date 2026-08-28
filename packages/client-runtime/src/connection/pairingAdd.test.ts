@@ -89,6 +89,8 @@ interface HarnessOptions {
   readonly authenticatedEnvironmentId?: EnvironmentId;
   readonly configEnvironmentId?: EnvironmentId;
   readonly configStorageInstanceId?: string;
+  readonly registrationPersistenceFailure?: boolean;
+  readonly identityPersistenceFailure?: boolean;
 }
 
 const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
@@ -108,17 +110,21 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
   const registry = EnvironmentRegistry.EnvironmentRegistry.of({
     entries,
     register: (registration: ConnectionRegistration) =>
-      Effect.sync(() => {
-        registrations.push(registration);
-      }),
+      options.registrationPersistenceFailure === true
+        ? Effect.fail(new Error("registration storage unavailable"))
+        : Effect.sync(() => {
+            registrations.push(registration);
+          }),
   } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
   const identities = Persistence.AcceptedStorageIdentityStore.of({
     get: (targetKey) => Effect.succeed(Option.fromUndefinedOr(accepted.get(targetKey))),
     accept: (identity) =>
-      Effect.sync(() => {
-        accepted.set(identity.targetKey, identity.storageInstanceId);
-        acceptedIdentities.push(identity);
-      }),
+      options.identityPersistenceFailure === true
+        ? Effect.fail(new Error("identity storage unavailable"))
+        : Effect.sync(() => {
+            accepted.set(identity.targetKey, identity.storageInstanceId);
+            acceptedIdentities.push(identity);
+          }),
     transition: (targetKey, decide) =>
       Effect.sync(() => {
         const transition = decide(accepted.get(targetKey) ?? null);
@@ -363,6 +369,34 @@ describe("verifyAndAddPairingCode", () => {
         "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
       );
       expect(harness.registrations).toEqual([]);
+    }),
+  );
+
+  it.effect("reports server-side residue when registration persistence fails after pairing", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ registrationPersistenceFailure: true });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("local-persistence-failed");
+      expect(error.detail).toContain(
+        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
+      );
+      expect(harness.registrations).toEqual([]);
+      expect(harness.acceptedIdentities).toEqual([]);
+    }),
+  );
+
+  it.effect("reports partial local state when identity persistence fails after registration", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ identityPersistenceFailure: true });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("local-persistence-failed");
+      expect(error.detail).toContain(
+        "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
+      );
+      expect(harness.registrations).toHaveLength(1);
+      expect(harness.acceptedIdentities).toEqual([]);
     }),
   );
 
