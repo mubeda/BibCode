@@ -21,6 +21,8 @@ import {
 import { parsePairingCode } from "@bibcode/shared/pairingCode";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
+import * as NodeNet from "node:net";
+import * as NodeTimersPromises from "node:timers/promises";
 
 import { decodeBase64UrlKey } from "./noise.ts";
 import {
@@ -240,13 +242,24 @@ async function assertAmbiguousOfferCancellation(administrator: string): Promise<
         reach: "another-device",
       }),
     });
-  const created = await create();
-  expect(created.ok).toBe(true);
-  decodePairingOffer(await created.json());
-  expect(await shareState(administrator)).toMatchObject({
-    desiredExposure: "wide",
-    offHostGrantCount: 1,
+  const abandonedRequest = await dispatchPairingOfferWithoutReadingResponse({
+    administrator,
+    idempotencyKey,
   });
+  try {
+    let observedCommittedGrant = false;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const state = await shareState(administrator);
+      if (state.desiredExposure === "wide" && state.offHostGrantCount === 1) {
+        observedCommittedGrant = true;
+        break;
+      }
+      await NodeTimersPromises.setTimeout(25);
+    }
+    expect(observedCommittedGrant).toBe(true);
+  } finally {
+    abandonedRequest.destroy();
+  }
 
   const cancelled = decodePairingOfferCancellation(
     await fetchJson("/api/auth/pairing-offer/cancel", {
@@ -268,6 +281,52 @@ async function assertAmbiguousOfferCancellation(administrator: string): Promise<
   const delayed = await create();
   expect(delayed.status).toBe(400);
   expect(await delayed.json()).toMatchObject({ reason: "invalid_pairing_offer" });
+}
+
+async function dispatchPairingOfferWithoutReadingResponse(input: {
+  administrator: string;
+  idempotencyKey: string;
+}): Promise<NodeNet.Socket> {
+  const url = new URL("/api/auth/pairing-offer", serverUrl!);
+  expect(url.protocol).toBe("http:");
+  const body = JSON.stringify({
+    name: "docker-cancelled",
+    endpoint: serverUrl,
+    reach: "another-device",
+  });
+  const request = [
+    `POST ${url.pathname} HTTP/1.1`,
+    `Host: ${url.host}`,
+    `Authorization: Bearer ${input.administrator}`,
+    "Content-Type: application/json",
+    `Content-Length: ${String(Buffer.byteLength(body))}`,
+    `Idempotency-Key: ${input.idempotencyKey}`,
+    "Connection: close",
+    "",
+    body,
+  ].join("\r\n");
+
+  return await new Promise<NodeNet.Socket>((resolve, reject) => {
+    let connected = false;
+    const socket = NodeNet.connect(
+      {
+        host: url.hostname,
+        port: url.port === "" ? 80 : Number(url.port),
+      },
+      () => {
+        socket.setNoDelay(true);
+        socket.write(request, () => {
+          connected = true;
+          resolve(socket);
+        });
+      },
+    );
+    socket.on("error", (error) => {
+      if (!connected) reject(error);
+    });
+    // Intentionally do not attach a data/readable listener: the caller abandons
+    // the response and must recover solely from the idempotency key.
+  });
 }
 
 describe.skipIf(serverUrl === undefined || adminCredential === undefined)(

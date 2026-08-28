@@ -93,6 +93,10 @@ transport ciphertext containing one record:
 - reassembled logical messages are capped at 64 MiB and are exactly the bytes
   consumed by the unchanged RPC protocol.
 
+Browser clients set the E2EE socket's `binaryType` to `arraybuffer` before the
+RPC socket adapter attaches. Ciphertext records therefore enter the Noise
+decryptor in WebSocket delivery order without asynchronous `Blob` conversion.
+
 The first logical message authenticates inside the encrypted channel. A new
 device sends `{"type":"e2ee_auth","pairing":"<one-time token>"}`. Only a
 successful exchange consumes that token; a wrong host or failed handshake does
@@ -128,13 +132,21 @@ one-second pump join bound. Transport cipher nonces are monotonically increasing
 64-bit counters. V1 does not rekey: exhaustion or any AEAD/protocol error fails
 closed and requires a new connection.
 
+Authenticated receivers additionally share a conservative 2,049-record global
+budget, dimensioned as 128 MiB of maximum-size plaintext chunks. Each record
+holds one permit while it is being reassembled; a completed logical message
+retains all of its permits while queued, decoded, authorized, and handled by RPC.
+Stalled consumers therefore apply backpressure across E2EE connections instead
+of allowing every connection's 64-entry queue to retain 64 MiB messages.
+
 The pairing payload is base64url-unpadded JSON in
 `bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
 token, host public key, reach intent, and persistent storage identity. An
 authenticated caller with `access:write` mints it through
 `POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
 the original offer and rejects reuse with different input. Replay entries are
-scoped to the authenticated principal and kept under a bounded, expiring cap.
+scoped to the authenticated principal and kept under bounded, expiring caps:
+128 live entries per principal and 4,096 globally.
 An authenticated `POST /api/auth/pairing-offer/cancel` names the same key. It
 revokes a committed offer for that principal and stores an expiring tombstone,
 so cancellation is safe both after a lost response and before a delayed create
@@ -148,13 +160,16 @@ performs the pinned handshake and in-channel pairing, and calls authenticated
 `server.getConfig` before saving anything. It compares the in-channel
 environment and storage identities with both the pairing payload and descriptor.
 Failures are classified as `unreachable`, `host-identity-mismatch`,
-`pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. Only the
-verified credential, profile, and accepted storage identity are then persisted.
-A post-bootstrap client verification or local-persistence failure can leave the
-new server-side session visible even though no profile was saved. The failure
-message identifies that condition; the operator can revoke the session from the
-host's client list. The client does not claim transparent retry with the same
-one-time code.
+`pairing-rejected`, `incompatible`, or `duplicate-storage-identity`. The
+verified credential and profile are registered before the storage identity is
+accepted. If identity persistence fails, the client compensates by removing the
+partial local registration; if that removal also fails, the failure explicitly
+instructs the user to remove it manually. Either failure can still leave the new
+server-side session visible because the one-time exchange was already committed.
+The failure message identifies that condition, and host-identity mismatch copy
+also covers a code accepted before later verification failed. The operator can
+revoke the incomplete session from the host's client list. The client does not
+claim transparent retry with the same one-time code.
 
 ### Remote Servers settings and pairing entry points
 
@@ -243,6 +258,12 @@ completed transition but is neither proof of actual topology nor permission to
 start wide. Creating a **This computer only** or loopback-custom grant never
 widens a later launch, and there is no independent manual exposure toggle.
 
+This coordinator governs only a native primary. When Windows desktop is in
+WSL-only mode, the Share tab chooses an available WSL-owned advertised endpoint
+and neither the offer ceremony nor the reconciler calls the native exposure
+bridge. Consequently sharing a WSL primary cannot restart, widen, narrow, or
+stop a stale native backend.
+
 Compatibility grants whose persisted reach and off-host fields are `NULL`
 never cause an automatic widen. While any unrevoked legacy one-time-token grant
 remains, they do block automatic reversion from an already-wide bind. The Share
@@ -268,6 +289,14 @@ it leaves exposure unchanged and reports cleanup failure. The direct path does
 not depend on an auth revision event that may never arrive. The UI distinguishes
 a successful cleanup with local-only confirmation from an explicit cleanup
 failure, while the startup/revision reconciler remains a backstop.
+
+Each pairing-offer create attempt and cancellation has a five-second deadline
+at both the primary HTTP Effect and ceremony boundary. The HTTP deadline
+interrupts the underlying request; the outer deadline also bounds injected or
+test transports that never settle. Five create attempts remain separated by
+the existing two-second backoff. A blackholed response therefore reaches the
+explicit cancellation/cleanup result instead of leaving the renderer waiting
+indefinitely after a native widen.
 
 A wide-bound native primary does not expose the desktop-only maintenance API.
 Update protection therefore degrades while sharing until exposure returns to

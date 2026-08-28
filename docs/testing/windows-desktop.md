@@ -344,10 +344,17 @@ minimum-size, and relevant Windows DPI states. Verify:
   offer or paired client, verify exposure returns to loopback, and confirm the
   named rule is absent. Record an elevation or policy denial as failed native
   evidence; do not substitute a manually created rule. Capture the shared
-  runbook's four compensation outcomes: successful local-only cleanup after a
+  runbook's five compensation outcomes: successful local-only cleanup after a
   failed mint, explicit cleanup failure, last-browser-session revocation with a
   local-only restart and removed rule, and one compensating widen when a
-  concurrent grant appears during narrowing;
+  concurrent grant appears during narrowing, plus bounded handling of a
+  blackholed create response;
+
+- with WSL-only primary mode active, generate an **Another device** offer from
+  a usable WSL advertised endpoint. Confirm the native Windows backend process,
+  native exposure state, and `BiBCode Remote Access` firewall rule do not change;
+  the ceremony and reconciler must not call the native exposure bridge for this
+  topology;
 
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
