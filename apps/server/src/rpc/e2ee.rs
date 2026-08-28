@@ -37,6 +37,54 @@ pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
 
+struct PlaintextRecords<'a> {
+    plaintext: &'a [u8],
+    offset: usize,
+    emitted_empty: bool,
+}
+
+impl<'a> Iterator for PlaintextRecords<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.plaintext.is_empty() {
+            if self.emitted_empty {
+                return None;
+            }
+            self.emitted_empty = true;
+            return Some((E2EE_RECORD_FLAG_FINAL, &[]));
+        }
+        if self.offset >= self.plaintext.len() {
+            return None;
+        }
+        let end = self
+            .offset
+            .saturating_add(MAX_E2EE_CHUNK_BYTES)
+            .min(self.plaintext.len());
+        let flag = if end == self.plaintext.len() {
+            E2EE_RECORD_FLAG_FINAL
+        } else {
+            E2EE_RECORD_FLAG_CONTINUATION
+        };
+        let chunk = &self.plaintext[self.offset..end];
+        self.offset = end;
+        Some((flag, chunk))
+    }
+}
+
+fn plaintext_records(plaintext: &[u8]) -> Result<PlaintextRecords<'_>, E2eeSessionError> {
+    if plaintext.len() > MAX_E2EE_LOGICAL_MESSAGE_BYTES {
+        return Err(E2eeSessionError::Protocol(
+            "outbound message too large".into(),
+        ));
+    }
+    Ok(PlaintextRecords {
+        plaintext,
+        offset: 0,
+        emitted_empty: false,
+    })
+}
+
 static E2EE_PREAUTH_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)));
 
@@ -57,6 +105,7 @@ pub(crate) enum E2eeSessionError {
 pub(crate) struct E2eeChannel {
     transport: snow::TransportState,
     assembling: Vec<u8>,
+    decrypt_scratch: Vec<u8>,
 }
 
 impl E2eeChannel {
@@ -117,35 +166,17 @@ impl E2eeChannel {
             Self {
                 transport,
                 assembling: Vec::new(),
+                decrypt_scratch: vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES],
             },
             message_b,
         ))
     }
 
-    pub(crate) fn encrypt_message(
-        &mut self,
-        plaintext: &[u8],
-    ) -> Result<Vec<Vec<u8>>, E2eeSessionError> {
-        if plaintext.len() > MAX_E2EE_LOGICAL_MESSAGE_BYTES {
-            return Err(E2eeSessionError::Protocol(
-                "outbound message too large".into(),
-            ));
-        }
-        let mut frames = Vec::new();
-        let mut chunks = plaintext.chunks(MAX_E2EE_CHUNK_BYTES).peekable();
-        if chunks.peek().is_none() {
-            frames.push(self.encrypt_record(E2EE_RECORD_FLAG_FINAL, &[])?);
-            return Ok(frames);
-        }
-        while let Some(chunk) = chunks.next() {
-            let flag = if chunks.peek().is_none() {
-                E2EE_RECORD_FLAG_FINAL
-            } else {
-                E2EE_RECORD_FLAG_CONTINUATION
-            };
-            frames.push(self.encrypt_record(flag, chunk)?);
-        }
-        Ok(frames)
+    #[cfg(test)]
+    fn encrypt_message(&mut self, plaintext: &[u8]) -> Result<Vec<Vec<u8>>, E2eeSessionError> {
+        plaintext_records(plaintext)?
+            .map(|(flag, chunk)| self.encrypt_record(flag, chunk))
+            .collect()
     }
 
     fn encrypt_record(&mut self, flag: u8, chunk: &[u8]) -> Result<Vec<u8>, E2eeSessionError> {
@@ -169,16 +200,15 @@ impl E2eeChannel {
         if frame.len() > MAX_E2EE_CIPHERTEXT_BYTES {
             return Err(E2eeSessionError::Protocol("oversized frame".into()));
         }
-        let mut record = vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES];
         let len = self
             .transport
-            .read_message(frame, &mut record)
+            .read_message(frame, &mut self.decrypt_scratch)
             .map_err(|error| E2eeSessionError::Crypto(format!("decrypt: {error:?}")))?;
         if len == 0 {
             return Err(E2eeSessionError::Protocol("empty record".into()));
         }
-        let flag = record[0];
-        let chunk = &record[1..len];
+        let flag = self.decrypt_scratch[0];
+        let chunk = &self.decrypt_scratch[1..len];
         if self.assembling.len().saturating_add(chunk.len()) > max_message_bytes {
             return Err(E2eeSessionError::Protocol("reassembly overflow".into()));
         }
@@ -215,15 +245,23 @@ pub(crate) fn e2ee_authenticated_json() -> Vec<u8> {
 pub(crate) fn e2ee_authenticated_with_credential_json(
     credential: &str,
     environment_id: &str,
-    storage_instance_id: &str,
+    storage_instance_id: Option<&str>,
 ) -> Vec<u8> {
-    serde_json::to_vec(&json!({
+    let mut reply = json!({
         "type": "e2ee_authenticated",
         "credential": credential,
         "environmentId": environment_id,
-        "storageInstanceId": storage_instance_id,
-    }))
-    .expect("static JSON")
+    });
+    if let Some(storage_instance_id) = storage_instance_id {
+        reply
+            .as_object_mut()
+            .expect("static authenticated reply is an object")
+            .insert(
+                "storageInstanceId".to_owned(),
+                serde_json::Value::String(storage_instance_id.to_owned()),
+            );
+    }
+    serde_json::to_vec(&reply).expect("static JSON")
 }
 
 pub(crate) fn e2ee_error_json(code: &str) -> Vec<u8> {
@@ -360,6 +398,7 @@ pub(crate) async fn run_e2ee_session(
             }
         };
 
+        let storage_instance_id = config.storage_instance_id.as_ref().map(ToString::to_string);
         let reply = match &accept {
             E2eeAccept::Authenticated {
                 minted: Some(minted),
@@ -367,10 +406,7 @@ pub(crate) async fn run_e2ee_session(
             } => e2ee_authenticated_with_credential_json(
                 &minted.credential,
                 &config.environment_id,
-                &config
-                    .storage_instance_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
+                storage_instance_id.as_deref(),
             ),
             E2eeAccept::Authenticated { minted: None, .. } | E2eeAccept::Unauthenticated => {
                 e2ee_authenticated_json()
@@ -434,7 +470,8 @@ async fn send_encrypted_frames(
     channel: &mut E2eeChannel,
     plaintext: &[u8],
 ) -> Result<(), E2eeSessionError> {
-    for frame in channel.encrypt_message(plaintext)? {
+    for (flag, chunk) in plaintext_records(plaintext)? {
+        let frame = channel.encrypt_record(flag, chunk)?;
         timeout(
             SOCKET_WRITE_TIMEOUT,
             writer.send(Message::Binary(frame.into())),
@@ -463,21 +500,27 @@ async fn run_established_e2ee(
     let outbound_channel = Arc::clone(&channel);
     let outbound_pump = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
-            let frames = match &message {
-                Message::Text(text) => outbound_channel
-                    .lock()
-                    .expect("E2EE channel lock")
-                    .encrypt_message(text.as_bytes()),
-                Message::Binary(bytes) => outbound_channel
-                    .lock()
-                    .expect("E2EE channel lock")
-                    .encrypt_message(bytes),
+            let plaintext = match &message {
+                Message::Text(text) => text.as_bytes(),
+                Message::Binary(bytes) => bytes.as_ref(),
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => continue,
             };
-            let Ok(frames) = frames else { break };
+            let Ok(records) = plaintext_records(plaintext) else {
+                break;
+            };
             let mut failed = false;
-            for frame in frames {
+            for (flag, chunk) in records {
+                let frame = {
+                    let mut channel = outbound_channel.lock().expect("E2EE channel lock");
+                    match channel.encrypt_record(flag, chunk) {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                };
                 if !matches!(
                     timeout(
                         SOCKET_WRITE_TIMEOUT,
@@ -651,6 +694,31 @@ mod tests {
         record
     }
 
+    #[test]
+    fn plaintext_record_iteration_is_lazy_and_preserves_flags() {
+        let big = vec![b'a'; MAX_E2EE_CHUNK_BYTES * 2 + 5];
+        let mut records = plaintext_records(&big).expect("valid message");
+        let first = records.next().expect("first record");
+        assert_eq!(first.0, E2EE_RECORD_FLAG_CONTINUATION);
+        assert_eq!(first.1.len(), MAX_E2EE_CHUNK_BYTES);
+        assert_eq!(records.count(), 2);
+    }
+
+    #[test]
+    fn pairing_reply_omits_an_absent_storage_identity() {
+        let absent = serde_json::from_slice::<serde_json::Value>(
+            &e2ee_authenticated_with_credential_json("credential", "environment", None),
+        )
+        .expect("absent storage reply");
+        assert!(absent.get("storageInstanceId").is_none());
+
+        let present = serde_json::from_slice::<serde_json::Value>(
+            &e2ee_authenticated_with_credential_json("credential", "environment", Some("storage")),
+        )
+        .expect("present storage reply");
+        assert_eq!(present["storageInstanceId"], "storage");
+    }
+
     #[tokio::test]
     async fn small_round_trip_uses_a_single_final_record() {
         let (mut initiator, mut responder) = establish().await;
@@ -675,6 +743,27 @@ mod tests {
             &plaintext[..len],
             record(E2EE_RECORD_FLAG_FINAL, b"{\"ok\":1}").as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn decrypt_scratch_is_reused_between_records() {
+        let (mut initiator, mut responder) = establish().await;
+        let scratch = responder.decrypt_scratch.as_ptr();
+        let frames = initiator_encrypt(
+            &mut initiator,
+            &[
+                record(E2EE_RECORD_FLAG_FINAL, b"first"),
+                record(E2EE_RECORD_FLAG_FINAL, b"second"),
+            ],
+        );
+
+        for frame in frames {
+            responder
+                .decrypt_frame(&frame, MAX_E2EE_LOGICAL_MESSAGE_BYTES)
+                .expect("decrypt record")
+                .expect("complete message");
+            assert_eq!(responder.decrypt_scratch.as_ptr(), scratch);
+        }
     }
 
     #[tokio::test]

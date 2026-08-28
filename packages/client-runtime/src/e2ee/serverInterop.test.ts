@@ -22,18 +22,14 @@ import {
 import { parsePairingCode } from "@bibcode/shared/pairingCode";
 import { afterAll, beforeAll, describe, expect, it } from "@effect/vitest";
 
-import { RecordAssembler, splitIntoRecords } from "./frame.ts";
-import { createNkInitiator, decodeBase64UrlKey } from "./noise.ts";
+import { decodeBase64UrlKey } from "./noise.ts";
+import {
+  type EncryptedTestSocket,
+  openEncryptedTestSocket,
+  requestTestRpc,
+} from "./testSupport.ts";
 
 const serverBinary = process.env["BIBCODE_E2EE_SERVER_BIN"];
-const EMPTY = new Uint8Array(0);
-
-function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
-}
-
 interface RunningServer {
   process: NodeChildProcess.ChildProcess;
   httpBaseUrl: string;
@@ -148,81 +144,8 @@ async function mintedPairing(server: RunningServer): Promise<{
   return { payload, hostKey };
 }
 
-interface EncryptedSocket {
-  nextMessage: () => Promise<string>;
-  sendMessage: (text: string) => void;
-  close: () => void;
-}
-
-async function openEncrypted(server: RunningServer, hostKey: Uint8Array): Promise<EncryptedSocket> {
-  const wsUrl = `${server.httpBaseUrl.replace(/^http/, "ws")}/ws-e2ee`;
-  const socket = new WebSocket(wsUrl);
-  socket.binaryType = "arraybuffer";
-  const frames: Uint8Array[] = [];
-  const waiters: Array<(frame: Uint8Array) => void> = [];
-  socket.addEventListener("message", (event) => {
-    const frame = new Uint8Array(event.data as ArrayBuffer);
-    const waiter = waiters.shift();
-    if (waiter === undefined) frames.push(frame);
-    else waiter(frame);
-  });
-  const nextFrame = (): Promise<Uint8Array> => {
-    const frame = frames.shift();
-    if (frame !== undefined) return Promise.resolve(frame);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timed out waiting for E2EE frame")), 10_000);
-      waiters.push((next) => {
-        clearTimeout(timer);
-        resolve(next);
-      });
-    });
-  };
-  await new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
-    socket.addEventListener("error", () => reject(new Error("websocket open failed")), {
-      once: true,
-    });
-  });
-  const initiator = createNkInitiator({ responderStaticPublicKey: hostKey });
-  socket.send(ownedBuffer(initiator.writeMessageA(EMPTY)));
-  const payload = initiator.readMessageB(await nextFrame());
-  expect(payload).toHaveLength(0);
-  const transport = initiator.split();
-  const assembler = new RecordAssembler();
-  const nextMessage = async (): Promise<string> => {
-    for (;;) {
-      const record = transport.receive.decryptWithAd(EMPTY, await nextFrame());
-      const message = assembler.push(record);
-      if (message !== null) return new TextDecoder().decode(message);
-    }
-  };
-  const sendMessage = (text: string): void => {
-    for (const record of splitIntoRecords(new TextEncoder().encode(text))) {
-      socket.send(ownedBuffer(transport.send.encryptWithAd(EMPTY, record)));
-    }
-  };
-  return { nextMessage, sendMessage, close: () => socket.close() };
-}
-
-async function requestConfig(channel: EncryptedSocket, requestId: string, payload: object = {}) {
-  channel.sendMessage(
-    JSON.stringify({
-      _tag: "Request",
-      id: requestId,
-      tag: "server.getConfig",
-      payload,
-      headers: [],
-    }),
-  );
-  for (;;) {
-    const message = JSON.parse(await channel.nextMessage()) as {
-      _tag?: string;
-      requestId?: string;
-    };
-    expect(message._tag).not.toBe("ClientProtocolError");
-    if (message.requestId === requestId) return message;
-  }
-}
+const openEncrypted = (server: RunningServer, hostKey: Uint8Array): Promise<EncryptedTestSocket> =>
+  openEncryptedTestSocket(server.httpBaseUrl, hostKey);
 
 describe.skipIf(serverBinary === undefined)(
   "TypeScript initiator against the Rust responder",
@@ -249,7 +172,10 @@ describe.skipIf(serverBinary === undefined)(
       expect(authenticated.type).toBe("e2ee_authenticated");
       expect(authenticated.credential).toBeTruthy();
       expect(authenticated.storageInstanceId).toBe(payload.storageInstanceId);
-      expect(await requestConfig(channel, "1")).toMatchObject({ _tag: "Exit", requestId: "1" });
+      expect(await requestTestRpc(channel, "1", "server.getConfig")).toMatchObject({
+        _tag: "Exit",
+        requestId: "1",
+      });
       channel.close();
 
       const second = await openEncrypted(server, hostKey);
@@ -263,9 +189,11 @@ describe.skipIf(serverBinary === undefined)(
       const channel = await openEncrypted(server, hostKey);
       channel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
       await channel.nextMessage();
-      expect(await requestConfig(channel, "2", { ignored: "x".repeat(200_000) })).toMatchObject({
-        requestId: "2",
-      });
+      expect(
+        await requestTestRpc(channel, "2", "server.getConfig", {
+          ignored: "x".repeat(200_000),
+        }),
+      ).toMatchObject({ requestId: "2" });
       channel.close();
     }, 30_000);
 

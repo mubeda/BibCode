@@ -10,10 +10,41 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Socket from "effect/unstable/socket/Socket";
+import { vi } from "vite-plus/test";
 
 import { RecordAssembler, splitIntoRecords } from "./frame.ts";
 import { createNkResponder, derivePublicKey, type NkTransport } from "./noise.ts";
 import { e2eeFailureOf, E2eeProtocolError, makeE2eeSocket } from "./socket.ts";
+
+const encryptProbe = vi.hoisted(() => ({ calls: 0 }));
+
+vi.mock("./noise.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./noise.ts")>();
+  return {
+    ...actual,
+    createNkInitiator(options: Parameters<typeof actual.createNkInitiator>[0]) {
+      const initiator = actual.createNkInitiator(options);
+      return {
+        ...initiator,
+        split() {
+          const transport = initiator.split();
+          return {
+            ...transport,
+            send: {
+              encryptWithAd(ad: Uint8Array, plaintext: Uint8Array) {
+                encryptProbe.calls += 1;
+                return transport.send.encryptWithAd(ad, plaintext);
+              },
+              decryptWithAd(ad: Uint8Array, ciphertext: Uint8Array) {
+                return transport.send.decryptWithAd(ad, ciphertext);
+              },
+            },
+          };
+        },
+      };
+    },
+  };
+});
 
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
@@ -24,6 +55,7 @@ const makeScriptedInnerSocket = (
     emit: (frame: Uint8Array) => void,
     close: (code?: number) => void,
   ) => void,
+  beforeWrite?: (frame: Uint8Array) => Effect.Effect<void>,
 ): Socket.Socket => {
   let deliver: ((frame: Uint8Array) => void) | null = null;
   let finish: ((code?: number) => void) | null = null;
@@ -76,12 +108,16 @@ const makeScriptedInnerSocket = (
   return Socket.make({
     runRaw,
     writer: Effect.succeed((chunk: Uint8Array | string | Socket.CloseEvent) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         if (typeof chunk === "string" || chunk instanceof Uint8Array) {
           const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
-          onFrame(bytes, emit, close);
+          return Effect.andThen(
+            beforeWrite?.(bytes) ?? Effect.void,
+            Effect.sync(() => onFrame(bytes, emit, close)),
+          );
         } else {
           close();
+          return Effect.void;
         }
       }),
     ),
@@ -349,5 +385,50 @@ describe("makeE2eeSocket", () => {
       expect(received[1]).toBe(large);
       expect(delivered).toEqual([encodeJson({ echoed: large.length })]);
     }),
+  );
+
+  it.live("does not encrypt later records while the first write is backpressured", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { hostKey, script } = responderScript();
+        const firstWriteStarted = yield* Deferred.make<void>();
+        const releaseFirstWrite = yield* Deferred.make<void>();
+        let blockNextWrite = false;
+        const inner = makeScriptedInnerSocket(script, () => {
+          if (!blockNextWrite) return Effect.void;
+          blockNextWrite = false;
+          return Deferred.succeed(firstWriteStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseFirstWrite)),
+          );
+        });
+        const socket = makeE2eeSocket(inner, {
+          hostKey: Buffer.from(hostKey).toString("base64url"),
+          auth: { kind: "bearer", credential: "stored-1" },
+        });
+        const opened = yield* Deferred.make<void>();
+        const runFiber = yield* Effect.forkChild(
+          socket.runString(() => {}, {
+            onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid),
+          }),
+        );
+        yield* Deferred.await(opened);
+
+        const write = yield* socket.writer;
+        encryptProbe.calls = 0;
+        blockNextWrite = true;
+        const writeFiber = yield* Effect.forkChild(
+          write(encodeJson({ blob: "x".repeat(200_000) })),
+          {
+            startImmediately: true,
+          },
+        );
+        yield* Deferred.await(firstWriteStarted);
+        expect(encryptProbe.calls).toBe(1);
+
+        yield* Deferred.succeed(releaseFirstWrite, undefined);
+        yield* Fiber.join(writeFiber);
+        yield* Fiber.interrupt(runFiber);
+      }),
+    ),
   );
 });

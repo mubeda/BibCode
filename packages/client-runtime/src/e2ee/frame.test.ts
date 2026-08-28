@@ -6,6 +6,8 @@ import {
   E2eeFrameError,
   MAX_E2EE_CHUNK_BYTES,
   MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+  MAX_E2EE_PREAUTH_MESSAGE_BYTES,
+  plaintextRecords,
   RecordAssembler,
   splitIntoRecords,
 } from "./frame.ts";
@@ -48,10 +50,47 @@ describe("e2ee record layer", () => {
     expect(assembler.push(third)).toEqual(payload);
   });
 
+  it("iterates plaintext records lazily with the same wire shape", () => {
+    const payload = new Uint8Array(MAX_E2EE_CHUNK_BYTES * 2 + 7).fill(0xab);
+    const records = [...plaintextRecords(payload)];
+
+    expect(records).toHaveLength(3);
+    expect(records[0]?.[0]).toBe(E2EE_RECORD_FLAG_CONTINUATION);
+    expect(records[1]?.[0]).toBe(E2EE_RECORD_FLAG_CONTINUATION);
+    expect(records[2]?.[0]).toBe(E2EE_RECORD_FLAG_FINAL);
+    expect(records.map((record) => record.length)).toEqual([
+      MAX_E2EE_CHUNK_BYTES + 1,
+      MAX_E2EE_CHUNK_BYTES + 1,
+      8,
+    ]);
+  });
+
   it("the assembler resets between messages", () => {
     const assembler = new RecordAssembler();
     expect(assembler.push(Uint8Array.of(E2EE_RECORD_FLAG_FINAL, 1))).toEqual(Uint8Array.of(1));
     expect(assembler.push(Uint8Array.of(E2EE_RECORD_FLAG_FINAL, 2))).toEqual(Uint8Array.of(2));
+  });
+
+  it("caps pre-auth reassembly at 64 KiB", () => {
+    const continuation = new Uint8Array(1 + 40 * 1024);
+    continuation[0] = E2EE_RECORD_FLAG_CONTINUATION;
+    const final = new Uint8Array(1 + 40 * 1024);
+    final[0] = E2EE_RECORD_FLAG_FINAL;
+    const assembler = new RecordAssembler(MAX_E2EE_PREAUTH_MESSAGE_BYTES);
+
+    expect(() => assembler.push(continuation)).not.toThrow();
+    expect(() => assembler.push(final)).toThrow("E2EE reassembly overflow");
+  });
+
+  it("retains the authenticated 64 MiB assembler default", () => {
+    const continuation = new Uint8Array(1 + 40 * 1024);
+    continuation[0] = E2EE_RECORD_FLAG_CONTINUATION;
+    const final = new Uint8Array(1 + 40 * 1024);
+    final[0] = E2EE_RECORD_FLAG_FINAL;
+    const assembler = new RecordAssembler();
+
+    expect(assembler.push(continuation)).toBeNull();
+    expect(assembler.push(final)).toHaveLength(80 * 1024);
   });
 
   it("rejects empty records, unknown flags, and overflow", () => {

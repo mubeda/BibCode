@@ -56,10 +56,7 @@ impl HostIdentity {
     }
 
     /// Test-mode and `AuthService::new`-without-persistence identity.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the E2EE channel is added in Phase 3 Task 4")
-    )]
+    #[cfg(test)]
     pub(crate) fn generate_ephemeral() -> Self {
         Self::generate().expect("X25519 keypair generation cannot fail")
     }
@@ -104,13 +101,7 @@ impl HostIdentity {
     }
 
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the E2EE channel tests are added in Phase 3 Task 4"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) fn public_key_bytes(&self) -> &[u8; 32] {
         &self.public
     }
