@@ -13,9 +13,9 @@ use uuid::Uuid;
 use super::{
     model::{
         ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
-        ClientMetadata, CreatePairingOfferRequest, CreatePairingRequest, PairingOfferResult,
-        RevokeClientRequest, RevokePairingRequest, SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE,
-        TOKEN_GRANT_TYPE, TokenExchangeRequest, WebSocketTicketResult,
+        CancelPairingOfferRequest, ClientMetadata, CreatePairingOfferRequest, CreatePairingRequest,
+        PairingOfferResult, RevokeClientRequest, RevokePairingRequest, SCOPE_ACCESS_READ,
+        SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest, WebSocketTicketResult,
     },
     pairing_code::{
         REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
@@ -39,6 +39,7 @@ pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/api/auth/websocket-ticket", post(websocket_ticket))
         .route("/api/auth/pairing-token", post(pairing_token))
         .route("/api/auth/pairing-offer", post(create_pairing_offer))
+        .route("/api/auth/pairing-offer/cancel", post(cancel_pairing_offer))
         .route("/api/auth/share-state", get(share_state))
         .route("/api/auth/pairing-links", get(pairing_links))
         .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
@@ -314,6 +315,9 @@ async fn create_pairing_offer(
             .await
         {
             PairingOfferReplay::Original(original) => return Json(original).into_response(),
+            PairingOfferReplay::Cancelled => {
+                return invalid_pairing_offer_response("idempotency key was cancelled");
+            }
             PairingOfferReplay::Conflict => {
                 return invalid_pairing_offer_response(
                     "idempotency key was already used with a different input",
@@ -439,6 +443,35 @@ async fn create_pairing_offer(
         return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
     }
     Json(result).into_response()
+}
+
+async fn cancel_pairing_offer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<CancelPairingOfferRequest>,
+) -> Response {
+    let principal = match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE)
+        .await
+    {
+        Ok(principal) => principal,
+        Err(error) => {
+            return auth_error_for_request(error, &headers, "pairing_offer_cancellation_failed");
+        }
+    };
+    let key = payload.idempotency_key.trim();
+    if key.is_empty() {
+        return invalid_pairing_offer_response("idempotency key must not be empty");
+    }
+    let _offer_guard = state.auth.lock_pairing_offer_issuance().await;
+    match state
+        .auth
+        .cancel_pairing_offer(&principal.session_id, key.to_owned())
+        .await
+    {
+        Ok(cancelled) => Json(json!({ "cancelled": cancelled })).into_response(),
+        Err(error) => auth_error_for_request(error, &headers, "pairing_offer_cancellation_failed"),
+    }
 }
 
 fn invalid_pairing_offer_response(detail: &str) -> Response {

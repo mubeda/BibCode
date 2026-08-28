@@ -5,6 +5,7 @@ import { type ReactElement, useCallback, useEffect, useMemo, useState } from "re
 
 import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
 import {
+  cancelServerPairingOffer,
   createServerPairingOffer,
   getServerShareState,
   usePrimarySessionState,
@@ -151,6 +152,7 @@ export function ShareThisHostTab(): ReactElement {
       },
       newIdempotencyKey: randomUUID,
       classifyMintError,
+      cancelOffer: cancelServerPairingOffer,
       cleanupExposureAfterFailedMint:
         !hasDesktopBridge || desktopBridge === undefined
           ? null

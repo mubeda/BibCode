@@ -14,6 +14,7 @@ export {
 } from "./context";
 
 export {
+  cancelServerPairingOffer,
   createServerPairingCredential,
   createServerPairingOffer,
   fetchSessionState,

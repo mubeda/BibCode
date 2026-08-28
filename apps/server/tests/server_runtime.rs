@@ -1096,6 +1096,7 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/auth/websocket-ticket"),
         ("POST", "/api/auth/pairing-token"),
         ("POST", "/api/auth/pairing-offer"),
+        ("POST", "/api/auth/pairing-offer/cancel"),
         ("GET", "/api/auth/share-state"),
         ("GET", "/api/auth/pairing-links"),
         ("POST", "/api/auth/pairing-links/revoke"),

@@ -32,6 +32,7 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "fetch-environment-descriptor",
   "create-pairing-credential",
   "create-pairing-offer",
+  "cancel-pairing-offer",
   "get-share-state",
   "list-pairing-links",
   "revoke-pairing-link",
@@ -417,6 +418,26 @@ export async function createServerPairingOffer(
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "create-pairing-offer",
+      cause: error,
+    });
+  }
+}
+
+export async function cancelServerPairingOffer(idempotencyKey: string): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.auth.cancelPairingOffer({
+            headers: {},
+            payload: { idempotencyKey },
+          }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "cancel-pairing-offer",
       cause: error,
     });
   }

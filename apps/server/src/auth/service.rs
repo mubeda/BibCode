@@ -94,7 +94,7 @@ struct AuthState {
 #[derive(Clone)]
 struct StoredPairingOffer {
     input_fingerprint: String,
-    result: PairingOfferResult,
+    result: Option<PairingOfferResult>,
     expires_at_ms: i64,
 }
 
@@ -107,6 +107,7 @@ struct AuthGrantMetadata {
 
 pub(crate) enum PairingOfferReplay {
     Original(PairingOfferResult),
+    Cancelled,
     Conflict,
     Fresh,
 }
@@ -785,9 +786,12 @@ impl AuthService {
             .retain(|_, stored| stored.expires_at_ms > observed_at);
         let lookup_key = (principal_id.to_owned(), key.to_owned());
         match state.pairing_offer_idempotency.get(&lookup_key) {
-            Some(stored) if stored.input_fingerprint == input_fingerprint => {
-                PairingOfferReplay::Original(stored.result.clone())
-            }
+            Some(stored) if stored.result.is_none() => PairingOfferReplay::Cancelled,
+            Some(stored) if stored.input_fingerprint == input_fingerprint => stored
+                .result
+                .clone()
+                .map(PairingOfferReplay::Original)
+                .unwrap_or(PairingOfferReplay::Cancelled),
             Some(_) => PairingOfferReplay::Conflict,
             None => PairingOfferReplay::Fresh,
         }
@@ -818,11 +822,52 @@ impl AuthService {
             lookup_key,
             StoredPairingOffer {
                 input_fingerprint,
-                result,
+                result: Some(result),
                 expires_at_ms,
             },
         );
         Ok(())
+    }
+
+    pub(crate) async fn cancel_pairing_offer(
+        &self,
+        principal_id: &str,
+        key: String,
+    ) -> Result<bool, AuthError> {
+        let observed_at = now_ms();
+        let lookup_key = (principal_id.to_owned(), key);
+        let offer_id = {
+            let mut state = self.state.lock().await;
+            state
+                .pairing_offer_idempotency
+                .retain(|_, stored| stored.expires_at_ms > observed_at);
+            if !state.pairing_offer_idempotency.contains_key(&lookup_key)
+                && state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS
+            {
+                return Err(AuthError::Internal(
+                    "pairing offer idempotency capacity exceeded".to_owned(),
+                ));
+            }
+            state
+                .pairing_offer_idempotency
+                .get(&lookup_key)
+                .and_then(|stored| stored.result.as_ref())
+                .map(|result| result.id.clone())
+        };
+
+        let cancelled = match offer_id {
+            Some(id) => self.revoke_pairing(&id).await?,
+            None => false,
+        };
+        self.state.lock().await.pairing_offer_idempotency.insert(
+            lookup_key,
+            StoredPairingOffer {
+                input_fingerprint: String::new(),
+                result: None,
+                expires_at_ms: observed_at.saturating_add(PAIRING_TTL_MS),
+            },
+        );
+        Ok(cancelled)
     }
 
     pub async fn share_exposure_state(&self) -> ShareExposureState {
@@ -2526,14 +2571,14 @@ mod tests {
                     (format!("principal-{index}"), format!("key-{index}")),
                     StoredPairingOffer {
                         input_fingerprint: format!("fingerprint-{index}"),
-                        result: PairingOfferResult {
+                        result: Some(PairingOfferResult {
                             id,
                             code: format!("code-{index}"),
                             reach: "another-device".to_owned(),
                             endpoint: "http://192.168.1.20:3773".to_owned(),
                             name: format!("Client {index}"),
                             expires_at: format_iso(now + PAIRING_TTL_MS),
-                        },
+                        }),
                         expires_at_ms: now + PAIRING_TTL_MS,
                     },
                 );

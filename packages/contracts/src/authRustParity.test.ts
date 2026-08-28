@@ -15,6 +15,7 @@ import {
   AuthAdministrativeScopes,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -34,6 +35,7 @@ import {
 import {
   AuthClientSessionRevokeResult,
   AuthOtherClientSessionsRevokeResult,
+  AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
   EnvironmentAuthInvalidError,
   EnvironmentHttpApi,
@@ -96,6 +98,14 @@ const authRouteContract = [
     name: "pairingOffer",
     method: "POST",
     path: "/api/auth/pairing-offer",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "cancelPairingOffer",
+    method: "POST",
+    path: "/api/auth/pairing-offer/cancel",
     requestContentTypes: ["application/json"],
     successStatuses: [200],
     errorStatuses: [400, 401, 403, 500],
@@ -319,6 +329,7 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
@@ -326,6 +337,7 @@ const namedSchemas = {
   AuthOtherClientSessionsRevokeResult,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
+  AuthPairingOfferCancellationResult,
   AuthShareStateResult,
   AuthPairingLink,
   AuthPairingLinkList,
@@ -385,6 +397,10 @@ const expectedSamples = {
     request: "requests/pairing-offer.json",
     success: "responses/pairing-offer.json",
   },
+  cancelPairingOffer: {
+    request: "requests/pairing-offer-cancel.json",
+    success: "responses/pairing-offer-cancel.json",
+  },
   shareState: { success: "responses/share-state.json" },
   pairingLinks: { success: "responses/pairing-list.json" },
   revokePairingLink: {
@@ -408,6 +424,7 @@ const expectedFixtures = [
   "requests/browser-session.json",
   "requests/client-revoke.json",
   "requests/pairing-create.json",
+  "requests/pairing-offer-cancel.json",
   "requests/pairing-offer.json",
   "requests/pairing-revoke.json",
   "requests/token-form.txt",
@@ -417,6 +434,7 @@ const expectedFixtures = [
   "responses/client-revoke.json",
   "responses/pairing-create.json",
   "responses/pairing-list.json",
+  "responses/pairing-offer-cancel.json",
   "responses/pairing-offer.json",
   "responses/pairing-revoke.json",
   "responses/session.json",
@@ -442,6 +460,10 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
   [
     "requests/pairing-offer.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthCreatePairingOfferInput)),
+  ],
+  [
+    "requests/pairing-offer-cancel.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthCancelPairingOfferInput)),
   ],
   [
     "requests/pairing-revoke.json",
@@ -470,6 +492,10 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
   [
     "responses/pairing-offer.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingOfferResult)),
+  ],
+  [
+    "responses/pairing-offer-cancel.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingOfferCancellationResult)),
   ],
   [
     "responses/pairing-list.json",
@@ -530,7 +556,7 @@ describe("Rust auth HTTP fixture parity", () => {
     const manifest = JSON.parse(NodeFS.readFileSync(manifestPath, "utf8")) as Manifest;
     expect(manifest.formatVersion).toBe(1);
     expect(manifest.routes).toEqual(currentRoutes());
-    expect(manifest.routes).toHaveLength(12);
+    expect(manifest.routes).toHaveLength(13);
     expect(
       manifest.routes.map(({ name, method, path, requestContentTypes, successes, errors }) => ({
         name,

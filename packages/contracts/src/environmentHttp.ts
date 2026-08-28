@@ -12,6 +12,7 @@ import {
   AuthAccessTokenResult,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
+  AuthCancelPairingOfferInput,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -86,6 +87,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "websocket_ticket_issuance_failed",
   "pairing_credential_issuance_failed",
   "pairing_offer_issuance_failed",
+  "pairing_offer_cancellation_failed",
   "share_state_load_failed",
   "pairing_links_load_failed",
   "pairing_link_revoke_failed",
@@ -336,6 +338,12 @@ export const AuthPairingLinkRevokeResult = Schema.Struct({
 });
 export type AuthPairingLinkRevokeResult = typeof AuthPairingLinkRevokeResult.Type;
 
+export const AuthPairingOfferCancellationResult = Schema.Struct({
+  cancelled: Schema.Boolean,
+});
+export type AuthPairingOfferCancellationResult =
+  typeof AuthPairingOfferCancellationResult.Type;
+
 export const AuthClientSessionRevokeResult = Schema.Struct({
   revoked: Schema.Boolean,
 });
@@ -395,6 +403,14 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       headers: PairingOfferHeaders,
       payload: AuthCreatePairingOfferInput,
       success: AuthPairingOfferResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("cancelPairingOffer", "/api/auth/pairing-offer/cancel", {
+      headers: OptionalBearerHeaders,
+      payload: AuthCancelPairingOfferInput,
+      success: AuthPairingOfferCancellationResult,
       error: EnvironmentPairingCredentialErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

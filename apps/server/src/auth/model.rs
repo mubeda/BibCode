@@ -119,6 +119,12 @@ pub struct CreatePairingOfferRequest {
     pub scopes: Option<Vec<String>>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelPairingOfferRequest {
+    pub idempotency_key: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingOfferResult {
