@@ -23,6 +23,8 @@ const MAX_CHUNK_BYTES: usize = 65_518;
 const RECORD_FINAL: u8 = 0;
 const RECORD_CONTINUATION: u8 = 1;
 const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
+const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
+const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn:bibcode:params:oauth:token-type:environment-bootstrap";
@@ -142,6 +144,24 @@ async fn send_encrypted(socket: &mut TestSocket, transport: &mut TransportState,
     }
 }
 
+async fn send_encrypted_continuations(
+    socket: &mut TestSocket,
+    transport: &mut TransportState,
+    bytes: usize,
+) {
+    let chunk = vec![b'x'; MAX_CHUNK_BYTES];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let length = remaining.min(chunk.len());
+        let frame = encrypt_record(transport, RECORD_CONTINUATION, &chunk[..length]);
+        socket
+            .send(Message::Binary(frame.into()))
+            .await
+            .expect("send encrypted continuation");
+        remaining -= length;
+    }
+}
+
 async fn recv_encrypted(socket: &mut TestSocket, transport: &mut TransportState) -> Vec<u8> {
     let mut assembled = Vec::new();
     loop {
@@ -186,6 +206,34 @@ async fn pair_inside_channel(
         &mut socket,
         &mut transport,
         json!({ "type": "e2ee_auth", "pairing": pairing })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let reply = recv_encrypted_json(&mut socket, &mut transport).await;
+    (socket, transport, reply)
+}
+
+async fn mint_e2ee_credential(handle: &ServerHandle, root: &Path, pairing: &str) -> String {
+    let (mut socket, _transport, reply) = pair_inside_channel(handle, root, pairing).await;
+    let credential = reply["credential"]
+        .as_str()
+        .expect("minted E2EE credential")
+        .to_owned();
+    socket.close(None).await.expect("close pairing socket");
+    credential
+}
+
+async fn open_authenticated_bearer_socket(
+    handle: &ServerHandle,
+    host_key: &[u8],
+    credential: &str,
+) -> (TestSocket, TransportState, Value) {
+    let (mut socket, mut transport) = noise_connect(handle.local_addr(), host_key).await;
+    send_encrypted(
+        &mut socket,
+        &mut transport,
+        json!({ "type": "e2ee_auth", "bearer": credential })
             .to_string()
             .as_bytes(),
     )
@@ -589,6 +637,168 @@ async fn preauth_connection_cap_rejects_the_overflow_connection() {
         .close(None)
         .await
         .expect("close admitted connection");
+}
+
+#[tokio::test]
+async fn established_capacity_is_partitioned_by_principal_and_released_on_close() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let client = Client::new();
+    let startup = handle.startup_access().expect("startup pairing");
+    let admin = exchange_plain_token(&client, &handle, &startup.credential).await;
+    let first_pairing = client
+        .post(http_url(&handle, "/api/auth/pairing-token"))
+        .bearer_auth(&admin)
+        .json(&json!({ "label": "first principal" }))
+        .send()
+        .await
+        .expect("first pairing request")
+        .json::<Value>()
+        .await
+        .expect("first pairing JSON")["credential"]
+        .as_str()
+        .expect("first pairing credential")
+        .to_owned();
+    let second_pairing = client
+        .post(http_url(&handle, "/api/auth/pairing-token"))
+        .bearer_auth(&admin)
+        .json(&json!({ "label": "second principal" }))
+        .send()
+        .await
+        .expect("second pairing request")
+        .json::<Value>()
+        .await
+        .expect("second pairing JSON")["credential"]
+        .as_str()
+        .expect("second pairing credential")
+        .to_owned();
+    let first_credential = mint_e2ee_credential(&handle, temp.path(), &first_pairing).await;
+    let second_credential = mint_e2ee_credential(&handle, temp.path(), &second_pairing).await;
+    let host_key = read_host_public_key(temp.path());
+
+    let mut first_principal_sockets = Vec::new();
+    for _ in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
+        let (socket, transport, reply) =
+            open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+        assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
+        first_principal_sockets.push((socket, transport));
+    }
+
+    let (mut overflow, _transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+    assert_eq!(reply, json!({ "type": "e2ee_error", "code": "protocol" }));
+    let _ = next_close_code(&mut overflow).await;
+
+    let (mut second_socket, _transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &second_credential).await;
+    assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
+    second_socket
+        .close(None)
+        .await
+        .expect("close second principal");
+
+    let (mut released, _) = first_principal_sockets
+        .pop()
+        .expect("first principal socket");
+    released
+        .close(None)
+        .await
+        .expect("close first principal socket");
+    let mut replacement = timeout(Duration::from_secs(3), async {
+        loop {
+            let (mut socket, transport, reply) =
+                open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+            if reply == json!({ "type": "e2ee_authenticated" }) {
+                break (socket, transport);
+            }
+            let _ = next_close_code(&mut socket).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed connection releases principal capacity");
+    replacement
+        .0
+        .close(None)
+        .await
+        .expect("close replacement socket");
+}
+
+#[tokio::test]
+async fn inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_close() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let client = Client::new();
+    let startup = handle.startup_access().expect("startup pairing");
+    let admin = exchange_plain_token(&client, &handle, &startup.credential).await;
+    let mut credentials = Vec::new();
+    for label in ["inbound first principal", "inbound second principal"] {
+        let pairing = client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(&admin)
+            .json(&json!({ "label": label }))
+            .send()
+            .await
+            .expect("pairing request")
+            .json::<Value>()
+            .await
+            .expect("pairing JSON")["credential"]
+            .as_str()
+            .expect("pairing credential")
+            .to_owned();
+        credentials.push(mint_e2ee_credential(&handle, temp.path(), &pairing).await);
+    }
+    let host_key = read_host_public_key(temp.path());
+    let (mut first_partial, mut first_transport, first_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    let (mut second_partial, mut second_transport, second_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    assert_eq!(first_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_eq!(second_reply, json!({ "type": "e2ee_authenticated" }));
+
+    send_encrypted_continuations(
+        &mut first_partial,
+        &mut first_transport,
+        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL / 2,
+    )
+    .await;
+    send_encrypted_continuations(
+        &mut second_partial,
+        &mut second_transport,
+        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL / 2,
+    )
+    .await;
+
+    let (mut first_overflow, mut first_overflow_transport, overflow_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    assert_eq!(overflow_reply, json!({ "type": "e2ee_authenticated" }));
+    send_encrypted(
+        &mut first_overflow,
+        &mut first_overflow_transport,
+        br#"{"_tag":"Ping"}"#,
+    )
+    .await;
+    let _ = next_close_code(&mut first_overflow).await;
+
+    let (mut other_principal, mut other_transport, other_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[1]).await;
+    assert_eq!(other_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut other_principal, &mut other_transport).await;
+
+    first_partial
+        .close(None)
+        .await
+        .expect("close first partial socket");
+    second_partial
+        .close(None)
+        .await
+        .expect("close second partial socket");
+    let (mut recovered, mut recovered_transport, recovered_reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    assert_eq!(recovered_reply, json!({ "type": "e2ee_authenticated" }));
+    assert_get_config(&mut recovered, &mut recovered_transport).await;
 }
 
 #[tokio::test]

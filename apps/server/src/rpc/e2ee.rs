@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
@@ -19,7 +20,10 @@ use tokio_util::sync::{CancellationToken, PollSender};
 
 use super::{
     RpcRegistry, RpcSessionContext,
-    session::{PUMP_JOIN_TIMEOUT, RpcInboundFrame, SOCKET_WRITE_TIMEOUT, run_session_split},
+    session::{
+        PUMP_JOIN_TIMEOUT, RpcInboundFrame, RpcOutboundBudget, RpcOutboundFrame,
+        SOCKET_WRITE_TIMEOUT, run_session_split_budgeted,
+    },
 };
 use crate::{
     auth::{AuthService, HostIdentity, NOISE_NK_PARAMS, Principal, SessionTransport},
@@ -40,7 +44,11 @@ pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS: usize = 64;
-const E2EE_INBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
+pub(crate) const E2EE_INBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
+pub(crate) const E2EE_OUTBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const E2EE_OUTBOUND_BUFFER_BUDGET_BYTES_PER_CONNECTION: usize = 64 * 1024 * 1024;
 
 struct PlaintextRecords<'a> {
     plaintext: &'a [u8],
@@ -92,10 +100,127 @@ fn plaintext_records(plaintext: &[u8]) -> Result<PlaintextRecords<'_>, E2eeSessi
 
 static E2EE_PREAUTH_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)));
-static E2EE_ESTABLISHED_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_ESTABLISHED_CONNECTIONS)));
-static E2EE_INBOUND_RECORD_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_INBOUND_BUFFER_BUDGET_BYTES)));
+static E2EE_RESOURCE_BUDGET: LazyLock<E2eeResourceBudget> = LazyLock::new(|| {
+    E2eeResourceBudget::new(
+        E2EE_MAX_ESTABLISHED_CONNECTIONS,
+        E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL,
+        E2EE_INBOUND_BUFFER_BUDGET_BYTES,
+        E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL,
+        E2EE_OUTBOUND_BUFFER_BUDGET_BYTES,
+    )
+});
+
+struct E2eeResourceBudget {
+    global_established: Arc<Semaphore>,
+    per_principal_established: usize,
+    global_inbound: Arc<Semaphore>,
+    per_principal_inbound: usize,
+    global_outbound: Arc<Semaphore>,
+    principals: Mutex<HashMap<String, std::sync::Weak<PrincipalResourceBudget>>>,
+}
+
+struct PrincipalResourceBudget {
+    established: Arc<Semaphore>,
+    inbound: Arc<Semaphore>,
+}
+
+impl E2eeResourceBudget {
+    fn new(
+        global_established: usize,
+        per_principal_established: usize,
+        global_inbound: usize,
+        per_principal_inbound: usize,
+        global_outbound: usize,
+    ) -> Self {
+        Self {
+            global_established: Arc::new(Semaphore::new(global_established)),
+            per_principal_established,
+            global_inbound: Arc::new(Semaphore::new(global_inbound)),
+            per_principal_inbound,
+            global_outbound: Arc::new(Semaphore::new(global_outbound)),
+            principals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_reserve(&self) -> Result<E2eeEstablishedReservation<'_>, &'static str> {
+        let global = Arc::clone(&self.global_established)
+            .try_acquire_owned()
+            .map_err(|_| "protocol")?;
+        Ok(E2eeEstablishedReservation {
+            budget: self,
+            global,
+        })
+    }
+
+    fn principal_budget(&self, principal_id: &str) -> Arc<PrincipalResourceBudget> {
+        let mut principals = self
+            .principals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        principals.retain(|_, budget| budget.strong_count() > 0);
+        if let Some(budget) = principals
+            .get(principal_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return budget;
+        }
+        let budget = Arc::new(PrincipalResourceBudget {
+            established: Arc::new(Semaphore::new(self.per_principal_established)),
+            inbound: Arc::new(Semaphore::new(self.per_principal_inbound)),
+        });
+        principals.insert(principal_id.to_owned(), Arc::downgrade(&budget));
+        budget
+    }
+
+    fn global_inbound(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.global_inbound)
+    }
+
+    fn global_outbound(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.global_outbound)
+    }
+}
+
+struct E2eeEstablishedReservation<'a> {
+    budget: &'a E2eeResourceBudget,
+    global: OwnedSemaphorePermit,
+}
+
+impl E2eeEstablishedReservation<'_> {
+    fn bind_principal(self, principal_id: &str) -> Result<E2eeEstablishedPermit, &'static str> {
+        let principal_budget = self.budget.principal_budget(principal_id);
+        let principal = Arc::clone(&principal_budget.established)
+            .try_acquire_owned()
+            .map_err(|_| "protocol")?;
+        Ok(E2eeEstablishedPermit {
+            _global: self.global,
+            _principal: Some(principal),
+            principal_budget: Some(principal_budget),
+        })
+    }
+
+    fn unpartitioned(self) -> E2eeEstablishedPermit {
+        E2eeEstablishedPermit {
+            _global: self.global,
+            _principal: None,
+            principal_budget: None,
+        }
+    }
+}
+
+struct E2eeEstablishedPermit {
+    _global: OwnedSemaphorePermit,
+    _principal: Option<OwnedSemaphorePermit>,
+    principal_budget: Option<Arc<PrincipalResourceBudget>>,
+}
+
+impl E2eeEstablishedPermit {
+    fn principal_inbound(&self) -> Option<Arc<Semaphore>> {
+        self.principal_budget
+            .as_ref()
+            .map(|budget| Arc::clone(&budget.inbound))
+    }
+}
 
 struct BudgetedPlaintext {
     plaintext: Vec<u8>,
@@ -106,14 +231,26 @@ struct E2eeInboundBudget {
     _permits: Option<E2eeRecordPermit>,
 }
 
+struct InboundRecordBudgets<'a> {
+    global: &'a Arc<Semaphore>,
+    principal: Option<&'a Arc<Semaphore>>,
+    connection: &'a Arc<Semaphore>,
+}
+
 struct E2eeRecordPermit {
     global: OwnedSemaphorePermit,
+    principal: Option<OwnedSemaphorePermit>,
     connection: OwnedSemaphorePermit,
 }
 
 impl E2eeRecordPermit {
     fn merge(&mut self, other: Self) {
         self.global.merge(other.global);
+        match (&mut self.principal, other.principal) {
+            (Some(principal), Some(other)) => principal.merge(other),
+            (None, Some(other)) => self.principal = Some(other),
+            (_, None) => {}
+        }
         self.connection.merge(other.connection);
     }
 }
@@ -238,12 +375,17 @@ impl E2eeChannel {
         frame: &[u8],
         max_message_bytes: usize,
         global_budget: &Arc<Semaphore>,
+        principal_budget: Option<&Arc<Semaphore>>,
         connection_budget: &Arc<Semaphore>,
     ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
         self.decrypt_frame_inner(
             frame,
             max_message_bytes,
-            Some((global_budget, connection_budget)),
+            Some(InboundRecordBudgets {
+                global: global_budget,
+                principal: principal_budget,
+                connection: connection_budget,
+            }),
         )
     }
 
@@ -251,7 +393,7 @@ impl E2eeChannel {
         &mut self,
         frame: &[u8],
         max_message_bytes: usize,
-        budgets: Option<(&Arc<Semaphore>, &Arc<Semaphore>)>,
+        budgets: Option<InboundRecordBudgets<'_>>,
     ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
         if frame.len() > MAX_E2EE_CIPHERTEXT_BYTES {
             return Err(E2eeSessionError::Protocol("oversized frame".into()));
@@ -269,7 +411,14 @@ impl E2eeChannel {
             return Err(E2eeSessionError::Protocol("reassembly overflow".into()));
         }
         let permit = budgets
-            .map(|(global, connection)| acquire_inbound_bytes(chunk.len(), global, connection))
+            .map(|budgets| {
+                acquire_inbound_bytes(
+                    chunk.len(),
+                    budgets.global,
+                    budgets.principal,
+                    budgets.connection,
+                )
+            })
             .transpose()?
             .flatten();
         match flag {
@@ -360,7 +509,7 @@ pub(crate) struct MintedE2eeSession {
 
 struct EstablishedE2eeAdmission {
     accept: E2eeAccept,
-    _permit: OwnedSemaphorePermit,
+    _permit: E2eeEstablishedPermit,
 }
 
 enum EstablishOutcome {
@@ -430,8 +579,8 @@ pub(crate) async fn run_e2ee_session(
             });
         }
 
-        let established_permit = match try_acquire_established_permit(&E2EE_ESTABLISHED_PERMITS) {
-            Ok(permit) => permit,
+        let established_reservation = match E2EE_RESOURCE_BUDGET.try_reserve() {
+            Ok(reservation) => reservation,
             Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
         };
 
@@ -484,6 +633,15 @@ pub(crate) async fn run_e2ee_session(
                     });
                 }
             }
+        };
+        let established_permit = match &accept {
+            E2eeAccept::Authenticated { principal, .. } => {
+                match established_reservation.bind_principal(&principal.session_id) {
+                    Ok(permit) => permit,
+                    Err(code) => return Ok(EstablishOutcome::Rejected { channel, code }),
+                }
+            }
+            E2eeAccept::Unauthenticated => established_reservation.unpartitioned(),
         };
 
         let storage_instance_id = config.storage_instance_id.as_ref().map(ToString::to_string);
@@ -588,17 +746,20 @@ async fn run_established_e2ee(
 ) {
     let EstablishedE2eeAdmission {
         accept,
-        _permit: _established_permit,
+        _permit: established_permit,
     } = admission;
+    let principal_inbound_permits = established_permit.principal_inbound();
+    let global_inbound_permits = E2EE_RESOURCE_BUDGET.global_inbound();
     let channel = Arc::new(Mutex::new(channel));
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<RpcOutboundFrame>(64);
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel::<Result<RpcInboundFrame, axum::Error>>(64);
 
     let outbound_shutdown = session_shutdown.clone();
     let outbound_channel = Arc::clone(&channel);
     let outbound_pump = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
+        while let Some(outbound) = outbound_rx.recv().await {
+            let (message, _outbound_budget) = outbound.into_parts();
             let plaintext = match &message {
                 Message::Text(text) => text.as_bytes(),
                 Message::Binary(bytes) => bytes.as_ref(),
@@ -651,7 +812,8 @@ async fn run_established_e2ee(
                         &mut inbound_channel.lock().expect("E2EE channel lock"),
                         &bytes,
                         MAX_E2EE_LOGICAL_MESSAGE_BYTES,
-                        &E2EE_INBOUND_RECORD_PERMITS,
+                        &global_inbound_permits,
+                        principal_inbound_permits.as_ref(),
                         &inbound_connection_permits,
                     );
                     match decrypted {
@@ -698,12 +860,18 @@ async fn run_established_e2ee(
     let reader_stream = stream::unfold(inbound_rx, |mut receiver| async {
         receiver.recv().await.map(|item| (item, receiver))
     });
-    run_session_split(
+    run_session_split_budgeted(
         writer_sink,
         reader_stream,
         registry,
         context,
         session_shutdown.clone(),
+        Some(RpcOutboundBudget::new(
+            E2EE_RESOURCE_BUDGET.global_outbound(),
+            Arc::new(Semaphore::new(
+                E2EE_OUTBOUND_BUFFER_BUDGET_BYTES_PER_CONNECTION,
+            )),
+        )),
     )
     .await;
 
@@ -723,14 +891,22 @@ fn decrypt_inbound_frame_budgeted(
     frame: &[u8],
     max_message_bytes: usize,
     global_budget: &Arc<Semaphore>,
+    principal_budget: Option<&Arc<Semaphore>>,
     connection_budget: &Arc<Semaphore>,
 ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
-    channel.decrypt_frame_budgeted(frame, max_message_bytes, global_budget, connection_budget)
+    channel.decrypt_frame_budgeted(
+        frame,
+        max_message_bytes,
+        global_budget,
+        principal_budget,
+        connection_budget,
+    )
 }
 
 fn acquire_inbound_bytes(
     bytes: usize,
     global_budget: &Arc<Semaphore>,
+    principal_budget: Option<&Arc<Semaphore>>,
     connection_budget: &Arc<Semaphore>,
 ) -> Result<Option<E2eeRecordPermit>, E2eeSessionError> {
     if bytes == 0 {
@@ -741,18 +917,21 @@ fn acquire_inbound_bytes(
     let connection = Arc::clone(connection_budget)
         .try_acquire_many_owned(permits)
         .map_err(|_| E2eeSessionError::Protocol("connection buffer budget exhausted".into()))?;
+    let principal = principal_budget
+        .map(|budget| {
+            Arc::clone(budget)
+                .try_acquire_many_owned(permits)
+                .map_err(|_| E2eeSessionError::Protocol("principal buffer budget exhausted".into()))
+        })
+        .transpose()?;
     let global = Arc::clone(global_budget)
         .try_acquire_many_owned(permits)
         .map_err(|_| E2eeSessionError::Protocol("global buffer budget exhausted".into()))?;
-    Ok(Some(E2eeRecordPermit { global, connection }))
-}
-
-fn try_acquire_established_permit(
-    budget: &Arc<Semaphore>,
-) -> Result<OwnedSemaphorePermit, &'static str> {
-    Arc::clone(budget)
-        .try_acquire_owned()
-        .map_err(|_| "protocol")
+    Ok(Some(E2eeRecordPermit {
+        global,
+        principal,
+        connection,
+    }))
 }
 
 async fn reap_pump(mut pump: tokio::task::JoinHandle<()>) {
@@ -1041,6 +1220,7 @@ mod tests {
                 &frames[0],
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &connection_budget,
             )
             .unwrap()
@@ -1051,6 +1231,7 @@ mod tests {
             &frames[1],
             MAX_E2EE_LOGICAL_MESSAGE_BYTES,
             &global_budget,
+            None,
             &connection_budget,
         )
         .unwrap()
@@ -1095,6 +1276,7 @@ mod tests {
                 &first_frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &first_connection_budget,
             )
             .unwrap()
@@ -1106,6 +1288,7 @@ mod tests {
                 &second_frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &second_connection_budget,
             ),
             Err(E2eeSessionError::Protocol(_))
@@ -1124,6 +1307,7 @@ mod tests {
                 &retry_frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &second_connection_budget,
             )
             .unwrap()
@@ -1157,6 +1341,7 @@ mod tests {
                 &first_frames[0],
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &first_connection_budget,
             )
             .unwrap()
@@ -1168,6 +1353,7 @@ mod tests {
                 &first_frames[1],
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &first_connection_budget,
             ),
             Err(E2eeSessionError::Protocol(_))
@@ -1178,6 +1364,7 @@ mod tests {
                 &second_frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &second_connection_budget,
             )
             .unwrap()
@@ -1205,6 +1392,7 @@ mod tests {
                 frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
+                None,
                 &connection_budget,
             )
             .expect("legal tiny fragment");
@@ -1217,15 +1405,15 @@ mod tests {
 
     #[test]
     fn established_connection_capacity_is_released_on_drop() {
-        let budget = Arc::new(Semaphore::new(1));
-        let permit = try_acquire_established_permit(&budget).expect("first connection");
-        assert_eq!(
-            try_acquire_established_permit(&budget).unwrap_err(),
-            "protocol",
-            "capacity rejection stays within the declared e2ee_error codes"
-        );
+        let budget = E2eeResourceBudget::new(1, 1, 1, 1, 1);
+        let permit = budget
+            .try_reserve()
+            .expect("first connection")
+            .bind_principal("principal")
+            .expect("first principal connection");
+        assert!(matches!(budget.try_reserve(), Err("protocol")));
         drop(permit);
-        assert!(try_acquire_established_permit(&budget).is_ok());
+        assert!(budget.try_reserve().is_ok());
     }
 
     #[tokio::test]

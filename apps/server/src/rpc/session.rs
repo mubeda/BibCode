@@ -1,15 +1,15 @@
 use std::{
-    any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc,
-    time::Duration,
+    any::Any, collections::HashMap, future::Future, io, panic::AssertUnwindSafe, pin::Pin,
+    sync::Arc, time::Duration,
 };
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -50,7 +50,204 @@ type LatestStreamHandler = Arc<
 >;
 
 pub(crate) trait RpcResponseEnqueueGuard: Send {
-    fn enqueue(self: Box<Self>, permit: mpsc::OwnedPermit<ServerMessage>, response: ServerMessage);
+    fn encoded_len_bound(&self, response: &ServerMessage) -> Result<usize, serde_json::Error> {
+        encoded_server_message_len(response)
+    }
+
+    fn enqueue(self: Box<Self>, permit: RpcResponseEnqueuePermit, response: ServerMessage);
+}
+
+#[derive(Clone)]
+pub(crate) struct RpcOutboundBudget {
+    process: Arc<Semaphore>,
+    connection: Arc<Semaphore>,
+    connection_capacity: usize,
+}
+
+impl RpcOutboundBudget {
+    pub(crate) fn new(process: Arc<Semaphore>, connection: Arc<Semaphore>) -> Self {
+        let connection_capacity = connection.available_permits();
+        Self {
+            process,
+            connection,
+            connection_capacity,
+        }
+    }
+
+    async fn acquire(&self, bytes: usize) -> Result<RpcOutboundBytePermit, ()> {
+        if bytes > self.connection_capacity {
+            return Err(());
+        }
+        let permits = u32::try_from(bytes).map_err(|_| ())?;
+        let connection = Arc::clone(&self.connection)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ())?;
+        let process = Arc::clone(&self.process)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ())?;
+        Ok(RpcOutboundBytePermit {
+            process,
+            connection,
+        })
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Result<RpcOutboundBytePermit, ()> {
+        if bytes > self.connection_capacity {
+            return Err(());
+        }
+        let permits = u32::try_from(bytes).map_err(|_| ())?;
+        let connection = Arc::clone(&self.connection)
+            .try_acquire_many_owned(permits)
+            .map_err(|_| ())?;
+        let process = Arc::clone(&self.process)
+            .try_acquire_many_owned(permits)
+            .map_err(|_| ())?;
+        Ok(RpcOutboundBytePermit {
+            process,
+            connection,
+        })
+    }
+}
+
+pub(crate) struct RpcOutboundBytePermit {
+    process: OwnedSemaphorePermit,
+    connection: OwnedSemaphorePermit,
+}
+
+impl RpcOutboundBytePermit {
+    fn shrink_to(&mut self, bytes: usize) -> Result<(), ()> {
+        let current = self.process.num_permits();
+        if bytes > current || self.connection.num_permits() != current {
+            return Err(());
+        }
+        let extra = current - bytes;
+        drop(self.process.split(extra));
+        drop(self.connection.split(extra));
+        Ok(())
+    }
+}
+
+pub(crate) struct RpcOutboundFrame {
+    payload: RpcOutboundPayload,
+    _budget: Option<RpcOutboundBytePermit>,
+}
+
+enum RpcOutboundPayload {
+    Plain(ServerMessage),
+    Encoded(Message),
+}
+
+impl RpcOutboundFrame {
+    fn into_wire(self) -> Result<Self, serde_json::Error> {
+        let payload = match self.payload {
+            RpcOutboundPayload::Plain(message) => {
+                RpcOutboundPayload::Encoded(Message::Text(serde_json::to_string(&message)?.into()))
+            }
+            payload @ RpcOutboundPayload::Encoded(_) => payload,
+        };
+        Ok(Self {
+            payload,
+            _budget: self._budget,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (Message, Option<RpcOutboundBytePermit>) {
+        let RpcOutboundPayload::Encoded(message) = self.payload else {
+            unreachable!("RPC writer encodes plain responses before the transport sink")
+        };
+        (message, self._budget)
+    }
+}
+
+pub(crate) struct RpcResponseEnqueuePermit {
+    permit: mpsc::OwnedPermit<RpcOutboundFrame>,
+    budget: Option<RpcOutboundBytePermit>,
+    encoded_len_bound: usize,
+}
+
+pub(crate) struct PreparedRpcResponse {
+    payload: RpcOutboundPayload,
+    encoded_len: usize,
+}
+
+impl RpcResponseEnqueuePermit {
+    pub(crate) fn prepare(&self, response: ServerMessage) -> Option<PreparedRpcResponse> {
+        if self.budget.is_some() {
+            let encoded = serde_json::to_string(&response).ok()?;
+            (encoded.len() <= self.encoded_len_bound).then(|| PreparedRpcResponse {
+                encoded_len: encoded.len(),
+                payload: RpcOutboundPayload::Encoded(Message::Text(encoded.into())),
+            })
+        } else {
+            Some(PreparedRpcResponse {
+                payload: RpcOutboundPayload::Plain(response),
+                encoded_len: 0,
+            })
+        }
+    }
+
+    pub(crate) fn send_prepared(mut self, prepared: PreparedRpcResponse) {
+        if let Some(budget) = &mut self.budget
+            && budget.shrink_to(prepared.encoded_len).is_err()
+        {
+            return;
+        }
+        self.permit.send(RpcOutboundFrame {
+            payload: prepared.payload,
+            _budget: self.budget,
+        });
+    }
+}
+
+#[derive(Clone)]
+struct RpcOutboundQueue {
+    sender: mpsc::Sender<RpcOutboundFrame>,
+    budget: Option<RpcOutboundBudget>,
+}
+
+impl RpcOutboundQueue {
+    async fn acquire_budget(
+        &self,
+        shutdown: &CancellationToken,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<Option<RpcOutboundBytePermit>, ()> {
+        let Some(budget) = &self.budget else {
+            return Ok(None);
+        };
+        let result = tokio::select! {
+            () = shutdown.cancelled() => Err(()),
+            result = timeout_at(deadline, budget.acquire(bytes)) => {
+                result.map_err(|_| ())?
+            }
+        };
+        if result.is_err() && bytes > budget.connection_capacity {
+            shutdown.cancel();
+        }
+        result.map(Some)
+    }
+
+    fn try_send(&self, message: ServerMessage) -> Result<(), ()> {
+        let (payload, budget) = if let Some(budget) = &self.budget {
+            let bytes = encoded_server_message_len(&message).map_err(|_| ())?;
+            let permit = budget.try_acquire(bytes)?;
+            let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+            (
+                RpcOutboundPayload::Encoded(Message::Text(encoded.into())),
+                Some(permit),
+            )
+        } else {
+            (RpcOutboundPayload::Plain(message), None)
+        };
+        self.sender
+            .try_send(RpcOutboundFrame {
+                payload,
+                _budget: budget,
+            })
+            .map_err(|_| ())
+    }
 }
 
 pub(crate) struct RpcUnaryResult {
@@ -306,7 +503,7 @@ struct InFlight {
 struct DispatchContext<'a> {
     registry: &'a RpcRegistry,
     session: &'a RpcSessionContext,
-    outbound: &'a mpsc::Sender<ServerMessage>,
+    outbound: &'a RpcOutboundQueue,
     completed: &'a mpsc::Sender<RequestId>,
     shutdown: &'a CancellationToken,
 }
@@ -356,6 +553,66 @@ pub(crate) async fn run_session(
     .await;
 }
 
+struct PlainRpcSink<W> {
+    inner: W,
+    pending_budget: Option<RpcOutboundBytePermit>,
+}
+
+impl<W> PlainRpcSink<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending_budget: None,
+        }
+    }
+}
+
+impl<W> Sink<RpcOutboundFrame> for PlainRpcSink<W>
+where
+    W: Sink<Message> + Unpin,
+{
+    type Error = W::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_ready(context)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, frame: RpcOutboundFrame) -> Result<(), Self::Error> {
+        let (message, budget) = frame.into_parts();
+        let result = Pin::new(&mut self.inner).start_send(message);
+        if result.is_ok() {
+            debug_assert!(self.pending_budget.is_none());
+            self.pending_budget = budget;
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let result = Pin::new(&mut self.inner).poll_flush(context);
+        if result.is_ready() {
+            self.pending_budget = None;
+        }
+        result
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let result = Pin::new(&mut self.inner).poll_close(context);
+        if result.is_ready() {
+            self.pending_budget = None;
+        }
+        result
+    }
+}
+
 pub(crate) async fn run_session_split<W, R>(
     socket_writer: W,
     socket_reader: R,
@@ -367,11 +624,37 @@ pub(crate) async fn run_session_split<W, R>(
     W::Error: Send,
     R: Stream<Item = Result<RpcInboundFrame, axum::Error>> + Send,
 {
-    let mut socket_writer = socket_writer;
+    run_session_split_budgeted(
+        PlainRpcSink::new(socket_writer),
+        socket_reader,
+        registry,
+        context,
+        session_shutdown,
+        None,
+    )
+    .await;
+}
+
+pub(crate) async fn run_session_split_budgeted<W, R>(
+    mut socket_writer: W,
+    socket_reader: R,
+    registry: RpcRegistry,
+    context: RpcSessionContext,
+    session_shutdown: CancellationToken,
+    outbound_budget: Option<RpcOutboundBudget>,
+) where
+    W: Sink<RpcOutboundFrame> + Unpin + Send + 'static,
+    W::Error: Send,
+    R: Stream<Item = Result<RpcInboundFrame, axum::Error>> + Send,
+{
     let socket_reader = socket_reader;
     let mut socket_reader = std::pin::pin!(socket_reader);
     let (outbound_sender, mut outbound_receiver) =
-        mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
+        mpsc::channel::<RpcOutboundFrame>(OUTBOUND_CAPACITY);
+    let outbound = RpcOutboundQueue {
+        sender: outbound_sender,
+        budget: outbound_budget,
+    };
     let writer_shutdown = session_shutdown.clone();
     let mut writer = tokio::spawn(async move {
         loop {
@@ -384,15 +667,11 @@ pub(crate) async fn run_session_split<W, R>(
                     message
                 }
             };
-            let Ok(encoded) = serde_json::to_string(&message) else {
+            let Ok(message) = message.into_wire() else {
                 break;
             };
             if !matches!(
-                timeout(
-                    SOCKET_WRITE_TIMEOUT,
-                    socket_writer.send(Message::Text(encoded.into())),
-                )
-                .await,
+                timeout(SOCKET_WRITE_TIMEOUT, socket_writer.send(message),).await,
                 Ok(Ok(()))
             ) {
                 break;
@@ -408,7 +687,7 @@ pub(crate) async fn run_session_split<W, R>(
         let dispatch = DispatchContext {
             registry: &registry,
             session: &context,
-            outbound: &outbound_sender,
+            outbound: &outbound,
             completed: &completed_sender,
             shutdown: &session_shutdown,
         };
@@ -446,7 +725,7 @@ pub(crate) async fn run_session_split<W, R>(
                         Ok(messages) => messages,
                         Err(error) => {
                             if send_server_message(
-                                &outbound_sender,
+                                &outbound,
                                 &session_shutdown,
                                 client_protocol_error(error.to_string()),
                             )
@@ -485,7 +764,7 @@ pub(crate) async fn run_session_split<W, R>(
     for (_, request) in in_flight {
         let _ = request.task.await;
     }
-    drop(outbound_sender);
+    drop(outbound);
     drop(completed_sender);
     if timeout(PUMP_JOIN_TIMEOUT, &mut writer).await.is_err() {
         writer.abort();
@@ -757,7 +1036,7 @@ async fn run_unary(
     context: RpcSessionContext,
     cancellation: CancellationToken,
     session_shutdown: CancellationToken,
-    outbound: mpsc::Sender<ServerMessage>,
+    outbound: RpcOutboundQueue,
 ) {
     let request_id = request.id.clone();
     let result = tokio::select! {
@@ -781,7 +1060,17 @@ async fn run_unary(
         Err(error) => ServerMessage::failure(request_id, error),
     };
     if let Some(enqueue_guard) = enqueue_guard {
-        if let Ok(permit) = reserve_server_message(&outbound, &session_shutdown).await {
+        let encoded_len_bound = if outbound.budget.is_some() {
+            let Ok(encoded_len_bound) = enqueue_guard.encoded_len_bound(&response) else {
+                return;
+            };
+            encoded_len_bound
+        } else {
+            0
+        };
+        if let Ok(permit) =
+            reserve_server_message(&outbound, &session_shutdown, encoded_len_bound).await
+        {
             enqueue_guard.enqueue(permit, response);
         }
     } else {
@@ -796,7 +1085,7 @@ async fn run_stream(
     cancellation: CancellationToken,
     session_shutdown: CancellationToken,
     mut acknowledgements: mpsc::Receiver<()>,
-    outbound: mpsc::Sender<ServerMessage>,
+    outbound: RpcOutboundQueue,
 ) {
     let request_id = request.id.clone();
     let mut stream = handler(request, context, cancellation.clone());
@@ -883,7 +1172,7 @@ async fn run_latest_stream(
     cancellation: CancellationToken,
     session_shutdown: CancellationToken,
     mut acknowledgements: mpsc::Receiver<()>,
-    outbound: mpsc::Sender<ServerMessage>,
+    outbound: RpcOutboundQueue,
 ) {
     let request_id = request.id.clone();
     let mut stream = handler(request, context, cancellation.clone());
@@ -964,7 +1253,7 @@ async fn run_latest_stream(
 }
 
 async fn send_latest_stream_message(
-    outbound: &mpsc::Sender<ServerMessage>,
+    outbound: &RpcOutboundQueue,
     session_shutdown: &CancellationToken,
     cancellation: &CancellationToken,
     message: ServerMessage,
@@ -977,13 +1266,30 @@ async fn send_latest_stream_message(
 }
 
 async fn send_server_message(
-    outbound: &mpsc::Sender<ServerMessage>,
+    outbound: &RpcOutboundQueue,
     session_shutdown: &CancellationToken,
     message: ServerMessage,
 ) -> Result<(), ()> {
+    let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
+    let frame = if outbound.budget.is_some() {
+        let bytes = encoded_server_message_len(&message).map_err(|_| ())?;
+        let budget = outbound
+            .acquire_budget(session_shutdown, bytes, deadline)
+            .await?;
+        let encoded = serde_json::to_string(&message).map_err(|_| ())?;
+        RpcOutboundFrame {
+            payload: RpcOutboundPayload::Encoded(Message::Text(encoded.into())),
+            _budget: budget,
+        }
+    } else {
+        RpcOutboundFrame {
+            payload: RpcOutboundPayload::Plain(message),
+            _budget: None,
+        }
+    };
     tokio::select! {
         () = session_shutdown.cancelled() => Err(()),
-        result = timeout(OUTBOUND_SEND_TIMEOUT, outbound.send(message)) => {
+        result = timeout_at(deadline, outbound.sender.send(frame)) => {
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(_)) | Err(_) => Err(()),
@@ -993,18 +1299,53 @@ async fn send_server_message(
 }
 
 async fn reserve_server_message(
-    outbound: &mpsc::Sender<ServerMessage>,
+    outbound: &RpcOutboundQueue,
     session_shutdown: &CancellationToken,
-) -> Result<mpsc::OwnedPermit<ServerMessage>, ()> {
+    encoded_len_bound: usize,
+) -> Result<RpcResponseEnqueuePermit, ()> {
+    let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
+    let budget = outbound
+        .acquire_budget(session_shutdown, encoded_len_bound, deadline)
+        .await?;
     tokio::select! {
         () = session_shutdown.cancelled() => Err(()),
-        result = timeout(OUTBOUND_SEND_TIMEOUT, outbound.clone().reserve_owned()) => {
+        result = timeout_at(deadline, outbound.sender.clone().reserve_owned()) => {
             match result {
-                Ok(Ok(permit)) => Ok(permit),
+                Ok(Ok(permit)) => Ok(RpcResponseEnqueuePermit {
+                    permit,
+                    budget,
+                    encoded_len_bound,
+                }),
                 Ok(Err(_)) | Err(_) => Err(()),
             }
         }
     }
+}
+
+struct JsonLength(usize);
+
+impl io::Write for JsonLength {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "serialized RPC response is too large",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn encoded_server_message_len(
+    message: &ServerMessage,
+) -> Result<usize, serde_json::Error> {
+    let mut length = JsonLength(0);
+    serde_json::to_writer(&mut length, message)?;
+    Ok(length.0)
 }
 
 fn decode_client_messages(bytes: &[u8]) -> Result<Vec<ClientMessage>, serde_json::Error> {
@@ -1031,17 +1372,110 @@ fn client_protocol_error(message: String) -> ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    #[derive(Default)]
+    struct BlockedSocketSink {
+        pending: Option<RpcOutboundFrame>,
+    }
+
+    impl Sink<RpcOutboundFrame> for BlockedSocketSink {
+        type Error = Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: RpcOutboundFrame) -> Result<(), Self::Error> {
+            assert!(
+                self.pending.is_none(),
+                "blocked sink owns one pending frame"
+            );
+            self.pending = Some(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.pending = None;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct EnqueueNotification(mpsc::UnboundedSender<RequestId>);
+
+    impl RpcResponseEnqueueGuard for EnqueueNotification {
+        fn enqueue(self: Box<Self>, permit: RpcResponseEnqueuePermit, response: ServerMessage) {
+            let request_id = response
+                .request_id()
+                .cloned()
+                .expect("test response request id");
+            let prepared = permit.prepare(response).expect("prepare test response");
+            permit.send_prepared(prepared);
+            let _ = self.0.send(request_id);
+        }
+    }
+
+    fn request_frame(ids: &[&str], tag: &str) -> RpcInboundFrame {
+        RpcInboundFrame::plain(Message::Text(
+            serde_json::to_string(
+                &ids.iter()
+                    .map(|id| {
+                        json!({
+                            "_tag": "Request",
+                            "id": id,
+                            "tag": tag,
+                            "payload": {},
+                            "headers": []
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("request JSON")
+            .into(),
+        ))
+    }
+
+    fn unbudgeted_outbound(
+        capacity: usize,
+    ) -> (RpcOutboundQueue, mpsc::Receiver<RpcOutboundFrame>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            RpcOutboundQueue {
+                sender,
+                budget: None,
+            },
+            receiver,
+        )
+    }
 
     #[tokio::test]
     async fn session_shutdown_unblocks_a_full_outbound_queue() {
-        let (sender, _receiver) = mpsc::channel(1);
-        sender.try_send(ServerMessage::Pong).expect("fill queue");
+        let (outbound, _receiver) = unbudgeted_outbound(1);
+        outbound.try_send(ServerMessage::Pong).expect("fill queue");
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
         timeout(
             Duration::from_millis(100),
-            send_server_message(&sender, &shutdown, ServerMessage::Pong),
+            send_server_message(&outbound, &shutdown, ServerMessage::Pong),
         )
         .await
         .expect("send observes cancellation")
@@ -1064,7 +1498,7 @@ mod tests {
             span_id: None,
             sampled: None,
         };
-        let (outbound, _outbound_receiver) = mpsc::channel(1);
+        let (outbound, _outbound_receiver) = unbudgeted_outbound(1);
         outbound.try_send(ServerMessage::Pong).expect("fill queue");
         let (_acknowledgements, acknowledgement_receiver) = mpsc::channel(1);
         let cancellation = CancellationToken::new();
@@ -1084,6 +1518,239 @@ mod tests {
             .await
             .expect("request cancellation unblocks the outbound capacity wait")
             .expect("latest stream task joins");
+    }
+
+    #[tokio::test]
+    async fn slow_socket_cannot_hide_more_than_one_large_response_in_the_session_queue() {
+        let response = Arc::new("x".repeat(40 * 1024 * 1024));
+        let (enqueued, mut enqueue_events) = mpsc::unbounded_channel();
+        let mut registry = RpcRegistry::empty();
+        registry.register_guarded_unary("test.largeResponse", move |_request, _cancellation| {
+            let response = Arc::clone(&response);
+            let enqueued = enqueued.clone();
+            async move {
+                RpcUnaryResult::guarded(
+                    Ok(json!({ "value": response.as_str() })),
+                    EnqueueNotification(enqueued),
+                )
+            }
+        });
+        let (inbound_sender, inbound_receiver) = mpsc::channel(1);
+        let reader = stream::unfold(inbound_receiver, |mut receiver| async {
+            receiver.recv().await.map(|item| (Ok(item), receiver))
+        });
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(run_session_split_budgeted(
+            BlockedSocketSink::default(),
+            reader,
+            registry,
+            RpcSessionContext::unauthenticated(),
+            shutdown.clone(),
+            Some(RpcOutboundBudget::new(
+                Arc::new(Semaphore::new(128 * 1024 * 1024)),
+                Arc::new(Semaphore::new(64 * 1024 * 1024)),
+            )),
+        ));
+        inbound_sender
+            .send(request_frame(&["1", "2"], "test.largeResponse"))
+            .await
+            .expect("send two large requests");
+
+        timeout(Duration::from_secs(1), enqueue_events.recv())
+            .await
+            .expect("first response is enqueued")
+            .expect("first enqueue notification");
+        assert!(
+            timeout(Duration::from_millis(100), enqueue_events.recv())
+                .await
+                .is_err(),
+            "the connection byte budget must stop the second response before enqueue"
+        );
+
+        shutdown.cancel();
+        drop(inbound_sender);
+        timeout(Duration::from_secs(2), session)
+            .await
+            .expect("session cleanup deadline")
+            .expect("session task joins");
+    }
+
+    #[tokio::test]
+    async fn slow_sockets_share_one_process_outbound_plaintext_budget() {
+        let process_budget = Arc::new(Semaphore::new(128 * 1024 * 1024));
+        let response = Arc::new("x".repeat(48 * 1024 * 1024));
+        let (enqueued, mut enqueue_events) = mpsc::unbounded_channel();
+        let mut sessions = HashMap::new();
+
+        for request_id in ["1", "2", "3"] {
+            let mut registry = RpcRegistry::empty();
+            let response = Arc::clone(&response);
+            let enqueued = enqueued.clone();
+            registry.register_guarded_unary(
+                "test.largeResponse",
+                move |_request, _cancellation| {
+                    let response = Arc::clone(&response);
+                    let enqueued = enqueued.clone();
+                    async move {
+                        RpcUnaryResult::guarded(
+                            Ok(json!({ "value": response.as_str() })),
+                            EnqueueNotification(enqueued),
+                        )
+                    }
+                },
+            );
+            let (inbound_sender, inbound_receiver) = mpsc::channel(1);
+            let reader = stream::unfold(inbound_receiver, |mut receiver| async {
+                receiver.recv().await.map(|item| (Ok(item), receiver))
+            });
+            let shutdown = CancellationToken::new();
+            let task = tokio::spawn(run_session_split_budgeted(
+                BlockedSocketSink::default(),
+                reader,
+                registry,
+                RpcSessionContext::unauthenticated(),
+                shutdown.clone(),
+                Some(RpcOutboundBudget::new(
+                    Arc::clone(&process_budget),
+                    Arc::new(Semaphore::new(64 * 1024 * 1024)),
+                )),
+            ));
+            inbound_sender
+                .send(request_frame(&[request_id], "test.largeResponse"))
+                .await
+                .expect("send large request");
+            sessions.insert(request_id.to_owned(), (shutdown, inbound_sender, task));
+        }
+
+        let first = timeout(Duration::from_secs(2), enqueue_events.recv())
+            .await
+            .expect("first process-budgeted response")
+            .expect("first enqueue event");
+        let second = timeout(Duration::from_secs(2), enqueue_events.recv())
+            .await
+            .expect("second process-budgeted response")
+            .expect("second enqueue event");
+        assert_ne!(first, second);
+        assert!(
+            timeout(Duration::from_millis(100), enqueue_events.recv())
+                .await
+                .is_err(),
+            "the process byte budget must stop the third slow-reader response before enqueue"
+        );
+
+        let first_id = first.as_str().to_owned();
+        let (shutdown, inbound, task) = sessions.remove(&first_id).expect("first session owner");
+        shutdown.cancel();
+        drop(inbound);
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled session cleanup deadline")
+            .expect("cancelled session joins");
+        let third = timeout(Duration::from_secs(2), enqueue_events.recv())
+            .await
+            .expect("released process bytes admit the third response")
+            .expect("third enqueue event");
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+
+        for (_, (shutdown, inbound, task)) in sessions {
+            shutdown.cancel();
+            drop(inbound);
+            timeout(Duration::from_secs(2), task)
+                .await
+                .expect("session cleanup deadline")
+                .expect("session joins");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_larger_than_the_connection_budget_fails_the_session_closed() {
+        let response = Arc::new("x".repeat(2 * 1024));
+        let (enqueued, mut enqueue_events) = mpsc::unbounded_channel();
+        let mut registry = RpcRegistry::empty();
+        registry.register_guarded_unary(
+            "test.oversizedResponse",
+            move |_request, _cancellation| {
+                let response = Arc::clone(&response);
+                let enqueued = enqueued.clone();
+                async move {
+                    RpcUnaryResult::guarded(
+                        Ok(json!({ "value": response.as_str() })),
+                        EnqueueNotification(enqueued),
+                    )
+                }
+            },
+        );
+        let (inbound_sender, inbound_receiver) = mpsc::channel(1);
+        let reader = stream::unfold(inbound_receiver, |mut receiver| async {
+            receiver.recv().await.map(|item| (Ok(item), receiver))
+        });
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(run_session_split_budgeted(
+            BlockedSocketSink::default(),
+            reader,
+            registry,
+            RpcSessionContext::unauthenticated(),
+            shutdown.clone(),
+            Some(RpcOutboundBudget::new(
+                Arc::new(Semaphore::new(4 * 1024)),
+                Arc::new(Semaphore::new(1024)),
+            )),
+        ));
+        inbound_sender
+            .send(request_frame(&["1"], "test.oversizedResponse"))
+            .await
+            .expect("send oversized response request");
+
+        timeout(Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .expect("impossible outbound admission closes the session");
+        assert!(enqueue_events.try_recv().is_err());
+        drop(inbound_sender);
+        timeout(Duration::from_secs(2), session)
+            .await
+            .expect("oversized response cleanup deadline")
+            .expect("session joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn byte_and_queue_admission_share_one_five_second_deadline() {
+        let process = Arc::new(Semaphore::new(1024));
+        let process_blocker = Arc::clone(&process)
+            .acquire_many_owned(1024)
+            .await
+            .expect("hold process capacity");
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(RpcOutboundFrame {
+                payload: RpcOutboundPayload::Plain(ServerMessage::Pong),
+                _budget: None,
+            })
+            .expect("fill response queue");
+        let outbound = RpcOutboundQueue {
+            sender,
+            budget: Some(RpcOutboundBudget::new(
+                Arc::clone(&process),
+                Arc::new(Semaphore::new(1024)),
+            )),
+        };
+        let shutdown = CancellationToken::new();
+        let send = tokio::spawn(async move {
+            send_server_message(&outbound, &shutdown, ServerMessage::Pong).await
+        });
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        drop(process_blocker);
+        tokio::task::yield_now().await;
+        assert!(
+            !send.is_finished(),
+            "queue admission still owns the final second"
+        );
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "the shared deadline has not elapsed");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(send.await.expect("send task joins"), Err(()));
     }
 
     #[tokio::test]

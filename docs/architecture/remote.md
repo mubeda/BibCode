@@ -133,15 +133,50 @@ one-second pump join bound. Transport cipher nonces are monotonically increasing
 closed and requires a new connection.
 
 Authenticated receivers additionally share a process-wide 128 MiB plaintext
-budget, while each connection has a separate 64 MiB budget. Every non-empty
-decrypted chunk holds byte-weighted permits from both budgets through assembly;
-a completed logical message retains them while queued, decoded, authorized, and
-handled by RPC. Zero-byte chunks retain no buffer or permit. Admission never
-waits while retaining an already-buffered ciphertext frame: exhausted capacity
-fails that connection closed. At most 64 established E2EE sockets are admitted,
-bounding the aggregate WebSocket-layer frame retained outside plaintext
-accounting. These limits preserve arbitrary legal chunk sizes while preventing
-a stalled or malicious peer from starving every other E2EE connection.
+budget. Each authenticated session ID has a 64 MiB aggregate budget across all
+of its sockets, and each connection retains its separate 64 MiB budget. Every
+non-empty decrypted chunk holds byte-weighted permits from all three applicable
+budgets through assembly; a completed logical message retains them while
+queued, decoded, authorized, and handled by RPC. Zero-byte chunks retain no
+buffer or permit, so fragmented tiny frames are charged once for their actual
+plaintext and not for record overhead. Admission never waits while retaining an
+already-buffered ciphertext frame: exhausted capacity fails that connection
+closed.
+
+Established-socket admission is likewise partitioned. At most 64 E2EE sockets
+are established process-wide, and one authenticated session ID may own at most
+32 of them; unsafe no-auth development sockets remain subject to the global cap.
+The global reservation is taken before credential exchange, then bound to the
+authenticated session ID. The resulting lease owns both permits until the
+session ends, so handshake/authentication rejection, timeout, socket error,
+session cancellation, revocation, nonce or AEAD failure, shutdown, and ordinary
+close all return capacity through the same drop path. The principal budget map
+holds only weak entries and prunes inactive identities while admitting a later
+connection.
+
+Established E2EE RPC output has a process-wide 128 MiB plaintext budget and a
+64 MiB per-connection budget. The generic session counts the exact serialized
+JSON bytes without allocating the encoded copy, acquires both byte permits, and
+only then encodes and enqueues the response. The queued frame owns those permits
+through Noise record encryption and every successful or failed WebSocket write;
+generic queue capacity therefore cannot hide additional plaintext. Unary
+results, stream chunks and terminals, RPC ping/pong control messages, protocol
+errors, interrupts, and defects use the same admission path. WebSocket-level
+ping/pong frames are transport control and carry no RPC plaintext. A response
+larger than the 64 MiB connection cap fails the session closed immediately;
+otherwise byte admission and the bounded 64-entry response queue share one
+five-second admission deadline. Each encrypted socket write retains its existing
+separate five-second deadline and the pump retains its one-second join bound.
+Dropping a queued, cancelled, rejected, serialization-failed, encryption-failed,
+or write-failed frame releases its single permit set without double accounting.
+
+Together, these limits preserve the 65,535-byte ciphertext record ceiling,
+65,518-byte plaintext chunk size, and 64 MiB logical-message contract.
+Established and inbound admission are principal-partitioned so one session
+cannot consume all of either resource. Outbound admission instead bounds
+aggregate retained plaintext; it is intentionally process/per-connection, not
+principal-fair, so saturated slow readers may delay unrelated output until a
+write fails, a session closes, or its five-second admission deadline expires.
 
 The pairing payload is base64url-unpadded JSON in
 `bibcode://pair?code=<payload>` with version, endpoint, display name, one-time
