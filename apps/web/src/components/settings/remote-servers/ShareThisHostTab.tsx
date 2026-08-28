@@ -116,7 +116,11 @@ export function ShareThisHostTab(): ReactElement {
     (wslOnlyPrimary ? options.find((option) => option.httpBaseUrl !== null) : options[0]) ??
     null;
   const wslExposureEndpoint = wslOnlyPrimary
-    ? (offer?.endpoint ?? selectedOption?.httpBaseUrl ?? null)
+    ? (advertisedEndpoints.find(
+        (endpoint) =>
+          endpoint.status === "available" &&
+          shareClassForPairingEndpoint(endpoint.httpBaseUrl) === "off-host",
+      )?.httpBaseUrl ?? null)
     : null;
   const effectiveName = defaultOfferName(
     offerName === "" ? (primaryEnvironment?.serverConfig?.environment.label ?? null) : offerName,
