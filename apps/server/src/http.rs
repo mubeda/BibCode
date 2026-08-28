@@ -185,6 +185,7 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
             axum::http::HeaderName::from_static("b3"),
             axum::http::HeaderName::from_static("traceparent"),
             axum::http::HeaderName::from_static("dpop"),
+            axum::http::HeaderName::from_static("idempotency-key"),
             axum::http::HeaderName::from_static(DESKTOP_MAINTENANCE_TOKEN_HEADER),
         ])
         .max_age(std::time::Duration::from_secs(600));

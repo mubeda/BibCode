@@ -2427,13 +2427,13 @@ async fn auth_routes_include_browser_cors_and_preflight_headers() {
     let preflight = client
         .request(
             reqwest::Method::OPTIONS,
-            http_url(&handle, "/api/auth/websocket-ticket"),
+            http_url(&handle, "/api/auth/pairing-offer"),
         )
         .header(header::ORIGIN, origin)
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
         .header(
             header::ACCESS_CONTROL_REQUEST_HEADERS,
-            "authorization, content-type, dpop",
+            "authorization, content-type, dpop, idempotency-key",
         )
         .send()
         .await
@@ -2448,7 +2448,7 @@ async fn auth_routes_include_browser_cors_and_preflight_headers() {
         .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
         .and_then(|value| value.to_str().ok())
         .expect("allowed headers");
-    for expected in ["authorization", "content-type", "dpop"] {
+    for expected in ["authorization", "content-type", "dpop", "idempotency-key"] {
         assert!(allowed_headers.contains(expected));
     }
 
