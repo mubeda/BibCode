@@ -129,11 +129,13 @@ Record the exposure mode, grant/session row, restart boundary, visible message,
 and screenshot for each outcome. Do not use a later app restart as substitute
 evidence for direct failed-mint cleanup.
 
-Run the lifecycle source and living-document contracts from the repository
-root whenever this boundary changes:
+Run the living-document contract plus the public WebSocket lifecycle and
+transport-size tests from the repository root whenever this boundary changes:
 
 ```sh
-vp test scripts/remote-architecture-contract.test.ts scripts/remote-transport-hardening.test.ts
+vp test scripts/remote-architecture-contract.test.ts
+cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
+cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
 ```
 
 ### Direct E2EE interop gate
@@ -154,6 +156,74 @@ key, authenticate and call RPC through Noise NK, reconnect with the in-channel
 credential, reassemble a fragmented request, and reject a bad pairing token.
 Without `BIBCODE_E2EE_SERVER_BIN`, the same file intentionally reports skipped
 so ordinary `vp test` does not depend on a prebuilt binary.
+
+### Cross-container remote-server gate
+
+When remote authentication, pairing, E2EE, share-state derivation, revocation,
+or remote updates change, run the opt-in smoke test with the server and client
+in distinct Linux containers. Build the current server first, verify Docker is
+available, and use test-owned names so cleanup can be proven:
+
+```sh
+cargo build -p bibcode-server
+docker version
+
+docker network create bibcode-remote-stabilization
+docker volume create bibcode-remote-stabilization-data
+cleanup_bibcode_remote_docker() {
+  docker rm -f bibcode-remote-server bibcode-remote-client 2>/dev/null || true
+  docker network rm bibcode-remote-stabilization 2>/dev/null || true
+  docker volume rm bibcode-remote-stabilization-data 2>/dev/null || true
+}
+trap cleanup_bibcode_remote_docker EXIT INT TERM
+
+docker run -d --name bibcode-remote-server \
+  --network bibcode-remote-stabilization \
+  -v "$PWD/target/debug/bibcode:/usr/local/bin/bibcode:ro" \
+  -v bibcode-remote-stabilization-data:/data \
+  debian:trixie-slim \
+  /usr/local/bin/bibcode --base-dir /data --host 0.0.0.0 --port 3773 serve
+
+for attempt in $(seq 1 40); do
+  BIBCODE_DOCKER_PAIRING_JSON=$(docker exec bibcode-remote-server \
+    /usr/local/bin/bibcode --base-dir /data pairing issue --json 2>/dev/null) && break
+  sleep 0.25
+done
+test -n "${BIBCODE_DOCKER_PAIRING_JSON:-}"
+BIBCODE_DOCKER_ADMIN_CREDENTIAL=$(node -e \
+  'process.stdout.write(JSON.parse(process.argv[1]).credential)' \
+  "$BIBCODE_DOCKER_PAIRING_JSON")
+
+docker run --rm --name bibcode-remote-client \
+  --network bibcode-remote-stabilization \
+  -v "$PWD:/workspace:ro" -w /workspace \
+  -e BIBCODE_DOCKER_SERVER_URL=http://bibcode-remote-server:3773 \
+  -e BIBCODE_DOCKER_ADMIN_CREDENTIAL="$BIBCODE_DOCKER_ADMIN_CREDENTIAL" \
+  node:26-bookworm \
+  corepack pnpm exec vite-plus test packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
+
+unset BIBCODE_DOCKER_PAIRING_JSON BIBCODE_DOCKER_ADMIN_CREDENTIAL
+cleanup_bibcode_remote_docker
+trap - EXIT INT TERM
+```
+
+The smoke test must cover descriptor negotiation, administrative token
+exchange, an off-host pairing offer, pinned-host Noise NK authentication,
+authenticated E2EE RPC, `updater.status`, `updater.check`, the typed manual
+install failure, browser-session share-state retention, client revocation, and
+the final loopback share state. It must not spawn a host server or fall back to
+loopback.
+
+After the run, all three commands below must print nothing:
+
+```sh
+docker ps -a --filter name=bibcode-remote- --format '{{.Names}}'
+docker network ls --filter name=bibcode-remote-stabilization --format '{{.Name}}'
+docker volume ls --filter name=bibcode-remote-stabilization-data --format '{{.Name}}'
+```
+
+Record image IDs, architecture, exact command results, and cleanup evidence in
+an execution report. Never record or retain the temporary pairing credential.
 
 ### VCS coordination gates
 

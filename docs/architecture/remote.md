@@ -135,6 +135,10 @@ authenticated caller with `access:write` mints it through
 `POST /api/auth/pairing-offer`. `Idempotency-Key` makes identical retries return
 the original offer and rejects reuse with different input. Replay entries are
 scoped to the authenticated principal and kept under a bounded, expiring cap.
+An authenticated `POST /api/auth/pairing-offer/cancel` names the same key. It
+revokes a committed offer for that principal and stores an expiring tombstone,
+so cancellation is safe both after a lost response and before a delayed create
+reaches the issuance lock. A cancelled key cannot mint or replay an offer.
 The server validates that `this-computer` uses loopback, `another-device` does
 not use loopback, and that no offered endpoint is wildcard or port zero. Reach
 is embedded in the code and persisted with the grant as described below.
@@ -219,9 +223,14 @@ including `browser-session-cookie`, `bearer-access-token`, and
 one-time-link reason with the browser-session reason instead of narrowing and
 disconnecting the newly paired browser.
 
-The desktop widens only as part of generating an off-host offer. One native
-`ServerExposureCoordinator` serializes settings, backend restart, verification,
-firewall synchronization, and recovery for every apply. Widening uses an
+Every fresh desktop process starts the actual primary backend local-only under
+the native `ServerExposureCoordinator`, regardless of a previously persisted
+wide setting. Once authenticated, the renderer compares authoritative share
+state with actual runtime topology and requests a widen only when a live
+off-host reason exists. One coordinator serializes exposure applies and every
+other settings mutation that can restart the native or WSL topology. Those
+non-exposure mutations preserve the actual runtime exposure across their
+restart instead of reapplying a stale durable mode. Widening uses an
 ephemeral launch override, verifies a network-accessible advertised endpoint,
 opens the program-scoped `BiBCode Remote Access` Windows Firewall rule, and
 persists network-accessible only after those native side effects succeed. Any
@@ -229,32 +238,36 @@ failure attempts every local safeguard even if an earlier recovery step fails:
 persist local-only, restart with a local-only override, close the firewall, and
 stop an unverified backend. Narrowing persists local-only first, restarts and
 verifies local topology, then closes the firewall; it never restores durable
-wide state as compensation. The persisted desktop setting is the next-launch
-target, not evidence that an apply succeeded. Creating a **This computer only**
-or loopback-custom grant never widens a later launch, and there is no independent
-manual exposure toggle.
+wide state as compensation. The persisted desktop setting records the last
+completed transition but is neither proof of actual topology nor permission to
+start wide. Creating a **This computer only** or loopback-custom grant never
+widens a later launch, and there is no independent manual exposure toggle.
 
 Compatibility grants whose persisted reach and off-host fields are `NULL`
 never cause an automatic widen. While any unrevoked legacy one-time-token grant
 remains, they do block automatic reversion from an already-wide bind. The Share
 tab identifies that condition and tells the user to revoke or re-pair those
 clients. Otherwise, the renderer checks share state at startup and after every
-auth-access revision and switches a wide desktop backend back to loopback when
-the last off-host grant is revoked. After narrowing it reads share state once
-more. Only if a concurrent new off-host grant appeared during that operation
-does it perform one compensating widen; later revisions schedule a fresh
+auth-access revision. It widens a local-only runtime only when the server
+currently reports a live off-host reason, and switches a wide runtime back to
+loopback when the last reason is revoked. After narrowing it reads share state
+once more. If a concurrent new off-host grant appeared during that operation,
+it performs one compensating widen; later revisions schedule a fresh
 reconciliation rather than creating an internal loop.
 
 Revoking a client invalidates its credential and actively cancels every live
 plain or E2EE WebSocket registered to that session. Revoking all other clients
 does the same for each affected session. Exposure changes still use a backend
 restart: live local connections and running turns drop, while committed SQLite
-state and other durable server state survive. A failed post-restart mint leaves
-no grant. The share ceremony immediately awaits a local-only compensation
-instead of depending on an auth revision event that may never arrive. The UI
-distinguishes a successful cleanup with local-only confirmation from an
-explicit cleanup failure, while the startup/revision reconciler remains a
-backstop.
+state and other durable server state survive. After bounded mint attempts fail,
+the share ceremony first cancels the principal-scoped idempotency key. This
+revokes a grant whose successful response was lost, or tombstones the key ahead
+of a delayed create. Only after cancellation succeeds may the renderer read
+share state and compensate to local-only; if cancellation cannot be confirmed,
+it leaves exposure unchanged and reports cleanup failure. The direct path does
+not depend on an auth revision event that may never arrive. The UI distinguishes
+a successful cleanup with local-only confirmation from an explicit cleanup
+failure, while the startup/revision reconciler remains a backstop.
 
 A wide-bound native primary does not expose the desktop-only maintenance API.
 Update protection therefore degrades while sharing until exposure returns to
