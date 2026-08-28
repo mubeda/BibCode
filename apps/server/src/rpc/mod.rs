@@ -10,6 +10,6 @@ pub use message::{
 pub use methods::{ACTIVE_RPC_METHODS, MethodMode, RpcMethodSpec};
 pub use session::{RpcRegistry, RpcResult, RpcStreamChunk};
 
-pub(crate) use e2ee::run_e2ee_session;
+pub(crate) use e2ee::{MAX_E2EE_CIPHERTEXT_BYTES, run_e2ee_session};
 pub(crate) use methods::{MethodMutability, method_mutability};
 pub(crate) use session::{RpcResponseEnqueueGuard, RpcSessionContext, RpcUnaryResult, run_session};

@@ -518,6 +518,21 @@ async fn oversized_binary_frame_closes_the_connection() {
 }
 
 #[tokio::test]
+async fn oversized_pre_auth_websocket_message_is_rejected() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let mut socket = open_socket(handle.local_addr()).await;
+
+    socket
+        .send(Message::Binary(vec![0_u8; MAX_CIPHERTEXT_BYTES + 1].into()))
+        .await
+        .expect("send oversized pre-auth message");
+
+    let _ = next_close_code(&mut socket).await;
+}
+
+#[tokio::test]
 async fn preauth_message_cap_is_64kib() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");

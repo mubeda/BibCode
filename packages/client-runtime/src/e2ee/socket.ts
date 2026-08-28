@@ -8,7 +8,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Socket from "effect/unstable/socket/Socket";
 
-import { RecordAssembler, splitIntoRecords } from "./frame.ts";
+import { MAX_E2EE_PREAUTH_MESSAGE_BYTES, plaintextRecords, RecordAssembler } from "./frame.ts";
 import {
   createNkInitiator,
   decodeBase64UrlKey,
@@ -70,16 +70,19 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
     write: (chunk: Uint8Array | string) => Effect.Effect<void, Socket.SocketError>,
     plaintext: Uint8Array,
   ): Effect.Effect<void, Socket.SocketError> =>
-    Effect.suspend(() => {
-      try {
-        const frames = splitIntoRecords(plaintext).map((record) =>
-          transport.send.encryptWithAd(EMPTY, record),
-        );
-        return Effect.forEach(frames, (frame) => write(frame), { discard: true });
-      } catch (cause) {
-        return Effect.fail(
+    Effect.gen(function* () {
+      const records = yield* Effect.try({
+        try: () => plaintextRecords(plaintext),
+        catch: (cause) =>
           socketFailure(new E2eeProtocolError("protocol", `encrypt failed: ${String(cause)}`)),
-        );
+      });
+      for (const record of records) {
+        const frame = yield* Effect.try({
+          try: () => transport.send.encryptWithAd(EMPTY, record),
+          catch: (cause) =>
+            socketFailure(new E2eeProtocolError("protocol", `encrypt failed: ${String(cause)}`)),
+        });
+        yield* write(frame);
       }
     });
 
@@ -94,7 +97,7 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
       hasStarted = true;
       transportDeferred = sessionTransport;
       const initiator = createNkInitiator({ responderStaticPublicKey: responderKey });
-      const assembler = new RecordAssembler();
+      let assembler = new RecordAssembler(MAX_E2EE_PREAUTH_MESSAGE_BYTES);
       const authenticated = Deferred.makeUnsafe<void, Socket.SocketError>();
       let phase: "handshake" | "auth" | "open" = "handshake";
       let transport: NkTransport | null = null;
@@ -201,6 +204,7 @@ export const makeE2eeSocket = (inner: Socket.Socket, options: E2eeSocketOptions)
                     return fail("protocol", `authenticated callback failed: ${String(cause)}`);
                   }
                   phase = "open";
+                  assembler = new RecordAssembler();
                   Deferred.doneUnsafe(sessionTransport, Effect.succeed(currentTransport()));
                   Deferred.doneUnsafe(authenticated, Effect.void);
                   return undefined;

@@ -35,7 +35,7 @@ use crate::{
     },
     production::http_routes::{self, HttpRoutesState},
     remote_update::RemoteUpdateSupport,
-    rpc::{RpcRegistry, RpcSessionContext, run_session},
+    rpc::{MAX_E2EE_CIPHERTEXT_BYTES, RpcRegistry, RpcSessionContext, run_session},
 };
 
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
@@ -256,6 +256,8 @@ async fn websocket(
 async fn websocket_e2ee(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
     let session_shutdown = state.shutdown.child_token();
     upgrade
+        .max_frame_size(MAX_E2EE_CIPHERTEXT_BYTES)
+        .max_message_size(MAX_E2EE_CIPHERTEXT_BYTES)
         .on_upgrade(move |socket| {
             crate::rpc::run_e2ee_session(
                 socket,
