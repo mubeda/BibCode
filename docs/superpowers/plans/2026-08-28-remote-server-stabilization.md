@@ -45,7 +45,7 @@
 - Consumes: current dependency inventory, Tauri capability JSON, generated auth fixture manifest, and `ROUTE_INVENTORY`.
 - Produces: a green repository baseline that explicitly accounts for the dependencies, permission, fixture route, and HTTP route introduced by the remote-server range.
 
-- [ ] **Step 1: Re-run the existing red gate tests and preserve their evidence**
+- [x] **Step 1: Re-run the existing red gate tests and preserve their evidence**
 
 Run:
 
@@ -56,7 +56,7 @@ cargo test -p bibcode-server --test server_runtime route_inventory_covers_every_
 
 Expected: the TypeScript command reports four failures (missing Noble acknowledgement, missing deep-link permission, four missing ledger entries, and missing `shareState` fixture route); the Rust command reports missing `GET /api/auth/share-state`.
 
-- [ ] **Step 2: Synchronize the dependency ledger with the discovered inventory**
+- [x] **Step 2: Synchronize the dependency ledger with the discovered inventory**
 
 Set the summary to:
 
@@ -129,7 +129,7 @@ Insert these sorted dependency records next to their cohorts:
 }
 ```
 
-- [ ] **Step 3: Make each contract test acknowledge the current checked-in behavior**
+- [x] **Step 3: Make each contract test acknowledge the current checked-in behavior**
 
 Append `"@noble/ciphers@2.4.0"` to the exact `minimumReleaseAgeExclude` expectation, append `"deep-link:default"` to the exact Tauri permission expectation, insert `"shareState"` after `"pairingOffer"` in the auth route-name expectation, change fixture count `23` to `24`, change schema fingerprint count `26` to `27`, and insert:
 
@@ -139,13 +139,13 @@ Append `"@noble/ciphers@2.4.0"` to the exact `minimumReleaseAgeExclude` expectat
 
 after `pairing-offer` in `expected_routes()`.
 
-- [ ] **Step 4: Re-run all five gates and verify green**
+- [x] **Step 4: Re-run all five gates and verify green**
 
 Run the two commands from Step 1.
 
 Expected: 30 TypeScript tests pass and the exact Rust route-inventory test passes.
 
-- [ ] **Step 5: Commit the synchronized gates**
+- [x] **Step 5: Commit the synchronized gates**
 
 ```bash
 git add docs/dependency-upgrades/2026-07-17-ledger.json scripts/toolchain-contract.test.ts scripts/tauri-hardening.test.ts packages/contracts/scripts/export-rust-auth-fixtures.test.ts apps/server/tests/server_runtime.rs
@@ -165,7 +165,7 @@ git commit -m "test(remote): synchronize implementation gates"
 - Consumes: `SessionRecord { subject, revoked_at_ms, expires_at_ms, off_host }`, authenticated principal `session_id`, and `MAX_ACTIVE_PAIRINGS`.
 - Produces: `share_exposure_state()` that counts every active off-host one-time-token session; principal-scoped bounded `replay_pairing_offer(principal_id, key, fingerprint)` and `record_pairing_offer(principal_id, key, fingerprint, result)`.
 
-- [ ] **Step 1: Add the browser-pair-path regression test**
+- [x] **Step 1: Add the browser-pair-path regression test**
 
 Add an HTTP test named `browser_pairing_session_preserves_off_host_exposure_until_revoked` that:
 
@@ -193,7 +193,7 @@ assert_eq!(share_state(&client, &handle, administrator_token).await["desiredExpo
 
 Use small test helpers in `auth_http.rs` only when they remove repeated real HTTP requests; do not call `AuthService` directly from this test.
 
-- [ ] **Step 2: Run the browser regression and observe the incorrect loopback result**
+- [x] **Step 2: Run the browser regression and observe the incorrect loopback result**
 
 ```bash
 cargo test -p bibcode-server --test auth_http browser_pairing_session_preserves_off_host_exposure_until_revoked -- --exact --nocapture
@@ -201,7 +201,7 @@ cargo test -p bibcode-server --test auth_http browser_pairing_session_preserves_
 
 Expected: FAIL because consuming the link removes it and `browser-session-cookie` is excluded.
 
-- [ ] **Step 3: Remove the access-method filter from live session grants**
+- [x] **Step 3: Remove the access-method filter from live session grants**
 
 Reduce the session predicate to the actual grant lifecycle:
 
@@ -221,7 +221,7 @@ cargo test -p bibcode-server auth::service::tests::share_exposure_derives_wide_o
 
 Expected: both pass.
 
-- [ ] **Step 4: Add failing principal-isolation and capacity tests for offer idempotency**
+- [x] **Step 4: Add failing principal-isolation and capacity tests for offer idempotency**
 
 Add tests proving:
 
@@ -242,7 +242,7 @@ cargo test -p bibcode-server auth::service::tests::pairing_offer_idempotency --l
 
 Expected: FAIL because keys are global and the map has no cap.
 
-- [ ] **Step 5: Key idempotency by principal and enforce the cap**
+- [x] **Step 5: Key idempotency by principal and enforce the cap**
 
 Change storage and signatures to:
 
@@ -267,7 +267,7 @@ pub(crate) async fn record_pairing_offer(
 
 Prune expired records before every replay/record, reject a fresh insert at `MAX_ACTIVE_PAIRINGS`, and pass `principal.session_id` from `create_pairing_offer`. Preserve replay and conflict behavior within one principal.
 
-- [ ] **Step 6: Run focused auth coverage and commit**
+- [x] **Step 6: Run focused auth coverage and commit**
 
 ```bash
 cargo test -p bibcode-server auth::service::tests --lib
@@ -308,7 +308,7 @@ git commit -m "fix(remote): preserve live browser grants"
 - Consumes: existing `buildPairingDeepLink`, `buildBrowserPairUrl`, `parsePairingCode`, and connection target shapes.
 - Produces: `resolvePairingDeepLinkCode(rawUrl): string | null`, `DESKTOP_LOCAL_CONNECTION_ID_PREFIX`, `isDesktopLocalConnectionId(connectionId)`, exact parsed-IP endpoint classification, and `RemoteUpdateSnapshot.error: string | null`.
 
-- [ ] **Step 1: Add failing endpoint and contract edge tests**
+- [x] **Step 1: Add failing endpoint and contract edge tests**
 
 Add these table entries to the shared endpoint test:
 
@@ -349,7 +349,7 @@ vp test packages/shared/src/advertisedEndpoint.test.ts packages/contracts/src/re
 
 Expected: path `:0`, DNS prefix, and empty error cases fail.
 
-- [ ] **Step 2: Parse port and IP families exactly and loosen only the update error field**
+- [x] **Step 2: Parse port and IP families exactly and loosen only the update error field**
 
 Replace the raw endpoint regex with `url.port === "0"`; parse IPv4 only when all four decimal octets are integers in `0..=255`; treat `127.0.0.0/8` as loopback; and treat IPv6 as private only when the first hexadecimal segment is `fc00::/7` or `fe80::/10`. DNS names containing those prefixes remain public.
 
@@ -361,7 +361,7 @@ error: Schema.NullOr(Schema.String),
 
 Run the Step 1 tests and expect them to pass.
 
-- [ ] **Step 3: Add failing shared-owner tests for pairing links and desktop-local IDs**
+- [x] **Step 3: Add failing shared-owner tests for pairing links and desktop-local IDs**
 
 Export and test:
 
@@ -383,11 +383,11 @@ vp test packages/shared/src/pairingCode.test.ts packages/client-runtime/src/conn
 
 Expected: FAIL because the exports do not exist and web still owns literals/parsing.
 
-- [ ] **Step 4: Replace duplicated consumers with the owning exports**
+- [x] **Step 4: Replace duplicated consumers with the owning exports**
 
 Implement `resolvePairingDeepLinkCode` in `pairingCode.ts` and reuse it from the parser and `desktopDeepLink.ts`. Import pairing URL builders in `shareOffer.ts` from `@bibcode/shared/pairingCode` and delete its local copies. Export the local ID constant/predicate from client-runtime presentation; use them from `desktopLocal.ts`, `connectPresentation.ts`, and connection security presentation. When `verifyAndAddPairingCode` has already received a minted credential and then rejects an environment/storage identity mismatch, append the exact client-list revocation guidance from Step 1; pre-auth failures keep their existing copy.
 
-- [ ] **Step 5: Run all affected TypeScript tests and commit**
+- [x] **Step 5: Run all affected TypeScript tests and commit**
 
 ```bash
 vp test packages/shared/src/pairingCode.test.ts packages/shared/src/advertisedEndpoint.test.ts packages/client-runtime/src/connection/presentation.test.ts packages/client-runtime/src/connection/pairingAdd.test.ts packages/contracts/src/remoteUpdate.test.ts apps/web/src/desktopDeepLink.test.ts apps/web/src/components/settings/remote-servers/connectPresentation.test.ts apps/web/src/components/settings/remote-servers/shareOffer.test.ts
@@ -416,7 +416,7 @@ git commit -m "refactor(remote): centralize connection policy"
 - Consumes: `getServerShareState`, `DesktopBridge.getServerExposureState`, and `DesktopBridge.applyServerExposure`.
 - Produces: `reconcileShareExposureOnce(operations): Promise<"unchanged" | "narrowed" | "rewidened">`; mint-failure cleanup status `"not-needed" | "restored" | "failed"`.
 
-- [ ] **Step 1: Add failing mint-failure compensation tests**
+- [x] **Step 1: Add failing mint-failure compensation tests**
 
 Extend `generateShareOffer` tests with:
 
@@ -440,7 +440,7 @@ vp test apps/web/src/components/settings/remote-servers/shareOffer.test.ts
 
 Expected: FAIL because mint failure returns without cleanup.
 
-- [ ] **Step 2: Add failing convergence and post-narrow race tests**
+- [x] **Step 2: Add failing convergence and post-narrow race tests**
 
 Extract a testable operation and cover these ordered observations:
 
@@ -464,7 +464,7 @@ vp test apps/web/src/state/shareExposureReconciler.test.tsx
 
 Expected: FAIL because no reusable operation or post-apply read exists.
 
-- [ ] **Step 3: Implement one bounded convergence pass**
+- [x] **Step 3: Implement one bounded convergence pass**
 
 Implement the exact operation shape:
 
@@ -484,7 +484,7 @@ export async function reconcileShareExposureOnce(
 
 Fetch share/exposure together, narrow only when `shouldRevertExposure` is true, fetch share state once more, and re-widen only when that post-narrow result is `wide`. Refresh desktop network state after each native apply. Do not loop inside this function.
 
-- [ ] **Step 4: Invoke convergence directly after a widened mint failure**
+- [x] **Step 4: Invoke convergence directly after a widened mint failure**
 
 Add this dependency to `GenerateShareOfferDependencies`:
 
@@ -496,7 +496,7 @@ readonly cleanupExposureAfterFailedMint: null | (() => Promise<
 
 After the fifth mint failure, await it when `widened === true`; map `narrowed` to `cleanup: "restored"`, the other successful results to `cleanup: "not-needed"`, and rejection to `cleanup: "failed"`. `ShareThisHostTab` supplies the real `reconcileShareExposureOnce` operation.
 
-- [ ] **Step 5: Make the UI copy report completed reality**
+- [x] **Step 5: Make the UI copy report completed reality**
 
 Render these outcomes:
 
@@ -510,7 +510,7 @@ cleanup === "restored"
 
 Delete “will switch off again automatically.” Add component assertions for restored and cleanup-failed text.
 
-- [ ] **Step 6: Run focused renderer coverage and commit**
+- [x] **Step 6: Run focused renderer coverage and commit**
 
 ```bash
 vp test apps/web/src/state/shareExposureReconciler.test.tsx apps/web/src/components/settings/remote-servers/shareOffer.test.ts apps/web/src/components/settings/remote-servers/ShareThisHostTab.test.tsx
@@ -537,7 +537,7 @@ git commit -m "fix(remote): compensate failed share ceremonies"
 - Consumes: `BackendSupervisor`, desktop settings helpers, and `firewall::sync_remote_access_rule`.
 - Produces: managed `ServerExposureCoordinator`, `apply_exposure`, and `BackendSupervisor::restart_default_if_active_with_exposure(app, desired)`.
 
-- [ ] **Step 1: Add failing backend override tests**
+- [x] **Step 1: Add failing backend override tests**
 
 Add a backend test that stores wide settings but asks launch planning for local-only, and the converse. Assert:
 
@@ -556,7 +556,7 @@ cargo test -p bibcode-desktop backend::tests::exposure_override --lib -- --nocap
 
 Expected: FAIL because launch planning can only reread the persisted mode.
 
-- [ ] **Step 2: Add an ephemeral exposure override to backend restart planning**
+- [x] **Step 2: Add an ephemeral exposure override to backend restart planning**
 
 Add:
 
@@ -572,7 +572,7 @@ Thread `Option<&str>` through `start_default_with_reason` and `default_launch_pl
 
 Run the Step 1 test and existing backend restart tests; expect green.
 
-- [ ] **Step 3: Create failing transaction-order and recovery tests with fake side effects**
+- [x] **Step 3: Create failing transaction-order and recovery tests with fake side effects**
 
 Define a private test fake for this interface in `server_exposure.rs`:
 
@@ -604,7 +604,7 @@ cargo test -p bibcode-desktop server_exposure::tests --lib -- --nocapture
 
 Expected: FAIL because the coordinator and transaction do not exist.
 
-- [ ] **Step 4: Implement the serialized asymmetric transaction**
+- [x] **Step 4: Implement the serialized asymmetric transaction**
 
 Implement:
 
@@ -623,11 +623,11 @@ pub(crate) async fn apply_exposure(
 
 Widen in restart → verify achieved wide → firewall open → persist-wide order. On any failure, collect rather than short-circuit local persistence, local override restart, firewall close, and stop when local restart cannot be verified. Narrow in persist-local → local override restart → firewall close order; never persist wide from recovery. Join initiating and recovery failures into one message.
 
-- [ ] **Step 5: Wire the production adapter and managed state**
+- [x] **Step 5: Wire the production adapter and managed state**
 
 Add `mod server_exposure;`, manage one `ServerExposureCoordinator::default()` in both the real and mock Tauri builders, accept `State<'_, ServerExposureCoordinator>` in `desktop_bridge_apply_server_exposure`, and replace the existing rollback block with `apply_exposure`. The production adapter calls the new backend override and existing firewall/settings functions.
 
-- [ ] **Step 6: Run desktop transaction, backend, and IPC tests and commit**
+- [x] **Step 6: Run desktop transaction, backend, and IPC tests and commit**
 
 ```bash
 cargo test -p bibcode-desktop server_exposure::tests --lib
@@ -666,7 +666,7 @@ git commit -m "fix(desktop): fail closed on exposure transitions"
 - Consumes: `MAX_E2EE_CIPHERTEXT_BYTES`, Noise send/receive states, socket write timeout, and record flags.
 - Produces: lazy plaintext record iterators, per-record encryption/send, reusable server decrypt scratch, explicit WebSocket frame/message caps, and a 64 KiB client pre-auth assembler limit.
 
-- [ ] **Step 1: Add failing WebSocket and client pre-auth cap tests**
+- [x] **Step 1: Add failing WebSocket and client pre-auth cap tests**
 
 Add a raw `/ws-e2ee` test that sends a `MAX_E2EE_CIPHERTEXT_BYTES + 1` binary message before a valid Noise handshake and expects the transport to close. Add a source-level transport configuration contract that reads `apps/server/src/http.rs` and asserts the `/ws-e2ee` route applies both:
 
@@ -694,7 +694,7 @@ vp test scripts/remote-transport-hardening.test.ts packages/client-runtime/src/e
 
 Expected: the static transport contract and client cap tests fail; the raw socket test documents the already fail-closed peer behavior.
 
-- [ ] **Step 2: Apply transport-level caps and phase-specific client assembly**
+- [x] **Step 2: Apply transport-level caps and phase-specific client assembly**
 
 Re-export `MAX_E2EE_CIPHERTEXT_BYTES` from `rpc` and configure:
 
@@ -706,7 +706,7 @@ upgrade
 
 on `/ws-e2ee`. Add `MAX_E2EE_PREAUTH_MESSAGE_BYTES = 64 * 1024` to client frame code, accept a constructor cap in `RecordAssembler`, and use the pre-auth cap until the socket enters `open`; retain 64 MiB afterward.
 
-- [ ] **Step 3: Add failing lazy-record/order tests**
+- [x] **Step 3: Add failing lazy-record/order tests**
 
 Define the wished-for APIs in tests:
 
@@ -724,7 +724,7 @@ In the socket test, make the first mocked write block and assert the Noise send 
 
 Run the E2EE unit tests and expect failure because both implementations eagerly allocate arrays.
 
-- [ ] **Step 4: Encrypt and send one record at a time**
+- [x] **Step 4: Encrypt and send one record at a time**
 
 Add lazy `plaintext_records`/`plaintextRecords` iterators that yield `(flag, chunk)` without copying the entire message. Keep `splitIntoRecords` as a compatibility wrapper over the iterator for existing test helpers, but change production socket code to:
 
@@ -737,13 +737,13 @@ for (const record of plaintextRecords(plaintext)) {
 
 On Rust, expose one-record encryption to the pumps; acquire the shared channel mutex only for `encrypt_record`, release it before the timed WebSocket write, and preserve the single outbound pump as send-order owner.
 
-- [ ] **Step 5: Reuse decrypt scratch and omit absent storage identity**
+- [x] **Step 5: Reuse decrypt scratch and omit absent storage identity**
 
 Add `decrypt_scratch: Vec<u8>` to `E2eeChannel`, resize it once to `MAX_E2EE_CIPHERTEXT_BYTES`, and reuse it in `decrypt_frame`. Build the pairing reply as a JSON object and insert `storageInstanceId` only when `config.storage_instance_id` is `Some`, so `None` never serializes as `""`.
 
 Delete the stale Phase 3 `#[expect]` annotations and remove auth re-exports that have no consumers; keep `NOISE_NK_PARAMS` exported because E2EE uses it.
 
-- [ ] **Step 6: Extract reusable real-socket test support**
+- [x] **Step 6: Extract reusable real-socket test support**
 
 Move the non-process-specific helpers from `serverInterop.test.ts` into
 `testSupport.ts` with these test-only exports:
@@ -773,7 +773,7 @@ inside `serverInterop.test.ts`. The helper uses the same ten-second frame
 watchdog, lazy record iterator, and `RecordAssembler` as production protocol
 tests; it is not exported from the package entry point.
 
-- [ ] **Step 7: Run crypto, interoperability, and client coverage and commit**
+- [x] **Step 7: Run crypto, interoperability, and client coverage and commit**
 
 ```bash
 cargo test -p bibcode-server rpc::e2ee::tests --lib
@@ -802,7 +802,7 @@ git commit -m "perf(remote): stream bounded E2EE records"
 - Consumes: `RemoteUpdateDelegate`, `HostUpdaterStatus`, `AuthService.mark_connected`, and Axum `on_upgrade`.
 - Produces: a 30-second delegate timeout mapped to typed `RemoteUpdateState::Error`, and connection accounting that begins only inside a completed upgrade.
 
-- [ ] **Step 1: Add a failing hung-delegate test**
+- [x] **Step 1: Add a failing hung-delegate test**
 
 Create a `PendingHostUpdater` whose methods return `std::future::pending()`. Add a test-only timeout constructor:
 
@@ -825,11 +825,11 @@ cargo test -p bibcode-server remote_update::tests::hung_delegate --lib -- --noca
 
 Expected: FAIL because calls await forever and no timeout seam exists.
 
-- [ ] **Step 2: Wrap every delegate future with one bounded helper**
+- [x] **Step 2: Wrap every delegate future with one bounded helper**
 
 Add a default `Duration::from_secs(30)` field and a helper that uses `tokio::time::timeout`. `status`, `check`, and `request_install` all call the helper; timeout returns an error snapshot without panicking or holding a single-flight caller indefinitely.
 
-- [ ] **Step 3: Add a failing rejected-upgrade accounting contract**
+- [x] **Step 3: Add a failing rejected-upgrade accounting contract**
 
 Extend `remote-transport-hardening.test.ts` to isolate the authenticated plain `/ws` handler and assert `mark_connected` appears inside the `on_upgrade(move |socket| async move { ... })` body, with no call between successful authentication and `on_upgrade`. This source contract captures the otherwise timing-dependent TCP response-write failure seam; existing real-socket auth tests continue to cover successful connected/disconnected accounting and revocation teardown.
 
@@ -841,7 +841,7 @@ vp test scripts/remote-transport-hardening.test.ts
 
 Expected: FAIL because `mark_connected` currently runs before `on_upgrade`.
 
-- [ ] **Step 4: Move accounting into the upgrade future and verify both fixes**
+- [x] **Step 4: Move accounting into the upgrade future and verify both fixes**
 
 Move `mark_connected` to the first lines inside `on_upgrade`; retain the expiration guard, cancellation, and matching `mark_disconnected` in that future.
 
@@ -856,7 +856,7 @@ vp test scripts/remote-transport-hardening.test.ts
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit lifecycle bounds**
+- [x] **Step 5: Commit lifecycle bounds**
 
 ```bash
 git add apps/server/src/remote_update.rs apps/server/tests/remote_update_rpc.rs apps/server/src/http.rs scripts/remote-transport-hardening.test.ts
@@ -881,7 +881,7 @@ git commit -m "fix(remote): bound delegated lifecycle work"
 - Consumes: final behavior and exact validation commands from Tasks 1-7.
 - Produces: living documentation that states current lifecycle truth and repeatable native checks.
 
-- [ ] **Step 1: Add a documentation assertion for the corrected pairing and exposure claims**
+- [x] **Step 1: Add a documentation assertion for the corrected pairing and exposure claims**
 
 Create `scripts/remote-architecture-contract.test.ts` to read
 `docs/architecture/remote.md` and assert the living document contains these
@@ -896,13 +896,13 @@ expect(remote).not.toContain("transport loss leaves it retryable");
 
 Run that test and observe failure against the current document.
 
-- [ ] **Step 2: Rewrite the living lifecycle description**
+- [x] **Step 2: Rewrite the living lifecycle description**
 
 Document all active off-host sessions regardless of access method; direct failed-mint convergence; serialized native applies; widen-last/narrow-first persistence; firewall/backend recovery; one post-narrow re-read and race-only re-widen; WebSocket caps; record-at-a-time E2EE; the 30-second update delegate timeout; and consume-before-delivery pairing semantics.
 
 Explicitly state that post-bootstrap client verification failure can leave a visible session that the operator can revoke. Do not claim transparent retry or guaranteed credential delivery.
 
-- [ ] **Step 3: Update native runbook observations**
+- [x] **Step 3: Update native runbook observations**
 
 In cross-platform and OS runbooks, require visual evidence for:
 
@@ -915,11 +915,11 @@ concurrent new grant during narrowing -> reachable offer after one compensating 
 
 Retain platform-specific firewall, package, signing, and updater procedures. If an OS runbook needs no text change, record that fact for the final report rather than editing it gratuitously.
 
-- [ ] **Step 4: Disclose the relay handle fix without rewriting history**
+- [x] **Step 4: Disclose the relay handle fix without rewriting history**
 
 Add a short remediation note to the final execution evidence section used by this plan stating that `81eff018` also dropped the writable relay executable handle before exec to prevent `ETXTBSY`; identify it as beneficial production scope discovered during E2EE interop, not part of a relay redesign.
 
-- [ ] **Step 5: Run docs checks and commit**
+- [x] **Step 5: Run docs checks and commit**
 
 ```bash
 vp test scripts/remote-architecture-contract.test.ts
@@ -946,7 +946,7 @@ Stage only files actually created or changed; omit reviewed-but-unchanged runboo
 - Consumes: all committed remediation tasks.
 - Produces: exact green evidence, a clean worktree, removed containers/network/volumes, commit hashes, and an honest residual-risk report.
 
-- [ ] **Step 1: Run all focused TypeScript and Rust regression targets**
+- [x] **Step 1: Run all focused TypeScript and Rust regression targets**
 
 ```bash
 vp test scripts/toolchain-contract.test.ts scripts/tauri-hardening.test.ts scripts/check-dependency-upgrade-ledger.test.ts scripts/remote-architecture-contract.test.ts scripts/remote-transport-hardening.test.ts packages/contracts/scripts/export-rust-auth-fixtures.test.ts packages/contracts/src/remoteUpdate.test.ts packages/shared/src/pairingCode.test.ts packages/shared/src/advertisedEndpoint.test.ts packages/client-runtime/src/connection/presentation.test.ts packages/client-runtime/src/connection/pairingAdd.test.ts packages/client-runtime/src/e2ee/frame.test.ts packages/client-runtime/src/e2ee/noise.test.ts packages/client-runtime/src/e2ee/socket.test.ts packages/client-runtime/src/e2ee/serverInterop.test.ts packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts apps/web/src/desktopDeepLink.test.ts apps/web/src/state/shareExposureReconciler.test.tsx apps/web/src/components/settings/remote-servers/connectPresentation.test.ts apps/web/src/components/settings/remote-servers/shareOffer.test.ts apps/web/src/components/settings/remote-servers/ShareThisHostTab.test.tsx apps/web/src/tauriDesktopBridge.test.ts
@@ -964,7 +964,7 @@ cargo test -p bibcode-desktop bridge::tests --lib
 
 Expected: every focused target passes. If a test is flaky, rerun its exact case to classify it, but do not call a range-introduced deterministic failure “baseline.”
 
-- [ ] **Step 2: Run repository completion gates**
+- [x] **Step 2: Run repository completion gates**
 
 ```bash
 vp check
@@ -979,7 +979,7 @@ cargo clippy -p bibcode-desktop --all-targets -- -D warnings
 
 Expected: all deterministic gates pass. Record exact flaky test names, isolated reruns, and ancestry evidence for any nondeterministic failure that remains.
 
-- [ ] **Step 3: Add the opt-in Docker boundary test**
+- [x] **Step 3: Add the opt-in Docker boundary test**
 
 Create a test guarded by both `BIBCODE_DOCKER_SERVER_URL` and
 `BIBCODE_DOCKER_ADMIN_CREDENTIAL`:
@@ -1030,7 +1030,7 @@ vp test packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
 
 Expected: one explicitly skipped opt-in test and no failure.
 
-- [ ] **Step 4: Build the server binary for container validation**
+- [x] **Step 4: Build the server binary for container validation**
 
 ```bash
 cargo build -p bibcode-server
@@ -1039,7 +1039,7 @@ docker version
 
 Expected: `target/debug/bibcode` exists and the Docker daemon responds.
 
-- [ ] **Step 5: Start isolated server and client containers**
+- [x] **Step 5: Start isolated server and client containers**
 
 Use fixed, narrowly scoped names and a temporary named volume:
 
@@ -1074,7 +1074,7 @@ The test uses the server container rather than spawning a host process. The
 scoped credential variables are unset immediately and never appear in the
 final report or committed fixtures.
 
-- [ ] **Step 6: Assert the cross-container feature boundary**
+- [x] **Step 6: Assert the cross-container feature boundary**
 
 The client test must assert, through real HTTP/WebSocket traffic:
 
@@ -1092,7 +1092,7 @@ browser-session revocation returns desiredExposure=loopback
 
 Expected: every assertion passes with the server and client in distinct containers on the Docker bridge network.
 
-- [ ] **Step 7: Remove all Docker resources even after a failed assertion**
+- [x] **Step 7: Remove all Docker resources even after a failed assertion**
 
 ```bash
 docker rm -f bibcode-remote-server 2>/dev/null || true
@@ -1110,7 +1110,7 @@ docker volume ls --filter name=bibcode-remote-stabilization-data --format '{{.Na
 
 Expected: all three commands print nothing.
 
-- [ ] **Step 8: Commit the Docker harness and review final diff, commits, and worktree**
+- [x] **Step 8: Commit the Docker harness and review final diff, commits, and worktree**
 
 ```bash
 git add packages/client-runtime/src/e2ee/dockerRemoteSmoke.test.ts
@@ -1126,6 +1126,31 @@ git diff --stat 98ac79bd..HEAD
 
 Expected: no unstaged or untracked implementation files, no generated graph data, no debug logging, and only intentional commits.
 
-- [ ] **Step 9: Request a final code review before declaring completion**
+- [x] **Step 9: Request a final code review before declaring completion**
 
 Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both standards and specification review, fix any confirmed High/Medium regression test-first, rerun affected gates, and report all commit hashes plus exact validation evidence and residual packaged-native risk.
+
+### Task 10: Close fresh adversarial-review lifecycle findings
+
+**Files:**
+
+- Modify: `apps/server/src/auth/{http,service}.rs`
+- Modify: `apps/server/src/persistence/{migrations,repositories}.rs`
+- Modify: `apps/server/src/rpc/e2ee.rs`
+- Modify: `apps/desktop/src-tauri/src/{bridge,server_exposure}.rs`
+- Modify: `apps/web/src/state/shareExposureReconciler.ts`
+- Modify: `packages/client-runtime/src/connection/{pairingAdd,registry}.ts`
+- Modify: focused tests and living remote/testing documentation beside those owners
+
+**Interfaces:**
+
+- Consumes: principal-scoped pairing-offer keys, SQLite migration 47, authenticated E2EE plaintext, desktop topology settings, renderer topology generations, and exact connection-registration ownership.
+- Produces: restart-durable offer replay/cancellation, byte-weighted E2EE admission, WSL-safe exposure convergence, and compare-and-remove pairing compensation.
+
+- [x] Persist pending/completed/tombstoned pairing-offer idempotency records with the pairing grant in SQLite transactions; hydrate and prune them before capacity checks; cover completed and pending crash windows across service restart.
+- [x] Replace record-count E2EE admission with global and per-connection byte budgets while retaining arbitrary legal chunk sizes, established-connection bounds, and declared wire error codes.
+- [x] Reject native exposure at the desktop owner when authoritative settings are WSL-only, and invalidate renderer reconciliation when bridge, primary environment, or WSL ownership changes.
+- [x] Make pairing-add compensation conditional on the exact registration object still owning the environment under the registry lease lock; cover a queued older rollback racing a replacement registration.
+- [x] Restore the unrelated environment-project plan/spec and provider reconciliation assertion to the pre-range baseline in history.
+- [ ] Repeat focused tests, all repository gates, complete Rust suites, Clippy, direct interop, and the separate-container Docker boundary after these changes.
+- [ ] Request fresh standards, specification, and core review over `3b1864eff..HEAD`; fix every confirmed High/Medium issue before completion.
