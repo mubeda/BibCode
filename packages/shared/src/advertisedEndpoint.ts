@@ -81,6 +81,14 @@ function isPrivateIpv4(octets: readonly [number, number, number, number]): boole
   );
 }
 
+function parseIpv4MappedIpv6(host: string): readonly [number, number, number, number] | null {
+  const match = /^(?:::ffff:|0:0:0:0:0:ffff:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(host);
+  if (match === null) return null;
+  const high = Number.parseInt(match[1]!, 16);
+  const low = Number.parseInt(match[2]!, 16);
+  return [high >>> 8, high & 0xff, low >>> 8, low & 0xff];
+}
+
 function isPrivateIpv6(host: string): boolean {
   if (!host.includes(":")) return false;
   const firstSegment = host.split(":", 1)[0] ?? "";
@@ -104,10 +112,15 @@ export function classifyPairingEndpoint(endpoint: string): PairingEndpointClassi
     return "unconnectable";
   }
   const ipv4 = parseIpv4(host);
-  if (host === "localhost" || host === "::1" || ipv4?.[0] === 127) {
+  const mappedIpv4 = parseIpv4MappedIpv6(host);
+  const effectiveIpv4 = ipv4 ?? mappedIpv4;
+  if (mappedIpv4?.every((octet) => octet === 0)) {
+    return "unconnectable";
+  }
+  if (host === "localhost" || host === "::1" || effectiveIpv4?.[0] === 127) {
     return "loopback";
   }
-  if (ipv4 !== null && isPrivateIpv4(ipv4)) {
+  if (effectiveIpv4 !== null && isPrivateIpv4(effectiveIpv4)) {
     return "private-network";
   }
   if (isPrivateIpv6(host)) {
