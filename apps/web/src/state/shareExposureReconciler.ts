@@ -34,7 +34,7 @@ export interface ShareExposureOperations {
   ) => Promise<DesktopServerExposureState>;
 }
 
-export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "rewidened";
+export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "widened" | "rewidened";
 
 export async function reconcileShareExposureOnce(
   operations: ShareExposureOperations,
@@ -43,6 +43,14 @@ export async function reconcileShareExposureOnce(
     operations.getShareState(),
     operations.getExposureState(),
   ]);
+  if (
+    shareState.desiredExposure === "wide" &&
+    exposureState.mode === "local-only"
+  ) {
+    await operations.applyExposure("network-accessible");
+    refreshDesktopNetworkAccessState();
+    return "widened";
+  }
   if (!shouldRevertExposure({ shareState, exposureMode: exposureState.mode })) {
     return "unchanged";
   }

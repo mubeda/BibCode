@@ -16,9 +16,16 @@ pub(crate) trait ExposureOperations {
     fn stop_backend(&self) -> BoxFuture<'_, Result<(), String>>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ServerExposureCoordinator {
-    apply_lock: tokio::sync::Mutex<()>,
+    apply_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ServerExposureCoordinator {
+    pub(crate) async fn run_exclusive<T>(&self, operation: impl Future<Output = T>) -> T {
+        let _guard = self.apply_lock.lock().await;
+        operation.await
+    }
 }
 
 #[derive(Debug)]
@@ -34,7 +41,15 @@ pub(crate) async fn apply_exposure(
     if !matches!(desired, "local-only" | "network-accessible") {
         return Err(format!("Unsupported server exposure mode: {desired}"));
     }
-    let _apply_guard = coordinator.apply_lock.lock().await;
+    coordinator
+        .run_exclusive(apply_exposure_locked(operations, desired))
+        .await
+}
+
+async fn apply_exposure_locked(
+    operations: &impl ExposureOperations,
+    desired: &str,
+) -> Result<ExposureTransition, String> {
     let mut errors = Vec::new();
     if let Err(error) = operations.persisted_mode() {
         errors.push(format!("read persisted exposure mode: {error}"));
@@ -73,14 +88,24 @@ pub(crate) async fn apply_exposure(
         return Err(format_exposure_error(desired, errors, recovery_errors));
     }
 
+    let mut persisted_local = true;
     if let Err(error) = operations.persist_mode("local-only").await {
+        persisted_local = false;
         errors.push(format!("persist local-only mode: {error}"));
     }
     let (current_config, restart_verified) = restart_local(operations, &mut errors).await;
     if let Err(error) = operations.sync_firewall(false).await {
         errors.push(format!("close remote-access firewall rule: {error}"));
     }
-    if !restart_verified && let Err(error) = operations.stop_backend().await {
+    if !persisted_local {
+        match operations.persist_mode("local-only").await {
+            Ok(()) => persisted_local = true,
+            Err(error) => errors.push(format!("retry persist local-only mode: {error}")),
+        }
+    }
+    if (!restart_verified || !persisted_local)
+        && let Err(error) = operations.stop_backend().await
+    {
         errors.push(format!("stop unverified backend: {error}"));
     }
 
@@ -100,7 +125,15 @@ fn is_verified_wide(config: Option<&BackendRunConfig>) -> bool {
 }
 
 fn is_verified_local(config: Option<&BackendRunConfig>) -> bool {
-    config.is_none_or(|config| config.server_exposure_mode == "local-only")
+    config.is_none_or(|config| {
+        config.server_exposure_mode == "local-only"
+            && config
+                .bind_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|host| host.is_loopback())
+            && config.endpoint_url.is_none()
+            && config.advertised_host.is_none()
+    })
 }
 
 async fn restart_local(
@@ -126,7 +159,9 @@ async fn restart_local(
 
 async fn recover_local(operations: &impl ExposureOperations) -> Vec<String> {
     let mut errors = Vec::new();
+    let mut persisted_local = true;
     if let Err(error) = operations.persist_mode("local-only").await {
+        persisted_local = false;
         errors.push(format!("recovery persist local-only mode: {error}"));
     }
     let (_, restart_verified) = restart_local(operations, &mut errors).await;
@@ -135,7 +170,15 @@ async fn recover_local(operations: &impl ExposureOperations) -> Vec<String> {
             "recovery close remote-access firewall rule: {error}"
         ));
     }
-    if !restart_verified && let Err(error) = operations.stop_backend().await {
+    if !persisted_local {
+        match operations.persist_mode("local-only").await {
+            Ok(()) => persisted_local = true,
+            Err(error) => errors.push(format!("recovery retry persist local-only mode: {error}")),
+        }
+    }
+    if (!restart_verified || !persisted_local)
+        && let Err(error) = operations.stop_backend().await
+    {
         errors.push(format!("recovery stop unverified backend: {error}"));
     }
     errors
@@ -412,6 +455,7 @@ mod tests {
                 "persist:local-only",
                 "restart:local-only",
                 "firewall:false",
+                "persist:local-only",
             ]
         );
     }
@@ -429,6 +473,104 @@ mod tests {
         assert!(error.contains("settings write failed"));
         assert_eq!(
             operations.calls(),
+            [
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+                "persist:local-only",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_stops_the_backend_when_local_persistence_cannot_be_recovered() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("network-accessible");
+        operations.fail_next_persist("first write failed");
+        operations.fail_next_persist("retry write failed");
+
+        let error = apply_exposure(&coordinator, &operations, "local-only")
+            .await
+            .expect_err("persistent settings failure is reported");
+
+        assert!(error.contains("first write failed"));
+        assert!(error.contains("retry write failed"));
+        assert_eq!(
+            operations.calls(),
+            [
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+                "persist:local-only",
+                "stop",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_rejects_a_mislabeled_wide_topology_and_stops_it() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("network-accessible");
+        let mut mislabeled = config_for_mode("local-only");
+        mislabeled.bind_host = "0.0.0.0".to_owned();
+        mislabeled.endpoint_url = Some("http://192.168.1.20:3773".to_owned());
+        mislabeled.advertised_host = Some("192.168.1.20".to_owned());
+        operations.return_next_restart(Some(mislabeled));
+
+        let error = apply_exposure(&coordinator, &operations, "local-only")
+            .await
+            .expect_err("mislabeled wide listener is rejected");
+
+        assert!(error.contains("verified local-only backend"));
+        assert_eq!(
+            operations.calls(),
+            [
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+                "stop",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn firewall_failures_are_reported_after_all_fail_closed_steps() {
+        let coordinator = ServerExposureCoordinator::default();
+        let widening = FakeExposureOperations::with_persisted_mode("local-only");
+        widening
+            .state
+            .lock()
+            .expect("fake state")
+            .firewall_results
+            .push_back(Err("open failed".to_owned()));
+        let error = apply_exposure(&coordinator, &widening, "network-accessible")
+            .await
+            .expect_err("firewall-open failure recovers local");
+        assert!(error.contains("open failed"));
+        assert_eq!(
+            widening.calls(),
+            [
+                "restart:network-accessible",
+                "firewall:true",
+                "persist:local-only",
+                "restart:local-only",
+                "firewall:false",
+            ]
+        );
+
+        let narrowing = FakeExposureOperations::with_persisted_mode("network-accessible");
+        narrowing
+            .state
+            .lock()
+            .expect("fake state")
+            .firewall_results
+            .push_back(Err("close failed".to_owned()));
+        let error = apply_exposure(&coordinator, &narrowing, "local-only")
+            .await
+            .expect_err("firewall-close failure is reported");
+        assert!(error.contains("close failed"));
+        assert_eq!(
+            narrowing.calls(),
             ["persist:local-only", "restart:local-only", "firewall:false"]
         );
     }
@@ -485,5 +627,46 @@ mod tests {
             "persist:network-accessible",
         ];
         assert!(calls == widen_then_narrow || calls == narrow_then_widen);
+    }
+
+    #[tokio::test]
+    async fn exposure_apply_and_other_topology_mutation_share_one_coordinator() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("local-only");
+        let settings_operations = operations.clone();
+
+        let (apply, ()) = tokio::join!(
+            apply_exposure(&coordinator, &operations, "network-accessible"),
+            coordinator.run_exclusive(async move {
+                tokio::task::yield_now().await;
+                settings_operations
+                    .state
+                    .lock()
+                    .expect("fake state")
+                    .calls
+                    .extend(["settings:write".to_owned(), "settings:restart".to_owned()]);
+            }),
+        );
+        apply.expect("widening succeeds");
+
+        let calls = operations.calls();
+        assert!(
+            calls
+                == [
+                    "restart:network-accessible",
+                    "firewall:true",
+                    "persist:network-accessible",
+                    "settings:write",
+                    "settings:restart",
+                ]
+                || calls
+                    == [
+                        "settings:write",
+                        "settings:restart",
+                        "restart:network-accessible",
+                        "firewall:true",
+                        "persist:network-accessible",
+                    ]
+        );
     }
 }
