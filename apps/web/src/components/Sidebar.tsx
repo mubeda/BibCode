@@ -97,6 +97,7 @@ import {
   type SidebarThreadSortOrder,
 } from "@bibcode/contracts/settings";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
+import { selectRemoteUpdateControlCapability } from "../connection/environmentCompat";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { isDesktopHost } from "../env";
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
@@ -142,6 +143,7 @@ import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
+import { remoteUpdateEnvironment } from "../state/remoteUpdates";
 import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
@@ -160,6 +162,7 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
+import { ServerUpdateBadge } from "./settings/ServerUpdateBadge";
 import {
   resolveAddProjectTargetLabel,
   selectRailVisibleEnvironmentIds,
@@ -272,6 +275,41 @@ import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
+
+function SidebarEnvironmentContextCard() {
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const environment = useEnvironment(activeEnvironmentId);
+  const remoteUpdateControl = selectRemoteUpdateControlCapability(
+    environment?.serverConfig ?? null,
+  );
+  const updateQuery = useEnvironmentQuery(
+    remoteUpdateControl && activeEnvironmentId !== null
+      ? remoteUpdateEnvironment.snapshot({ environmentId: activeEnvironmentId, input: {} })
+      : null,
+  );
+  const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
+  const checkForUpdates = useCallback(
+    async (environmentId: EnvironmentId) => {
+      const result = await runCheck({ environmentId, input: {} });
+      if (result._tag === "Success") {
+        updateQuery.refresh();
+      }
+    },
+    [runCheck, updateQuery.refresh],
+  );
+
+  return (
+    <EnvironmentContextCard
+      {...(remoteUpdateControl
+        ? {
+            updateBadge: <ServerUpdateBadge snapshot={updateQuery.data} />,
+            onCheckForUpdates: (environmentId: EnvironmentId) =>
+              void checkForUpdates(environmentId),
+          }
+        : {})}
+    />
+  );
+}
 
 const WorktreeRemovalRequestContext = createContext<
   ((target: WorktreeRemovalTarget) => void) | null
@@ -4714,7 +4752,7 @@ export default function Sidebar() {
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
-          <EnvironmentContextCard />
+          <SidebarEnvironmentContextCard />
           <SidebarProjectsContent
             showArm64IntelBuildWarning={showArm64IntelBuildWarning}
             arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}

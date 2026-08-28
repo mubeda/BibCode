@@ -4,15 +4,22 @@ import * as React from "react";
 import { useCallback, useEffect, useMemo } from "react";
 
 import type { EnvironmentId } from "@bibcode/contracts";
+import { isRemoteUpdateAvailable } from "@bibcode/client-runtime/state/remoteUpdates";
 
-import { resolveEnvironmentCompatVerdict } from "../../connection/environmentCompat";
+import {
+  resolveEnvironmentCompatVerdict,
+  selectRemoteUpdateControlCapability,
+} from "../../connection/environmentCompat";
 import { cn } from "../../lib/utils";
 import { setActiveEnvironmentId, useActiveEnvironmentId } from "../../state/entities";
-import { useEnvironments } from "../../state/environments";
+import { type EnvironmentPresentation, useEnvironments } from "../../state/environments";
+import { useEnvironmentQuery } from "../../state/query";
+import { remoteUpdateEnvironment } from "../../state/remoteUpdates";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   buildEnvironmentRailModel,
+  resolveEnvironmentRailStatus,
   toEnvironmentRailCandidate,
   type EnvironmentRailEntry,
   type EnvironmentRailStatus,
@@ -78,6 +85,41 @@ function RemoteEntryButton({
       </TooltipTrigger>
       <TooltipPopup side="right">{entry.label}</TooltipPopup>
     </Tooltip>
+  );
+}
+
+function RemoteEntryButtonWithUpdate({
+  entry,
+  environment,
+  onSelect,
+}: {
+  readonly entry: EnvironmentRailEntry;
+  readonly environment: EnvironmentPresentation;
+  readonly onSelect: (environmentId: EnvironmentId) => void;
+}) {
+  const remoteUpdateControl = selectRemoteUpdateControlCapability(environment.serverConfig);
+  const updateQuery = useEnvironmentQuery(
+    remoteUpdateControl
+      ? remoteUpdateEnvironment.snapshot({
+          environmentId: environment.environmentId,
+          input: {},
+        })
+      : null,
+  );
+  const candidate = toEnvironmentRailCandidate({
+    environmentId: environment.environmentId,
+    label: environment.label,
+    target: environment.entry.target,
+    phase: environment.connection.phase,
+    compat: resolveEnvironmentCompatVerdict(environment.serverConfig),
+    updateAvailable: isRemoteUpdateAvailable(updateQuery.data),
+  });
+
+  return (
+    <RemoteEntryButton
+      entry={{ ...entry, status: resolveEnvironmentRailStatus(candidate) }}
+      onSelect={onSelect}
+    />
   );
 }
 
@@ -211,9 +253,19 @@ export function EnvironmentRail() {
             className="h-px w-6 bg-border"
           />
         ) : null}
-        {model.remotes.map((entry) => (
-          <RemoteEntryButton key={entry.environmentId} entry={entry} onSelect={selectEnvironment} />
-        ))}
+        {model.remotes.map((entry) => {
+          const environment = environments.find(
+            (candidate) => candidate.environmentId === entry.environmentId,
+          );
+          return environment === undefined ? null : (
+            <RemoteEntryButtonWithUpdate
+              key={entry.environmentId}
+              entry={entry}
+              environment={environment}
+              onSelect={selectEnvironment}
+            />
+          );
+        })}
       </div>
       <div className="flex-1" />
       <Tooltip>

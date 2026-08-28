@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   catalogCommandCalls: [] as Array<string>,
   buttons: [] as Array<Record<string, unknown>>,
   menuItems: [] as Array<Record<string, unknown>>,
+  updateSnapshots: new Map<string, unknown>(),
   reset() {
     h.environments = [];
     h.isReady = true;
@@ -21,6 +22,7 @@ const h = vi.hoisted(() => ({
     h.catalogCommandCalls = [];
     h.buttons = [];
     h.menuItems = [];
+    h.updateSnapshots.clear();
   },
 }));
 
@@ -33,6 +35,28 @@ vi.mock("../../state/entities", () => ({
 }));
 vi.mock("../../connection/environmentCompat", () => ({
   resolveEnvironmentCompatVerdict: () => null,
+  selectRemoteUpdateControlCapability: (serverConfig: unknown) =>
+    (serverConfig as { environment?: { capabilities?: { remoteUpdateControl?: boolean } } } | null)
+      ?.environment?.capabilities?.remoteUpdateControl === true,
+}));
+vi.mock("../../state/remoteUpdates", () => ({
+  remoteUpdateEnvironment: {
+    snapshot: ({ environmentId }: { environmentId: string }) => ({
+      __kind: "remoteUpdateSnapshot",
+      environmentId,
+    }),
+  },
+}));
+vi.mock("../../state/query", () => ({
+  useEnvironmentQuery: (atom: { __kind?: string; environmentId?: string } | null) => ({
+    data:
+      atom?.__kind === "remoteUpdateSnapshot" && atom.environmentId !== undefined
+        ? (h.updateSnapshots.get(atom.environmentId) ?? null)
+        : null,
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+  }),
 }));
 vi.mock("../../connection/catalog", () => ({
   environmentCatalog: new Proxy(
@@ -95,13 +119,21 @@ function environment(input: {
   label: string;
   target: Record<string, unknown>;
   phase?: string;
+  remoteUpdateControl?: boolean;
 }) {
   return {
     environmentId: input.environmentId,
     label: input.label,
     entry: { target: input.target },
     connection: { phase: input.phase ?? "connected", error: null, traceId: null },
-    serverConfig: null,
+    serverConfig:
+      input.remoteUpdateControl === undefined
+        ? null
+        : {
+            environment: {
+              capabilities: { remoteUpdateControl: input.remoteUpdateControl },
+            },
+          },
   };
 }
 
@@ -182,6 +214,32 @@ describe("EnvironmentRail", () => {
     expect(h.setActiveEnvironmentId).toHaveBeenCalledExactlyOnceWith(ENV_REMOTE);
     expect(h.navigate).not.toHaveBeenCalled();
     expect(h.catalogCommandCalls).toEqual([]);
+  });
+
+  it("shows an amber attention dot when a capable remote has an update available", () => {
+    h.reset();
+    h.environments = [
+      environment({
+        environmentId: ENV_PRIMARY,
+        label: "Local",
+        target: { _tag: "PrimaryConnectionTarget" },
+      }),
+      environment({
+        environmentId: ENV_REMOTE,
+        label: "AI-SERVER",
+        target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" },
+        remoteUpdateControl: true,
+      }),
+    ];
+    h.updateSnapshots.set(ENV_REMOTE, {
+      serverVersion: "0.4.2",
+      latestVersion: "0.5.0",
+      state: "update-available",
+      error: null,
+      support: { installMode: "interactive", reason: "available" },
+    });
+
+    expect(renderRail()).toContain('data-status="attention"');
   });
 
   it("groups desktop-local backends under the Local sub-picker", () => {
