@@ -91,6 +91,7 @@ interface HarnessOptions {
   readonly configStorageInstanceId?: string;
   readonly registrationPersistenceFailure?: boolean;
   readonly identityPersistenceFailure?: boolean;
+  readonly registrationRemovalFailure?: boolean;
 }
 
 const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
@@ -119,6 +120,17 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
           )
         : Effect.sync(() => {
             registrations.push(registration);
+          }),
+    remove: () =>
+      options.registrationRemovalFailure === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "remove-connection",
+              message: "registration cleanup unavailable",
+            }),
+          )
+        : Effect.sync(() => {
+            registrations.splice(0, registrations.length);
           }),
   } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
   const identities = Persistence.AcceptedStorageIdentityStore.of({
@@ -396,7 +408,7 @@ describe("verifyAndAddPairingCode", () => {
     }),
   );
 
-  it.effect("reports partial local state when identity persistence fails after registration", () =>
+  it.effect("compensates registration when identity persistence fails", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ identityPersistenceFailure: true });
       const error = yield* harness.run(validPayload()).pipe(Effect.flip);
@@ -405,8 +417,22 @@ describe("verifyAndAddPairingCode", () => {
       expect(error.detail).toContain(
         "This pairing attempt may still appear in the server's client list; revoke it there before retrying.",
       );
-      expect(harness.registrations).toHaveLength(1);
+      expect(harness.registrations).toEqual([]);
       expect(harness.acceptedIdentities).toEqual([]);
+    }),
+  );
+
+  it.effect("reports local cleanup failure when identity persistence and compensation fail", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        identityPersistenceFailure: true,
+        registrationRemovalFailure: true,
+      });
+      const error = yield* harness.run(validPayload()).pipe(Effect.flip);
+      if (!isPairingAddError(error)) throw new Error("expected PairingAddError");
+      expect(error.reason).toBe("local-persistence-failed");
+      expect(error.detail).toContain("registration cleanup also failed");
+      expect(harness.registrations).toHaveLength(1);
     }),
   );
 

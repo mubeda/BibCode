@@ -111,6 +111,33 @@ export interface GenerateShareOfferDeps {
     | null
     | (() => Promise<"unchanged" | "narrowed" | "widened" | "rewidened">);
   readonly sleep: (ms: number) => Promise<void>;
+  readonly requestTimeoutMs: number;
+}
+
+class ShareOfferOperationTimeoutError extends Error {
+  constructor(operation: string, timeoutMs: number) {
+    super(`${operation} timed out after ${String(timeoutMs)}ms.`);
+    this.name = "ShareOfferOperationTimeoutError";
+  }
+}
+
+async function withRequestTimeout<A>(
+  operation: string,
+  timeoutMs: number,
+  request: Promise<A>,
+): Promise<A> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new ShareOfferOperationTimeoutError(operation, timeoutMs)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([request, deadline]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 function resolveOfferEndpoint(deps: GenerateShareOfferDeps): string | null {
@@ -196,12 +223,16 @@ export async function generateShareOffer(
   for (let attempt = 0; attempt < maxMintAttempts; attempt += 1) {
     if (attempt > 0) await deps.sleep(2_000);
     try {
-      const minted = await deps.mintOffer({
-        name: deps.name,
-        endpoint,
-        reach: deps.intent,
-        idempotencyKey,
-      });
+      const minted = await withRequestTimeout(
+        "Pairing-offer creation",
+        deps.requestTimeoutMs,
+        deps.mintOffer({
+          name: deps.name,
+          endpoint,
+          reach: deps.intent,
+          idempotencyKey,
+        }),
+      );
       const endpointClass = shareClassForPairingEndpoint(minted.endpoint);
       return {
         ok: true,
@@ -227,7 +258,11 @@ export async function generateShareOffer(
     lastError instanceof Error ? lastError.message : "Could not create the pairing offer.";
   let cancellationSucceeded = false;
   try {
-    await deps.cancelOffer(idempotencyKey);
+    await withRequestTimeout(
+      "Pairing-offer cancellation",
+      deps.requestTimeoutMs,
+      deps.cancelOffer(idempotencyKey),
+    );
     cancellationSucceeded = true;
   } catch (error) {
     cleanup = "failed";

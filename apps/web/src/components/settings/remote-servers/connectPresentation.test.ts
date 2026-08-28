@@ -118,6 +118,9 @@ describe("add-server failure copy", () => {
     expect(describeAddServerFailure("local-persistence-failed").detail).toContain(
       "revoke the incomplete attempt",
     );
+    expect(describeAddServerFailure("host-identity-mismatch").detail).toContain(
+      "revoke the incomplete attempt",
+    );
   });
 
   it("reads the reason off a PairingAddError and rejects everything else", () => {

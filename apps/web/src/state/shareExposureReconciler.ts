@@ -12,6 +12,7 @@ import { toastManager } from "../components/ui/toast";
 import { getServerShareState } from "../environments/primary";
 import { authEnvironment } from "./auth";
 import { refreshDesktopNetworkAccessState } from "./desktopNetworkAccess";
+import { desktopWslStateAtom } from "./desktopWslState";
 import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
 import { useEnvironmentQuery } from "./query";
 
@@ -70,7 +71,12 @@ interface ReconcileTarget {
 export function useShareExposureReconciler(): void {
   const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
   const primaryEnvironmentId = useAtomValue(primaryEnvironmentIdAtom);
-  const canReconcile = bridge?.applyServerExposure !== undefined && primaryEnvironmentId !== null;
+  const desktopWsl = useEnvironmentQuery(bridge === undefined ? null : desktopWslStateAtom);
+  const canManageNativeExposure = desktopWsl.data?.wslOnly === false;
+  const canReconcile =
+    bridge?.applyServerExposure !== undefined &&
+    primaryEnvironmentId !== null &&
+    canManageNativeExposure;
   const accessChanges = useEnvironmentQuery(
     canReconcile
       ? authEnvironment.accessChanges({ environmentId: primaryEnvironmentId, input: null })

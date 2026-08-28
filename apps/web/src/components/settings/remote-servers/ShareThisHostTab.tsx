@@ -8,12 +8,14 @@ import {
   cancelServerPairingOffer,
   createServerPairingOffer,
   getServerShareState,
+  PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
   usePrimarySessionState,
 } from "~/environments/primary";
 import {
   desktopNetworkAccessStateAtom,
   refreshDesktopNetworkAccessState,
 } from "~/state/desktopNetworkAccess";
+import { desktopWslStateAtom } from "~/state/desktopWslState";
 import {
   useEnvironmentHttpBaseUrl,
   usePrimaryEnvironment,
@@ -73,6 +75,9 @@ export function ShareThisHostTab(): ReactElement {
   const desktopNetworkAccess = useEnvironmentQuery(
     hasDesktopBridge ? desktopNetworkAccessStateAtom : null,
   );
+  const desktopWsl = useEnvironmentQuery(hasDesktopBridge ? desktopWslStateAtom : null);
+  const wslOnlyPrimary = desktopWsl.data?.wslOnly === true;
+  const canManageNativeExposure = hasDesktopBridge && desktopWsl.data?.wslOnly === false;
   const exposureState = desktopNetworkAccess.data?.serverExposureState ?? null;
   const advertisedEndpoints = desktopNetworkAccess.data?.advertisedEndpoints ?? [];
   const [intent, setIntent] = useState<ShareIntent>("another-device");
@@ -107,7 +112,9 @@ export function ShareThisHostTab(): ReactElement {
     [advertisedEndpoints, exposureState, intent, primaryHttpBaseUrl],
   );
   const selectedOption =
-    options.find((option) => option.id === selectedOptionId) ?? options[0] ?? null;
+    options.find((option) => option.id === selectedOptionId) ??
+    (wslOnlyPrimary ? options.find((option) => option.httpBaseUrl !== null) : options[0]) ??
+    null;
   const effectiveName = defaultOfferName(
     offerName === "" ? (primaryEnvironment?.serverConfig?.environment.label ?? null) : offerName,
   );
@@ -116,7 +123,7 @@ export function ShareThisHostTab(): ReactElement {
       ? shareClassForPairingEndpoint(customAddress)
       : null;
   const willWiden =
-    hasDesktopBridge &&
+    canManageNativeExposure &&
     exposureState?.mode !== "network-accessible" &&
     (intent === "another-device" || (intent === "custom" && customEndpointClass === "off-host"));
 
@@ -135,10 +142,10 @@ export function ShareThisHostTab(): ReactElement {
       name: effectiveName,
       customAddress: intent === "custom" ? customAddress : null,
       selectedOption,
-      hasDesktopBridge,
+      hasDesktopBridge: canManageNativeExposure,
       exposureState,
       applyServerExposure:
-        !hasDesktopBridge || desktopBridge === undefined
+        !canManageNativeExposure || desktopBridge === undefined
           ? null
           : (desired) => desktopBridge.applyServerExposure(desired),
       mintOffer: async ({ idempotencyKey, ...input }) => {
@@ -154,7 +161,7 @@ export function ShareThisHostTab(): ReactElement {
       classifyMintError,
       cancelOffer: cancelServerPairingOffer,
       cleanupExposureAfterFailedMint:
-        !hasDesktopBridge || desktopBridge === undefined
+        !canManageNativeExposure || desktopBridge === undefined
           ? null
           : () =>
               reconcileShareExposureOnce({
@@ -163,6 +170,7 @@ export function ShareThisHostTab(): ReactElement {
                 applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
               }),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      requestTimeoutMs: PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
     });
     if (result.ok) setOffer(result.offer);
     else setFailure(result.failure);
@@ -171,10 +179,10 @@ export function ShareThisHostTab(): ReactElement {
     setIsGenerating(false);
   }, [
     customAddress,
+    canManageNativeExposure,
     desktopBridge,
     effectiveName,
     exposureState,
-    hasDesktopBridge,
     intent,
     refreshShareState,
     selectedOption,

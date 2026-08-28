@@ -19,6 +19,7 @@ const loopbackState = {
 };
 
 const defaultDeps = {
+  requestTimeoutMs: 1_000,
   newIdempotencyKey: () => "key-1",
   classifyMintError: (): "retryable" | "fatal" => "retryable",
   cancelOffer: async () => {},
@@ -183,6 +184,64 @@ describe("generateShareOffer", () => {
     expect(mintOffer).toHaveBeenCalledTimes(5);
     expect(sleep).toHaveBeenCalledTimes(4);
     expect(result).toMatchObject({ ok: false, failure: { kind: "mint-failed" } });
+  });
+
+  it("times out blackholed mint attempts and still cancels before narrowing", async () => {
+    const cancelOffer = vi.fn(async () => {});
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: () => new Promise(() => {}),
+      ...defaultDeps,
+      requestTimeoutMs: 5,
+      classifyMintError: () => "fatal",
+      cancelOffer,
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(cancelOffer).toHaveBeenCalledExactlyOnceWith("key-1");
+    expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "mint-failed", cleanup: "restored" },
+    });
+  });
+
+  it("bounds a blackholed cancellation and reports cleanup as unconfirmed", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("response lost");
+      },
+      ...defaultDeps,
+      requestTimeoutMs: 5,
+      classifyMintError: () => "fatal",
+      cancelOffer: () => new Promise(() => {}),
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: false,
+      failure: {
+        kind: "mint-failed",
+        cleanup: "failed",
+        message: expect.stringContaining("timed out"),
+      },
+    });
   });
 
   it("restores local-only exposure after widening when every mint attempt fails", async () => {

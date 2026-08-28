@@ -255,11 +255,27 @@ export const verifyAndAddPairingCode = Effect.fn(
   yield* registry
     .register(registration)
     .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server connection")));
-  yield* identities
+  const identityPersistenceError = yield* identities
     .accept({
       targetKey: storageIdentityTargetKey(target),
       storageInstanceId: verified.storageInstanceId,
     })
-    .pipe(Effect.mapError(() => postBootstrapPersistenceError("the server identity")));
+    .pipe(
+      Effect.as(null),
+      Effect.orElseSucceed(() => postBootstrapPersistenceError("the server identity")),
+    );
+  if (identityPersistenceError !== null) {
+    const registrationCleanupFailed = yield* registry.remove(verified.environmentId).pipe(
+      Effect.as(false),
+      Effect.orElseSucceed(() => true),
+    );
+    if (registrationCleanupFailed) {
+      return yield* new PairingAddError({
+        reason: "local-persistence-failed",
+        detail: `${identityPersistenceError.detail} Local registration cleanup also failed; remove the saved entry manually before retrying.`,
+      });
+    }
+    return yield* identityPersistenceError;
+  }
   return registration.target.environmentId as EnvironmentId;
 });

@@ -24,6 +24,7 @@ export {
   listServerClientSessions,
   listServerPairingLinks,
   peekPairingTokenFromUrl,
+  PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
   PrimaryEnvironmentPairingCredentialRejectedError,
   PrimaryEnvironmentRequestError,
   reauthenticatePrimaryEnvironment,
