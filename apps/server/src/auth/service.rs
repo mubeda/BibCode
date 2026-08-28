@@ -43,6 +43,7 @@ const PAIRING_REJECTION_LIMIT: u8 =
     (u8::MAX as usize / PAIRING_ALPHABET.len() * PAIRING_ALPHABET.len()) as u8;
 const ACCESS_EVENT_CAPACITY: usize = 64;
 const MAX_ACTIVE_PAIRINGS: usize = 4_096;
+const MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL: usize = 128;
 const MAX_ACTIVE_SESSIONS: usize = 4_096;
 pub(crate) const PAIRING_REACH_VALUES: [&str; 3] = ["another-device", "this-computer", "custom"];
 
@@ -96,6 +97,31 @@ struct StoredPairingOffer {
     input_fingerprint: String,
     result: Option<PairingOfferResult>,
     expires_at_ms: i64,
+}
+
+fn ensure_pairing_offer_capacity(
+    state: &AuthState,
+    lookup_key: &(String, String),
+) -> Result<(), AuthError> {
+    if state.pairing_offer_idempotency.contains_key(lookup_key) {
+        return Ok(());
+    }
+    let principal_entries = state
+        .pairing_offer_idempotency
+        .keys()
+        .filter(|(principal_id, _)| principal_id == &lookup_key.0)
+        .count();
+    if principal_entries >= MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL {
+        return Err(AuthError::Internal(
+            "pairing offer principal capacity exceeded".to_owned(),
+        ));
+    }
+    if state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS {
+        return Err(AuthError::Internal(
+            "pairing offer idempotency capacity exceeded".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -811,13 +837,7 @@ impl AuthService {
             .pairing_offer_idempotency
             .retain(|_, stored| stored.expires_at_ms > observed_at);
         let lookup_key = (principal_id.to_owned(), key);
-        if !state.pairing_offer_idempotency.contains_key(&lookup_key)
-            && state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS
-        {
-            return Err(AuthError::Internal(
-                "pairing offer idempotency capacity exceeded".to_owned(),
-            ));
-        }
+        ensure_pairing_offer_capacity(&state, &lookup_key)?;
         state.pairing_offer_idempotency.insert(
             lookup_key,
             StoredPairingOffer {
@@ -841,13 +861,7 @@ impl AuthService {
             state
                 .pairing_offer_idempotency
                 .retain(|_, stored| stored.expires_at_ms > observed_at);
-            if !state.pairing_offer_idempotency.contains_key(&lookup_key)
-                && state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS
-            {
-                return Err(AuthError::Internal(
-                    "pairing offer idempotency capacity exceeded".to_owned(),
-                ));
-            }
+            ensure_pairing_offer_capacity(&state, &lookup_key)?;
             state
                 .pairing_offer_idempotency
                 .get(&lookup_key)
@@ -2627,5 +2641,28 @@ mod tests {
             service.state.lock().await.pairing_offer_idempotency.len(),
             MAX_ACTIVE_PAIRINGS
         );
+    }
+
+    #[tokio::test]
+    async fn pairing_offer_tombstones_are_bounded_per_principal() {
+        let service = service();
+        for index in 0..MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL {
+            service
+                .cancel_pairing_offer("principal-a", format!("cancelled-{index}"))
+                .await
+                .expect("principal tombstone within quota");
+        }
+
+        assert!(matches!(
+            service
+                .cancel_pairing_offer("principal-a", "cancelled-overflow".to_owned())
+                .await,
+            Err(AuthError::Internal(message))
+                if message == "pairing offer principal capacity exceeded"
+        ));
+        service
+            .cancel_pairing_offer("principal-b", "cancelled-elsewhere".to_owned())
+            .await
+            .expect("one principal cannot consume another principal's quota");
     }
 }

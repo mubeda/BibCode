@@ -311,6 +311,33 @@ struct DispatchContext<'a> {
     shutdown: &'a CancellationToken,
 }
 
+trait RpcInboundGuard: Send + Sync {}
+
+impl<T: Send + Sync> RpcInboundGuard for T {}
+
+type SharedRpcInboundGuard = Arc<dyn RpcInboundGuard>;
+
+pub(crate) struct RpcInboundFrame {
+    message: Message,
+    guard: Option<SharedRpcInboundGuard>,
+}
+
+impl RpcInboundFrame {
+    fn plain(message: Message) -> Self {
+        Self {
+            message,
+            guard: None,
+        }
+    }
+
+    pub(crate) fn guarded(message: Message, guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            message,
+            guard: Some(Arc::new(guard)),
+        }
+    }
+}
+
 pub(crate) async fn run_session(
     socket: WebSocket,
     registry: RpcRegistry,
@@ -318,6 +345,7 @@ pub(crate) async fn run_session(
     session_shutdown: CancellationToken,
 ) {
     let (socket_writer, socket_reader) = socket.split();
+    let socket_reader = socket_reader.map(|frame| frame.map(RpcInboundFrame::plain));
     run_session_split(
         socket_writer,
         socket_reader,
@@ -337,7 +365,7 @@ pub(crate) async fn run_session_split<W, R>(
 ) where
     W: Sink<Message> + Unpin + Send + 'static,
     W::Error: Send,
-    R: Stream<Item = Result<Message, axum::Error>> + Send,
+    R: Stream<Item = Result<RpcInboundFrame, axum::Error>> + Send,
 {
     let mut socket_writer = socket_writer;
     let socket_reader = socket_reader;
@@ -407,6 +435,7 @@ pub(crate) async fn run_session_split<W, R>(
                     let Ok(frame) = frame else {
                         break;
                     };
+                    let RpcInboundFrame { message: frame, guard } = frame;
                     let decoded = match frame {
                         Message::Text(text) => decode_client_messages(text.as_bytes()),
                         Message::Binary(bytes) => decode_client_messages(&bytes),
@@ -435,6 +464,7 @@ pub(crate) async fn run_session_split<W, R>(
                             &dispatch,
                             &mut in_flight,
                             &mut received_eof,
+                            guard.clone(),
                         )
                         .await
                         .is_err()
@@ -468,6 +498,7 @@ async fn process_client_message(
     dispatch: &DispatchContext<'_>,
     in_flight: &mut HashMap<RequestId, InFlight>,
     received_eof: &mut bool,
+    inbound_guard: Option<SharedRpcInboundGuard>,
 ) -> Result<(), ()> {
     if *received_eof && matches!(message, ClientMessage::Request { .. }) {
         return Ok(());
@@ -602,7 +633,14 @@ async fn process_client_message(
                     .await;
                 }
             };
-            spawn_request(request, method, admission, dispatch, in_flight);
+            spawn_request(
+                request,
+                method,
+                admission,
+                dispatch,
+                in_flight,
+                inbound_guard,
+            );
             Ok(())
         }
     }
@@ -614,6 +652,7 @@ fn spawn_request(
     admission: RpcPermit,
     dispatch: &DispatchContext<'_>,
     in_flight: &mut HashMap<RequestId, InFlight>,
+    inbound_guard: Option<SharedRpcInboundGuard>,
 ) {
     let request_id = request.id.clone();
     let cancellation = CancellationToken::new();
@@ -634,6 +673,7 @@ fn spawn_request(
     let request_shutdown = session_shutdown.clone();
     let task = tokio::spawn(async move {
         let _admission = admission;
+        let _inbound_guard = inbound_guard;
         let execution = AssertUnwindSafe(async move {
             match method {
                 RpcMethod::Unary(handler) => {
