@@ -132,17 +132,16 @@ one-second pump join bound. Transport cipher nonces are monotonically increasing
 64-bit counters. V1 does not rekey: exhaustion or any AEAD/protocol error fails
 closed and requires a new connection.
 
-Authenticated receivers additionally share a process-wide record budget sized
-for two 64 MiB logical messages. Each connection has a separate one-message
-record quota, so one peer cannot retain the entire global budget with tiny
-continuation records. Each record holds both permits while it is being
-reassembled; a completed logical message retains its permits while queued,
-decoded, authorized, and handled by RPC. Admission never waits while retaining
-an already-buffered ciphertext frame: exhausted capacity fails that connection
-closed. At most 64 established E2EE sockets are admitted, bounding the aggregate
-WebSocket-layer frame retained outside record accounting. These limits preserve
-arbitrary legal chunk sizes while preventing a stalled or malicious peer from
-starving every other E2EE connection.
+Authenticated receivers additionally share a process-wide 128 MiB plaintext
+budget, while each connection has a separate 64 MiB budget. Every non-empty
+decrypted chunk holds byte-weighted permits from both budgets through assembly;
+a completed logical message retains them while queued, decoded, authorized, and
+handled by RPC. Zero-byte chunks retain no buffer or permit. Admission never
+waits while retaining an already-buffered ciphertext frame: exhausted capacity
+fails that connection closed. At most 64 established E2EE sockets are admitted,
+bounding the aggregate WebSocket-layer frame retained outside plaintext
+accounting. These limits preserve arbitrary legal chunk sizes while preventing
+a stalled or malicious peer from starving every other E2EE connection.
 
 The pairing payload is base64url-unpadded JSON in
 `bibcode://pair?code=<payload>` with version, endpoint, display name, one-time

@@ -41,11 +41,6 @@ pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS: usize = 64;
 const E2EE_INBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
-const E2EE_MAX_RECORDS_PER_LOGICAL_MESSAGE: usize =
-    MAX_E2EE_LOGICAL_MESSAGE_BYTES.div_ceil(MAX_E2EE_CHUNK_BYTES);
-const E2EE_INBOUND_RECORD_BUDGET: usize = E2EE_INBOUND_BUFFER_BUDGET_BYTES
-    .div_ceil(MAX_E2EE_LOGICAL_MESSAGE_BYTES)
-    * E2EE_MAX_RECORDS_PER_LOGICAL_MESSAGE;
 
 struct PlaintextRecords<'a> {
     plaintext: &'a [u8],
@@ -100,20 +95,27 @@ static E2EE_PREAUTH_PERMITS: LazyLock<Arc<Semaphore>> =
 static E2EE_ESTABLISHED_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_ESTABLISHED_CONNECTIONS)));
 static E2EE_INBOUND_RECORD_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_INBOUND_RECORD_BUDGET)));
+    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_INBOUND_BUFFER_BUDGET_BYTES)));
 
 struct BudgetedPlaintext {
     plaintext: Vec<u8>,
-    permits: Vec<E2eeRecordPermit>,
+    permits: Option<E2eeRecordPermit>,
 }
 
 struct E2eeInboundBudget {
-    _permits: Vec<E2eeRecordPermit>,
+    _permits: Option<E2eeRecordPermit>,
 }
 
 struct E2eeRecordPermit {
-    _global: OwnedSemaphorePermit,
-    _connection: OwnedSemaphorePermit,
+    global: OwnedSemaphorePermit,
+    connection: OwnedSemaphorePermit,
+}
+
+impl E2eeRecordPermit {
+    fn merge(&mut self, other: Self) {
+        self.global.merge(other.global);
+        self.connection.merge(other.connection);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -133,7 +135,7 @@ pub(crate) enum E2eeSessionError {
 pub(crate) struct E2eeChannel {
     transport: snow::TransportState,
     assembling: Vec<u8>,
-    assembling_permits: Vec<E2eeRecordPermit>,
+    assembling_permits: Option<E2eeRecordPermit>,
     decrypt_scratch: Vec<u8>,
 }
 
@@ -195,7 +197,7 @@ impl E2eeChannel {
             Self {
                 transport,
                 assembling: Vec::new(),
-                assembling_permits: Vec::new(),
+                assembling_permits: None,
                 decrypt_scratch: vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES],
             },
             message_b,
@@ -235,16 +237,21 @@ impl E2eeChannel {
         &mut self,
         frame: &[u8],
         max_message_bytes: usize,
-        permit: E2eeRecordPermit,
+        global_budget: &Arc<Semaphore>,
+        connection_budget: &Arc<Semaphore>,
     ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
-        self.decrypt_frame_inner(frame, max_message_bytes, Some(permit))
+        self.decrypt_frame_inner(
+            frame,
+            max_message_bytes,
+            Some((global_budget, connection_budget)),
+        )
     }
 
     fn decrypt_frame_inner(
         &mut self,
         frame: &[u8],
         max_message_bytes: usize,
-        permit: Option<E2eeRecordPermit>,
+        budgets: Option<(&Arc<Semaphore>, &Arc<Semaphore>)>,
     ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
         if frame.len() > MAX_E2EE_CIPHERTEXT_BYTES {
             return Err(E2eeSessionError::Protocol("oversized frame".into()));
@@ -261,20 +268,32 @@ impl E2eeChannel {
         if self.assembling.len().saturating_add(chunk.len()) > max_message_bytes {
             return Err(E2eeSessionError::Protocol("reassembly overflow".into()));
         }
+        let permit = budgets
+            .map(|(global, connection)| acquire_inbound_bytes(chunk.len(), global, connection))
+            .transpose()?
+            .flatten();
         match flag {
             E2EE_RECORD_FLAG_CONTINUATION => {
                 self.assembling.extend_from_slice(chunk);
                 if let Some(permit) = permit {
-                    self.assembling_permits.push(permit);
+                    if let Some(assembling) = &mut self.assembling_permits {
+                        assembling.merge(permit);
+                    } else {
+                        self.assembling_permits = Some(permit);
+                    }
                 }
                 Ok(None)
             }
             E2EE_RECORD_FLAG_FINAL => {
                 let mut message = std::mem::take(&mut self.assembling);
                 message.extend_from_slice(chunk);
-                let mut permits = std::mem::take(&mut self.assembling_permits);
+                let mut permits = self.assembling_permits.take();
                 if let Some(permit) = permit {
-                    permits.push(permit);
+                    if let Some(assembling) = &mut permits {
+                        assembling.merge(permit);
+                    } else {
+                        permits = Some(permit);
+                    }
                 }
                 Ok(Some(BudgetedPlaintext {
                     plaintext: message,
@@ -626,7 +645,7 @@ async fn run_established_e2ee(
 
     let inbound_shutdown = session_shutdown.clone();
     let inbound_channel = Arc::clone(&channel);
-    let inbound_connection_permits = Arc::new(Semaphore::new(E2EE_MAX_RECORDS_PER_LOGICAL_MESSAGE));
+    let inbound_connection_permits = Arc::new(Semaphore::new(MAX_E2EE_LOGICAL_MESSAGE_BYTES));
     let inbound_pump = tokio::spawn(async move {
         while let Some(frame) = ws_reader.next().await {
             let message = match frame {
@@ -709,20 +728,26 @@ fn decrypt_inbound_frame_budgeted(
     global_budget: &Arc<Semaphore>,
     connection_budget: &Arc<Semaphore>,
 ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
+    channel.decrypt_frame_budgeted(frame, max_message_bytes, global_budget, connection_budget)
+}
+
+fn acquire_inbound_bytes(
+    bytes: usize,
+    global_budget: &Arc<Semaphore>,
+    connection_budget: &Arc<Semaphore>,
+) -> Result<Option<E2eeRecordPermit>, E2eeSessionError> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let permits = u32::try_from(bytes)
+        .map_err(|_| E2eeSessionError::Protocol("record budget overflow".into()))?;
     let connection = Arc::clone(connection_budget)
-        .try_acquire_owned()
+        .try_acquire_many_owned(permits)
         .map_err(|_| E2eeSessionError::Protocol("connection buffer budget exhausted".into()))?;
     let global = Arc::clone(global_budget)
-        .try_acquire_owned()
+        .try_acquire_many_owned(permits)
         .map_err(|_| E2eeSessionError::Protocol("global buffer budget exhausted".into()))?;
-    channel.decrypt_frame_budgeted(
-        frame,
-        max_message_bytes,
-        E2eeRecordPermit {
-            _global: global,
-            _connection: connection,
-        },
-    )
+    Ok(Some(E2eeRecordPermit { global, connection }))
 }
 
 fn try_acquire_established_permit(
@@ -1001,9 +1026,10 @@ mod tests {
     #[tokio::test]
     async fn completed_messages_retain_their_global_record_budget() {
         let (mut initiator, mut responder) = establish().await;
-        let global_budget = Arc::new(Semaphore::new(2));
-        let connection_budget = Arc::new(Semaphore::new(2));
         let continuation = vec![b'f'; MAX_E2EE_CHUNK_BYTES];
+        let message_bytes = continuation.len() + b"second".len();
+        let global_budget = Arc::new(Semaphore::new(message_bytes));
+        let connection_budget = Arc::new(Semaphore::new(message_bytes));
         let frames = initiator_encrypt(
             &mut initiator,
             &[
@@ -1047,9 +1073,9 @@ mod tests {
     async fn exhausted_global_budget_fails_another_channel_closed() {
         let (mut first_initiator, mut first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
-        let global_budget = Arc::new(Semaphore::new(1));
-        let first_connection_budget = Arc::new(Semaphore::new(1));
-        let second_connection_budget = Arc::new(Semaphore::new(1));
+        let global_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
+        let first_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
+        let second_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
         let first_frame = initiator_encrypt(
             &mut first_initiator,
             &[record(
@@ -1089,10 +1115,16 @@ mod tests {
         ));
 
         drop(first_responder);
+        let retry_frame = initiator_encrypt(
+            &mut second_initiator,
+            &[record(E2EE_RECORD_FLAG_FINAL, b"retry")],
+        )
+        .pop()
+        .unwrap();
         assert!(
             decrypt_inbound_frame_budgeted(
                 &mut second_responder,
-                &second_frame,
+                &retry_frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
                 &second_connection_budget,
@@ -1106,9 +1138,9 @@ mod tests {
     async fn one_connection_cannot_monopolize_the_global_budget() {
         let (mut first_initiator, mut first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
-        let global_budget = Arc::new(Semaphore::new(2));
-        let first_connection_budget = Arc::new(Semaphore::new(1));
-        let second_connection_budget = Arc::new(Semaphore::new(1));
+        let global_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES * 2));
+        let first_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
+        let second_connection_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
         let continuation = record(
             E2EE_RECORD_FLAG_CONTINUATION,
             &vec![0_u8; MAX_E2EE_CHUNK_BYTES],
@@ -1154,6 +1186,36 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn many_tiny_records_remain_within_the_byte_budget() {
+        let (mut initiator, mut responder) = establish().await;
+        let continuation_count = 1_026;
+        let mut records = (0..continuation_count)
+            .map(|_| record(E2EE_RECORD_FLAG_CONTINUATION, b"x"))
+            .collect::<Vec<_>>();
+        records.push(record(E2EE_RECORD_FLAG_FINAL, b"done"));
+        let frames = initiator_encrypt(&mut initiator, &records);
+        let message_bytes = continuation_count + b"done".len();
+        let global_budget = Arc::new(Semaphore::new(message_bytes));
+        let connection_budget = Arc::new(Semaphore::new(message_bytes));
+        let mut completed = None;
+
+        for frame in &frames {
+            completed = decrypt_inbound_frame_budgeted(
+                &mut responder,
+                frame,
+                MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                &global_budget,
+                &connection_budget,
+            )
+            .expect("legal tiny fragment");
+        }
+
+        let completed = completed.expect("final record completes message");
+        assert_eq!(completed.plaintext.len(), message_bytes);
+        assert!(completed.plaintext.ends_with(b"done"));
     }
 
     #[test]
