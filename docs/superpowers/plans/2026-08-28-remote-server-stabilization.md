@@ -1188,11 +1188,11 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - Consumes: simultaneously live `AuthService` instances sharing SQLite, durable sessions/pairing grants, and principal/key offer rows.
 - Produces: transactional replay/reservation/quota/cancellation results and bounded cross-process live-connection revocation.
 
-- [ ] Add a failing two-live-service test for create on A, replay/conflict/cancel on B, replay after cancellation on A, and shared 128-per-principal/4,096-global quota enforcement.
-- [ ] Make SQLite keyed reservation authoritative: return the persisted existing/pending/cancelled/reserved row from one transaction, enforce both quotas there, and refresh each process-local projection from repository outcomes.
-- [ ] Add a failing two-server live-subscription test proving revocation through B closes an already-ACKed stream on A before later events can be delivered.
-- [ ] Implement one bounded per-service durable-state watcher while any local live connection, cached active grant/session, or access-state subscriber can require convergence; avoid one poller per socket, stop it only when the service has no remaining authority consumer, and preserve immediate same-process cancellation. Prove an off-host grant cancelled through B converges A's share state and access-change event even when A has no live socket.
-- [ ] Run focused repository, auth service, auth HTTP/WebSocket, restart, and simultaneous-server tests; document the cross-process convergence bound.
+- [x] Add a failing two-live-service test for create on A, replay/conflict/cancel on B, replay after cancellation on A, and shared 128-per-principal/4,096-global quota enforcement.
+- [x] Make SQLite keyed reservation authoritative: return the persisted existing/pending/cancelled/reserved row from one transaction, enforce both quotas there, and refresh each process-local projection from repository outcomes.
+- [x] Add a failing two-server live-subscription test proving revocation through B closes an already-ACKed stream on A before later events can be delivered.
+- [x] Implement one bounded per-service durable-state watcher while any local live connection, cached active grant/session, or access-state subscriber can require convergence; avoid one poller per socket, stop it only when the service has no remaining authority consumer, and preserve immediate same-process cancellation. Prove an off-host grant cancelled through B converges A's share state and access-change event even when A has no live socket.
+- [x] Run focused repository, auth service, auth HTTP/WebSocket, restart, and simultaneous-server tests; document the cross-process convergence bound.
 
 ### Task 13: Budget E2EE resources by principal and outbound bytes
 
