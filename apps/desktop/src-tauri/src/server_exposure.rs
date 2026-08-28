@@ -5,6 +5,7 @@ use crate::backend::BackendRunConfig;
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub(crate) trait ExposureOperations {
+    fn native_exposure_available(&self) -> Result<bool, String>;
     fn persisted_mode(&self) -> Result<String, String>;
     fn persist_mode<'a>(&'a self, mode: &'a str) -> BoxFuture<'a, Result<(), String>>;
     fn current_config(&self) -> Option<BackendRunConfig>;
@@ -50,6 +51,12 @@ async fn apply_exposure_locked(
     operations: &impl ExposureOperations,
     desired: &str,
 ) -> Result<ExposureTransition, String> {
+    if !operations.native_exposure_available()? {
+        return Err(
+            "Native server exposure is unavailable while WSL-only primary mode is active."
+                .to_owned(),
+        );
+    }
     let mut errors = Vec::new();
     if let Err(error) = operations.persisted_mode() {
         errors.push(format!("read persisted exposure mode: {error}"));
@@ -218,6 +225,7 @@ mod tests {
     #[derive(Default)]
     struct FakeState {
         calls: Vec<String>,
+        native_exposure_available: Option<bool>,
         persisted_mode: String,
         current_config: Option<BackendRunConfig>,
         persist_results: VecDeque<Result<(), String>>,
@@ -258,6 +266,13 @@ mod tests {
                 .push_back(Err(detail.to_owned()));
         }
 
+        fn set_native_exposure_available(&self, available: bool) {
+            self.state
+                .lock()
+                .expect("fake state")
+                .native_exposure_available = Some(available);
+        }
+
         fn return_next_restart(&self, result: Option<BackendRunConfig>) {
             self.state
                 .lock()
@@ -268,6 +283,15 @@ mod tests {
     }
 
     impl ExposureOperations for FakeExposureOperations {
+        fn native_exposure_available(&self) -> Result<bool, String> {
+            Ok(self
+                .state
+                .lock()
+                .expect("fake state")
+                .native_exposure_available
+                .unwrap_or(true))
+        }
+
         fn persisted_mode(&self) -> Result<String, String> {
             Ok(self
                 .state
@@ -356,6 +380,20 @@ mod tests {
             tailscale_serve_enabled: false,
             tailscale_serve_port: 443,
         }
+    }
+
+    #[tokio::test]
+    async fn wsl_only_topology_rejects_native_exposure_without_side_effects() {
+        let coordinator = ServerExposureCoordinator::default();
+        let operations = FakeExposureOperations::with_persisted_mode("local-only");
+        operations.set_native_exposure_available(false);
+
+        let error = apply_exposure(&coordinator, &operations, "local-only")
+            .await
+            .expect_err("WSL-only primary rejects native exposure");
+
+        assert!(error.contains("WSL-only primary mode"));
+        assert!(operations.calls().is_empty());
     }
 
     #[tokio::test]
