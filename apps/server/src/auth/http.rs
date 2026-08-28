@@ -30,6 +30,7 @@ use crate::http::AppState;
 
 const CREDENTIAL_HEADERS: [(&str, &str); 2] =
     [("cache-control", "no-store"), ("pragma", "no-cache")];
+const MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
@@ -290,11 +291,19 @@ async fn create_pairing_offer(
                 return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
             }
         };
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|key| !key.trim().is_empty())
-        .map(str::to_owned);
+    let idempotency_key = match headers.get("idempotency-key") {
+        Some(value) => {
+            let Ok(value) = value.to_str() else {
+                return invalid_pairing_offer_response("idempotency key must be valid text");
+            };
+            let key = value.trim();
+            if !is_valid_pairing_offer_idempotency_key(key) {
+                return invalid_pairing_offer_response("idempotency key is invalid");
+            }
+            Some(key.to_owned())
+        }
+        None => None,
+    };
     let input_fingerprint = format!(
         "{}\n{}\n{}\n{:?}\n{:?}",
         payload.name.trim(),
@@ -386,11 +395,26 @@ async fn create_pairing_offer(
         "this-computer" => false,
         _ => !endpoint_is_loopback,
     };
-    let issued = match state
-        .auth
-        .issue_share_pairing(scopes, Some(label), payload.reach.clone(), off_host)
-        .await
-    {
+    let issuance = if let Some(key) = &idempotency_key {
+        state
+            .auth
+            .issue_share_pairing_offer(
+                scopes,
+                Some(label),
+                payload.reach.clone(),
+                off_host,
+                principal.session_id.clone(),
+                key.clone(),
+                input_fingerprint.clone(),
+            )
+            .await
+    } else {
+        state
+            .auth
+            .issue_share_pairing(scopes, Some(label), payload.reach.clone(), off_host)
+            .await
+    };
+    let issued = match issuance {
         Ok(issued) => issued,
         Err(error) => {
             return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
@@ -412,7 +436,14 @@ async fn create_pairing_offer(
     let code = match encode_pairing_code(&code_payload) {
         Ok(code) => code,
         Err(error) => {
-            let _ = state.auth.revoke_pairing(&issued.id).await;
+            if let Some(key) = &idempotency_key {
+                let _ = state
+                    .auth
+                    .cancel_pairing_offer(&principal.session_id, key.clone())
+                    .await;
+            } else {
+                let _ = state.auth.revoke_pairing(&issued.id).await;
+            }
             return auth_error_for_request(
                 AuthError::Internal(format!("pairing code encoding failed: {error}")),
                 &headers,
@@ -433,13 +464,16 @@ async fn create_pairing_offer(
             .auth
             .record_pairing_offer(
                 &principal.session_id,
-                key,
+                key.clone(),
                 input_fingerprint,
                 result.clone(),
             )
             .await
     {
-        let _ = state.auth.revoke_pairing(&result.id).await;
+        let _ = state
+            .auth
+            .cancel_pairing_offer(&principal.session_id, key.clone())
+            .await;
         return auth_error_for_request(error, &headers, "pairing_offer_issuance_failed");
     }
     Json(result).into_response()
@@ -460,8 +494,8 @@ async fn cancel_pairing_offer(
         }
     };
     let key = payload.idempotency_key.trim();
-    if key.is_empty() {
-        return invalid_pairing_offer_response("idempotency key must not be empty");
+    if !is_valid_pairing_offer_idempotency_key(key) {
+        return invalid_pairing_offer_response("idempotency key is invalid");
     }
     let _offer_guard = state.auth.lock_pairing_offer_issuance().await;
     match state
@@ -486,6 +520,10 @@ fn invalid_pairing_offer_response(detail: &str) -> Response {
             "traceId": trace_id,
         }),
     )
+}
+
+fn is_valid_pairing_offer_idempotency_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES
 }
 
 async fn pairing_links(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -882,4 +920,23 @@ fn non_empty(value: Option<String>) -> Option<String> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES, is_valid_pairing_offer_idempotency_key};
+
+    #[test]
+    fn pairing_offer_idempotency_keys_are_byte_bounded() {
+        assert!(!is_valid_pairing_offer_idempotency_key(""));
+        assert!(is_valid_pairing_offer_idempotency_key(
+            &"x".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES)
+        ));
+        assert!(!is_valid_pairing_offer_idempotency_key(
+            &"x".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES + 1)
+        ));
+        assert!(!is_valid_pairing_offer_idempotency_key(
+            &"🦀".repeat(MAX_PAIRING_OFFER_IDEMPOTENCY_KEY_BYTES / 2)
+        ));
+    }
 }

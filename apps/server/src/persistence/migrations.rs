@@ -42,6 +42,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (13, "projection_thread_proposed_plans"),
     (20, "auth_pairing_links"),
     (20, "auth_sessions"),
+    (47, "auth_pairing_offer_idempotency"),
     (34, "activity_scopes"),
     (34, "activity_records"),
     (34, "activity_entries"),
@@ -673,6 +674,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(44, "ProjectionThreadSessionErrorClass", migration_044),
     Migration::new(45, "ProjectionThreadUnresolvedDelivery", migration_045),
     Migration::new(46, "AuthPairingReach", migration_046),
+    Migration::new(47, "AuthPairingOfferIdempotency", migration_047),
 ];
 
 impl Migration {
@@ -2410,6 +2412,25 @@ fn migration_046(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_047(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS auth_pairing_offer_idempotency (
+            principal_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            pairing_id TEXT,
+            result_json TEXT,
+            expires_at TEXT NOT NULL,
+            cancelled_at TEXT,
+            PRIMARY KEY (principal_id, idempotency_key),
+            FOREIGN KEY (pairing_id) REFERENCES auth_pairing_links(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_pairing_offer_idempotency_expiry
+            ON auth_pairing_offer_idempotency(expires_at);",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2930,7 +2951,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=46).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=47).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -2948,6 +2969,7 @@ mod tests {
         assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
         assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
         assert_eq!(MIGRATIONS[45].name, "AuthPairingReach");
+        assert_eq!(MIGRATIONS[46].name, "AuthPairingOfferIdempotency");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -3037,9 +3059,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 30);
+        assert_eq!(second.len(), 31);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[29].id, 46);
+        assert_eq!(second[30].id, 47);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3051,7 +3073,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 26);
+        assert_eq!(application_table_count, 27);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3146,7 +3168,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46]
+            [40, 41, 42, 43, 44, 45, 46, 47]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3183,7 +3205,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46]
+            [41, 42, 43, 44, 45, 46, 47]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3211,7 +3233,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46]
+            [42, 43, 44, 45, 46, 47]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3285,7 +3307,7 @@ mod tests {
             assert!(!has_column(&connection, table, "off_host")?);
         }
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(46))?;
         assert_eq!(
             applied
                 .iter()
@@ -3297,6 +3319,45 @@ mod tests {
             assert!(has_column(&connection, table, "reach")?);
             assert!(has_column(&connection, table, "off_host")?);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn migration_47_adds_the_durable_pairing_offer_ledger() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(46))?;
+        assert!(!table_exists(
+            &connection,
+            "auth_pairing_offer_idempotency"
+        )?);
+
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [47]
+        );
+        assert!(table_exists(&connection, "auth_pairing_offer_idempotency")?);
+
+        let columns = connection
+            .prepare("PRAGMA table_info(auth_pairing_offer_idempotency)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            columns,
+            [
+                "principal_id",
+                "idempotency_key",
+                "input_fingerprint",
+                "pairing_id",
+                "result_json",
+                "expires_at",
+                "cancelled_at",
+            ]
+        );
 
         Ok(())
     }
@@ -3317,7 +3378,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 13);
+        assert_eq!(applied.len(), 14);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3331,6 +3392,7 @@ mod tests {
         assert_eq!(applied[10].id, 44);
         assert_eq!(applied[11].id, 45);
         assert_eq!(applied[12].id, 46);
+        assert_eq!(applied[13].id, 47);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;
