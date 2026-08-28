@@ -2165,6 +2165,53 @@ mod tests {
 
     use super::*;
 
+    struct IndependentAuthRepositories {
+        _database_directory: tempfile::TempDir,
+        first: Repositories,
+        second: Repositories,
+    }
+
+    impl IndependentAuthRepositories {
+        async fn new() -> Self {
+            let database_directory = tempfile::tempdir().expect("temporary SQLite directory");
+            let database_path = database_directory.path().join("auth.sqlite3");
+            let first_database = crate::persistence::Database::create_new(&database_path)
+                .await
+                .expect("first SQLite connection opens");
+            first_database
+                .call(|connection| {
+                    crate::persistence::run_migrations(connection, None)?;
+                    Ok(())
+                })
+                .await
+                .expect("all migrations apply");
+            let second_database = crate::persistence::Database::open_existing(&database_path)
+                .await
+                .expect("second independent SQLite connection opens");
+            let first = Repositories::new(first_database);
+            let second = Repositories::new(second_database);
+            let first_observer = first
+                .database()
+                .enable_queue_backpressure_observation_for_integration_test()
+                .expect("first repository owns a SQLite worker");
+            let second_observer = second
+                .database()
+                .enable_queue_backpressure_observation_for_integration_test()
+                .expect("second repository must own an independent SQLite worker");
+            drop((first_observer, second_observer));
+            Self {
+                _database_directory: database_directory,
+                first,
+                second,
+            }
+        }
+
+        async fn close(self) {
+            self.first.database().clone().close().await;
+            self.second.database().clone().close().await;
+        }
+    }
+
     #[tokio::test]
     async fn issues_a_persisted_administrative_pairing_a_running_service_exchanges_once() {
         let database = crate::persistence::Database::open_in_memory()
@@ -3258,17 +3305,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_offer_cancellation_converges_dormant_share_state_and_access_events() {
-        let database = crate::persistence::Database::open_in_memory()
-            .await
-            .expect("in-memory database opens");
-        database
-            .call(|connection| {
-                crate::persistence::run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .expect("all migrations apply");
-        let repositories = Repositories::new(database);
+        let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
         let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let first = AuthService::new_with_persistence(
@@ -3277,7 +3314,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("first secret store"),
-            repositories.clone(),
+            repositories.first.clone(),
         )
         .await
         .expect("first live service");
@@ -3287,7 +3324,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("second secret store"),
-            repositories,
+            repositories.second.clone(),
         )
         .await
         .expect("second live service");
@@ -3357,21 +3394,13 @@ mod tests {
             first.share_exposure_state().await.desired_exposure,
             "loopback"
         );
+        drop((first, second));
+        repositories.close().await;
     }
 
     #[tokio::test]
     async fn access_subscriber_keeps_one_service_watcher_without_cached_authority() {
-        let database = crate::persistence::Database::open_in_memory()
-            .await
-            .expect("in-memory database opens");
-        database
-            .call(|connection| {
-                crate::persistence::run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .expect("all migrations apply");
-        let repositories = Repositories::new(database);
+        let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
         let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let first = AuthService::new_with_persistence(
@@ -3380,7 +3409,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("first secret store"),
-            repositories.clone(),
+            repositories.first.clone(),
         )
         .await
         .expect("first live service");
@@ -3390,7 +3419,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("second secret store"),
-            repositories,
+            repositories.second.clone(),
         )
         .await
         .expect("second live service");
@@ -3420,21 +3449,13 @@ mod tests {
         .await
         .expect("subscriber-only authority watcher must converge");
         assert!(event.revision > 1);
+        drop((access_events, first, second));
+        repositories.close().await;
     }
 
     #[tokio::test]
     async fn cached_grant_keeps_one_service_watcher_without_socket_or_subscriber() {
-        let database = crate::persistence::Database::open_in_memory()
-            .await
-            .expect("in-memory database opens");
-        database
-            .call(|connection| {
-                crate::persistence::run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .expect("all migrations apply");
-        let repositories = Repositories::new(database);
+        let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
         let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let first = AuthService::new_with_persistence(
@@ -3443,7 +3464,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("first secret store"),
-            repositories.clone(),
+            repositories.first.clone(),
         )
         .await
         .expect("first live service");
@@ -3453,7 +3474,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("second secret store"),
-            repositories,
+            repositories.second.clone(),
         )
         .await
         .expect("second live service");
@@ -3492,21 +3513,13 @@ mod tests {
         })
         .await
         .expect("cached grant watcher must converge without a socket or subscriber");
+        drop((first, second));
+        repositories.close().await;
     }
 
     #[tokio::test]
     async fn cached_session_keeps_one_service_watcher_without_live_connection() {
-        let database = crate::persistence::Database::open_in_memory()
-            .await
-            .expect("in-memory database opens");
-        database
-            .call(|connection| {
-                crate::persistence::run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .expect("all migrations apply");
-        let repositories = Repositories::new(database);
+        let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
         let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let first = AuthService::new_with_persistence(
@@ -3515,7 +3528,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("first secret store"),
-            repositories.clone(),
+            repositories.first.clone(),
         )
         .await
         .expect("first live service");
@@ -3525,7 +3538,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("second secret store"),
-            repositories,
+            repositories.second.clone(),
         )
         .await
         .expect("second live service");
@@ -3563,21 +3576,13 @@ mod tests {
         })
         .await
         .expect("cached session watcher must converge without a live connection");
+        drop((first, second));
+        repositories.close().await;
     }
 
     #[tokio::test]
     async fn cross_service_authentication_starts_watcher_for_the_cached_session() {
-        let database = crate::persistence::Database::open_in_memory()
-            .await
-            .expect("in-memory database opens");
-        database
-            .call(|connection| {
-                crate::persistence::run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .expect("all migrations apply");
-        let repositories = Repositories::new(database);
+        let repositories = IndependentAuthRepositories::new().await;
         let secrets = tempfile::tempdir().expect("secret store directory");
         let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
         let first = AuthService::new_with_persistence(
@@ -3586,7 +3591,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("first secret store"),
-            repositories.clone(),
+            repositories.first.clone(),
         )
         .await
         .expect("first live service");
@@ -3596,7 +3601,7 @@ mod tests {
             SecretStore::new(secrets.path())
                 .await
                 .expect("second secret store"),
-            repositories,
+            repositories.second.clone(),
         )
         .await
         .expect("second live service");
@@ -3636,6 +3641,8 @@ mod tests {
         })
         .await
         .expect("authenticated peer session must retain revocation convergence");
+        drop((first, second));
+        repositories.close().await;
     }
 
     #[tokio::test]
