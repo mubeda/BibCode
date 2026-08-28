@@ -343,7 +343,11 @@ minimum-size, and relevant Windows DPI states. Verify:
   TCP-only, and limited to Domain/Private profiles. Revoke the last off-host
   offer or paired client, verify exposure returns to loopback, and confirm the
   named rule is absent. Record an elevation or policy denial as failed native
-  evidence; do not substitute a manually created rule;
+  evidence; do not substitute a manually created rule. Capture the shared
+  runbook's four compensation outcomes: successful local-only cleanup after a
+  failed mint, explicit cleanup failure, last-browser-session revocation with a
+  local-only restart and removed rule, and one compensating widen when a
+  concurrent grant appears during narrowing;
 
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with

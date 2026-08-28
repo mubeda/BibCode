@@ -21,6 +21,13 @@
 - Every production behavior change starts with a focused failing test, is observed red, receives the smallest passing implementation, and is committed before the next task.
 - Preserve the existing bounded two-at-a-time update pool, per-row Check action, rail null-selection behavior, and per-entry update wiring.
 
+## Execution Evidence Disclosures
+
+- Commit `81eff018` also dropped the writable relay executable handle before
+  `exec` to prevent Linux `ETXTBSY`. The production fix was discovered while
+  running the E2EE interop path and is beneficial, but it was outside that
+  commit's documentation-only description. It did not redesign the relay.
+
 ---
 
 ### Task 1: Restore the five range-introduced repository gates
