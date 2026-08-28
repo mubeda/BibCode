@@ -137,7 +137,7 @@ Tasks below implement them; do not silently revisit them.
   `RemoteUpdateInstallError` (tagged error class, `_tag: "RemoteUpdateInstallError"`,
   field `code`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `packages/contracts/src/remoteUpdate.test.ts`:
 
@@ -211,12 +211,12 @@ describe("RemoteUpdateInstallError", () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `vp test packages/contracts/src/remoteUpdate.test.ts`
 Expected: FAIL — cannot resolve `./remoteUpdate.ts`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `packages/contracts/src/remoteUpdate.ts` (spec §4.5 verbatim; `supervised` is
 schema-reserved, v1 ships `interactive` and `manual` only):
@@ -288,12 +288,12 @@ Add to `packages/contracts/src/index.ts`, directly after the `remoteAccess.ts` l
 export * from "./remoteUpdate.ts";
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `vp test packages/contracts/src/remoteUpdate.test.ts`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/contracts/src/remoteUpdate.ts packages/contracts/src/remoteUpdate.test.ts packages/contracts/src/index.ts
@@ -318,7 +318,7 @@ git commit -m "feat(contracts): add remote update contract (spec 4.5)"
   (decode-default `null`). Later tasks gate all UI on
   `capabilities.remoteUpdateControl === true`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `packages/contracts/src/environment.test.ts` (reuse the existing `descriptor`
 fixture object and `decodeExecutionEnvironmentDescriptor` helper defined at the top of
@@ -350,13 +350,13 @@ describe("remote update descriptor surface", () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `vp test packages/contracts/src/environment.test.ts`
 Expected: FAIL — `remoteUpdateControl` is not a known capability / `remoteUpdateSupport`
 missing from the decoded descriptor.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `packages/contracts/src/environment.ts`:
 
@@ -378,13 +378,13 @@ Add to `ExecutionEnvironmentDescriptor` (after `storageInstanceId`):
   ),
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `vp test packages/contracts/src/environment.test.ts packages/contracts/src/`
 Expected: PASS, including all pre-existing descriptor tests (the additions are
 decode-defaulted, so no existing fixture needs the new fields).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/contracts/src/environment.ts packages/contracts/src/environment.test.ts
@@ -419,7 +419,7 @@ delegate: Option<Arc<dyn RemoteUpdateDelegate>>) -> RemoteUpdateService` with
     `manual` / `manual-update-required`) and
     `ServerConfig::with_remote_update_support(self, support) -> Self`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `apps/server/src/remote_update.rs` with the tests module first (the module body
 comes in Step 3; writing tests against the not-yet-written API makes `cargo test` fail
@@ -560,12 +560,12 @@ Also append to the tests module in `apps/server/src/config.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p bibcode-server remote_update`
 Expected: COMPILE ERROR (types not defined) — that is the red state.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Top of `apps/server/src/remote_update.rs` (above the tests module):
 
@@ -776,12 +776,12 @@ And add the builder next to `with_bind`:
     }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p bibcode-server remote_update && cargo test -p bibcode-server config`
 Expected: PASS (5 new remote_update tests + config default test).
 
-- [ ] **Step 5: Format, lint, commit**
+- [x] **Step 5: Format, lint, commit**
 
 ```bash
 cargo fmt --all
@@ -817,7 +817,7 @@ a latent bug.
   `lifecycle.rs`. Task 5's integration test asserts the well-known route; this task's
   unit tests pin `server.getConfig` and the Connect descriptor.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the tests module of `apps/server/src/production/control.rs`, modeled on the
 neighboring `environment_descriptor_advertises_complete_worktree_catalog_surface` test
@@ -863,7 +863,7 @@ descriptor producer):
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p bibcode-server environment_descriptor_advertises_remote_update`
 Expected: FAIL — `remoteUpdateControl` is `Value::Null`.
@@ -871,7 +871,7 @@ Expected: FAIL — `remoteUpdateControl` is `Value::Null`.
 Run: `cargo test -p bibcode-server connect_descriptor_advertises_remote_update`
 Expected: COMPILE ERROR — `connect_environment_descriptor` does not exist yet.
 
-- [ ] **Step 3: Write minimal implementation (all three producers)**
+- [x] **Step 3: Write minimal implementation (all three producers)**
 
 `apps/server/src/production/control.rs`, in `environment_descriptor`:
 
@@ -958,12 +958,12 @@ Note: if Phase 2 already added `remoteProtocolVersion`/`minCompatibleRemoteProto
 the http.rs/control.rs structs, keep those fields — this task only adds the two update
 fields.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p bibcode-server environment_descriptor && cargo test -p bibcode-server connect_descriptor && cargo test -p bibcode-server http`
 Expected: PASS (new tests green; existing descriptor tests untouched).
 
-- [ ] **Step 5: Format, lint, commit**
+- [x] **Step 5: Format, lint, commit**
 
 ```bash
 cargo fmt --all
@@ -1007,7 +1007,7 @@ together to stay green.
   In this task the production runtime constructs the service with `delegate: None`
   (headless/manual); Task 6 threads the desktop delegate.
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 Create `apps/server/tests/remote_update_rpc.rs`:
 
@@ -1144,13 +1144,13 @@ current `ServerMessage` API — those two files are the authoritative harness ex
 `reqwest` and `tempfile` are already dev-dependencies of `apps/server`; verify in
 `apps/server/Cargo.toml` and add to `[dev-dependencies]` only if missing.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bibcode-server --test remote_update_rpc`
 Expected: FAIL — `updater.status` is not a registered method (the request errors or the
 scope map returns none).
 
-- [ ] **Step 3: Add the TS method definitions**
+- [x] **Step 3: Add the TS method definitions**
 
 In `packages/contracts/src/rpc.ts`:
 
@@ -1200,7 +1200,7 @@ export const WsUpdaterInstallRpc = Rpc.make(WS_METHODS.updaterInstall, {
   WsUpdaterInstallRpc,
 ```
 
-- [ ] **Step 4: Regenerate the TS↔Rust wire fixtures**
+- [x] **Step 4: Regenerate the TS↔Rust wire fixtures**
 
 ```bash
 cd packages/contracts && node scripts/export-rust-rpc-fixtures.ts && cd ../..
@@ -1215,7 +1215,7 @@ part of this commit — none may be left untracked.
 Then run the contracts suite: `vp test packages/contracts/src/`
 Expected: PASS (`rpcRustParity.test.ts` reads the regenerated manifest).
 
-- [ ] **Step 5: Add the Rust method inventory + scopes**
+- [x] **Step 5: Add the Rust method inventory + scopes**
 
 `apps/server/src/rpc/methods.rs` — `ACTIVE_RPC_METHODS` is name-sorted and the
 `rpc_wire` test compares it _ordered_ against the generated manifest. Insert between
@@ -1254,7 +1254,7 @@ Run: `cargo test -p bibcode-server scope`
 Expected: PASS (`every_active_rpc_method_has_exactly_one_declared_scope` — this test
 was the free red gate the moment the methods entered `ACTIVE_RPC_METHODS`).
 
-- [ ] **Step 6: Register the handlers in the production runtime**
+- [x] **Step 6: Register the handlers in the production runtime**
 
 Create `apps/server/src/production/remote_update_rpc.rs`:
 
@@ -1317,7 +1317,7 @@ std::sync::Arc<dyn crate::remote_update::RemoteUpdateDelegate>> = None;` immedia
 above the call (Task 6 replaces this local with a threaded parameter — the variable
 name is the seam).
 
-- [ ] **Step 7: Update the pinned counts in `rpc_wire.rs`**
+- [x] **Step 7: Update the pinned counts in `rpc_wire.rs`**
 
 In `apps/server/tests/rpc_wire.rs`, `rust_registry_matches_the_active_typescript_rpc_group`
 pins literals. Update:
@@ -1332,7 +1332,7 @@ pins literals. Update:
 the manifest, do not guess. The pins exist to force conscious review of generated-fixture
 drift; syncing them here _is_ that review.
 
-- [ ] **Step 8: Run tests to verify everything passes**
+- [x] **Step 8: Run tests to verify everything passes**
 
 ```bash
 cargo test -p bibcode-server --test rpc_wire
@@ -1344,7 +1344,7 @@ vp test packages/contracts/src/
 Expected: all PASS. The integration test now sees `updater.status` → manual snapshot,
 `updater.check` → manual snapshot, `updater.install` → `RemoteUpdateInstallError`.
 
-- [ ] **Step 9: Format, lint, typecheck, commit**
+- [x] **Step 9: Format, lint, typecheck, commit**
 
 ```bash
 cargo fmt --all
@@ -1393,7 +1393,7 @@ update_delegate: Arc<dyn RemoteUpdateDelegate>) -> Result<ServerHandle, ServerEr
   - `map_desktop_update_state(state: &serde_json::Value) -> HostUpdaterStatus`
   - `BackendSupervisor::install_remote_update_integration(delegate, support)`
 
-- [ ] **Step 1: Write the failing server test (delegate is consulted end-to-end)**
+- [x] **Step 1: Write the failing server test (delegate is consulted end-to-end)**
 
 Append to `apps/server/tests/remote_update_rpc.rs` (reusing that file's
 `disable_provider_processes` and `call_unary` helpers):
@@ -1483,12 +1483,12 @@ async fn desktop_integrated_server_routes_install_through_the_delegate() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bibcode-server --test remote_update_rpc`
 Expected: COMPILE ERROR — `start_with_desktop_integration` does not exist.
 
-- [ ] **Step 3: Thread the delegate through the server**
+- [x] **Step 3: Thread the delegate through the server**
 
 `apps/server/src/lifecycle.rs`:
 
@@ -1528,12 +1528,12 @@ None;` local, and let the existing `register_remote_update_rpc` call consume the
 parameter. Update any other callers of the changed constructor (tests included) with
 `None` — let the compiler enumerate them.
 
-- [ ] **Step 4: Run the server test to verify it passes**
+- [x] **Step 4: Run the server test to verify it passes**
 
 Run: `cargo test -p bibcode-server --test remote_update_rpc`
 Expected: PASS (both the manual test from Task 5 and the new delegate test).
 
-- [ ] **Step 5: Write the failing desktop unit tests**
+- [x] **Step 5: Write the failing desktop unit tests**
 
 Create `apps/desktop/src-tauri/src/remote_update_delegate.rs` starting with its tests
 module:
@@ -1615,7 +1615,7 @@ mod tests {
 Run: `cargo test -p bibcode-desktop remote_update_delegate`
 Expected: COMPILE ERROR (module body missing) — red.
 
-- [ ] **Step 6: Implement the desktop delegate**
+- [x] **Step 6: Implement the desktop delegate**
 
 Fill in `apps/desktop/src-tauri/src/remote_update_delegate.rs` above the tests module:
 
@@ -1768,7 +1768,7 @@ failure-acknowledgement flow from d8daae10). If `updates.rs` marks
 `DesktopUpdateManager`, `DesktopUpdateInstallInput`, or the needed methods `pub(crate)`
 only, that visibility already suffices (same crate); widen nothing.
 
-- [ ] **Step 7: Wire the delegate into the backend launch**
+- [x] **Step 7: Wire the delegate into the backend launch**
 
 `apps/desktop/src-tauri/src/lib.rs`: declare `mod remote_update_delegate;` and, in the
 setup closure that already spawns `updates::run_background_update_checks` (~line 107),
@@ -1851,7 +1851,7 @@ reuse it or take another clone — match the surrounding code.)
 (Adapt variable names to the surrounding code; ExternalProcess/WSL launches are
 untouched — those servers answer in their own headless manual mode.)
 
-- [ ] **Step 8: Run desktop and server tests to verify they pass**
+- [x] **Step 8: Run desktop and server tests to verify they pass**
 
 ```bash
 cargo test -p bibcode-desktop remote_update_delegate
@@ -1862,7 +1862,7 @@ cargo test -p bibcode-server --test remote_update_rpc
 Expected: PASS. Existing backend tests that construct `BackendSupervisor` may need the
 two new fields defaulted — extend the constructor/`Default` in one place, not each test.
 
-- [ ] **Step 9: Format, lint, commit**
+- [x] **Step 9: Format, lint, commit**
 
 ```bash
 cargo fmt --all
@@ -1910,7 +1910,7 @@ Promise<ReadonlyArray<RemoteUpdateFanOutResult<A, E>>>` where `check` returns
     `{ environmentId, input: {} }` yielding `RemoteUpdateSnapshot`; `check`/`install`
     are commands with per-environment single-flight.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `packages/client-runtime/src/state/remoteUpdates.test.ts`. The fan-out is a pure
 promise scheduler — deliberately testable with no sockets, atoms, or Effect runtime.
@@ -2035,12 +2035,12 @@ the assertion that matters is `peak === 2` with all four results delivered. If t
 `result._tag === "Failure"` idiom and `packages/client-runtime/src/state/runtime.ts` —
 those are the authority.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `vp test packages/client-runtime/src/state/remoteUpdates.test.ts`
 Expected: FAIL — cannot resolve `./remoteUpdates.ts`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `packages/client-runtime/src/state/remoteUpdates.ts`:
 
@@ -2161,12 +2161,12 @@ the existing `./state/*` entries:
     },
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `vp test packages/client-runtime/src/state/remoteUpdates.test.ts`
 Expected: PASS (6 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/client-runtime/src/state/remoteUpdates.ts \
@@ -2227,7 +2227,7 @@ and the landed source before wiring.
   `selectRemoteUpdateControlCapability` now reads the typed
   `capabilities.remoteUpdateControl` field.
 
-- [ ] **Step 1: Write the failing logic tests**
+- [x] **Step 1: Write the failing logic tests**
 
 Create `apps/web/src/components/settings/ServerUpdateBadge.test.tsx`:
 
@@ -2296,12 +2296,12 @@ describe("manualUpdateInstructions", () => {
 });
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `vp test apps/web/src/components/settings/ServerUpdateBadge.test.tsx`
 Expected: FAIL — module `./ServerUpdateBadge` does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 Create `apps/web/src/state/remoteUpdates.ts`:
 
@@ -2393,12 +2393,12 @@ export function manualUpdateInstructions(serverVersion: string): string {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `vp test apps/web/src/components/settings/ServerUpdateBadge.test.tsx`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Wire the settings and context-card slots (interface-level)**
+- [x] **Step 5: Wire the settings and context-card slots (interface-level)**
 
 All wiring is gated on the capability boolean via Phase 6's selector — first replace
 its defensive read with the typed field this phase introduced
@@ -2471,7 +2471,7 @@ hidden-until-capable.) 4. Extend the nearest existing test file for the row comp
 capability-off renders no badge; capability-on renders the badge markup. Follow that
 file's existing harness idioms.
 
-- [ ] **Step 6: Wire update-available into the Phase 6 rail dot (amended spec §4.8)**
+- [x] **Step 6: Wire update-available into the Phase 6 rail dot (amended spec §4.8)**
 
 Phase 6's `toEnvironmentRailCandidate`
 (`apps/web/src/components/sidebar/environmentRail.logic.ts`) hardcodes
@@ -2531,7 +2531,7 @@ Follow the component's existing per-environment atom-read idiom for the map.
 4. Re-run: `vp test apps/web/src/components/sidebar/` — PASS, including Phase 6's
    pre-existing rail tests (updated fixtures included).
 
-- [ ] **Step 7: Run the web suites**
+- [x] **Step 7: Run the web suites**
 
 ```bash
 vp test apps/web/src/components/settings/ apps/web/src/components/sidebar/ \
@@ -2541,7 +2541,7 @@ vp run typecheck
 
 Expected: PASS, including the extended row, rail-logic, and capability-selector tests.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add apps/web/src/state/remoteUpdates.ts \
@@ -2571,7 +2571,7 @@ so runbooks get a real edit — not a "reviewed and remain accurate" statement.
 - Consumes: everything shipped in Tasks 1–8 (documents must describe the code as
   landed, not as planned).
 
-- [ ] **Step 1: Update `docs/architecture/overview.md`**
+- [x] **Step 1: Update `docs/architecture/overview.md`**
 
 In the section that documents desktop updates / update protection (extended by
 d8daae10), add a subsection:
@@ -2602,7 +2602,7 @@ Scopes: `updater.status` requires `orchestration:read`; `updater.check` and
 `updater.install` require `orchestration:operate` (`apps/server/src/auth/scope.rs`).
 ```
 
-- [ ] **Step 2: Update `docs/architecture/remote.md`**
+- [x] **Step 2: Update `docs/architecture/remote.md`**
 
 Add a "Remote server updates" section stating: the wire contract (three methods,
 snapshot shape, install error), the descriptor embedding + capability gate, the
@@ -2619,7 +2619,7 @@ the operator instead of guessing. Teaching servers a feed URL is a possible futu
 extension, deliberately out of scope for v1.
 ```
 
-- [ ] **Step 3: Update the three desktop runbooks**
+- [x] **Step 3: Update the three desktop runbooks**
 
 Append one step to the packaged-UI validation flow of each of
 `docs/testing/linux-desktop.md`, `docs/testing/macos-desktop.md`,
@@ -2634,7 +2634,7 @@ Append one step to the packaged-UI validation flow of each of
   blocking the rest of the batch.
 ```
 
-- [ ] **Step 4: Verify docs against the landed code**
+- [x] **Step 4: Verify docs against the landed code**
 
 Re-read each edited section and confirm every path, method name, scope, and behavior
 matches the implementation from Tasks 1–8 (AGENTS.md: living docs change in the same
@@ -2642,7 +2642,7 @@ patch and must match source). `docs/architecture/connection-runtime.md` needs no
 in this phase (no connection/catalog behavior changed) — state exactly that in the
 final report.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/architecture/overview.md docs/architecture/remote.md docs/testing/
