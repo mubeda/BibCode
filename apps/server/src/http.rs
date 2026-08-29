@@ -51,6 +51,7 @@ pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-tok
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const HTML_CACHE_CONTROL: &str = "no-cache";
+const MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMethod {
@@ -219,6 +220,8 @@ async fn websocket(
     let session_shutdown = state.shutdown.child_token();
     if state.config.unsafe_no_auth {
         return upgrade
+            .max_frame_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
+            .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
             .on_upgrade(move |socket| {
                 run_session(
                     socket,
@@ -236,6 +239,8 @@ async fn websocket(
             let expires_at_ms = principal.expires_at_ms;
             let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
             upgrade
+                .max_frame_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
+                .max_message_size(MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES)
                 .on_upgrade(move |socket| async move {
                     let Ok(connection_id) = auth
                         .mark_connected(&session_id, session_shutdown.clone())
