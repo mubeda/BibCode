@@ -2081,7 +2081,30 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
     normalized == "localhost"
         || normalized
             .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+            .is_ok_and(|address| match address {
+                IpAddr::V4(address) => address.is_loopback(),
+                IpAddr::V6(address) => {
+                    address
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback())
+                        || address.is_loopback()
+                }
+            })
+}
+
+pub(crate) fn is_unspecified_host(host: &str) -> bool {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(|address| match address {
+            IpAddr::V4(address) => address.is_unspecified(),
+            IpAddr::V6(address) => {
+                address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_unspecified())
+                    || address.is_unspecified()
+            }
+        })
 }
 
 fn apply_grant_label(mut client: ClientMetadata, label: Option<String>) -> ClientMetadata {
