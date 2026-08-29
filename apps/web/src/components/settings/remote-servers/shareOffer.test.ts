@@ -4,6 +4,8 @@ import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairi
 import { generateShareOffer, resolveShareAddressOptions } from "./shareOffer.ts";
 
 const wideState = {
+  configuredMode: "network-accessible" as const,
+  management: "native" as const,
   mode: "network-accessible" as const,
   endpointUrl: "http://192.168.1.20:3773",
   advertisedHost: "192.168.1.20",

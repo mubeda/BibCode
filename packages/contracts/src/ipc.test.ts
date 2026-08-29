@@ -8,6 +8,7 @@ import {
   DesktopProjectDataRecoveryResultSchema,
   type DesktopUpdateState,
   DesktopEnvironmentBootstrapSchema,
+  DesktopServerExposureStateSchema,
   DesktopUpdateStateSchema,
 } from "./ipc.ts";
 import { expectDecodeFailure, expectEncodeFailure } from "./test/schemaAssertions.ts";
@@ -18,10 +19,37 @@ const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
 const decodeDesktopUpdateState = Schema.decodeUnknownSync(DesktopUpdateStateSchema);
+const decodeDesktopServerExposureState = Schema.decodeUnknownSync(
+  DesktopServerExposureStateSchema,
+);
 const decodeProjectDataStatus = Schema.decodeUnknownSync(DesktopProjectDataEnvironmentStatusSchema);
 const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
   DesktopProjectDataRecoveryResultSchema,
 );
+
+describe("Desktop server exposure contract", () => {
+  it("keeps actual topology distinct from configured intent and management owner", () => {
+    expect(
+      decodeDesktopServerExposureState({
+        mode: "local-only",
+        configuredMode: "network-accessible",
+        management: "native",
+        endpointUrl: null,
+        advertisedHost: null,
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+      }),
+    ).toEqual({
+      mode: "local-only",
+      configuredMode: "network-accessible",
+      management: "native",
+      endpointUrl: null,
+      advertisedHost: null,
+      tailscaleServeEnabled: false,
+      tailscaleServePort: 443,
+    });
+  });
+});
 
 describe("Desktop project-data recovery contract", () => {
   it("exposes a disposable project data status invalidation subscription", () => {

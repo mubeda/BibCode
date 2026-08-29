@@ -56,6 +56,8 @@ import {
 } from "./shareExposureReconciler";
 
 const localExposure = {
+  configuredMode: "local-only" as const,
+  management: "native" as const,
   mode: "local-only" as const,
   endpointUrl: null,
   advertisedHost: null,
@@ -64,6 +66,7 @@ const localExposure = {
 };
 const wideExposure = {
   ...localExposure,
+  configuredMode: "network-accessible" as const,
   mode: "network-accessible" as const,
   endpointUrl: "http://192.168.1.20:3773",
   advertisedHost: "192.168.1.20",

@@ -624,14 +624,18 @@ export const PersistedSavedEnvironmentRecordSchema = Schema.Struct({
 export type PersistedSavedEnvironmentRecord = typeof PersistedSavedEnvironmentRecordSchema.Type;
 
 export type DesktopServerExposureMode = "local-only" | "network-accessible";
+export type DesktopServerExposureManagement = "native" | "external";
 
 export const DesktopServerExposureModeSchema = Schema.Literals([
   "local-only",
   "network-accessible",
 ]);
+export const DesktopServerExposureManagementSchema = Schema.Literals(["native", "external"]);
 
 export interface DesktopServerExposureState {
   mode: DesktopServerExposureMode;
+  configuredMode: DesktopServerExposureMode;
+  management: DesktopServerExposureManagement;
   endpointUrl: string | null;
   advertisedHost: string | null;
   tailscaleServeEnabled: boolean;
@@ -640,6 +644,8 @@ export interface DesktopServerExposureState {
 
 export const DesktopServerExposureStateSchema = Schema.Struct({
   mode: DesktopServerExposureModeSchema,
+  configuredMode: DesktopServerExposureModeSchema,
+  management: DesktopServerExposureManagementSchema,
   endpointUrl: Schema.NullOr(Schema.String),
   advertisedHost: Schema.NullOr(Schema.String),
   tailscaleServeEnabled: Schema.Boolean,

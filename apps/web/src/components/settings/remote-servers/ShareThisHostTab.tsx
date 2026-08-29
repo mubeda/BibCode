@@ -1,4 +1,4 @@
-import type { AuthShareStateResult } from "@bibcode/contracts";
+import type { AuthShareStateResult, DesktopServerExposureState } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 import { RefreshCwIcon } from "lucide-react";
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -64,6 +64,20 @@ function copyText(value: string): void {
   void navigator.clipboard?.writeText(value);
 }
 
+export function canResumeLegacyExposure(
+  shareState: AuthShareStateResult,
+  exposureState: DesktopServerExposureState,
+): boolean {
+  return (
+    exposureState.management === "native" &&
+    exposureState.mode === "local-only" &&
+    exposureState.configuredMode === "network-accessible" &&
+    shareState.desiredExposure === "loopback" &&
+    shareState.offHostGrantCount === 0 &&
+    shareState.legacyGrantCount > 0
+  );
+}
+
 export function ShareThisHostTab(): ReactElement {
   const desktopBridge = window.desktopBridge;
   const presentationPolicy = readCurrentEnvironmentPresentationPolicy();
@@ -90,6 +104,8 @@ export function ShareThisHostTab(): ReactElement {
   const [failure, setFailure] = useState<GenerateShareOfferFailure | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [shareState, setShareState] = useState<AuthShareStateResult | null>(null);
+  const [isResumingLegacy, setIsResumingLegacy] = useState(false);
+  const [legacyResumeError, setLegacyResumeError] = useState<string | null>(null);
 
   const refreshShareState = useCallback(async () => {
     try {
@@ -140,6 +156,26 @@ export function ShareThisHostTab(): ReactElement {
     refreshDesktopNetworkAccessState();
     void refreshShareState();
   }, [refreshShareState]);
+
+  const handleResumeLegacy = useCallback(async () => {
+    if (desktopBridge === undefined) return;
+    setIsResumingLegacy(true);
+    setLegacyResumeError(null);
+    try {
+      await desktopBridge.applyServerExposure("network-accessible");
+      refreshDesktopNetworkAccessState();
+      await refreshShareState();
+    } catch (error) {
+      setLegacyResumeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsResumingLegacy(false);
+    }
+  }, [desktopBridge, refreshShareState]);
+
+  const canResumeLegacy =
+    shareState !== null &&
+    exposureState !== null &&
+    canResumeLegacyExposure(shareState, exposureState);
 
   const handleGenerate = useCallback(async () => {
     if (selectedOption === null) return;
@@ -350,8 +386,8 @@ export function ShareThisHostTab(): ReactElement {
               </span>
               {wslOnlyPrimary ? (
                 <span className="block">
-                  Exposure is owned by the WSL backend. BiBCode leaves the native Windows server and
-                  firewall unchanged.
+                  This WSL listener is externally managed. WSL/Hyper-V firewall policy controls
+                  external reachability, and BiBCode cannot switch it off automatically.
                 </span>
               ) : !hasDesktopBridge ? (
                 <span className="block">
@@ -370,6 +406,25 @@ export function ShareThisHostTab(): ReactElement {
                   Paired clients from an earlier version keep remote access on. Revoke or re-pair
                   them to allow automatic switch-off.
                 </span>
+              ) : null}
+              {canResumeLegacy ? (
+                <span className="block space-y-2 pt-1">
+                  <span className="block text-warning">
+                    This host was previously shared with clients whose reach is unknown. Resume only
+                    if you still trust those clients, or re-pair them for automatic exposure.
+                  </span>
+                  <Button
+                    disabled={isResumingLegacy}
+                    size="xs"
+                    variant="outline"
+                    onClick={() => void handleResumeLegacy()}
+                  >
+                    {isResumingLegacy ? "Resuming…" : "Resume legacy remote access"}
+                  </Button>
+                </span>
+              ) : null}
+              {legacyResumeError ? (
+                <span className="block text-destructive">{legacyResumeError}</span>
               ) : null}
             </span>
           }

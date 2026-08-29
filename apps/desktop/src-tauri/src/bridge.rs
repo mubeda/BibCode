@@ -432,8 +432,24 @@ fn update_desktop_settings<R: Runtime>(
 
 fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunConfig>) -> Value {
     if let Some(config) = config {
+        let management = if settings.wsl_only || config.running_distro.is_some() {
+            "external"
+        } else {
+            "native"
+        };
+        let actual_mode = config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|host| !host.is_loopback())
+            .map_or(
+                config.server_exposure_mode.as_str(),
+                |_| "network-accessible",
+            );
         return json!({
-            "mode": &config.server_exposure_mode,
+            "mode": actual_mode,
+            "configuredMode": &settings.server_exposure_mode,
+            "management": management,
             "endpointUrl": &config.endpoint_url,
             "advertisedHost": &config.advertised_host,
             "tailscaleServeEnabled": config.tailscale_serve_enabled,
@@ -443,6 +459,8 @@ fn server_exposure_state(settings: &DesktopSettings, config: Option<&BackendRunC
 
     json!({
         "mode": &settings.server_exposure_mode,
+        "configuredMode": &settings.server_exposure_mode,
+        "management": if settings.wsl_only { "external" } else { "native" },
         "endpointUrl": null,
         "advertisedHost": null,
         "tailscaleServeEnabled": settings.tailscale_serve_enabled,
@@ -2323,6 +2341,8 @@ mod tests {
             server_exposure_state(&settings, None),
             json!({
                 "mode": "local-only",
+                "configuredMode": "local-only",
+                "management": "native",
                 "endpointUrl": null,
                 "advertisedHost": null,
                 "tailscaleServeEnabled": true,
@@ -2338,8 +2358,29 @@ mod tests {
             server_exposure_state(&settings, Some(&config)),
             json!({
                 "mode": "network-accessible",
+                "configuredMode": "local-only",
+                "management": "native",
                 "endpointUrl": "http://192.168.1.20:13773",
                 "advertisedHost": "192.168.1.20",
+                "tailscaleServeEnabled": false,
+                "tailscaleServePort": 443,
+            })
+        );
+
+        settings.wsl_only = true;
+        config.running_distro = Some("Ubuntu".to_owned());
+        config.bind_host = "0.0.0.0".to_owned();
+        config.server_exposure_mode = "local-only".to_owned();
+        config.endpoint_url = None;
+        config.advertised_host = None;
+        assert_eq!(
+            server_exposure_state(&settings, Some(&config)),
+            json!({
+                "mode": "network-accessible",
+                "configuredMode": "local-only",
+                "management": "external",
+                "endpointUrl": null,
+                "advertisedHost": null,
                 "tailscaleServeEnabled": false,
                 "tailscaleServePort": 443,
             })
