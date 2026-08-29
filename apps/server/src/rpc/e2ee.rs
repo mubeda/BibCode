@@ -41,6 +41,7 @@ pub(crate) const MAX_E2EE_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_E2EE_PREAUTH_MESSAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_E2EE_RECORDS_PER_MESSAGE: usize = 2_048;
 const E2EE_INBOUND_RECORD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const E2EE_LOGICAL_WRITE_BYTES_PER_SECOND: usize = 64 * 1024;
 /// One deadline covering upgrade -> handshake -> e2ee_authenticated.
 pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Wrong pinned key: the responder cannot decrypt Message 1 and closes with this code.
@@ -905,20 +906,31 @@ async fn send_established_encrypted_message<W>(
     writer: &mut W,
     channel: &Arc<Mutex<E2eeChannel>>,
     plaintext: &[u8],
-    deadline: Instant,
+    started_at: Instant,
 ) -> Result<(), E2eeSessionError>
 where
     W: Sink<Message> + Unpin,
 {
+    let size_seconds = plaintext
+        .len()
+        .div_ceil(E2EE_LOGICAL_WRITE_BYTES_PER_SECOND);
+    let size_allowance = Duration::from_secs(u64::try_from(size_seconds).unwrap_or(u64::MAX));
+    let aggregate_deadline = started_at
+        .checked_add(SOCKET_WRITE_TIMEOUT.saturating_add(size_allowance))
+        .ok_or(E2eeSessionError::Timeout)?;
     for (flag, chunk) in plaintext_records(plaintext)? {
         let frame = channel
             .lock()
             .expect("E2EE channel lock")
             .encrypt_record(flag, chunk)?;
-        timeout_at(deadline, writer.send(Message::Binary(frame.into())))
-            .await
-            .map_err(|_| E2eeSessionError::Timeout)?
-            .map_err(|_| E2eeSessionError::Closed)?;
+        let record_deadline = Instant::now() + SOCKET_WRITE_TIMEOUT;
+        timeout_at(
+            record_deadline.min(aggregate_deadline),
+            writer.send(Message::Binary(frame.into())),
+        )
+        .await
+        .map_err(|_| E2eeSessionError::Timeout)?
+        .map_err(|_| E2eeSessionError::Closed)?;
     }
     Ok(())
 }
@@ -990,7 +1002,7 @@ async fn run_established_e2ee(
                 &mut ws_writer,
                 &outbound_channel,
                 plaintext,
-                Instant::now() + SOCKET_WRITE_TIMEOUT,
+                Instant::now(),
             )
             .await
             .is_err()
@@ -1071,9 +1083,7 @@ async fn run_established_e2ee(
         session_shutdown.clone(),
         Some(RpcOutboundBudget::new(
             E2EE_RESOURCE_BUDGET.global_outbound(),
-            Arc::new(Semaphore::new(
-                E2EE_OUTBOUND_BUFFER_BUDGET_BYTES_PER_CONNECTION,
-            )),
+            E2EE_OUTBOUND_BUFFER_BUDGET_BYTES_PER_CONNECTION,
         )),
     )
     .await;
@@ -1395,7 +1405,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn outbound_logical_message_uses_one_absolute_write_deadline() {
+    async fn outbound_logical_message_accepts_progress_across_record_deadlines() {
+        let (_initiator, responder) = establish().await;
+        let channel = Arc::new(Mutex::new(responder));
+        let mut writer = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _message: Message| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok::<_, std::convert::Infallible>(())
+            },
+        ));
+        let plaintext = vec![b'x'; MAX_E2EE_CHUNK_BYTES * 6];
+        let started = tokio::time::Instant::now();
+
+        send_established_encrypted_message(&mut writer, &channel, &plaintext, started)
+            .await
+            .expect("record-level progress keeps the logical message alive");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(6)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbound_logical_message_rejects_a_stalled_record() {
+        let (_initiator, responder) = establish().await;
+        let channel = Arc::new(Mutex::new(responder));
+        let mut writer = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _message: Message| async move {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Ok::<_, std::convert::Infallible>(())
+            },
+        ));
+        let started = tokio::time::Instant::now();
+
+        assert!(matches!(
+            send_established_encrypted_message(&mut writer, &channel, b"stalled", started).await,
+            Err(E2eeSessionError::Timeout)
+        ));
+        assert_eq!(tokio::time::Instant::now() - started, SOCKET_WRITE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbound_logical_message_enforces_the_size_derived_total_deadline() {
         let (_initiator, responder) = establish().await;
         let channel = Arc::new(Mutex::new(responder));
         let mut writer = Box::pin(futures_util::sink::unfold(
@@ -1409,16 +1462,13 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         assert!(matches!(
-            send_established_encrypted_message(
-                &mut writer,
-                &channel,
-                &plaintext,
-                started + SOCKET_WRITE_TIMEOUT,
-            )
-            .await,
+            send_established_encrypted_message(&mut writer, &channel, &plaintext, started).await,
             Err(E2eeSessionError::Timeout)
         ));
-        assert_eq!(tokio::time::Instant::now() - started, SOCKET_WRITE_TIMEOUT);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(6)
+        );
     }
 
     #[tokio::test]
