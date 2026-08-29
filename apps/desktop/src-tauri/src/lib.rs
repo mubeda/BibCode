@@ -273,6 +273,7 @@ mod config;
 mod context_menu;
 mod data_safety;
 mod firewall;
+mod network_interfaces;
 mod preview;
 mod remote_update_delegate;
 mod security;

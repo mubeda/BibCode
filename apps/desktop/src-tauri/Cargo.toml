@@ -19,6 +19,7 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
+if-addrs.workspace = true
 libc.workspace = true
 portpicker.workspace = true
 reqwest.workspace = true
