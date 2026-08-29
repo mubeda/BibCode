@@ -116,10 +116,14 @@ Capture visual evidence for all exposure-compensation outcomes, using a
 test-owned server/profile and controlled failure injection where required:
 
 - a mint failure after widening plus successful cleanup shows **The offer was
-  not created. Remote access was restored to local-only.**, and native state is
+  not created. Remote access is confirmed local-only.**, and native state is
   local-only;
-- the same mint failure plus failed cleanup shows the explicit remote-access
-  cleanup failure and does not claim local-only restoration;
+- a concurrent live grant shows that remote access remains enabled for another
+  live access reason;
+- an unconfirmed cancellation says exposure was deliberately left unchanged
+  because a live credential may exist; and
+- a confirmed cancellation plus failed cleanup says topology could not be
+  verified and does not claim local-only restoration;
 - consuming an off-host offer through the browser keeps exposure wide, and
   revoking that last browser session causes one local-only restart; and
 - when a new off-host grant appears during narrowing, the one post-narrow read
@@ -128,6 +132,10 @@ test-owned server/profile and controlled failure injection where required:
   deadline, completes the bounded retry/cancel path, and reports either verified
   local-only cleanup or explicit cancellation/cleanup failure instead of
   remaining indefinitely in the generating state.
+- a prior network-accessible native configuration with only legacy grants starts
+  local-only and widens only after **Resume legacy remote access** is selected;
+- unmounting the reconciler or switching to WSL-only while a state read is in
+  flight prevents every later privileged exposure apply.
 
 Record the exposure mode, grant/session row, restart boundary, visible message,
 and screenshot for each outcome. Do not use a later app restart as substitute
@@ -142,15 +150,24 @@ vp test packages/client-runtime/src/rpc/session.test.ts
 cargo test -p bibcode-server --test auth_http plain_websocket_connected_state_tracks_the_completed_upgrade_lifecycle -- --exact
 cargo test -p bibcode-server --test auth_http auth_routes_include_browser_cors_and_preflight_headers -- --exact
 cargo test -p bibcode-server --test e2ee_ws oversized_pre_auth_websocket_message_is_rejected -- --exact
+cargo test -p bibcode-server --test e2ee_ws preauth_peer_connection_cap_rejects_the_fifth_connection -- --exact
 cargo test -p bibcode-server --test e2ee_ws established_capacity_is_partitioned_by_principal_and_released_on_close -- --exact
 cargo test -p bibcode-server --test e2ee_ws inbound_plaintext_capacity_is_partitioned_by_principal_and_released_on_close -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::preauth_admission_partitions_slots_and_refills_peer_tokens --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::inbound_empty_continuations_and_excessive_fragmentation_are_rejected --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::inbound_global_pressure_waits_for_capacity_instead_of_closing_the_victim --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::incomplete_minted_session_delivery_is_compensated --lib -- --exact
+cargo test -p bibcode-server rpc::e2ee::tests::outbound_logical_message_uses_one_absolute_write_deadline --lib -- --exact
 cargo test -p bibcode-server rpc::e2ee::tests::completed_messages_retain_their_global_buffer_budget --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::outbound_process_budget_is_fit_first_then_admits_the_aged_large_waiter --lib -- --exact
+cargo test -p bibcode-server rpc::session::tests::outbound_process_budget_refunds_a_cancelled_waiter_immediately --lib -- --exact
 cargo test -p bibcode-server rpc::session::tests::slow_socket_cannot_hide_more_than_one_large_response_in_the_session_queue --lib -- --exact
 cargo test -p bibcode-server rpc::session::tests::slow_sockets_share_one_process_outbound_plaintext_budget --lib -- --exact
 cargo test -p bibcode-server rpc::session::tests::response_larger_than_the_connection_budget_fails_the_session_closed --lib -- --exact
 cargo test -p bibcode-server rpc::session::tests::byte_and_queue_admission_share_one_five_second_deadline --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::completed_pairing_offer_replays_and_cancels_after_restart --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_can_be_cancelled_after_restart --lib -- --exact
+cargo test -p bibcode-server auth::service::tests::pending_pairing_offer_recovers_for_retry_after_restart --lib -- --exact
 cargo test -p bibcode-server auth::service::tests::remote_offer_cancellation_converges_dormant_share_state_and_access_events --lib -- --exact
 cargo test -p bibcode-server --lib keeps_one_service_watcher -- --nocapture
 cargo test -p bibcode-server auth::service::tests::cross_service_authentication_starts_watcher_for_the_cached_session --lib -- --exact
@@ -158,6 +175,7 @@ cargo test -p bibcode-server --test repositories pairing_offer_reservations_enfo
 cargo test -p bibcode-server --test auth_http pairing_offer_authority_is_shared_across_simultaneously_live_servers -- --exact
 cargo test -p bibcode-server --test auth_http remote_revocation_closes_an_acked_live_stream_before_later_events -- --exact
 cargo test -p bibcode-desktop firewall::tests --lib -- --nocapture
+vp test packages/client-runtime/src/connection/registry.test.ts packages/client-runtime/src/state/remoteUpdates.test.ts apps/web/src/connection/databaseHealth.test.ts apps/web/src/components/ConnectionDatabaseRecoveryDialog.test.tsx
 ```
 
 ### Direct E2EE interop gate
@@ -240,8 +258,10 @@ The smoke test must cover descriptor negotiation, administrative token
 exchange, an off-host pairing offer, pinned-host Noise NK authentication,
 authenticated E2EE RPC, `updater.status`, `updater.check`, the typed manual
 install failure, browser-session share-state retention, client revocation, and
-the final loopback share state. It must also cancel an ambiguously delivered
-pairing offer and prove that a delayed retry cannot recreate its grant. The
+the final loopback share state. It must also reject a fifth silent pre-auth
+socket from one peer, close an authenticated connection that exceeds the
+2,048-record logical-message limit, cancel an ambiguously delivered pairing
+offer, and prove that a delayed retry cannot recreate its grant. The
 test containers disable SELinux process labeling because both host bind mounts
 are read-only; this keeps the command portable on enforcing hosts without
 relabeling the worktree. The client receives a narrow tmpfs for Vite's generated

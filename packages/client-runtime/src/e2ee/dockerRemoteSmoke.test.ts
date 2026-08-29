@@ -50,6 +50,8 @@ const decodePairingOfferCancellation = Schema.decodeUnknownSync(
   Schema.toCodecJson(AuthPairingOfferCancellationResult),
 );
 const decodeSession = Schema.decodeUnknownSync(Schema.toCodecJson(AuthSessionState));
+const E2EE_RECORD_FLAG_CONTINUATION = 0x01;
+const MAX_E2EE_RECORDS_PER_MESSAGE = 2_048;
 
 const RpcSuccess = Schema.TaggedStruct("Exit", {
   requestId: Schema.String,
@@ -156,6 +158,64 @@ async function assertRemoteUpdateRpc(channel: EncryptedTestSocket): Promise<void
     _tag: "RemoteUpdateInstallError",
     code: "remote_update_manual_required",
   });
+}
+
+interface SilentPreauthSocket {
+  readonly socket: WebSocket;
+  readonly closed: Promise<CloseEvent>;
+}
+
+async function openSilentPreauthSocket(): Promise<SilentPreauthSocket> {
+  const socket = new WebSocket(`${serverUrl!.replace(/^http/, "ws")}/ws-e2ee`);
+  const closed = new Promise<CloseEvent>((resolve) => {
+    socket.addEventListener("close", (event) => resolve(event), { once: true });
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("error", () => reject(new Error("pre-auth socket failed to open")), {
+      once: true,
+    });
+  });
+  return { socket, closed };
+}
+
+async function waitForClose(socket: SilentPreauthSocket): Promise<CloseEvent> {
+  return await Promise.race([
+    socket.closed,
+    NodeTimersPromises.setTimeout(5_000).then(() => {
+      throw new Error("timed out waiting for pre-auth socket close");
+    }),
+  ]);
+}
+
+async function assertPreauthPeerOverflowIsRejected(): Promise<void> {
+  const admitted: SilentPreauthSocket[] = [];
+  try {
+    for (let index = 0; index < 4; index += 1) {
+      admitted.push(await openSilentPreauthSocket());
+      // The WebSocket open event can precede the server task acquiring its
+      // peer lease. Give the local cross-container hop time to publish each
+      // admission before the fifth socket probes the per-peer limit.
+      await NodeTimersPromises.setTimeout(25);
+    }
+    const overflow = await openSilentPreauthSocket();
+    const close = await waitForClose(overflow);
+    expect(close.code).toBe(1013);
+    expect(close.reason).toBe("busy");
+  } finally {
+    const closes = admitted.map((socket) => waitForClose(socket));
+    for (const { socket } of admitted) socket.close();
+    await Promise.all(closes);
+    // Let the server observe every close before the next smoke-test phase
+    // opens its authenticated socket.
+    await NodeTimersPromises.setTimeout(25);
+  }
+}
+
+async function assertRecordCountOverflowCloses(channel: EncryptedTestSocket): Promise<void> {
+  const continuation = Uint8Array.of(E2EE_RECORD_FLAG_CONTINUATION, 0x78);
+  channel.sendRecords(Array.from({ length: MAX_E2EE_RECORDS_PER_MESSAGE + 1 }, () => continuation));
+  await expect(channel.nextMessage()).rejects.toThrow("E2EE WebSocket closed");
 }
 
 async function shareState(administrator: string) {
@@ -335,6 +395,7 @@ describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
     it("pairs, runs E2EE RPC, retains browser exposure, updates, and revokes", async () => {
       await assertDescriptor();
       const administrator = await exchangeAdministrativeCredential();
+      await assertPreauthPeerOverflowIsRejected();
       const e2eeLabel = "docker-e2ee";
       const payload = await createOffHostOffer(administrator, e2eeLabel);
       const channel = await openEncryptedTestSocket(
@@ -351,7 +412,7 @@ describe.skipIf(serverUrl === undefined || adminCredential === undefined)(
       });
 
       await assertRemoteUpdateRpc(channel);
-      channel.close();
+      await assertRecordCountOverflowCloses(channel);
       await assertBrowserPairingRetainsAndRevokesExposure(administrator, e2eeLabel);
       await assertAmbiguousOfferCancellation(administrator);
     }, 60_000);

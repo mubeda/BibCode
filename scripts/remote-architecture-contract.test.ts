@@ -15,7 +15,8 @@ describe("remote architecture contract", () => {
 
     expect(remote).toContain("browser-session-cookie");
     expect(remote).toContain("persists network-accessible only after");
-    expect(remote).toContain("interrupted exchange may consume the one-time token");
+    expect(remote).toContain("best-effort revocation of the undelivered session");
+    expect(remote).toContain("The one-time token remains consumed");
     expect(remote).not.toContain("transport loss leaves it retryable");
   });
 });
