@@ -777,7 +777,7 @@ async fn process_client_message(
     dispatch: &DispatchContext<'_>,
     in_flight: &mut HashMap<RequestId, InFlight>,
     received_eof: &mut bool,
-    inbound_guard: Option<SharedRpcInboundGuard>,
+    _inbound_guard: Option<SharedRpcInboundGuard>,
 ) -> Result<(), ()> {
     if *received_eof && matches!(message, ClientMessage::Request { .. }) {
         return Ok(());
@@ -912,14 +912,7 @@ async fn process_client_message(
                     .await;
                 }
             };
-            spawn_request(
-                request,
-                method,
-                admission,
-                dispatch,
-                in_flight,
-                inbound_guard,
-            );
+            spawn_request(request, method, admission, dispatch, in_flight);
             Ok(())
         }
     }
@@ -931,7 +924,6 @@ fn spawn_request(
     admission: RpcPermit,
     dispatch: &DispatchContext<'_>,
     in_flight: &mut HashMap<RequestId, InFlight>,
-    inbound_guard: Option<SharedRpcInboundGuard>,
 ) {
     let request_id = request.id.clone();
     let cancellation = CancellationToken::new();
@@ -952,7 +944,6 @@ fn spawn_request(
     let request_shutdown = session_shutdown.clone();
     let task = tokio::spawn(async move {
         let _admission = admission;
-        let _inbound_guard = inbound_guard;
         let execution = AssertUnwindSafe(async move {
             match method {
                 RpcMethod::Unary(handler) => {
@@ -1433,6 +1424,16 @@ mod tests {
         }
     }
 
+    struct InboundDropNotification(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for InboundDropNotification {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
     fn request_frame(ids: &[&str], tag: &str) -> RpcInboundFrame {
         RpcInboundFrame::plain(Message::Text(
             serde_json::to_string(
@@ -1480,6 +1481,62 @@ mod tests {
         .await
         .expect("send observes cancellation")
         .expect_err("cancelled session rejects outbound messages");
+    }
+
+    #[tokio::test]
+    async fn inbound_guard_is_released_after_dispatch_not_handler_completion() {
+        let (handler_started_tx, handler_started_rx) = tokio::sync::oneshot::channel();
+        let handler_started_tx = Arc::new(std::sync::Mutex::new(Some(handler_started_tx)));
+        let mut registry = RpcRegistry::empty();
+        registry.register_unary("test.pending", move |_request, _cancellation| {
+            let handler_started_tx = Arc::clone(&handler_started_tx);
+            async move {
+                if let Some(sender) = handler_started_tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+                std::future::pending::<RpcResult>().await
+            }
+        });
+        let (guard_dropped_tx, guard_dropped_rx) = tokio::sync::oneshot::channel();
+        let plain = request_frame(&["1"], "test.pending");
+        let guarded = RpcInboundFrame::guarded(
+            plain.message,
+            InboundDropNotification(Some(guard_dropped_tx)),
+        );
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let reader = stream::unfold(inbound_rx, |mut receiver| async {
+            receiver.recv().await.map(|item| (Ok(item), receiver))
+        });
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(run_session_split_budgeted(
+            BlockedSocketSink::default(),
+            reader,
+            registry,
+            RpcSessionContext::unauthenticated(),
+            shutdown.clone(),
+            None,
+        ));
+
+        inbound_tx.send(guarded).await.expect("guarded request");
+        timeout(Duration::from_secs(1), handler_started_rx)
+            .await
+            .expect("handler dispatches")
+            .expect("handler start signal");
+        timeout(Duration::from_secs(1), guard_dropped_rx)
+            .await
+            .expect("input budget releases after dispatch")
+            .expect("guard drop signal");
+
+        shutdown.cancel();
+        drop(inbound_tx);
+        timeout(Duration::from_secs(2), session)
+            .await
+            .expect("session cleanup deadline")
+            .expect("session joins");
     }
 
     #[tokio::test]

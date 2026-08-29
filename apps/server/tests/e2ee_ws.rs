@@ -655,6 +655,30 @@ async fn preauth_message_cap_is_64kib() {
 }
 
 #[tokio::test]
+async fn authenticated_empty_continuation_is_rejected() {
+    let _permit = TEST_PERMIT.acquire().await.expect("test permit");
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_server(&temp).await;
+    let startup = handle.startup_access().expect("startup pairing");
+    let (mut socket, mut transport, reply) =
+        pair_inside_channel(&handle, temp.path(), &startup.credential).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+
+    let frame = encrypt_record(&mut transport, RECORD_CONTINUATION, b"");
+    socket
+        .send(Message::Binary(frame.into()))
+        .await
+        .expect("send empty continuation");
+    let outcome = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("server rejects invalid fragmentation");
+    assert!(matches!(
+        outcome,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
+}
+
+#[tokio::test]
 async fn handshake_timeout_closes_the_socket() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");

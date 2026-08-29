@@ -7,6 +7,7 @@ import {
   MAX_E2EE_CHUNK_BYTES,
   MAX_E2EE_LOGICAL_MESSAGE_BYTES,
   MAX_E2EE_PREAUTH_MESSAGE_BYTES,
+  MAX_E2EE_RECORDS_PER_MESSAGE,
   plaintextRecords,
   RecordAssembler,
   splitIntoRecords,
@@ -106,6 +107,19 @@ describe("e2ee record layer", () => {
         overflowing.push(chunk);
       }
     }).toThrow(E2eeFrameError);
+  });
+
+  it("rejects empty continuations and more than 2,048 records", () => {
+    const emptyContinuation = Uint8Array.of(E2EE_RECORD_FLAG_CONTINUATION);
+    expect(() => new RecordAssembler().push(emptyContinuation)).toThrow("empty E2EE continuation");
+
+    const assembler = new RecordAssembler();
+    for (let index = 0; index < MAX_E2EE_RECORDS_PER_MESSAGE; index += 1) {
+      expect(assembler.push(Uint8Array.of(E2EE_RECORD_FLAG_CONTINUATION, 1))).toBeNull();
+    }
+    expect(() => assembler.push(Uint8Array.of(E2EE_RECORD_FLAG_FINAL))).toThrow(
+      "E2EE record count overflow",
+    );
   });
 
   it("refuses to split payloads beyond the logical cap", () => {
