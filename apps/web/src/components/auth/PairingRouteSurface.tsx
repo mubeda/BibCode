@@ -172,16 +172,15 @@ export function HostedPairingRouteSurface() {
     reportFailure: false,
   });
   const hostedPairingRequestRef = useRef(readHostedPairingRequest());
-  const [status, setStatus] = useState<"pairing" | "paired" | "error">(() =>
-    hostedPairingRequestRef.current ? "pairing" : "error",
+  const [status, setStatus] = useState<"confirm" | "pairing" | "paired" | "error">(() =>
+    hostedPairingRequestRef.current ? "confirm" : "error",
   );
   const [message, setMessage] = useState(() =>
     hostedPairingRequestRef.current
-      ? "Connecting to this backend."
+      ? "Review the backend address before submitting this one-time pairing token."
       : "This pairing link is missing its backend host or token.",
   );
-  const [canRetry, setCanRetry] = useState(false);
-  const submitAttemptedRef = useRef(false);
+  const tokenStrippedRef = useRef(false);
   const tokenSubmittedRef = useRef(false);
 
   const submitHostedPairingRequest = useCallback(async () => {
@@ -190,20 +189,17 @@ export function HostedPairingRouteSurface() {
     if (!request) {
       setStatus("error");
       setMessage("This pairing link is missing its backend host or token.");
-      setCanRetry(false);
       return;
     }
 
     if (tokenSubmittedRef.current) {
       setStatus("error");
       setMessage("This one-time pairing token was already submitted. Request a new pairing link.");
-      setCanRetry(false);
       return;
     }
 
     setStatus("pairing");
     setMessage("Connecting to this backend.");
-    setCanRetry(false);
     tokenSubmittedRef.current = true;
 
     const result = await connectPairingEnvironment({
@@ -216,23 +212,20 @@ export function HostedPairingRouteSurface() {
       return;
     }
 
-    tokenSubmittedRef.current = false;
     setStatus("error");
-    setCanRetry(true);
     setMessage(
-      `${errorMessageFromUnknown(squashAtomCommandFailure(result))} If the backend accepted this one-time token, request a new pairing link before retrying.`,
+      `${errorMessageFromUnknown(squashAtomCommandFailure(result))} This one-time token may already have been accepted; request a new pairing link before trying again.`,
     );
   }, [connectPairingEnvironment]);
 
   useEffect(() => {
-    if (submitAttemptedRef.current) {
+    if (tokenStrippedRef.current) {
       return;
     }
-    submitAttemptedRef.current = true;
+    tokenStrippedRef.current = true;
 
     stripPairingTokenFromUrl();
-    void submitHostedPairingRequest();
-  }, [submitHostedPairingRequest]);
+  }, []);
 
   const request = hostedPairingRequestRef.current;
 
@@ -253,7 +246,9 @@ export function HostedPairingRouteSurface() {
             ? "Backend paired"
             : status === "error"
               ? "Pairing failed"
-              : "Pairing backend"}
+              : status === "pairing"
+                ? "Pairing backend"
+                : "Pair this backend"}
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{message}</p>
 
@@ -271,13 +266,13 @@ export function HostedPairingRouteSurface() {
         ) : null}
 
         <div className="mt-6 flex flex-wrap gap-2">
-          {status === "pairing" ? (
+          {status === "confirm" ? (
+            <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
+              Pair this backend
+            </Button>
+          ) : status === "pairing" ? (
             <Button disabled size="sm">
               Pairing...
-            </Button>
-          ) : canRetry ? (
-            <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
-              Try again
             </Button>
           ) : null}
           {status === "paired" ? (
