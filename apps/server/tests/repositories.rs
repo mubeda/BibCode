@@ -365,6 +365,7 @@ fn public_repository_api_inventory_is_explicit() {
         "prepare_reserved_command_receipt",
         "prune_and_list_active_auth_pairing_offers",
         "prune_and_get_active_auth_pairing_offer",
+        "recover_pending_auth_pairing_offer",
         "new",
         "read_events_from_sequence",
         "release_reserved_command_receipt",
@@ -1882,6 +1883,74 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
     assert!(tombstone[0].pairing_id.is_none());
     assert!(tombstone[0].result.is_none());
     assert_eq!(tombstone[0].cancelled_at.as_deref(), Some(TIME_3));
+}
+
+#[tokio::test]
+async fn pending_pairing_offer_recovery_revokes_the_grant_and_releases_the_key() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .create_auth_pairing_link_with_offer(
+            pairing_offer_link(17),
+            NewAuthPairingOffer {
+                principal_id: "principal".to_owned(),
+                idempotency_key: "interrupted-request".to_owned(),
+                input_fingerprint: "same-input".to_owned(),
+                expires_at: FUTURE.to_owned(),
+            },
+        )
+        .await
+        .expect("pending pairing offer");
+
+    assert!(
+        repositories
+            .recover_pending_auth_pairing_offer(
+                "principal".to_owned(),
+                "interrupted-request".to_owned(),
+                "different-input".to_owned(),
+                T2.to_owned(),
+            )
+            .await
+            .expect("conflicting recovery lookup")
+            .is_none(),
+        "a conflicting request must not abandon another request's grant"
+    );
+    assert_eq!(
+        repositories
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("conflicting recovery preserves the grant")
+            .len(),
+        1
+    );
+
+    let recovered = repositories
+        .recover_pending_auth_pairing_offer(
+            "principal".to_owned(),
+            "interrupted-request".to_owned(),
+            "same-input".to_owned(),
+            T2.to_owned(),
+        )
+        .await
+        .expect("atomic pending-offer recovery");
+    assert_eq!(recovered.as_deref(), Some("pairing-quota-17"));
+    assert!(
+        repositories
+            .list_active_auth_pairing_links(T2.to_owned())
+            .await
+            .expect("abandoned grant lookup")
+            .is_empty()
+    );
+    assert!(
+        repositories
+            .prune_and_get_active_auth_pairing_offer(
+                "principal".to_owned(),
+                "interrupted-request".to_owned(),
+                T2.to_owned(),
+            )
+            .await
+            .expect("released idempotency key lookup")
+            .is_none()
+    );
 }
 
 #[tokio::test]
