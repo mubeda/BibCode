@@ -727,11 +727,17 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentRegistry.connect"),
     );
   const disconnect = (environmentId: EnvironmentId) =>
-    acquireSupervisor(environmentId).pipe(
-      Effect.flatMap((supervisor) => supervisor.disconnect),
-      Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
-      Effect.withSpan("EnvironmentRegistry.disconnect"),
-    );
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const supervisor = (yield* SubscriptionRef.get(serviceScopes)).get(
+          environmentId,
+        )?.supervisor;
+        if (supervisor !== undefined) {
+          yield* supervisor.disconnect;
+        }
+      }),
+    ).pipe(Effect.withSpan("EnvironmentRegistry.disconnect"));
   const acceptStorageIdentity = Effect.fn("EnvironmentRegistry.acceptStorageIdentity")(function* (
     environmentId: EnvironmentId,
   ) {
