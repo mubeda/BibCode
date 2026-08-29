@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{ServerConfig, ServerHandle, ServerRuntime};
@@ -7,9 +11,13 @@ use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use snow::TransportState;
 use tempfile::TempDir;
-use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
+use tokio::{
+    net::{TcpSocket, TcpStream},
+    sync::Semaphore,
+    time::timeout,
+};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async, connect_async,
     tungstenite::{
         Message,
         client::IntoClientRequest,
@@ -22,7 +30,7 @@ const MAX_CIPHERTEXT_BYTES: usize = 65_535;
 const MAX_CHUNK_BYTES: usize = 65_518;
 const RECORD_FINAL: u8 = 0;
 const RECORD_CONTINUATION: u8 = 1;
-const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
+const E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER: usize = 4;
 const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
 const E2EE_INBOUND_BUFFER_BUDGET_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -65,6 +73,20 @@ async fn open_socket(address: SocketAddr) -> TestSocket {
         .0
 }
 
+async fn open_socket_from(address: SocketAddr, source_ip: Ipv4Addr) -> TestSocket {
+    let tcp = TcpSocket::new_v4().expect("IPv4 client socket");
+    tcp.bind(SocketAddr::new(IpAddr::V4(source_ip), 0))
+        .expect("bind loopback source address");
+    let stream = tcp.connect(address).await.expect("connect from source IP");
+    client_async(
+        ws_url(address, "/ws-e2ee").into_client_request().unwrap(),
+        MaybeTlsStream::Plain(stream),
+    )
+    .await
+    .expect("open /ws-e2ee from source IP")
+    .0
+}
+
 fn initiator(host_key: &[u8]) -> snow::HandshakeState {
     snow::Builder::new(NOISE_NK_PARAMS.parse().expect("Noise parameters"))
         .remote_public_key(host_key)
@@ -74,7 +96,18 @@ fn initiator(host_key: &[u8]) -> snow::HandshakeState {
 }
 
 async fn noise_connect(address: SocketAddr, host_key: &[u8]) -> (TestSocket, TransportState) {
-    let mut socket = open_socket(address).await;
+    noise_connect_on(open_socket(address).await, host_key).await
+}
+
+async fn noise_connect_from(
+    address: SocketAddr,
+    host_key: &[u8],
+    source_ip: Ipv4Addr,
+) -> (TestSocket, TransportState) {
+    noise_connect_on(open_socket_from(address, source_ip).await, host_key).await
+}
+
+async fn noise_connect_on(mut socket: TestSocket, host_key: &[u8]) -> (TestSocket, TransportState) {
     let mut initiator = initiator(host_key);
     let mut message_a = vec![0_u8; MAX_CIPHERTEXT_BYTES];
     let len = initiator
@@ -230,6 +263,26 @@ async fn open_authenticated_bearer_socket(
     credential: &str,
 ) -> (TestSocket, TransportState, Value) {
     let (mut socket, mut transport) = noise_connect(handle.local_addr(), host_key).await;
+    send_encrypted(
+        &mut socket,
+        &mut transport,
+        json!({ "type": "e2ee_auth", "bearer": credential })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    let reply = recv_encrypted_json(&mut socket, &mut transport).await;
+    (socket, transport, reply)
+}
+
+async fn open_authenticated_bearer_socket_from(
+    handle: &ServerHandle,
+    host_key: &[u8],
+    credential: &str,
+    source_ip: Ipv4Addr,
+) -> (TestSocket, TransportState, Value) {
+    let (mut socket, mut transport) =
+        noise_connect_from(handle.local_addr(), host_key, source_ip).await;
     send_encrypted(
         &mut socket,
         &mut transport,
@@ -617,13 +670,13 @@ async fn handshake_timeout_closes_the_socket() {
 }
 
 #[tokio::test]
-async fn preauth_connection_cap_rejects_the_overflow_connection() {
+async fn preauth_peer_connection_cap_rejects_the_fifth_connection() {
     let _permit = TEST_PERMIT.acquire().await.expect("test permit");
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_server(&temp).await;
     let host_key = read_host_public_key(temp.path());
-    let mut stalled = Vec::with_capacity(E2EE_MAX_PREAUTH_CONNECTIONS);
-    for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS {
+    let mut stalled = Vec::with_capacity(E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER);
+    for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
         stalled.push(noise_connect(handle.local_addr(), &host_key).await);
     }
     let mut overflow = open_socket(handle.local_addr()).await;
@@ -678,20 +731,37 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
     let host_key = read_host_public_key(temp.path());
 
     let mut first_principal_sockets = Vec::new();
-    for _ in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
+    for index in 0..E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL {
+        let source_ip = Ipv4Addr::new(
+            127,
+            0,
+            0,
+            2 + u8::try_from(index / 4).expect("source address index fits u8"),
+        );
         let (socket, transport, reply) =
-            open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+            open_authenticated_bearer_socket_from(&handle, &host_key, &first_credential, source_ip)
+                .await;
         assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
         first_principal_sockets.push((socket, transport));
     }
 
-    let (mut overflow, _transport, reply) =
-        open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+    let (mut overflow, _transport, reply) = open_authenticated_bearer_socket_from(
+        &handle,
+        &host_key,
+        &first_credential,
+        Ipv4Addr::new(127, 0, 0, 2),
+    )
+    .await;
     assert_eq!(reply, json!({ "type": "e2ee_error", "code": "protocol" }));
     let _ = next_close_code(&mut overflow).await;
 
-    let (mut second_socket, _transport, reply) =
-        open_authenticated_bearer_socket(&handle, &host_key, &second_credential).await;
+    let (mut second_socket, _transport, reply) = open_authenticated_bearer_socket_from(
+        &handle,
+        &host_key,
+        &second_credential,
+        Ipv4Addr::new(127, 0, 0, 10),
+    )
+    .await;
     assert_eq!(reply, json!({ "type": "e2ee_authenticated" }));
     second_socket
         .close(None)
@@ -707,8 +777,13 @@ async fn established_capacity_is_partitioned_by_principal_and_released_on_close(
         .expect("close first principal socket");
     let mut replacement = timeout(Duration::from_secs(3), async {
         loop {
-            let (mut socket, transport, reply) =
-                open_authenticated_bearer_socket(&handle, &host_key, &first_credential).await;
+            let (mut socket, transport, reply) = open_authenticated_bearer_socket_from(
+                &handle,
+                &host_key,
+                &first_credential,
+                Ipv4Addr::new(127, 0, 0, 11),
+            )
+            .await;
             if reply == json!({ "type": "e2ee_authenticated" }) {
                 break (socket, transport);
             }

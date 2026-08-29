@@ -25,7 +25,7 @@ use crate::{
         server_terminal::ProcessTreeCleanup,
     },
     remote_update::RemoteUpdateDelegate,
-    rpc::RpcRegistry,
+    rpc::{E2eePreauthAdmission, RpcRegistry},
 };
 
 const SIGNING_KEY_NAME: &str = "server-signing-key";
@@ -360,6 +360,7 @@ impl ServerRuntime {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
             rpc_registry,
+            e2ee_preauth_admission: E2eePreauthAdmission::new(),
             http_routes,
             auth,
             admission_gate,
@@ -371,9 +372,12 @@ impl ServerRuntime {
         let task_log_sink = log_sink.clone();
         let task = tokio::spawn(async move {
             let _log_sink = task_log_sink;
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(server_shutdown.cancelled_owned())
-                .await;
+            let result = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .await;
             if let Some(runtime) = cleanup_runtime {
                 runtime.shutdown().await;
             }

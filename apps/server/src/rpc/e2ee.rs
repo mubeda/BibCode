@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
@@ -43,6 +44,10 @@ pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Wrong pinned key: the responder cannot decrypt Message 1 and closes with this code.
 pub(crate) const E2EE_HOST_IDENTITY_CLOSE_CODE: u16 = 4403;
 pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS: usize = 32;
+pub(crate) const E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER: usize = 4;
+const E2EE_PREAUTH_BURST_PER_PEER: u8 = 8;
+const E2EE_PREAUTH_REFILL_INTERVAL: Duration = Duration::from_secs(1);
+const E2EE_PREAUTH_PEER_STATE_TTL: Duration = Duration::from_secs(8);
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS: usize = 64;
 pub(crate) const E2EE_MAX_ESTABLISHED_CONNECTIONS_PER_PRINCIPAL: usize = 32;
 pub(crate) const E2EE_INBOUND_BUFFER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
@@ -98,8 +103,6 @@ fn plaintext_records(plaintext: &[u8]) -> Result<PlaintextRecords<'_>, E2eeSessi
     })
 }
 
-static E2EE_PREAUTH_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)));
 static E2EE_RESOURCE_BUDGET: LazyLock<E2eeResourceBudget> = LazyLock::new(|| {
     E2eeResourceBudget::new(
         E2EE_MAX_ESTABLISHED_CONNECTIONS,
@@ -109,6 +112,114 @@ static E2EE_RESOURCE_BUDGET: LazyLock<E2eeResourceBudget> = LazyLock::new(|| {
         E2EE_OUTBOUND_BUFFER_BUDGET_BYTES,
     )
 });
+
+#[derive(Clone)]
+pub(crate) struct E2eePreauthAdmission {
+    inner: Arc<E2eePreauthAdmissionInner>,
+}
+
+struct E2eePreauthAdmissionInner {
+    global: Arc<Semaphore>,
+    peers: Mutex<HashMap<IpAddr, E2eePreauthPeerState>>,
+}
+
+struct E2eePreauthPeerState {
+    active: usize,
+    tokens: u8,
+    last_refill: tokio::time::Instant,
+    last_activity: tokio::time::Instant,
+}
+
+struct E2eePreauthLease {
+    inner: Arc<E2eePreauthAdmissionInner>,
+    peer_ip: IpAddr,
+    _global: OwnedSemaphorePermit,
+}
+
+impl E2eePreauthAdmission {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(E2eePreauthAdmissionInner {
+                global: Arc::new(Semaphore::new(E2EE_MAX_PREAUTH_CONNECTIONS)),
+                peers: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    fn try_admit(
+        &self,
+        peer_ip: IpAddr,
+        now: tokio::time::Instant,
+    ) -> Result<E2eePreauthLease, &'static str> {
+        let global = Arc::clone(&self.inner.global)
+            .try_acquire_owned()
+            .map_err(|_| "busy")?;
+        let mut peers = self
+            .inner
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        peers.retain(|_, state| {
+            state.active > 0
+                || now.saturating_duration_since(state.last_activity) < E2EE_PREAUTH_PEER_STATE_TTL
+        });
+        let state = peers.entry(peer_ip).or_insert(E2eePreauthPeerState {
+            active: 0,
+            tokens: E2EE_PREAUTH_BURST_PER_PEER,
+            last_refill: now,
+            last_activity: now,
+        });
+        let elapsed_intervals = now.saturating_duration_since(state.last_refill).as_secs()
+            / E2EE_PREAUTH_REFILL_INTERVAL.as_secs();
+        if elapsed_intervals > 0 {
+            let replenished = u8::try_from(elapsed_intervals).unwrap_or(u8::MAX);
+            state.tokens = state
+                .tokens
+                .saturating_add(replenished)
+                .min(E2EE_PREAUTH_BURST_PER_PEER);
+            state.last_refill += E2EE_PREAUTH_REFILL_INTERVAL
+                .saturating_mul(u32::try_from(elapsed_intervals).unwrap_or(u32::MAX));
+        }
+        state.last_activity = now;
+        if state.active >= E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
+            return Err("busy");
+        }
+        if state.tokens == 0 {
+            return Err("rate");
+        }
+        state.tokens -= 1;
+        state.active += 1;
+        drop(peers);
+        Ok(E2eePreauthLease {
+            inner: Arc::clone(&self.inner),
+            peer_ip,
+            _global: global,
+        })
+    }
+
+    #[cfg(test)]
+    fn peer_count(&self) -> usize {
+        self.inner
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+impl Drop for E2eePreauthLease {
+    fn drop(&mut self) {
+        let mut peers = self
+            .inner
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(state) = peers.get_mut(&self.peer_ip) {
+            state.active = state.active.saturating_sub(1);
+            state.last_activity = tokio::time::Instant::now();
+        }
+    }
+}
 
 struct E2eeResourceBudget {
     global_established: Arc<Semaphore>,
@@ -570,12 +681,15 @@ enum EstablishOutcome {
 /// bootstrap, then the unchanged RPC protocol over encrypted records.
 pub(crate) async fn run_e2ee_session(
     socket: WebSocket,
+    peer_ip: IpAddr,
+    preauth_admission: E2eePreauthAdmission,
     auth: AuthService,
     registry: RpcRegistry,
     config: Arc<ServerConfig>,
     session_shutdown: CancellationToken,
 ) {
-    let Ok(preauth_permit) = Arc::clone(&E2EE_PREAUTH_PERMITS).try_acquire_owned() else {
+    let Ok(preauth_permit) = preauth_admission.try_admit(peer_ip, tokio::time::Instant::now())
+    else {
         let mut socket = socket;
         let _ = socket
             .send(Message::Close(Some(CloseFrame {
@@ -1035,6 +1149,62 @@ fn e2ee_client_metadata() -> crate::auth::ClientMetadata {
 mod tests {
     use super::*;
     use crate::auth::{HostIdentity, SessionTransport};
+
+    #[tokio::test(start_paused = true)]
+    async fn preauth_admission_partitions_slots_and_refills_peer_tokens() {
+        let admission = E2eePreauthAdmission::new();
+        let peer = "127.0.0.2".parse().expect("peer IP");
+        let now = tokio::time::Instant::now();
+        let mut leases = (0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER)
+            .map(|_| admission.try_admit(peer, now).expect("per-peer slot"))
+            .collect::<Vec<_>>();
+        assert!(matches!(admission.try_admit(peer, now), Err("busy")));
+
+        leases.clear();
+        for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
+            drop(
+                admission
+                    .try_admit(peer, now)
+                    .expect("remaining burst token"),
+            );
+        }
+        assert!(matches!(admission.try_admit(peer, now), Err("rate")));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(
+            admission
+                .try_admit(peer, tokio::time::Instant::now())
+                .expect("one token refills per second"),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preauth_admission_keeps_global_capacity_and_prunes_idle_peers() {
+        let admission = E2eePreauthAdmission::new();
+        let now = tokio::time::Instant::now();
+        let mut leases = Vec::new();
+        for peer_index in 1..=8 {
+            let peer = std::net::Ipv4Addr::new(127, 0, 1, peer_index).into();
+            for _ in 0..E2EE_MAX_PREAUTH_CONNECTIONS_PER_PEER {
+                leases.push(admission.try_admit(peer, now).expect("global slot"));
+            }
+        }
+        let overflow_peer = "127.0.2.1".parse().expect("overflow peer IP");
+        assert!(matches!(
+            admission.try_admit(overflow_peer, now),
+            Err("busy")
+        ));
+
+        leases.clear();
+        tokio::time::advance(E2EE_PREAUTH_PEER_STATE_TTL).await;
+        let trigger_peer = "127.0.3.1".parse().expect("trigger peer IP");
+        drop(
+            admission
+                .try_admit(trigger_peer, tokio::time::Instant::now())
+                .expect("released global slot"),
+        );
+        assert_eq!(admission.peer_count(), 1);
+    }
 
     #[tokio::test]
     async fn incomplete_minted_session_delivery_is_compensated() {
