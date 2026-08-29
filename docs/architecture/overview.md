@@ -276,6 +276,16 @@ clients classify as legacy limited compatibility. The window supplements —
 never replaces — the default-false capability booleans that continue to gate
 optional behavior.
 
+Direct remote connections use the server-owned pairing/auth authority and the
+client-runtime-owned transport policy described in
+[Remote architecture](./remote.md). Noise E2EE bounds unauthenticated work by
+global and socket-peer admission, bounds authenticated assembly by bytes and
+record count, and uses work-conserving outbound byte admission plus one logical
+write deadline. Desktop exposure remains a privileged `DesktopBridge` operation:
+native starts are local-only, WSL exposure is externally managed, and only
+authoritative live grants or an explicit legacy-resume action can request a
+wide native bind.
+
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
 with an atomic no-replace hard link. Platform file identity checks bind cleanup
@@ -549,6 +559,9 @@ before asking.
 `updater.status` requires `orchestration:read`; `updater.check` and
 `updater.install` require `orchestration:operate`
 (`apps/server/src/auth/scope.rs`).
+Desktop delegate calls and each client-side per-environment update check are
+independently bounded to 30 seconds. A timed-out client request is interrupted
+at the RPC command boundary and releases one of the two update-check workers.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -618,6 +631,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   sources and leaves catalog operations fail-closed. Unprotected legacy
   migration preserves an existing valid IndexedDB winner and uses exact CAS
   before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
+  A connection-database `VersionError` is handled before the connection runtime
+  starts: the shell offers an explicit, confirmed destructive reset and reloads
+  only after deletion succeeds. Blocked or otherwise unavailable databases
+  remain non-destructive and show actionable health instead of looping at boot.
   Outside that migration, a corrupt authoritative catalog is never rewritten
   as empty: it is quarantined when supported, publishes redacted
   recovery-required health, blocks mutation, and requires an explicit

@@ -329,7 +329,8 @@ minimum-size, and relevant Windows DPI states. Verify:
   Server Updates**, and confirm each saved server row shows an update badge
   (**Manual updates** for a headless server) and a manual-instructions block
   with a copy button. An offline server must show **Status unavailable** without
-  blocking the rest of the batch;
+  blocking the rest of the batch; a blackholed check must settle after 30
+  seconds and release its batch worker;
 - in **Settings → Remote Servers → Share this host**, generate an **Another
   device** offer. Confirm the local server restarts before the pairing offer is
   shown, and that the result contains the browser URL, `bibcode://` deep link,
@@ -348,22 +349,34 @@ minimum-size, and relevant Windows DPI states. Verify:
   natively and confirm the app reports incomplete cleanup rather than claiming
   the rule was removed. A missing rule is benign only when the persistent
   firewall store can be queried and its absence verified. Capture the shared
-  runbook's five compensation outcomes: successful local-only cleanup after a
-  failed mint, explicit cleanup failure, last-browser-session revocation with a
-  local-only restart and removed rule, and one compensating widen when a
-  concurrent grant appears during narrowing, plus bounded handling of a
-  blackholed create response;
+  runbook's four explicit ceremony outcomes: confirmed local-only, another live
+  access reason kept wide, cancellation unconfirmed and deliberately unchanged,
+  and cleanup topology unverified. Also cover last-browser-session revocation
+  with a local-only restart and removed rule, one compensating widen during a
+  concurrent grant, bounded handling of a blackholed create response, and
+  explicit legacy resume after a local-only restart. Confirm a hung `netsh` or
+  PowerShell operation is terminated and reaped after 15 seconds and never
+  retains the exposure coordinator indefinitely;
 
 - with WSL-only primary mode active, generate an **Another device** offer from
   a usable WSL advertised endpoint. Confirm the native Windows backend process,
   native exposure state, and `BiBCode Remote Access` firewall rule do not change;
   the ceremony and reconciler must not call the native exposure bridge for this
   topology. In the Exposure section, confirm the available off-host WSL URL is
-  shown and the native-only **Limited to this machine** and **Managed
-  automatically** copy is absent. Start one native reconciliation before the
+  shown, exposure is described as externally managed by WSL/Hyper-V policy, and
+  the native-only **Limited to this machine** and **Managed automatically** copy
+  is absent. Start one native reconciliation before the
   switch and let it resume after WSL-only becomes active; it must produce no
   exposure side effects. A direct native exposure bridge invocation after the
   switch must be rejected by the host-side topology guard;
+
+- the address picker lists every active usable Windows interface, ranks the
+  default-route address first, brackets IPv6, uses stable address/port IDs, and
+  discovers a packaged Tailscale CLI without depending on shell `PATH`;
+- seed an incompatible newer connection IndexedDB version and confirm the
+  boot-level recovery dialog lists the deleted data classes, requires explicit
+  confirmation, handles a blocked deletion without reloading, and reloads only
+  after successful deletion;
 
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with

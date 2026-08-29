@@ -2,6 +2,11 @@
 
 **Status:** Approved in chat on 2026-08-28.
 
+> Superseded for post-review remediation details by
+> [Remote Server Adversarial Review Remediation Design](./2026-08-29-remote-server-adversarial-remediation-design.md).
+> This file remains the historical record of the earlier approved stabilization
+> boundary; current behavior is defined by the living architecture documents.
+
 ## Outcome
 
 The remote-server feature keeps its existing protocol and product shape while

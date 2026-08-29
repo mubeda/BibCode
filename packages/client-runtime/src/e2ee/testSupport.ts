@@ -16,6 +16,7 @@ function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
 export interface EncryptedTestSocket {
   readonly nextMessage: () => Promise<string>;
   readonly sendMessage: (text: string) => void;
+  readonly sendRecords: (records: ReadonlyArray<Uint8Array>) => void;
   readonly close: () => void;
 }
 
@@ -105,12 +106,15 @@ export async function openEncryptedTestSocket(
       return text;
     }
   };
-  const sendMessage = (text: string): void => {
-    for (const record of plaintextRecords(new TextEncoder().encode(text))) {
+  const sendRecords = (records: Iterable<Uint8Array>): void => {
+    for (const record of records) {
       socket.send(ownedBuffer(transport.send.encryptWithAd(EMPTY, record)));
     }
   };
-  return { nextMessage, sendMessage, close: () => socket.close() };
+  const sendMessage = (text: string): void => {
+    sendRecords(plaintextRecords(new TextEncoder().encode(text)));
+  };
+  return { nextMessage, sendMessage, sendRecords, close: () => socket.close() };
 }
 
 export async function requestTestRpc(

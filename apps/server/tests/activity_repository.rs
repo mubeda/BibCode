@@ -379,14 +379,14 @@ async fn monitoring_disabled_finalization_interrupts_once_and_preserves_complete
                         "work:running",
                         Some("actor:running"),
                         ActivityLifecycle::Running,
-                        "2026-07-30T12:00:00Z",
-                        "2026-07-30T12:00:00Z",
+                        "2099-07-30T12:00:00Z",
+                        "2099-07-30T12:00:00Z",
                         None,
                     )
                     .expect("running work item"),
                 ),
             ],
-            "2026-07-30T12:00:00Z".to_owned(),
+            "2099-07-30T12:00:00Z".to_owned(),
         )
         .await
         .expect("fixture");

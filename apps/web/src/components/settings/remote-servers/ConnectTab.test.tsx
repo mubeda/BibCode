@@ -205,6 +205,29 @@ vi.mock("~/connection/currentEnvironmentPresentation", () => ({
 
 vi.mock("@bibcode/client-runtime/connection", () => ({
   connectionStatusText: (connection: { phase: string }) => `status:${connection.phase}`,
+  connectionTransportSecurity: (entry: {
+    target: { _tag: string; connectionId?: string };
+    profile: { _tag: string; value?: { _tag: string; hostKey?: string | null } };
+  }) => {
+    if (
+      entry.target._tag === "PrimaryConnectionTarget" ||
+      entry.target._tag === "UnavailableConnectionTarget" ||
+      entry.target.connectionId?.startsWith("local:")
+    ) {
+      return "local";
+    }
+    if (
+      entry.target._tag === "RelayConnectionTarget" ||
+      entry.target._tag === "SshConnectionTarget"
+    ) {
+      return "channel-secured";
+    }
+    return entry.profile._tag === "Some" &&
+      entry.profile.value?._tag === "BearerConnectionProfile" &&
+      (entry.profile.value.hostKey?.trim().length ?? 0) > 0
+      ? "e2ee"
+      : "unencrypted";
+  },
   isDesktopLocalConnectionId: (connectionId: string | undefined) =>
     connectionId?.startsWith("local:") ?? false,
   RelayConnectionRegistration: class RelayConnectionRegistration {

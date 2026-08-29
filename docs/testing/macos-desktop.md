@@ -197,18 +197,26 @@ minimum sizes verify:
   an **Another device** offer, verify the restart completes before the browser
   URL, deep link, pairing code, and QR code appear, then revoke the last
   off-host offer or client and verify exposure returns to loopback. Capture the
-  shared runbook's five compensation outcomes: successful local-only cleanup
-  after a failed mint, explicit cleanup failure, last-browser-session revocation
-  with a local-only restart, and one compensating widen when a concurrent grant
-  appears during narrowing, plus bounded handling of a blackholed create
-  response. The local-machine flow still has no Host selector;
-  remote targeting is driven by the environment rail;
+  shared runbook's four explicit ceremony outcomes: confirmed local-only,
+  another live access reason kept wide, cancellation unconfirmed and deliberately
+  unchanged, and cleanup topology unverified. Also cover last-browser-session
+  revocation, one compensating widen during a concurrent grant, bounded handling
+  of a blackholed create response, and explicit legacy resume after a local-only
+  restart. The address picker lists every usable non-loopback interface with
+  bracketed IPv6 and stable address/port IDs; a packaged Tailscale installation
+  must be found without shell `PATH`. The local-machine flow still has no Host
+  selector; remote targeting is driven by the environment rail;
 - Remote server updates: with a second BiBCode server saved (headless
   `bibcode serve` is sufficient), open Remote Servers settings, run **Check for
   Server Updates**, and confirm each saved server row shows an update badge
   (**Manual updates** for a headless server) and a manual-instructions block
   with a copy button. An offline server must show **Status unavailable** without
-  blocking the rest of the batch;
+  blocking the rest of the batch; a blackholed check must settle after 30
+  seconds and release its batch worker;
+- seed an incompatible newer connection IndexedDB version and confirm the
+  boot-level recovery dialog lists the deleted data classes, requires explicit
+  confirmation, handles a blocked deletion without reloading, and reloads only
+  after successful deletion;
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running lands on Add Server with the code prefilled. The
   custom scheme is bundle-time-only on macOS and is not an unbundled dev-mode
