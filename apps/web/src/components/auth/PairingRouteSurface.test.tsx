@@ -382,21 +382,25 @@ describe("HostedPairingRouteSurface", () => {
     expect(ui.filter("Button", (props) => props.children === "Try again")).toHaveLength(0);
   });
 
-  it("shows the host row and the pairing spinner while connecting", () => {
+  it("shows the host row and waits for explicit confirmation", () => {
     testState.hostedRequest = request;
     const markup = render(<HostedPairingRouteSurface />);
-    expect(markup).toContain("Pairing backend");
+    expect(markup).toContain("Pair this backend");
     expect(markup).toContain("https://backend.example");
-    expect(markup).toContain("Pairing...");
+    expect(ui.filter("Button", (props) => props.children === "Pair this backend")).toHaveLength(1);
   });
 
-  it("connects on mount and marks the backend paired on success", async () => {
+  it("strips the token on mount but connects only after confirmation", async () => {
     testState.hostedRequest = request;
     testState.connect.mockResolvedValue({ _tag: "Success" });
     render(<HostedPairingRouteSurface />);
 
     harness.runEffects();
     expect(testState.stripCalls).toBe(1);
+    expect(testState.connect).not.toHaveBeenCalled();
+
+    const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
+    (confirm.onClick as () => void)();
     expect(testState.connect).toHaveBeenCalledWith({
       host: request.host,
       pairingCode: request.token,
@@ -417,36 +421,25 @@ describe("HostedPairingRouteSurface", () => {
     render(<HostedPairingRouteSurface />);
 
     harness.runEffects();
+    const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
+    (confirm.onClick as () => void)();
     await flush();
     expect(harness.setStateCalls.some((call) => call.applied === "error")).toBe(true);
-    expect(harness.setStateCalls.some((call) => call.applied === true)).toBe(true);
     expect(
       harness.setStateCalls.some(
         (call) => typeof call.applied === "string" && call.applied.includes("backend unreachable"),
       ),
     ).toBe(true);
+    expect(ui.filter("Button", (props) => props.children === "Try again")).toHaveLength(0);
   });
 
   it("renders the paired state with an Open app button that navigates home", () => {
     testState.hostedRequest = request;
-    harness.seedState((initial) => initial === "pairing", "paired");
+    harness.seedState((initial) => initial === "confirm", "paired");
     render(<HostedPairingRouteSurface />);
     const openApp = ui.find("Button", (props) => props.children === "Open app");
     (openApp.onClick as () => void)();
     expect(locationHref).toBe("/");
-  });
-
-  it("retries the hosted pairing request from the try-again button", async () => {
-    testState.hostedRequest = request;
-    harness.seedState((initial) => initial === "pairing", "error");
-    harness.seedState((initial) => initial === false, true);
-    render(<HostedPairingRouteSurface />);
-
-    const retry = ui.find("Button", (props) => props.children === "Try again");
-    testState.connect.mockClear();
-    (retry.onClick as () => void)();
-    await flush();
-    expect(testState.connect).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a token that was already submitted", async () => {
@@ -456,7 +449,8 @@ describe("HostedPairingRouteSurface", () => {
     const tokenSubmittedRef = harness.refs[2]!;
     tokenSubmittedRef.current = true;
 
-    harness.runEffects();
+    const confirm = ui.find("Button", (props) => props.children === "Pair this backend");
+    (confirm.onClick as () => void)();
     await flush();
     expect(
       harness.setStateCalls.some(
