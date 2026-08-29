@@ -1,15 +1,26 @@
 import { type EnvironmentId, type RemoteUpdateSnapshot, WS_METHODS } from "@bibcode/contracts";
+import type * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
 import type { Atom } from "effect/unstable/reactivity";
 
 import {
   type AtomCommandResult,
+  createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { type EnvironmentRpcInput, request } from "../rpc/client.ts";
 
 /** Spec section 4.5: "Check for Server Updates" fans out with max 2 concurrent. */
 export const MAX_CONCURRENT_REMOTE_UPDATE_CHECKS = 2;
+export const REMOTE_UPDATE_CHECK_TIMEOUT_MS = 30_000;
+
+export function withRemoteUpdateCheckTimeout<A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | Cause.TimeoutError, R> {
+  return effect.pipe(Effect.timeout(REMOTE_UPDATE_CHECK_TIMEOUT_MS));
+}
 
 export interface RemoteUpdateFanOutResult<A, E> {
   readonly environmentId: EnvironmentId;
@@ -80,9 +91,10 @@ export function createRemoteUpdateEnvironmentAtoms<R, ER>(
       tag: WS_METHODS.updaterStatus,
       staleTimeMs: 30_000,
     }),
-    check: createEnvironmentRpcCommand(runtime, {
+    check: createEnvironmentCommand(runtime, {
       label: "environment-data:remote-update:check",
-      tag: WS_METHODS.updaterCheck,
+      execute: (input: EnvironmentRpcInput<typeof WS_METHODS.updaterCheck>) =>
+        withRemoteUpdateCheckTimeout(request(WS_METHODS.updaterCheck, input)),
       concurrency: {
         mode: "singleFlight",
         key: ({ environmentId }) => environmentId,

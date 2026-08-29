@@ -895,6 +895,20 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("disconnect on a registered cold environment does not create a supervisor", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+        yield* registry.disconnect(TARGET.environmentId);
+
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("adopts the current structured storage change and retries exactly once", () =>
     Effect.gen(function* () {
       const connectionAttempts = yield* Ref.make(0);

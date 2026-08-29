@@ -1,11 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, type RemoteUpdateSnapshot } from "@bibcode/contracts";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 
 import type { AtomCommandResult } from "./runtime.ts";
 import {
   MAX_CONCURRENT_REMOTE_UPDATE_CHECKS,
+  REMOTE_UPDATE_CHECK_TIMEOUT_MS,
   fanOutRemoteUpdateChecks,
   isRemoteUpdateAvailable,
+  withRemoteUpdateCheckTimeout,
 } from "./remoteUpdates.ts";
 
 const flushMicrotasks = async () => {
@@ -89,6 +94,22 @@ describe("fanOutRemoteUpdateChecks", () => {
       fanOutRemoteUpdateChecks([], () => Promise.resolve(settledSuccess("ok"))),
     ).resolves.toEqual([]);
   });
+});
+
+describe("remote update check timeout", () => {
+  it.effect("interrupts a check and fails it after thirty seconds", () =>
+    Effect.gen(function* () {
+      expect(REMOTE_UPDATE_CHECK_TIMEOUT_MS).toBe(30_000);
+      const fiber = yield* Effect.forkChild(withRemoteUpdateCheckTimeout(Effect.never));
+
+      yield* TestClock.adjust("29 seconds");
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust("1 second");
+
+      const timeout = yield* Fiber.join(fiber).pipe(Effect.flip);
+      expect(timeout._tag).toBe("TimeoutError");
+    }),
+  );
 });
 
 describe("isRemoteUpdateAvailable", () => {
