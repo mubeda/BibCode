@@ -366,6 +366,8 @@ function connectionCatalogProtectionCapability(
 function defaultServerExposureState(): DesktopServerExposureState {
   return {
     mode: "local-only",
+    configuredMode: "local-only",
+    management: "native",
     endpointUrl: null,
     advertisedHost: null,
     tailscaleServeEnabled: false,

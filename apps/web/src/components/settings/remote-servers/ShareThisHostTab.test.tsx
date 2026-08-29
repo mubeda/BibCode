@@ -20,6 +20,8 @@ const h = vi.hoisted(() => ({
   networkQuery: {
     data: {
       serverExposureState: {
+        configuredMode: "local-only" as "local-only" | "network-accessible",
+        management: "native" as "native" | "external",
         mode: "local-only" as "local-only" | "network-accessible",
         endpointUrl: null as string | null,
         advertisedHost: null as string | null,
@@ -128,13 +130,15 @@ vi.mock("./ShareTab", () => ({
   ),
 }));
 
-import { ShareThisHostTab } from "./ShareThisHostTab";
+import { canResumeLegacyExposure, ShareThisHostTab } from "./ShareThisHostTab";
 
 let domWindow: Window;
 let container: HTMLDivElement;
 let root: Root;
 
 const localState = {
+  configuredMode: "local-only" as const,
+  management: "native" as const,
   mode: "local-only" as const,
   endpointUrl: null,
   advertisedHost: null,
@@ -233,6 +237,54 @@ afterEach(async () => {
 });
 
 describe("ShareThisHostTab", () => {
+  it("offers legacy resume only for an explicitly configured prior wide native host", () => {
+    const shareState = {
+      desiredExposure: "loopback" as const,
+      offHostGrantCount: 0,
+      legacyGrantCount: 1,
+    };
+    expect(
+      canResumeLegacyExposure(shareState, {
+        ...localState,
+        configuredMode: "network-accessible",
+      }),
+    ).toBe(true);
+    expect(canResumeLegacyExposure({ ...shareState, legacyGrantCount: 0 }, localState)).toBe(false);
+    expect(
+      canResumeLegacyExposure(
+        { ...shareState, desiredExposure: "wide", offHostGrantCount: 1 },
+        { ...localState, configuredMode: "network-accessible" },
+      ),
+    ).toBe(false);
+    expect(
+      canResumeLegacyExposure(shareState, {
+        ...localState,
+        configuredMode: "network-accessible",
+        management: "external",
+      }),
+    ).toBe(false);
+  });
+
+  it("requires an explicit action to resume legacy remote access", async () => {
+    Object.assign(h.networkQuery.data.serverExposureState, {
+      ...localState,
+      configuredMode: "network-accessible",
+    });
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "loopback",
+      offHostGrantCount: 0,
+      legacyGrantCount: 1,
+    });
+    const apply = installBridge();
+
+    await renderTab();
+
+    expect(container.textContent).toContain("Resume legacy remote access");
+    expect(apply).not.toHaveBeenCalled();
+    await click("Resume legacy remote access");
+    expect(apply).toHaveBeenCalledWith("network-accessible");
+  });
+
   it("renders every intent and the threat-model copy", async () => {
     installBridge();
     await renderTab();
@@ -363,7 +415,7 @@ describe("ShareThisHostTab", () => {
       expect.any(String),
     );
     expect(container.textContent).toContain("Reachable at http://172.20.10.2:3773/");
-    expect(container.textContent).toContain("Exposure is owned by the WSL backend");
+    expect(container.textContent).toContain("WSL/Hyper-V firewall policy");
     expect(container.textContent).not.toContain("Limited to this machine");
     expect(container.textContent).not.toContain("Managed automatically");
 
