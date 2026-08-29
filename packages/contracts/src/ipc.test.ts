@@ -19,9 +19,7 @@ const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
 const decodeDesktopUpdateState = Schema.decodeUnknownSync(DesktopUpdateStateSchema);
-const decodeDesktopServerExposureState = Schema.decodeUnknownSync(
-  DesktopServerExposureStateSchema,
-);
+const decodeDesktopServerExposureState = Schema.decodeUnknownSync(DesktopServerExposureStateSchema);
 const decodeProjectDataStatus = Schema.decodeUnknownSync(DesktopProjectDataEnvironmentStatusSchema);
 const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
   DesktopProjectDataRecoveryResultSchema,

@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import pairingEndpointFixtures from "../fixtures/pairing-endpoint-classification.json" with {
-  type: "json",
-};
+import pairingEndpointFixtures from "../fixtures/pairing-endpoint-classification.json" with { type: "json" };
 
 import {
   classifyPairingEndpoint,
