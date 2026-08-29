@@ -323,6 +323,31 @@ describe("makeE2eeSocket", () => {
     }),
   );
 
+  it.live("rejects an empty encrypted continuation from the server", () =>
+    Effect.gen(function* () {
+      const staticPrivate = crypto.getRandomValues(new Uint8Array(32));
+      const hostKey = derivePublicKey(staticPrivate);
+      const responder = createNkResponder({ staticPrivateKey: staticPrivate });
+      let transport: NkTransport | null = null;
+      const script = (frame: Uint8Array, emit: (frame: Uint8Array) => void): void => {
+        if (transport === null) {
+          responder.readMessageA(frame);
+          emit(responder.writeMessageB(new Uint8Array(0)));
+          transport = responder.split();
+          return;
+        }
+        transport.receive.decryptWithAd(new Uint8Array(0), frame);
+        emit(transport.send.encryptWithAd(new Uint8Array(0), Uint8Array.of(0x01)));
+      };
+      const socket = makeE2eeSocket(makeScriptedInnerSocket(script), {
+        hostKey: Buffer.from(hostKey).toString("base64url"),
+        auth: { kind: "bearer", credential: "stored-1" },
+      });
+      const exit = yield* socket.runString(() => {}).pipe(Effect.exit);
+      expect(exit._tag).toBe("Failure");
+    }),
+  );
+
   it.live("fails with unauthorized when the server rejects the credential", () =>
     Effect.gen(function* () {
       const { hostKey, script } = responderScript({ failAuth: true });

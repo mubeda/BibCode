@@ -39,6 +39,8 @@ pub(crate) const E2EE_RECORD_FLAG_CONTINUATION: u8 = 0x01;
 pub(crate) const MAX_E2EE_CHUNK_BYTES: usize = MAX_E2EE_CIPHERTEXT_BYTES - NOISE_TAG_BYTES - 1;
 pub(crate) const MAX_E2EE_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_E2EE_PREAUTH_MESSAGE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_E2EE_RECORDS_PER_MESSAGE: usize = 2_048;
+const E2EE_INBOUND_RECORD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// One deadline covering upgrade -> handshake -> e2ee_authenticated.
 pub(crate) const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Wrong pinned key: the responder cannot decrypt Message 1 and closes with this code.
@@ -342,12 +344,6 @@ struct E2eeInboundBudget {
     _permits: Option<E2eeRecordPermit>,
 }
 
-struct InboundRecordBudgets<'a> {
-    global: &'a Arc<Semaphore>,
-    principal: Option<&'a Arc<Semaphore>>,
-    connection: &'a Arc<Semaphore>,
-}
-
 struct E2eeRecordPermit {
     global: OwnedSemaphorePermit,
     principal: Option<OwnedSemaphorePermit>,
@@ -384,7 +380,13 @@ pub(crate) struct E2eeChannel {
     transport: snow::TransportState,
     assembling: Vec<u8>,
     assembling_permits: Option<E2eeRecordPermit>,
+    assembling_records: usize,
     decrypt_scratch: Vec<u8>,
+}
+
+struct DecryptedRecord {
+    final_record: bool,
+    chunk: Vec<u8>,
 }
 
 impl E2eeChannel {
@@ -446,6 +448,7 @@ impl E2eeChannel {
                 transport,
                 assembling: Vec::new(),
                 assembling_permits: None,
+                assembling_records: 0,
                 decrypt_scratch: vec![0_u8; MAX_E2EE_CIPHERTEXT_BYTES],
             },
             message_b,
@@ -477,35 +480,12 @@ impl E2eeChannel {
         frame: &[u8],
         max_message_bytes: usize,
     ) -> Result<Option<Vec<u8>>, E2eeSessionError> {
-        self.decrypt_frame_inner(frame, max_message_bytes, None)
+        let record = self.decrypt_record(frame)?;
+        self.assemble_decrypted_record(record, max_message_bytes, None)
             .map(|message| message.map(|message| message.plaintext))
     }
 
-    fn decrypt_frame_budgeted(
-        &mut self,
-        frame: &[u8],
-        max_message_bytes: usize,
-        global_budget: &Arc<Semaphore>,
-        principal_budget: Option<&Arc<Semaphore>>,
-        connection_budget: &Arc<Semaphore>,
-    ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
-        self.decrypt_frame_inner(
-            frame,
-            max_message_bytes,
-            Some(InboundRecordBudgets {
-                global: global_budget,
-                principal: principal_budget,
-                connection: connection_budget,
-            }),
-        )
-    }
-
-    fn decrypt_frame_inner(
-        &mut self,
-        frame: &[u8],
-        max_message_bytes: usize,
-        budgets: Option<InboundRecordBudgets<'_>>,
-    ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
+    fn decrypt_record(&mut self, frame: &[u8]) -> Result<DecryptedRecord, E2eeSessionError> {
         if frame.len() > MAX_E2EE_CIPHERTEXT_BYTES {
             return Err(E2eeSessionError::Protocol("oversized frame".into()));
         }
@@ -517,53 +497,76 @@ impl E2eeChannel {
             return Err(E2eeSessionError::Protocol("empty record".into()));
         }
         let flag = self.decrypt_scratch[0];
-        let chunk = &self.decrypt_scratch[1..len];
-        if self.assembling.len().saturating_add(chunk.len()) > max_message_bytes {
+        let final_record = match flag {
+            E2EE_RECORD_FLAG_FINAL => true,
+            E2EE_RECORD_FLAG_CONTINUATION => false,
+            other => {
+                return Err(E2eeSessionError::Protocol(format!(
+                    "unknown record flag {other}"
+                )));
+            }
+        };
+        let chunk = self.decrypt_scratch[1..len].to_vec();
+        if !final_record && chunk.is_empty() {
+            return Err(E2eeSessionError::Protocol(
+                "empty continuation record".into(),
+            ));
+        }
+        Ok(DecryptedRecord {
+            final_record,
+            chunk,
+        })
+    }
+
+    fn validate_decrypted_record(
+        &self,
+        record: &DecryptedRecord,
+        max_message_bytes: usize,
+    ) -> Result<(), E2eeSessionError> {
+        if self.assembling_records >= MAX_E2EE_RECORDS_PER_MESSAGE {
+            return Err(E2eeSessionError::Protocol("record count overflow".into()));
+        }
+        if self.assembling.len().saturating_add(record.chunk.len()) > max_message_bytes {
             return Err(E2eeSessionError::Protocol("reassembly overflow".into()));
         }
-        let permit = budgets
-            .map(|budgets| {
-                acquire_inbound_bytes(
-                    chunk.len(),
-                    budgets.global,
-                    budgets.principal,
-                    budgets.connection,
-                )
-            })
-            .transpose()?
-            .flatten();
-        match flag {
-            E2EE_RECORD_FLAG_CONTINUATION => {
-                self.assembling.extend_from_slice(chunk);
-                if let Some(permit) = permit {
-                    if let Some(assembling) = &mut self.assembling_permits {
-                        assembling.merge(permit);
-                    } else {
-                        self.assembling_permits = Some(permit);
-                    }
+        Ok(())
+    }
+
+    fn assemble_decrypted_record(
+        &mut self,
+        record: DecryptedRecord,
+        max_message_bytes: usize,
+        permit: Option<E2eeRecordPermit>,
+    ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
+        self.validate_decrypted_record(&record, max_message_bytes)?;
+        self.assembling_records += 1;
+        if !record.final_record {
+            self.assembling.extend_from_slice(&record.chunk);
+            if let Some(permit) = permit {
+                if let Some(assembling) = &mut self.assembling_permits {
+                    assembling.merge(permit);
+                } else {
+                    self.assembling_permits = Some(permit);
                 }
-                Ok(None)
             }
-            E2EE_RECORD_FLAG_FINAL => {
-                let mut message = std::mem::take(&mut self.assembling);
-                message.extend_from_slice(chunk);
-                let mut permits = self.assembling_permits.take();
-                if let Some(permit) = permit {
-                    if let Some(assembling) = &mut permits {
-                        assembling.merge(permit);
-                    } else {
-                        permits = Some(permit);
-                    }
-                }
-                Ok(Some(BudgetedPlaintext {
-                    plaintext: message,
-                    permits,
-                }))
-            }
-            other => Err(E2eeSessionError::Protocol(format!(
-                "unknown record flag {other}"
-            ))),
+            return Ok(None);
         }
+
+        let mut message = std::mem::take(&mut self.assembling);
+        message.extend_from_slice(&record.chunk);
+        self.assembling_records = 0;
+        let mut permits = self.assembling_permits.take();
+        if let Some(permit) = permit {
+            if let Some(assembling) = &mut permits {
+                assembling.merge(permit);
+            } else {
+                permits = Some(permit);
+            }
+        }
+        Ok(Some(BudgetedPlaintext {
+            plaintext: message,
+            permits,
+        }))
     }
 }
 
@@ -1005,14 +1008,35 @@ async fn run_established_e2ee(
         while let Some(frame) = ws_reader.next().await {
             let message = match frame {
                 Ok(Message::Binary(bytes)) => {
-                    let decrypted = decrypt_inbound_frame_budgeted(
-                        &mut inbound_channel.lock().expect("E2EE channel lock"),
-                        &bytes,
-                        MAX_E2EE_LOGICAL_MESSAGE_BYTES,
+                    let record = {
+                        let mut channel = inbound_channel.lock().expect("E2EE channel lock");
+                        let record = match channel.decrypt_record(&bytes) {
+                            Ok(record) => record,
+                            Err(_) => break,
+                        };
+                        if channel
+                            .validate_decrypted_record(&record, MAX_E2EE_LOGICAL_MESSAGE_BYTES)
+                            .is_err()
+                        {
+                            break;
+                        }
+                        record
+                    };
+                    let permit = match acquire_inbound_bytes(
+                        record.chunk.len(),
                         &global_inbound_permits,
                         principal_inbound_permits.as_ref(),
                         &inbound_connection_permits,
-                    );
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
+                    let decrypted = inbound_channel
+                        .lock()
+                        .expect("E2EE channel lock")
+                        .assemble_decrypted_record(record, MAX_E2EE_LOGICAL_MESSAGE_BYTES, permit);
                     match decrypted {
                         Ok(Some(BudgetedPlaintext { plaintext, permits })) => {
                             RpcInboundFrame::guarded(
@@ -1079,7 +1103,8 @@ async fn register_e2ee_connection(
     }
 }
 
-fn decrypt_inbound_frame_budgeted(
+#[cfg(test)]
+async fn decrypt_inbound_frame_budgeted(
     channel: &mut E2eeChannel,
     frame: &[u8],
     max_message_bytes: usize,
@@ -1087,16 +1112,19 @@ fn decrypt_inbound_frame_budgeted(
     principal_budget: Option<&Arc<Semaphore>>,
     connection_budget: &Arc<Semaphore>,
 ) -> Result<Option<BudgetedPlaintext>, E2eeSessionError> {
-    channel.decrypt_frame_budgeted(
-        frame,
-        max_message_bytes,
+    let record = channel.decrypt_record(frame)?;
+    channel.validate_decrypted_record(&record, max_message_bytes)?;
+    let permit = acquire_inbound_bytes(
+        record.chunk.len(),
         global_budget,
         principal_budget,
         connection_budget,
     )
+    .await?;
+    channel.assemble_decrypted_record(record, max_message_bytes, permit)
 }
 
-fn acquire_inbound_bytes(
+async fn acquire_inbound_bytes(
     bytes: usize,
     global_budget: &Arc<Semaphore>,
     principal_budget: Option<&Arc<Semaphore>>,
@@ -1107,9 +1135,13 @@ fn acquire_inbound_bytes(
     }
     let permits = u32::try_from(bytes)
         .map_err(|_| E2eeSessionError::Protocol("record budget overflow".into()))?;
-    let connection = Arc::clone(connection_budget)
-        .try_acquire_many_owned(permits)
-        .map_err(|_| E2eeSessionError::Protocol("connection buffer budget exhausted".into()))?;
+    let global = timeout(
+        E2EE_INBOUND_RECORD_WAIT_TIMEOUT,
+        Arc::clone(global_budget).acquire_many_owned(permits),
+    )
+    .await
+    .map_err(|_| E2eeSessionError::Timeout)?
+    .map_err(|_| E2eeSessionError::Protocol("global buffer budget closed".into()))?;
     let principal = principal_budget
         .map(|budget| {
             Arc::clone(budget)
@@ -1117,9 +1149,9 @@ fn acquire_inbound_bytes(
                 .map_err(|_| E2eeSessionError::Protocol("principal buffer budget exhausted".into()))
         })
         .transpose()?;
-    let global = Arc::clone(global_budget)
+    let connection = Arc::clone(connection_budget)
         .try_acquire_many_owned(permits)
-        .map_err(|_| E2eeSessionError::Protocol("global buffer budget exhausted".into()))?;
+        .map_err(|_| E2eeSessionError::Protocol("connection buffer budget exhausted".into()))?;
     Ok(Some(E2eeRecordPermit {
         global,
         principal,
@@ -1490,6 +1522,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_empty_continuations_and_excessive_fragmentation_are_rejected() {
+        let (mut initiator, mut responder) = establish().await;
+        let empty_continuation = initiator_encrypt(
+            &mut initiator,
+            &[record(E2EE_RECORD_FLAG_CONTINUATION, b"")],
+        )
+        .pop()
+        .unwrap();
+        assert!(matches!(
+            responder.decrypt_frame(&empty_continuation, MAX_E2EE_LOGICAL_MESSAGE_BYTES),
+            Err(E2eeSessionError::Protocol(_))
+        ));
+
+        let (mut initiator, mut responder) = establish().await;
+        for _ in 0..MAX_E2EE_RECORDS_PER_MESSAGE {
+            let continuation = initiator_encrypt(
+                &mut initiator,
+                &[record(E2EE_RECORD_FLAG_CONTINUATION, b"x")],
+            )
+            .pop()
+            .unwrap();
+            assert!(
+                responder
+                    .decrypt_frame(&continuation, MAX_E2EE_LOGICAL_MESSAGE_BYTES)
+                    .expect("record within fragmentation bound")
+                    .is_none()
+            );
+        }
+        let overflow = initiator_encrypt(&mut initiator, &[record(E2EE_RECORD_FLAG_FINAL, b"")])
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            responder.decrypt_frame(&overflow, MAX_E2EE_LOGICAL_MESSAGE_BYTES),
+            Err(E2eeSessionError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn completed_messages_retain_their_global_buffer_budget() {
         let (mut initiator, mut responder) = establish().await;
         let continuation = vec![b'f'; MAX_E2EE_CHUNK_BYTES];
@@ -1513,6 +1583,7 @@ mod tests {
                 None,
                 &connection_budget,
             )
+            .await
             .unwrap()
             .is_none()
         );
@@ -1524,6 +1595,7 @@ mod tests {
             None,
             &connection_budget,
         )
+        .await
         .unwrap()
         .expect("completed message");
 
@@ -1538,7 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_global_budget_fails_another_channel_closed() {
+    async fn inbound_global_pressure_waits_for_capacity_instead_of_closing_the_victim() {
         let (mut first_initiator, mut first_responder) = establish().await;
         let (mut second_initiator, mut second_responder) = establish().await;
         let global_budget = Arc::new(Semaphore::new(MAX_E2EE_CHUNK_BYTES));
@@ -1569,10 +1641,11 @@ mod tests {
                 None,
                 &first_connection_budget,
             )
+            .await
             .unwrap()
             .is_none()
         );
-        assert!(matches!(
+        let waiting = tokio::spawn(async move {
             decrypt_inbound_frame_budgeted(
                 &mut second_responder,
                 &second_frame,
@@ -1580,29 +1653,55 @@ mod tests {
                 &global_budget,
                 None,
                 &second_connection_budget,
-            ),
-            Err(E2eeSessionError::Protocol(_))
-        ));
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "global pressure must backpressure");
 
         drop(first_responder);
-        let retry_frame = initiator_encrypt(
-            &mut second_initiator,
-            &[record(E2EE_RECORD_FLAG_FINAL, b"retry")],
+        assert!(
+            waiting
+                .await
+                .expect("waiting decrypt task")
+                .expect("capacity becomes available")
+                .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_global_pressure_times_out_after_five_seconds() {
+        let (mut initiator, mut responder) = establish().await;
+        let frame = initiator_encrypt(
+            &mut initiator,
+            &[record(E2EE_RECORD_FLAG_FINAL, b"blocked")],
         )
         .pop()
         .unwrap();
-        assert!(
+        let global_budget = Arc::new(Semaphore::new(b"blocked".len()));
+        let held = Arc::clone(&global_budget)
+            .acquire_many_owned(u32::try_from(b"blocked".len()).unwrap())
+            .await
+            .unwrap();
+        let connection_budget = Arc::new(Semaphore::new(b"blocked".len()));
+        let waiting = tokio::spawn(async move {
             decrypt_inbound_frame_budgeted(
-                &mut second_responder,
-                &retry_frame,
+                &mut responder,
+                &frame,
                 MAX_E2EE_LOGICAL_MESSAGE_BYTES,
                 &global_budget,
                 None,
-                &second_connection_budget,
+                &connection_budget,
             )
-            .unwrap()
-            .is_some()
-        );
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(E2EE_INBOUND_RECORD_WAIT_TIMEOUT).await;
+        assert!(matches!(
+            waiting.await.expect("waiting decrypt task"),
+            Err(E2eeSessionError::Timeout)
+        ));
+        drop(held);
     }
 
     #[tokio::test]
@@ -1634,6 +1733,7 @@ mod tests {
                 None,
                 &first_connection_budget,
             )
+            .await
             .unwrap()
             .is_none()
         );
@@ -1645,7 +1745,8 @@ mod tests {
                 &global_budget,
                 None,
                 &first_connection_budget,
-            ),
+            )
+            .await,
             Err(E2eeSessionError::Protocol(_))
         ));
         assert!(
@@ -1657,6 +1758,7 @@ mod tests {
                 None,
                 &second_connection_budget,
             )
+            .await
             .unwrap()
             .is_some()
         );
@@ -1685,6 +1787,7 @@ mod tests {
                 None,
                 &connection_budget,
             )
+            .await
             .expect("legal tiny fragment");
         }
 
