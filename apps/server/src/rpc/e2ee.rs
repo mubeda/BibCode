@@ -9,13 +9,13 @@ use std::{
 use std::ops::AsyncFnMut;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures_util::{SinkExt, StreamExt, stream};
+use futures_util::{Sink, SinkExt, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::{CancellationToken, PollSender};
 
@@ -23,7 +23,7 @@ use super::{
     RpcRegistry, RpcSessionContext,
     session::{
         PUMP_JOIN_TIMEOUT, RpcInboundFrame, RpcOutboundBudget, RpcOutboundFrame,
-        SOCKET_WRITE_TIMEOUT, run_session_split_budgeted,
+        RpcOutboundProcessBudget, SOCKET_WRITE_TIMEOUT, run_session_split_budgeted,
     },
 };
 use crate::{
@@ -228,7 +228,7 @@ struct E2eeResourceBudget {
     per_principal_established: usize,
     global_inbound: Arc<Semaphore>,
     per_principal_inbound: usize,
-    global_outbound: Arc<Semaphore>,
+    global_outbound: RpcOutboundProcessBudget,
     principals: Mutex<HashMap<String, std::sync::Weak<PrincipalResourceBudget>>>,
 }
 
@@ -250,7 +250,7 @@ impl E2eeResourceBudget {
             per_principal_established,
             global_inbound: Arc::new(Semaphore::new(global_inbound)),
             per_principal_inbound,
-            global_outbound: Arc::new(Semaphore::new(global_outbound)),
+            global_outbound: RpcOutboundProcessBudget::new(global_outbound),
             principals: Mutex::new(HashMap::new()),
         }
     }
@@ -289,8 +289,8 @@ impl E2eeResourceBudget {
         Arc::clone(&self.global_inbound)
     }
 
-    fn global_outbound(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.global_outbound)
+    fn global_outbound(&self) -> RpcOutboundProcessBudget {
+        self.global_outbound.clone()
     }
 }
 
@@ -890,15 +890,35 @@ async fn send_encrypted_frames(
     channel: &mut E2eeChannel,
     plaintext: &[u8],
 ) -> Result<(), E2eeSessionError> {
+    let deadline = Instant::now() + SOCKET_WRITE_TIMEOUT;
     for (flag, chunk) in plaintext_records(plaintext)? {
         let frame = channel.encrypt_record(flag, chunk)?;
-        timeout(
-            SOCKET_WRITE_TIMEOUT,
-            writer.send(Message::Binary(frame.into())),
-        )
-        .await
-        .map_err(|_| E2eeSessionError::Timeout)?
-        .map_err(|_| E2eeSessionError::Closed)?;
+        timeout_at(deadline, writer.send(Message::Binary(frame.into())))
+            .await
+            .map_err(|_| E2eeSessionError::Timeout)?
+            .map_err(|_| E2eeSessionError::Closed)?;
+    }
+    Ok(())
+}
+
+async fn send_established_encrypted_message<W>(
+    writer: &mut W,
+    channel: &Arc<Mutex<E2eeChannel>>,
+    plaintext: &[u8],
+    deadline: Instant,
+) -> Result<(), E2eeSessionError>
+where
+    W: Sink<Message> + Unpin,
+{
+    for (flag, chunk) in plaintext_records(plaintext)? {
+        let frame = channel
+            .lock()
+            .expect("E2EE channel lock")
+            .encrypt_record(flag, chunk)?;
+        timeout_at(deadline, writer.send(Message::Binary(frame.into())))
+            .await
+            .map_err(|_| E2eeSessionError::Timeout)?
+            .map_err(|_| E2eeSessionError::Closed)?;
     }
     Ok(())
 }
@@ -966,34 +986,15 @@ async fn run_established_e2ee(
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => continue,
             };
-            let Ok(records) = plaintext_records(plaintext) else {
-                break;
-            };
-            let mut failed = false;
-            for (flag, chunk) in records {
-                let frame = {
-                    let mut channel = outbound_channel.lock().expect("E2EE channel lock");
-                    match channel.encrypt_record(flag, chunk) {
-                        Ok(frame) => frame,
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    }
-                };
-                if !matches!(
-                    timeout(
-                        SOCKET_WRITE_TIMEOUT,
-                        ws_writer.send(Message::Binary(frame.into())),
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    failed = true;
-                    break;
-                }
-            }
-            if failed {
+            if send_established_encrypted_message(
+                &mut ws_writer,
+                &outbound_channel,
+                plaintext,
+                Instant::now() + SOCKET_WRITE_TIMEOUT,
+            )
+            .await
+            .is_err()
+            {
                 break;
             }
         }
@@ -1391,6 +1392,33 @@ mod tests {
             &plaintext[..len],
             record(E2EE_RECORD_FLAG_FINAL, b"{\"ok\":1}").as_slice()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbound_logical_message_uses_one_absolute_write_deadline() {
+        let (_initiator, responder) = establish().await;
+        let channel = Arc::new(Mutex::new(responder));
+        let mut writer = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _message: Message| async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Ok::<_, std::convert::Infallible>(())
+            },
+        ));
+        let plaintext = vec![b'x'; MAX_E2EE_CHUNK_BYTES + 1];
+        let started = tokio::time::Instant::now();
+
+        assert!(matches!(
+            send_established_encrypted_message(
+                &mut writer,
+                &channel,
+                &plaintext,
+                started + SOCKET_WRITE_TIMEOUT,
+            )
+            .await,
+            Err(E2eeSessionError::Timeout)
+        ));
+        assert_eq!(tokio::time::Instant::now() - started, SOCKET_WRITE_TIMEOUT);
     }
 
     #[tokio::test]
