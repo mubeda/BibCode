@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -29,6 +29,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
+use crate::network_interfaces::default_route_ip;
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 
@@ -2739,17 +2740,9 @@ struct ResolvedBackendExposure {
 }
 
 pub fn resolve_lan_advertised_host() -> Option<String> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("8.8.8.8", 80)).ok()?;
-    let address = socket.local_addr().ok()?.ip();
-    if !address.is_ipv4() || address.is_loopback() {
-        return None;
-    }
-    let text = address.to_string();
-    if text.starts_with("169.254.") {
-        return None;
-    }
-    Some(text)
+    default_route_ip()
+        .filter(IpAddr::is_ipv4)
+        .map(|ip| ip.to_string())
 }
 
 fn resolve_backend_exposure(

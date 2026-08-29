@@ -25,6 +25,10 @@ use crate::context_menu::{
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
 use crate::data_safety;
+use crate::network_interfaces::{
+    NetworkAddress, enumerate_system_advertised_addresses, is_cgnat_or_tailscale,
+    is_private_network,
+};
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
@@ -594,7 +598,10 @@ fn tailscale_advertised_endpoint(
     }))
 }
 
-fn advertised_endpoints_for_config(config: &BackendRunConfig) -> Result<Vec<Value>, String> {
+fn advertised_endpoints_for_config(
+    config: &BackendRunConfig,
+    network_addresses: &[NetworkAddress],
+) -> Result<Vec<Value>, String> {
     let mut endpoints = vec![advertised_endpoint(
         format!("desktop-loopback:{}", config.port),
         "This machine",
@@ -604,15 +611,48 @@ fn advertised_endpoints_for_config(config: &BackendRunConfig) -> Result<Vec<Valu
         "Loopback endpoint for this desktop app.",
     )?];
 
-    if let Some(endpoint_url) = &config.endpoint_url {
-        endpoints.push(advertised_endpoint(
-            format!("desktop-lan:{endpoint_url}"),
-            "Local network",
-            endpoint_url.clone(),
-            "lan",
-            Some(true),
-            "Reachable from devices on the same network.",
-        )?);
+    if config.server_exposure_mode == "network-accessible" {
+        for address in network_addresses {
+            let socket = std::net::SocketAddr::new(address.ip, config.port);
+            let is_tailnet = is_cgnat_or_tailscale(address.ip);
+            let reachability = if is_tailnet {
+                "private-network"
+            } else if is_private_network(address.ip) {
+                "lan"
+            } else {
+                "public"
+            };
+            endpoints.push(advertised_endpoint(
+                format!("desktop-network:{socket}"),
+                if address.is_default_route {
+                    "Local network"
+                } else if is_tailnet {
+                    "Private network"
+                } else {
+                    "Additional network"
+                },
+                format!("http://{socket}"),
+                reachability,
+                Some(address.is_default_route),
+                &format!(
+                    "Reachable through network interface {}.",
+                    address.interface_name
+                ),
+            )?);
+        }
+
+        if network_addresses.is_empty()
+            && let Some(endpoint_url) = &config.endpoint_url
+        {
+            endpoints.push(advertised_endpoint(
+                format!("desktop-network:{endpoint_url}"),
+                "Local network",
+                endpoint_url.clone(),
+                "lan",
+                Some(true),
+                "Reachable from devices on the same network.",
+            )?);
+        }
     }
 
     Ok(endpoints)
@@ -1573,7 +1613,14 @@ pub async fn desktop_bridge_get_advertised_endpoints(
     let Some(config) = backend.current_run_config() else {
         return Ok(Vec::new());
     };
-    let mut endpoints = advertised_endpoints_for_config(&config)?;
+    let network_addresses = match enumerate_system_advertised_addresses() {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            tracing::warn!(%error, "native advertised endpoint enumeration failed");
+            Vec::new()
+        }
+    };
+    let mut endpoints = advertised_endpoints_for_config(&config, &network_addresses)?;
     endpoints.extend(tailscale_advertised_endpoints_for_config(&config).await?);
     Ok(endpoints)
 }
@@ -2426,20 +2473,38 @@ mod tests {
     fn advertised_endpoints_serialize_loopback_and_lan_routes() {
         let config = test_run_config();
         let loopback =
-            advertised_endpoints_for_config(&config).expect("loopback endpoint should build");
+            advertised_endpoints_for_config(&config, &[]).expect("loopback endpoint should build");
         assert_eq!(loopback.len(), 1);
         assert_eq!(loopback[0]["id"], "desktop-loopback:13773");
         assert!(loopback[0].get("isDefault").is_none());
 
         let mut network_config = config;
+        network_config.server_exposure_mode = "network-accessible".to_string();
         network_config.endpoint_url = Some("http://192.168.1.20:13773/path".to_string());
-        let endpoints =
-            advertised_endpoints_for_config(&network_config).expect("LAN endpoint should build");
-        assert_eq!(endpoints.len(), 2);
+        let addresses = [
+            NetworkAddress {
+                interface_name: "Ethernet".to_string(),
+                ip: "192.168.1.20".parse().expect("IPv4 fixture"),
+                is_default_route: true,
+            },
+            NetworkAddress {
+                interface_name: "IPv6".to_string(),
+                ip: "2001:db8::20".parse().expect("IPv6 fixture"),
+                is_default_route: false,
+            },
+        ];
+        let endpoints = advertised_endpoints_for_config(&network_config, &addresses)
+            .expect("LAN endpoints should build");
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[1]["id"], "desktop-network:192.168.1.20:13773");
         assert_eq!(endpoints[1]["httpBaseUrl"], "http://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["wsBaseUrl"], "ws://192.168.1.20:13773/");
         assert_eq!(endpoints[1]["isDefault"], true);
         assert_eq!(endpoints[1]["reachability"], "lan");
+        assert_eq!(endpoints[2]["id"], "desktop-network:[2001:db8::20]:13773");
+        assert_eq!(endpoints[2]["httpBaseUrl"], "http://[2001:db8::20]:13773/");
+        assert_eq!(endpoints[2]["isDefault"], false);
+        assert_eq!(endpoints[2]["reachability"], "public");
     }
 
     #[test]
