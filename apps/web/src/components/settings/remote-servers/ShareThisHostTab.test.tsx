@@ -350,7 +350,7 @@ describe("ShareThisHostTab", () => {
 
     expect(apply.mock.calls).toEqual([["network-accessible"], ["local-only"]]);
     expect(container.textContent).toContain(
-      "The offer was not created. Remote access was restored to local-only.",
+      "The offer was not created. Remote access is confirmed local-only.",
     );
     expect(container.textContent).not.toContain("will switch off again automatically");
   });
@@ -372,9 +372,49 @@ describe("ShareThisHostTab", () => {
     await click("Generate pairing offer");
 
     expect(container.textContent).toContain(
-      "The offer was not created, and remote-access cleanup also failed. Review Exposure and retry cleanup.",
+      "The offer was canceled, but remote-access cleanup could not be verified. Review Exposure and retry cleanup.",
     );
     expect(container.textContent).not.toContain("will switch off again automatically");
+  });
+
+  it("explains when another live access reason keeps the host wide", async () => {
+    const apply = installBridge();
+    h.createOffer.mockRejectedValue(
+      Object.assign(new Error("mint failed"), {
+        cause: { _tag: "EnvironmentRequestInvalidError" },
+      }),
+    );
+    h.getShareState.mockResolvedValue({
+      desiredExposure: "wide",
+      offHostGrantCount: 1,
+      legacyGrantCount: 0,
+    });
+
+    await renderTab();
+    await click("Generate pairing offer");
+
+    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(container.textContent).toContain(
+      "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
+    );
+  });
+
+  it("leaves exposure unchanged when offer cancellation cannot be confirmed", async () => {
+    const apply = installBridge();
+    h.createOffer.mockRejectedValue(
+      Object.assign(new Error("response lost"), {
+        cause: { _tag: "EnvironmentRequestInvalidError" },
+      }),
+    );
+    h.cancelOffer.mockRejectedValue(new Error("server unreachable"));
+
+    await renderTab();
+    await click("Generate pairing offer");
+
+    expect(apply).toHaveBeenCalledExactlyOnceWith("network-accessible");
+    expect(container.textContent).toContain(
+      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
+    );
   });
 
   it("creates a loopback offer without touching exposure", async () => {

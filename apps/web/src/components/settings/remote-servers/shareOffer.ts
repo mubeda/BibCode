@@ -67,6 +67,12 @@ export function resolveShareAddressOptions(input: {
   return options;
 }
 
+export type ShareOfferCleanupOutcome =
+  | "local-confirmed"
+  | "active-reason"
+  | "cancellation-unconfirmed"
+  | "cleanup-failed";
+
 export type GenerateShareOfferFailure =
   | { readonly kind: "invalid-address"; readonly message: string }
   | { readonly kind: "widen-failed"; readonly message: string }
@@ -74,7 +80,7 @@ export type GenerateShareOfferFailure =
       readonly kind: "mint-failed";
       readonly message: string;
       readonly widened: boolean;
-      readonly cleanup: "not-needed" | "restored" | "failed";
+      readonly cleanup: ShareOfferCleanupOutcome;
     };
 
 export interface GeneratedShareOffer {
@@ -109,7 +115,7 @@ export interface GenerateShareOfferDeps {
   readonly cancelOffer: (idempotencyKey: string) => Promise<void>;
   readonly cleanupExposureAfterFailedMint:
     | null
-    | (() => Promise<"unchanged" | "narrowed" | "widened" | "rewidened">);
+    | (() => Promise<"local-confirmed" | "active-reason">);
   readonly sleep: (ms: number) => Promise<void>;
   readonly requestTimeoutMs: number;
 }
@@ -253,7 +259,8 @@ export async function generateShareOffer(
     }
   }
 
-  let cleanup: "not-needed" | "restored" | "failed" = "not-needed";
+  let cleanup: ShareOfferCleanupOutcome =
+    deps.exposureState?.mode === "local-only" ? "local-confirmed" : "active-reason";
   let message =
     lastError instanceof Error ? lastError.message : "Could not create the pairing offer.";
   let cancellationSucceeded = false;
@@ -265,19 +272,21 @@ export async function generateShareOffer(
     );
     cancellationSucceeded = true;
   } catch (error) {
-    cleanup = "failed";
+    cleanup = "cancellation-unconfirmed";
     const cancellationMessage = error instanceof Error ? error.message : String(error);
     message = `${message} Pairing-offer cancellation failed: ${cancellationMessage}`;
   }
   if (cancellationSucceeded && widened && deps.cleanupExposureAfterFailedMint !== null) {
     try {
-      const outcome = await deps.cleanupExposureAfterFailedMint();
-      cleanup = outcome === "narrowed" ? "restored" : "not-needed";
+      cleanup = await deps.cleanupExposureAfterFailedMint();
     } catch (error) {
-      cleanup = "failed";
+      cleanup = "cleanup-failed";
       const cleanupMessage = error instanceof Error ? error.message : String(error);
       message = `${message} Remote-access cleanup failed: ${cleanupMessage}`;
     }
+  } else if (cancellationSucceeded && widened) {
+    cleanup = "cleanup-failed";
+    message = `${message} Remote-access cleanup could not be verified.`;
   }
 
   return {

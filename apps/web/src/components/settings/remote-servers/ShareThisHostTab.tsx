@@ -208,13 +208,35 @@ export function ShareThisHostTab(): ReactElement {
       cleanupExposureAfterFailedMint:
         !canManageNativeExposure || desktopBridge === undefined
           ? null
-          : () =>
-              reconcileShareExposureOnce({
+          : async () => {
+              const outcome = await reconcileShareExposureOnce({
                 getShareState: getServerShareState,
                 getExposureState: () => desktopBridge.getServerExposureState(),
                 applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
                 canApplyExposure: () => canManageNativeExposureRef.current,
-              }),
+              });
+              if (outcome === "narrowed") return "local-confirmed";
+              if (outcome === "widened" || outcome === "rewidened") return "active-reason";
+
+              const [confirmedShareState, confirmedExposureState] = await Promise.all([
+                getServerShareState(),
+                desktopBridge.getServerExposureState(),
+              ]);
+              if (
+                confirmedExposureState.mode === "local-only" &&
+                confirmedShareState.desiredExposure === "loopback"
+              ) {
+                return "local-confirmed";
+              }
+              if (
+                confirmedExposureState.mode === "network-accessible" &&
+                (confirmedShareState.desiredExposure === "wide" ||
+                  confirmedShareState.legacyGrantCount > 0)
+              ) {
+                return "active-reason";
+              }
+              throw new Error("Remote-access cleanup could not confirm the server's exposure.");
+            },
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       requestTimeoutMs: PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
     });
@@ -240,11 +262,13 @@ export function ShareThisHostTab(): ReactElement {
       ? null
       : failure.kind !== "mint-failed"
         ? failure.message
-        : failure.cleanup === "restored"
-          ? "The offer was not created. Remote access was restored to local-only."
-          : failure.cleanup === "failed"
-            ? "The offer was not created, and remote-access cleanup also failed. Review Exposure and retry cleanup."
-            : failure.message;
+        : failure.cleanup === "local-confirmed"
+          ? "The offer was not created. Remote access is confirmed local-only."
+          : failure.cleanup === "active-reason"
+            ? "The offer was not created. Remote access remains enabled because another live access reason still requires it."
+            : failure.cleanup === "cancellation-unconfirmed"
+              ? "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist."
+              : "The offer was canceled, but remote-access cleanup could not be verified. Review Exposure and retry cleanup.";
 
   return (
     <>

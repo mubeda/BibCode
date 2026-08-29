@@ -100,6 +100,19 @@ describe("connection presentation", () => {
     expect(connectionTransportSecurity(entry(primary))).toBe("local");
     expect(connectionTransportSecurity(entry(TARGET, Option.some(pinned)))).toBe("e2ee");
     expect(connectionTransportSecurity(ENTRY)).toBe("unencrypted");
+    expect(
+      connectionTransportSecurity(
+        entry(
+          TARGET,
+          Option.some(
+            new BearerConnectionProfile({
+              ...pinned,
+              hostKey: " \t\n ",
+            }),
+          ),
+        ),
+      ),
+    ).toBe("unencrypted");
     expect(connectionTransportSecurity(entry(relay))).toBe("channel-secured");
     expect(connectionTransportSecurity(entry(ssh))).toBe("channel-secured");
     expect(

@@ -47,7 +47,10 @@ export async function reconcileShareExposureOnce(
   ]);
   if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
     if (!operations.canApplyExposure()) return "unchanged";
-    await operations.applyExposure("network-accessible");
+    const applied = await operations.applyExposure("network-accessible");
+    if (applied.mode !== "network-accessible") {
+      throw new Error("Server exposure did not reach network-accessible mode.");
+    }
     refreshDesktopNetworkAccessState();
     return "widened";
   }
@@ -56,13 +59,19 @@ export async function reconcileShareExposureOnce(
   }
 
   if (!operations.canApplyExposure()) return "unchanged";
-  await operations.applyExposure("local-only");
+  const applied = await operations.applyExposure("local-only");
+  if (applied.mode !== "local-only") {
+    throw new Error("Server exposure did not reach local-only mode.");
+  }
   refreshDesktopNetworkAccessState();
   const confirmedShareState = await operations.getShareState();
   if (confirmedShareState.desiredExposure !== "wide") return "narrowed";
 
   if (!operations.canApplyExposure()) return "narrowed";
-  await operations.applyExposure("network-accessible");
+  const restored = await operations.applyExposure("network-accessible");
+  if (restored.mode !== "network-accessible") {
+    throw new Error("Server exposure did not return to network-accessible mode.");
+  }
   refreshDesktopNetworkAccessState();
   return "rewidened";
 }
@@ -114,6 +123,15 @@ export function useShareExposureReconciler(): void {
   };
   const requestedRef = useRef(false);
   const inFlightRef = useRef<Promise<void> | null>(null);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestedRef.current = false;
+    };
+  }, []);
 
   const requestReconcile = useCallback(() => {
     requestedRef.current = true;
@@ -140,6 +158,7 @@ export function useShareExposureReconciler(): void {
             canApplyExposure: () => {
               const current = targetRef.current;
               return (
+                mountedRef.current &&
                 current.generation === target.generation &&
                 current.canManageNativeExposure &&
                 current.bridge === targetBridge &&
