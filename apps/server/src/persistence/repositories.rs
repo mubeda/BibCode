@@ -15,14 +15,14 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::orchestration::{ProviderTurnDelivery, TurnDeliveryState};
+use crate::{
+    auth::limits::{MAX_ACTIVE_PAIRING_OFFERS, MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL},
+    orchestration::{ProviderTurnDelivery, TurnDeliveryState},
+};
 
 use super::{Database, PersistenceError, Result};
 
 pub type Timestamp = String;
-
-pub const MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL: usize = 128;
-pub const MAX_ACTIVE_PAIRING_OFFERS: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct Repositories {

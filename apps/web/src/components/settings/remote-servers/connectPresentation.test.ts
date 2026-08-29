@@ -46,7 +46,7 @@ describe("resolveTransportBadge", () => {
   const bearer = (profile: { readonly _tag: string; readonly hostKey?: string | null } | null) => ({
     relayManaged: false,
     entry: {
-      target: { _tag: "BearerConnectionTarget", connectionId: "bearer:x" },
+      target: { _tag: "BearerConnectionTarget" as const, connectionId: "bearer:x" },
       profile:
         profile === null
           ? ({ _tag: "None" } as const)
@@ -77,6 +77,13 @@ describe("resolveTransportBadge", () => {
     ).toEqual({ kind: "e2ee", label: "End-to-end encrypted" });
     expect(
       resolveTransportBadge(bearer({ _tag: "BearerConnectionProfile", hostKey: null })),
+    ).toEqual({
+      kind: "unencrypted",
+      label: "Unencrypted",
+      guidance: "Re-pair with a new pairing code to secure this connection.",
+    });
+    expect(
+      resolveTransportBadge(bearer({ _tag: "BearerConnectionProfile", hostKey: " \t " })),
     ).toEqual({
       kind: "unencrypted",
       label: "Unencrypted",

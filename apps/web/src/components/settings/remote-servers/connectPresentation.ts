@@ -1,6 +1,7 @@
 import {
-  isDesktopLocalConnectionId,
+  connectionTransportSecurity,
   type CompatVerdict,
+  type ConnectionTransportSecurityInput,
   type PairingAddFailureReason,
 } from "@bibcode/client-runtime/connection";
 
@@ -35,15 +36,7 @@ export function describeCompatBadge(verdict: CompatVerdict | null): CompatBadge 
  */
 export interface TransportBadgeInput {
   readonly relayManaged: boolean;
-  readonly entry: {
-    readonly target: { readonly _tag: string; readonly connectionId?: string };
-    readonly profile:
-      | { readonly _tag: "None" }
-      | {
-          readonly _tag: "Some";
-          readonly value: { readonly _tag: string; readonly hostKey?: string | null };
-        };
-  };
+  readonly entry: ConnectionTransportSecurityInput;
 }
 
 export type TransportBadge =
@@ -55,13 +48,9 @@ export function resolveTransportBadge(environment: TransportBadgeInput): Transpo
   const target = environment.entry.target;
   if (target._tag === "SshConnectionTarget") return { kind: "ssh", label: "SSH tunnel" };
   if (target._tag !== "BearerConnectionTarget") return null;
-  if (isDesktopLocalConnectionId(target.connectionId)) return null;
-  const profile = environment.entry.profile;
-  const hostKey =
-    profile._tag === "Some" && profile.value._tag === "BearerConnectionProfile"
-      ? (profile.value.hostKey ?? null)
-      : null;
-  if (hostKey !== null && hostKey.length > 0) {
+  const security = connectionTransportSecurity(environment.entry);
+  if (security === "local") return null;
+  if (security === "e2ee") {
     return { kind: "e2ee", label: "End-to-end encrypted" };
   }
   return {

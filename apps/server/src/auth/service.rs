@@ -17,6 +17,10 @@ use uuid::Uuid;
 use super::{
     HostIdentity,
     dpop::DpopVerifier,
+    limits::{
+        MAX_ACTIVE_PAIRING_OFFERS, MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL, MAX_ACTIVE_PAIRINGS,
+        MAX_ACTIVE_SESSIONS,
+    },
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
         ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView,
@@ -45,9 +49,6 @@ const PAIRING_REJECTION_LIMIT: u8 =
     (u8::MAX as usize / PAIRING_ALPHABET.len() * PAIRING_ALPHABET.len()) as u8;
 const ACCESS_EVENT_CAPACITY: usize = 64;
 const AUTHORITY_CONVERGENCE_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_ACTIVE_PAIRINGS: usize = 4_096;
-const MAX_ACTIVE_PAIRING_OFFERS_PER_PRINCIPAL: usize = 128;
-const MAX_ACTIVE_SESSIONS: usize = 4_096;
 pub(crate) const PAIRING_REACH_VALUES: [&str; 3] = ["another-device", "this-computer", "custom"];
 
 fn is_valid_pairing_reach(value: &str) -> bool {
@@ -148,7 +149,7 @@ fn ensure_pairing_offer_capacity(
             "pairing offer principal capacity exceeded".to_owned(),
         ));
     }
-    if state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRINGS {
+    if state.pairing_offer_idempotency.len() >= MAX_ACTIVE_PAIRING_OFFERS {
         return Err(AuthError::Internal(
             "pairing offer idempotency capacity exceeded".to_owned(),
         ));

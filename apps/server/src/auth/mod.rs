@@ -1,6 +1,7 @@
 mod dpop;
 mod host_identity;
 mod http;
+pub(crate) mod limits;
 mod model;
 pub mod pairing_code;
 mod rpc;

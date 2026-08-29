@@ -188,9 +188,9 @@ describe("generateShareOffer", () => {
     expect(result).toMatchObject({ ok: false, failure: { kind: "mint-failed" } });
   });
 
-  it("times out blackholed mint attempts and still cancels before narrowing", async () => {
+  it("times out blackholed mint attempts and confirms local-only after cancellation", async () => {
     const cancelOffer = vi.fn(async () => {});
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
@@ -211,12 +211,12 @@ describe("generateShareOffer", () => {
     expect(cleanupExposureAfterFailedMint).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: "mint-failed", cleanup: "restored" },
+      failure: { kind: "mint-failed", cleanup: "local-confirmed" },
     });
   });
 
   it("bounds a blackholed cancellation and reports cleanup as unconfirmed", async () => {
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
@@ -240,7 +240,7 @@ describe("generateShareOffer", () => {
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "failed",
+        cleanup: "cancellation-unconfirmed",
         message: expect.stringContaining("timed out"),
       },
     });
@@ -248,7 +248,7 @@ describe("generateShareOffer", () => {
 
   it("restores local-only exposure after widening when every mint attempt fails", async () => {
     const calls: string[] = [];
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const mintOffer = vi.fn(async () => {
       calls.push("mint");
       throw new Error("still unreachable");
@@ -279,7 +279,7 @@ describe("generateShareOffer", () => {
     expect(calls).toEqual(["widen", "mint", "mint", "mint", "mint", "mint", "cancel"]);
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: "mint-failed", widened: true, cleanup: "restored" },
+      failure: { kind: "mint-failed", widened: true, cleanup: "local-confirmed" },
     });
   });
 
@@ -309,14 +309,14 @@ describe("generateShareOffer", () => {
       failure: {
         kind: "mint-failed",
         widened: true,
-        cleanup: "failed",
+        cleanup: "cleanup-failed",
         message: expect.stringContaining("firewall cleanup failed"),
       },
     });
   });
 
   it("reports cancellation failure and does not claim exposure was restored", async () => {
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
@@ -341,14 +341,14 @@ describe("generateShareOffer", () => {
       ok: false,
       failure: {
         kind: "mint-failed",
-        cleanup: "failed",
+        cleanup: "cancellation-unconfirmed",
         message: expect.stringContaining("Pairing-offer cancellation failed: server unreachable"),
       },
     });
   });
 
   it("does not run exposure cleanup when the ceremony did not widen", async () => {
-    const cleanupExposureAfterFailedMint = vi.fn(async () => "narrowed" as const);
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "local-confirmed" as const);
     const result = await generateShareOffer({
       intent: "another-device",
       name: "AI-SERVER",
@@ -372,7 +372,31 @@ describe("generateShareOffer", () => {
     expect(cleanupExposureAfterFailedMint).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: "mint-failed", widened: false, cleanup: "not-needed" },
+      failure: { kind: "mint-failed", widened: false, cleanup: "active-reason" },
+    });
+  });
+
+  it("reports when another live sharing reason correctly keeps exposure wide", async () => {
+    const cleanupExposureAfterFailedMint = vi.fn(async () => "active-reason" as const);
+    const result = await generateShareOffer({
+      intent: "another-device",
+      name: "AI-SERVER",
+      customAddress: null,
+      selectedOption: { id: "auto-lan", label: "Automatic (LAN)", httpBaseUrl: null },
+      hasDesktopBridge: true,
+      exposureState: loopbackState,
+      applyServerExposure: async () => wideState,
+      mintOffer: async () => {
+        throw new Error("mint failed");
+      },
+      ...defaultDeps,
+      classifyMintError: () => "fatal",
+      cleanupExposureAfterFailedMint,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { kind: "mint-failed", widened: true, cleanup: "active-reason" },
     });
   });
 

@@ -136,6 +136,18 @@ describe("reconcileShareExposureOnce", () => {
     expect(h.refreshNetwork).toHaveBeenCalledOnce();
   });
 
+  it("does not report narrowing when the bridge returns a still-wide topology", async () => {
+    await expect(
+      reconcileShareExposureOnce({
+        getShareState: async () => loopbackDesired,
+        getExposureState: async () => wideExposure,
+        applyExposure: async () => wideExposure,
+        canApplyExposure: () => true,
+      }),
+    ).rejects.toThrow("did not reach local-only");
+    expect(h.refreshNetwork).not.toHaveBeenCalled();
+  });
+
   it("re-widens when an off-host grant appears during narrowing", async () => {
     const getShareState = vi.fn().mockResolvedValueOnce(loopbackDesired).mockResolvedValueOnce({
       desiredExposure: "wide",
@@ -317,6 +329,46 @@ describe("useShareExposureReconciler", () => {
       root.render(<HookHarness />);
       await Promise.resolve();
     });
+    await act(async () => {
+      resolveShareState({
+        desiredExposure: "loopback",
+        offHostGrantCount: 0,
+        legacyGrantCount: 0,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applyServerExposure).not.toHaveBeenCalled();
+    expect(h.refreshNetwork).not.toHaveBeenCalled();
+    expect(h.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("cancels an in-flight native reconciliation when the hook unmounts", async () => {
+    let resolveShareState!: (value: {
+      desiredExposure: "loopback";
+      offHostGrantCount: number;
+      legacyGrantCount: number;
+    }) => void;
+    h.getShareState.mockReturnValue(
+      new Promise((resolve) => {
+        resolveShareState = resolve;
+      }),
+    );
+    const getServerExposureState = vi.fn(async () => wideExposure);
+    const applyServerExposure = vi.fn(async () => localExposure);
+    Object.defineProperty(window, "desktopBridge", {
+      configurable: true,
+      value: { getServerExposureState, applyServerExposure },
+    });
+
+    await act(async () => {
+      root.render(<HookHarness />);
+      await Promise.resolve();
+    });
+    expect(h.getShareState).toHaveBeenCalledOnce();
+
+    await act(async () => root.render(<></>));
     await act(async () => {
       resolveShareState({
         desiredExposure: "loopback",
