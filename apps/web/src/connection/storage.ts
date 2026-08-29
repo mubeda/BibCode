@@ -35,8 +35,13 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
-const DATABASE_NAME = "bibcode:connection-runtime";
-const DATABASE_VERSION = 2;
+import {
+  CONNECTION_DATABASE_NAME,
+  CONNECTION_DATABASE_VERSION,
+  monitorConnectionDatabaseOpenRequest,
+  reportConnectionDatabaseUnavailable,
+} from "./databaseHealth";
+
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
@@ -113,16 +118,22 @@ function catalogResetPersistenceError() {
 }
 
 const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
-  databaseName = DATABASE_NAME,
+  databaseName = CONNECTION_DATABASE_NAME,
 ) {
   return yield* Effect.callback<IDBDatabase, ConnectionTransientError>((resume) => {
     if (typeof indexedDB === "undefined") {
+      if (databaseName === CONNECTION_DATABASE_NAME) {
+        reportConnectionDatabaseUnavailable("IndexedDB is unavailable in this browser context.");
+      }
       resume(
         Effect.fail(catalogError("open", "IndexedDB is unavailable in this browser context.")),
       );
       return;
     }
-    const request = indexedDB.open(databaseName, DATABASE_VERSION);
+    const request = indexedDB.open(databaseName, CONNECTION_DATABASE_VERSION);
+    if (databaseName === CONNECTION_DATABASE_NAME) {
+      monitorConnectionDatabaseOpenRequest(request);
+    }
     request.addEventListener("upgradeneeded", () => {
       if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
         request.result.createObjectStore(CATALOG_STORE_NAME);
