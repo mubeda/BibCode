@@ -1218,5 +1218,5 @@ Use `superpowers:requesting-code-review` against `98ac79bd..HEAD`, require both 
 - [x] Re-run every focused regression plus `vp check`, `vp run typecheck`, `vp test`, Rust formatting, complete server/desktop suites, and both Clippy targets.
 - [x] Rebuild and run direct TypeScript-to-Rust E2EE interop and the separate Debian/Node Docker smoke; prove test-owned resources are removed.
 - [x] Complete the execution-report template without claiming unavailable native/package evidence or Docker fragmentation that was not exercised.
-- [ ] Reapply the two original user-staged environment-project documentation deletions after every product commit.
-- [ ] Request one final adversarial review of `3b1864eff..HEAD` and close every confirmed High/Medium issue.
+- [x] Reapply the two original user-staged environment-project documentation deletions after every product commit.
+- [x] Request one final adversarial review of `3b1864eff..HEAD` and close every confirmed High/Medium issue.
